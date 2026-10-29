@@ -13,10 +13,18 @@ public enum DoctorSafeRepairPolicy {
 
     // Automatic repair delegates to registered owners. Doctor never seeds
     // persona, resets runtime authority or rewrites transcripts.
-    public static let automaticCoreIDs: Set<String> = [
-        "icloud_bridge_state", "oauth_token_expiry",
-        "inspector.trace_integrity", "coreml_embedder",
-    ]
+    static func allowsCoreRepair(_ id: String, scope: DoctorRepairScope) -> Bool {
+        switch scope {
+        case .automatic:
+            ["icloud_bridge_state", "oauth_token_expiry", "inspector.trace_integrity", "coreml_embedder"].contains(id)
+        case .onboarding: ["icloud_bridge_state", "oauth_token_expiry"].contains(id)
+        case .button: true
+        }
+    }
+
+    private static let coreHandlerIDs = Set(SwiftNativeDoctorChecks.defaultChecks.compactMap {
+        $0 is any RepairingDoctorCheck ? $0.id : nil
+    })
 
     public static func checkIDs(
         for checks: [CheckResult], executableLiveIDs: Set<String> = [],
@@ -26,17 +34,17 @@ public enum DoctorSafeRepairPolicy {
         return checks.compactMap { check in
             let liveRepair = executableLiveIDs.contains(check.checkID)
                 || (check.checkID.hasPrefix("live.") && check.repair_available == true)
+            let coreRepair = coreHandlerIDs.contains(check.checkID) && check.repair_available == true
             let scopeAllowsRepair = switch scope {
             case .automatic, .onboarding:
-                automaticCoreIDs.contains(check.checkID)
-                    || (scope == .automatic && executableLiveIDs.contains(check.checkID)
-                        && check.automaticRepairEligible != false)
-                    || (check.checkID == "live.embedding_download"
-                        && check.detail.hasPrefix("A resumable memory model transfer"))
+                allowsCoreRepair(check.checkID, scope: scope)
+                    || (executableLiveIDs.contains(check.checkID)
+                        && ((scope == .automatic && check.automaticRepairEligible != false)
+                            || check.checkID == "live.embedding_download"))
             case .button: true
             }
-            guard isAdverse(check.status) || isOAuthRefresh(check),
-                  liveRepair || check.repair_available == true || isSafeCoreRepair(check),
+            guard isAdverse(check.status) || (check.checkID == "oauth_token_expiry" && coreRepair),
+                  liveRepair || coreRepair,
                   scopeAllowsRepair else { return nil }
             let id = check.checkID.trimmingCharacters(in: .whitespacesAndNewlines)
             return !id.isEmpty && seen.insert(id).inserted ? id : nil
@@ -48,13 +56,9 @@ public enum DoctorSafeRepairPolicy {
         checks.filter { $0.repairApplied == true }.count
     }
 
-    /// Core checks still return legacy repair copy. Only an advertised,
-    /// registered handler may survive in the report's executable field.
+    /// Only an advertised, registered handler is executable.
     public static func executableCoreIDs(for checks: [CheckResult]) -> Set<String> {
-        let handlers = Set(SwiftNativeDoctorChecks.defaultChecks.compactMap {
-            $0 is any RepairingDoctorCheck ? $0.id : nil
-        })
-        return Set(checkIDs(for: checks)).intersection(handlers)
+        Set(checkIDs(for: checks)).intersection(coreHandlerIDs)
     }
 
     /// Only sign-ins and permissions join the consent inbox ask; app-defect
@@ -67,21 +71,11 @@ public enum DoctorSafeRepairPolicy {
         ["warning", "failing"].contains(DoctorPlainCopy.bucket(for: normalized(status)))
     }
 
-    /// Recognize current instructions and older cached reports in both admission
-    /// and human-step projection.
+    /// Keep executable instructions out of human-step copy in cached reports.
     static func isCoreRepairInstruction(_ instruction: String?) -> Bool {
         let instruction = normalized(instruction)
         return instruction.hasPrefix("run repair safe issues")
             || instruction.hasPrefix("press repair in diagnostics → health checks")
-    }
-
-    private static func isSafeCoreRepair(_ check: CheckResult) -> Bool {
-        isOAuthRefresh(check) || isCoreRepairInstruction(check.repair)
-    }
-
-    private static func isOAuthRefresh(_ check: CheckResult) -> Bool {
-        check.checkID == "oauth_token_expiry" && (check.repair == oauthRefreshInstruction
-            || check.repair == "Run Repair Safe Issues to refresh expired OAuth access through each credential owner.")
     }
 
     private static func normalized(_ value: String?) -> String {

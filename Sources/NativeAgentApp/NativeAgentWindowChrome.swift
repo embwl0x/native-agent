@@ -12,17 +12,14 @@ struct MainWindowContent: View {
         ContentView()
             .background { ShellWindowChrome() }
             .onAppear {
-                NativeAgentAppCoordinator.shared.configureMainWindowOpening { [openWindow] in
-                    openWindow(id: NativeAgentAppCoordinator.mainSceneID)
+                ApplicationLifetime.shared.configureMainWindowOpening { [openWindow] in
+                    openWindow(id: ApplicationLifetime.mainSceneID)
                 }
             }
     }
 }
 
-// PATCH-2026-05-07: app-owned runtime helper button that opens the main
-// window via @Environment(\.openWindow). Lives outside the MenuBarExtra
-// closure because MenuBarExtra is a Scene, not a View — environment
-// values for openWindow only resolve inside an actual view hierarchy.
+// openWindow resolves inside a View hierarchy, outside the MenuBarExtra scene closure.
 struct MenuBarOpenButton: View {
     @Environment(\.openWindow) private var openWindow
     var body: some View {
@@ -31,7 +28,7 @@ struct MenuBarOpenButton: View {
             // The main scene is a single-instance Window (not WindowGroup),
             // so openWindow(id:) reuses the existing one if visible or
             // recreates it if closed — never stacks copies.
-            openWindow(id: NativeAgentAppCoordinator.mainSceneID)
+            openWindow(id: ApplicationLifetime.mainSceneID)
         }
     }
 }

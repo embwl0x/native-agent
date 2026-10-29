@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
@@ -13,9 +12,10 @@ import Desk
 import StandingBots
 import DreamREMCycle
 import Observation
+import SwarmRuns
 // Blueprint: | `RuntimeReadProjection+Feeds.swift` | Notification pending counts read only ApprovalInbox; the unwritten notification receipt input and inferred authorization are retired. Browser reads, checked skills with opt-in source/revision from the inventory body epoch, JSON decoding and JSONL tails; engine.runs retains rows and availability through LatestRead and returns its own read for DeviceSync, preserving rows on failure. Saved-things reads delegate to existing Desk, bot, memory and diary owners. |
 
-extension RuntimeReadProjection {
+extension RuntimeReadouts {
     @MainActor @Observable
     public final class Runs {
         public private(set) var rows: [RunRecord] = []
@@ -24,7 +24,7 @@ extension RuntimeReadProjection {
         public nonisolated init() {}
         @discardableResult
         public func refresh(dataRoot: URL) async throws -> [RunRecord] {
-            let read = await latest.read({ await RuntimeReadProjection.runs(dataRoot: dataRoot) }, publish: { next in
+            let read = await latest.read({ await RuntimeReadouts.runs(dataRoot: dataRoot) }, publish: { next in
                 readSucceeded = next != nil
                 if let next { rows = next }
             })
@@ -34,13 +34,13 @@ extension RuntimeReadProjection {
     }
 }
 
-private enum NextGenStatusFeedAvailability: Equatable {
+private enum StatusFeedAvailability: Equatable {
     case absent
     case measured
     case unavailable
 }
 
-extension RuntimeReadProjection {
+extension RuntimeReadouts {
     public static func getNotificationStatus(dataRoot: URL) async throws -> NotificationRuntimeStatus {
         // The approval owner supplies the panel's pending count. The retired
         // notification receipt path has no producer and cannot measure it.
@@ -72,14 +72,7 @@ extension RuntimeReadProjection {
     }
 
     public static func getBrowserStatus(dataRoot: URL) async throws -> BrowserRuntimeStatus {
-        // Subsystem #27 wave 33 W17 (2026-06-01): when .browser is ON, the
-        // in-process SwiftNativeBrowserClient reads the co-located
-        // native_power/browser/{runs.json,receipts.jsonl} + trust-policy
-        // approvedDomains and serves the same browser_status() envelope without
-        // the HTTP round-trip. The reader is a PURE read (no write-back); the
-        // daemon's run/cancel R-M-W of runs.json is flock-guarded this wave so a
-        // status read never sees a torn file. A root with no browser run or
-        // receipt feed is unmeasured rather than an idle zero-count runtime.
+        // Read this root's browser feeds without write-back; absent feeds mean unmeasured.
         let root = dataRoot
         let browserRoot = root
             .appendingPathComponent("native_power", isDirectory: true)
@@ -92,8 +85,6 @@ extension RuntimeReadProjection {
                 status: availability == .absent ? "unmeasured" : "unavailable",
                 sourcePath: nil,
                 screenshotPath: nil,
-                approvedDomains: nil,
-                domainPolicy: nil,
                 activeRuns: nil,
                 receiptCount: nil,
                 latestReceipt: nil,
@@ -107,14 +98,14 @@ extension RuntimeReadProjection {
         } catch {
             return BrowserRuntimeStatus(
                 status: "unavailable", sourcePath: nil,
-                screenshotPath: nil, approvedDomains: nil, domainPolicy: nil,
+                screenshotPath: nil,
                 activeRuns: nil, receiptCount: nil, latestReceipt: nil,
                 createdAt: ISO8601DateFormatter().string(from: Date())
             )
         }
     }
 
-    private static func statusFeedAvailability(_ paths: [URL]) -> NextGenStatusFeedAvailability {
+    private static func statusFeedAvailability(_ paths: [URL]) -> StatusFeedAvailability {
         let fileManager = FileManager.default
         var foundEvidence = false
         for path in paths where fileManager.fileExists(atPath: path.path) {
@@ -135,75 +126,52 @@ extension RuntimeReadProjection {
 
     /// Checked built-in guidance; source is loaded only for source review.
     public static func skills(dataRoot: URL, includingSource: Bool = false) async throws -> [SkillRecord] {
-        let entries = try InstalledSkillInventory.entries(dataRoot: dataRoot)
-        var survivors: [SkillRecord] = [], firstDropError: Error?
-        for entry in entries {
-            var skill: SkillRecord
-            do { skill = try SkillRecord(row: .object(entry.row)) }
-            catch {
-                if firstDropError == nil { firstDropError = error }
-                print("[NativeAgent] getSkills(swiftNative) dropped a malformed element: \(error)")
-                continue
-            }
-            if includingSource {
-                let body = entry.readme
-                skill.body = body
-                skill.bodyRevision = SHA256.hash(data: Data(body.utf8)).map { String(format: "%02x", $0) }.joined()
-            }
-            survivors.append(skill)
-        }
-        if !entries.isEmpty, survivors.isEmpty, let firstDropError { throw firstDropError }
-        return survivors
+        try InstalledSkillInventory.entries(dataRoot: dataRoot, includingSource: includingSource)
     }
 
-    /// `runs/runs.json`, newest first, at most 200. `[]` means the ledger
-    /// doesn't exist (or holds no runs); nil means a ledger EXISTS but could
-    /// not be read or decoded, so a snapshot writer can skip its write and a
-    /// corrupt ledger never overwrites last-good runs with fabricated-empty
-    /// state (sync-audit #1 discipline). The on-disk shape may be a bare
-    /// array or `{"runs": [...]}`.
+    /// `runs/runs.json`, newest first, at most 200; accepts a bare array or `{"runs": [...]}`.
+    /// `[]` means absent or empty; nil means unreadable, so publication preserves the last good rows.
     public static func runs(dataRoot: URL) async -> [RunRecord]? {
         let path = dataRoot
             .appendingPathComponent("runs", isDirectory: true)
             .appendingPathComponent("runs.json")
         guard FileManager.default.fileExists(atPath: path.path) else { return [] }
         guard let data = try? Data(contentsOf: path) else { return nil }
-        let decoder = JSONDecoder.nativeAgent
-        var rows: [RunRecord]
-        if let arr = try? decoder.decode([RunRecord].self, from: data) {
-            rows = arr
-        } else if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let runs = obj["runs"],
-                  let runsData = try? JSONSerialization.data(withJSONObject: runs),
-                  let arr = try? decoder.decode([RunRecord].self, from: runsData) {
-            rows = arr
-        } else {
-            return nil
-        }
+        guard var rows = try? RunLedger.records(from: data) else { return nil }
         rows.sort { $0.createdAt > $1.createdAt }
         return Array(rows.prefix(200))
     }
 
-    /// The last `limit` rows of a JSONL file, each decoded on its own; a row
-    /// that does not decode is skipped and a missing file reads as `[]`.
-    /// Reads at most the last 1 MB, dropping the partial first line.
-    public static func tailJSONL<T: Decodable>(path: URL, limit: Int) async -> [T] {
-        guard let read = try? SwiftNativePersistenceCore.tailPhysicalLines(
-            path, limit: limit, maxBytes: 1_048_576
-        ) else { return [] }
+    /// A bounded receipt tail with read/decode coverage. Missing is empty;
+    /// unreadable or malformed evidence is a failure, even with valid rows.
+    /// Blank rows are counted separately so each consumer keeps its policy.
+    public static func tailJSONL<T: Decodable>(path: URL, limit: Int) async ->
+        (rows: [T], malformedRows: Int, blankRows: Int, truncated: Bool, readFailed: Bool, failure: String?) {
+        let read: (lines: [Data], bytesRead: Int, truncatedToByteWindow: Bool, leadingFragment: Bool)
+        do { read = try SwiftNativePersistenceCore.tailPhysicalLines(path, limit: limit, maxBytes: 1_048_576) ?? ([], 0, false, false) }
+        catch { return ([], 0, 0, false, true, "Could not read \(path.lastPathComponent): \(error.localizedDescription)") }
         let decoder = JSONDecoder.nativeAgent
-        let tail = read.lines
+        let tail = read.lines.dropFirst(read.leadingFragment ? 1 : 0)
         var out: [T] = []
+        var malformed = 0
+        var blank = 0
+        var cause: String?
         out.reserveCapacity(tail.count)
         for line in tail {
-            guard let line else { continue }
+            guard let line = String(data: line, encoding: .utf8) else {
+                malformed += 1
+                cause = cause ?? "Invalid UTF-8"
+                continue
+            }
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.isEmpty { continue }
-            if let lineData = trimmed.data(using: .utf8),
-               let row = try? decoder.decode(T.self, from: lineData) {
-                out.append(row)
+            if trimmed.isEmpty { blank += 1; continue }
+            do { out.append(try decoder.decode(T.self, from: Data(trimmed.utf8))) }
+            catch {
+                malformed += 1
+                cause = cause ?? error.localizedDescription
             }
         }
-        return out
+        let failure = cause.map { "\(path.lastPathComponent) has \(malformed) malformed receipt row(s): \($0)" }
+        return (out, malformed, blank, read.truncatedToByteWindow, false, failure)
     }
 }

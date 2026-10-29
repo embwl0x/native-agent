@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentShared
+import PersistenceCore
 
 // Blueprint: | `TelegramMediaAttachment.swift` | `TelegramMediaDownloader`: two-stage file metadata/download admission with declared-size and actual-byte bounds |
 
@@ -74,14 +75,7 @@ public actor TelegramMediaDownloader {
         self.session = session
     }
 
-    /// 2026-09-06: URLSession reports cooperative task cancellation as
-    /// NSURLError -999 (`URLError.cancelled`), not `CancellationError` — and
-    /// both `session.bytes` and the byte loop torn down by `body.task.cancel()`
-    /// surface it. The poll loop's photo branch releases the admitted claim on
-    /// `CancellationError` only, so an unnormalised -999 was read as an
-    /// ordinary download failure: the photo was consumed, the claim settled,
-    /// and the sender never got an answer. `TelegramBot+Client.longPoll`
-    /// normalises the same way.
+    /// Normalize URLSession cancellation so admission can release the saved message.
     public func download(
         token: String,
         attachment: TelegramMediaAttachment,
@@ -103,43 +97,28 @@ public actor TelegramMediaDownloader {
         attachment: TelegramMediaAttachment,
         maxBytes: Int
     ) async throws -> TelegramMediaAttachment {
-        // --- Stage 1: getFile ---
         let encodedToken = _tgEncodeBotToken(token)
-        var comps1 = URLComponents()
-        comps1.scheme = "https"
-        comps1.host = "api.telegram.org"
-        comps1.percentEncodedPath = "/bot\(encodedToken)/getFile"
-        guard let getFileURL = comps1.url else {
-            throw TelegramMediaDownloadError.malformedResponse
-        }
-        var req1 = URLRequest(url: getFileURL)
-        req1.httpMethod = "POST"
-        req1.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        let body1 = try JSONSerialization.data(withJSONObject: ["file_id": attachment.fileId])
-        req1.httpBody = body1
-
-        let (data1, resp1) = try await session.data(for: req1)
-        if let http = resp1 as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
-            throw TelegramMediaDownloadError.httpError(status: http.statusCode)
+        let result: [String: JSONValue]
+        do {
+            result = try await TelegramPollLoop._tgPostJSON(token: token, method: "getFile",
+                resultType: [String: JSONValue].self, session: session) {
+                try JSONSerialization.data(withJSONObject: ["file_id": attachment.fileId])
+            }.value
+        } catch let failure as TelegramAPIFailure {
+            if failure.kind == .httpStatus, let status = failure.httpStatus {
+                throw TelegramMediaDownloadError.httpError(status: status)
+            }
+            throw failure
         }
 
-        guard
-            let json1 = try? JSONSerialization.jsonObject(with: data1) as? [String: Any],
-            let result = json1["result"] as? [String: Any]
-        else {
-            throw TelegramMediaDownloadError.malformedResponse
-        }
-
-        // Check reported file size before transferring bytes.
-        if let reportedSize = result["file_size"] as? Int, reportedSize > maxBytes {
+        if let reportedSize = (result["file_size"]?.integerValue.flatMap(Int.init(exactly:)) ?? result["file_size"]?.stringValue.flatMap(Int.init)), reportedSize > maxBytes {
             throw TelegramMediaDownloadError.oversized(reportedBytes: reportedSize, capBytes: maxBytes)
         }
 
-        guard let filePath = result["file_path"] as? String, !filePath.isEmpty else {
+        guard let filePath = result["file_path"]?.stringValue, !filePath.isEmpty else {
             throw TelegramMediaDownloadError.missingFilePath
         }
 
-        // --- Stage 2: download bytes ---
         let encodedPath = filePath
             .addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? filePath
         var comps2 = URLComponents()

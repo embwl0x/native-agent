@@ -1,5 +1,4 @@
 import AgentWorkspace
-import GrokLink
 import CryptoKit
 import Foundation
 import ChatTurnRuntime
@@ -7,6 +6,7 @@ import ChatTurnContracts
 import AgentConversations
 import NativeAgentCore
 import PersistenceCore
+import NativeAgentShared
 // Blueprint: | `GrokInboundReply.swift` | Root-retained handover tasks deduplicate by message until actual exit; canonical `TurnAdmission.admittedRun` registers accepted runs for Stop/quit before session admission; `settle` writes their terminal handover result and releases ownership; the continuation lifecycle closes admission, cancels and joins them before closing live publication |
 
 public struct GrokInboundReply: Sendable {
@@ -22,30 +22,19 @@ public struct GrokInboundReply: Sendable {
     /// Local correlation is authority; stdin cannot choose the conversation.
     /// Claim before enqueue so ambiguous delivery cannot duplicate a turn.
     public func receive(_ reply: GrokReplyInput, principal: AgentBridgePrincipal, dataRoot: URL,
-                        continuation: AgentConversationContinuation,
-                        deliver: (@Sendable (GrokPendingRequest, String, AgentBridgePrincipal) async throws -> String)? = nil) async throws {
+                        continuation: AgentConversationContinuation) async throws {
         guard principal.peerID == principal.id,
               let contact = try AgentPeerStore(dataRoot: dataRoot).list().first(where: { $0.id == principal.id }),
               contact.transport == .grokBot, contact.grokSetup == "set up" else { throw GrokLinkCredential.Failure.invalid }
         let store = GrokRequestStore(dataRoot: dataRoot)
         let pending = try store.claimReply(reply, peer: principal.id)
         let peer = AgentBridgePrincipal(id: principal.id, peerID: principal.id, elevated: contact.elevationAllowed, displayName: contact.name)
-        var run = ""
-        if let deliver {
-            do { run = try await deliver(pending, reply.text, peer) } catch {
-                // Queuing failed: put the claim back so the reply can still land.
-                _ = try? store.update(reply.message_id, peer: peer.id) { $0.state = "accepted" }
-                throw error
-            }
-        }
-        let handsOver = deliver == nil && pending.quiet != true
+        let handsOver = pending.quiet != true
         let answered = try store.update(reply.message_id, peer: peer.id) {
-            $0.state = "answered"; $0.reply = reply.text; $0.runID = run.isEmpty ? nil : run
+            $0.state = "answered"; $0.reply = reply.text; $0.runID = nil
             if handsOver { $0.handOver = "pending" }
         }
-        // 2026-09-22 WHY: no background read covers Grok, so its conversation
-        // row stayed "waiting" forever. Settle the exact row that sent this id;
-        // a late answer to an earlier exchange lands on that exchange only.
+        // Settle only the conversation row or exchange matching this reply's message ID.
         let conversations = AgentConversationStore(dataRoot: dataRoot)
         let rows = (try? conversations.records())?.filter { $0.agent == "peer:" + peer.id } ?? []
         if let row = rows.first(where: { $0.readInput?["message_id"] == .string(reply.message_id) }) {
@@ -64,11 +53,8 @@ public struct GrokInboundReply: Sendable {
         if handsOver { handOver(answered, text: reply.text, peer: peer, dataRoot: dataRoot, continuation: continuation) }
     }
 
-    /// The answer becomes her turn only when the asking turn did not already
-    /// take it with `wait`, and only once any turn in that chat has finished:
-    /// two turns at once both acted on "plum" and the follow-up went twice
-    /// (walk 3, 09-25). The answer is saved above; `handOver` on the request
-    /// says durably whether it has become her turn yet.
+    /// After session admission, only a pending, unconsumed answer becomes a turn.
+    /// The saved `handOver` durably records its outcome.
     private func handOver(_ pending: GrokPendingRequest, text: String, peer: AgentBridgePrincipal, dataRoot: URL,
                           continuation: AgentConversationContinuation) {
         running.start(pending.messageID) {
@@ -88,8 +74,7 @@ public struct GrokInboundReply: Sendable {
                                                              route: route, principal: "peer:" + peer.id) { runID, binding in
                     try await TurnAdmission.admittedRun(dataRoot: dataRoot, sessionID: pending.conversationID,
                                                         runID: runID, waitForCapacity: true) {
-                        // Only a still-pending hand-over starts a turn; a wait or a room
-                        // in the turn that just finished may have taken it meanwhile.
+                        // Recheck pending after admission: wait or room may have consumed it.
                         let claimed = try store.update(id, peer: peer.id) {
                             if $0.handOver == "pending" { $0.handOver = "running"; $0.runID = runID }
                         }
@@ -193,11 +178,8 @@ public struct GrokInboundReply: Sendable {
         let envelope = TurnEnvelope(surface: peer.surface, agent: "peer", verifiedUserId: peer.id,
             commandSignatureVerified: true, deliveryRoute: route.chatToolReplyRoute, declaredRemote: !peer.elevated)
         let origin = ChatMessageOrigin(surface: peer.surface, agent: "agent", authored: .agent)
-        // This credential can only answer a message this app sent, so say so:
-        // unframed, the answer read as a new request and the question was re-asked
-        // (driven 09-20).
-        // Which message it answers: unnamed, a late answer to her earlier
-        // message read as the answer to her newest one (10-14, "got it" for 17 × 23).
+        // This credential answers only a message this app sent; name that
+        // message so a late answer cannot be mistaken for a newer exchange.
         let asked = GrokBotRoute.thread(peer: peer.id, dataRoot: dataRoot)
             .first { $0.id == pending.messageID }.map { "your message \u{201C}" + HerScreen.clip($0.prompt, 120) + "\u{201D}" }
         let message = AgentBridgeSurface.turnHeader(peerName: peer.displayName, elevated: peer.elevated)

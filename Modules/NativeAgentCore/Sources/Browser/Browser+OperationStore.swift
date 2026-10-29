@@ -1,7 +1,8 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `Browser+OperationStore.swift` | SwiftNativeBrowserClient's checked run-array schema, lifecycle writes and terminal vocabulary shared by reconciliation; derived receipts and traces use appendPathOwnedJSONL; local backup/export/raw phone sync excluded, PrivacyMap lists Browser Runs |
+import TurnTrace
+// Blueprint: | `Browser+OperationStore.swift` | SwiftNativeBrowserClient's checked run-array schema, lifecycle writes and terminal vocabulary shared by reconciliation; derived receipts use appendPathOwnedJSONL, transition traces use TurnTracePersistLane with checked deduplication; local backup/export/raw phone sync excluded, PrivacyMap lists Browser Runs |
 
 /// Canonical Browser lifecycle commands. WebKit/AppKit remain effect adapters;
 /// every durable lifecycle transition enters through this boundary.
@@ -95,7 +96,7 @@ public struct BrowserOperationCommandResult: Sendable {
     }
 }
 
-public enum BrowserOperationStoreError: Error, Sendable, Equatable {
+public enum BrowserOperationStoreError: Error, LocalizedError, Sendable, Equatable {
     case invalidIdentity
     case invalidURL
     case invalidDomain
@@ -105,7 +106,15 @@ public enum BrowserOperationStoreError: Error, Sendable, Equatable {
     case runNotFound
     case invalidTransition
     case corruptRunsDocument
+    case invalidTransitionMetadata(runID: String)
     case capacityExceeded
+
+    public var errorDescription: String? {
+        if case .invalidTransitionMetadata(let runID) = self {
+            return "Browser run \(runID) has invalid or exhausted transition metadata; canonical bytes retained."
+        }
+        return nil
+    }
 }
 
 /// Cancellation committed even though its derived receipt could not be written.
@@ -115,7 +124,7 @@ public struct BrowserCancellationProjectionError: Error, LocalizedError {
     public var errorDescription: String? { underlyingError.localizedDescription }
 }
 
-private struct BrowserPendingProjection: Sendable {
+private struct PendingBrowserReceipt: Sendable {
     let runID: String
     let projectionID: String
     let publicRun: JSONValue
@@ -140,7 +149,9 @@ extension SwiftNativeBrowserClient {
 
     /// Sole canonical Browser command boundary. The runs row is committed
     /// first under one lock; receipt/trace feeds are idempotent derived
-    /// projections and can be resumed after a crash.
+    /// projections and can be resumed after a crash. A running start returns
+    /// its committed claim before projecting; its effect owner must receive
+    /// that claim and install settlement even when an older feed is damaged.
     public func executeBrowserOperation(
         _ command: BrowserOperationCommand
     ) async throws -> BrowserOperationCommandResult {
@@ -148,6 +159,9 @@ extension SwiftNativeBrowserClient {
         switch command {
         case .start(let request):
             result = try await commitStart(request)
+            // Running rows have no start receipt. Terminal settlement drains
+            // pending projections and reports any derived-feed failures then.
+            if request.initialState == .running { return result }
         case .complete(let completion):
             result = try await commitCompletion(completion)
         case .cancel(let requestedID):
@@ -159,7 +173,7 @@ extension SwiftNativeBrowserClient {
             try await projectPendingBrowserReceipts()
         } catch {
             if case .cancel = command, let run = result.run,
-               Self.objectString(run, "status") == "canceled" {
+               run.objectValue?["status"]?.stringValue == "canceled" {
                 throw BrowserCancellationProjectionError(run: run, underlyingError: error)
             }
             throw error
@@ -174,14 +188,11 @@ extension SwiftNativeBrowserClient {
         guard !identity.isEmpty, identity.utf8.count <= 200 else {
             throw BrowserOperationStoreError.invalidIdentity
         }
-        guard let components = URLComponents(string: request.url),
-              let scheme = components.scheme?.lowercased(),
-              scheme == "http" || scheme == "https",
-              let urlHost = components.host?.lowercased() else {
+        guard let parsed = try? BrowserActionRoutes.ValidBrowserURL(request.url) else {
             throw BrowserOperationStoreError.invalidURL
         }
         let domain = request.domain.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !domain.isEmpty, domain.utf8.count <= 253, domain == urlHost else {
+        guard !domain.isEmpty, domain.utf8.count <= 253, domain == parsed.domain else {
             throw BrowserOperationStoreError.invalidDomain
         }
         if let deadline = request.deadlineSeconds, !(1...86_400).contains(deadline) {
@@ -192,8 +203,8 @@ extension SwiftNativeBrowserClient {
 
         return try await withCanonicalRunsLock {
             var rows = try await self.readCanonicalRuns()
-            if let index = rows.firstIndex(where: { Self.objectString($0, "id") == identity }) {
-                guard Self.objectString(rows[index], "requestDigest") == digest else {
+            if let index = rows.firstIndex(where: { $0.objectValue?["id"]?.stringValue == identity }) {
+                guard rows[index].objectValue?["requestDigest"]?.stringValue == digest else {
                     throw BrowserOperationStoreError.conflictingIdempotencyKey
                 }
                 return BrowserOperationCommandResult(run: Self.externalRun(rows[index]), didTransition: false)
@@ -224,12 +235,12 @@ extension SwiftNativeBrowserClient {
                 row["deadlineAt"] = .string(Self.nowISO(now().addingTimeInterval(TimeInterval(seconds))))
             }
             if request.initialState == .dryRun {
-                Self.stageProjection(on: &row, status: request.initialState.rawValue, at: timestamp)
+                try Self.stageProjection(on: &row, status: request.initialState.rawValue, at: timestamp)
             }
             let canonical = JSONValue.object(row)
             rows.append(canonical)
             rows = try Self.prunedCanonicalRuns(rows)
-            try await self.persistence.writeJSON(.array(rows), to: self.runsPath)
+            try await SwiftNativePersistenceCore.writeJSON(.array(rows), to: self.runsPath)
             return BrowserOperationCommandResult(run: Self.externalRun(canonical), didTransition: true)
         }
     }
@@ -243,44 +254,47 @@ extension SwiftNativeBrowserClient {
         let timestamp = Self.nowISO(now())
         return try await withCanonicalRunsLock {
             var rows = try await self.readCanonicalRuns()
-            guard let index = rows.firstIndex(where: { Self.objectString($0, "id") == completion.id }),
+            guard let index = rows.firstIndex(where: { $0.objectValue?["id"]?.stringValue == completion.id }),
                   case .object(var row) = rows[index] else {
                 throw BrowserOperationStoreError.runNotFound
             }
-            guard Self.objectString(rows[index], "requestDigest") == completion.requestDigest else {
+            guard rows[index].objectValue?["requestDigest"]?.stringValue == completion.requestDigest else {
                 throw BrowserOperationStoreError.conflictingIdempotencyKey
             }
-            let current = Self.objectString(rows[index], "status") ?? ""
-            if Self.terminalStatuses.contains(current) {
+            let current = rows[index].objectValue?["status"]?.stringValue ?? ""
+            let cancelPending = current == "canceled" && row["completedAt"] == nil
+            if Self.terminalStatuses.contains(current), !cancelPending {
                 return BrowserOperationCommandResult(run: Self.externalRun(rows[index]), didTransition: false)
             }
-            guard current == "running" || current == "waiting_approval" else {
+            guard current == "running" || current == "waiting_approval" || cancelPending else {
                 throw BrowserOperationStoreError.invalidTransition
             }
 
-            row["status"] = .string(completion.state.rawValue)
+            let state: BrowserOperationTerminalState = cancelPending ? .canceled : completion.state
+            row["status"] = .string(state.rawValue)
             row["opened"] = .bool(completion.opened)
             row["sourceReceipt"] = completion.sourceReceipt
             row["screenshotReceipt"] = completion.screenshotReceipt
             if case .object(let receipt) = completion.sourceReceipt,
                receipt["outcomeKind"] == .string("outcome_unknown") {
                 row["outcomeKind"] = .string("outcome_unknown")
+                if !completion.opened { row["opened"] = .null }
             }
             row["updatedAt"] = .string(timestamp)
             row["completedAt"] = .string(timestamp)
             row["verificationStatus"] = .string(
-                completion.state == .succeeded && completion.opened ? "satisfied"
-                    : completion.state == .failed ? "failed" : "not_required"
+                state == .succeeded && completion.opened ? "satisfied"
+                    : state == .failed ? "failed" : "not_required"
             )
-            if completion.state == .canceled {
+            if state == .canceled {
                 row["canceledAt"] = .string(timestamp)
             } else if completion.state == .denied {
                 row["deniedAt"] = .string(timestamp)
             }
             row.removeValue(forKey: "deadlineAt")
-            Self.stageProjection(on: &row, status: completion.state.rawValue, at: timestamp)
+            try Self.stageProjection(on: &row, status: state.rawValue, at: timestamp)
             rows[index] = .object(row)
-            try await self.persistence.writeJSON(.array(rows), to: self.runsPath)
+            try await SwiftNativePersistenceCore.writeJSON(.array(rows), to: self.runsPath)
             return BrowserOperationCommandResult(run: Self.externalRun(rows[index]), didTransition: true)
         }
     }
@@ -292,9 +306,9 @@ extension SwiftNativeBrowserClient {
             var rows = try await self.readCanonicalRuns()
             let index = rows.firstIndex { candidate in
                 let identityMatches = normalized == nil || normalized?.isEmpty == true
-                    || Self.objectString(candidate, "id") == normalized
+                    || candidate.objectValue?["id"]?.stringValue == normalized
                 guard identityMatches else { return false }
-                let status = Self.objectString(candidate, "status") ?? ""
+                let status = candidate.objectValue?["status"]?.stringValue ?? ""
                 return status == "running" || status == "waiting_approval" || status == "dry_run"
             }
             guard let index, case .object(var row) = rows[index] else {
@@ -305,16 +319,21 @@ extension SwiftNativeBrowserClient {
                 ])
                 return BrowserOperationCommandResult(run: notFound, didTransition: false)
             }
+            let executing = rows[index].objectValue?["status"]?.stringValue == "running"
             row["status"] = .string("canceled")
-            row["opened"] = .bool(false)
             row["canceledAt"] = .string(timestamp)
-            row["completedAt"] = .string(timestamp)
             row["updatedAt"] = .string(timestamp)
             row["verificationStatus"] = .string("not_required")
             row.removeValue(forKey: "deadlineAt")
-            Self.stageProjection(on: &row, status: "canceled", at: timestamp)
+            // An executing owner still owes its evidence and one terminal
+            // projection. A request cannot claim that nothing opened.
+            if executing { row["opened"] = .null }
+            if !executing {
+                row["completedAt"] = .string(timestamp)
+                try Self.stageProjection(on: &row, status: "canceled", at: timestamp)
+            }
             rows[index] = .object(row)
-            try await self.persistence.writeJSON(.array(rows), to: self.runsPath)
+            try await SwiftNativePersistenceCore.writeJSON(.array(rows), to: self.runsPath)
             return BrowserOperationCommandResult(run: Self.externalRun(rows[index]), didTransition: true)
         }
     }
@@ -331,23 +350,25 @@ extension SwiftNativeBrowserClient {
                 // WebKit task can survive it. Any persisted running row is
                 // therefore stranded even when its wall-clock deadline has not
                 // elapsed. Never reopen an outcome-unknown external effect.
-                guard Self.objectString(rows[index], "status") == "running",
+                let status = rows[index].objectValue?["status"]?.stringValue
+                guard status == "running" || (status == "canceled" && rows[index].objectValue?["completedAt"]?.stringValue == nil),
                       case .object(var row) = rows[index] else { continue }
-                row["status"] = .string("failed")
-                row["opened"] = .bool(false)
+                let terminal = status == "canceled" ? "canceled" : "failed"
+                row["status"] = .string(terminal)
+                row["opened"] = .null
                 row["errorCode"] = .string("restart_stranded_running")
                 row["outcomeKind"] = .string("outcome_unknown")
                 row["verificationStatus"] = .string("failed")
                 row["completedAt"] = .string(timestamp)
                 row["updatedAt"] = .string(timestamp)
                 row.removeValue(forKey: "deadlineAt")
-                Self.stageProjection(on: &row, status: "failed", at: timestamp)
+                try Self.stageProjection(on: &row, status: terminal, at: timestamp)
                 rows[index] = .object(row)
                 last = rows[index]
                 recovered += 1
             }
             if recovered > 0 {
-                try await self.persistence.writeJSON(.array(rows), to: self.runsPath)
+                try await SwiftNativePersistenceCore.writeJSON(.array(rows), to: self.runsPath)
             }
             return BrowserOperationCommandResult(
                 run: last.map(Self.externalRun),
@@ -358,133 +379,95 @@ extension SwiftNativeBrowserClient {
     }
 
     /// Resumes receipt/trace projection from canonical pending transition IDs.
-    /// Each target is de-duplicated under its own file lock before the owner row
-    /// is marked projected, closing the append-before-checkpoint crash window.
+    /// Feeds and traces land before one checkpoint removes only the captured IDs.
     private func projectPendingBrowserReceipts() async throws {
-        let pending: [BrowserPendingProjection] = try await withCanonicalRunsLock {
+        let pending: [PendingBrowserReceipt] = try await withCanonicalRunsLock {
             try await self.readCanonicalRuns().flatMap(Self.pendingProjections)
         }
-        for projection in pending {
-            let projectionID = projection.projectionID
-            let publicRun = projection.publicRun
-            let status = Self.objectString(publicRun, "status") ?? "unknown"
-            let createdAt = Self.objectString(publicRun, "createdAt") ?? Self.nowISO(now())
-            let runID = projection.runID
-            let domain = Self.objectString(publicRun, "domain") ?? "browser"
-            let url = Self.objectString(publicRun, "url") ?? ""
-            let dryRun = Self.objectBool(publicRun, "dryRun") ?? false
-            let approvalID = Self.objectString(publicRun, "approvalId")
-
-            var browserReceipt = Self.objectValue(publicRun)
-            browserReceipt["transitionId"] = .string(projectionID)
-            try await appendDerivedOnce(
-                .object(browserReceipt), projectionID: projectionID,
-                to: receiptsPath, label: "Browser.receipts"
-            )
-
-            let nativeReceipt: JSONValue = .object([
-                "id": .string(runID),
-                "transitionId": .string(projectionID),
-                "actionId": .string("browser.open_url"),
-                "name": .string("Visible Browser URL"),
-                "kind": .string("browser"),
-                "status": .string(status),
-                "dryRun": .bool(dryRun),
-                "approvalId": approvalID.map(JSONValue.string) ?? .null,
-                "output": publicRun,
-                "createdAt": .string(createdAt),
+        guard !pending.isEmpty else { return }
+        try await appendDerivedOnce(pending, to: receiptsPath, label: "Browser.receipts") { projection in
+            var receipt = (projection.publicRun.objectValue ?? [:])
+            receipt["transitionId"] = .string(projection.projectionID)
+            return .object(receipt)
+        }
+        try await appendDerivedOnce(pending, to: nativeActionsReceiptsPath, label: "Browser.actionReceipts") { projection in
+            let run = projection.publicRun
+            return .object([
+                "id": .string(projection.runID), "transitionId": .string(projection.projectionID),
+                "actionId": .string("browser.open_url"), "name": .string("Visible Browser URL"),
+                "kind": .string("browser"), "status": .string(run.objectValue?["status"]?.stringValue ?? "unknown"),
+                "dryRun": .bool(run.objectValue?["dryRun"]?.boolValue ?? false),
+                "approvalId": run.objectValue?["approvalId"]?.stringValue.map(JSONValue.string) ?? .null,
+                "output": run, "createdAt": .string(run.objectValue?["createdAt"]?.stringValue ?? Self.nowISO(self.now())),
             ])
-            try await appendDerivedOnce(
-                nativeReceipt, projectionID: projectionID,
-                to: nativeActionsReceiptsPath, label: "Browser.actionReceipts"
-            )
+        }
+        for projection in pending {
+            let publicRun = projection.publicRun
+            let status = publicRun.objectValue?["status"]?.stringValue ?? "unknown"
+            let createdAt = publicRun.objectValue?["createdAt"]?.stringValue ?? Self.nowISO(now())
+            let domain = publicRun.objectValue?["domain"]?.stringValue ?? "browser"
+            let url = publicRun.objectValue?["url"]?.stringValue ?? ""
+            let dryRun = publicRun.objectValue?["dryRun"]?.boolValue ?? false
 
-            let trace: JSONValue = .object([
-                "id": .string(projectionID),
-                "transitionId": .string(projectionID),
-                "kind": .string("browser.action"),
-                "title": .string(domain),
-                "status": .string(status),
-                "payload": .object([
+            try await TurnTracePersistLane(standalonePath: tracesPath).appendChecked(
+                TurnTraceEvent(kind: "browser.action", title: domain, status: status, payload: .object([
                     "url": .string(url),
                     "status": .string(status),
                     "dryRun": .bool(dryRun),
-                ]),
-                "createdAt": .string(createdAt),
-            ])
-            try await appendDerivedOnce(
-                trace, projectionID: projectionID,
-                to: tracesPath, label: "Browser.trace",
-                maxLines: JSONLLineCaps.traceEvents
-            )
-
-            try await withCanonicalRunsLock {
-                var rows = try await self.readCanonicalRuns()
-                guard let index = rows.firstIndex(where: {
-                    Self.objectString($0, "id") == runID
-                }), case .object(var object) = rows[index] else { return }
-                if case .array(let entries)? = object["projectionOutbox"] {
-                    let remaining = entries.filter {
-                        Self.objectString($0, "id") != projectionID
-                    }
-                    if remaining.isEmpty {
-                        object.removeValue(forKey: "projectionOutbox")
-                        object["projectionState"] = .string("projected")
-                        object["projectionId"] = .string(projectionID)
-                    } else {
-                        object["projectionOutbox"] = .array(remaining)
-                        object["projectionState"] = .string("pending")
-                        object["projectionId"] = Self.objectString(
-                            remaining.last ?? .null, "id"
-                        ).map(JSONValue.string) ?? .null
-                        object.removeValue(forKey: "projectedAt")
-                    }
-                } else {
-                    // Compatibility recovery for a pending row written by the
-                    // first single-slot implementation.
-                    guard Self.objectString(rows[index], "projectionState") == "pending",
-                          Self.objectString(rows[index], "projectionId") == projectionID else { return }
-                    object["projectionState"] = .string("projected")
-                }
+                ]), id: projection.projectionID, createdAt: createdAt), transitionId: projection.projectionID)
+        }
+        let projected = Set(pending.map(\.projectionID))
+        try await withCanonicalRunsLock {
+            var rows = try await self.readCanonicalRuns()
+            for index in rows.indices {
+                guard case .object(var object) = rows[index],
+                      case .array(let entries)? = object["projectionOutbox"] else { continue }
+                let remaining = entries.filter { !projected.contains($0.objectValue?["id"]?.stringValue ?? "") }
+                guard remaining.count != entries.count else { continue }
+                if remaining.isEmpty { object.removeValue(forKey: "projectionOutbox") }
+                else { object["projectionOutbox"] = .array(remaining) }
                 rows[index] = .object(object)
-                try await self.persistence.writeJSON(.array(rows), to: self.runsPath)
             }
+            try await SwiftNativePersistenceCore.writeJSON(.array(rows), to: self.runsPath)
         }
     }
 
     private func appendDerivedOnce(
-        _ value: JSONValue,
-        projectionID: String,
+        _ pending: [PendingBrowserReceipt],
         to path: URL,
         label: String,
-        maxLines: Int = JSONLLineCaps.actionReceipts
+        value: @escaping @Sendable (PendingBrowserReceipt) -> JSONValue
     ) async throws {
+        guard !pending.isEmpty else { return }
         let work: @Sendable () async throws -> Void = {
-            let existing = (try? await self.persistence.tailJSONL(
-                path, limit: maxLines, maxBytes: nil
-            )) ?? []
-            guard !existing.contains(where: {
-                Self.objectString($0, "transitionId") == projectionID
-            }) else { return }
-            try await appendPathOwnedJSONL(
-                value, to: path, using: self.persistence,
-                logLabel: label, takeLock: false
+            // A missing feed is empty; unreadable or malformed evidence cannot
+            // establish that an append-before-checkpoint transition is absent.
+            let read = try await SwiftNativePersistenceCore.tailJSONLReadReceipt(
+                path, limit: JSONLLineCaps.actionReceipts, maxBytes: nil
             )
+            guard read.malformedJSONRowCount == 0, !read.truncatedToByteWindow,
+                  read.rows.allSatisfy({ if case .object = $0 { return true }; return false }),
+                  read.physicalRowsScanned > 0 || read.bytesRead == 0 else {
+                throw PersistenceCoreError.ioFailure("Browser projection cannot deduplicate \(path.path): its receipt feed is malformed or incomplete; existing bytes retained.")
+            }
+            var seen = Set(read.rows.compactMap { $0.objectValue?["transitionId"]?.stringValue })
+            for projection in pending where !seen.contains(projection.projectionID) {
+                try await appendPathOwnedJSONL(value(projection), to: path, logLabel: label)
+                seen.insert(projection.projectionID)
+            }
         }
-        // Every persistence conformer uses the same path lock.
-        try await persistence.withFileLock(path, work)
+        try await SwiftNativePersistenceCore.withFileLock(path, work)
     }
 
     private func readCanonicalRuns() async throws -> [JSONValue] {
-        try await Self.readCanonicalRuns(at: runsPath, using: persistence)
+        try await Self.readCanonicalRuns(at: runsPath)
     }
 
     static func readCanonicalRuns(
-        at runsPath: URL, using persistence: any PersistenceCoreProtocol,
-        malformed: any Error = BrowserOperationStoreError.corruptRunsDocument
+        at runsPath: URL, malformed: any Error = BrowserOperationStoreError.corruptRunsDocument
     ) async throws -> [JSONValue] {
         guard FileManager.default.fileExists(atPath: runsPath.path) else { return [] }
-        let raw = try await persistence.readJSON(runsPath, ifMissing: .null)
+        let raw = try await SwiftNativePersistenceCore.readJSON(runsPath, ifMissing: .null)
         guard case .array(let rows) = raw,
               rows.allSatisfy({
                   if case .object(let row) = $0, case .string? = row["status"] { return true }
@@ -492,14 +475,32 @@ extension SwiftNativeBrowserClient {
               }) else {
             throw malformed
         }
-        return rows
+        for case .object(let row) in rows {
+            // Missing counters belong to pre-counter rows. Present metadata
+            // must leave room for the next transition; preserve bad bytes.
+            guard let value = row["transitionSequence"] else { continue }
+            guard case .int(let sequence) = value, sequence >= 0, sequence < Int64.max else {
+                throw BrowserOperationStoreError.invalidTransitionMetadata(
+                    runID: row["id"]?.stringValue ?? "<missing id>")
+            }
+        }
+        return rows.map { value in
+            guard case .object(var row) = value else { return value }
+            if row["projectionOutbox"] == nil, value.objectValue?["projectionState"]?.stringValue == "pending",
+               let id = value.objectValue?["projectionId"]?.stringValue {
+                row["projectionOutbox"] = .array([.object(["id": .string(id), "run": externalRun(value)])])
+            }
+            for key in ["projectionId", "projectionState", "projectedAt"] { row.removeValue(forKey: key) }
+            return .object(row)
+        }
     }
 
     package static func terminalRun(id: String, at path: URL) async throws -> JSONValue? {
         guard !id.isEmpty else { return nil }
-        let rows = try await readCanonicalRuns(at: path, using: SwiftNativePersistenceCore())
-        guard let row = rows.first(where: { objectString($0, "id") == id }),
-              let status = objectString(row, "status"), terminalStatuses.contains(status) else { return nil }
+        let rows = try await readCanonicalRuns(at: path)
+        guard let row = rows.first(where: { $0.objectValue?["id"]?.stringValue == id }),
+              let status = row.objectValue?["status"]?.stringValue, terminalStatuses.contains(status),
+              status != "canceled" || row.objectValue?["completedAt"]?.stringValue != nil else { return nil }
         return row
     }
 
@@ -507,7 +508,7 @@ extension SwiftNativeBrowserClient {
         _ operation: @Sendable () async throws -> T
     ) async throws -> T {
         // Every persistence conformer uses the same path lock.
-        return try await persistence.withFileLock(runsPath, operation)
+        return try await SwiftNativePersistenceCore.withFileLock(runsPath, operation)
     }
 
     private static let terminalStatuses: Set<String> = [
@@ -521,11 +522,18 @@ extension SwiftNativeBrowserClient {
 
     private static func stageProjection(
         on row: inout [String: JSONValue], status: String, at timestamp: String
-    ) {
-        let runID = objectString(.object(row), "id") ?? "browser"
+    ) throws {
+        let runID = row["id"]?.stringValue ?? "browser"
         let sequence: Int64
-        if case .int(let previous)? = row["transitionSequence"] {
-            sequence = previous + 1
+        if let value = row["transitionSequence"] {
+            guard case .int(let previous) = value, previous >= 0 else {
+                throw BrowserOperationStoreError.invalidTransitionMetadata(runID: runID)
+            }
+            let (next, overflow) = previous.addingReportingOverflow(1)
+            guard !overflow, next < Int64.max else {
+                throw BrowserOperationStoreError.invalidTransitionMetadata(runID: runID)
+            }
+            sequence = next
         } else {
             sequence = 1
         }
@@ -548,33 +556,24 @@ extension SwiftNativeBrowserClient {
             "run": snapshot,
         ]))
         row["projectionOutbox"] = .array(outbox)
-        row["projectionId"] = .string(projectionID)
-        row["projectionState"] = .string("pending")
-        row.removeValue(forKey: "projectedAt")
     }
 
-    private static func pendingProjections(_ row: JSONValue) -> [BrowserPendingProjection] {
-        let runID = objectString(row, "id") ?? "browser"
+    private static func pendingProjections(_ row: JSONValue) -> [PendingBrowserReceipt] {
+        let runID = row.objectValue?["id"]?.stringValue ?? "browser"
         if case .object(let object) = row,
            case .array(let outbox)? = object["projectionOutbox"] {
             return outbox.compactMap { entry in
-                guard let id = objectString(entry, "id"),
+                guard let id = entry.objectValue?["id"]?.stringValue,
                       case .object(let fields) = entry,
                       let snapshot = fields["run"] else { return nil }
-                return BrowserPendingProjection(
+                return PendingBrowserReceipt(
                     runID: runID,
                     projectionID: id,
                     publicRun: externalRun(snapshot)
                 )
             }
         }
-        guard objectString(row, "projectionState") == "pending",
-              let id = objectString(row, "projectionId") else { return [] }
-        return [BrowserPendingProjection(
-            runID: runID,
-            projectionID: id,
-            publicRun: externalRun(row)
-        )]
+        return []
     }
 
     private static func prunedCanonicalRuns(_ rows: [JSONValue]) throws -> [JSONValue] {
@@ -583,8 +582,9 @@ extension SwiftNativeBrowserClient {
         var retained: [JSONValue] = []
         retained.reserveCapacity(min(rows.count, 200))
         for row in rows {
-            let status = objectString(row, "status") ?? ""
+            let status = row.objectValue?["status"]?.stringValue ?? ""
             let isEvictable = evictableStatuses.contains(status)
+                && (status != "canceled" || row.objectValue?["completedAt"]?.stringValue != nil)
             let hasPendingProjection = !pendingProjections(row).isEmpty
             if overflow > 0, isEvictable, !hasPendingProjection {
                 overflow -= 1
@@ -597,30 +597,13 @@ extension SwiftNativeBrowserClient {
     }
 
     private static func externalRun(_ value: JSONValue) -> JSONValue {
-        var object = objectValue(value)
+        var object = (value.objectValue ?? [:])
         object.removeValue(forKey: "projectionState")
         object.removeValue(forKey: "projectionId")
         object.removeValue(forKey: "projectedAt")
         object.removeValue(forKey: "transitionSequence")
         object.removeValue(forKey: "projectionOutbox")
         return .object(object)
-    }
-
-    private static func objectValue(_ value: JSONValue) -> [String: JSONValue] {
-        guard case .object(let object) = value else { return [:] }
-        return object
-    }
-
-    static func objectString(_ value: JSONValue, _ key: String) -> String? {
-        guard case .object(let object) = value,
-              case .string(let string)? = object[key] else { return nil }
-        return string
-    }
-
-    private static func objectBool(_ value: JSONValue, _ key: String) -> Bool? {
-        guard case .object(let object) = value,
-              case .bool(let bool)? = object[key] else { return nil }
-        return bool
     }
 
 }

@@ -1,48 +1,11 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `StudioCanon.swift` | Append-only membership, evidence-bound proposal references and unchanged native identity/fingerprints (fixed 90-day silence ledger units); editable `Resources/abilities/studio-canon.js` owns proposal selection/reasons and the next silence deadline; native counts/entry ids cannot be supplied by the part, native capacity and agent-only decision/append authority remain |
 
-// MARK: - The museum's canon — desk 903 phase 4
-//
-// Her brief, verbatim: "Museum/canon — earned by recurrence, not the calendar.
-// A work is proposed when N later entries deepen/echo it or it is pulled in
-// production; evidence is the graph. Proposal/approval shape kept; Agent is the
-// SOLE approver ('my taste, not User's to sign off'). Demotion proposals for
-// canon that goes silent. No auto-canonization."
-//
-// ── WHAT THIS FILE IS, AND IS NOT ────────────────────────────────────────────
-// It is the LAW and the LEDGER, and nothing else:
-//   • `StudioCanonLaw` exports neutral facts to studio-canon.js and binds its
-//     proposal references back to native evidence. Identity and membership
-//     stay here; selection, reasons and the next silence deadline are hers.
-//     Neither the part nor this adapter can append a canon decision.
-//   • `canon.jsonl` — append-only promote/demote rows, each naming the evidence
-//     entry ids that argued for it and WHO decided. A demotion does not erase a
-//     promotion; both rows stay, so the canon's own history reads as the record
-//     of a mind changing, which is the same promise the journal makes.
-//
-// It is NOT a score. Recurrence is a COUNT of distinct later entries that
-// deepened or echoed a work — a fact about how often she came back — never a
-// ranking of one work against another. Two works that both cross the threshold
-// are both proposed; nothing sorts them.
-//
-// ── WHY RECURRENCE, AND WHY A PULL ───────────────────────────────────────────
-// Two independent doors, either of which is enough:
-//   1. RECURRENCE — the seed's threshold of distinct later entries linking back to
-//      the work with `deepens` or `echoes`. Not `revises` and not
-//      `contradicts`: those are her arguing with an earlier judgment, and an
-//      argument is not evidence that a work has become load-bearing.
-//   2. PULLED IN PRODUCTION — the pointer was actually used in a live judgment.
-//      This is the phase-5 success metric turned into canon evidence: "never
-//      called in production means pull failed", so a work that IS called has
-//      proved the opposite about itself.
-//
-// ── AND WHY SILENCE DEMOTES ──────────────────────────────────────────────────
-// A canon that only ever grows is a favourites list with extra steps. If
-// nothing has been written about a canon work and nothing has pulled it for
-// the seed's silence window, that is a PROPOSAL to demote — never a demotion. She may
-// look at it and say it still holds.
+// Native storage owns canon identity, membership, evidence and the append-only decision ledger.
+// studio-canon.js owns proposal selection, reasons and silence deadlines; proposals never decide membership.
 
 // MARK: - Vocabulary
 
@@ -216,8 +179,7 @@ public struct StudioCanonWorkEvidence: Sendable, Equatable {
     /// Distinct LATER journal entries whose `deepens`/`echoes` relation resolves
     /// to this work. Ids, not a count, so the proposal can cite them.
     public var recurrenceEntryIDs: [String]
-    /// How many times a `studio_recall` pull actually returned this work in a
-    /// live turn. The phase-5 metric, reused as evidence.
+    /// Live-turn studio_recall pulls that returned this work; evidence, not a preference score.
     public var recallHits: Int
     /// The most recent thing that touched this work at all: a new entry about
     /// it, or a pull of it. Empty means "nothing recorded", which never demotes.
@@ -431,14 +393,7 @@ public enum StudioCanonLaw {
 
 // MARK: - Who may decide
 
-/// SHE IS THE SOLE APPROVER. This is the inversion of every other card in the
-/// app: elsewhere the owner decides and the agent proposes; here the agent
-/// decides and the owner may not.
-///
-/// Her line: "my taste, not User's to sign off." So the seat check is not a
-/// courtesy — a canon row carrying an owner seat is refused and nothing is
-/// written. User can still see the card, argue about it in chat, and watch what
-/// she does with it; he cannot resolve it into her museum.
+/// Only the agent's live tool turn may decide canon membership; the owner cannot approve it.
 public enum StudioCanonSeat {
     /// The only seat a canon row may carry: her own tool lane, reached when SHE
     /// calls `studio_canon_resolve` during a turn.
@@ -449,14 +404,7 @@ public enum StudioCanonSeat {
     }
 }
 
-/// WHERE a canon decision was made, derived from the running turn.
-///
-/// The seat string alone was never enough: any dispatch path — the Claude
-/// bridge's `/claude/tool` runner, an approval executor, a replay — could call
-/// a tool that stamped it. So the seat is now composed of two halves that a
-/// caller cannot supply: this value, which only the tool lane can obtain from
-/// the live turn's own task-locals, and the agent seat above. The store refuses
-/// a row missing either.
+/// Decision surface and identity come from live turn task-locals, never caller-supplied provenance.
 public struct StudioCanonTurnProvenance: Sendable, Equatable {
     /// The surface the LIVE turn is running on, as the tool loop bound it.
     public let surface: String
@@ -494,11 +442,11 @@ public extension SwiftNativeStudioStore {
 
     /// Every decided row, in file order. Missing file is an empty canon.
     func readCanon() async throws -> [StudioCanonRow] {
-        try await Self.readCanon(at: canonPath, using: persistence)
+        try await Self.readCanon(at: canonPath)
     }
 
-    private static func readCanon(at path: URL, using core: any PersistenceCoreProtocol) async throws -> [StudioCanonRow] {
-        let (rows, report) = try await core.readJSONLReporting(path)
+    private static func readCanon(at path: URL) async throws -> [StudioCanonRow] {
+        let (rows, report) = try await SwiftNativePersistenceCore.readJSONLReporting(path)
         let decoded = rows.compactMap { StudioCanonRow.fromJSON($0) }
         guard report.malformedLineCount == 0, !report.trailingPartialLine,
               decoded.count == rows.count else {
@@ -536,19 +484,14 @@ public extension SwiftNativeStudioStore {
         try FileManager.default.createDirectory(
             at: canonDirectory, withIntermediateDirectories: true
         )
-        // ONE transaction. The proposal-id check and the append have to be
-        // atomic against a concurrent writer, or two racing replays both read
-        // "no row yet" and both append — the exact lost-update shape the desk
-        // stores learned the hard way. `readJSONL` takes no lock of its own, so
-        // the read is safe inside the flock and the append takes none.
+        // Proposal-id deduplication and append share one flock, including replayed decisions.
         let path = canonPath
-        let core = persistence
         let payload = row.toJSON()
         let proposalID = row.proposalID
         let label = Self.logLabel
-        let appended = try await core.withFileLock(path) { () async throws -> Bool in
+        let appended = try await SwiftNativePersistenceCore.withFileLock(path) { () async throws -> Bool in
             let existing: [StudioCanonRow]
-            do { existing = try await Self.readCanon(at: path, using: core) }
+            do { existing = try await Self.readCanon(at: path) }
             catch {
                 nativeLog("[StudioCanon] Append deferred: %@", error.localizedDescription)
                 throw error
@@ -557,9 +500,7 @@ public extension SwiftNativeStudioStore {
             try await appendPathOwnedJSONL(
                 payload,
                 to: path,
-                using: core,
                 logLabel: label,
-                takeLock: false,
                 durable: true
             )
             return true
@@ -576,32 +517,26 @@ public extension SwiftNativeStudioStore {
 
     // MARK: Production pulls
 
-    /// Note that a `studio_recall` actually RETURNED these works during a live
-    /// turn. This is the "pulled in production" evidence door, and it is the
-    /// only counter in the whole studio.
-    ///
-    /// It counts PULLS, not preference: there is no ordering, no decay, and
-    /// nothing reads it except the canon law's threshold test. Bounded to
-    /// `maximumTrackedWorks` keys, evicting the least recently pulled, so a
-    /// noisy month cannot grow a file without end.
+    /// Count works actually returned by live-turn recall as native evidence for the editable canon policy.
+    /// Bound to maximumTrackedWorks keys by evicting the least recently pulled; no preference or decay.
     func noteRecallPulls(
         titles: [(title: String, creator: String?)],
         now: Date = Date(),
         maximumTrackedWorks: Int = 256
     ) async {
-        guard !titles.isEmpty else { return }
+        guard !titles.isEmpty, maximumTrackedWorks > 0 else { return }
         let stamp = NativeTimestampFormat.sixDigitUTCOffset(now)
         try? FileManager.default.createDirectory(
             at: canonDirectory, withIntermediateDirectories: true
         )
         let path = canonRecallHitsPath
-        let core = persistence
-        _ = try? await core.withFileLock(path) {
-            let current = try await core.readJSON(path, ifMissing: .object([:]))
+        do { try await SwiftNativePersistenceCore.withFileLock(path) {
+            let current = try await SwiftNativePersistenceCore.readJSON(path, ifMissing: .object([:]))
             var table: [String: JSONValue] = [:]
             if case .object(let obj) = current, case .object(let works)? = obj["works"] {
                 table = works
             }
+            _ = try Self.checkedRecallCounts(current)
             var seen = Set<String>()
             for entry in titles {
                 let cleaned = entry.title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -612,8 +547,10 @@ public extension SwiftNativeStudioStore {
                 if case .object(let row)? = table[key], case .int(let existing)? = row["count"] {
                     count = existing
                 }
+                let (next, overflow) = count.addingReportingOverflow(1)
+                guard !overflow else { throw StudioCanonError.unavailableRecallCounts }
                 let row: [String: JSONValue] = [
-                    "count": .int(count + 1),
+                    "count": .int(next),
                     "last_at": .string(stamp),
                 ]
                 table[key] = .object(row)
@@ -634,26 +571,33 @@ public extension SwiftNativeStudioStore {
                     uniqueKeysWithValues: ordered.prefix(maximumTrackedWorks).map { ($0.key, $0.value) }
                 )
             }
-            try await core.writeJSON(
+            try await SwiftNativePersistenceCore.writeJSON(
                 .object(["works": .object(table)]),
                 to: path
             )
+        } } catch {
+            nativeLog("[StudioCanon] Recall counting unavailable: %@", error.localizedDescription)
         }
     }
 
     /// The counter, read back as `workKey → (count, lastAt)`.
     func recallPullCounts() async throws -> [String: (count: Int, lastAt: String)] {
-        let value = try await persistence.readJSON(canonRecallHitsPath, ifMissing: .object([:]))
-        guard case .object(let obj) = value, case .object(let works)? = obj["works"] else {
-            return [:]
-        }
+        let value = try await SwiftNativePersistenceCore.readJSON(canonRecallHitsPath, ifMissing: .object([:]))
+        return try Self.checkedRecallCounts(value)
+    }
+
+    private static func checkedRecallCounts(_ value: JSONValue) throws -> [String: (count: Int, lastAt: String)] {
+        guard case .object(let obj) = value else { throw StudioCanonError.unavailableRecallCounts }
+        if obj.isEmpty { return [:] } // A missing counter has no pulls yet.
+        guard case .object(let works)? = obj["works"] else { throw StudioCanonError.unavailableRecallCounts }
         var result: [String: (count: Int, lastAt: String)] = [:]
         for (key, row) in works {
-            guard case .object(let fields) = row else { continue }
-            var count = 0
-            if case .int(let value)? = fields["count"] { count = Int(value) }
-            var lastAt = ""
-            if case .string(let value)? = fields["last_at"] { lastAt = value }
+            guard case .object(let fields) = row,
+                  case .int(let value)? = fields["count"], value >= 0,
+                  let count = Int(exactly: value),
+                  case .string(let lastAt)? = fields["last_at"] else {
+                throw StudioCanonError.unavailableRecallCounts
+            }
             result[key] = (count, lastAt)
         }
         return result
@@ -669,9 +613,12 @@ public enum StudioCanonError: Error, LocalizedError, Sendable, Equatable {
     case missingWorkTitle
     case unknownProposal(String)
     case unreadableHistory
+    case unavailableRecallCounts
 
     public var errorDescription: String? {
         switch self {
+        case .unavailableRecallCounts:
+            return "studio canon: recall counts are invalid or exhausted; counting is unavailable and stored bytes were preserved."
         case .approvalNotFromAgentSeat(let seat):
             return "studio canon: '\(seat)' is not the agent seat. The canon is hers to tend — "
                 + "only she may promote or demote a work, through studio_canon_resolve. "

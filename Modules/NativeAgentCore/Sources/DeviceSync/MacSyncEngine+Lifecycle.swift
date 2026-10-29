@@ -1,9 +1,3 @@
-// PATCH-2026-05-07: ios-sync MacSyncEngine — SnapshotWriter + InboxWatcher (Mac side)
-// SnapshotWriter: source mutations write app-owned Swift runtime state to iCloud Drive `snapshots/`.
-//   Touches KVS key `snapshot_updated` so iOS observes immediately.
-// InboxWatcher: NSMetadataQuery on `inbox/`. When iOS drops an action JSON, dispatch to
-//   the in-process Swift runtime, write response to `responses/<msg_id>.json`, touch KVS `inbox_response_<msg_id>`.
-
 import BackgroundLoops
 import CommonCrypto
 import CryptoKit
@@ -15,7 +9,7 @@ import NativeAgentShared
 import NativeAgentCore
 import MemoryV2
 import PersistenceCore
-// Blueprint: | `MacSyncEngine+Lifecycle.swift` | `MacSyncEngine`: `startCloudKitSnapshotProjection`, `start`, `stop`; saved connector setup changes and receipt-ledger health edges rebuild the heavy snapshots, so the phone follows health changes without rebuilding for repeated healthy receipts |
+// Blueprint: | `MacSyncEngine+Lifecycle.swift` | `MacSyncEngine`: `start`, `stop`; the selected transport supplies roots and ingress to one snapshot lifecycle; saved connector setup changes and receipt-ledger health edges rebuild the heavy snapshots |
 
 extension MacSyncEngine {
     /// A repair attempt uses the mounted writer and transport; its next health
@@ -68,16 +62,12 @@ extension MacSyncEngine {
 
     // MARK: - Start
 
-    /// Public Developer ID builds carry CloudKit but cannot carry the
-    /// Mac-App-Store-only CloudDocuments entitlement. Keep producing the exact
-    /// same bounded snapshot files in a local rebuildable cache; iCloudBridge
-    /// publishes those bytes through NAStatus after each owner-driven write.
+    /// Drive supplies its Documents root; CloudKit uses a local snapshot cache.
     /// Nil when it started (or was superseded); otherwise why it did not.
-    /// Readiness is the first publication's result, handed to the bridge.
     @discardableResult
-    func startCloudKitSnapshotProjection() async -> String? {
+    func start(docsURL driveDocsURL: URL? = nil) async -> String? {
         guard !Task.isCancelled else { return nil }
-        let docsURL = PersistenceCore.defaultDataRoot()
+        let docsURL = driveDocsURL ?? PersistenceCore.defaultDataRoot()
             .appendingPathComponent("mobile_snapshot_cache", isDirectory: true)
         if isActive, activeDocsURL == docsURL {
             return nil
@@ -88,84 +78,36 @@ extension MacSyncEngine {
         snapshotLifecycleGeneration &+= 1
         let generation = snapshotLifecycleGeneration
         activeDocsURL = docsURL
-        guard await restoreState(generation: generation) else { return nil }
-        snapshotDir = docsURL.appendingPathComponent(Folder.snapshots, isDirectory: true)
-        inboxDir = nil
-        responsesDir = docsURL.appendingPathComponent(Folder.responses, isDirectory: true)
-        transactionDir = docsURL.appendingPathComponent(Folder.transactions, isDirectory: true)
-        let directories = [snapshotDir, responsesDir, transactionDir].compactMap({ $0 })
-        if let failure = await createDirectories(directories, generation: generation) { return failure }
-        guard generation == snapshotLifecycleGeneration else { return nil }
-        isActive = true
-        await startArchiveRetentionWatcher()
-        guard generation == snapshotLifecycleGeneration, isActive else { return nil }
-        reconcileArchiveRetention(pruneFirst: true)
-        await startSnapshotIntegrityFallback()
-        guard generation == snapshotLifecycleGeneration, isActive else { return nil }
-        startPresenceBeat()
-        startCognitionSnapshotObservation()
-        await startSchedulerSnapshotObservation()
-        await startHelpersSnapshotObservation()
-        await startConnectorsSnapshotObservation()
-        guard generation == snapshotLifecycleGeneration, isActive else { return nil }
-        startWorkActivityObservation()
-        startLiveTurnRelay()
-        startChatTranscriptSnapshotObservation()
-        await writeSnapshots(forceHeavy: true)
-        if generation == snapshotLifecycleGeneration, isActive, let snapshotDir {
-            let failures = await sync.bridge.publishMobileSnapshotStatus(
-                groups: Set(NAMobileSnapshotGroup.allCases),
-                snapshotDirectory: snapshotDir,
-                shouldPublish: { self.snapshotLifecycleGeneration == generation && self.isActive }
-            )
-            guard generation == snapshotLifecycleGeneration, isActive else { return nil }
-            sync.bridge.notePublication(failures)
-            // One integrity pass on the fresh snapshot, then its 15-minute clock.
-            requestSnapshotIntegrityPass(retrySkipped: true)
-        }
-        return nil
-    }
-
-    /// Nil when it started (or was superseded); otherwise why it did not.
-    @discardableResult
-    func start(docsURL: URL) async -> String? {
-        guard !Task.isCancelled else { return nil }
-        if isActive, activeDocsURL == docsURL {
-            return nil
-        }
-        if isActive {
-            stop()
-        }
-        snapshotLifecycleGeneration &+= 1
-        let generation = snapshotLifecycleGeneration
-        activeDocsURL = docsURL
-        inboxDir = docsURL.appendingPathComponent(Folder.inbox)
+        inboxDir = driveDocsURL?.appendingPathComponent(Folder.inbox)
         // Replay state must be restored before either inbox admits work.
         guard await restoreState(generation: generation) else { return nil }
-        let secret: Data
-        do {
-            if pairingSecretRotationInProgress { _ = try pairingSecret() }
-            let cached = _pairingSecret
-            let loaded = try await sync.storage.perform { try cached ?? PairingSecretManager.loadOrGenerateSecret() }
-            guard generation == snapshotLifecycleGeneration else { return nil }
-            if pairingSecretRotationInProgress { _ = try pairingSecret() }
-            secret = _pairingSecret ?? loaded
-            _pairingSecret = secret
-        } catch {
-            guard generation == snapshotLifecycleGeneration else { return nil }
-            syncError = "Snapshot pairing unavailable: \(error.localizedDescription)"
-            return syncError
+        snapshotDir = docsURL.appendingPathComponent(Folder.snapshots, isDirectory: true)
+        if driveDocsURL != nil {
+            let secret: Data
+            do {
+                if pairingSecretRotationInProgress { _ = try pairingSecret() }
+                let cached = _pairingSecret
+                let loaded = try await sync.storage.perform { try cached ?? PairingSecret.loadOrGenerateSecret() }
+                guard generation == snapshotLifecycleGeneration else { return nil }
+                if pairingSecretRotationInProgress { _ = try pairingSecret() }
+                secret = _pairingSecret ?? loaded
+                _pairingSecret = secret
+            } catch {
+                guard generation == snapshotLifecycleGeneration else { return nil }
+                syncError = "Snapshot pairing unavailable: \(error.localizedDescription)"
+                return syncError
+            }
+            // Same pairing fingerprint/path as the phone's cachedSnapshotDirectory.
+            // Unscoped snapshots are never copied into a new pairing.
+            let fingerprint = SHA256.hash(data: secret).prefix(8)
+                .map { String(format: "%02x", $0) }.joined()
+            snapshotDir = docsURL.appendingPathComponent(Folder.snapshots)
+                .appendingPathComponent("pairings", isDirectory: true)
+                .appendingPathComponent(fingerprint, isDirectory: true)
         }
-        // Same pairing fingerprint/path as the phone's cachedSnapshotDirectory.
-        // Unscoped legacy snapshots are never copied into a new pairing.
-        let fingerprint = SHA256.hash(data: secret).prefix(8)
-            .map { String(format: "%02x", $0) }.joined()
-        snapshotDir = docsURL.appendingPathComponent(Folder.snapshots)
-            .appendingPathComponent("pairings", isDirectory: true)
-            .appendingPathComponent(fingerprint, isDirectory: true)
         responsesDir = docsURL.appendingPathComponent(Folder.responses)
         transactionDir = docsURL.appendingPathComponent(Folder.transactions)
-        let inboxRejectedDir = docsURL.appendingPathComponent(Folder.inboxRejected)
+        let inboxRejectedDir = driveDocsURL?.appendingPathComponent(Folder.inboxRejected)
 
         let directories = [snapshotDir, inboxDir, inboxRejectedDir, responsesDir, transactionDir].compactMap({ $0 })
         if let failure = await createDirectories(directories, generation: generation) { return failure }
@@ -173,17 +115,23 @@ extension MacSyncEngine {
 
         isActive = true
 
-        // KVS observation for iOS-initiated inbox deposits
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(kvsDidChange(_:)),
-            name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
-            object: nil
-        )
-        Task.detached(priority: .utility) {
-            _ = await withCKTimeout("MacSyncEngine.start.kvsSynchronize") {
-                NSUbiquitousKeyValueStore.default.synchronize()
+        if driveDocsURL != nil {
+            // KVS observation for iOS-initiated inbox deposits.
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(kvsDidChange(_:)),
+                name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
+                object: nil
+            )
+            Task.detached(priority: .utility) {
+                _ = await withCKTimeout("MacSyncEngine.start.kvsSynchronize") {
+                    NSUbiquitousKeyValueStore.default.synchronize()
+                }
             }
+        } else {
+            await startArchiveRetentionWatcher()
+            guard generation == snapshotLifecycleGeneration, isActive else { return nil }
+            reconcileArchiveRetention(pruneFirst: true)
         }
 
         // Normal writes are mutation-driven. Retain one deliberately slow
@@ -202,18 +150,27 @@ extension MacSyncEngine {
         startChatTranscriptSnapshotObservation()
 
         // Watch inbox for iOS-deposited action files
-        startInboxQuery(docsURL: docsURL)
+        if driveDocsURL != nil { startInboxQuery(docsURL: docsURL) }
 
         // Immediate first snapshot, then one integrity pass on it.
         await writeSnapshots(forceHeavy: true)
         guard generation == snapshotLifecycleGeneration, isActive else { return nil }
+        if driveDocsURL == nil, let snapshotDir {
+            let failures = await sync.bridge.publishMobileSnapshotStatus(
+                groups: Set(NAMobileSnapshotGroup.allCases),
+                snapshotDirectory: snapshotDir,
+                shouldPublish: { self.snapshotLifecycleGeneration == generation && self.isActive }
+            )
+            guard generation == snapshotLifecycleGeneration, isActive else { return nil }
+            sync.bridge.notePublication(failures)
+        }
         requestSnapshotIntegrityPass(retrySkipped: true)
 
-        // R11-N30: prune at startup, then schedule the exact earliest 7-day
-        // retention crossing instead of waking every ten minutes.
-        await startArchiveRetentionWatcher()
-        guard generation == snapshotLifecycleGeneration, isActive else { return nil }
-        reconcileArchiveRetention(pruneFirst: true)
+        if driveDocsURL != nil {
+            await startArchiveRetentionWatcher()
+            guard generation == snapshotLifecycleGeneration, isActive else { return nil }
+            reconcileArchiveRetention(pruneFirst: true)
+        }
         return nil
     }
 
@@ -241,7 +198,7 @@ extension MacSyncEngine {
         workActivityObservationTask = nil
         stopLiveTurnRelay()
         workActivityPublicationTask?.cancel()
-        // The retiring publisher keeps admission until its physical write ends.
+        // The snapshot writer keeps admission until its physical write ends.
         workActivities.removeAll()
         activeDocsURL = nil
         snapshotIntegrityTask?.cancel()
@@ -273,12 +230,11 @@ extension MacSyncEngine {
         chatTranscriptSnapshotPublicationTask = nil
         chatSnapshotCoalescer.reset()
         // The retiring pass owns admission until its physical write returns.
-        snapshotWriteQueued = false
+        snapshotWriteQueuedScope = nil
         snapshotWriteQueuedNeedsHeavy = false
         snapshotWriteQueuedNeedsRepublish = false
         snapshotWriteQueuedNeedsMemories = false
         snapshotWriteQueuedNeedsChatTranscripts = false
-        snapshotWriteQueuedNeedsStandardPass = false
         // A stopped lifecycle must not retain a routable old container. Late
         // work is already generation-gated; clearing these roots also makes a
         // post-stop inbox/action call fail closed instead of writing to a
@@ -378,7 +334,7 @@ extension MacSyncEngine {
             defer { if presenceBeatRegistrationID == id { presenceBeatRegistrationTask = nil } }
             await previous?.value
             guard !enabled || (isActive && generation == snapshotLifecycleGeneration) else { return }
-            await BackgroundLoopsManager.shared.restartLoop(id: "presence_beat") { @MainActor [self] in
+            await BackgroundLoopLifetimes.shared.restartLoop(id: "presence_beat") { @MainActor [self] in
                 guard !enabled || (isActive && snapshotLifecycleGeneration == generation) else { return nil }
                 return registration
             }
@@ -424,7 +380,7 @@ extension MacSyncEngine {
         let lifecycleGeneration = snapshotLifecycleGeneration
         let digests = snapshotFileDigests
         let dataRoot = PersistenceCore.defaultDataRoot()
-        let (report, skippedGroups) = await Task.detached(priority: .utility) {
+        let (report, skippedGroups) = await VolumeIO.run {
             let report = MacSyncSnapshotIntegrity.reconcile(digests: digests, in: snapshotDir)
             let skipsURL = ICloudSyncStatePaths.snapshotSkips(dataRoot: dataRoot)
             let skippedGroups: [String: String]?
@@ -440,7 +396,7 @@ extension MacSyncEngine {
                 skippedGroups = nil
             }
             return (report, skippedGroups)
-        }.value
+        }
         guard lifecycleGeneration == snapshotLifecycleGeneration, isActive, !Task.isCancelled else { return }
         guard !snapshotWriteInFlight, digests == snapshotFileDigests else {
             requestSnapshotIntegrityPass(retrySkipped: retrySkipped)
@@ -510,11 +466,9 @@ extension MacSyncEngine {
     private func publishConnectorHealthChange(force: Bool, generation: UInt64) async {
         let health: JSONValue
         do {
-            let rows = try await sync.host.getConnectors()
-            guard case .array(let values) = try JSONValue.parse(JSONEncoder().encode(rows)) else { return }
-            health = .array(values.map { value in
-                guard case .object(let row) = value else { return value }
-                return .object(row.filter { ["id", "authState", "healthStatus"].contains($0.key) })
+            health = .array(try await sync.host.getConnectors().map { row in
+                .object(["id": row.id, "authState": row.authState, "healthStatus": row.healthStatus]
+                    .compactMapValues { $0.map(JSONValue.string) })
             })
         } catch { health = .null }
         guard isActive, generation == snapshotLifecycleGeneration else { return }
@@ -537,10 +491,7 @@ extension MacSyncEngine {
                 self?.requestChatSnapshotPublication(includeTranscripts: true)
             }
         }
-        // 2026-09-06: the same edge for a transcript rewritten outside a turn
-        // (the compaction distiller's swap). It bumps the session's transcript
-        // version, so without a publication the phone keeps the mechanical
-        // summary and every later publish looks no newer than what it holds.
+        // Transcript rewrites outside turns publish through the same completion coalescer.
         if let chatTranscriptDidChangeObserver {
             NotificationCenter.default.removeObserver(chatTranscriptDidChangeObserver)
         }

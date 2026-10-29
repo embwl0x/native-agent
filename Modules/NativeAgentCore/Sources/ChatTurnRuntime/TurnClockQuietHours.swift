@@ -1,17 +1,14 @@
+import Transcripts
 import Foundation
 import PersistenceCore
 
 // Blueprint: | `TurnClockQuietHours.swift` | `TurnQuietHoursWindow`: local wall-clock quiet-hours membership, wraparound and exact end deadline shared by native reply admission |
 
-/// The user's declared quiet-hours window, in LOCAL wall-clock hours.
-/// `start > end` wraps midnight (19 → 3 means 7 PM through 3 AM).
-///
-/// W5 L1#6: the model was inferring "he must be asleep" from a bare clock
-/// reading. The window is a FACT the turn can state instead of a guess it has
-/// to make, so it rides the same one-line dynamic clock context.
+/// Declared quiet hours in local wall-clock time, shared by turn context and delivery admission.
+/// `start > end` wraps midnight.
 public struct TurnQuietHoursWindow: Sendable, Equatable {
     public static func holdsResidentWake(session: String?, dataRoot: URL, at date: Date = Date()) -> Bool {
-        session == ResidentWake.session && read(dataRoot: dataRoot)?.contains(hour: Calendar.current.component(.hour, from: date)) == true
+        SessionConversation.kind(session, dataRoot: dataRoot)?.isOwnWork == true && read(dataRoot: dataRoot)?.contains(hour: Calendar.current.component(.hour, from: date)) == true
     }
 
     public let startHour: Int
@@ -24,24 +21,20 @@ public struct TurnQuietHoursWindow: Sendable, Equatable {
         self.endHour = endHour
     }
 
-    /// Whether a local wall-clock hour falls inside the window. Mirrors
-    /// `SwiftNativeTriggerScheduler.inQuietHours` semantics deliberately: two
-    /// different answers to "is it quiet right now" is exactly the shape that
-    /// makes an agent contradict itself.
+    /// Local-hour membership includes the start and excludes the end.
     public func contains(hour: Int) -> Bool {
         if startHour < endHour { return hour >= startHour && hour < endHour }
         return hour >= startHour || hour < endHour
     }
 
+    /// Next local occurrence of the end hour, using the calendar's next valid time.
     public func end(after date: Date) -> Date? {
         var components = DateComponents()
         components.hour = endHour; components.minute = 0; components.second = 0
         return Calendar.current.nextDate(after: date, matching: components, matchingPolicy: .nextTime)
     }
 
-    /// `data/user_prefs.json` → `quiet_hours.{start,end}`. Absent file,
-    /// absent key, or an out-of-range pair → nil (no quiet-hours clause is
-    /// rendered; the clock line degrades to time + zone only).
+    /// Reads `quiet_hours.{start,end}` from `user_prefs.json`; missing or invalid data means no window.
     public static func read(dataRoot: URL) -> TurnQuietHoursWindow? {
         let url = dataRoot.appendingPathComponent("user_prefs.json")
         guard let data = try? Data(contentsOf: url),

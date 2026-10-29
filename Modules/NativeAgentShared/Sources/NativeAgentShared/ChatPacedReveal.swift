@@ -2,9 +2,7 @@ import SwiftUI
 
 // Blueprint: | `ChatPacedReveal.swift` | `ChatStreamPacer` and shared streaming views: paragraph-aware paced reveal, edge fade and settle crossfade for Mac/iPhone |
 
-// Shared by the Mac transcript and the iPhone chat (2026-10-04): the live
-// reply's paced reveal, its edge fade and the settle crossfade, so both
-// platforms stream with one feel.
+// Mac and iPhone share paced reply reveal, edge fade and settle crossfade.
 
 /// One Text per paragraph, with the same gap and inline styling as settled
 /// replies. The pacer retains paragraph offsets and the styled edge; fade-only
@@ -485,7 +483,7 @@ public final class ChatStreamPacer {
 /// When a run of the live reply appeared, for its fade-in.
 @available(macOS 15, iOS 18, *)
 struct ChatEdgeFade: TextAttribute {
-    /// ChatGPT's number: only the new edge fades, over about 150 ms, ease-out.
+    /// Only the new edge fades, over about 150 ms, ease-out.
     static let duration = 0.15
     let revealedAt: TimeInterval
 }
@@ -512,12 +510,7 @@ struct ChatEdgeFadeRenderer: TextRenderer, Equatable {
     }
 }
 
-/// Overlays its children and takes the size of the one tagged `current`.
-///
-/// Fluid glass A1: a phase swapped in place (the streamed reply becoming its
-/// settled rendering, the live tool box becoming its row) crossfades here. In
-/// a VStack the outgoing phase would stack on the incoming one for the whole
-/// fade; here it only draws, and the size goes to the incoming phase's.
+/// Overlays crossfading phases and takes the size of the one tagged `current`.
 public struct ChatCrossfadeStack: Layout {
     public var current: Int
 

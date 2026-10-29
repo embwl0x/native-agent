@@ -9,6 +9,7 @@ import ProviderRouting
 import Senses
 import Transcripts
 import TurnTrace
+import NativeAgentShared
 // Blueprint: | `TurnPart.swift` | `TurnPart`: their turn as a part (`abilities/turn.js` `step(state, event)`) in one held helper per turn (a helper short of resources is an observation retried on the helper backoff until Stop; any other start failure ends the turn with its fix), version choice (prior shipped bodies come from generated `shipped`) and seed install (write failures name the person and storage repair), the effect queue, the turn's event log and reconstruction for resume and heal; `provider_failure` carries the repair's callable input, permits explicit `app` repair calls through the ordinary dispatcher or a re-issued `model.call`, and can end incomplete without healing an authored part; compare-and-swap heal in one store transaction |
 
 /// Her turn as a part (docs/AGENT_IS_THE_APP.md, contract 1). `abilities/turn.js`
@@ -365,18 +366,14 @@ struct TurnPart {
     /// turn is stopped; any other start failure is the stem's own and permanent,
     /// and ends the turn at once with its fix.
     private mutating func run(_ input: JSONValue, host: Reach) async throws -> [String: JSONValue]? {
-        let helperURL = SenseHostLocator.helperURL, root = dataRoot
-        let runner = OwnedProgramRunner(helperURL: helperURL, dataRoot: root) { scratch in
-            try SenseSandboxProfile.build(reach: SenseReach(), helperURL: helperURL, scratch: scratch,
-                dataRoot: root, personaRoot: defaultPersonaRoot(dataRoot: root))
-        }
+        let runner = OwnedProgramRunner(dataRoot: dataRoot)
         var attempt = 0
         while helper == nil {
             if Task.isCancelled || ChatCancelFlag.isRaised(stop) { return nil }
             do { helper = try runner.hold() } catch {
                 guard (error as? SenseFailure)?.code == "spawn_busy" else {
                     let code = (error as? SenseFailure)?.code ?? "helper_start_failed"
-                    throw TurnEngineError.turnHelperUnavailable("\(code): \(error.localizedDescription) Tell the person: this copy of NativeAgent could not start its turn helper at \(helperURL.path).")
+                    throw TurnEngineError.turnHelperUnavailable("\(code): \(error.localizedDescription) Tell the person: this copy of NativeAgent could not start its turn helper at \(SenseHostLocator.helperURL.path).")
                 }
                 attempt += 1
                 let delay = ProviderRecoveryPolicy.backoffSeconds(forRetry: attempt)
@@ -408,21 +405,12 @@ struct TurnPart {
 
     /// False when Stop (the turn's cancellation or its cancel flag) ends the wait.
     private func waitUnlessStopped(_ seconds: TimeInterval) async -> Bool {
-        let stop = stop
-        return await withTaskGroup(of: Bool.self) { group in
-            group.addTask { (try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))) != nil }
-            if let stop {
-                group.addTask {
-                    let changes = FileChangeEvents(paths: [stop])
-                    defer { changes.cancel() }
-                    for await _ in changes.stream where ChatCancelFlag.isRaised(stop) { return false }
-                    return false
-                }
+        do {
+            try await SwiftNativeTurnEngine.untilStopped(stop) {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
             }
-            let slept = await group.next() ?? false
-            group.cancelAll()
-            return slept && !Task.isCancelled && !ChatCancelFlag.isRaised(stop)
-        }
+            return !Task.isCancelled && !ChatCancelFlag.isRaised(stop)
+        } catch { return false }
     }
 
     /// Compare-and-swap on the failing version, in one store transaction: only

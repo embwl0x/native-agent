@@ -247,12 +247,16 @@ public enum AgentRecipeStore {
 
     /// The next version: the file it replaces kept as <id>.previous.json.
     private static func commit(_ saved: inout Recipe, host: AgentHostRow, source: String, file: URL, previous: URL) throws {
+        let next = saved.recipeVersion.addingReportingOverflow(1)
+        guard saved.recipeVersion > 0, !next.overflow else {
+            throw ShapeError(description: "Recipe version cannot be incremented; preserve and repair \(file.path) before writing")
+        }
         if source != "re-seeded" {
             saved.authoredFields = Array(Set(saved.authoredFields ?? []).union(JSONValue.differences(
                 try JSONValue.fromEncodable(saved.host), try JSONValue.fromEncodable(host)))).sorted()
         }
         saved.host = host
-        saved.recipeVersion += 1
+        saved.recipeVersion = next.partialValue
         saved.updatedAt = ISO8601DateFormatter().string(from: Date())
         saved.source = source
         saved.digest = saved.hostDigest
@@ -279,7 +283,13 @@ public enum AgentRecipeStore {
     }
 
     /// The one shape check, for a file read and a write alike.
-    private static func validated(_ document: JSONValue) throws -> Recipe { try document.decodedExactly(as: Recipe.self) }
+    private static func validated(_ document: JSONValue) throws -> Recipe {
+        let recipe = try document.decodedExactly(as: Recipe.self)
+        guard recipe.recipeVersion > 0, recipe.recipeVersion < Int.max else {
+            throw ShapeError(description: "recipeVersion must be positive and leave room for the next version; existing bytes were preserved")
+        }
+        return recipe
+    }
 
     private typealias ShapeError = JSONValue.ShapeError
 

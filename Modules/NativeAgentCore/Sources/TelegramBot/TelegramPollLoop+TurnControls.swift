@@ -78,7 +78,7 @@ extension TelegramPollLoop {
         destination: TelegramDestination,
         turnId: UUID? = nil,
         pauseQueuedTurns: Bool = false
-    ) async -> TelegramTurnCoordinator.StopOutcome {
+    ) async -> TelegramTurns.StopOutcome {
         await turnCoordinator.requestStop(
             destination: destination,
             turnId: turnId,
@@ -87,10 +87,8 @@ extension TelegramPollLoop {
     }
 
     func isAllowlistedControl(chatId: Int, fromUserId: Int?) -> Bool {
-        guard !allowedChatIds.isEmpty || !allowedUserIds.isEmpty else { return false }
-        if allowedChatIds.contains(Int64(chatId)) { return true }
-        guard let fromUserId else { return false }
-        return allowedUserIds.contains(Int64(fromUserId))
+        Self.inboundAuthorizationDecision(allowedChatIds: allowedChatIds, allowedUserIds: allowedUserIds,
+            chatId: chatId, fromUserId: fromUserId) == .allowed
     }
 
 }

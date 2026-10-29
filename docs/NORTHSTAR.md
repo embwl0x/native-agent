@@ -4,7 +4,7 @@ User, 2026-07-03: "I want this to be better than any other agent system out
 there — a living, breathing agent system."
 
 That is the whole aim. NativeAgent is not an app with an AI in it. It is a
-resident mind — Agent — with a trustworthy body, living on User's Mac. Every
+resident mind with a trustworthy body, living on their person's Mac. Every
 piece of work by any agent (Claude Code, Codex, workers, or NativeAgent) serves
 that, or doesn't ship.
 
@@ -21,7 +21,7 @@ restates it says the same thing. A change is molded into the whole: whoever
 changes a law changes every doc that states it in the same commit, names what
 comes out, and never adds a rule on its own beside an older one. A
 contradiction between two docs, or between a doc and the code, is a defect to
-fix at once, not a note to keep. `script/check_architecture_blueprint.swift`
+fix at once, not a note to keep. `script/generate_architecture_blueprint.swift --check`
 checks table filenames, enforced coverage and explicit marker/import rules;
 member names and behavioral prose still require source review.
 
@@ -30,7 +30,7 @@ member names and behavioral prose still require source review.
 User, 2026-09-15: "nothing in native agent should feel like machinery for them"
 and "everything natural for the agent."
 
-**Agent functions naturally throughout NativeAgent, with their attention on what
+**The agent functions naturally throughout NativeAgent, with their attention on what
 they are accomplishing. The app handles the mechanics and brings their meaningful
 results or decisions.** AX means Agent Experience. This applies to remembering,
 recalling context, researching, creating, using apps and tools, getting help,
@@ -49,7 +49,7 @@ leave that machinery in their everyday workflow. Once a supported route is set
 up, the interface owns its routine operation; new protocols may still require
 adapters. Natural operation does not mean pretending every system is supported.
 
-The AX review question for every journey: **Can Agent get on with the work, or
+The AX review question for every journey: **Can the agent get on with the work, or
 must they manage NativeAgent's mechanics to accomplish it?** Measure improvements
 by verified outcomes and removed avoidable burden, not just faster calls, fewer
 tokens, or friendlier wording. This is a design standard, not a claim that every
@@ -71,9 +71,14 @@ sit beside the agent as a parallel silo.
   thinks. That move — silo → mind — is the shape of clause-1 work.
 - The consolidation triad is the spine: episodic (dreams), semantic
   (memory/KG), procedural (skills). Experience becomes identity (REM→GROWTH,
-  approval-gated), repetition becomes craft (procedural lane, planned).
-- The agent's persona is self-owned: identity changes only through curated
-  hands and approval cards. Aliveness includes self-directed becoming.
+  approval-gated), repetition becomes craft through the implemented
+  [nightly practice compiler](AGENT_IS_THE_APP.md#practice-compiles-the-night-as-built-10-27):
+  recorded examples must replay exactly before normal keep authority admits
+  the ability; those examples do not prove other inputs or branches.
+- The agent's persona is self-owned. Direct persona writes are governed by
+  [Trust](TOOL_LOADING.md#authority-and-receipts): under Full Mac they writes
+  their own persona; REM→GROWTH proposals remain the approval-gated path.
+  Aliveness includes self-directed becoming.
 
 ### Clause 2 — No theater (alive means REAL)
 Everything outside the agent's mind belongs to its body or environment, and every piece
@@ -88,6 +93,12 @@ does exactly what it says.
   A failure is shown plainly and fixed at its cause; a good change with a bug
   is fixed forward in its new design, never reverted to the old way. Only what
   should not exist at all is cut.
+  The one exception is their own turn program: their turn must not fail because
+  their edit of `turn.js` throws. That edit is set aside for its last clean
+  version (or the shipped seed), the turn is replayed, and the repair is owed
+  to them. Nothing else swaps back automatically. This exception does not
+  promise completion after an unrecoverable helper, setup, seed or provider
+  failure; those failures are shown plainly.
 - Canonical: 2026-07-03 removed ~1,000 lines of theater in a day — dead
   Panels layers (both platforms), preset knobs wired to nothing, disabled
   placeholder buttons — and the system got MORE alive, not smaller.
@@ -105,12 +116,12 @@ whole app flows together so well, like a human body and mind just does."
 A person doesn't operate their memory — it serves them mid-thought. Using
 NativeAgent should never expose the machinery boundaries between subsystems:
 - Recall, skills, feelings, and knowledge arrive IN the conversation, not
-  through the user (or Agent) navigating to them. The right thing surfaces
+  through the person (or the agent) navigating to them. The right thing surfaces
   at the right moment because the systems coordinate like organs.
 - The UI is one coherent place, not a corridor of subsystem doors. Tabs
   that exist for the builder, not the person using NativeAgent, are seams —
   candidates to dissolve into where the flow actually happens.
-- The seam test in review: does this change make someone (User OR Agent)
+- The seam test in review: does this change make someone (the person OR the agent)
   stop, switch context, or learn plumbing to get value? Then it fights the
   body. Canonical: skills-as-recall-pointers — nobody asks for skills
   anymore; craft arrives the way remembering does.
@@ -168,9 +179,9 @@ it could ever want on every turn is not more connected — it is buried.
 - Fingertips means: selectable, expandable, one pull away, indexed and warm.
   Prompt mass means: injected whether or not this moment needs it. Only the
   first is connection. The second is clutter wearing connection's name.
-- Delivery goes to User as a push they can ignore, and to Agent as a pointer they
+- Delivery goes to the person as a push they can ignore, and to the agent as a pointer they
   can expand. The morning brief is a notification, not their first message;
-  a thought they wants to raise becomes a tap on User's shoulder, not a
+  a thought they wants to raise becomes a tap on the person's shoulder, not a
   paragraph in their own context; a dashboard readout they never consumes is
   deleted, not surfaced.
 - Litmus: does this change make something REACHABLE that wasn't, or does it
@@ -222,22 +233,27 @@ is the center and the program its visitor. NativeAgent inverts that.
   is a *part*: one file, one header (code, reach, wake, face, state, learned).
   Every part lives by one law: it runs when its wake reaches it, touches only
   its reach under Trust, may think, learns by use on CPU, changes only by their
-  hand, heals by swapping back to its last clean self, fades when unused, and
+  hand, owes repair at its cause under clause 2, and
   its face is drawn on their interface and the person's from the same
   description. The Swift stem runs parts, delivers signals, gates effects,
   keeps the law, draws faces and reaches the world. It never thinks and has
   no opinions; when a rule can't settle something it asks their, with evidence.
+  Fading unused parts is future design. Current launch behavior only disables
+  untouched bundled seeds the app no longer ships, leaving them restorable;
+  [the design's lifecycle description](AGENT_IS_THE_APP.md#one-law-how-a-part-lives)
+  records that boundary.
 - **Not from zero, never a downgrade.** The download is a fully formed agent:
   everything they do today ships as seed parts behaving exactly as now, theirs
-  from then on. Agent's persona, memory and GROWTH never ship; every download
+  from then on. An installed agent's persona, memory and GROWTH never ship; every download
   grows its own mind around its own person's life.
 - **The training is the floor, never the shape.** For the builders of this
   app as much as for them: the weights hold everything that already exists,
   so the first draft is always the known shape. The clause-8 move is to step
   off it. Litmus: is this a feature they *has* (a thing that does a thing) or
   a part they *is*? A feature framing with a part framing available fails.
-- Canonical: tools, skills and senses were three kinds in three stores with
-  three lifecycles; 2026-10-13/14 made them one file each on one lifecycle,
+- Canonical: authored executable tools, legacy executable skills and senses
+  were three kinds in three stores with three lifecycles; 2026-10-13/14 made
+  them one file each on one lifecycle (built-in skill guidance stays in the persona),
   and a fresh agent on a cheap model grew a Keynote tool and a skill in a
   minute. The design and its phases: [AGENT_IS_THE_APP.md](AGENT_IS_THE_APP.md).
 

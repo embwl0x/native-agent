@@ -2,18 +2,7 @@ import EngineRuntime
 import Foundation
 
 // Blueprint: | `SetupView.swift` | `SetupView`: settings page assembly, shared row controls and model pickers over canonical settings owners |
-// Lane B (2026-09-02, ui-simplify): THE SETUP PAGE.
-//
-// "Four things make up <name>. The rest is below."
-//
-// This page owns no settings of its own. Every switch here writes exactly the
-// same storage the old Settings controls wrote — the Subconscious master and
-// Fluid Context (SlimSettingsView ▸ Advanced ▸ Subconscious), the moments lane
-// switch (MomentsLaneSetting), the agent's hour (StudioWanderLane.enabledDefaultsKey),
-// and the Mac Integration permission store. Nothing on the
-// top half of this page names an internal: no "Subconscious", no "Fluid
-// Context", no "organism", no "YOLO". User, 2026-09-04: the features those
-// words stood for are cards further down this page now, said in plain words.
+// Setup uses canonical settings owners and describes features in plain language.
 
 import SwiftUI
 import NativeAgentShared
@@ -40,69 +29,32 @@ enum SettingsLink {
         if mode != SimpleViewMode.advanced {
             UserDefaults.standard.set(SimpleViewMode.advanced, forKey: SimpleViewMode.key)
         }
-        NativeAgentAppCoordinator.shared.request(.sidebar(item))
+        ApplicationLifetime.shared.request(.sidebar(item))
         // The route lands on the page's first tab, synchronously, so the tab
         // is chosen after it.
         if let tab { UserDefaults.standard.set(tab, forKey: ShellRailTab.storageKey(item)) }
     }
 }
 
-/// THE HOUSE, WORN FROM THE OUTSIDE. Every page behind Advanced is the page it
-/// always was — none of their internals are rewritten here. This puts the room
-/// under them, a title in the shell's hand, and one way back, so opening one
-/// no longer reads as leaving the app.
-///
-/// It also quiets the default chrome those pages carry: `scrollContentBackground`
-/// hidden so their Lists and Forms show the glass, and the brand tint set once
-/// so every control in the subtree agrees on its accent.
+/// The rail-page frame owns the title, page column and shared chrome.
 struct ShellPageFrame<Content: View>: View {
     let title: String
     /// One plain sentence under the title, in the agent's own voice — the line
     /// Today, Memories and the Desk already carry. Nil leaves the title alone.
     var subtitle: String?
-    /// What the back row says. The pages under Setup all came from Settings.
-    var backLabel: String = "Settings"
-    /// A page reached from the rail has nowhere to go back to.
-    var showsBack: Bool = true
-    /// User, 2026-09-04: Providers is two columns of controls; at the 920
-    /// measure its model menu had no width left. A wide page takes the room.
+    /// Wide pages give two-column controls the full available width.
     var wide: Bool = false
-    /// Alive glass (User, 2026-09-23): the serif header, whose one sentence the
-    /// page's content hands up through `alivePageLine`, in place of the
-    /// display title and the fixed subtitle.
+    /// The serif header receives its sentence through `alivePageLine`.
     var alive: Bool = false
     @ViewBuilder var content: Content
 
-    @Environment(\.dismiss) private var dismiss
     @State private var aliveLine: AlivePageLine?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Back is `dismiss()` again, and this is safe ONLY because the
-            // stack above it is UNBOUND — see `SetupView.body`. On an unbound
-            // stack SwiftUI owns the path, so a surplus dismiss (a click that
-            // lands on a frame already leaving, which stays hit-testable
-            // through the transition) is a no-op with nothing to write back.
-            // Bound, the same surplus killed the app four times on 2026-09-03.
-            if showsBack {
-                Button(action: { dismiss() }) {
-                    HStack(spacing: 3) {
-                        Image(systemName: "chevron.left")
-                            .font(ShellType.labelSemibold)
-                        Text(backLabel)
-                            .font(ShellType.labelMedium)
-                    }
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("shell.page.back")
-            }
-
             if alive {
                 AlivePageHeader(title: title, line: aliveLine?.text ?? subtitle,
                                 lineID: aliveLine?.id ?? "shell.page.subtitle")
-                    .padding(.top, showsBack ? 6 : 0)
             } else {
                 Text(title)
                     .font(ShellType.display)
@@ -131,19 +83,15 @@ struct ShellPageFrame<Content: View>: View {
                 .environment(\.shellTabRowHostsActions, false)
         }
         .padding(.horizontal, NativeAgentSpacing.pageInset)
-        .padding(.top, alive && !showsBack ? TodayMetrics.topPadding : 20)
+        .padding(.top, alive ? TodayMetrics.topPadding : 20)
         .onPreferenceChange(AlivePageLineKey.self) { aliveLine = $0 }
         .frame(maxWidth: wide ? .infinity : TodayMetrics.contentWidth, alignment: .leading)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         // The pages' own Lists and Forms paint a slab by default; this is the
         // one line that lets the room through them.
         .scrollContentBackground(.hidden)
-        // User, 2026-09-03: the frame used to tint the whole page teal, so every
-        // bordered button on every Advanced page wore the waiting colour. The
-        // teal has one job. Buttons take the text colour; a control with an
-        // "on" state wears the haze itself (`hazeTinted`, WindowHaze.swift).
+        // Buttons use text colour; active controls use `hazeTinted`.
         .tint(NativeAgentShell.text)
-        .background { ShellRoomBackdrop() }
         // The NavigationStack still owns the back gesture; only its chrome is
         // hidden, because a painted bar on glass reads as another app's.
         .navigationTitle(title)
@@ -166,9 +114,6 @@ struct SetupView: View {
     @AppStorage("cognitiveSubstrateReflectionEnabled") private var reflectionEnabled = false
     @AppStorage("cognitiveSubstrateDailyReflectionBudget") private var reflectionBudget = 2
     @AppStorage("organismKernelEnabled") private var organismEnabled = false
-
-    // MOMENTS THE AGENT KEEPS
-    @AppStorage(MomentsLaneSetting.defaultsKey) private var momentsEnabled = true
 
     // THE AGENT'S HOUR
     @AppStorage(StudioWanderLane.enabledDefaultsKey) private var studioWanderEnabled = false
@@ -195,9 +140,7 @@ struct SetupView: View {
 
     var body: some View {
         ScrollView {
-            // Alive glass (2026-09-23): the page's sections, each ONE
-            // group card of rows under an eyebrow, where every setting
-            // used to be its own card.
+            // Each section groups its rows in one card under an eyebrow.
             VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
                 AlivePageHeader(
                     title: "Settings",
@@ -211,23 +154,14 @@ struct SetupView: View {
                         .textSelection(.enabled)
                         .padding(.top, 8)
                 }
-                section("Who I am") { fourThings }
-                // User, 2026-09-05: the everyday controls come first; the
-                // fourteen feature switches sit below them.
-                // The trust level and the chat model are the composer's
-                // and the rail's (Trust, Providers); Telegram, iPhone and
-                // Senses are rail tabs. Settings does not copy them.
-                section("And the rest") {
+                AdvancedSection(title: "Who I am") { fourThings }
+                // Everyday controls precede feature switches; settings do not duplicate rail controls.
+                AdvancedSection(title: "And the rest") {
                     appearanceRow
-                    // User, 2026-09-04: no All settings door. What lived
-                    // there is here, as rows (SetupRestRows).
                     SetupRestRows(part: .everyday)
                 }
                 SetupRestRows(part: .app)
-                // User, 2026-09-04: "a switch for each of her features,
-                // all here, simple." One row per feature, wired to the
-                // key the feature actually reads (SetupFeatureRows). The
-                // inner life's master heads its own card.
+                // Each feature switch writes the key its feature reads.
                 SetupFeatureRows { innerLifeControls }
             }
             .padding(.top, TodayMetrics.topPadding)
@@ -270,30 +204,10 @@ struct SetupView: View {
         .quietReadTask(live: false) { await appModel.engine.macIntegration.refresh() }
     }
 
-    // MARK: Header
-
-    private func section<Rows: View>(_ title: String, @ViewBuilder rows: () -> Rows) -> some View {
-        AdvancedSection(title: title, content: rows)
-    }
-
     // MARK: The four things
 
     @ViewBuilder
     private var fourThings: some View {
-        SetupSwitchCard(
-            title: "Moments I keep",
-            sentence: "Small things that happened between us. I pick which stay.",
-            isOn: Binding(
-                get: { momentsEnabled },
-                set: { enabled in
-                    momentsEnabled = enabled
-                    appModel.statusText = enabled
-                        ? "I keep moments again"
-                        : "I am no longer keeping moments"
-                }
-            )
-        )
-
         SetupSwitchCard(
             title: "\(voice.Possessive) hour",
             sentence: "Once a day, when nothing is happening, an hour with no task set.",
@@ -308,13 +222,7 @@ struct SetupView: View {
             // inner life, exactly as the old switch could not.
             disabled: savingInnerLife || !subconsciousEnabled
         )
-        // The hour's provider/model pickers moved to Advanced ▸ minds.
-
-        // User, 2026-09-04: this was a switch bound to a constant. Each
-        // capability is its own grant and macOS asks again on first use,
-        // so there is nothing one switch could honestly do. The card
-        // says what is granted and opens the rail's Trust ▸ Mac
-        // integration, where the grants are.
+        // Mac capabilities have individual grants; this card opens their controls.
         SetupInfoCard(
             title: "Use my Mac",
             detail: appModel.engine.macIntegration.permissionLoadError != nil
@@ -442,9 +350,7 @@ struct SetupView: View {
 
 // MARK: - Rows
 
-/// ONE HEIGHT FOR EVERY ROW. User, 2026-09-02: the column read ragged because
-/// every card was as tall as its own copy. A fixed frame, not a minimum — a
-/// minimum drifts the moment a sentence or a name changes length.
+/// Every settings row uses a fixed height so copy length cannot change the rhythm.
 enum SetupMetrics {
     /// A 14pt title plus up to two 12pt lines ("Full Mac" needs the second
     /// one to say plainly what full run means).
@@ -456,6 +362,7 @@ enum SetupMetrics {
 struct SetupRow<Control: View>: View {
     let title: String
     let detail: String
+    var identifier: String = ""
     @ViewBuilder var control: Control
 
     var body: some View {
@@ -464,6 +371,7 @@ struct SetupRow<Control: View>: View {
             Spacer(minLength: 12)
             control
         }
+        .accessibilityIdentifier(identifier)
     }
 }
 
@@ -495,6 +403,7 @@ struct SetupRowText: View {
 struct SetupSwitchCard<Detail: View>: View {
     let title: String
     let sentence: String
+    var identifier: String?
     @Binding var isOn: Bool
     var disabled: Bool = false
     @ViewBuilder var detail: Detail
@@ -502,12 +411,14 @@ struct SetupSwitchCard<Detail: View>: View {
     init(
         title: String,
         sentence: String,
+        identifier: String? = nil,
         isOn: Binding<Bool>,
         disabled: Bool = false,
         @ViewBuilder detail: () -> Detail = { EmptyView() }
     ) {
         self.title = title
         self.sentence = sentence
+        self.identifier = identifier
         self._isOn = isOn
         self.disabled = disabled
         self.detail = detail()
@@ -515,12 +426,7 @@ struct SetupSwitchCard<Detail: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(alignment: .center, spacing: 12) {
-                // The fixed box every row shares.
-                SetupRowText(title: title, detail: sentence)
-                Spacer(minLength: 12)
-                switchFace
-            }
+            SetupRow(title: title, detail: sentence) { switchFace }
             detail
         }
     }
@@ -535,6 +441,7 @@ struct SetupSwitchCard<Detail: View>: View {
             .disabled(disabled)
             .accessibilityLabel(title)
             .accessibilityHint(sentence)
+            .accessibilityIdentifier(identifier ?? "")
     }
 }
 
@@ -561,12 +468,7 @@ struct SetupInfoCard: View {
 
 // MARK: - Provider, then model
 
-/// Two menus, not one list of everything. The first names a provider that is
-/// actually connected; the second lists that provider's models, the way the
-/// Providers page does. User, 2026-09-05: "it even shows stuff I don't have API
-/// keys on; pick provider, then another box shows models." Changing the
-/// provider selects its first model at once so the pair never disagrees;
-/// the model menu then narrows it.
+/// A model menu grouped by connected provider, retaining the saved choice's label.
 struct ProviderThenModelPicker: View {
     struct Model: Identifiable, Equatable {
         let id: String
@@ -586,32 +488,16 @@ struct ProviderThenModelPicker: View {
     let currentModelID: String
     let disabled: Bool
     let onSelect: (Provider, Model) -> Void
-    var integrated: Bool = false
 
-    private var visibleProviders: [Provider] {
-        var list = providers.filter(\.ready).map { provider in
-            Provider(id: provider.id, name: provider.name + (provider.models.isEmpty ? " · no models available" : ""),
-                ready: provider.ready, models: provider.models)
-        }
-        if !currentProviderID.isEmpty, !list.contains(where: { $0.id == currentProviderID }) {
-            // The saved provider lost its key: keep it selectable so the
-            // control never claims someone else's mind is current.
-            let stale = providers.first(where: { $0.id == currentProviderID })
-            list.insert(Provider(
-                id: currentProviderID,
-                name: (stale?.name ?? currentProviderID) + " · not connected",
-                ready: false,
-                models: stale?.models ?? []
-            ), at: 0)
-        }
-        return list.sorted { lhs, rhs in
-            if lhs.ready != rhs.ready { return lhs.ready }
-            return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
-        }
-    }
-
-    private var selectedProvider: Provider? {
-        visibleProviders.first(where: { $0.id == currentProviderID })
+    private var selectedLabel: String {
+        guard !currentModelID.isEmpty else { return "Choose model" }
+        let provider = providers.first { $0.id == currentProviderID && ($0.ready || !currentProviderID.isEmpty) }
+        let name = provider?.name ?? currentProviderID
+        let suffix = provider?.ready == true
+            ? (provider?.models.isEmpty == true ? " · no models available" : "")
+            : (currentProviderID.isEmpty ? "" : " · not connected")
+        let model = provider?.models.first { $0.id == currentModelID }?.name ?? currentModelID + " — unavailable"
+        return "\(name)\(suffix) · \(model)"
     }
 
     /// "Anthropic (OAuth / Setup-Token)" is a wiring detail, not a name. The
@@ -621,16 +507,7 @@ struct ProviderThenModelPicker: View {
         return String(displayName[..<open.lowerBound])
     }
 
-    private var visibleModels: [Model] {
-        var models = selectedProvider?.models ?? []
-        if !currentModelID.isEmpty, !models.contains(where: { $0.id == currentModelID }) {
-            models.insert(Model(id: currentModelID, name: currentModelID + " — unavailable"), at: 0)
-        }
-        return models
-    }
-
     var body: some View {
-        if integrated {
             Menu {
                 ForEach(providers.filter(\.ready)) { provider in
                     Section(provider.name) {
@@ -642,125 +519,15 @@ struct ProviderThenModelPicker: View {
                     }
                 }
             } label: {
-                Text(currentModelID.isEmpty ? "Choose model" : "\(selectedProvider?.name ?? currentProviderID) · \(visibleModels.first(where: { $0.id == currentModelID })?.name ?? currentModelID)")
+                Text(selectedLabel)
             }
             .disabled(disabled).accessibilityLabel("Model and provider")
-        } else {
-        HStack(spacing: 8) {
-            Picker("Provider", selection: Binding(
-                get: { currentProviderID },
-                set: { id in
-                    guard id != currentProviderID,
-                          let provider = visibleProviders.first(where: { $0.id == id }),
-                          let first = provider.models.first(where: { $0.id == currentModelID }) ?? provider.models.first
-                    else { return }
-                    onSelect(provider, first)
-                }
-            )) {
-                ForEach(visibleProviders) { provider in
-                    Text(provider.name).tag(provider.id)
-                }
-            }
-            .pickerStyle(.menu)
-            .labelsHidden()
-            .fixedSize()
-            .disabled(disabled)
-
-            Picker("Model", selection: Binding(
-                get: { currentModelID },
-                set: { id in
-                    guard id != currentModelID,
-                          let provider = selectedProvider,
-                          let model = provider.models.first(where: { $0.id == id })
-                    else { return }
-                    onSelect(provider, model)
-                }
-            )) {
-                ForEach(visibleModels) { model in
-                    Text(model.name).tag(model.id)
-                }
-            }
-            .pickerStyle(.menu)
-            .labelsHidden()
-            .fixedSize()
-            .disabled(disabled || selectedProvider == nil)
-        }
-        }
     }
 }
 
-// MARK: - Reflection model picker
+// MARK: - Memory and mind provider picker
 
-/// The same reflection selection the Subconscious section owns: it writes
-/// through `NativeCognitionRuntime.setReflectionSelection`, which is what
-/// persists `cognitiveSubstrateReflectionModel` / `…Provider`.
-struct SetupReflectionModelPicker: View {
-    @Environment(AppModel.self) private var appModel
-    @State private var saving = false
-    @State private var pendingProviderID: String?
-    @State private var pendingModelID: String?
-    @State private var errorMessage: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            if appModel.engine.providers.settings == nil {
-                ProgressView().controlSize(.small)
-            } else if appModel.engine.providers.connections.isEmpty {
-                Text("Connect a provider to choose the mind I reflect with.")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-            } else {
-                ProviderThenModelPicker(
-                    providers: appModel.engine.providers.connections.map { provider in
-                        ProviderThenModelPicker.Provider(
-                            id: provider.provider_id,
-                            name: ProviderThenModelPicker.plainProviderName(provider.display_name),
-                            ready: provider.auth_status.eligible,
-                            models: provider.models.map { ProviderThenModelPicker.Model(id: $0.id, name: $0.name) }
-                        )
-                    },
-                    currentProviderID: pendingProviderID ?? appModel.engine.providers.settings?.routing.activeProviders["cognition_reflection"] ?? "",
-                    currentModelID: pendingModelID ?? appModel.engine.providers.settings?.routing.preferences["cognition_reflection"]?.model ?? "",
-                    disabled: saving
-                ) { provider, model in
-                    pendingProviderID = provider.id
-                    pendingModelID = model.id
-                    Task {
-                        await save(providerID: provider.id, modelID: model.id)
-                    }
-                }
-                .font(.callout)
-            }
-            if let errorMessage = errorMessage ?? appModel.engine.providers.settingsError {
-                Text(errorMessage).font(.caption).foregroundStyle(.orange)
-            }
-        }
-    }
-
-    @MainActor
-    private func save(providerID: String, modelID: String) async {
-        saving = true
-        defer { saving = false }
-        do {
-            try await NativeAgentEngine.liveCognition.setReflectionSelection(
-                model: modelID,
-                provider: providerID
-            )
-            if case .failed(let detail) = await appModel.engine.providers.refreshSettings(
-                refreshCatalog: false, cause: { error, _ in error.localizedDescription }
-            ) { throw ProviderRoutingError.underlying(detail) }
-            errorMessage = nil
-        } catch {
-            errorMessage = UserFacingError.message(error, action: "save that mind")
-        }
-        pendingProviderID = nil
-        pendingModelID = nil
-    }
-}
-
-// MARK: - The hour's provider picker
-
-/// The hour's effective Memory and mind choice, rendered where the switch is.
+/// The effective Memory and mind choice for reflection and the daily hour.
 /// Writes the whole group through the same transaction Providers uses.
 struct SetupStudioWanderPicker: View {
     @Environment(AppModel.self) private var appModel
@@ -780,12 +547,12 @@ struct SetupStudioWanderPicker: View {
             if appModel.engine.providers.settings == nil {
                 ProgressView().controlSize(.small)
             } else if providers.isEmpty {
-                Text("Connect a provider to choose the mind my hour is spent with.")
+                Text("Connect a provider to choose Memory and mind.")
                     .font(.caption)
                     .foregroundStyle(.orange)
             } else {
                 HStack(spacing: 8) {
-                    Picker("\(AgentVoice.live.possessive) hour — provider", selection: Binding(
+                    Picker("Memory and mind — provider", selection: Binding(
                         get: { activeProvider },
                         set: { newValue in
                             pendingProvider = newValue
@@ -802,7 +569,7 @@ struct SetupStudioWanderPicker: View {
                     .pickerStyle(.menu)
                     .fixedSize()
 
-                    Picker("\(AgentVoice.live.possessive) hour — model", selection: Binding(
+                    Picker("Memory and mind — model", selection: Binding(
                         get: { model },
                         set: { newValue in
                             pendingModel = newValue
@@ -839,20 +606,21 @@ struct SetupStudioWanderPicker: View {
         saving = true
         defer { saving = false; pendingProvider = nil; pendingModel = nil }
         do {
-            _ = try await appModel.saveProviderGroupSelection(
+            _ = try await appModel.engine.saveProviderGroupSelection(
                 group: ProviderSurfaceGroups.mind,
                 providerID: activeProvider,
                 model: model,
-                reasoningEffort: preference?.reasoningEffort ?? "high",
+                reasoningEffort: ProvidersFacade.normalizedReasoningEffort(
+                    from: appModel.engine.providers.catalog,
+                    model: model,
+                    selected: preference?.reasoningEffort ?? "high"
+                ),
                 serviceTier: preference?.serviceTier
             )
-            if case .failed(let detail) = await appModel.engine.providers.refreshSettings(
-                refreshCatalog: false, cause: { error, _ in error.localizedDescription }
-            ) { throw ProviderRoutingError.underlying(detail) }
             errorMessage = nil
             appModel.statusText = "Memory and mind → \(model) saved"
         } catch {
-            errorMessage = UserFacingError.message(error, action: "save the mind for my hour")
+            errorMessage = UserFacingError.message(error, action: "save Memory and mind")
         }
     }
 }
@@ -860,28 +628,16 @@ struct SetupStudioWanderPicker: View {
 // MARK: - Minds (Advanced)
 
 /// WHERE THE MINDS ARE: Personality ▸ My minds. The chat mind is the
-/// composer's and Providers'. The reflection mind and the hour's mind are
-/// still exactly the pickers they were (`SetupReflectionModelPicker`,
-/// `SetupStudioWanderPicker`), writing the same storage.
+/// composer's and Providers'. Reflection and the daily hour share one Memory
+/// and mind picker and the canonical provider-group transaction.
 struct SetupMindsView: View {
-    @AppStorage("cognitiveSubstrateEnabled") private var subconsciousEnabled = true
     @AppStorage(StudioWanderLane.enabledDefaultsKey) private var studioWanderEnabled = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
                 AdvancedSection(
-                    title: "The mind I reflect with",
-                    card: .single,
-                    note: subconsciousEnabled
-                        ? "Used by my inner life, between conversations."
-                        : "My inner life is off, so nothing reflects with this yet."
-                ) {
-                    SetupReflectionModelPicker()
-                }
-
-                AdvancedSection(
-                    title: "\(AgentVoice.live.possessive) hour",
+                    title: "Memory and mind",
                     card: .single,
                     note: studioWanderEnabled
                         ? "The provider and model for Memory and mind, including reflection and my daily hour."
@@ -922,34 +678,30 @@ enum SlimSettingsSubconsciousStatusLine {
         let text: String
         let detail: String?
         let tone: Tone
-        let systemImage: String
         var recovery: Recovery? = nil
     }
 
     static func state(
         runtime: NativeSubconsciousRuntimeState?,
-        reflectionRoute: NativeReflectionRouteStatus?,
-        enableRequested: Bool = false
+        reflectionRoute: NativeReflectionRouteStatus?
     ) -> State {
         guard let runtime else {
             return State(
                 text: "Checking background activity…",
                 detail: nil,
-                tone: .progress,
-                systemImage: "hourglass"
+                tone: .progress
             )
         }
 
-        guard runtime.enabled || enableRequested else {
-            return State(text: "Off", detail: nil, tone: .neutral, systemImage: "circle")
+        guard runtime.enabled else {
+            return State(text: "Off", detail: nil, tone: .neutral)
         }
 
         guard let reflectionRoute else {
             return State(
                 text: "Checking the reflection model…",
                 detail: nil,
-                tone: .progress,
-                systemImage: "hourglass"
+                tone: .progress
             )
         }
 
@@ -963,7 +715,6 @@ enum SlimSettingsSubconsciousStatusLine {
                     : (isUnavailable ? "The reflection connection is unavailable." : "Reflection needs a ready provider connection."),
                 detail: detail,
                 tone: isUnavailable ? .unavailable : .warning,
-                systemImage: "exclamationmark.triangle.fill",
                 recovery: reflectionRoute.providerReady ? .selectModel : .configureProvider
             )
         }
@@ -974,7 +725,6 @@ enum SlimSettingsSubconsciousStatusLine {
                 text: "Not active: " + inactiveLanes.joined(separator: ", ") + ". Try enabling again.",
                 detail: nil,
                 tone: .warning,
-                systemImage: "exclamationmark.triangle.fill",
                 recovery: .reapply
             )
         }
@@ -982,14 +732,12 @@ enum SlimSettingsSubconsciousStatusLine {
         return State(
             text: "Running with " + bounded(reflectionRoute.model),
             detail: nil,
-            tone: .healthy,
-            systemImage: "checkmark.circle.fill"
+            tone: .healthy
         )
     }
 
     private static func inactiveLaneNames(_ runtime: NativeSubconsciousRuntimeState) -> [String] {
         var lanes: [String] = []
-        if !runtime.enabled { lanes.append("background activity") }
         if !runtime.capsuleEnabled { lanes.append("reflection context") }
         if !runtime.backgroundEnabled { lanes.append("between-conversation activity") }
         if !runtime.reflectionEnabled { lanes.append("reflection") }

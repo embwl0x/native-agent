@@ -1,34 +1,9 @@
 import Foundation
+import CoreGraphics
 import NativeAgentCore
 import PersistenceCore
 import Senses
-// Blueprint: | `MacFourVerbs+Observation.swift` | `MacFourVerbs`: `screen`, `observedReply`, `sight`; self-window looks hand off to the mounted `visible` presentation without claiming a completed read; call-local complete AX read shared with pixel capture under window identity and frame-generation validation; observed and blind replies preserve failed declared-effect verdicts and confirmed window/process removal even when the next screen belongs to another app |
-
-/// Call-local proof supplied by the canonical view capture, never
-/// by app-name matching. Pixels that cannot bind to this look are discarded.
-final class MacSightCaptureBinding: @unchecked Sendable {
-    @TaskLocal static var current: MacSightCaptureBinding?
-    let frameID: String
-    private let lock = NSLock()
-    private var validate: (@Sendable () async -> Bool)?
-    private var read: (read: MacAXRead, seam: [String: JSONValue])?
-    init(frameID: String) { self.frameID = frameID }
-    /// One complete window walk and its seam, read once for every reader of
-    /// it: the look's walk for its supplemental view, and an act's post-effect
-    /// read for the look that replies to it.
-    var walked: (read: MacAXRead, seam: [String: JSONValue])? {
-        get { lock.withLock { read } }
-        set { lock.withLock { read = newValue } }
-    }
-    func confirm(validate: @escaping @Sendable () async -> Bool = { true }) {
-        lock.lock(); defer { lock.unlock() }
-        self.validate = validate
-    }
-    func isCurrent() async -> Bool {
-        let check = lock.withLock { validate }
-        return await check?() ?? false
-    }
-}
+// Blueprint: | `MacFourVerbs+Observation.swift` | `MacFourVerbs`: `screen`, `observedReply`; self-window looks hand off to mounted `visible`, naming the person's app behind their (`appBehindMe`); observed and blind replies preserve failed effect verdicts and confirmed window/process removal across app changes |
 
 extension MacFourVerbs {
     // MARK: 1 — EYES
@@ -44,23 +19,7 @@ extension MacFourVerbs {
             + (omitted > 0 ? " (+\(omitted) more)" : "") + "\n"
     }
 
-    /// A FRESH look, rendered in the one canonical structure.
-    ///
-    /// `part` zooms: "the list", "the toolbar", "the Send button". Same shape,
-    /// scoped, more detail for that part. ORDINALS ARE NEVER RENUMBERED by a
-    /// zoom — row 3 is row 3 whether or not the render is scoped, because an
-    /// ordinal that means something different in a zoomed view is the same
-    /// class of bookkeeping trap the handles were. So a zoom onto content shows
-    /// the section WHOLE (its cap raised) and names which rows matched; a zoom
-    /// onto controls, which carry no ordinals, filters them.
-    ///
-    /// fable51 item 32a — `app` GLANCES SIDEWAYS. Naming a running app reads
-    /// ITS front window without activating it: no focus steal, no window flip
-    /// on User's screen, no three-call `go there / look / go back` dance. What
-    /// comes back says plainly that the window is not in front, because whether
-    /// it is in front decides whether she may act on it: `act` and `go` are
-    /// still frontmost verbs, and a background sighting is a LOOK, not a
-    /// license.
+    /// Render a fresh look with stable ordinals; zoom includes the named section or filters controls without renumbering.
     public func screen(part: String? = nil, app: String? = nil, structured: Bool = false) async -> MacFourVerbsReply {
         // The menu bar belongs to the app, not the window, so the window read
         // never spends its budget there; `part: menu` reads it on purpose.
@@ -157,13 +116,13 @@ extension MacFourVerbs {
                 verdict = MacActClosedLoop.verify(.pointer, pointerOnTarget: inside)
                 detail["pointer_on_target"] = inside.map(JSONValue.bool) ?? .null
             } else if let pressed, let before, mechanism["verified"] != .bool(true) {
-                verdict = Self.pressVerdict(pressed, before: before, after: after)
+                verdict = await Self.pressVerdict(pressed, before: before, after: after) {
+                    if case .seen(let again) = await sight(part: afterPart) { return again.percept }
+                    return nil
+                }
             }
             if let verdict { detail.merge(verdict.receipt) { _, new in new } }
             let verified = detail["verified"] == .bool(true)
-            detail["verification"] = .string(verified ? MotorVerificationState.satisfied.rawValue
-                : detail["status"] == .string("acted_mismatch") ? MotorVerificationState.failed.rawValue
-                : MotorVerificationState.unverified.rawValue)
             let note = Self.string(detail["status_note"])
                 ?? "The input went out, but the declared effect could not be read back."
             let neutral = mechanism["holding"] != nil && mechanism["holding"] != .null
@@ -177,7 +136,12 @@ extension MacFourVerbs {
     }
 
     /// Pointer and AX presses declare the same surface effect, judged from AX.
-    static func pressVerdict(_ pressed: ActTarget, before: Sighting, after: Sighting) -> MacActClosedLoop.ActClassification {
+    /// Only target-linked content counts; an unrelated screen delta cannot
+    /// prove the press. A target-linked readout also has to read the same again:
+    /// when it is the only evidence, the screen is looked at once more.
+    static func pressVerdict(
+        _ pressed: ActTarget, before: Sighting, after: Sighting, again: () async -> MacLookPercept?
+    ) async -> MacActClosedLoop.ActClassification {
         guard before.pid != nil, before.pid == after.pid,
               let beforePercept = before.percept, let afterPercept = after.percept else {
             return MacActClosedLoop.verify(.surface(nil))
@@ -190,7 +154,19 @@ extension MacFourVerbs {
         guard let entry = frame.entries[pressed.handle] else { return MacActClosedLoop.verify(.surface(nil)) }
         let diff = MacActClosedLoop.diff(before: frame, after: afterPercept,
                                          afterWindowTitle: afterPercept.windowTitle, afterCaps: caps(afterPercept))
-        return MacActClosedLoop.verify(.surface(nil), diff: diff, press: (frame, entry))
+        func texts(_ percept: MacLookPercept) -> [String: String] {
+            Dictionary(percept.readouts.map { (MacLookReadoutRecord.key(handle: $0.handle, path: $0.path), $0.text) }) { first, _ in first }
+        }
+        var held: [String: String] = [:]
+        if !diff.readoutsChanged.isEmpty,
+           !MacActClosedLoop.pressEvidence(diff, before: frame, pressed: entry, settled: { _ in false }).consequence,
+           let again = await again() {
+            let read = texts(afterPercept)
+            held = texts(again).filter { read[$0.key] == $0.value }
+        }
+        return MacActClosedLoop.verify(.surface(nil), diff: diff, press: (frame, entry, { row in
+            held[MacLookReadoutRecord.key(handle: row.handle, path: row.path)] != nil
+        }))
     }
 
     // MARK: - One sighting
@@ -215,23 +191,12 @@ extension MacFourVerbs {
         let place: String
         let appName: String?
         let bundleIdentifier: String?
-        /// fable51 item 31 — the process `wait` installs its AX observer on.
-        /// nil when the look could not name one, which the wait reports as "no
-        /// observer" rather than installing on a guess.
+        /// The observed pid for `wait`; nil reports no observer rather than guessing a process.
         let pid: Int32?
-        /// fable51 item 32a/b — whether the window this sighting DESCRIBES is
-        /// the one in front. Always true for an unanchored look; a measured
-        /// fact for an anchored one, and the fact the cross-app drag's raise
-        /// decision turns on.
+        /// Measured front state for anchored looks; cross-app drag uses it to decide whether to raise.
         let isFront: Bool
         let visibleFrame: MacAXFrame?
-        /// fable51 item 32b (gpt-5.5 review) — the frame of the WINDOW this
-        /// sighting describes, as the look's own anchor reported it. nil when
-        /// the host published none. Distinct from `visibleFrame`, which is the
-        /// screen's usable area, and from the union of `targets` frames, which
-        /// is only what was READ inside the window: a window's title bar,
-        /// toolbar and blank areas belong to the window and to neither of
-        /// those. The cross-app drag's coverage guard turns on this.
+        /// The anchored window's own frame, or nil; target unions and usable screen area cannot establish its coverage.
         let windowFrame: MacAXFrame?
         let targets: [ActTarget]
         let frameId: String
@@ -240,11 +205,9 @@ extension MacFourVerbs {
         /// selections. Normal prose screen calls do not emit this extra data.
         let controls: JSONValue
         let detail: [String: JSONValue]
-        /// Her-screen Phase 4 — the app in front when an ANCHORED look was
-        /// taken (name, bundle id), so a `front:true` act can put it back.
-        /// nil for an unanchored look, which is the front by construction.
+        /// The prior front app for restoring after an explicitly raised anchored act; nil for an unanchored look.
         var frontmostApp: (name: String, pid: Int32, window: JSONValue?)? = nil
-        /// Her-screen Phase 5 — the window's kind, the app map's key.
+        /// Window kind used as the app-map key.
         var windowKind: String? = nil
         /// Where keyboard focus is in this read (same paths as targets' sourceAXPath).
         var focusPath: [Int]? = nil
@@ -343,541 +306,6 @@ extension MacFourVerbs {
         }
     }
 
-    // Module-internal so paired perception fixtures can inspect the same
-    // private target/render compilation used by screen and act.
-    /// `seek`: a name the caller is about to act on. When the ordinary walk
-    /// stops short of it, the look searches deeper and frames it (`seekScoped`).
-    func sight(part: String?, app: String? = nil, seek: String? = nil,
-               observed: (read: MacAXRead, seam: [String: JSONValue])? = nil) async -> Sighted {
-        let captureBinding = MacSightCaptureBinding(frameID: UUID().uuidString)
-        captureBinding.walked = observed
-        let continuation = MacWorkContinuation.current.flatMap { $0.isPending ? $0 : nil }
-        let app = continuation?.app?.bundleIdentifier ?? continuation?.app?.name ?? app
-        let result: MacControlResult
-        do {
-            // fable51 item 32a — when `app` is named, the look is ANCHORED to
-            // that app's front window and nothing is activated. The dispatch
-            // body is the only difference; everything downstream reads the same
-            // percept shape, and `front` in the output tells the renderer the
-            // truth about what it is describing.
-            var body: [String: JSONValue] = ["grade": .string("look"), "app_map": .bool(true)]
-            if let app { body["app"] = .string(app) }
-            if let part { body["section"] = .string(part) }
-            if let seek = seek ?? part, !seek.isEmpty { body["seek"] = .string(seek) }
-            result = try await MacSightCaptureBinding.$current.withValue(captureBinding) {
-                try await host.dispatch(action: "look", body: body)
-            }
-        } catch {
-            return .blind(MacFourVerbsReply(
-                ok: false,
-                text: "I can't see the screen right now: \(error).",
-                detail: ["error": .string("\(error)")]
-            ))
-        }
-        let output = Self.object(result.output)
-        if result.error == "self_inspection_unsupported" {
-            let route = Self.ownAppRoute()
-            return .blind(MacFourVerbsReply(ok: route.ok, text: route.text,
-                detail: route.detail.merging(["frontmost_app": output["frontmost_app"] ?? .null,
-                    "running_apps": output["running_apps"] ?? .null,
-                    "running_apps_omitted": output["running_apps_omitted"] ?? .int(0)]) { current, _ in current }))
-        }
-        guard result.ok, let frameId = Self.string(output["frame_id"]) else {
-            let why = Self.string(output["message"])
-                ?? Self.string(output["note"])
-                ?? Self.lookRefusalWords(result.error ?? Self.string(output["status"]) ?? "unknown")
-            return .blind(MacFourVerbsReply(
-                ok: false,
-                text: Self.runningAppsLine(output) + "I can't see the screen right now. " + why,
-                // The refusal's own words, unwrapped. A caller with a different
-                // lead sentence (the cross-app drag: "I can't drop into Mail")
-                // must not have to strip this one's off the front.
-                detail: Self.operationDetail(result).merging([
-                    "error": .string(result.error ?? "look_failed"),
-                    "message": .string(why),
-                ]) { _, new in new }.merging(output["frontmost_app"].map { ["frontmost_app": $0] } ?? [:]) { current, _ in current }
-                    .merging(output["requested_app"].map { ["requested_app": $0] } ?? [:]) { current, _ in current }
-            ))
-        }
-
-        let percept = Self.percept(from: output)
-        if percept.app?.bundleIdentifier == MacWakeGuard.loginWindowBundleID {
-            return .blind(MacFourVerbsReply(
-                ok: false,
-                text: MacScreenLock.reply,
-                detail: ["error": .string("display_obstructed")]
-            ))
-        }
-
-        // An UNANCHORED look is frontmost-anchored by construction, so FRONT is
-        // a fact there rather than a guess; how many OTHER windows exist is not
-        // something this read can tell, and an unknown is omitted, never zeroed
-        // into a claim.
-        //
-        // fable51 item 32a — an ANCHORED look is a different case: the window
-        // it describes is usually BEHIND whatever User is using, and printing
-        // "in front" over it would be the render lying about the one fact that
-        // decides whether she may act on it. The handler publishes `front`;
-        // this reads it, and only falls back to `true` when the field is absent
-        // (an older host, where every look really was frontmost).
-        let isFront = Self.bool(output["front"]) ?? true
-        var full = MacScreenRender.screen(from: percept, isFront: isFront)
-        let (rows, controls) = Self.partition(percept)
-        var targets: [ActTarget] = []
-        var rowRoleOrdinals: [String: Int] = [:]
-        // Render limits keep the model's reply bounded; they must never become
-        // an input limit. A control or row revealed by a prior zoom remains a
-        // valid natural target even when the next full-screen render elides it.
-        for (index, row) in rows.enumerated() {
-            let kind = MacScreenRender.kindName(role: row.role)
-            let roleOrdinal = (rowRoleOrdinals[kind] ?? 0) + 1
-            rowRoleOrdinals[kind] = roleOrdinal
-            targets.append(ActTarget(
-                handle: row.handle,
-                label: MacScreenText(row.label, redacted: row.labelJSON).display,
-                kind: kind,
-                secret: row.secret,
-                ordinal: index + 1,
-                roleOrdinal: roleOrdinal,
-                enabled: row.enabled,
-                frame: row.frame,
-                viewId: nil,
-                mark: nil,
-                sourceAXPath: row.path
-            ))
-            targets[targets.count - 1].placeholder = row.placeholder
-        }
-        let controlOrdinals = MacScreenRender.controlRoleOrdinals(for: controls)
-        for control in controls {
-            let kind = MacScreenRender.kindName(role: control.role)
-            let display = MacScreenText(control.label, redacted: control.labelJSON).display
-            let roleOrdinal = controlOrdinals[control.handle]
-            targets.append(ActTarget(
-                handle: control.handle,
-                label: display,
-                kind: kind,
-                secret: control.secret,
-                ordinal: nil,
-                roleOrdinal: roleOrdinal,
-                enabled: control.enabled,
-                frame: control.frame,
-                viewId: nil,
-                mark: nil,
-                sourceAXPath: control.path
-            ))
-            targets[targets.count - 1].placeholder = control.placeholder
-        }
-
-        // Structural regions are addresses too. They are not click targets—
-        // clicking the centre of a sidebar would select an arbitrary row—but
-        // they are safe, useful destinations for scroll, move and hover. This
-        // closes the gap where SCREEN said WHERE=sidebar and ACT could not name
-        // that same visible region.
-        var landmarkRoleOrdinals: [String: Int] = [:]
-        for landmark in percept.landmarks {
-            guard let frame = landmark.frame, frame.w > 0, frame.h > 0 else { continue }
-            let label = MacScreenText(
-                landmark.label ?? landmark.kind,
-                redacted: landmark.labelJSON ?? .string(landmark.kind)
-            ).display
-            let roleOrdinal = (landmarkRoleOrdinals[landmark.kind] ?? 0) + 1
-            landmarkRoleOrdinals[landmark.kind] = roleOrdinal
-            targets.append(ActTarget(
-                handle: "",
-                label: label,
-                kind: landmark.kind,
-                ordinal: nil,
-                roleOrdinal: roleOrdinal,
-                enabled: true,
-                frame: frame,
-                regionOnly: true,
-                sourceAXPath: landmark.path
-            ))
-        }
-
-        var visibleFrame: MacAXFrame?
-        var pointer: MacPointerPosition?
-        var pointerFrame: MacAXFrame?
-        var supplementalDiagnostics: [String: JSONValue] = [:]
-        var nativeAXSupplement: MacFourVerbsSupplement?
-        let supplement = await MacSightCaptureBinding.$current.withValue(captureBinding) {
-            await supplementalSource?.observe(app: app)
-        }
-        if let detail = supplement?.diagnostics, detail["remedy"] != nil {
-            return .blind(MacFourVerbsReply(ok: false, text: Self.string(detail["message"]) ?? "The requested screen capture failed.", detail: detail))
-        }
-        if let supplement, await captureBinding.isCurrent(),
-           Self.sameApp(percept: percept, supplement: supplement) {
-            visibleFrame = supplement.visibleFrame
-            pointer = supplement.pointer
-            pointerFrame = supplement.pointerFrame ?? supplement.visibleFrame
-            supplementalDiagnostics = supplement.diagnostics
-            nativeAXSupplement = supplement
-            var addedTargets: [ActTarget] = []
-            var mergedAXPaths: Set<[Int]> = []
-            var addedAXOrdinals: [[Int]: Int] = [:]
-            for candidate in supplement.targets {
-                let display = candidate.label?.display
-                let combined = targets + addedTargets
-                let duplicateIndex = Self.supplementalDuplicateIndex(candidate, among: combined)
-                if let duplicateIndex {
-                    if let path = candidate.sourceAXPath { mergedAXPaths.insert(path) }
-                    // The semantic `look` lane intentionally keeps coordinates
-                    // private, while the fused view carries the same element's
-                    // frame and mark. Do not discard that richer address merely
-                    // because the label already exists: that was why Chrome's
-                    // visible link could be named but not hovered. Enrich the
-                    // semantic target in place so every visible mark has both
-                    // its stable AX handle and a safe physical point.
-                    let existing = combined[duplicateIndex]
-                    let mergedLabel = existing.label ?? display
-                    let mergedFrame = existing.frame ?? candidate.frame
-                    // A containing row and its filename are one named item,
-                    // but their marks still address DIFFERENT AX elements.
-                    // Keep the semantic leaf handle; never donate the row mark.
-                    let sameAXElement = existing.sourceAXPath == nil || candidate.sourceAXPath == nil
-                        || existing.sourceAXPath == candidate.sourceAXPath
-                    let mergedViewId = existing.viewId ?? (sameAXElement ? candidate.viewId : nil)
-                    let mergedMark = existing.mark ?? (sameAXElement ? candidate.mark : nil)
-                    var enriched = ActTarget(
-                        handle: existing.handle,
-                        label: mergedLabel,
-                        aliases: (existing.aliases + candidate.aliases).reduce(into: []) {
-                            if !$0.contains($1) { $0.append($1) }
-                        },
-                        kind: existing.kind,
-                        secret: existing.secret || candidate.secret,
-                        ordinal: existing.ordinal,
-                        roleOrdinal: existing.roleOrdinal,
-                        enabled: existing.enabled,
-                        frame: mergedFrame,
-                        observedFrame: existing.observedFrame ?? candidate.observedFrame,
-                        excludedFrames: existing.excludedFrames + candidate.excludedFrames,
-                        viewId: mergedViewId,
-                        mark: mergedMark,
-                        regionOnly: existing.regionOnly,
-                        physicalOnly: existing.physicalOnly || candidate.physicalOnly,
-                        motionUncertain: candidate.motionUncertain,
-                        sourceAXPath: existing.sourceAXPath ?? candidate.sourceAXPath,
-                        actions: sameAXElement ? candidate.actions : existing.actions,
-                        settableAttributes: sameAXElement ? candidate.settableAttributes : existing.settableAttributes
-                    )
-                    enriched.placeholder = existing.placeholder
-                    if duplicateIndex < targets.count {
-                        targets[duplicateIndex] = enriched
-                    } else {
-                        addedTargets[duplicateIndex - targets.count] = enriched
-                    }
-                    continue
-                }
-                let roleOrdinal = candidate.ordinal ?? Self.nextRoleOrdinal(
-                    for: candidate.kind, among: targets + addedTargets
-                )
-                if let path = candidate.sourceAXPath { addedAXOrdinals[path] = roleOrdinal }
-                addedTargets.append(ActTarget(
-                    handle: "",
-                    label: display,
-                    aliases: candidate.aliases,
-                    kind: candidate.kind,
-                    secret: candidate.secret,
-                    ordinal: rows.isEmpty ? candidate.ordinal : nil,
-                    roleOrdinal: roleOrdinal,
-                    enabled: candidate.enabled,
-                    frame: candidate.frame,
-                    observedFrame: candidate.observedFrame,
-                    excludedFrames: candidate.excludedFrames,
-                    viewId: candidate.viewId,
-                    mark: candidate.mark,
-                    regionOnly: candidate.regionOnly,
-                    physicalOnly: candidate.physicalOnly,
-                    motionUncertain: candidate.motionUncertain,
-                    sourceAXPath: candidate.sourceAXPath,
-                    actions: candidate.actions,
-                    settableAttributes: candidate.settableAttributes
-                ))
-            }
-            targets.append(contentsOf: addedTargets)
-            let supplementalControls = supplement.controls.compactMap { control -> MacScreenRender.Control? in
-                guard let path = control.sourceAXPath else { return control }
-                guard !mergedAXPaths.contains(path) else { return nil }
-                return MacScreenRender.Control(
-                    label: control.label, kind: control.kind,
-                    ordinal: addedAXOrdinals[path] ?? control.ordinal,
-                    value: control.value, states: control.states, provenance: control.provenance,
-                    abstain: control.abstain, sourceAXPath: path
-                )
-            }
-            let supplementalContents = supplement.contents.map { content in
-                MacScreenRender.Content(
-                    kind: content.kind, noun: content.noun,
-                    rows: content.rows.filter { row in
-                        row.sourceAXPath.map { !mergedAXPaths.contains($0) } ?? true
-                    },
-                    totalRows: content.totalRows, scrollable: content.scrollable, canvas: content.canvas
-                )
-            }
-            full = Self.adding(
-                contents: supplementalContents,
-                controls: supplementalControls,
-                values: supplement.values,
-                to: full
-            )
-        } else if supplement != nil {
-            // Not this look's own window: nothing from that capture may leave.
-            supplementalSource?.rejected()
-        }
-
-        // A focused empty text area has no title or value, so it is not an AX
-        // affordance — but the look frame deliberately minted a safe handle for
-        // it. Make that existing address visible as a role ordinal. This is the
-        // Notes case Agent found, expressed by shape rather than app name.
-        if let focus = percept.focus, let handle = focus.handle {
-            let kind = MacScreenRender.kindName(role: focus.role)
-            let label = focus.displayLabel ?? "focused \(kind)"
-            if let index = targets.firstIndex(where: { $0.handle == handle }) {
-                // A text area can already be an interactive affordance despite
-                // having no label. Focus gives that same safe handle a natural
-                // name; otherwise the duplicate target would leave it visible
-                // yet impossible to address by the focused label.
-                if targets[index].label == nil {
-                    targets[index].label = label
-                    targets[index].aliases = Self.editableKinds.contains(kind)
-                        ? Self.focusedEditableAliases(kind: kind)
-                        : []
-                    full = Self.adding(
-                        controls: [MacScreenRender.Control(
-                            label: MacScreenText(label, redacted: .string(label)),
-                            kind: kind,
-                            states: ["focused", "unnamed"],
-                            provenance: .ax
-                        )],
-                        to: full
-                    )
-                } else if Self.editableKinds.contains(kind) {
-                    targets[index].aliases = Self.focusedEditableAliases(kind: kind)
-                }
-            } else {
-                targets.append(ActTarget(
-                    handle: handle,
-                    label: label,
-                    aliases: Self.editableKinds.contains(kind)
-                        ? Self.focusedEditableAliases(kind: kind)
-                        : [],
-                    kind: kind,
-                    secret: MacScreenViewBuilder.isSecretField(role: focus.role, subrole: nil, label: focus.label),
-                    ordinal: nil,
-                    roleOrdinal: Self.nextRoleOrdinal(for: kind, among: targets),
-                    enabled: true,
-                    frame: nil,
-                    viewId: nil,
-                    mark: nil,
-                    sourceAXPath: focus.path
-                ))
-                full = Self.adding(
-                    controls: [MacScreenRender.Control(
-                        label: MacScreenText(label, redacted: .string(label)),
-                        kind: kind,
-                        states: ["focused", "unnamed"],
-                        provenance: .ax
-                    )],
-                    to: full
-                )
-            }
-        }
-
-        let zoom = part.flatMap { Self.zoom(full, part: $0) }
-        let pointerLine: String? = {
-            guard let pointer else { return nil }
-            guard let frame = pointerFrame else { return "POINTER: observed; surface position unavailable." }
-            guard pointer.isInside(frame) else { return "POINTER: outside the observed surface." }
-            let x = Int(((pointer.x - frame.x) / frame.w * 100).rounded())
-            let y = Int(((pointer.y - frame.y) / frame.h * 100).rounded())
-            return "POINTER: \(x)%,\(y)% of the observed surface (system position)."
-        }()
-        let windowKind = Self.string(output["window_kind"])
-        // A walk its caps cut must not read as the whole window: say so, and
-        // how to reach the rest (a named act searches past the cut).
-        let cutLine: String? = !percept.truncated ? nil
-            : percept.truncationReasons.contains("ax_error")
-            ? "partial: the app didn't answer every accessibility read; this is only the content read so far."
-            : percept.truncationReasons.contains(where: { ["depth_cap", "node_cap", "time_budget"].contains($0) })
-            ? "partial: budget reached; this is only the accessibility content read so far."
-            : nil
-        let rendererNote = Self.string(Self.object(output["seam"])["renderer_wait_note"])
-        // The AX native page already represents its text, values and controls
-        // together. The legacy render remains the independent pixel surface;
-        // it must never be appended as a second copy of an AX document.
-        guard var nativePage = result.nativePage else {
-            return .blind(MacFourVerbsReply(ok: false,
-                text: "raw view · accessibility · The look reader did not return a native screen page.",
-                detail: ["error": .string("screen_page_unavailable")]))
-        }
-        // Resolve the names and presses the native page actually offers,
-        // rather than a same-named decorative element from the raw percept.
-        for thing in nativePage.things {
-            guard let address = try? JSONValue.parse(Data(thing.address.utf8)),
-                  let handle = Self.string(Self.object(address)["handle"]),
-                  let index = targets.firstIndex(where: { $0.handle == handle }) else { continue }
-            targets[index].label = thing.name
-            if thing.verbs.contains("press") { targets[index].actions = ["AXPress"] }
-        }
-        var nativeBlocks = Self.array(output["native_page_blocks"]).map(Self.object)
-        if let nativeAXSupplement {
-            do { try Self.addingNativeAX(nativeAXSupplement, to: &nativePage, blocks: &nativeBlocks, targets: targets, frameID: frameId) }
-            catch {
-                return .blind(MacFourVerbsReply(ok: false,
-                    text: "raw view · accessibility · The supplemental native surfaces could not be compiled: \(error.localizedDescription)",
-                    detail: ["error": .string("screen_page_unavailable")]))
-            }
-        }
-        let fullNativeText = nativePage.text
-        var nativeZoomNote: String?
-        if let part, Self.string(Self.object(output["seam"])["scope_name"]) == part {
-            nativeZoomNote = "Read the named native section; its action addresses are unchanged."
-        } else if let part {
-            var page = nativePage
-            let blocks = nativeBlocks
-            var scopePaths: [[Int]] = []
-            var scopeAddresses: Set<String> = []
-            if case .hit(let target) = Self.resolve(part, among: targets) {
-                if let path = target.sourceAXPath { scopePaths = [path] }
-                else if let ordinal = target.roleOrdinal {
-                    let selector = "\(target.kind) \(ordinal)"
-                    for block in blocks where Self.string(block["target"]) == selector {
-                        if let address = Self.string(block["address"]) { scopeAddresses.insert(address) }
-                    }
-                }
-            } else if let zoom, zoom.scope == .controls {
-                scopePaths = zoom.screen.controls.compactMap(\.sourceAXPath)
-            } else if let zoom, zoom.scope == .readouts {
-                let text = Set(zoom.screen.values.compactMap { $0.text.display })
-                scopePaths = percept.readouts.filter { $0.displayText.map(text.contains) ?? false }.map(\.path)
-            }
-            if scopePaths.isEmpty {
-                let needle = Self.normalize(part)
-                scopePaths = blocks.compactMap { block in
-                    guard let text = Self.string(block["text"]),
-                          Self.normalize(text.trimmingCharacters(in: CharacterSet(charactersIn: "# \n"))) == needle else { return nil }
-                    return Self.path(block["path"])
-                }
-            }
-            if !scopePaths.isEmpty || !scopeAddresses.isEmpty {
-                let selected = blocks.enumerated().filter { index, block in
-                    if index < 2 { return true }
-                    if let address = Self.string(block["address"]), scopeAddresses.contains(address) { return true }
-                    let path = Self.path(block["path"])
-                    return !path.isEmpty && scopePaths.contains { path.starts(with: $0) || $0.starts(with: path) }
-                }.compactMap { Self.string($0.element["text"]) }
-                page.text = selected.joined(separator: "\n")
-                page.things = page.things.filter { page.text.contains("[" + SenseScreenThings.printed($0.address) + "]") }
-                nativePage = page
-                nativeZoomNote = "Read the named native section; its action addresses are unchanged."
-            } else {
-                if zoom?.scope == .visual {
-                    page.text = blocks.prefix(2).compactMap { Self.string($0["text"]) }.joined(separator: "\n")
-                    page.things = []
-                    nativePage = page
-                    nativeZoomNote = "Read the observed visual surface; its existing name and region targets are unchanged."
-                } else {
-                    nativeZoomNote = "No native section is named \"\(part)\"; this is the whole page."
-                }
-            }
-        }
-        let pixelText = MacScreenRender.pixelEvidence(zoom?.screen ?? full)
-        let fullPixelText = MacScreenRender.pixelEvidence(full)
-        let pageText = (nativeZoomNote.map { $0 + "\n" } ?? "") + nativePage.text + pixelText
-        let renderedText = (rendererNote.map { $0 + "\n" } ?? "")
-            + Self.runningAppsLine(output)
-            + pageText
-            + (cutLine.map { $0 + "\n" } ?? "") + (pointerLine.map { "\n" + $0 } ?? "")
-        var pageDetail: [String: JSONValue] = [:]
-        do {
-            var page = nativePage
-            page.text = renderedText
-            do { pageDetail["native_page"] = try JSONValue.parse(JSONEncoder().encode(page)) }
-            catch {
-                return .blind(MacFourVerbsReply(ok: false,
-                    text: "raw view · accessibility · The native screen page could not be encoded: \(error.localizedDescription)",
-                    detail: ["error": .string("screen_page_unavailable")]))
-            }
-        }
-        if let name = percept.app?.name {
-            // A scroll bar's thumb is a raw position (Freeform · 0.3936617029400535 on
-            // home, walk 6), not something the window says: home never shows it.
-            sightRecorder?.record(app: name, kind: windowKind,
-                                  readouts: percept.readouts.filter { $0.role != "AXValueIndicator" }.compactMap(\.displayText))
-        }
-        return .seen(Sighting(
-            render: renderedText,
-            effectRender: ([MacScreenPageCompiler.actLine(frameID: frameId), SenseScreenThings.accessibilityReadLine]
-                .reduce(fullNativeText) { $0.replacingOccurrences(of: "\n" + $1, with: "") } + fullPixelText)
-                .replacingOccurrences(of: frameId, with: "<frame>"),
-            pointer: pointer,
-            place: Self.place(percept),
-            appName: percept.app?.name,
-            bundleIdentifier: percept.app?.bundleIdentifier,
-            pid: percept.app.map(\.processIdentifier).flatMap { $0 == 0 ? nil : $0 },
-            isFront: isFront,
-            visibleFrame: visibleFrame,
-            windowFrame: Self.frame(output["window_frame"]),
-            targets: targets,
-            frameId: frameId,
-            zoomNote: nativeZoomNote ?? zoom?.note,
-            controls: .object([
-                "frame_id": .string(frameId),
-                "app": output["app"] ?? .null,
-                "front": output["front"] ?? .bool(false),
-                "affordances": output["affordances"] ?? .array([]),
-                "affordances_truncated": output["affordances_truncated"] ?? .bool(false),
-                "affordances_omitted": output["affordances_omitted"] ?? .int(0),
-            ]),
-            detail: [
-                "frame_id": .string(frameId),
-                "partial": .bool(cutLine != nil),
-                "truncation_reasons": .array(percept.truncationReasons.map(JSONValue.string)),
-                "bytes": .int(Int64(renderedText.utf8.count)),
-                "rows_dropped": .int(0),
-                "controls_dropped": .int(0),
-                "semantic_targets_omitted": .int(Int64(percept.affordancesOmitted)),
-            ].merging(pageDetail) { _, new in new }
-                .merging(rendererNote.map { ["renderer_wait_note": JSONValue.string($0)] } ?? [:]) { current, _ in current }
-                .merging(supplementalDiagnostics) { current, _ in current },
-            frontmostApp: {
-                let front = Self.object(output["frontmost_app"])
-                guard let name = Self.string(front["name"]),
-                      let pid = Self.int(front["pid"]).flatMap(Int32.init(exactly:)), pid > 0 else { return nil }
-                return (name, pid, front["window"])
-            }(),
-            windowKind: windowKind,
-            focusPath: percept.focus?.path,
-            editableHandles: {
-                // Password fields never count, whatever their role says.
-                let fieldRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
-                let secure = Set(percept.affordances.filter {
-                    $0.role == "AXSecureTextField" || $0.subrole == "AXSecureTextField"
-                }.map(\.handle))
-                var editable = Set(percept.affordances.filter {
-                    fieldRoles.contains($0.role) || $0.subrole == "AXSearchField"
-                }.map(\.handle)).subtracting(secure)
-                if let focus = percept.focus, let handle = focus.handle,
-                   fieldRoles.contains(focus.role), !secure.contains(handle) { editable.insert(handle) }
-                return editable
-            }(),
-            focusSecure: {
-                guard let focus = percept.focus else { return true }
-                let read = percept.affordances.first { $0.path == focus.path }
-                // A text field whose subrole this read never saw may be a password field.
-                if read == nil, ["AXTextField", "AXComboBox"].contains(focus.role) { return true }
-                return MacScreenViewBuilder.isSecretField(role: focus.role, subrole: nil, label: focus.label)
-                    || read.map {
-                        $0.secret || MacScreenViewBuilder.isSecretField(role: $0.role, subrole: $0.subrole, label: $0.label)
-                    } == true
-            }(),
-            obstructions: nativeAXSupplement?.obstructions ?? [],
-            percept: percept
-        ))
-    }
-
     static func ownAppRoute(verb: String? = nil, target: String = "", text: String? = nil) -> MacFourVerbsReply {
         var input: [String: JSONValue] = ["page": .string("visible")]
         let verb = verb?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -898,13 +326,37 @@ extension MacFourVerbs {
                 input = ["action": .string("chat.open_card"), "args": .object(["card": .string(card)])]
             }
         }
+        // A look with no app named, while her own app is in front, reads her
+        // own page; the person's app behind her is named so she can look past
+        // herself without guessing which app that is.
+        let behind = verb == nil ? Self.appBehindMe().map {
+            "NativeAgent (me) is in front; the person's app behind me is \($0): mac.look {app:\"\($0)\"} reads it, with pixels:true for its picture."
+        } : nil
         return MacFourVerbsReply(
             ok: false,
             text: "This is my own app. Use app with the input in next_action to \(executable ? "work in process" : "inspect its available controls; this gesture has no in-process equivalent").",
             detail: ["status": .string("in_process_route"),
                      "execute_in_process": .bool(executable),
+                     "behind": behind.map(JSONValue.string) ?? .null,
                      "next_action": .object(["tool": .string("app"), "input": .object(input)])]
         )
+    }
+
+    /// The owner of the topmost on-screen window that is not NativeAgent's own:
+    /// what the person sees behind her window. Owner names need no screen
+    /// recording grant; nil when nothing else is on screen.
+    static func appBehindMe() -> String? {
+        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]] else { return nil }
+        let me = getpid()
+        for window in windows {
+            guard (window[kCGWindowLayer as String] as? Int) == 0,
+                  let pid = window[kCGWindowOwnerPID as String] as? pid_t, pid != me,
+                  let name = window[kCGWindowOwnerName as String] as? String,
+                  !name.trimmingCharacters(in: .whitespaces).isEmpty else { continue }
+            return name
+        }
+        return nil
     }
 
     /// Keep temporal evidence and both drag endpoints in the same fresh sight.
@@ -948,17 +400,5 @@ extension MacFourVerbs {
             detail: ["error": .string("motion_sampling_app_changed")])
     }
 
-
-    /// A screenshot supplement is useful only when it describes the same app
-    /// as the semantic look it augments. The two captures are separate system
-    /// calls, so a foreground change between them must discard the supplement
-    /// rather than manufacture one mixed screen.
-    static func sameApp(percept: MacLookPercept, supplement: MacFourVerbsSupplement) -> Bool {
-        if let lookID = percept.app?.bundleIdentifier, let viewID = supplement.bundleIdentifier {
-            return lookID == viewID
-        }
-        guard let lookName = percept.app?.name, let viewName = supplement.appName else { return false }
-        return normalize(lookName) == normalize(viewName)
-    }
 
 }

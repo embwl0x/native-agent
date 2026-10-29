@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import MacControl
-// Blueprint: | `ResearchTransports.swift` | `URLSessionResearchHTTPClient.getBounded`; Docker discovery/start retains daemon readiness polling at 3-second intervals within its 90-second window, with no confirmed push replacement; subprocesses delegate to `MacControl.SystemProcessAdapter` with full output capture |
+// Blueprint: | `ResearchTransports.swift` | `URLSessionResearchHTTPClient.getBounded`; Docker discovery/start retains daemon readiness polling at 3-second intervals within its 90-second window, with no confirmed push replacement; subprocesses delegate to `MacControl.ProcessExecution` with full output capture |
 
 // MARK: - URLSession-backed HTTP client (production)
 
@@ -41,9 +41,7 @@ public struct SearXNGStartError: LocalizedError, Sendable {
 }
 
 /// Shells out to `docker ps --format '{{json .}}'` with an 8s deadline.
-/// Returns nil if docker isn't on PATH or the call fails, matching
-/// `Daemon.docker_searxng_candidates`'s `except Exception: return []`
-/// branch.
+/// Returns nil if docker isn't found or the call fails.
 public final class SystemDockerPSExecutor: Sendable {
     public init() {}
 
@@ -179,7 +177,6 @@ public final class SystemDockerPSExecutor: Sendable {
     }
 
     private func run(arguments: [String]) async -> String? {
-        // Locate `docker` on PATH (matches Python's shutil.which).
         guard let dockerPath = Self.whichDocker(),
               let result = await runResearchSubprocess(executable: dockerPath, arguments: arguments, timeout: 8),
               result.exitCode == 0 else { return nil }
@@ -206,7 +203,7 @@ func runResearchSubprocess(
     cwd: URL? = nil, timeout: TimeInterval
 ) async -> ProcessRunResult? {
     guard !Task.isCancelled else { return nil }
-    return try? await SystemProcessAdapter().run(
+    return try? await ProcessExecution().run(
         executable: executable, arguments: arguments, currentDirectory: cwd,
         environment: environment, standardInput: nil, timeoutSeconds: timeout,
         outputByteLimit: Int.max

@@ -71,8 +71,8 @@ var SenseXML = (() => {
         return node.children.map(text).join("");
     }
     function resolve(base, target) {
-        if (!target || /^[a-z][a-z\d+.-]*:/i.test(target) || target.startsWith("/")) fail("External or invalid package relationship");
-        const parts = base.split("/").slice(0, -1);
+        if (!target || /^[a-z][a-z\d+.-]*:/i.test(target) || target.startsWith("//")) fail("External or invalid package relationship");
+        const parts = target.startsWith("/") ? [] : base.split("/").slice(0, -1);
         for (const part of decodeURIComponent(target.split("#")[0]).split("/")) {
             if (part === "..") { if (!parts.length) fail("Relationship escapes package"); parts.pop(); }
             else if (part && part !== ".") parts.push(part);

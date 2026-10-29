@@ -1,4 +1,5 @@
 import Cognition
+import NativeAgentShared
 import NativeAgentCore
 import AppKit
 import PersistenceCore
@@ -260,7 +261,7 @@ struct MakeMockupView: NSViewRepresentable {
     let folder: URL
     let revision: Int
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeCoordinator() -> SandboxedPreview { SandboxedPreview() }
 
     func makeNSView(context: Context) -> WKWebView {
         let configuration = WKWebViewConfiguration()
@@ -279,11 +280,19 @@ struct MakeMockupView: NSViewRepresentable {
         context.coordinator.show(file, folder: folder, revision: revision, in: view)
     }
 
+    static func dismantleNSView(_ view: WKWebView, coordinator: SandboxedPreview) {
+        coordinator.cancel()
+        view.stopLoading()
+        view.navigationDelegate = nil
+    }
+
     @MainActor
-    final class Coordinator: NSObject, WKNavigationDelegate {
-        private var shown: (URL, Int)?
+    final class SandboxedPreview: NSObject, WKNavigationDelegate {
+        private var shown: (URL, URL, Int)?
         private var folder: URL?
         private var guarded = false
+        private let selectionRead = LatestRead()
+        private var preparation: Task<Void, Never>?
 
         private static let rules = """
         [{"trigger":{"url-filter":".*"},"action":{"type":"block"}},
@@ -294,25 +303,46 @@ struct MakeMockupView: NSViewRepresentable {
         """
         private static var compiled: WKContentRuleList?
 
+        func cancel() {
+            preparation?.cancel()
+            preparation = nil
+            selectionRead.write { folder = nil }
+        }
+
         func show(_ file: URL, folder: URL, revision: Int, in view: WKWebView) {
-            guard shown.map({ $0.0 != file || $0.1 != revision }) ?? true else { return }
-            shown = (file, revision)
-            self.folder = folder.standardizedFileURL
-            Task {
-                if Self.compiled == nil {
-                    Self.compiled = try? await WKContentRuleListStore.default()
-                        .compileContentRuleList(forIdentifier: "NativeAgentMakeOffline", encodedContentRuleList: Self.rules)
-                }
-                guard let rules = Self.compiled else {
-                    view.loadHTMLString("<p style=\"font: 13px -apple-system\">The offline guard did not compile, "
-                                        + "so this mockup was not opened.</p>", baseURL: nil)
-                    return
-                }
-                if !guarded {
-                    view.configuration.userContentController.add(rules)
-                    guarded = true
-                }
-                view.loadFileURL(file, allowingReadAccessTo: folder)
+            let folder = folder.standardizedFileURL
+            guard shown.map({ $0.0 != file || $0.1 != folder || $0.2 != revision }) ?? true else { return }
+            shown = (file, folder, revision)
+            cancel()
+            view.stopLoading()
+            preparation = Task { [weak self, weak view] in
+                guard let self, let view, !Task.isCancelled else { return }
+                _ = await selectionRead.read({ () -> (rules: WKContentRuleList?, failure: String?) in
+                    if let compiled = Self.compiled { return (compiled, nil) }
+                    do {
+                        Self.compiled = try await WKContentRuleListStore.default()
+                            .compileContentRuleList(forIdentifier: "NativeAgentMakeOffline", encodedContentRuleList: Self.rules)
+                        return (Self.compiled, nil)
+                    } catch {
+                        return (nil, TurnSecretRedactor.redactText(error.localizedDescription))
+                    }
+                }, publish: { prepared in
+                    guard let rules = prepared.rules else {
+                        let reason = (prepared.failure ?? "WebKit returned no offline rule list.")
+                            .replacingOccurrences(of: "&", with: "&amp;")
+                            .replacingOccurrences(of: "<", with: "&lt;")
+                            .replacingOccurrences(of: ">", with: "&gt;")
+                        view.loadHTMLString("<p style=\"font: 13px -apple-system\">Could not prepare the offline preview: "
+                                            + reason + " This mockup was not opened.</p>", baseURL: nil)
+                        return
+                    }
+                    if !self.guarded {
+                        view.configuration.userContentController.add(rules)
+                        self.guarded = true
+                    }
+                    self.folder = folder
+                    view.loadFileURL(file, allowingReadAccessTo: folder)
+                })
             }
         }
 
@@ -320,7 +350,7 @@ struct MakeMockupView: NSViewRepresentable {
             let url = action.request.url
             if let url, ["about", "data", "blob"].contains(url.scheme ?? "") { return .allow }
             guard let url, url.isFileURL, let folder,
-                  url.standardizedFileURL.path.hasPrefix(folder.path + "/") else { return .cancel }
+                  let tail = NativeAgentWorkspaceRoot.relativePath(url.standardizedFileURL.path, under: folder.path), !tail.isEmpty else { return .cancel }
             return .allow
         }
     }
@@ -331,15 +361,19 @@ struct MakeQuickLookView: NSViewRepresentable {
     let file: URL
     let revision: Int
 
-    final class Coordinator { var shown: (URL, Int)? }
+    final class QuickLookSelection { var shown: (URL, Int)? }
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeCoordinator() -> QuickLookSelection { QuickLookSelection() }
 
-    func makeNSView(context: Context) -> QLPreviewView {
-        QLPreviewView(frame: .zero, style: .normal)!
+    func makeNSView(context: Context) -> NSView {
+        guard let preview = QLPreviewView(frame: .zero, style: .normal) else {
+            return NSHostingView(rootView: Text("Quick Look preview unavailable.").foregroundStyle(.secondary))
+        }
+        return preview
     }
 
-    func updateNSView(_ view: QLPreviewView, context: Context) {
+    func updateNSView(_ view: NSView, context: Context) {
+        guard let view = view as? QLPreviewView else { return }
         guard context.coordinator.shown.map({ $0.0 != file || $0.1 != revision }) ?? true else { return }
         let sameFile = context.coordinator.shown?.0 == file
         context.coordinator.shown = (file, revision)

@@ -1,5 +1,6 @@
 import ApprovalInbox
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Procedures
@@ -35,16 +36,25 @@ public enum WorkshopProcedureExactActivationQualifier {
             return nil
         }
 
-        let boundedReceipts = Array(receipts.suffix(64))
+        return try await qualifiedProposal(dataRoot: dataRoot, artifact: artifact,
+            receipts: Array(receipts.suffix(64)), evaluatedAt: evaluatedAt.map(iso8601))
+    }
+
+    private static func qualifiedProposal(
+        dataRoot: URL, artifact: DeclarativeProcedureArtifact,
+        receipts: [ProcedureInvocationReceipt], evaluatedAt: String?
+    ) async throws -> ProcedureExactActivationProposal? {
         let records = await SwiftNativeWorkshopRunner(root: dataRoot).listAll()
         let recordGroups = Dictionary(grouping: records, by: {
             CausalTransitionEvidence.opaqueIdentity($0.id)
         })
         let runner = SwiftNativeWorkshopRunner(root: dataRoot)
         var qualified: [(receipt: ProcedureInvocationReceipt, trajectory: ProcedureTrajectory)] = []
-        qualified.reserveCapacity(boundedReceipts.count)
-        for receipt in boundedReceipts {
-            guard let matches = recordGroups[receipt.opaqueInputReference],
+        qualified.reserveCapacity(receipts.count)
+        for receipt in receipts {
+            guard receipt.dispatched, receipt.verified, receipt.authorityRechecked,
+                  receipt.canonicalEvidenceMatched, receipt.executorStatus == .verifiedSuccess,
+                  let matches = recordGroups[receipt.opaqueInputReference],
                   matches.count == 1,
                   let record = matches.first,
                   record.status == "completed",
@@ -52,32 +62,17 @@ public enum WorkshopProcedureExactActivationQualifier {
                   record.planningProviderCallCount == 0,
                   record.planningRemovableOrchestrationProviderCallCount == 0,
                   record.hasExactZeroProviderStepAccounting,
-                  SwiftNativeWorkshopRunner.procedureContractProjection(record: record)
+                  SwiftNativeWorkshopRunner.procedureContractProjection(plan: record.plan,
+                    trustRequired: record.trustRequired, triggerSource: record.triggerSource)
                     .procedureShapeIdentity == artifact.procedureShapeIdentity else {
                 return nil
             }
-            let timeline = try await runner.readTimeline(record.id)
-            let extraction = ProcedureTrajectoryExtractor.extract(
-                SwiftNativeWorkshopRunner.causalTransitionEvidence(
-                    executionId: record.id,
-                    timeline: timeline,
-                    record: record
-                )
-            )
-            guard extraction.rejections.isEmpty,
-                  extraction.trajectories.count == 1,
-                  let trajectory = extraction.trajectories.first,
+            guard let trajectory = try await runner.matchingProcedureTrajectory(for: artifact, record: record),
                   trajectory.terminalClass == .verifiedSuccess,
                   trajectory.providerCallCount == 0,
                   trajectory.inputInstanceIdentity == receipt.opaqueInputReference else {
                 return nil
             }
-            let replay = ProcedureReplayEngine.replay(
-                artifact,
-                against: trajectory
-            )
-            guard replay.status == .matched,
-                  replay.matchedStepCount == artifact.transitionTable.count else { return nil }
             qualified.append((receipt, trajectory))
         }
         guard qualified.count >= ProcedureExactActivationProposal.minimumVerifiedExecutions else {
@@ -110,7 +105,7 @@ public enum WorkshopProcedureExactActivationQualifier {
             // Default to immutable canonical evidence time, not wall-clock
             // qualification time. Reconciliation of unchanged evidence must
             // produce the same digest and therefore the same approval card.
-            evaluatedAt: evaluatedAt.map(iso8601) ?? latestCanonicalEnd
+            evaluatedAt: evaluatedAt ?? latestCanonicalEnd
         )
         return proposal.validates ? proposal : nil
     }
@@ -137,74 +132,19 @@ public enum WorkshopProcedureExactActivationQualifier {
         }
         do {
             let invocationIDs = Set(proposal.qualifyingInvocationIDs)
-            let receipts = try await ProcedureArtifactStore(dataRoot: dataRoot)
-                .loadInvocationReceipts(artifactID: artifact.id)
-                .filter { invocationIDs.contains($0.invocationID) }
-            guard receipts.count == invocationIDs.count,
-                  Set(receipts.map(\.invocationID)) == invocationIDs else { return false }
-
-            let records = await SwiftNativeWorkshopRunner(root: dataRoot).listAll()
-            let recordGroups = Dictionary(grouping: records, by: {
-                CausalTransitionEvidence.opaqueIdentity($0.id)
-            })
-            let runner = SwiftNativeWorkshopRunner(root: dataRoot)
-            var trajectories: [ProcedureTrajectory] = []
-            trajectories.reserveCapacity(receipts.count)
-            for receipt in receipts {
-                guard receipt.dispatched,
-                      receipt.verified,
-                      receipt.authorityRechecked,
-                      receipt.canonicalEvidenceMatched,
-                      receipt.executorStatus == .verifiedSuccess,
-                      let matches = recordGroups[receipt.opaqueInputReference],
-                      matches.count == 1,
-                      let record = matches.first,
-                      record.status == "completed",
-                      record.verification?.status == .satisfied,
-                      record.planningProviderCallCount == 0,
-                      record.planningRemovableOrchestrationProviderCallCount == 0,
-                      record.hasExactZeroProviderStepAccounting,
-                      SwiftNativeWorkshopRunner.procedureContractProjection(record: record)
-                        .procedureShapeIdentity == artifact.procedureShapeIdentity else {
-                    return false
-                }
-                let timeline = try await runner.readTimeline(record.id)
-                let extraction = ProcedureTrajectoryExtractor.extract(
-                    SwiftNativeWorkshopRunner.causalTransitionEvidence(
-                        executionId: record.id,
-                        timeline: timeline,
-                        record: record
-                    )
-                )
-                guard extraction.rejections.isEmpty,
-                      extraction.trajectories.count == 1,
-                      let trajectory = extraction.trajectories.first else { return false }
-                let replay = ProcedureReplayEngine.replay(
-                    artifact,
-                    against: trajectory
-                )
-                guard
-                      trajectory.terminalClass == .verifiedSuccess,
-                      trajectory.providerCallCount == 0,
-                      trajectory.inputInstanceIdentity == receipt.opaqueInputReference,
-                      replay.status == .matched,
-                      replay.matchedStepCount == artifact.transitionTable.count else {
-                    return false
-                }
-                trajectories.append(trajectory)
+            // A retry after an unverified attempt appends a second row for the
+            // same invocation; the verified row is the one that settles it.
+            var byInvocation: [String: ProcedureInvocationReceipt] = [:]
+            for receipt in try await ProcedureArtifactStore(dataRoot: dataRoot).loadInvocationReceipts(artifactID: artifact.id)
+            where invocationIDs.contains(receipt.invocationID) {
+                if let kept = byInvocation[receipt.invocationID], kept.verified, !receipt.verified { continue }
+                byInvocation[receipt.invocationID] = receipt
             }
-            let durations = trajectories.map(\.durationMilliseconds).sorted()
-            let percentileIndex = min(
-                durations.count - 1,
-                max(0, Int(ceil(Double(durations.count) * 0.95)) - 1)
-            )
-            return Set(trajectories.map(\.id))
-                    == Set(proposal.qualifyingTrajectoryIDs)
-                && Set(trajectories.map(\.inputInstanceIdentity)).count
-                    == proposal.distinctInputCount
-                && trajectories.allSatisfy { $0.providerCallCount == 0 }
-                && durations[percentileIndex]
-                    == proposal.p95ExecutionLatencyMilliseconds
+            let receipts = Array(byInvocation.values)
+            guard Set(byInvocation.keys) == invocationIDs else { return false }
+
+            return try await qualifiedProposal(dataRoot: dataRoot, artifact: artifact,
+                receipts: receipts, evaluatedAt: proposal.evaluatedAt) == proposal
         } catch {
             return false
         }
@@ -218,7 +158,7 @@ public enum WorkshopProcedureExactActivationQualifier {
 /// Bounded event seam from verified Workshop consequences into local review.
 /// It stages at most one card for the exact evidence digest and stops doing
 /// work once the exact procedure is active. It never resolves the card.
-public enum WorkshopProcedureExactActivationCoordinator {
+public enum WorkshopProcedureActivation {
     /// Returns how many activation-review cards it staged (zero or one).
     @discardableResult
     public static func reconcileLocalFileCopyIfQualified(

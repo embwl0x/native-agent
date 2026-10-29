@@ -135,12 +135,10 @@ public enum HarnessQueue {
         try await settle(dataRoot: dataRoot) { key in notes.first { key.hasPrefix($0.key) }?.value }
     }
 
-    /// Retire per-record findings after their rollup is filed, one item transaction at a time.
+    /// Retire per-record findings after their rollup is filed, in one settlement pass.
     public static func fold(keyPrefixes: [String], into title: String, dataRoot: URL) async throws {
-        let store = SwiftNativeDeskStore(dataRoot: dataRoot)
-        for item in try await store.liveState().items where item.project == project {
-            guard let key = item.findingKey, keyPrefixes.contains(where: { key.hasPrefix($0) }) else { continue }
-            try await settle(dataRoot: dataRoot) { $0 == key ? "folded into " + title : nil }
+        try await settle(dataRoot: dataRoot) { key in
+            keyPrefixes.contains(where: { key.hasPrefix($0) }) ? "folded into " + title : nil
         }
     }
 

@@ -2,24 +2,18 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Transcripts
-// Blueprint: | `HumanConversationIndex.swift` | `HumanConversationIndex` enum; `string`, `object` |
+// Blueprint: | `HumanConversationIndex.swift` | `HumanConversationIndex` enum; `rows`, `list` |
 
 package enum HumanConversationIndex {
-    package static func string(_ value: JSONValue?) -> String? {
-        if case .string(let text)? = value, !text.isEmpty { return text }; return nil
-    }
-    package static func object(_ value: JSONValue?) -> [String: JSONValue] {
-        if case .object(let row)? = value { return row }; return [:]
-    }
     package static func rows(dataRoot: URL) throws -> [[String: JSONValue]] {
         try ChatSessionIndexFile.loadObjectRowsForMutation(at: dataRoot.appendingPathComponent("chat/sessions.json"))
             .filter { row in
-                let source = string(row["source"]) ?? "app"
+                let source = row["source"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? "app"
                 return ["app", "chat", "mac", "telegram", "slack", "ios", "iphone", "mobile", "icloud"].contains(source)
                     && row["archived"] != .bool(true)
-                    && string(row["id"]).flatMap(NativeAgentChatSessionID.normalizedPathComponent) != nil
+                    && row["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }).flatMap(NativeAgentChatSessionID.normalizedPathComponent) != nil
             }
-            .sorted { (string($0["updatedAt"]) ?? "") > (string($1["updatedAt"]) ?? "") }
+            .sorted { ($0["updatedAt"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? "") > ($1["updatedAt"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? "") }
     }
 
     /// The workspace's list of conversations with User, newest first, 8 a page
@@ -54,7 +48,7 @@ package enum HumanConversationIndex {
     /// A preview as it is shown now: read under its stored stamp through the
     /// one per-line path first; a preview with no stamp is not shown at all.
     package static func shownPreview(_ row: [String: JSONValue]) -> String? {
-        guard let text = string(row["lastMessagePreview"]), let stamp = previewStamp(row) else { return nil }
+        guard let text = row["lastMessagePreview"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }), let stamp = previewStamp(row) else { return nil }
         ContactThread.consume(.init(text: text, stamp: stamp), mark: { peer, _ in
             AgentWorkspacePorts.current.tools.markConsumed(peer: peer)
         })

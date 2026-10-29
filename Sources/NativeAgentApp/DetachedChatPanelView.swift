@@ -6,24 +6,10 @@ import ChatSessionWork
 import ToolRegistry
 
 // Blueprint: | `DetachedChatPanelView.swift` | `DetachedChatPanelView`: session-bound transcript/composer, search, speech and attachment intake through shared chat owners |
-// DetachedChatPanelView — the focused chat surface hosted inside a
-// DetachedChatPanel (free-floating window for a single session).
-//
-// Deliberately narrower than the main ChatView: no session sidebar, model
-// picker, persona switcher, file-access toggle, context bar, or slash-command
-// help. It does include the same practical composer affordances the user expects:
-// growing text input, voice input, screen capture, and file/image attachment.
-// It reuses the main chat's render components (ChatMessageListView →
-// MessageBubble/ToolPillView/ToolCallGroup/InlineApprovalCard) so message
-// styling stays consistent across surfaces.
-//
-// Binds to AppModel's per-session storage (Phase 0): reads
-// `appModel.engine.transcripts.messages(for: sessionId)` and sends via
-// `appModel.sendChat(_, sessionId:)`. Because that storage is a tracked
-// @Observable dict, deltas streamed into this session's slot — even while
-// the main window shows a different session — re-render here live.
+// Detached transcripts and sends stay bound to one session through shared chat owners.
 
 import SwiftUI
+import NativeAgentShared
 import ScreenVision
 import AppKit
 import UniformTypeIdentifiers
@@ -36,41 +22,23 @@ struct DetachedChatPanelView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var didInitialLoad = false
-    // Render-cost audit F1 — streaming-delta scroll throttle.
-    //
-    // `.onChange(of: messages.last?.content)` fires on every coalesced delta
-    // (~14 Hz for the whole turn, `ChatStreamAccumulator.publishInterval = 0.07`), and each
-    // one forced a LazyVStack realization/measurement pass toward the bottom
-    // anchor. The main window has solved this since chat-smoothness phase 1;
-    // the panel just never got the coordinator. Same type, same call shape as
-    // `ChatView+SessionActions.swift:72-80`.
-    //
-    // 2026-09-06: the other half of F1 has landed. The panel now installs the
-    // main window's scroll-wheel and drag handling, so scrolling up during a
-    // streaming reply disarms follow and the reader is left where they are;
-    // scrolling back down to the bottom re-arms it.
-    @State private var scrollCoordinator = ChatScrollCoordinator()
+    // Scrolling up disarms follow; returning to the bottom re-arms it.
+    @State private var scrollCoordinator = ChatScrollFollow()
+    /// Room the transcript lends the floating turn card.
+    @State private var cardRoom = ChatTurnCardClearance()
     /// The detached window is a real chat transcript, so it draws real cards.
     /// It used to mount `ChatMessageListView` with no card source at all: a
     /// request that raised "Connect GitHub" in a detached window showed a bare
     /// tool row with nothing to tap, and the same conversation in the main
     /// window showed the card. Window controls, shared transcript projection.
     @State private var inlineCards = InlineInteractionChatBinding()
-    /// D2 review fix: the routing decision must know the dynamically
-    /// registered slash tools too, or a dynamic command typed here falls
-    /// through as chat text while the built-ins toast. Same store the main
-    /// window uses; refreshed once per panel.
-    private var capabilitiesStore: ToolsFacade { appModel.engine.tools }
     @State private var isCapturing = false
     @State private var isRetryingLoad = false
     @State private var toastMessage: String?
     @State private var voiceInput = VoiceInputCapture.forChat()
     @State private var voiceDraftBeforeListening = ""
     @State private var voiceDraftRevision: UInt64 = 0
-    /// 2026-09-06: this dictation's generation. Bumped by every end — a send,
-    /// a stop, the panel closing — so a start still waiting on the microphone
-    /// permission prompt cannot begin afterwards, and so a transcript that
-    /// arrives after the composer was cleared is not written back into it.
+    /// Ending dictation invalidates pending starts and late transcripts.
     @State private var voiceGeneration = 0
     /// True only between a successful `startListening` and the next end.
     @State private var voiceAcceptsTranscript = false
@@ -78,17 +46,9 @@ struct DetachedChatPanelView: View {
     @State private var transcriptSearch = MacChatTranscriptSearchController()
     @State private var showTranscriptSearch = false
     @State private var transcriptSearchFocusRequest: UInt = 0
-    /// 2026-09-06: the "show me the latest" signal the windowed transcript
-    /// needs. This panel never passed one, so after "Earlier messages" pinned
-    /// the list to an older page nothing sent it back — a reply to a message
-    /// sent from here rendered offscreen forever. Bumped on the same events
-    /// the main window bumps its own: a send, a screenshot send.
+    /// Sends and screenshot sends return the transcript to its latest page.
     @State private var transcriptLatestRequest = 0
-    /// 2026-09-06: held from the synchronous start of a send until its
-    /// acceptance returns. The composer's text is not cleared until then, so
-    /// a second Return in that window used to submit the very same draft
-    /// again — the first turn is running by then, so the duplicate landed in
-    /// the send-next queue and was spoken twice.
+    /// Hold the send latch synchronously until acceptance returns to prevent duplicate drafts.
     @State private var isSubmittingSend = false
 
     private var panelDraft: ChatComposerDraft { appModel.composerDraft(for: sessionId) }
@@ -134,8 +94,7 @@ struct DetachedChatPanelView: View {
         sessionPresentation.isAvailable
     }
 
-    /// The conversation's current name, or nil once it is gone. 2026-09-06:
-    /// watched so a rename reaches this window's titlebar.
+    /// The conversation's current name, or nil once it is gone.
     private var sessionTitle: String? {
         if case .available(let title) = sessionPresentation { return title }
         return nil
@@ -191,12 +150,31 @@ struct DetachedChatPanelView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            InboxStripContainer { notes in
+            InboxStripContainer(sessionID: sessionId, interactionBinding: inlineCards) { notes in
                 notes
                     .frame(maxWidth: .infinity, alignment: .trailing)
                     .padding(.horizontal, 12)
             }
             messageScrollback
+                // Desk 658.11: the same shared live-turn card as the main window,
+                // keyed on THIS window's session. It floats over the transcript's
+                // live edge and borrows its room from the transcript's end, so it
+                // never resizes the scroll view (TurnCardRoom).
+                .overlay(alignment: .bottom) {
+                    TurnCardRoom(shows: TurnCardReadout.isVisible(
+                        appModel.engine.turns.lifecycle(for: sessionId),
+                        sessionId: sessionId,
+                        approvals: appModel.engine.approvals.records,
+                        parseTimestamp: NativeTimestampFormat.parseISO8601FractionalFirst
+                    ), floor: 0, store: cardRoom) {
+                        MacChatTurnCardHost(
+                            sessionId: sessionId,
+                            onStop: { appModel.stopChatStream(sessionId: sessionId) }
+                        )
+                        .padding(.horizontal, 14)
+                        .padding(.bottom, 6)
+                    }
+                }
             Divider()
             inputBar
                 .disabled(!sessionIsAvailable)
@@ -217,7 +195,6 @@ struct DetachedChatPanelView: View {
             // task(id:) re-fires if the panel is somehow rebound to a new
             // session, but in practice sessionId is immutable per panel.
             guard !didInitialLoad else { return }
-            await capabilitiesStore.refreshSlashCatalog()
             didInitialLoad = true
             await appModel.loadDetachedSessionMessages(sessionId)
             await appModel.engine.transcripts.reclaimContinuations(for: sessionId)
@@ -231,10 +208,7 @@ struct DetachedChatPanelView: View {
                 await appModel.refreshDetachedChatMessagesAfterTurn(sessionId: sessionId)
             }
         }
-        // 2026-09-06: the panel's titlebar was set once, when the window was
-        // built. Renaming the conversation — or its first auto-title arriving
-        // after the window opened — left the old name up. AppKit owns the
-        // titlebar, so the change is handed back to the window controller.
+        // AppKit owns the titlebar; pass title changes to the window controller.
         .onChange(of: sessionTitle) { _, title in
             guard let title else { return }
             DetachedChatWindowController.shared.updateTitle(
@@ -267,13 +241,7 @@ struct DetachedChatPanelView: View {
             }
         }
         .onDisappear {
-            // F1: invalidate any scroll scheduled against the now-dead proxy
-            // (same contract as `ChatView.swift:1032`).
-            scrollCoordinator.markViewDisappeared()
-            // 2026-09-06: this panel had no dictation cleanup at all — a
-            // closed panel kept the microphone open, and a start still waiting
-            // on the permission prompt began listening for a window that was
-            // already gone.
+            // Closing the panel also cancels dictation awaiting permission.
             endPanelDictation()
         }
         .focusedSceneValue(\.chatCommandActions, ChatFocusedCommandActions(
@@ -321,9 +289,6 @@ struct DetachedChatPanelView: View {
                                 Text(reason).font(.caption).foregroundStyle(.red).textSelection(.enabled)
                             }
                         }
-                        .environment(\.inlineCardSource) { [appModel] rowID in
-                            appModel.engine.transcripts.cards(forRow: rowID, in: sessionId)
-                        }
                         .environment(\.inlineCardAction) { [inlineCards, appModel] card, action in
                             inlineCards.handle(card: card, action: action, appModel: appModel)
                         }
@@ -332,32 +297,15 @@ struct DetachedChatPanelView: View {
                     // progress has exactly one surface now — MacChatTurnCardHost
                     // above the composer — so this window and the main window
                     // show the same one thing instead of stacking two.
-                    Color.clear.frame(height: 1).id(detachedBottomAnchor)
+                    ChatTranscriptBottomAnchor(anchorID: detachedBottomAnchor, store: cardRoom, margin: 1)
                 }
                 .padding(.horizontal, 18)
                 .padding(.vertical, 14)
                 .frame(maxWidth: .infinity, alignment: .topLeading)
-                // phase 6: bubble entrance is driven by the append seam's
-                // withAnimation (appendChatMessage) — no list-level animation
-                // key here, so wholesale replaces stay instant.
+                // animateMacChatMutation drives bubble entrance; wholesale
+                // replacements stay instant without list-level animation.
             }
-            // Anchor the INITIAL offset only (User, 2026-07-25 round 2). The
-            // first-round blanket .defaultScrollAnchor(.bottom) fixed opening
-            // at the top but re-anchored on EVERY content-size change too:
-            // hovering a bubble inserts its timestamp row
-            // (ChatMessageListView:919) → height change → re-pin → the view
-            // "pops up from the bottom"; a live window resize reflows every
-            // LazyVStack row per frame → re-pin per frame → scroll thrown
-            // across the conversation. Scoping to .initialOffset keeps the
-            // open-at-bottom win while size changes leave the offset alone
-            // (mid-list hover now nudges only content BELOW the hovered
-            // bubble, same as the main window). Resize-while-at-bottom is
-            // re-pinned explicitly below via the bottom sentinel. macOS 14
-            // fallback keeps the blanket anchor — open-at-bottom is the
-            // bigger win and User runs 26.x.
-            // Empty/placeholder states anchor to the TOP: the anchor also
-            // aligns content SHORTER than the viewport, and a lone empty-state
-            // card shoved to the bottom of a 600pt panel reads as broken.
+            // Anchor the initial transcript at the bottom and empty states at the top.
             .modifier(DetachedScrollAnchorModifier(isEmpty: messages.isEmpty || !sessionIsAvailable))
             .safeAreaInset(edge: .top, spacing: 0) {
                 if showTranscriptSearch {
@@ -372,45 +320,18 @@ struct DetachedChatPanelView: View {
                 }
             }
             .onChange(of: messages.count) {
-                if showTranscriptSearch {
-                    refreshTranscriptSearchIfPresented()
-                } else if scrollCoordinator.autoFollow {
-                    // 2026-09-06: an arriving message used to scroll the panel
-                    // to the bottom unconditionally, so a reader who had
-                    // scrolled up was dragged back down by every append.
-                    // 2026-09-13: and it jumps rather than eases — the bottom
-                    // anchor has already taken the viewport there, so an ease
-                    // would only re-lay the column for 11 more frames.
+                if !showTranscriptSearch, scrollCoordinator.autoFollow {
+                    // Auto-follow jumps without animation; the bottom anchor already positions the viewport.
                     proxy.scrollTo(detachedBottomAnchor, anchor: .bottom)
                 }
             }
-            .onChange(of: messages.last?.content) {
-                // User, 2026-09-13: no scroll command per streamed chunk. The
-                // `.sizeChanges` bottom anchor (DetachedScrollAnchorModifier)
-                // keeps the bottom pinned while follow is armed, so only the
-                // open search bar still needs feeding here.
-                if showTranscriptSearch {
-                    refreshTranscriptSearchTailIfPresented()
-                }
-            }
-            // 2026-09-14: the streamed chunk publishes the tail row's box, not
-            // the transcript, so the open search bar is fed from there.
+            // Streaming publishes the tail row's box, which feeds the open search bar.
             .followsStreamingTail(
                 messageID: messages.last?.id,
                 enabled: showTranscriptSearch,
                 onChanged: { refreshTranscriptSearchTailIfPresented() }
             )
-            .onChange(of: messages.last?.id) {
-                refreshTranscriptSearchTailIfPresented()
-            }
-            .onChange(of: messages.first?.id) {
-                refreshTranscriptSearchIfPresented()
-            }
-            // 2026-09-06: an edit to a row that is neither the first nor the
-            // last — a streaming reply that a tool row has since been appended
-            // after — changes no count and no end id, so open search kept
-            // showing results for text that is no longer there. The
-            // transcript's own mutation counter catches every such write.
+            // Transcript mutations refresh search even when count and endpoint IDs stay unchanged.
             .onChange(of: appModel.engine.transcripts.structureVersion(for: sessionId)) {
                 refreshTranscriptSearchIfPresented()
             }
@@ -439,10 +360,7 @@ struct DetachedChatPanelView: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 28))
                     .foregroundStyle(.yellow)
-                // Public-era honesty copy (2026-08-01): the headline used to be
-                // a list of internal endpoint names. Plain sentence first, what
-                // to try second, endpoint names last in a smaller line that
-                // also carries the full list as a tooltip.
+                // Show the failure and recovery before endpoint details.
                 Text("This conversation could not be loaded")
                     .font(NativeAgentFont.section)
                 Text(DetachedChatLoadFailureCopy.message)
@@ -550,23 +468,6 @@ struct DetachedChatPanelView: View {
                 }
             }
 
-            // Desk 658.11: the same shared live-turn card as the main window.
-            // Keyed on THIS window's session, so a concurrent turn in another
-            // session (detached or main) can never render here.
-            // Its room only grows while it is up, so the card changing does
-            // not move the transcript above (TurnCardRoom).
-            TurnCardRoom(shows: MacChatTurnCardProjection.isVisible(
-                appModel.engine.turns.lifecycle(for: sessionId),
-                sessionId: sessionId,
-                approvals: appModel.engine.approvals.records,
-                parseTimestamp: UserDisplayFormatters.parseFoundationISOTimestamp
-            ), floor: 0, turn: appModel.engine.turns.lifecycle(for: sessionId).map { "\($0.identity.sessionId)/\($0.identity.turnId)" } ?? "") {
-                MacChatTurnCardHost(
-                    sessionId: sessionId,
-                    onStop: { appModel.stopChatStream(sessionId: sessionId) }
-                )
-            }
-
             ChatQueuedTurnsView(sessionId: sessionId, isBusy: isBusy)
 
             if let toastMessage {
@@ -595,10 +496,7 @@ struct DetachedChatPanelView: View {
                 onStop: { appModel.stopChatStream(sessionId: sessionId) },
                 onSend: send,
                 onTranscript: { newVal in
-                    // 2026-09-06: only a live dictation may write here. The
-                    // recognizer's transcript is cumulative, so after a send
-                    // cleared the box the next update used to put the whole
-                    // already-sent phrase back into it.
+                    // Only live dictation may write the recognizer's cumulative transcript.
                     guard voiceAcceptsTranscript else { return }
                     if ChatTranscriptPresentation.hasVisibleText(newVal) {
                         panelDraft.dictate(composeVoiceDraft(newVal), revision: voiceDraftRevision)
@@ -624,20 +522,14 @@ struct DetachedChatPanelView: View {
         guard !appModel.isSavingChatBrain else { return }
         guard ensureSessionIsAvailable() else { return }
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        // 2026-09-06: the stored draft and its edit time, captured before the
-        // box is cleared, so the send-clear speaks only for what it sent.
+        // Capture the draft and edit time so acceptance clears only what was sent.
         let sentDraft = panelDraft.text
         let sentDraftEditedAt = panelDraft.editedAt
         let attachments = pendingAttachments
         guard !isCapturing, (!text.isEmpty || !attachments.isEmpty) else { return }
-        // D2 (2026-08-28): this panel has no slash-command dispatcher, so a
-        // typed `/model gpt-5.5` used to be sent to the agent as ordinary text
-        // and echoed straight back. Same prefix check the main window makes;
-        // a recognized command says where it works instead of dead-ending.
-        // Non-command slash text (`/tmp/foo`) still reaches the agent.
+        // Recognized commands say where they work; other slash text reaches the agent.
         switch ChatSlashCommandRouting.decide(
             text: text,
-            dynamicToolNames: capabilitiesStore.slashCommandNames,
             supportsDispatch: false
         ) {
         case .unsupportedHere(let command):
@@ -665,10 +557,7 @@ struct DetachedChatPanelView: View {
                     editedAt: sentDraftEditedAt
                 )
                 pendingAttachments = []
-                // 2026-09-06: sending from scrollback used to leave the new
-                // exchange offscreen — nothing here re-armed follow, so the
-                // panel stayed where the reader had scrolled to. The main
-                // window does the same on its own send.
+                // An accepted send returns to the latest exchange and re-arms follow.
                 transcriptLatestRequest &+= 1
                 scrollCoordinator.forceFollow()
                 // The composer's words are gone; a still-running dictation
@@ -680,15 +569,13 @@ struct DetachedChatPanelView: View {
         }
     }
 
-    /// Stop recognition without writing anything through the composer. Used
-    /// when the words it was dictating into are gone — a send — or when this
-    /// panel is closing (2026-09-06).
+    /// Stop recognition without writing through the composer on send or close.
     private func endPanelDictation() {
         voiceGeneration &+= 1
         voiceAcceptsTranscript = false
         voiceDraftBeforeListening = ""
         guard voiceInput.isListening else { return }
-        Task { @MainActor in _ = await voiceInput.stopListening() }
+        Task { @MainActor in _ = await voiceInput.stopListeningResult() }
     }
 
     private func toggleVoice() {
@@ -696,11 +583,6 @@ struct DetachedChatPanelView: View {
             Task { @MainActor in _ = await finishPanelDictation() }
         } else {
             guard ensureSessionIsAvailable() else { return }
-            voiceInput.errorMessage = nil
-            showToast("Checking microphone...")
-            // 2026-09-06: the permission prompt suspends. A panel closed while
-            // it was up could not cancel the start — `onDisappear` had nothing
-            // to stop, because listening had not begun.
             let requestedGeneration = voiceGeneration
             Task {
                 guard requestedGeneration == voiceGeneration else { return }
@@ -708,46 +590,30 @@ struct DetachedChatPanelView: View {
                     guard await finishPanelDictation() else { return }
                 }
                 let startGeneration = voiceGeneration
-                let granted = await voiceInput.requestPermission()
-                guard granted else {
-                    showToast(voiceInput.errorMessage ?? "Microphone or speech permission denied.")
-                    return
-                }
-                guard ensureSessionIsAvailable(),
-                      startGeneration == voiceGeneration
-                else { return }
-                voiceDraftBeforeListening = draft
-                voiceDraftRevision = panelDraft.manualEditRevision
-                voiceInput.startListening()
-                voiceAcceptsTranscript = voiceInput.isListening
-                if let msg = voiceInput.errorMessage, !voiceInput.isListening {
-                    showToast(msg)
-                } else if voiceInput.isListening {
-                    showToast("Listening")
-                }
+                let listening = await ChatAttachmentTypeResolver.beginDictation(
+                    voiceInput, draft: panelDraft,
+                    isCurrent: { ensureSessionIsAvailable() && startGeneration == voiceGeneration },
+                    prepareDraft: { base, revision in
+                        voiceDraftBeforeListening = base
+                        voiceDraftRevision = revision
+                    },
+                    showToast: showToast
+                )
+                if startGeneration == voiceGeneration { voiceAcceptsTranscript = listening }
             }
         }
     }
 
     private func finishPanelDictation() async -> Bool {
         let stoppedGeneration = voiceGeneration
-        let stoppedDraftRevision = voiceDraftRevision
-        let wasListening = voiceInput.isListening
-        let result = await voiceInput.stopListeningResult()
-        guard stoppedGeneration == voiceGeneration else { return false }
-        voiceAcceptsTranscript = false
-        guard panelDraft.manualEditRevision == stoppedDraftRevision else {
-            // The person's own edit stands, and the action they asked for goes on with it.
+        return await ChatAttachmentTypeResolver.finishDictation(
+            voiceInput, draft: panelDraft, revision: voiceDraftRevision,
+            isCurrent: { stoppedGeneration == voiceGeneration },
+            base: { voiceDraftBeforeListening }, finished: {
+            voiceAcceptsTranscript = false
             voiceDraftBeforeListening = ""
             voiceGeneration &+= 1
-            return true
-        }
-        let accepted = ChatComposerSupport.finishDictation(
-            result, wasListening: wasListening, base: &voiceDraftBeforeListening,
-            draft: &draft, attachments: &pendingAttachments,
-            attachment: voiceInput.attachment, showToast: showToast)
-        voiceGeneration &+= 1
-        return accepted
+        }, attach: { pendingAttachments.append($0) }, showToast: showToast)
     }
 
     private func captureScreen() {
@@ -757,10 +623,7 @@ struct DetachedChatPanelView: View {
         }
         guard ensureSessionIsAvailable() else { return }
         guard !isCapturing else { return }
-        // 2026-09-06: a screenshot send is a send, so it takes the send latch
-        // too. Admission suspends before it marks the session busy, so a
-        // Return whose send is still in flight leaves `isBusy` false and the
-        // capture button live — the screenshot was admitted as a second turn.
+        // Screenshot sends share the send latch because admission suspends before marking the session busy.
         guard !isSubmittingSend else { return }
         guard screenCaptureAllowed else {
             showToast("Enable screen capture in Trust → Features → Multimodal")
@@ -770,14 +633,7 @@ struct DetachedChatPanelView: View {
             showToast("Chat is already running in this session")
             return
         }
-        let capturedDraft = draft
-        // 2026-09-06: the snapshot's own edit time, for the send-clear below.
-        let capturedDraftEditedAt = panelDraft.editedAt
-        let capturedAttachments = pendingAttachments
-        let capturedAttachmentIds = Set(capturedAttachments.map(\.id))
-        let prompt = capturedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? "Look at this screenshot and tell me what you see."
-            : capturedDraft
+        let captured = ChatAttachmentTypeResolver.ScreenshotDraft(panelDraft, attachments: pendingAttachments)
         isCapturing = true
         isSubmittingSend = true
         showToast("Capturing screen...")
@@ -786,64 +642,28 @@ struct DetachedChatPanelView: View {
                 isCapturing = false
                 isSubmittingSend = false
             }
-            do {
-                let capture = try await Task.detached(priority: .userInitiated) {
-                    try await NativeScreenCapture.captureImageBase64()
-                }.value
-                let mb = Double(capture.byteSize) / (1024.0 * 1024.0)
-                showToast(String(format: "Sending screenshot (%.1f MB)...", mb))
-                let attachment = MultimodalAttachment(
-                    type: "image",
-                    base64: capture.base64,
-                    mime: capture.mime,
-                    name: capture.name,
-                    byteSize: capture.byteSize
-                )
-                guard ensureSessionIsAvailable() else { return }
-                let acceptance = await appModel.startChatTurnForSession(
-                    prompt,
-                    attachments: capturedAttachments + [attachment],
-                    sessionId: sessionId
-                )
-                switch acceptance {
-                case .accepted, .queued:
-                    let currentAttachmentIds = Set(pendingAttachments.map(\.id))
-                    guard draft == capturedDraft,
-                          currentAttachmentIds == capturedAttachmentIds
-                    else { return }
-                    appModel.clearChatDraftAfterSend(
-                        capturedDraft,
-                        sessionId: sessionId,
-                        editedAt: capturedDraftEditedAt
-                    )
-                    pendingAttachments = []
-                    // 2026-09-06: a screenshot send is a send — re-arm follow
-                    // so the new exchange is not left offscreen, and end the
-                    // dictation whose cumulative transcript would otherwise
-                    // write the words just sent back into the empty box. The
-                    // ordinary send above already does both, and both put
-                    // the windowed transcript back on its latest page.
-                    transcriptLatestRequest &+= 1
-                    scrollCoordinator.forceFollow()
+            await ChatAttachmentTypeResolver.sendScreenshot(captured, canSubmit: {
+                ensureSessionIsAvailable()
+            }, submit: { prompt, attachments in
+                await appModel.startChatTurnForSession(prompt, attachments: attachments, sessionId: sessionId)
+            }, accepted: { acceptedSessionId in
+                guard acceptedSessionId == sessionId else { return }
+                transcriptLatestRequest &+= 1
+                scrollCoordinator.forceFollow()
+                if captured.clearIfUnchanged(appModel: appModel, draft: panelDraft, attachments: &pendingAttachments) {
                     endPanelDictation()
-                case .rejected(let message):
-                    showToast(message)
                 }
-            } catch let error as NativeScreenCapture.CaptureError {
-                showToast(error.localizedDescription)
-            } catch {
-                showToast(UserFacingError.message(error, action: "send the screenshot"))
-            }
+            }, showToast: showToast)
         }
     }
 
     private func composeVoiceDraft(_ transcript: String) -> String {
-        ChatComposerSupport.voiceDraft(base: voiceDraftBeforeListening, transcript: transcript)
+        ChatAttachmentTypeResolver.voiceDraft(base: voiceDraftBeforeListening, transcript: transcript)
     }
 
     private func attachFromClipboardOrPickFile() {
         guard ensureSessionIsAvailable() else { return }
-        ChatComposerSupport.attachFromClipboardOrPickFile(
+        ChatAttachmentTypeResolver.attachFromClipboardOrPickFile(
             appendImage: {
                 guard ensureSessionIsAvailable() else { return }
                 pendingAttachments.append($0)
@@ -855,7 +675,7 @@ struct DetachedChatPanelView: View {
 
     private func handleDrop(_ providers: [NSItemProvider]) {
         guard ensureSessionIsAvailable() else { return }
-        ChatComposerSupport.attachProviders(
+        ChatAttachmentTypeResolver.attachProviders(
             providers,
             appendImage: {
                 guard ensureSessionIsAvailable() else { return }
@@ -867,7 +687,7 @@ struct DetachedChatPanelView: View {
     }
 
     private func attachLocalFile(_ url: URL) {
-        ChatComposerSupport.attachLocalFile(
+        ChatAttachmentTypeResolver.attachLocalFile(
             url,
             to: appModel,
             sessionId: sessionId,
@@ -951,8 +771,7 @@ private struct DetachedScrollAnchorModifier: ViewModifier {
     }
 }
 
-/// The panel's text field and send strip: the only view that reads the draft,
-/// so a keystroke re-runs this and not the panel's transcript (2026-09-22).
+/// Only the composer reads the draft, so keystrokes do not re-render the transcript.
 private struct DetachedChatComposer: View {
     let draft: ChatComposerDraft
     let sessionId: String
@@ -1004,11 +823,15 @@ private struct DetachedChatComposer: View {
             .lineLimit(1...5)
             .fixedSize(horizontal: false, vertical: true)
             .focused($inputFocused)
+            .shellComposerKeyboardTarget(
+                isFocused: inputFocused,
+                focus: { inputFocused = true },
+                onPaste: onDrop
+            )
             .foregroundStyle(voiceInput.isListening ? .secondary : .primary)
             .italic(voiceInput.isListening)
             .onSubmit(onSend)
-            .onPasteCommand(of: ChatComposerSupport.attachmentContentTypes, perform: onDrop)
-            .background(ChatAttachmentPasteHandler(isFocused: inputFocused, onPaste: onDrop))
+            .onPasteCommand(of: ChatAttachmentTypeResolver.attachmentContentTypes, perform: onDrop)
             .onChange(of: voiceInput.transcript) { _, newVal in onTranscript(newVal) }
         }
         .animation(

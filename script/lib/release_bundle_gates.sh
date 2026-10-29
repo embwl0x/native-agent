@@ -6,48 +6,13 @@
 #
 #   ./script/release.sh --self-test-gates dist/NativeAgent.app
 #
-# A1.1 (leak gate) and A1.5 (bundle assertion) of
-# docs/build_plans/prerelease-upgrade-campaign.md live here.
+# Validate each denylist regex and its assembled alternation, naming rejected file:line inputs.
+# Preserve grep status and diagnostics: rc 0 = hits, rc 1 = clean, rc >= 2 = scanner failure.
+# Missing, empty or unreadable scan subjects fail rather than certify clean.
+# Require the real scanner to find planted text and binary tokens before trusting it.
+# Helpers: exit 0 = authoritative stdout paths (empty means clean); exit 2 = failed scan.
 
-# ---------------------------------------------------------------------------
-# SCANNER INTEGRITY PRIMITIVES (2026-08-21)
-# ---------------------------------------------------------------------------
-# THE BUG THESE EXIST TO KILL: every secret/identity gate used to be written as
-#
-#     hits="$(find "$dir" -type f -print0 2>/dev/null | xargs -0 grep -IlE "$re" 2>/dev/null || true)"
-#     [[ -z "$hits" ]] && echo "clean"
-#
-# which renders FOUR different worlds identically as a green gate:
-#   1. genuinely no secrets                       (grep rc 1)
-#   2. grep REJECTED the regex as invalid         (grep rc 2 — the runtime
-#      denylist is assembled from local/privacy_denylist.regex, so one bad
-#      line silently disables the whole scan)
-#   3. the scan directory does not exist / is empty (find prints nothing)
-#   4. the scanner could not read the files        (grep rc 2)
-# `2>/dev/null` throws away the diagnostic and `|| true` throws away the exit
-# code. `set -o pipefail` does NOT help: the `|| true` on the same line wins.
-# xargs makes it worse — xargs collapses ANY utility exit in 1-125 into its own
-# 123, so a clean scan and a rejected regex are indistinguishable by exit code.
-#
-# The contract implemented below:
-#   1. VALIDATE every runtime-assembled regex before use, naming the offending
-#      denylist file:line when it is rejected.
-#   2. NEVER swallow scanner status. rc 0 = hits, rc 1 = clean, rc >= 2 =
-#      SCANNER ERROR -> abort. Scanner stderr is left attached to the caller's
-#      stderr so the diagnostic stays visible. xargs is not used at all.
-#   3. ASSERT the scan had a subject — a missing or empty scan directory is an
-#      abort, never a CLEAN verdict.
-#   4. NEGATIVE CONTROL — before trusting a clean verdict, plant a synthetic
-#      token in a throwaway tree and prove the same pipeline finds it.
-#
-# Calling convention for the scan helpers: matching paths on stdout (one per
-# line), diagnostics on stderr, exit 0 = the scan ran and its stdout is
-# authoritative (empty stdout really means clean), exit 2 = the scan did not
-# run correctly and its stdout means NOTHING.
-
-# Single source of truth for the value/filename secret shapes. release.sh and
-# verify_release_artifact.sh both carried private copies of these that could
-# drift apart.
+# Shared secret value and filename patterns for release and artifact verification.
 RELEASE_SECRET_VALUE_RE='(sk-(proj-)?[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{20,}|[0-9]{7,12}:[A-Za-z0-9_-]{30,}|AIza[0-9A-Za-z_-]{30,}|ya29\.[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|(sk|rk)_live_[0-9A-Za-z]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,})'
 # shellcheck disable=SC2034  # consumed by release.sh / verify_release_artifact.sh
 RELEASE_SECRET_FILE_RE='(^|/)(\.env($|[._-])|.*\.env$|\.npmrc$|\.pypirc$|\.netrc$|id_rsa$|id_dsa$|id_ecdsa$|id_ed25519$|credentials?\.(json|ya?ml|toml|ini)$|.*credentials?\.(json|ya?ml|toml|ini)$|token(s)?\.(json|ya?ml|toml|ini)$|.*token(s)?\.(json|ya?ml|toml|ini)$|oauth.*token.*\.(json|ya?ml|toml|ini)$|client_secret(s)?\.(json|ya?ml|toml|ini)$|.*client_secret.*\.(json|ya?ml|toml|ini)$|service[-_]?account.*\.(json|ya?ml|toml|ini)$|firebase-adminsdk.*\.json$|.*\.(pem|p12|pfx|jks|keystore|key|gpg|asc)$)'
@@ -87,10 +52,7 @@ release_require_valid_regex() {
 }
 
 # release_denylist_regex_from_file <file>
-# Assembles the alternation the old `grep -Ev ... | paste -sd'|'` produced, but
-# validates EACH line on its own first so a rejection can name file:line, then
-# validates the assembled alternation. stdout: the assembled ERE (may be empty
-# when the file has only comments). rc 1 = a broken pattern; ABORT the release.
+# stdout: assembled ERE, empty for comment-only files; rc 1 aborts the release.
 release_denylist_regex_from_file() {
   local file="$1"
   local line assembled=""
@@ -137,9 +99,7 @@ release_collect_scan_files() {
 }
 
 # release_collect_scan_files_of_type <dir> <label> <find-type> [prune-path-glob...]
-# Same contract as release_collect_scan_files, with find's -type selectable so
-# the directory-shaped assertions (A1.5) get the identical status handling
-# instead of their own `find ... 2>/dev/null`.
+# Selectable find type shares the file collector's enumeration and status contract.
 release_collect_scan_files_of_type() {
   local dir="$1"
   local label="$2"
@@ -184,21 +144,8 @@ release_collect_scan_files_of_type() {
 }
 
 # release_scan_binary_files_for_regex <ere> <cs|ci> <label>
-# SECOND PASS for value scans, over the files the -I text pass REFUSED TO READ.
-#
-# THE BUG THIS EXISTS TO KILL (2026-08-21, review round 2): `grep -I` classifies
-# any file carrying NUL bytes as binary and reports NO MATCH in it — rc 1, which
-# is indistinguishable from "this file is clean". A credential embedded in a
-# binary plist, a compiled asset catalog, a nib, or any other binary resource is
-# therefore invisible to the text pass, and the canary (a .txt file) could never
-# notice, because the canary only ever exercised the text path.
-#
-# Classification is grep's own: `grep -Iq -e ''` matches the first line of any
-# TEXT file (rc 0) and refuses a binary one (rc 1), so the two passes partition
-# RELEASE_SCAN_FILES exactly, with no file read twice for matching. An empty
-# file lands here too and yields an empty string table, which is harmless.
-# rc >= 2 from the classifier is a real read failure and aborts like everything
-# else. Same status contract as the text pass: rc 2 = the scan did NOT run.
+# grep -I skips NUL-bearing resources; value scans must also inspect their string tables.
+# grep -Iq -e '' partitions text (rc 0) from binary/empty files (rc 1); rc >= 2 aborts.
 release_scan_binary_files_for_regex() {
   local regex="$1"
   local case_mode="$2"
@@ -254,7 +201,7 @@ release_scan_binary_files_for_regex() {
 # identity/name scans deliberately do not, because the identity gate has its own
 # dedicated Mach-O + raw-byte passes with a tuned minimum run length, and
 # blanket string-table matching of short human names inside compiled payloads is
-# exactly the false-positive source documented in the A1.1 note below.
+# a source of false positives in instruction bytes.
 release_scan_files_for_regex() {
   local regex="$1"
   local case_mode="$2"
@@ -351,10 +298,21 @@ release_find_checked() {
   return 0
 }
 
+nativeagent_assert_no_python_artifacts() {
+  local bundle="$1" prefix="$2" placement="$3" artifact_kind="$4" hits
+  hits="$(release_find_checked "$prefix python-artifact" "$bundle/Contents/Resources" \
+    \( -type d \( -name python -o -name __pycache__ -o -name daemon \) \
+       -o -type f \( -name '*.py' -o -name '*.pyc' -o -name '*.pyo' -o -name '*python*' \) \
+       -o -type l \( -name '*python*' -o -name 'native_agentd.py' \) \) -print)" || return 2
+  if [[ -n "$hits" ]]; then
+    echo "$prefix ERROR: Python artifact $placement in app bundle: $hits" >&2
+    echo "$prefix NativeAgent $artifact_kind artifacts must be Swift-native and zero-Python." >&2
+    return 1
+  fi
+}
+
 # release_scan_dir_for_filename_re <dir> <label> <ere>
-# Case-insensitive filename match over the same asserted file list. Replaces
-# the old `find | awk | awk || true` chain, which both swallowed status and
-# stopped at the first hit.
+# Case-insensitive filename matches over the asserted file list, retaining all hits.
 release_scan_dir_for_filename_re() {
   local dir="$1"
   local label="$2"
@@ -376,8 +334,7 @@ release_scan_dir_for_filename_re() {
 }
 
 # release_scan_binary_for_regex <executable> <label> <cs|ci> <ere>
-# `strings | grep ... | head -20 || true` had the same collapse, plus a SIGPIPE
-# from head. Materialize the string table, check every exit code, then trim.
+# Materialize the string table and check every exit code before trimming to avoid SIGPIPE.
 release_scan_binary_for_regex() {
   local exe="$1"
   local label="$2"
@@ -416,7 +373,6 @@ release_scan_binary_for_regex() {
 
 # The optional case-insensitive identity scan treats punctuation as a boundary,
 # including underscores and possessives, but never matches inside alphanumerics.
-# A1.1 deliberately retains its separate case-sensitive scans unchanged.
 release_scan_binary_for_local_identity() {
   local exe="$1" label="$2" regex="$3" tmp rc=0 out string_hits
   release_require_valid_regex "$regex" "$label scan pattern" || return 2
@@ -431,17 +387,9 @@ release_scan_binary_for_local_identity() {
   out="$(LC_ALL=C grep -Ei -e "$regex" -- "$tmp")" || rc=$?
   rm -f "$tmp"
   [[ "$rc" -le 1 ]] || { echo "ERROR: $label byte-run scan failed ($rc)." >&2; return 2; }
-  # A short byte run with jumbled case (a lowercase letter then capitals) is
-  # machine-code noise, not a name; a real literal is lowercase, Capitalized or
-  # UPPERCASE, and a real path or address is longer. Keep those; drop the noise.
-  # A run under four characters that is ALL CAPS is also noise: 0.4.12's build
-  # tripped on the three bytes 4a 4f 45 of an arm64 `bl` instruction. A real
-  # three-letter name still arrives Capitalized or lowercase and is kept.
+  # Raw runs shorter than eight bytes need ordinary word casing; longer paths or addresses survive.
   if [[ "$rc" -eq 0 ]]; then
-    # A single-word run shorter than four bytes is ARM64 instruction noise
-    # whatever its case: 2026-09-16 the bytes 4a 6f 65 94 (a BL encoding)
-    # spelled "User" inside __text. Real names in the string table are caught
-    # by the `strings` pass above; this raw pass keeps runs of four or more.
+    # Raw runs under four bytes can be ARM64 instructions; strings catches real short literals.
     out="$(LC_ALL=C awk 'length($0) >= 8 || ($0 ~ /^[^A-Za-z]*([a-z]+|[A-Z][a-z]+|[A-Z]+)[^A-Za-z]*$/ && length($0) >= 4)' <<<"$out")"
     [[ -n "$out" ]] || rc=1
   fi
@@ -461,16 +409,7 @@ release_scan_binary_for_local_identity() {
 }
 
 # release_assert_scanner_canary <label>
-# NEGATIVE CONTROL. Runs the real scan pipeline over a throwaway tree holding
-# TWO planted synthetic tokens and two benign files:
-#   - a TEXT file, in a path WITH A SPACE (which also exercises hit reporting);
-#   - a BINARY file (NUL bytes around the token), which `grep -I` refuses to
-#     read and reports as rc 1 "no match". Before round 2 the canary planted
-#     only text, so the entire binary-resource blind spot was invisible to the
-#     very control that exists to prove the pipeline has teeth.
-# A pipeline that cannot find a known token cannot certify anything clean, so a
-# miss on EITHER file aborts the release. Nothing is ever written inside the
-# real bundle.
+# The control scans a throwaway tree with text/binary tokens, a spaced path and benign files.
 release_assert_scanner_canary() {
   local label="$1"
   local tmp rc=0 hits
@@ -515,38 +454,23 @@ release_assert_scanner_canary() {
 }
 
 # ---------------------------------------------------------------------------
-# A1.1 — compiled-binary identity leak gate
+# Compiled-binary identity leak gate
 # ---------------------------------------------------------------------------
 # The compiled-binary gate consumes maintainer-local patterns instead of
 # embedding private identities in public source. GitHub release preflight
 # requires NATIVEAGENT_LOCAL_IDENTITY_RE, NATIVEAGENT_PRIVACY_RE, or a readable
 # NATIVEAGENT_PRIVACY_DENYLIST_FILE, and the same input drives resource checks.
 #
-# WHY BOTH A MACH-O STRING SCAN AND A BYTE SCAN: macOS `strings` understands
-# Mach-O sections, which keeps arbitrary instruction/model bytes from becoming
-# false identity matches. `-n 3` is required for short maintainer names. It does
-# not inspect bytes appended outside a loadable section, however, so a second
-# section-agnostic scan covers printable runs of four or more bytes. Three-byte
-# raw runs are deliberately excluded: ARM64 instructions and opaque payloads
-# routinely contain coincidental triplets (the 0.3.4 public build contained
-# three such `User`/`user` byte sequences while carrying no corresponding string
-# literal). Source/resource identity gates cover three-character text outside
-# the executable, while real compiled string literals remain visible to the
-# Mach-O-aware scan.
+# Mach-O-aware strings -n 3 finds short literals without treating instruction bytes as names.
+# Raw runs of four or more bytes cover data outside sections; shorter runs can be instruction noise.
+# Source/resource gates cover short text outside the executable.
 
 # release_collect_identity_gate_binaries <bundle>
 # Fills RELEASE_IDENTITY_BINARIES with the app-owned executables. Contents/
 # Frameworks (Sparkle, third-party) is deliberately out of scope — we do not
-# build it and it cannot carry our identity strings. The pinned upstream
-# `codex` executable (script/fetch_codex.sh, an OpenAI release download) is
-# out of scope for the same reason; its Unicode tables and stopword lists
-# are exactly the jumbled byte runs the raw pass mistakes for names.
+# build it and it cannot carry our identity strings.
 #
-# rc 0 = the list is complete and non-empty. rc 2 = the enumeration failed or
-# found nothing, which is a staging failure, NOT a clean binary. The previous
-# `find ... 2>/dev/null` piped into a process substitution had no status check
-# anywhere: a find that failed partway (unreadable directory) scanned whatever
-# subset it managed to print and the gate passed on it.
+# rc 0 = complete, non-empty list; rc 2 = enumeration or staging failure.
 #
 # NOTE: mutates a global, so it must not be called inside a command
 # substitution by a caller that needs the array.
@@ -563,7 +487,7 @@ release_collect_identity_gate_binaries() {
   status_file="$(mktemp "${TMPDIR:-/tmp}/nativeagent-gate-find.XXXXXX")" || return 2
   while IFS= read -r -d '' f; do
     RELEASE_IDENTITY_BINARIES+=("$f")
-  done < <(find "$dir" -type f -perm -u+x ! -name codex -print0; printf '%s' "$?" > "$status_file")
+  done < <(find "$dir" -type f -perm -u+x -print0; printf '%s' "$?" > "$status_file")
   find_rc="$(cat "$status_file")"
   rm -f "$status_file"
   if [[ "$find_rc" != "0" ]]; then
@@ -606,15 +530,9 @@ release_identity_leak_regex() {
 
 # release_personal_identity_hit_files <bundle> <regex>
 #
-# Search every staged file except the exact, verified MiniLM resource payload.
-# A general language-model vocabulary legitimately contains ordinary person
-# names, so applying a maintainer's local identity denylist to it creates false
-# positives. The exemption is deliberately tied to MemoryV2's known SwiftPM
-# resource bundle and to the staged large embedding model under
-# Contents/Resources/embedding/ (the same kind of vocabulary; 2026-09-05, when
-# the standard BERT vocabulary's token "user" tripped the guard). Similarly
-# named files elsewhere remain in scope. Secret
-# value/file scans still cover the full Resources tree in release.sh.
+# Search every staged file except bge model data under Resources/embedding.
+# A general vocabulary legitimately contains ordinary person names. Similarly
+# named files elsewhere remain in scope; secret scans still cover all resources.
 #
 # rc 0 = the scan ran; stdout is authoritative (empty really means clean).
 # rc 2 = the scan did NOT run correctly; stdout means nothing — abort.
@@ -625,10 +543,6 @@ release_personal_identity_hit_files() {
 
   release_scan_dir_for_regex "$bundle" "personal identity" cs "$regex" \
     '*/_CodeSignature' \
-    '*/NativeAgentCore_MemoryV2.bundle/minilm_vocab.txt' \
-    '*/NativeAgentCore_MemoryV2.bundle/minilm.mlpackage/*' \
-    '*/NativeAgentCore_MemoryV2.bundle/Contents/Resources/minilm_vocab.txt' \
-    '*/NativeAgentCore_MemoryV2.bundle/Contents/Resources/minilm.mlpackage/*' \
     '*/Contents/Resources/embedding/vocab.txt' \
     '*/Contents/Resources/embedding/embedding.mlpackage/*'
 }
@@ -734,7 +648,7 @@ release_assert_no_identity_strings() {
 }
 
 # ---------------------------------------------------------------------------
-# A1.5 — user-store / runtime-state bundle assertion
+# User-store / runtime-state bundle assertion
 # ---------------------------------------------------------------------------
 # The .app is read-only signed code. Any live store shipped inside it either
 # leaks the developer's machine state to every downloader (trust/policy.json
@@ -745,7 +659,7 @@ release_assert_no_identity_strings() {
 RELEASE_FORBIDDEN_BUNDLE_DIRS=(
   data .runtime workspace secrets .secrets
   trust providers approvals pairings tokens credentials oauth keychain
-  memory memory_proposals chat_sessions self_worktrees
+  cognition memory memory_proposals chat_sessions self_worktrees
   activity browser catalog connectors context dreams evolution inbox
   knowledge_graph missions nextgen scheduler traces workflow workflows
   persona
@@ -762,14 +676,22 @@ RELEASE_FORBIDDEN_BUNDLE_FILE_RE='(^|/)(policy\.json|surfaces\.json|trust\.json|
 RELEASE_BUNDLE_DIR_EXEMPT_RE='\.mlpackage/Data(/|$)'
 
 # release_assert_no_user_state_in_bundle <bundle>
+# Owns recursive store and top-level resource-path exclusion for staged bundles and artifacts.
 release_assert_no_user_state_in_bundle() {
   local bundle="$1"
-  local dir_hits="" file_hits="" p rel low name forbidden
+  local dir_hits="" file_hits="" runtime_hits="" p rel low name forbidden
 
-  # Both walks go through release_collect_scan_files, which keeps find's exit
-  # status and refuses an empty/missing subject. The old `2>/dev/null` finds
-  # here could fail partway through the bundle and the gate would pass on the
-  # subset that happened to be printed.
+  for forbidden in \
+    REPO_PATH data .runtime workspace secrets .secrets cognition memory memory_proposals \
+    chat_sessions self_worktrees config providers approvals pairings tokens credentials \
+    oauth keychain .env daemon native_agentd.py python persona
+  do
+    if [[ -e "$bundle/Contents/Resources/$forbidden" ]]; then
+      runtime_hits="$runtime_hits$forbidden"$'\n'
+    fi
+  done
+
+  # Both walks preserve find's status and refuse empty or missing subjects.
   release_collect_scan_files_of_type "$bundle" "A1.5 bundle directory" d || return 1
   for p in "${RELEASE_SCAN_FILES[@]}"; do
     rel="${p#"$bundle"/}"
@@ -795,8 +717,9 @@ release_assert_no_user_state_in_bundle() {
 
   dir_hits="${dir_hits%$'\n'}"
   file_hits="${file_hits%$'\n'}"
+  runtime_hits="${runtime_hits%$'\n'}"
 
-  if [[ -n "$dir_hits" || -n "$file_hits" ]]; then
+  if [[ -n "$dir_hits" || -n "$file_hits" || -n "$runtime_hits" ]]; then
     echo "" >&2
     echo "ERROR: A1.5 bundle assertion — user/runtime state staged inside the .app." >&2
     if [[ -n "$dir_hits" ]]; then
@@ -807,22 +730,24 @@ release_assert_no_user_state_in_bundle() {
       echo "  user-store files:" >&2
       printf '%s\n' "$file_hits" | sed 's/^/    /' >&2
     fi
+    if [[ -n "$runtime_hits" ]]; then
+      echo "  top-level runtime/state paths in Contents/Resources:" >&2
+      printf '%s\n' "$runtime_hits" | sed 's/^/    /' >&2
+    fi
     echo "  The app resolves its data root to ~/Library/Application Support/NativeAgent/" >&2
     echo "  at runtime; nothing writable belongs in the signed bundle. REFUSING TO SHIP." >&2
     return 1
   fi
-  echo "[bundle-assert] passed — no data/, trust/policy.json, providers/surfaces.json, or user stores in the bundle."
+  echo "[bundle-assert] passed — no top-level runtime paths, data/, trust/policy.json, providers/surfaces.json, or user stores in the bundle."
   return 0
 }
 
 # ---------------------------------------------------------------------------
-# A1.0 — public-release leak guard (extracted from release.sh, 2026-08-21)
+# Public-release content-leak guard
 # ---------------------------------------------------------------------------
 # release_assert_no_leaked_data <bundle> <product> <repo_root>
-# Returns 0 when the staged bundle is genuinely clean, 1 when it leaks OR when
-# any scan could not be trusted. Lives here (rather than inline in release.sh)
-# so `release.sh --self-test-gates <app>` can prove the guard actually fires
-# without a 20-minute build.
+# Owns content-leak validation for staged bundles and mounted artifacts.
+# Returns 0 when clean, 1 when content leaks or any scan could not be trusted.
 release_assert_no_leaked_data() {
   local BUNDLE="$1"
   local PRODUCT="$2"
@@ -830,17 +755,16 @@ release_assert_no_leaked_data() {
   local _RES_DIR _PRIVACY_DENYLIST_FILE _PERSONAL_RE _FILE_PRIVACY_RE
   local _PUBLIC_IDENTITY_RE _SECRET_VALUE_RE _SECRET_FILE_RE _EXECUTABLE
   local _raw_hits _personal_hits _identity_text_hits _secret_text_hits
-  local _secret_file_hits _forbidden_runtime_hits _LOCAL_STATE_DIR_RE
-  local _nested_state_hits _live_persona_hits _test_artifact_hits
+  local _secret_file_hits
   local _identity_binary_hits _secret_binary_hits _secret_binary_matches
-  local _rel _f
+  local _f
 
   # PUBLIC-RELEASE LEAK GUARD: a release bundle must contain ZERO developer
-  # personal data, ZERO credential-looking values, ZERO live runtime state, and
+  # personal data, ZERO credential-looking values, and
   # ZERO local-agent identity defaults in app-owned resources.
   # Scope is deliberate:
   #   - personal identifiers (handle / location / telegram id / email) fail
-  #     everywhere in app-owned content. The exact verified MiniLM model payload
+  #     everywhere in app-owned content. The bge model payload under Resources/embedding
   #     is exempt because a general vocabulary legitimately contains ordinary
   #     person names; similarly named files elsewhere remain fully scanned.
   #   - app-owned text resources fail on common API/OAuth/JWT/private-key token
@@ -851,21 +775,13 @@ release_assert_no_leaked_data() {
   #     token/credential/client-secret JSON, PEM/P12/PFX/key material, npm/pypi
   #     credential files, and SSH private keys. OAuth *code* may ship; OAuth
   #     token/cache/config files may not.
-  #   - live state directories and live persona files fail. Release builds ship
-  #     NO persona directory inside the bundle (see ONBOARDING-2026-05-26 above);
-  #     the Swift runtime resolves persona to ~/Library/Application Support/NativeAgent/
-  #     memory/ at first run and the onboarding wizard scaffolds a blank slate
-  #     there.
   #   - old local-agent names fail in app-owned text resources and in the
   #     release executable's string table.
   # Runs after ALL staging, before codesign — a tampered/regressed persona
   # step aborts the release instead of shipping the developer's data.
   #
-  # SCANNER-INTEGRITY CONTRACT (2026-08-21): every scan below goes through the
-  # release_scan_* helpers in script/lib/release_bundle_gates.sh, which validate
-  # the pattern, assert the scan had a subject, and propagate the scanner's exit
-  # code instead of `2>/dev/null || true`. An empty result is only allowed to
-  # mean "clean" when the scan is known to have actually run.
+  # Scans validate their pattern and subject and propagate scanner errors;
+  # an empty result means clean only when the scan actually ran.
   _RES_DIR="$BUNDLE/Contents/Resources"
   _PRIVACY_DENYLIST_FILE="${NATIVEAGENT_PRIVACY_DENYLIST_FILE:-$ROOT/local/privacy_denylist.regex}"
   _PERSONAL_RE="${NATIVEAGENT_PRIVACY_RE:-}"
@@ -902,9 +818,7 @@ release_assert_no_leaked_data() {
     echo "==> WARNING: no NATIVEAGENT_PRIVACY_RE and no usable privacy denylist —"
     echo "    the personal-identifier scan is SKIPPED for this build."
   fi
-  # Preserve full paths: word-splitting on $_raw_hits used to shred any hit path
-  # containing a space, so the guard reported a truncated fragment of the file it
-  # was refusing to ship.
+  # Read line-wise to preserve hit paths containing spaces.
   _personal_hits=""
   while IFS= read -r _f; do
     [[ -n "$_f" ]] || continue
@@ -915,7 +829,6 @@ release_assert_no_leaked_data() {
   if [[ -n "$_PUBLIC_IDENTITY_RE" ]]; then
     _identity_text_hits="$(
       release_scan_dir_for_regex "$_RES_DIR" "release resource identity" ci "$_PUBLIC_IDENTITY_RE" \
-        '*/minilm_vocab.txt' '*/minilm.mlpackage/*' \
         '*/embedding/vocab.txt' '*/embedding/embedding.mlpackage/*'
     )" || { echo "ERROR: identity resource scan did not run correctly — REFUSING TO SHIP." >&2; return 1; }
   else
@@ -933,49 +846,7 @@ release_assert_no_leaked_data() {
     || { echo "ERROR: secret-value resource scan did not run correctly — REFUSING TO SHIP." >&2; return 1; }
   _secret_file_hits="$(release_scan_dir_for_filename_re "$_RES_DIR" "release resource secret filename" "$_SECRET_FILE_RE")" \
     || { echo "ERROR: secret-filename resource scan did not run correctly — REFUSING TO SHIP." >&2; return 1; }
-  _forbidden_runtime_hits=""
-  for _rel in data .runtime workspace secrets .secrets memory memory_proposals chat_sessions self_worktrees config providers approvals pairings tokens credentials oauth keychain daemon python native_agentd.py; do
-    if [[ -e "$_RES_DIR/$_rel" ]]; then
-      _forbidden_runtime_hits="$_forbidden_runtime_hits$_RES_DIR/$_rel"$'\n'
-    fi
-  done
-  _LOCAL_STATE_DIR_RE='/(activity|approvals|browser|catalog|chat_sessions|connectors|context|credentials|dreams|evolution|inbox|keychain|knowledge_graph|memory|memory_proposals|missions|nextgen|oauth|pairings|providers|scheduler|self_worktrees|tokens|traces|trust|workflow|workflows)(/|$)'
-  # No `exit` after the first hit and no `|| true`: reporting every offending
-  # directory is more useful than one, and stopping early sent find a SIGPIPE
-  # whose nonzero status then had to be discarded — which is exactly the pattern
-  # that let real scanner failures read as clean.
-  # find's status is captured BEFORE the awk pipeline, so a partially-failed
-  # walk cannot be masked by awk's own exit 0 (`$(find | awk)` reports awk).
-  _nested_state_dirs="$(release_find_checked "nested state-directory" "$_RES_DIR" -type d -print)" \
-    || { echo "ERROR: nested state-directory scan of $_RES_DIR failed — REFUSING TO SHIP." >&2; return 1; }
-  _nested_state_hits="$(
-    printf '%s\n' "$_nested_state_dirs" \
-    | awk 'NF' \
-    | awk '{ low=tolower($0); print low "\t" $0 }' \
-    | awk -F '\t' -v root="$(printf '%s' "$_RES_DIR" | tr '[:upper:]' '[:lower:]')" -v re="$_LOCAL_STATE_DIR_RE" '
-        index($1, root "/") == 1 {
-          rel = substr($1, length(root) + 1)
-          if (rel ~ re) { print $2 }
-        }'
-  )" || { echo "ERROR: nested state-directory scan of $_RES_DIR failed — REFUSING TO SHIP." >&2; return 1; }
-  if [[ -n "$_nested_state_hits" ]]; then
-    _forbidden_runtime_hits="$_forbidden_runtime_hits"$'\n'"$_nested_state_hits"
-  fi
-  _forbidden_runtime_hits="${_forbidden_runtime_hits%$'\n'}"
-  # ONBOARDING-2026-05-26: NO persona dir should ever ship inside the bundle.
-  # Any file (template or otherwise) under Contents/Resources/persona/ is a leak
-  # regression: it would cause _resolve_persona_root() step 3 to resolve inside
-  # the read-only signed .app, breaking first-run onboarding. The persona-pruning
-  # step above removes the directory; this check fails the release if it crept
-  # back in (e.g. a stale dist/ tree, a misguided cp -R, or a future packaging
-  # step that re-introduces it).
-  _live_persona_hits=""
-  if [[ -e "$_RES_DIR/persona" ]]; then
-    _live_persona_hits="$(release_find_checked "persona" "$_RES_DIR/persona" -type f -print)" \
-      || { echo "ERROR: persona scan of $_RES_DIR/persona failed — REFUSING TO SHIP." >&2; return 1; }
-  fi
-  _test_artifact_hits="$(release_find_checked "test-artifact" "$_RES_DIR" -type f \( -name '*_tests.py' -o -name 'test_*.py' \) -print)" \
-    || { echo "ERROR: test-artifact scan of $_RES_DIR failed — REFUSING TO SHIP." >&2; return 1; }
+  nativeagent_assert_no_python_artifacts "$BUNDLE" '[release]' present release || return 1
   # The staged executable is a REQUIRED scan subject at this point; "no binary to
   # scan" is a staging failure, not a clean binary.
   _EXECUTABLE="$BUNDLE/Contents/MacOS/$PRODUCT"
@@ -996,13 +867,11 @@ release_assert_no_leaked_data() {
   # loosening. Each entry is a compiled constant proven non-secret; anything
   # else — including a superstring of an entry — still refuses. Add entries
   # only with the literal's origin documented here.
-  #   attention-mask-mean-or-model-pooled — MiniLM pooling-mode identifier;
+  #   attention-mask-mean-or-model-pooled — CoreML pooling-mode identifier;
   #   its "sk-mean-or-model-pooled" tail trips the sk-[A-Za-z0-9_-]{20,}
-  #   alternative. Exact string-table line verified against the real staged
-  #   executable 2026-08-21.
-  #   pooling=attention-mask-mean-or-model-pooled — same MiniLM constant, now
-  #   emitted with its log-field prefix in one string-table line. Exact line
-  #   verified against the real staged executable 2026-08-25.
+  #   alternative.
+  #   pooling=attention-mask-mean-or-model-pooled — the same CoreML constant
+  #   emitted with its log-field prefix in one string-table line.
   if [[ -n "$_secret_binary_matches" ]]; then
     local _allow_rc=0
     _secret_binary_matches="$(grep -Fxv -e "attention-mask-mean-or-model-pooled" -e "pooling=attention-mask-mean-or-model-pooled" <<<"$_secret_binary_matches")" || _allow_rc=$?
@@ -1014,7 +883,7 @@ release_assert_no_leaked_data() {
   if [[ -n "$_secret_binary_matches" ]]; then
     _secret_binary_hits="$_EXECUTABLE"
   fi
-  if [[ -n "$_personal_hits" || -n "$_identity_text_hits" || -n "$_identity_binary_hits" || -n "$_secret_text_hits" || -n "$_secret_file_hits" || -n "$_secret_binary_hits" || -n "$_forbidden_runtime_hits" || -n "$_live_persona_hits" || -n "$_test_artifact_hits" ]]; then
+  if [[ -n "$_personal_hits" || -n "$_identity_text_hits" || -n "$_identity_binary_hits" || -n "$_secret_text_hits" || -n "$_secret_file_hits" || -n "$_secret_binary_hits" ]]; then
     echo "" >&2
     echo "ERROR: release bundle FAILED the personal-data leak guard — REFUSING TO SHIP." >&2
     if [[ -n "$_personal_hits" ]]; then
@@ -1041,21 +910,9 @@ release_assert_no_leaked_data() {
       echo "  credential-looking values found in release executable strings:" >&2
       echo "$_secret_binary_hits" | sed 's/^/    /' >&2
     fi
-    if [[ -n "$_forbidden_runtime_hits" ]]; then
-      echo "  live runtime/state directories found in release resources:" >&2
-      echo "$_forbidden_runtime_hits" | sed 's/^/    /' >&2
-    fi
-    if [[ -n "$_live_persona_hits" ]]; then
-      echo "  persona files found in release bundle (Contents/Resources/persona must not ship — see ONBOARDING-2026-05-26):" >&2
-      echo "$_live_persona_hits" | sed 's/^/    /' >&2
-    fi
-    if [[ -n "$_test_artifact_hits" ]]; then
-      echo "  test artifacts found in release resources:" >&2
-      echo "$_test_artifact_hits" | sed 's/^/    /' >&2
-    fi
     echo "  Fix release defaults; do NOT ship until this is clean." >&2
     return 1
   fi
-  echo "[release] leak guard passed — blank slate bundle: no configured personal data, credentials, OAuth/token files, live or derived ContextFlow state, or local identity defaults"
+  echo "[release] leak guard passed — no configured personal data, credentials, or local identity defaults"
   return 0
 }

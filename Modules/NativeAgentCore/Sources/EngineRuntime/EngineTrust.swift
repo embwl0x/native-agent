@@ -2,6 +2,7 @@ import TrustPersistence
 import AppToolRuntime
 import Cognition
 import Foundation
+import NativeAgentShared
 import Observation
 import PersistenceCore
 import TrustCenter
@@ -88,9 +89,7 @@ public struct MacControlAuditEntry: Identifiable, Decodable, Sendable {
         let legacyAction = try c.decodeIfPresent(String.self, forKey: .action)
         method = decodedMethod ?? legacyAction ?? ""
         action = legacyAction ?? decodedMethod ?? "unknown"
-        // detail prefers a NON-EMPTY block_reason, then NON-EMPTY stderr —
-        // gpt-5.5 review MEDIUM #6: canonical successful rows can carry
-        // `block_reason: ""`, which would otherwise mask a useful stderr.
+        // Empty canonical `block_reason` must not hide stderr when deriving historical receipt detail.
         let decodedDetail = try c.decodeIfPresent(String.self, forKey: .detail)
         detail = Self.firstNonEmpty(decodedDetail, blockReason, stderr)
         if let explicit = try c.decodeIfPresent(Bool.self, forKey: .allowed) {
@@ -112,13 +111,6 @@ public struct MacControlAuditEntry: Identifiable, Decodable, Sendable {
         return nil
     }
 
-    init(ts: String, action: String, detail: String? = nil, allowed: Bool? = nil) {
-        self.method = action
-        self.ts = ts
-        self.action = action
-        self.detail = detail
-        self.allowed = allowed
-    }
 }
 
 public enum MacControlAuditLogRead: Sendable {
@@ -153,7 +145,7 @@ public enum MacControlAuditLogRead: Sendable {
 }
 
 
-/// `NativeAgentEngine.trust` (S10): the TrustCenter for one data root, in core
+/// `NativeAgentEngine.trust`: the TrustCenter for one data root, in core
 /// types. The Trust Center pages, Setup, chat and the badges render `policy`;
 /// Backups render `backups`; Capabilities renders `capabilityNetwork`. Reads
 /// and publication use the same owner for the phone lanes. Policy writes still
@@ -177,10 +169,11 @@ public final class TrustFacade {
         public let forced: Bool
     }
     public var unattendedWork: FeatureVerdict? {
-        policy.map {
-            let forced = TrustAccessModeCapabilityCatalog.fullMacGrantIsActive($0)
-            return FeatureVerdict(enabled: $0.enableAutonomy || forced, forced: forced)
-        }
+        policy.map(Self.unattendedWork(for:))
+    }
+    private nonisolated static func unattendedWork(for policy: TrustPolicy) -> FeatureVerdict {
+        let forced = TrustAccessModeCapabilityCatalog.fullMacGrantIsActive(policy)
+        return FeatureVerdict(enabled: policy.enableAutonomy || forced, forced: forced)
     }
     public var deskTasks: FeatureVerdict? {
         guard let policy else { return nil }
@@ -234,7 +227,7 @@ public final class TrustFacade {
         await EventDeadlinePhysiology.refreshOnChanges(paths:
             ["trust/policy.json", "security/audit.jsonl", "telegram/config.json", "paired_phones.json"]
                 .map { dataRoot.appendingPathComponent($0) }
-                + TransportAllowlist.slackMetadataPaths(dataRoot: dataRoot)
+                + [TransportAllowlist.slackMetadataPath(dataRoot: dataRoot)]
         ) { await self.refreshSecurity() }
     }
 
@@ -268,7 +261,8 @@ public final class TrustFacade {
     public var autonomyKernel: AutonomyKernelSummary? { policy.map(Self.autonomyKernel(for:)) }
 
     public var capabilityNetwork: CapabilityTrustNetwork?
-    public var capabilitySummary: CapabilitySummaryResponse?
+    public private(set) var capabilitySummary: CapabilitySummaryResponse?
+    public private(set) var capabilitySummaryError: String?
     public private(set) var privacyMap: PrivacyMap?
 
     public func refreshPrivacyMap() async {
@@ -303,6 +297,7 @@ public final class TrustFacade {
             return (summary, items, sources, installs, network, failures)
         }, publish: { read in
             if let value = read.0 { capabilitySummary = value }
+            capabilitySummaryError = read.5.first { $0.endpoint == "capability summary" }?.error.localizedDescription
             if let value = read.1 { capabilityCatalog = value }
             if let value = read.2 { capabilityCatalogSources = value }
             if let value = read.3 { capabilityPackInstalls = value }
@@ -335,31 +330,23 @@ public final class TrustFacade {
     }
 
     public nonisolated func notify(
-        title: String, message: String, notificationCenterAdapter: any NotificationCenterAdapter
+        title: String, message: String, notificationCenterAdapter: any NotificationPosting
     ) async throws -> Bool {
-        // User's own Trust click: the workbench origin, like runMacControl.
-        let impl = makeMacControl(
+        try await runMacControl(action: .notify, body: [
+            "title": .string(title), "message": .string(message),
+        ], notificationCenterAdapter: notificationCenterAdapter).ok
+    }
+
+    public nonisolated func runMacControl(
+        action: MacControlWorkbenchAction, body: [String: JSONValue], notificationCenterAdapter: any NotificationPosting
+    ) async throws -> MacControlResult {
+        let client = makeMacControl(
             policyProvider: TrustCenterMacControlPolicyProvider(
                 dataRoot: dataRoot, operatorOrigin: SecurityOriginContext(surface: "native_actions")),
             auditAppendPath: MacControlActionRoutes.auditPath(dataRoot: dataRoot),
             notificationCenterAdapter: notificationCenterAdapter
         )
-        return try await impl.dispatch(action: "notify", body: [
-            "title": .string(title), "message": .string(message),
-        ]).ok
-    }
-
-    public nonisolated func runMacControl(
-        path: String, bodyData: Data, notificationCenterAdapter: any NotificationCenterAdapter
-    ) async throws -> MacControlRunResult {
-        try await MacControlActionRoutes.run(
-            path: path, bodyData: bodyData, dataRoot: dataRoot, localWorkbench: true
-        ) { operatorOrigin, auditPath in
-            makeMacControl(
-                policyProvider: TrustCenterMacControlPolicyProvider(dataRoot: dataRoot, operatorOrigin: operatorOrigin),
-                auditAppendPath: auditPath, notificationCenterAdapter: notificationCenterAdapter
-            )
-        }
+        return try await client.dispatch(action: action.rawValue, body: body)
     }
 
     nonisolated private var center: SwiftNativeTrustCenter {
@@ -390,7 +377,14 @@ public final class TrustFacade {
         var autoloaded = 0
         let activeStatuses: Set<String> = ["active", "installed", "ready", "configured"]
         let reviewStatuses: Set<String> = ["review", "proposal", "draft", "drafted", "needs_setup"]
+        var identities: Set<String> = []
         for record in records {
+            guard !record.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw RuntimeReadError.unreadableFeed("The capability list does not add up (one or more entries have no stable id). Refresh before relying on it.")
+            }
+            guard identities.insert(record.id).inserted else {
+                throw RuntimeReadError.unreadableFeed("The capability list does not add up (the list contains duplicate ids). Refresh before relying on it.")
+            }
             byKind[record.kind ?? "", default: 0] += 1
             let status = (record.status ?? "").lowercased()
             if activeStatuses.contains(status) { active += 1 }
@@ -430,15 +424,14 @@ public final class TrustFacade {
         var snapshot = try await rawPolicy()
         let policy = try TrustPolicy(policyObject: snapshot)
         let accessMode = TrustAccessModeCapabilityCatalog.agentAccessMode(from: policy)
-        snapshot["resolvedPreset"] = TrustPolicyPreset.matching(policy: policy, accessMode: accessMode)
-            .map { .string($0.quietID) } ?? .null
+        snapshot["resolvedPreset"] = MobileTrustAction.Preset.matching(policy: policy, accessMode: accessMode)
+            .map { .string($0.rawValue) } ?? .null
         snapshot["effectivePermissionLevel"] = .string(
             TrustAccessModeCapabilityCatalog.fullMacGrantIsActive(policy) ? "full_mac_os" : policy.permissionLevel)
         return try JSONValue.object(snapshot).serializedData(pretty: false)
     }
 
-    /// Both backup indexes (index.json, the daemon-era registry.json), deduped
-    /// by id, newest first.
+    /// Read both `index.json` and historical `registry.json`, deduplicated by id, newest first.
     public nonisolated func listBackups() async throws -> [BackupRecord] {
         try TrustBackupPersistence.readBackupRecords(root: dataRoot)
     }
@@ -460,9 +453,9 @@ public final class TrustFacade {
         try await capabilityTrust().evaluate(capabilityId: id)
     }
 
-    nonisolated private func capabilityTrust() throws -> any CapabilityTrustProtocol {
+    nonisolated private func capabilityTrust() throws -> SwiftNativeCapabilityTrust {
         guard let connectorActionStatuses else { throw CapabilityTrustError.unavailable }
-        return makeCapabilityTrust(
+        return SwiftNativeCapabilityTrust(
             dataRoot: dataRoot, connectorActionStatuses: connectorActionStatuses
         )
     }
@@ -481,9 +474,7 @@ extension TrustFacade {
     /// The capability catalog: saved rows merged with the built-in defaults.
     /// Read-only; the merge is never written back.
     public nonisolated func catalog() async throws -> [CapabilityCatalogItem] {
-        try await listCapabilityCatalog(
-            dataRoot: dataRoot, nowISO: SwiftNativeManifestSigner.isoTimestamp(Date())
-        ).map { try CapabilityCatalogItem(row: .object($0)) }
+        try await listCapabilityCatalog(dataRoot: dataRoot).map { try CapabilityCatalogItem(row: .object($0)) }
     }
 
     public func refreshCatalogSources() async throws {
@@ -506,9 +497,7 @@ extension TrustFacade {
     /// Catalog sources, defaults overlaid on the saved store. Missing state
     /// reads as the defaults; a damaged store throws and is never rewritten.
     public nonisolated func catalogSources() async throws -> [CapabilityCatalogSource] {
-        try await SwiftNativeCatalogSources(
-            dataRoot: dataRoot, persistence: SwiftNativePersistenceCore()
-        ).catalogSources().map { try CapabilityCatalogSource(row: .object($0)) }
+        try CapabilityCatalogStoreReader.catalogSources(dataRoot: dataRoot).map { try CapabilityCatalogSource(row: .object($0)) }
     }
 
     /// Installed capability packs, newest first.
@@ -531,14 +520,8 @@ extension TrustFacade {
         return saved
     }
 
-    /// The catalog owner reports update checking as unavailable until it can
-    /// compare source versions; this request does not stamp source check times.
-    public nonisolated func checkCapabilityUpdates() async throws -> CapabilityUpdateCheck {
-        try CapabilityUpdateCheck(row: .object(try await catalogWrites.checkCapabilityUpdates()))
-    }
-
     nonisolated private var catalogWrites: SwiftNativeCatalogWrites {
-        SwiftNativeCatalogWrites(dataRoot: dataRoot, persistence: SwiftNativePersistenceCore())
+        SwiftNativeCatalogWrites(dataRoot: dataRoot)
     }
 }
 
@@ -576,16 +559,15 @@ extension TrustFacade {
 extension TrustFacade {
     public nonisolated static func autonomyKernel(for policy: TrustPolicy) -> AutonomyKernelSummary {
         let trustEnabled = policy.enableAutonomy
-        let enabled = trustEnabled
+        let enabled = unattendedWork(for: policy).enabled
         let mode = policy.autonomyDefault ?? "supervised"
         let disabledReason: String? = {
-            if !trustEnabled { return "Trust Center autonomy is disabled" }
+            if !enabled { return "Trust Center autonomy is disabled" }
             return nil
         }()
 
         let outside = policy.filePolicy?.outsideWorkspaceDefault ?? "deny"
         let backupRequired = policy.filePolicy?.requireBackupBeforeWrite ?? true
-        let memoryHygiene = policy.memoryPolicy?.hygiene_enabled ?? true
 
         return AutonomyKernelSummary(
             status: enabled ? "ok" : "off",
@@ -597,7 +579,7 @@ extension TrustFacade {
             guardrails: [
                 KernelGuardrail(
                     id: "trust.enableAutonomy",
-                    title: "Trust autonomy switch",
+                    title: "Saved autonomy switch",
                     status: trustEnabled ? "ok" : "off"
                 ),
                 KernelGuardrail(
@@ -609,11 +591,6 @@ extension TrustFacade {
                     id: "file.requireBackupBeforeWrite",
                     title: "Write backup requirement",
                     status: backupRequired ? "ok" : "warn"
-                ),
-                KernelGuardrail(
-                    id: "memory.hygiene_enabled",
-                    title: "Memory hygiene",
-                    status: memoryHygiene ? "ok" : "off"
                 ),
             ],
             approvalClasses: [

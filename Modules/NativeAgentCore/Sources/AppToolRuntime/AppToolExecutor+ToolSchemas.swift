@@ -16,12 +16,6 @@ extension AppToolExecutor {
 
     private static func makeAppToolSchemas(includeDoor: Bool) -> [LLMToolSchema] {
 
-        func nullable(_ schema: JSONValue) -> JSONValue {
-            guard case .object(var value) = schema, let type = value["type"] else { return schema }
-            value["type"] = .array([type, .string("null")])
-            return .object(value)
-        }
-
         func stringArraySchema(_ desc: String) -> JSONValue {
             ToolSchema.obj([
                 ("type", .string("array")),
@@ -33,6 +27,7 @@ extension AppToolExecutor {
         }
         // 09-24: a form in one call; snapshot_id defaults to the last page read.
         let fieldsSchema = ToolSchema.obj([("type", .array([.string("object"), .string("string")])),
+            ("additionalProperties", .object(["type": .array([.string("string"), .string("number"), .string("boolean")])])),
             ("description", .string("Fields by shown label/row: {\"Email\":\"a@b.com\",\"Country\":\"Canada\",\"Remember me\":true} or \"Email: a@b.com; Country: Canada\"."))])
         let submitSchema = ToolSchema.obj([("type", .array([.string("string"), .string("boolean")])),
             ("description", .string("After fill: button label/row to click, or true for Enter in the last field."))])
@@ -45,7 +40,7 @@ extension AppToolExecutor {
             LLMToolSchema(
                 name: "app",
                 toolClass: .read, capabilities: ["app_data_write", "safe_read", "tool_call"],
-                description: "NativeAgent itself, worked in process: your home, its pages, settings and buttons, and every tool you have. Nothing comes forward on the owner's screen unless an action says screen. {} is your home first, where you left off (open agent windows, work in progress, what waits and what arrived, each with a name like desk.4, mail or an agent's name), then a line per page and the action ids that work on every page. item alone opens a name or ref from home or one of its rooms; its text or fields go in args. page (+item) reads one: what it shows, its settings, its version, and its actions as id(args) label; the owner's ones say why and where they do them. action + args does one; the receipt says what changed and what else the app did. preview:true reports checks, would_card and approver and does nothing; script previews describe only calls reached. expected_version refuses if the page changed since that read. find takes words (\"disconnect telegram\") and returns matching pages and actions, one line each as id(args) label; an action id named in the words (\"mail.search\") returns its args_schema and example. script runs a JavaScript function body that finishes a task in one call; app.* calls return synchronously and top-level await is not supported: app.<page>.<action>(args) for any action, as app.inbox.archive({ids, reason}), plus app.read(page, item) (a home item opens only outside a script), app.find(words) and app.log(text); return what you want back. Each call passes the turn's gates and gets its own ledger row. A call needing approval waits for the card: approved returns its real result. A call that fails or is declined throws AppError (reason, receipt), which code can catch and continue. A shell or bash command that ran has answered: exit_code, stdout, stderr and timed_out come back as data whatever the exit code; it throws only when the command didn't run. card.request waits and returns the person's answer. Full Mac writes need no approval card. Owner-only or blocked calls still stop at that line; earlier calls stay done. "
+                description: "NativeAgent itself, worked in process: your home, its pages, settings and buttons, and every tool you have. Nothing comes forward on the owner's screen unless an action says screen. {} is your home first, where you left off (open agent windows, work in progress, what waits and what arrived, each with a name like desk.4, mail or an agent's name), then a line per page and the action ids that work on every page. item alone opens a name or ref from home or one of its rooms; its text or fields go in args. page (+item) reads one: what it shows, its settings, its version, and its actions as id(args) label; the owner's ones say why and where they do them. action + args does one; the receipt says what changed and what else the app did. preview:true performs no proposed effects: native preflight reports checks, would_card and approver; authored preview runs live reads with writes previewed; resume preview only inspects stopped work; script previews describe only calls reached. expected_version refuses if the page changed since that read. find takes words (\"disconnect telegram\") and returns matching pages and actions, one line each as id(args) label; an action id named in the words (\"mail.search\") returns its args_schema and example. script runs a JavaScript function body that finishes a task in one call; app.* calls return synchronously and top-level await is not supported: app.<page>.<action>(args) for any action, as app.inbox.archive({ids, reason}), plus app.read(page, item) (a home item opens only outside a script), app.find(words) and app.log(text); return what you want back. Each call passes the turn's gates and gets its own ledger row. A call needing approval waits for the card: approved returns its real result. A call that fails or is declined throws AppError (reason, receipt), which code can catch and continue. A shell or bash command that ran has answered: exit_code, stdout, stderr and timed_out come back as data whatever the exit code; it throws only when the command didn't run. card.request waits and returns the person's answer. Full Mac writes need no approval card. Owner-only or blocked calls still stop at that line; earlier calls stay done. "
                     + "Permitted reads need no permission: do them.mac.go opens apps, files and folders; content readers only read. "
                     + "One action uses app {action:\"files.read\",args:{path:\"README.md\"}}. Put its arguments inside args; page selects a reader, not an action id. find always discovers actions, including with page:\"home\"; use work.context {query} or chat.search {query} for saved work and history. Call these without a read first: " + AppActions.hot.map(\.hotLine).joined(separator: "; ") + ".",
                 parametersJSON: ToolSchema.params(
@@ -56,8 +51,8 @@ extension AppToolExecutor {
                         ("args", ToolSchema.obj([("type", .string("object")),
                                       ("description", .string("The action's arguments by name, as its id(args) line shows; for a home item, text or fields. A list where the action takes one value (handle:[…]) runs it once per value."))])),
                         ("actions", ToolSchema.obj([("type", .string("array")), ("items", .object(["type": .string("object")])), ("maxItems", .int(Int64(AppScriptRunner.actionLimit))),
-                                         ("description", .string("Many calls in one, in order: each {action, args}, {page[, item]} or {item}, so several pages or items are one call. Every one runs and reports itself with its own receipt; preview and expected_version beside it apply to each, a write's new version passing to the next on its page."))])),
-                        ("preview", ToolSchema.boolSchema("With action or script: report checks, would_card and approver; nothing is done. Script previews describe only calls reached.")),
+                                         ("description", .string("Many calls in one, in order: each {action, args}, {page[, item]} or {item}, so several pages or items are one call. Every one runs and reports itself with its own receipt; preview and expected_version beside it apply to each, a write's new version passing to the next on its page. Steps are independent: one step's result never reaches the next; to feed one call's output into another, use script."))])),
+                        ("preview", ToolSchema.boolSchema("With action or script: report proposed effects without performing them; authored reads run live, resume only inspects. Native preflight reports checks, would_card and approver. Script previews describe only calls reached.")),
                         ("expected_version", ToolSchema.strSchema("With action: the version a read returned. Refused, with nothing done, if that page changed since. It hashes what the page shows, so a page changed and changed back has its old version again.")),
                         ("find", ToolSchema.strSchema("What you want done, in words. Discovers actions on every page, including home, one line each as id(args) label, with the best match's example. Name an action's id in the words for its args_schema and example. Search history explicitly with work.context or chat.search.")),
                         ("script", ToolSchema.strSchema("JavaScript function body: app.* calls return synchronously; top-level await is not supported. No direct network or file APIs; use eligible app actions. Up to 512 KB, 50 actions, 100 reads and 60 seconds of script time; time waiting on app calls does not count.")),
@@ -134,7 +129,7 @@ extension AppToolExecutor {
             LLMToolSchema(
                 name: "browser.chrome_status",
                 toolClass: .read,
-                description: "Whether the Chrome extension is connected and which tabs are yours in the NativeAgent group.",
+                description: "Whether the Chrome extension is connected and which tabs are yours in the NativeAgent group. released lists the last eight tabs that stopped being yours in this app run, with their reason, time and URL.",
                 parametersJSON: ToolSchema.params(properties: [], required: [])
             ),
             LLMToolSchema(
@@ -154,18 +149,26 @@ extension AppToolExecutor {
                 toolClass: .write, capabilities: ["app_data_write", "tool_call"],
                 description: "Explicitly close one of your NativeAgent group tabs. Omit tab_id for this conversation's tab. The person's tabs cannot be closed.",
                 parametersJSON: ToolSchema.params(properties: [
-                    ("tab_id", nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
-                    ("expected_user_sequence", nullable(ToolSchema.intSchema("Optional observed user sequence; omit to use the current page's sequence."))),
+                    ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
+                    ("expected_user_sequence", ToolSchema.nullable(ToolSchema.intSchema("Optional observed user sequence; omit to use the current page's sequence."))),
+                ], required: [])
+            ),
+            LLMToolSchema(
+                name: "browser.chrome_look",
+                toolClass: .read,
+                description: "Look at one of your NativeAgent group tabs: the picture Chrome renders of it now, without activating or moving it. Internal pages return one line with their title, URL and no-reader reason (read_mode none), without a picture attempt. Omit tab_id for this conversation's tab. The person's tabs cannot be looked at.",
+                parametersJSON: ToolSchema.params(properties: [
+                    ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
                 ], required: [])
             ),
             LLMToolSchema(
                 name: "browser.chrome_navigate",
                 toolClass: .read, capabilities: ["network_read", "tool_call"],
-                description: "Open/read a URL in this conversation's last tab if it is still in the NativeAgent group; otherwise open a new tab there. The owner's tabs are never used. Returns main content as numbered rows. url back/forward moves through this tab's history. fields + submit fills/sends a form in this call.",
+                description: "Open/read a URL in this conversation's last tab if it is still in the NativeAgent group; otherwise open a new tab there. The owner's tabs are never used. Chrome's completed tab and landed URL verify arrival, including internal pages and PDFs. Returns main content as numbered rows, or the displayed picture with a no-DOM note for PDFs/pages without DOM access; HTTP PDFs keep the independent unverified text transcript beside the verified picture. Internal pages return one title/URL/no-reader line with read_mode none. Unsupported schemes such as javascript: and data: refuse before any tab changes. url back/forward moves through this tab's history. fields + submit fills/sends a form in this call.",
                 parametersJSON: ToolSchema.params(
                     properties: [
-                        ("tab_id", nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
-                        ("expected_user_sequence", nullable(ToolSchema.intSchema("Optional; omit."))),
+                        ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
+                        ("expected_user_sequence", ToolSchema.nullable(ToolSchema.intSchema("Optional; omit."))),
                         ("url", ToolSchema.strSchema("HTTP(S) destination, or back / forward to go through this tab's history like the Back button.")),
                         ("fields", fieldsSchema),
                         ("submit", submitSchema),
@@ -177,14 +180,14 @@ extension AppToolExecutor {
             LLMToolSchema(
                 name: "browser.chrome_snapshot",
                 toolClass: .read,
-                description: "Read Chrome's rendered document in reading order, including inline links, once the page has finished loading (a read says so when it had not). Act with node_id (row number as a string or label). Reads carry url, title, snapshot_id, version, captured_at, bytes and has_more. Read folded sections with the supplied more address; scrolling remains an action. scope page adds site nav.",
+                description: "Read Chrome's ready rendered document in reading order, including inline links; a read says when the tab is still loading. Internal pages return one title/URL/no-reader line with read_mode none. Other pages and PDFs without DOM access return the displayed picture with read_mode picture and an explicit reason. HTTP PDFs retain an independent text transcript in the same receipt: unverified against Chrome's displayed document, without Chrome cookies/authentication. DOM reads carry url, title, snapshot_id, version, captured_at, bytes and has_more; act with node_id (row number as a string or label). Read folded sections with the supplied more address; scrolling remains an action. scope page adds site nav.",
                 parametersJSON: ToolSchema.params(
                     properties: [
-                        ("tab_id", nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
-                        ("expected_user_sequence", nullable(ToolSchema.intSchema("Optional user-sequence proof from the Chrome reader."))),
+                        ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
+                        ("expected_user_sequence", ToolSchema.nullable(ToolSchema.intSchema("Optional user-sequence proof from the Chrome reader."))),
                         ("max_nodes", ToolSchema.intSchema("Maximum rows, 1 through 200. Defaults 150.")),
                         ("max_text_chars", ToolSchema.intSchema("Maximum readable text characters, 1 through 40000. Defaults 12000.")),
-                        ("scope", ToolSchema.enumStringSchema(["page", "main_content"], "Rendered page or semantic main/article content. A main_content read reports when no semantic content region was found; use page to retain surrounding controls.")),
+                        ("scope", ToolSchema.enumStringSchema(["page", "main_content"], "Rendered page or main_content: declared main regions, else article bodies, else the document body, excluding navigation. Reports when no main/article region was declared; scope page includes navigation.")),
                         ("more", ToolSchema.strSchema("Structural cursor from the page's More address (the more string in next); reads the current snapshot of the same URL without scrolling.")),
                     ],
                     required: []
@@ -196,8 +199,8 @@ extension AppToolExecutor {
                 description: "Click one row of the current Chrome page with node_id: a row number as a string (\"73\") or its label (\"Sign in\"). Waits for any navigation it starts and returns the fresh page; no snapshot call needed.",
                 parametersJSON: ToolSchema.params(
                     properties: [
-                        ("tab_id", nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
-                        ("expected_user_sequence", nullable(ToolSchema.intSchema("Optional; omit."))),
+                        ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
+                        ("expected_user_sequence", ToolSchema.nullable(ToolSchema.intSchema("Optional; omit."))),
                         ("snapshot_id", ToolSchema.strSchema(snapshotDefault)),
                         ("node_id", ToolSchema.strSchema("Row number from the page, or the row's label.")),
                     ],
@@ -209,8 +212,8 @@ extension AppToolExecutor {
                 toolClass: .write, capabilities: ["safe_read", "tool_call"],
                 description: "Play, pause or seek the first audio/video in your Chrome tab, and only that player. Reports paused state, current time and whether the player confirmed it: playback advancing, the pause holding, the seek landing.Resume uses play; stop-playing uses pause.",
                 parametersJSON: ToolSchema.params(properties: [
-                    ("tab_id", nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
-                    ("expected_user_sequence", nullable(ToolSchema.intSchema("Optional observed user sequence; omit to use the current tab's sequence."))),
+                    ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
+                    ("expected_user_sequence", ToolSchema.nullable(ToolSchema.intSchema("Optional observed user sequence; omit to use the current tab's sequence."))),
                     ("operation", ToolSchema.enumStringSchema(["play", "pause", "seek"], "Media operation.")),
                     ("seconds", .object(["type": .string("number"), "minimum": .int(0), "description": .string("Nonnegative playback position in seconds; required for seek.")])),
                 ], required: ["operation"])
@@ -221,8 +224,8 @@ extension AppToolExecutor {
                 description: "Move a Chrome page or scrollable row by delta_y pixels. Returns newly visible rows, distance moved and remaining below; explicitly reports no movement.",
                 parametersJSON: ToolSchema.params(
                     properties: [
-                        ("tab_id", nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
-                        ("expected_user_sequence", nullable(ToolSchema.intSchema("Optional; omit."))),
+                        ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
+                        ("expected_user_sequence", ToolSchema.nullable(ToolSchema.intSchema("Optional; omit."))),
                         ("snapshot_id", ToolSchema.strSchema("Snapshot id when targeting a node. For page scrolling omit both optional IDs or supply both as empty strings.")),
                         ("target_node_id", ToolSchema.strSchema("Optional scrollable node id. Node scrolling requires both exact IDs from a fresh snapshot.")),
                         ("delta_x", ToolSchema.intSchema("Horizontal scroll delta.")),
@@ -237,8 +240,8 @@ extension AppToolExecutor {
                 description: "Fill the current Chrome form: fields {label or row: value} sets text boxes/selects/checkboxes in page order, then submit clicks a button (true presses Enter). Finds all fields before typing. For one row use node_id + value. Returns filled fields and fresh page; never retries ambiguous dispatch.",
                 parametersJSON: ToolSchema.params(
                     properties: [
-                        ("tab_id", nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
-                        ("expected_user_sequence", nullable(ToolSchema.intSchema("Optional; omit."))),
+                        ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
+                        ("expected_user_sequence", ToolSchema.nullable(ToolSchema.intSchema("Optional; omit."))),
                         ("fields", fieldsSchema),
                         ("submit", submitSchema),
                         ("snapshot_id", ToolSchema.strSchema(snapshotDefault)),
@@ -254,8 +257,8 @@ extension AppToolExecutor {
                 description: "Append text to an editable row (number or label), up to 20 s; returns typed progress and the fresh page. On partial progress send only the rest, never the whole text again.",
                 parametersJSON: ToolSchema.params(
                     properties: [
-                        ("tab_id", nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
-                        ("expected_user_sequence", nullable(ToolSchema.intSchema("Optional; omit."))),
+                        ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
+                        ("expected_user_sequence", ToolSchema.nullable(ToolSchema.intSchema("Optional; omit."))),
                         ("snapshot_id", ToolSchema.strSchema(snapshotDefault)),
                         ("node_id", ToolSchema.strSchema("Editable row: its number or label.")),
                         ("text", ToolSchema.strSchema("Text to append, at most 50000 characters.")),
@@ -270,8 +273,8 @@ extension AppToolExecutor {
                 description: "Choose options in a select row by value or label (shown as label=value, * selected). Returns the fresh page.",
                 parametersJSON: ToolSchema.params(
                     properties: [
-                        ("tab_id", nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
-                        ("expected_user_sequence", nullable(ToolSchema.intSchema("Optional; omit."))),
+                        ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
+                        ("expected_user_sequence", ToolSchema.nullable(ToolSchema.intSchema("Optional; omit."))),
                         ("snapshot_id", ToolSchema.strSchema(snapshotDefault)),
                         ("node_id", ToolSchema.strSchema("Select row: its number or label.")),
                         ("values", stringArraySchema("Option values or labels; single-select rows take exactly one.")),
@@ -285,8 +288,8 @@ extension AppToolExecutor {
                 description: "Press a key or chord in a row (number or label): Enter, Tab, Escape, arrows, a single character like j or /. To move down the page use browser.chrome_scroll; to go back, browser.chrome_navigate{url:\"back\"}. Verified by what changed; returns the fresh page.",
                 parametersJSON: ToolSchema.params(
                     properties: [
-                        ("tab_id", nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
-                        ("expected_user_sequence", nullable(ToolSchema.intSchema("Optional; omit."))),
+                        ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
+                        ("expected_user_sequence", ToolSchema.nullable(ToolSchema.intSchema("Optional; omit."))),
                         ("snapshot_id", ToolSchema.strSchema(snapshotDefault)),
                         ("node_id", ToolSchema.strSchema("Row to press in: its number or label.")),
                         ("key", ToolSchema.strSchema("Enter, Tab, Shift+Tab, Escape, ArrowDown/Up/Left/Right, Home, End, PageUp, PageDown, Backspace, Delete, Space, Control+A, Meta+A, or one character (j, k, /).")),
@@ -300,8 +303,8 @@ extension AppToolExecutor {
                 description: "Set a checkbox, radio or switch row on or off (idempotent). Returns the fresh page.",
                 parametersJSON: ToolSchema.params(
                     properties: [
-                        ("tab_id", nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
-                        ("expected_user_sequence", nullable(ToolSchema.intSchema("Optional; omit."))),
+                        ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
+                        ("expected_user_sequence", ToolSchema.nullable(ToolSchema.intSchema("Optional; omit."))),
                         ("snapshot_id", ToolSchema.strSchema(snapshotDefault)),
                         ("node_id", ToolSchema.strSchema("Checkable row: its number or label.")),
                         ("checked", ToolSchema.boolSchema("Exact checked state to apply.")),
@@ -315,8 +318,8 @@ extension AppToolExecutor {
                 description: "Double-click a row (number or label). Verified by what changed; returns the fresh page.",
                 parametersJSON: ToolSchema.params(
                     properties: [
-                        ("tab_id", nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
-                        ("expected_user_sequence", nullable(ToolSchema.intSchema("Optional; omit."))),
+                        ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
+                        ("expected_user_sequence", ToolSchema.nullable(ToolSchema.intSchema("Optional; omit."))),
                         ("snapshot_id", ToolSchema.strSchema(snapshotDefault)),
                         ("node_id", ToolSchema.strSchema("Row: its number or label.")),
                     ],
@@ -329,8 +332,8 @@ extension AppToolExecutor {
                 description: "Drag a drag-advertising node onto a drop-advertising node in one exact fresh Chrome snapshot/frame. Uses synthetic HTML events and page DataTransfer handlers without activating the tab. Target must accept dragover. dropDispatched does not prove success; check returned page. No OS/file dragging or pointer-only canvas gestures. Never automatically retry unknown outcomes.",
                 parametersJSON: ToolSchema.params(
                     properties: [
-                        ("tab_id", nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
-                        ("expected_user_sequence", nullable(ToolSchema.intSchema("Optional; omit."))),
+                        ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
+                        ("expected_user_sequence", ToolSchema.nullable(ToolSchema.intSchema("Optional; omit."))),
                         ("snapshot_id", ToolSchema.strSchema("Fresh snapshot containing both endpoints.")),
                         ("node_id", ToolSchema.strSchema("Source row number or label advertising drag.")),
                         ("target_node_id", ToolSchema.strSchema("Target row number or label advertising drop; acceptance is checked during the operation.")),
@@ -344,8 +347,8 @@ extension AppToolExecutor {
                 description: "Wait up to 10 s for the tab to settle or a row to become visible/hidden/enabled/disabled. Rarely needed: acts already wait for navigation.",
                 parametersJSON: ToolSchema.params(
                     properties: [
-                        ("tab_id", nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
-                        ("expected_user_sequence", nullable(ToolSchema.intSchema("Optional; omit."))),
+                        ("tab_id", ToolSchema.nullable(ToolSchema.intSchema("Omit for this chat's tab, or name one of your NativeAgent group tabs."))),
+                        ("expected_user_sequence", ToolSchema.nullable(ToolSchema.intSchema("Optional; omit."))),
                         ("condition", ToolSchema.enumStringSchema(["element_state", "navigation_settled"], "Wait condition.")),
                         ("snapshot_id", ToolSchema.strSchema("Exact current snapshot id for element_state.")),
                         ("node_id", ToolSchema.strSchema("Row number or label that advertised wait for element_state.")),

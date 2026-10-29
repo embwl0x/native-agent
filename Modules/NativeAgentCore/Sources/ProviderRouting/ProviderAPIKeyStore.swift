@@ -24,7 +24,10 @@ public enum ProviderAPIKeyStore {
             guard let data = try DeviceSecretKeychain.read(service: service, account: reference) else { return nil }
             guard let key = String(data: data, encoding: .utf8), !key.isEmpty else { throw Failure.unavailable }
             return key
-        } catch { throw Failure.unavailable }
+        } catch {
+            throw ProviderFailure.Diagnostic(cause: .routingUnavailable,
+                detail: "Provider Keychain read: \(ProviderFailure.diagnosticDescription(error))")
+        }
     }
 
     public static func delete(_ reference: String) throws {

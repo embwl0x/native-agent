@@ -33,7 +33,6 @@ public struct MacChatTurnActivity: Sendable, Equatable {
     public let identity: MacChatTurnIdentity
     public let source: MacChatTurnActivitySource
     public let phase: TurnPresentationPhase
-    public let toolDisplayName: String?
     public let actionSummary: String?
     /// Existing toast copy, redacted and independently capped before crossing
     /// the boundary. The stored shared-kernel summary remains at its tighter
@@ -87,10 +86,9 @@ public enum MacChatTurnActivityBoundary {
             identity: identity,
             source: .notice(kind: safeKind),
             phase: noticePhase(kind: kind),
-            toolDisplayName: nil,
             actionSummary: safeText,
             userVisibleNoticeText: boundedNoticeText(text),
-            delegateDisplayName: delegateName(forNoticeKind: kind, text: text),
+            delegateDisplayName: nil,
             outcome: nil,
             occurredAt: instant
         )
@@ -102,15 +100,14 @@ public enum MacChatTurnActivityBoundary {
         identity: MacChatTurnIdentity,
         at instant: Date
     ) -> MacChatTurnActivity {
-        let safeName = sanitized(ToolActivityPresentation.title(name)) ?? "Tool"
+        let delegate = delegateName(forTool: name, args: args)
         return MacChatTurnActivity(
             identity: identity,
             source: .toolUse,
-            phase: delegateName(forTool: name) == nil ? .tool : .delegation,
-            toolDisplayName: safeName,
+            phase: delegate == nil ? .tool : .delegation,
             actionSummary: sanitized(ToolActivityPresentation.progress(name, args: args)),
             userVisibleNoticeText: nil,
-            delegateDisplayName: delegateName(forTool: name),
+            delegateDisplayName: delegate,
             outcome: nil,
             occurredAt: instant
         )
@@ -124,7 +121,6 @@ public enum MacChatTurnActivityBoundary {
         identity: MacChatTurnIdentity,
         at instant: Date
     ) -> MacChatTurnActivity {
-        let safeName = sanitized(ToolActivityPresentation.title(name)) ?? "Tool"
         let outcome: TurnPresentationActivity.Outcome? = switch result {
         case .succeeded: .ok
         case .refused: .refused
@@ -135,7 +131,6 @@ public enum MacChatTurnActivityBoundary {
             identity: identity,
             source: .toolResult,
             phase: .working,
-            toolDisplayName: safeName,
             actionSummary: sanitized(ToolActivityPresentation.finished(name, outcome: result.rawValue)),
             userVisibleNoticeText: nil,
             delegateDisplayName: nil,
@@ -154,22 +149,14 @@ public enum MacChatTurnActivityBoundary {
         return .working
     }
 
-    private static func delegateName(forTool name: String) -> String? {
+    private static func delegateName(forTool name: String, args: [String: String]) -> String? {
         switch name.lowercased() {
-        case "claude_message", "invoke_claude": return "Claude"
-        case "codex_message", "invoke_codex": return "Codex"
-        case "omp_message": return "OMP"
-        case "agent_swarm": return "Worker swarm"
+        case "agent_message", "claude_message", "invoke_claude", "codex_message", "invoke_codex", "omp_message", "agent_swarm":
+            guard let agent = sanitized(args["agent"]),
+                  !agent.hasPrefix("peer:"), !agent.hasPrefix("bot:") else { return "Agent" }
+            return agent
         default: return nil
         }
-    }
-
-    private static func delegateName(forNoticeKind kind: String, text: String) -> String? {
-        let combined = "\(kind) \(text)".lowercased()
-        if combined.contains("claude") || combined.contains("claude") { return "Claude" }
-        if combined.contains("codex") { return "Codex" }
-        if combined.contains(" omp") || combined.hasPrefix("omp") { return "OMP" }
-        return nil
     }
 
     private static func sanitized(_ raw: String?) -> String? {

@@ -1,42 +1,11 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `AgentA2AStream.swift` | `AgentA2AStream` enum; `events`, `normalize`; shared stream accumulator |
+// Blueprint: | `AgentA2AStream.swift` | `AgentA2AStream` enum; `normalize`; shared stream accumulator |
 
 /// Bounded SSE evidence folded into the same result as send/get. No replay and
 /// no completion inferred from EOF, lastChunk, or the legacy `final` field.
 public enum AgentA2AStream {
-    public static func events(in data: Data) throws -> [JSONValue] {
-        guard data.count <= AgentPeerHTTP.maximumResponseBytes else {
-            throw AgentA2AWire.WireError.invalid("unreadable stream")
-        }
-        // Find complete frames in bytes so a split UTF-8 character in the
-        // discarded tail cannot invalidate earlier evidence.
-        var lineStart = data.startIndex
-        var end = lineStart
-        var index = lineStart
-        while index < data.endIndex {
-            if data[index] == 0x0A || data[index] == 0x0D {
-                var next = index + 1
-                if data[index] == 0x0D, next < data.endIndex, data[next] == 0x0A { next += 1 }
-                if index == lineStart { end = next }
-                lineStart = next; index = next
-            } else { index += 1 }
-        }
-        guard let text = String(data: data[data.startIndex..<end], encoding: .utf8) else {
-            throw AgentA2AWire.WireError.invalid("unreadable stream")
-        }
-        let frames = text.replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n").components(separatedBy: "\n\n")
-        return try frames.dropLast().compactMap { frame in
-            let lines = frame.components(separatedBy: "\n").filter { $0.hasPrefix("data:") }.map {
-                let value = String($0.dropFirst(5))
-                return value.hasPrefix(" ") ? String(value.dropFirst()) : value
-            }
-            guard !lines.isEmpty else { return nil }
-            return try JSONValue.parse(Data(lines.joined(separator: "\n").utf8))
-        }
-    }
-
     /// Validated display snapshots: assembled artifact text, a direct message,
     /// and status progress notes, retained together for coalesced delivery.
     /// Never evidence; the accumulator's receipt alone decides the outcome.
@@ -76,12 +45,13 @@ public enum AgentA2AStream {
             let legacy = interface.version == "0.3"
             guard case .object(var payload) = event else { throw AgentA2AWire.WireError.invalid("stream event") }
             if interface.binding == "JSONRPC" {
-                guard payload["jsonrpc"] == .string("2.0"), let requestID,
-                      payload["id"] == .string(requestID), payload["error"] == nil,
-                      case .object(let result)? = payload["result"] else {
+                let result: JSONValue
+                do { result = try AgentA2AWire.operationResult(event, interface: interface, requestID: requestID) }
+                catch { throw AgentA2AWire.WireError.invalid("stream response was not confirmed") }
+                guard case .object(let object) = result else {
                     throw AgentA2AWire.WireError.invalid("stream response was not confirmed")
                 }
-                payload = result
+                payload = object
             }
             guard latest?.kind != "message", latest?.terminal != true,
                   latest?.needsInput != true, latest?.needsAuthentication != true else {
@@ -152,6 +122,9 @@ public enum AgentA2AStream {
             let response: JSONValue = legacy ? .object(body) : .object([task == nil ? "message" : "task": .object(body)])
             let wrapped: JSONValue = interface.binding == "JSONRPC"
                 ? .object(["jsonrpc": .string("2.0"), "id": .string(requestID!), "result": response]) : response
+            guard try wrapped.serializedData(pretty: false).count <= AgentPeerHTTP.maximumResponseBytes else {
+                throw AgentPeerHTTP.TransportError.tooLarge
+            }
             latest = try AgentA2AWire.normalizeResponse(wrapped, interface: interface,
                 expectedRequestID: requestID, expectedTaskID: expectedTaskID)
             let result = latest!

@@ -1,16 +1,16 @@
 import AppKit
+import AppToolRuntime
+import EngineRuntime
+import ChatTurnRuntime
+import NativeAgentShared
 import Foundation
 import Observation
 import SwiftUI
 
-// Blueprint: | `ChatViewStateCoordinators.swift` | Chat view coordinators: viewport/follow state and occurrence-preserving composer toast queue independent of transcript layout |
+/// Measuring the twitch (10-29): every move of the transcript that is not the reader's own hand.
+let scrollMoveLog = ModuleLog(category: "TranscriptScroll", trail: true)
 
-/// Scroll offsets are deliberately excluded: following the bottom must not
-/// trigger another layout-follow request merely because the viewport moved.
-struct ChatScrollLayoutExtent: Equatable {
-    let contentHeight: CGFloat
-    let viewportHeight: CGFloat
-}
+// Blueprint: | `ChatViewStateCoordinators.swift` | Chat viewport/follow state, measured turn-card/composer clearance and clear confirmation; occurrence-preserving toast queue |
 
 @Observable
 @MainActor
@@ -18,35 +18,13 @@ final class ChatToastQueue {
     var current: String?
 
     private var queue: [String] = []
-    private var recentKeys: [(key: String, at: Date)] = []
     private let displayDuration: TimeInterval
-    @ObservationIgnored private let visibleEntryDidChange: @MainActor @Sendable (String?) -> Void
-
-    init(
-        displayDuration: TimeInterval = 2.0,
-        visibleEntryDidChange: @escaping @MainActor @Sendable (String?) -> Void = { _ in }
-    ) {
+    init(displayDuration: TimeInterval = 2.0) {
         self.displayDuration = max(0, displayDuration)
-        self.visibleEntryDidChange = visibleEntryDidChange
     }
 
-    /// `deduplicating: false` is for the chat composer sink: every call there
-    /// is an independently actionable outcome, even when its human text has
-    /// the same timestamp/UUID-normalized shape as a prior failure.
-    func show(_ message: String, deduplicating: Bool = true) {
-        let normalized = normalizedKey(message)
-        if deduplicating {
-            let normalizedCurrent = normalizedKey(current ?? "")
-            if normalized == normalizedCurrent { return }
-
-            let now = Date()
-            recentKeys.removeAll { now.timeIntervalSince($0.at) > 10 }
-            if recentKeys.contains(where: { $0.key == normalized }) { return }
-
-            recentKeys.append((key: normalized, at: now))
-            if recentKeys.count > 5 { recentKeys.removeFirst() }
-        }
-
+    /// Preserve every producer occurrence in a bounded FIFO.
+    func show(_ message: String) {
         if queue.count >= 10 { queue.removeFirst() }
         queue.append(message)
         if current == nil { advance() }
@@ -54,49 +32,11 @@ final class ChatToastQueue {
 
     private func advance() {
         guard !queue.isEmpty else { return }
-        setVisibleEntry(queue.removeFirst())
+        current = queue.removeFirst()
         DispatchQueue.main.asyncAfter(deadline: .now() + displayDuration) {
-            self.setVisibleEntry(nil)
+            self.current = nil
             self.advance()
         }
-    }
-
-    private func setVisibleEntry(_ entry: String?) {
-        current = entry
-        visibleEntryDidChange(entry)
-    }
-
-    private func normalizedKey(_ value: String) -> String {
-        var output = value
-        output = output.replacingOccurrences(
-            of: "\u{1B}\\][^\u{07}]*\u{07}",
-            with: "",
-            options: .regularExpression
-        )
-        output = output.replacingOccurrences(
-            of: "\u{1B}\\[[0-?]*[ -/]*[@-~]",
-            with: "",
-            options: .regularExpression
-        )
-        output = output.replacing(/\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z?\b/, with: "<ts>")
-        output = output.replacing(/\b\d{2}:\d{2}:\d{2}\b/, with: "<time>")
-        output = output.replacing(/\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/, with: "<id>")
-        return output
-    }
-}
-
-/// The composer is the visible sink for ChatView.showToast.  It deliberately
-/// retains every producer occurrence: pin persistence, voice, and slash
-/// command outcomes may share normalized text while still requiring separate
-/// acknowledgement by the user.
-@MainActor
-enum ChatComposerBottomToastPresentation {
-    static func show(_ message: String, in queue: ChatToastQueue) {
-        queue.show(message, deduplicating: false)
-    }
-
-    static func visibleEntry(from queue: ChatToastQueue) -> String? {
-        queue.current
     }
 }
 
@@ -116,23 +56,11 @@ struct TranscriptViewportReading: Equatable {
     }
 }
 
-/// One transcript's viewport owner: the main chat, the detached panel and
-/// Simple's threads each hold one, and `TranscriptScrollView` is the scroll
-/// view all of them read through.
-///
-/// The reader's place. Following is one place: the live edge, which the
-/// scroll view's bottom anchor holds by itself. Anywhere else the place is the
-/// block under the reader's reading line (a row, a card, a reply's notes or
-/// answer) and how far its top sits from the top of the viewport, and every
-/// layout change puts that block back where it was: a reply settling, a card
-/// moving under its reply, an image decoding, a window resize, the window of
-/// rows sliding. A kept scroll offset could not do this — anything above the
-/// reader that changed height moved their words. Only the reader moves the
-/// place: a scroll, a press on something (that thing is where they are), a
-/// jump they asked for.
+/// Shared transcript viewport owner. Only reader input moves the reading place; layout
+/// changes restore its block and gap, while the live edge follows the bottom anchor.
 @Observable
 @MainActor
-final class ChatScrollCoordinator {
+final class ChatScrollFollow {
     var autoFollow: Bool
     /// The live edge is in view. Read by the re-arm and the Latest pill.
     private(set) var atBottom = true
@@ -141,40 +69,20 @@ final class ChatScrollCoordinator {
     /// pill's own gate, never by ChatView.body.
     var transcriptPagedBack = false
 
-    private var serial = 0
-    /// True only while the request holding the CURRENT serial is pending.
-    /// Every serial bump supersedes that request, so every bump also clears
-    /// the latch: a superseded block returns on the serial guard before it
-    /// reaches its own `scheduled = false`, and a latch left standing behind
-    /// it turned off ordinary auto-follow for the life of the view
-    /// (2026-09-06).
-    private var scheduled = false
-    private var lastScrollAt = Date.distantPast
-    /// Bumped every time the reader scrolls away from the bottom. A scroll
-    /// scheduled before that gesture is stale, `force` or not — the old code
-    /// let a forced repair fire seconds later and yank the viewport out from
-    /// under someone reading upward (2026-09-06).
-    private var disarmCount = 0
-
     /// A transcript that opens on its newest follows it; one read from the top
     /// (a crew's findings) starts in place.
     init(following: Bool = true) {
         autoFollow = following
     }
 
-    func markViewDisappeared() {
-        serial &+= 1
-        scheduled = false
-    }
-
     func forceFollow() {
+        if !autoFollow { scrollMoveLog("scroll.follow on (re-arm)") }
         autoFollow = true
     }
 
     func disarmFollow() {
-        if autoFollow { pickPlace() }
+        if autoFollow { pickPlace(); scrollMoveLog("scroll.follow off") }
         autoFollow = false
-        disarmCount &+= 1
     }
 
     // MARK: The reader's place
@@ -203,6 +111,7 @@ final class ChatScrollCoordinator {
 
     /// The reader asked for the newest (a send): follow it, from the live edge.
     func followFromLiveEdge() {
+        scrollMoveLog("scroll.live_edge (send) follow=%@", autoFollow ? "on" : "off")
         autoFollow = true
         moveToLiveEdge?()
     }
@@ -215,6 +124,7 @@ final class ChatScrollCoordinator {
         let offset = minY - place.gap
         guard abs(offset - (correcting ?? viewport.offset)) > 0.5 else { return }
         correcting = offset
+        scrollMoveLog("scroll.keep_place block=%@ from=%.1f to=%.1f delta=%.1f", id, viewport.offset, offset, offset - viewport.offset)
         // A scroll position's y is measured from under the top inset (the
         // header); the offset the geometry reports includes it.
         moveTo?(offset + viewport.top)
@@ -246,11 +156,7 @@ final class ChatScrollCoordinator {
         pickPlace()
     }
 
-    /// A press on the transcript: what was pressed is where the reader is.
-    /// A press alone never leaves the live edge; a scroll does, and so does
-    /// opening a disclosure (`opening`). 0.6.8: pressing Approve on a card
-    /// while her reply streamed stopped the follow, and the reply ran on
-    /// under the composer behind a "Latest" pill.
+    /// A press records the reading place without leaving the live edge; opening a disclosure does.
     func pressed(atY y: CGFloat) {
         guard y >= viewport.top, y <= viewport.top + viewport.visible else { return }
         pressedAt = y
@@ -284,59 +190,18 @@ final class ChatScrollCoordinator {
         !autoFollow && place.map { $0.id == rowID || $0.id.hasPrefix(rowID + "#") } == true
     }
 
-    func scrollToBottom(
-        _ proxy: ScrollViewProxy,
-        bottomAnchor: String,
-        animated: Bool,
-        delay: TimeInterval,
-        force: Bool = false
-    ) {
-        guard force || autoFollow else { return }
-        if force {
-            serial &+= 1
-            scheduled = false
-        } else if scheduled {
-            return
-        }
-
-        let minInterval: TimeInterval = animated ? 0.12 : 0.16
-        let elapsed = Date().timeIntervalSince(lastScrollAt)
-        let effectiveDelay = force ? delay : max(delay, max(0, minInterval - elapsed))
-        let expectedSerial = serial
-        let expectedDisarm = disarmCount
-        scheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + effectiveDelay) {
-            guard expectedSerial == self.serial else { return }
-            self.scheduled = false
-            guard expectedDisarm == self.disarmCount else { return }
-            guard force || self.autoFollow else { return }
-            self.lastScrollAt = Date()
-            if animated {
-                // No SwiftUI Environment here, so Reduce Motion is read from
-                // the system: for that reader the follow is an instant jump.
-                withAnimation(
-                    NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-                        ? nil : NativeAgentMotion.quick
-                ) {
-                    proxy.scrollTo(bottomAnchor, anchor: .bottom)
-                }
-            } else {
-                proxy.scrollTo(bottomAnchor, anchor: .bottom)
-            }
-        }
-    }
 }
 
 extension EnvironmentValues {
     /// The transcript viewport a block reports to; nil outside a transcript.
-    @Entry var readingPlace: ChatScrollCoordinator?
+    @Entry var readingPlace: ChatScrollFollow?
 }
 
 /// The one transcript scroll view. The main chat, the detached panel and
 /// Simple's threads scroll through it, so the reader's place is kept the same
-/// way in all of them (ChatScrollCoordinator).
+/// way in all of them (ChatScrollFollow).
 struct TranscriptScrollView<Content: View>: View {
-    let coordinator: ChatScrollCoordinator
+    let coordinator: ChatScrollFollow
     /// False while this transcript is mounted behind another page: the wheel
     /// and press monitors are window-wide.
     var isActive: Bool = true
@@ -350,13 +215,10 @@ struct TranscriptScrollView<Content: View>: View {
         ScrollView {
             content
                 .environment(\.readingPlace, coordinator)
-                .coordinateSpace(.named(ChatScrollCoordinator.readingSpace))
+                .coordinateSpace(.named(ChatScrollFollow.readingSpace))
         }
         .scrollPosition($position)
-        // User, 2026-09-13: while the reader is at the bottom the scroll view
-        // keeps the bottom pinned itself — no scroll command per token. Away
-        // from it the offset is left alone (`.top`, the system default) and
-        // the reader's place is put back by `blockMoved` instead.
+        // The live edge follows the bottom; `blockMoved` preserves a reader elsewhere.
         .defaultScrollAnchor(coordinator.autoFollow ? .bottom : .top, for: .sizeChanges)
         .onScrollPhaseChange { _, phase in coordinator.scrolling = phase.isScrolling }
         .onScrollGeometryChange(for: TranscriptViewportReading.self) { geometry in
@@ -364,10 +226,27 @@ struct TranscriptScrollView<Content: View>: View {
                 offset: geometry.contentOffset.y,
                 contentHeight: geometry.contentSize.height,
                 top: geometry.contentInsets.top,
-                visible: geometry.containerSize.height - geometry.contentInsets.top - geometry.contentInsets.bottom
+                // The container already excludes the header and composer
+                // insets (10-29: a 1203pt window read 1029 = 1203 - 62 - 112);
+                // subtracting them again left a long transcript never at its
+                // bottom, so scrolling back down never re-armed following.
+                visible: geometry.containerSize.height
             )
         } action: { old, new in
             coordinator.viewportChanged(from: old, to: new)
+            // Following IS the live edge: a size change (rows arriving after a relaunch, a card, a
+            // resize) that leaves a following transcript off its edge puts it back, until the reader
+            // scrolls (10-29: a one-shot move on open fired mid-load and left the chat at the top).
+            if coordinator.autoFollow, !coordinator.scrolling, !coordinator.atBottom,
+               new.contentHeight != old.contentHeight || new.visible != old.visible {
+                scrollMoveLog("scroll.repin live_edge content=%.0f visible=%.0f offset=%.1f", new.contentHeight, new.visible, new.offset)
+                position.scrollTo(edge: .bottom)
+            }
+            // Any offset change while following that is not at the live edge is a visible jump.
+            if coordinator.autoFollow, !coordinator.scrolling, abs(new.offset - old.offset) > 2,
+               new.contentHeight == old.contentHeight {
+                scrollMoveLog("scroll.jump following offset %.1f -> %.1f content=%.0f visible=%.0f", old.offset, new.offset, new.contentHeight, new.visible)
+            }
         }
         .simultaneousGesture(
             DragGesture(minimumDistance: 4).onChanged { _ in coordinator.disarmFollow() }
@@ -380,10 +259,7 @@ struct TranscriptScrollView<Content: View>: View {
                 case .disarm:
                     coordinator.disarmFollow()
                 case .rearm:
-                    // Scrolling back DOWN to the bottom re-arms follow
-                    // (2026-06-12). No snap: the reader is already there and
-                    // still scrolling, and a forced jump moved the transcript
-                    // under them as the pill left.
+                    // Returning to the bottom re-arms follow without snapping.
                     onRearm()
                     coordinator.forceFollow()
                 case .none:
@@ -396,6 +272,218 @@ struct TranscriptScrollView<Content: View>: View {
             coordinator.moveTo = { position.scrollTo(y: $0) }
             coordinator.moveToLiveEdge = { position.scrollTo(edge: .bottom) }
         }
+    }
+}
+
+/// Measured card and composer heights; only the Latest pill observes them, never ChatView.body.
+@MainActor
+@Observable
+final class ChatTurnCardClearance {
+    /// What the card actually drew, where it drew it.
+    var measuredHeight: CGFloat = 0
+    /// Whether a card is on screen at all; idle keeps the floor.
+    var showsCard = false
+    /// Composer inset height, needed by the frame-aligned Latest overlay.
+    var measuredComposerHeight: CGFloat = 0
+    /// Room the transcript lends the floating card, as content at its end.
+    var room: CGFloat = 0
+    var clearance: CGFloat {
+        ChatViewportPresentation.transcriptBottomClearance(
+            showingTurnCard: showsCard,
+            measuredCardHeight: measuredHeight,
+            measuredComposerHeight: measuredComposerHeight
+        )
+    }
+
+    /// Idle overlay clearance keeps the floor until the composer is measured.
+    func idleClearance(floor: CGFloat) -> CGFloat {
+        max(floor, ChatViewportPresentation.composerClearance(
+            measuredComposerHeight: measuredComposerHeight))
+    }
+}
+
+/// The scroll target, and the room lent to the working card that floats
+/// over the live edge. The room is content, so a card appearing, growing or
+/// leaving is the transcript growing at its end, never the viewport resizing.
+struct ChatTranscriptBottomAnchor: View {
+    let anchorID: String
+    let store: ChatTurnCardClearance
+    var margin: CGFloat = NativeAgentShellLayout.composerClearanceMargin
+
+    var body: some View {
+        Color.clear
+            .frame(height: margin + store.room)
+            .id(anchorID)
+    }
+}
+
+/// The Latest pill's bottom inset. The clearance read is confined to a
+/// modifier body.
+struct ChatTurnCardClearancePadding: ViewModifier {
+    let store: ChatTurnCardClearance
+    let idle: CGFloat
+
+    func body(content: Content) -> some View {
+        content.padding(
+            .bottom,
+            (store.showsCard ? store.clearance : store.idleClearance(floor: idle))
+        )
+    }
+}
+
+/// Value-only presentation rules used by the chat viewport. The view is their
+/// sole consumer; no state is duplicated here.
+enum ChatViewportPresentation {
+    static func turnCardClearance(showingTurnCard: Bool, measuredHeight: CGFloat) -> CGFloat {
+        guard showingTurnCard else { return MacChatTurnCardMetrics.floatingClearance }
+        return max(MacChatTurnCardMetrics.floatingClearance, measuredHeight)
+    }
+
+    /// The frame-aligned Latest overlay must clear the sum of both stacked bottom insets.
+    static func transcriptBottomClearance(
+        showingTurnCard: Bool,
+        measuredCardHeight: CGFloat,
+        measuredComposerHeight: CGFloat
+    ) -> CGFloat {
+        let card = turnCardClearance(
+            showingTurnCard: showingTurnCard,
+            measuredHeight: measuredCardHeight
+        )
+        return card + composerClearance(measuredComposerHeight: measuredComposerHeight)
+    }
+
+    /// Capped composer height (including padding) plus margin, or zero until measured.
+    static func composerClearance(measuredComposerHeight: CGFloat) -> CGFloat {
+        guard measuredComposerHeight > 0 else { return 0 }
+        let sane = min(measuredComposerHeight, NativeAgentShellLayout.composerClearanceMax)
+        return sane + NativeAgentShellLayout.composerClearanceMargin
+    }
+
+    /// Only for a reader who left, and only when the live edge is out of
+    /// view: one who scrolled up a hair has nothing below the fold, and the
+    /// bottom of an earlier page is not the live edge.
+    static func shouldShowLatestPill(autoFollow: Bool, atBottom: Bool, pagedBack: Bool) -> Bool {
+        !autoFollow && (!atBottom || pagedBack)
+    }
+
+    enum ScrollFollowAction: Equatable {
+        case none
+        case disarm
+        case rearm
+    }
+
+    static func scrollFollowAction(
+        deltaY: CGFloat,
+        atBottom: Bool,
+        autoFollow: Bool
+    ) -> ScrollFollowAction {
+        if deltaY > 0.5 { return .disarm }
+        if deltaY < -0.5, atBottom, !autoFollow { return .rearm }
+        return .none
+    }
+}
+
+/// Only a presented clear confirmation may consume its captured session, once.
+struct ChatClearConfirmationState: Equatable {
+    private(set) var sessionId: String?
+    var isPresented: Bool { sessionId != nil }
+
+    mutating func request(sessionId: String) {
+        guard !isPresented else { return }
+        self.sessionId = sessionId
+    }
+
+    mutating func cancel() {
+        sessionId = nil
+    }
+
+    /// Returns the captured session exactly once per confirmation.
+    mutating func consumeConfirmation() -> String? {
+        defer { cancel() }
+        return sessionId
+    }
+}
+
+/// Observes turn lifecycle and approvals here so their updates do not invalidate ChatView.body.
+struct ChatTurnCardInset: View {
+    @Environment(AppModel.self) var appModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Simple view has no Work pane, so its card keeps the thumbnail.
+    @Environment(\.layoutProfile) private var layoutProfile
+    let store: ChatTurnCardClearance
+
+    /// Inside the composer's glass container, already in the reply column; the
+    /// tray's gap keeps it within the merge distance, so the glass fuses.
+    private var card: some View {
+        // Shared with detached chat; this window's Stop belongs to the composer.
+        MacChatTurnCardHost(
+            sessionId: appModel.activeChatSessionId,
+            onOpenScreen: layoutProfile == SimpleViewMode.simple ? nil : { WorkPaneState.shared.userShow(.screen) }
+        )
+        .padding(.horizontal, NativeAgentShellLayout.roomGutter)
+        .padding(.bottom, ChatComposerTray.gap)
+    }
+
+    var body: some View {
+        TurnCardRoom(shows: showThinkingRow, floor: MacChatTurnCardMetrics.floatingClearance,
+                     store: store) { card }
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+            store.measuredHeight = height
+        }
+        .onChange(of: showThinkingRow, initial: true) { _, shows in
+            store.showsCard = shows
+        }
+        .animation(
+            NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
+            value: showThinkingRow)
+    }
+}
+
+/// Her working card floats over the transcript's live edge and borrows its
+/// room from the transcript's end (`ChatTranscriptBottomAnchor`), so the
+/// viewport never changes size during a turn. The room opens when the card
+/// shows, only grows while it is up, and closes once, after it has faded.
+/// Main and detached windows share it.
+struct TurnCardRoom<Card: View>: View {
+    let shows: Bool
+    let floor: CGFloat
+    let store: ChatTurnCardClearance
+    @ViewBuilder let card: () -> Card
+    @State private var held: CGFloat = 0
+    /// `shows`, read live: a disappearing card's closure holds the value from
+    /// the last render it was in, which was still showing.
+    @State private var showing = false
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            if shows {
+                card()
+                    .fixedSize(horizontal: false, vertical: true)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+                        guard height > held else { return }
+                        held = height
+                        lend(max(floor, height))
+                    }
+                    .transition(NativeAgentMotion.fade)
+                    // Its fade has finished: now the room closes.
+                    .onDisappear {
+                        guard !showing else { return }
+                        held = 0
+                        lend(0)
+                    }
+            }
+        }
+        .onChange(of: shows, initial: true) { _, now in
+            showing = now
+            if now { lend(max(floor, held)) }
+        }
+    }
+
+    /// One eased move per change, so the transcript glides with the card.
+    private func lend(_ height: CGFloat) {
+        guard height != store.room else { return }
+        scrollMoveLog("card.room %.0f -> %.0f", store.room, height)
+        withAnimation(NativeAgentMotion.standard) { store.room = height }
     }
 }
 
@@ -415,7 +503,7 @@ private struct ReadingBlock: ViewModifier {
         if let place {
             content
                 .onGeometryChange(for: CGFloat.self) {
-                    $0.frame(in: .named(ChatScrollCoordinator.readingSpace)).minY
+                    $0.frame(in: .named(ChatScrollFollow.readingSpace)).minY
                 } action: { minY in
                     place.blockMoved(id, mount: mount, to: minY)
                 }

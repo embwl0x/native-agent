@@ -4,10 +4,11 @@ import JavaScriptCore
 import Senses
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `Sources/NativeAgentSenseHost/JavaScriptSenseRuntime.swift` | Persistent sense/resident-part contexts with fresh frozen input per call, synchronous run/face entries, fresh projection helpers, shared Swift fragment-redaction binding and SenseWire validation, JSC execution watchdog with ProgramProgressWindow arithmetic |
+// Blueprint: | `Sources/NativeAgentSenseHost/JavaScriptSenseRuntime.swift` | Persistent sense/resident-part contexts with fresh frozen input per call; native rehearsal requests reset context/body/input references between fixtures in one helper; synchronous run/face entries, fresh projection helpers, shared Swift fragment-redaction binding and SenseWire validation, JSC execution watchdog with ProgramProgressWindow arithmetic |
 
-/// One isolated context per helper/program. Resident parts retain their context;
-/// all kinds share the VM, exception latch, host exchange and JSC watchdog.
+/// One program per helper. Resident parts retain their context; rehearsal
+/// passes create fresh contexts in that helper. All kinds use the same
+/// exception latch, host exchange and JSC watchdog.
 final class JavaScriptProgramRuntime {
     private typealias ShouldTerminate = @convention(c) (JSContextRef?, UnsafeMutableRawPointer?) -> Bool
     private typealias SetTimeLimit = @convention(c) (JSContextGroupRef, Double, ShouldTerminate?, UnsafeMutableRawPointer?) -> Void
@@ -223,6 +224,12 @@ final class JavaScriptProgramRuntime {
     }
 
     private func runProgram(_ program: OwnedProgram, message: [String: Any]) throws {
+        // A rehearsal shares its process, never its fixture's globals or input.
+        // The app supplies this flag; the exact program identity was checked above.
+        if message["freshContext"] as? Bool == true {
+            if let context, let group = JSContextGetGroup(context.jsGlobalContextRef) { Self.clearTimeLimit?(group) }
+            body = nil; updateInput = nil; thrown = nil; context = nil
+        }
         guard (context == nil || program.isResident), let runID = message["id"] as? Int, let ids = message["actionIDs"] as? [String] else {
             throw failure("bad_input", "Program requires an available helper, an integer id and admitted action names.")
         }

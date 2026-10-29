@@ -1,15 +1,13 @@
 import Foundation
 
-// Blueprint: | `CognitiveConfiguration.swift` | `CognitiveConfiguration`: cleaned cognition settings, reflection spend ceilings and personality experiment gates |
+// Blueprint: | `CognitiveConfiguration.swift` | `CognitiveConfiguration`: cognition settings, Observatory availability and reflection spend ceilings |
 
 public struct CognitiveConfiguration: Sendable, Equatable {
     public var enabled: Bool
     public var persistenceEnabled: Bool
     public var capsuleInjectionEnabled: Bool
-    public var affectEnabled: Bool { enabled }
     public var backgroundMicrocyclesEnabled: Bool
     public var reflectiveCallsEnabled: Bool
-    public var observatoryEnabled: Bool { enabled }
     public var maximumActiveNodes: Int
     public var defaultDecayHalfLife: TimeInterval
     public var maximumMetadataKeys: Int
@@ -29,9 +27,6 @@ public struct CognitiveConfiguration: Sendable, Equatable {
     /// a person asked for is not gated by it — only by the ceiling.
     public var reflectionLoadThreshold: Double
     public var reflectionSurface: String
-    public var reflectionModel: String
-    public var reflectionProvider: String
-    public var reflectionReasoningEffort: String
 
     public init(
         enabled: Bool = false,
@@ -48,12 +43,7 @@ public struct CognitiveConfiguration: Sendable, Equatable {
         maximumWorkspaceItems: Int = 12,
         dailyReflectionCallBudget: Int = 0,
         reflectionLoadThreshold: Double = 0.35,
-        reflectionSurface: String = "cognition_reflection",
-        // 2026-09-13: the reflection model and route are the Memory and mind
-        // group's, resolved at call time. Empty means "the group's choice".
-        reflectionModel: String = "",
-        reflectionProvider: String = "",
-        reflectionReasoningEffort: String = "high"
+        reflectionSurface: String = "cognition_reflection"
     ) {
         self.enabled = enabled
         self.persistenceEnabled = persistenceEnabled
@@ -70,9 +60,6 @@ public struct CognitiveConfiguration: Sendable, Equatable {
         self.dailyReflectionCallBudget = max(0, dailyReflectionCallBudget)
         self.reflectionLoadThreshold = reflectionLoadThreshold.clamped01()
         self.reflectionSurface = Self.cleaned(reflectionSurface, fallback: "cognition_reflection")
-        self.reflectionModel = Self.cleaned(reflectionModel, fallback: "")
-        self.reflectionProvider = Self.cleaned(reflectionProvider, fallback: "")
-        self.reflectionReasoningEffort = Self.cleaned(reflectionReasoningEffort, fallback: "high")
     }
 
     public static let disabled = CognitiveConfiguration(enabled: false)

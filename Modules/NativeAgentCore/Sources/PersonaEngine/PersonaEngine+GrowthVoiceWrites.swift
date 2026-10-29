@@ -15,10 +15,7 @@ extension SwiftNativePersonaEngine {
     static let memoryOwnedUserDocMessage =
         "USER.md is generated from MemoryV2; use app memory.commit or memory proposal tools for durable user facts."
 
-    /// NFKC + strip + lower, matching the daemon's
-    /// `unicodedata.normalize("NFKC", str(kind or "")).strip().lower()` AND the
-    /// Swift `PersonaWriteGuard` canonicalization (same byte form, so a kind that
-    /// the guard upgrades resolves here to the same protected doc).
+    /// Protected reads and writes share NFKC, trimming and lowercase before selecting a document.
     package static func canonicalizeKind(_ kind: String) -> String {
         (kind)
             .precomposedStringWithCompatibilityMapping
@@ -39,12 +36,7 @@ extension SwiftNativePersonaEngine {
 
     // MARK: - persona_write (full-doc REPLACE + backup)
 
-    /// Native mirror of `_exec_persona_write`.
-    /// Full-doc REPLACE: back up the prior content (if any) to a timestamped
-    /// `<file>.pre-<ts>-<uid>.bak`, then atomically write `content`. The backup
-    /// + write run under ONE flock on the target (the daemon's
-    /// `with _persona_write_lock, file_lock(target)`). `keeping` sees the
-    /// document being replaced under that lock and throws to refuse the write.
+    /// Under the target lock, `keeping` may refuse replacement before backup or write.
     @discardableResult
     public func personaWrite(kind: String, content: String,
                              keeping: (@Sendable (_ current: String) throws -> Void)? = nil) async throws -> PersonaToolWriteResult {
@@ -62,8 +54,7 @@ extension SwiftNativePersonaEngine {
         }
 
         let contentBytes = Array(content.utf8)
-        let persistence = SwiftNativePersistenceCore()
-        let backupPath: String? = try await persistence.withFileLock(target) {
+        let backupPath: String? = try await SwiftNativePersistenceCore.withFileLock(target) {
             let original = FileManager.default.fileExists(atPath: target.path)
                 ? try Data(contentsOf: target) : nil
             if let keeping, let original {
@@ -92,10 +83,8 @@ extension SwiftNativePersonaEngine {
 
     // MARK: - persona_append_section (titled section append + backup)
 
-    /// Native mirror of `_exec_persona_append_section` (builtin_tools.py
-    /// L3948-4038). Appends `\n\n## <title>\n<content>` to the persona file
-    /// after `existing.rstrip()`, with a timestamped backup of the prior
-    /// content. Read-modify-rewrite + backup run under ONE flock on the target.
+    /// Append the full `\n\n## <trimmed title>\n<content>` section after trimming the base's trailing whitespace.
+    /// Read, backup and rewrite hold the target lock.
     @discardableResult
     public func personaAppendSection(kind: String, title: String, content: String) async throws -> PersonaToolWriteResult {
         let canon = Self.canonicalizeKind(kind)
@@ -116,17 +105,13 @@ extension SwiftNativePersonaEngine {
             throw PersonaWriteError.invalidInput("Could not resolve persona path")
         }
 
-        // new_section = f"\n\n## {title}\n{content}" -- the daemon uses the
-        // STRIPPED title value (title = str(...).strip(), L3966) in the heading.
         let newSection = "\n\n## \(trimmedTitle)\n\(content)"
         let newSectionBytes = Array(newSection.utf8).count
 
-        let persistence = SwiftNativePersistenceCore()
-        let backupPath: String? = try await persistence.withFileLock(target) {
+        let backupPath: String? = try await SwiftNativePersistenceCore.withFileLock(target) {
             let existing = FileManager.default.fileExists(atPath: target.path)
                 ? try Self.readPersonaTextForAppend(at: target) : nil
             let backup = try Self.backup(target, data: existing?.data)
-            // new_content = existing.rstrip() + new_section
             let newContent = Self.rstrip(existing?.text ?? "") + newSection
             try Self.atomicWriteText(newContent, to: target)
             return backup
@@ -175,8 +160,7 @@ extension SwiftNativePersonaEngine {
         ))
     }
 
-    /// `existing.rstrip()` -- Python strips trailing Unicode whitespace only.
-    /// Swift String has no rstrip; drop trailing whitespace scalars.
+    /// Remove trailing Unicode whitespace scalars only.
     static func rstrip(_ s: String) -> String {
         var scalars = Array(s.unicodeScalars)
         while let last = scalars.last, CharacterSet.whitespacesAndNewlines.contains(last) {
@@ -185,19 +169,11 @@ extension SwiftNativePersonaEngine {
         return String(String.UnicodeScalarView(scalars))
     }
 
-    /// Back up the target file's current content to a timestamped sibling
-    /// `<file>.pre-<ts>-<uid>.bak`, mirroring the daemon's backup naming:
-    /// `target.with_suffix(target.suffix + f".pre-{ts}-{uid}.bak")` where
-    /// `ts = strftime("%Y%m%dT%H%M%S%fZ")` (UTC, microseconds) and
-    /// `uid = uuid4().hex[:8]`. Returns the backup path (or `nil` if the target
-    /// did not exist -- no backup needed). Byte-for-byte copy.
+    /// Copy prior bytes to `<file>.pre-<UTC timestamp>-<8 lowercase hex digits>.bak`; nil means no prior file.
     static func backup(_ target: URL, data: Data?) throws -> String? {
         guard let data else { return nil }
         let ts = backupTimestamp()
         let uid = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(8))
-        // Python with_suffix(suffix + ".pre-...") REPLACES the final suffix with
-        // <oldsuffix>.pre-<ts>-<uid>.bak -- e.g. VOICE.md -> VOICE.md.pre-...bak
-        // (the old ".md" is kept because the new suffix string starts with it).
         let backupURL = target.deletingPathExtension()
             .appendingPathExtension("\(target.pathExtension).pre-\(ts)-\(uid).bak")
         do {
@@ -205,14 +181,7 @@ extension SwiftNativePersonaEngine {
         } catch {
             throw PersonaWriteError.ioFailure("Could not create backup: \(error.localizedDescription)")
         }
-        // A5.5(c): bound the `.pre-*.bak` accumulation at the source. Every
-        // SOUL/VOICE/GROWTH/USER write (dream, REM, growth feedback) drops a
-        // full-file copy here — with no retention they pile up forever (the
-        // orphan-.bak bloat the audit measured). Keep the newest
-        // `backupRetention` per target; the compact UTC timestamp in the name
-        // sorts chronologically, so newest = lexicographically largest. The
-        // sweep is scoped to THIS target's siblings and best-effort — a prune
-        // failure must never fail the write we just backed up.
+        // Keep the newest backupRetention siblings per target; pruning failure cannot fail the write.
         pruneOldBackups(for: target, keeping: backupRetention)
         return backupURL.path
     }
@@ -240,12 +209,10 @@ extension SwiftNativePersonaEngine {
         }
     }
 
-    /// `datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")` -- compact UTC
-    /// timestamp with microseconds, used only for backup-file uniqueness.
-    /// Shape: YYYYMMDDTHHMMSS<6-digit-micros>Z (e.g. 20260602T031540123456Z).
+    /// Backup timestamp shape: YYYYMMDDTHHMMSS<6-digit-microseconds>Z in UTC.
     static func backupTimestamp() -> String {
         var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone(identifier: "UTC")!
+        cal.timeZone = .gmt
         let now = Date()
         let c = cal.dateComponents([.year, .month, .day, .hour, .minute, .second, .nanosecond], from: now)
         let micros = (c.nanosecond ?? 0) / 1000

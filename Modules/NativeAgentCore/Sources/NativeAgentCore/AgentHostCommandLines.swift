@@ -98,43 +98,37 @@ public struct AgentHostCommandLine: Sendable, Equatable, Codable {
         return "\(program) is \(found); this connection needs \(minimumVersion) or newer (\(documentation)). Update \(program), then Agents > Verify. Nothing was sent."
     }
 
-    /// Only the protocol event supplies identity; prose/tool output cannot.
-    /// Multiple different identities are ambiguous and must not be resumed.
-    public func capturedThreadID(stdout: String, expected: String? = nil) -> String? {
-        guard capturesThreadID else { return nil }
+    /// Read reply and identity together; only protocol evidence confirms identity,
+    /// independently of reply success. Conflicting identities cannot be resumed.
+    public func interpretOutput(stdout: String, expected: String? = nil) -> (reply: String?, failure: String?, threadID: String?) {
         if jsonResultReply {
-            guard let fields = resultFields, let key = fields["session"],
-                  let object = resultObject(stdout), let raw = object[key] as? String,
-                  let uuid = UUID(uuidString: raw) else { return nil }
-            let value = uuid.uuidString.lowercased()
-            guard expected == nil || value == expected?.lowercased() else { return nil }
-            return value
+            guard let fields = resultFields, let object = resultObject(stdout) else { return (nil, nil, nil) }
+            let identity = capturesThreadID ? fields["session"].flatMap { object[$0] as? String }
+                .flatMap { UUID(uuidString: $0) }?.uuidString.lowercased() : nil
+            let confirmed = expected == nil || identity == expected?.lowercased() ? identity : nil
+            guard let reply = fields["reply"], let status = fields["status"],
+                  let success = fields["success"] else { return (nil, nil, confirmed) }
+            let text = object[reply] as? String
+            if object[status] as? String != success || fields["error"].map({ object[$0] as? Bool != false }) == true {
+                let errors = fields["errors"].flatMap { object[$0] as? [String] } ?? []
+                return (nil, ([object[status] as? String, text].compactMap { $0 } + errors).joined(separator: "\n"), confirmed)
+            }
+            return (text, nil, confirmed)
         }
+        guard capturesThreadID else { return (nil, nil, nil) }
         var found: String?
         for line in stdout.split(separator: "\n") {
             guard let data = String(line).data(using: .utf8),
                   let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   event["type"] as? String == "thread.started" else { continue }
             guard let raw = event["thread_id"] as? String,
-                  let uuid = UUID(uuidString: raw) else { return nil }
+                  let uuid = UUID(uuidString: raw) else { return (nil, nil, nil) }
             let value = uuid.uuidString.lowercased()
-            if let found, found != value { return nil }
-            if let expected, value != expected.lowercased() { return nil }
+            if let found, found != value { return (nil, nil, nil) }
+            if let expected, value != expected.lowercased() { return (nil, nil, nil) }
             found = value
         }
-        return found
-    }
-
-    public func resultReply(stdout: String) -> (reply: String?, failure: String?) {
-        guard jsonResultReply, let fields = resultFields, let reply = fields["reply"],
-              let status = fields["status"], let success = fields["success"],
-              let object = resultObject(stdout) else { return (nil, nil) }
-        let text = object[reply] as? String
-        if object[status] as? String != success || fields["error"].map({ object[$0] as? Bool != false }) == true {
-            let errors = fields["errors"].flatMap { object[$0] as? [String] } ?? []
-            return (nil, ([object[status] as? String, text].compactMap { $0 } + errors).joined(separator: "\n"))
-        }
-        return (text, nil)
+        return (nil, nil, found)
     }
 
     /// The whole-output envelope, or in stream form the one `result` event's.
@@ -240,46 +234,8 @@ public enum AgentHostLaunches {
     public static func launch(host: String) -> Launch { reader.withLock { $0 }?(host) ?? (nil, nil) }
 }
 
-/// The command-line half of the known-agent table, keyed by the row's id: the
-/// recipes' seed (`AgentHostDirectory.seed`). What runs is the recipe.
+/// Command-line executable resolution and the login environment used by host recipes.
 public enum AgentHostCommandLines {
-    public static let seed: [String: AgentHostCommandLine] = [
-        "antigravity-cli": AgentHostCommandLine(
-            executable: "agy",
-            arguments: ["--mode", "plan", "--sandbox", "--disable-slash-commands", "--output-format", "stream-json",
-                        "--print=" + AgentHostCommandLine.messagePlaceholder],
-            continuation: ["--mode", "plan", "--sandbox", "--disable-slash-commands", "--output-format", "stream-json",
-                           "--conversation", AgentHostCommandLine.sessionPlaceholder,
-                           "--print=" + AgentHostCommandLine.messagePlaceholder],
-            capturesThreadID: true, jsonResultReply: true,
-            resultFields: ["reply": "response", "session": "conversation_id", "status": "status", "success": "SUCCESS"],
-            automaticMCPProbe: false, stream: .antigravity, timeoutSeconds: 300,
-            documentation: "https://www.antigravity.google/docs/cli/headless/"),
-        "claude-code": AgentHostCommandLine(
-            executable: "claude",
-            arguments: ["-p", "--output-format", "json", "--name", AgentHostCommandLine.sessionNamePlaceholder,
-                        "--", AgentHostCommandLine.messagePlaceholder],
-            continuation: ["-p", "--output-format", "json", "--resume", AgentHostCommandLine.sessionPlaceholder,
-                           "--", AgentHostCommandLine.messagePlaceholder],
-            capturesThreadID: true, jsonResultReply: true,
-            resultFields: ["reply": "result", "session": "session_id", "status": "subtype", "success": "success", "error": "is_error", "errors": "errors"],
-            automaticMCPProbe: false, permissionFlags: .claude, timeoutSeconds: 300,
-            documentation: "https://code.claude.com/docs/en/headless", minimumVersion: "2.1.76"),
-        // JSONL thread.started carries the CLI-minted identity. Resume uses
-        // that exact UUID, never --last or a guessed private rollout path.
-        "codex": AgentHostCommandLine(
-            executable: "codex",
-            arguments: ["exec", "--json", "--skip-git-repo-check", "-o", AgentHostCommandLine.replyFilePlaceholder,
-                        "--", AgentHostCommandLine.messagePlaceholder],
-            continuation: ["exec", "resume", "--json", "--skip-git-repo-check",
-                           "-o", AgentHostCommandLine.replyFilePlaceholder,
-                           "--", AgentHostCommandLine.sessionPlaceholder, AgentHostCommandLine.messagePlaceholder],
-            replyFileName: "reply.txt",
-            capturesThreadID: true, stream: .codex, permissionFlags: .codex,
-            timeoutSeconds: 300,
-            documentation: "https://learn.chatgpt.com/docs/non-interactive-mode"),
-    ]
-
     /// Read once per app launch, with the same startup files as a login terminal.
     public static let loginEnvironment: Result<[String: String], ToolFailureError> = {
         let shell = getpwuid(getuid()).flatMap { $0.pointee.pw_shell }.map { String(cString: $0) } ?? ""
@@ -355,12 +311,7 @@ public enum AgentHostCommandLines {
         for directory in directories + (environment["PATH"] ?? "").components(separatedBy: ":") {
             let expanded = directory.hasPrefix("~/") ? home + String(directory.dropFirst()) : directory
             guard expanded.hasPrefix("/") else { continue }
-            // Standalone installations use links, sometimes through another
-            // linked version directory. Inspect the resolved file consistently.
-            let candidate = URL(fileURLWithPath: expanded + "/" + name).resolvingSymlinksInPath().path
-            var info = stat()
-            if stat(candidate, &info) == 0, info.st_mode & S_IFMT == S_IFREG,
-               access(candidate, X_OK) == 0 { return URL(fileURLWithPath: candidate).resolvingSymlinksInPath().path }
+            if let path = resolveCommand(expanded + "/" + name) { return path }
         }
         return nil
     }

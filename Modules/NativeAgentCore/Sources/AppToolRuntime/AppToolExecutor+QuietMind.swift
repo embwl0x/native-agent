@@ -1,6 +1,7 @@
 import ChatTurnContracts
 import ChatToolRuntime
 import Cognition
+import BackgroundLoops
 import CognitiveSubstrate
 import Foundation
 import MemoryV2
@@ -22,10 +23,10 @@ extension AppToolExecutor {
         // surface she is answering, as mind.why reads it: a correction
         // that surface may not see counts, without its text. No persona
         // filter: one store for every persona slot (memoryRecallPersonaFilter).
-        let weeks = [MemoryStatusProjection.isoWeek(), MemoryStatusProjection.isoWeek(ago: 1)]
+        let weeks = [MemoryRecoveryReadout.isoWeek(), MemoryRecoveryReadout.isoWeek(ago: 1)]
         let envelope = TurnEnvelope.current(surface: ChatTurnRuntimeContext.current?.surface ?? "chat")
         do {
-            let lessons = try await MemoryStatusProjection.misses(
+            let lessons = try await MemoryRecoveryReadout.misses(
                 dataRoot: dataRoot, weeks: weeks,
                 surface: envelope.agent == nil ? envelope.replyRoute.surface : "bridge")
             return (true, lessons.isEmpty ? "No corrections this week or last."
@@ -38,8 +39,7 @@ extension AppToolExecutor {
         }
     }
 
-    /// The Observatory's buttons, refused when the same switch that greys the
-    /// button out is off.
+    /// Mind actions use the live runtime's configuration and effect owners.
     @MainActor
     public static func runQuietMind(
         verb: String, input: [String: JSONValue], runtime: NativeCognitionRuntime,
@@ -78,15 +78,15 @@ extension AppToolExecutor {
             return (false, run.note + Self.quietMindRetry, [:])
         default: break
         }
-        let detail = await runtime.observatoryDetailRead().detail
-        let config = detail.configuration
+        await runtime.bootstrap()
+        let config = await runtime.substrate.configurationSnapshot()
         guard config.enabled else {
-            return (false, "Your inner life is off, and the Observatory with it. setting.set with setting settings.inner_life, value true turns it on.", [:])
+            return (false, "Your inner life is off. setting.set with setting settings.inner_life, value true turns it on.", [:])
         }
-        func background(_ outcome: CognitiveBackgroundRunOutcome, _ label: String) -> QuietMindOutcome {
+        func background(_ outcome: LoopTickOutcome, _ label: String) -> QuietMindOutcome {
             switch outcome {
-            case .completed(let note): return (true, "\(label) done: \(note).", [:])
-            case .skipped(let reason): return (true, "\(label) skipped: \(reason).", ["changed": .bool(false)])
+            case .completed(let note): return (true, note.map { "\(label) done: \($0)." } ?? "\(label) done.", [:])
+            case .skipped(let reason, _): return (true, "\(label) skipped: \(reason).", ["changed": .bool(false)])
             case .failed(let reason): return (false, "\(label) failed: \(reason)." + Self.quietMindRetry, [:])
             }
         }
@@ -101,10 +101,10 @@ extension AppToolExecutor {
         }
         switch verb {
         case "why":
-            let turn = AppToolExecutor.inputString(input["turn"])
+            let turn = input["turn"]?.scalarText
             guard case .object(let fields) = await runtime.why(turn: turn) else { return (false, "No why record.", [:]) }
             return (fields["status"] == .string("ok"),
-                    AppToolExecutor.inputString(fields["detail"]) ?? "Why it surfaced, from the turn trace.", fields)
+                    fields["detail"]?.scalarText ?? "Why it surfaced, from the turn trace.", fields)
         case "reject", "undo":
             // Her own live local turn, refused on a bridge, executor, replay or phone lane.
             let seat: StudioCanonTurnProvenance
@@ -115,12 +115,12 @@ extension AppToolExecutor {
                         ["reason": .string(refusal.rawValue)])
             }
             if verb == "undo" {
-                let outcome = await runtime.undo(item: AppToolExecutor.inputString(input["item"]), seat: seat)
+                let outcome = await runtime.undo(item: input["item"]?.scalarText, seat: seat)
                 return (outcome.ok, outcome.detail, outcome.fields)
             }
-            let source = AppToolExecutor.inputString(input["source"]) ?? ""
+            let source = input["source"]?.scalarText ?? ""
             let outcome = await runtime.rejectAssociation(
-                source: source, turn: AppToolExecutor.inputString(input["turn"]),
+                source: source, turn: input["turn"]?.scalarText,
                 always: input["always"] == .bool(true), seat: seat)
             return (outcome.ok, outcome.detail, ["source": .string(source)])
         case "think_now":
@@ -133,16 +133,11 @@ extension AppToolExecutor {
                 return (false, "Your daily reflection budget is 0. setting.set with setting settings.daily_reflection_budget, value 1 to 8 allows one.", [:])
             }
             let outcome = await runtime.runManualReflection()
-            _ = await runtime.observatoryDetailRead()
             return background(outcome, "Reflection")
         case "settle_body", "reset_body":
-            guard detail.organism.enabled else {
-                return (false, "Body signals are off. setting.set with setting settings.organism_kernel, value true turns them on.", [:])
-            }
             let outcome = verb == "settle_body"
                 ? await runtime.settleOrganismContinuityChecked()
                 : await runtime.resetOrganismContinuityChecked()
-            _ = await runtime.observatoryDetailRead()
             return body(outcome, verb == "settle_body" ? "settled" : "reset")
         case "pin_concern":
             let seat: StudioCanonTurnProvenance
@@ -154,33 +149,15 @@ extension AppToolExecutor {
             }
             do {
                 guard let pinned = try await runtime.pinTopConcern(
-                    text: AppToolExecutor.inputString(input["concern"]), seat: seat) else {
+                    text: input["concern"]?.scalarText,
+                    care: input["care"]?.scalarText, seat: seat) else {
                     return (true, "Nothing pressing to pin right now.", ["changed": .bool(false)])
                 }
                 return (true, "Kept open: \(pinned)", [:])
             } catch {
                 return (false, "The concern was not saved: \(error)." + Self.quietMindRetry, [:])
             }
-        case "run_checks":
-            let outcome = await runtime.runResearchHarness()
-            return (!outcome.isFailed, outcome.presentationText + (outcome.isFailed ? Self.quietMindRetry : ""), [:])
-        case "export_trace":
-            guard let path = await runtime.exportResearchTrace() else {
-                return (false, "The trace could not be written. Check free disk space, then try again.", [:])
-            }
-            return (true, "Trace exported to \(path).", ["path": .string(path)])
-        case "ablate_workspace", "include_workspace":
-            let include = verb == "include_workspace"
-            guard (detail.summary.ablations["workspace"] == false) == include else {
-                return (true, include ? "The workspace is already included." : "The workspace is already left out.",
-                        ["changed": .bool(false)])
-            }
-            await runtime.setAblation("workspace", enabled: include)
-            return (true, include
-                ? "The workspace is included again."
-                : "The workspace is left out: the thought summary and background thinking ignore it until include_workspace.", [:])
         case "clear":
-            // The Observatory's Clear.
             switch await runtime.clearTransientState() {
             case .cleared:
                 recordQuietMindDecision("mind.clear", input: input, dataRoot: dataRoot)
@@ -197,6 +174,6 @@ extension AppToolExecutor {
 
     public static func recordQuietMindDecision(_ tool: String, input: [String: JSONValue], dataRoot: URL) {
         HarnessDecidedRow.post(requester: "Full Mac", tool: tool,
-                              sessionID: inputString(input["__session_id"]), dataRoot: dataRoot)
+                              sessionID: input["__session_id"]?.scalarText, dataRoot: dataRoot)
     }
 }

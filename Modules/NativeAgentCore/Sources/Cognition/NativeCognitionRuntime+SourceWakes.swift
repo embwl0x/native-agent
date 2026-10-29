@@ -5,7 +5,8 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Desk
-// Blueprint: | `NativeCognitionRuntime+SourceWakes.swift` | Runtime-owned source observations for canon, horizon, Reach, cares and quiet-hour preferences; registration precedes reads, renewed directory children remain watched, canon arms journal membership before enumerating input children and compares input stamps to ignore audit output and unchanged directory events, stop cancels observations, and the existing residual deadline owns source cooldown/eligibility/expiry boundaries |
+import Senses
+// Blueprint: | `NativeCognitionRuntime+SourceWakes.swift` | Runtime-owned source observations for canon, horizon, Reach, cares and quiet-hour preferences; the crossing (`SenseCrossing`): a part's arrival or a sense's news that touches a care asks for one ResidentWake naming it, once per watch per care until the care rests; registration precedes reads, renewed directory children remain watched, canon arms journal membership before enumerating input children and compares input stamps to ignore audit output and unchanged directory events, stop cancels observations, and the existing residual deadline owns source cooldown/eligibility/expiry boundaries |
 
 /// Source invalidations and their real time boundaries, owned by this runtime.
 /// No interval samples unchanged sources; the existing residual deadline owns
@@ -26,7 +27,6 @@ struct CognitiveSourceWakes: Sendable {
     var canonNextAt: Date?
     var horizonDirty = true
     var horizonNextAt: Date?
-    var horizonLastAt: Date?
     var horizonRunning = false
     var reachDirty = true
     var reachNextAt: Date?
@@ -262,10 +262,34 @@ extension NativeCognitionRuntime {
             ? lastStudioCanonTendingAt?.addingTimeInterval(Self.studioCanonTendingMinimumInterval) ?? at
             : sourceWakes.canonNextAt) : nil
         let horizon = sourceWakes.horizonReady && horizonRefreshTask == nil ? (sourceWakes.horizonDirty
-            ? sourceWakes.horizonLastAt?.addingTimeInterval(Self.horizonRefreshMinimumInterval) ?? at
+            ? at
             : sourceWakes.horizonNextAt) : nil
         let reach = sourceWakes.reachReady && reachTask == nil && reachEnabled ? (sourceWakes.reachDirty
             ? sourceWakes.reachNextAt ?? at : sourceWakes.reachNextAt) : nil
         return [canon, horizon, reach, sourceWakes.pursuitNextAt].compactMap { $0 }.min()
+    }
+}
+
+// What reaches her mind is a change that touches what she cares about
+// (docs/SUBCONSCIOUS.md, Cares). Owed work (carried promises, approvals, her
+// opened apps, Reach, agent messages) files its own arrivals and is not this.
+extension NativeCognitionRuntime: SenseCrossing {
+    public func cross(_ line: String, watch: String, reason: String, id: String, says: String,
+                      agent: String?) async -> SenseCrossed {
+        guard !isFlushedForTermination else { return .unweighed }
+        // Whatever it weighs, the moment stays primed for her next turn.
+        PrimedMoments.prime(dataRoot: dataRoot, line: says.isEmpty ? line : says, source: watch)
+        switch await substrate.careTouched(by: line, watch: watch) {
+        case .unweighed: return .unweighed
+        case .untouched: return .untouched
+        case .touches(let care, resting: true): return .resting(care: care.about)
+        case .touches(let care, resting: false):
+            // The watch's thread carries the hop rule, so a watch cannot keep waking her.
+            guard ResidentWake.shared.request(dataRoot: dataRoot, reason: reason + " about " + care.about, items: [
+                .init(id: id, line: says, thread: watch, agent: agent, home: true)
+            ]) else { return .notKept(care: care.about) }
+            await substrate.watchWoke(watch, about: care)
+            return .woke(care: care.about)
+        }
     }
 }

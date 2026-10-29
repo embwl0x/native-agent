@@ -62,7 +62,7 @@ extension TelegramPollLoop {
                 return true
             }
             await answer("Removed from the queue.")
-            try? await editMessageTextWithReplyMarkup(
+            try? await Self.defaultEditMessageTextWithReplyMarkup(
                 token,
                 parsed.chatId,
                 parsed.messageId,
@@ -84,7 +84,7 @@ extension TelegramPollLoop {
                 return true
             }
             await answer("Steering to this message now.")
-            let stopOutcome: TelegramTurnCoordinator.StopOutcome
+            let stopOutcome: TelegramTurns.StopOutcome
             if let interruptedTurnID {
                 stopOutcome = await requestLiveTurnStop(
                     destination: parsed.destination,
@@ -94,7 +94,7 @@ extension TelegramPollLoop {
                 stopOutcome = .notRunning
             }
             if stopOutcome == .outcomeUnknown {
-                try? await editMessageTextWithReplyMarkup(
+                try? await Self.defaultEditMessageTextWithReplyMarkup(
                     token,
                     parsed.chatId,
                     parsed.messageId,

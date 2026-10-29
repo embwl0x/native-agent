@@ -3,21 +3,12 @@ import Foundation
 import NativeAgentCore
 
 // Blueprint: | `DreamsView.swift` | `DreamsView`: shared diary reads, selection, dream/REM controls and unavailable/error presentation |
-// PATCH-2026-05-29: dreams-tab DreamsView — surfaces + controls the dream diary
-// and REM consolidation cycle. Backend: Swift-native DreamREMCycle runtime.
-//   engine.cognitionView.dreamDiary(limit:) -> core DreamEntry rows + gate
-//   POST /v1/dream/run           -> run a dream pass now
-//   POST /v1/rem/run             -> run a REM consolidation pass now
-// The two kill switches (personalityPolicy.dream_cycle_enabled with
-// dream_scheduler, and trainingPolicy.rem_cycle_enabled) are switched in one
-// place, Settings ▸ Inner life (SetupFeatureRows). This page reads them.
+// Dream and REM switches belong to Settings → Inner life; this page reads them.
 import SwiftUI
 import DreamREMCycle
 import PersistenceCore
 
-/// The manual Dream action must distinguish a verified disabled policy from an
-/// unavailable diary/gate read. Both prevent a run, but only the former may be
-/// described as disabled to the person using the Dreams surface.
+/// Manual Dream and REM actions share availability, each from its own authority read.
 enum DreamRunAvailability: Equatable {
     case checking
     case enabled
@@ -25,29 +16,16 @@ enum DreamRunAvailability: Equatable {
     case unavailable
 
     static func resolve(
-        hasReadDiaryGate: Bool,
-        diaryLoadFailed: Bool,
-        dreamEnabledFromDiary: Bool
+        hasReadAuthority: Bool,
+        loadFailed: Bool,
+        enabled: Bool
     ) -> Self {
-        if diaryLoadFailed { return .unavailable }
-        guard hasReadDiaryGate else { return .checking }
-        return dreamEnabledFromDiary ? .enabled : .disabled
+        if loadFailed { return .unavailable }
+        guard hasReadAuthority else { return .checking }
+        return enabled ? .enabled : .disabled
     }
 
     var canRun: Bool { self == .enabled }
-
-    var help: String {
-        switch self {
-        case .checking:
-            return "Checking dream-cycle availability."
-        case .enabled:
-            return "Run a dream reflection pass against recent sessions."
-        case .disabled:
-            return "Dreams at night is off. Turn it on in Settings \u{25B8} Inner life."
-        case .unavailable:
-            return "Dream-cycle availability could not be read. Refresh the diary and retry."
-        }
-    }
 }
 
 /// The Dreams surface displays failures from diary reads, manual Dream/REM
@@ -55,23 +33,18 @@ enum DreamRunAvailability: Equatable {
 /// evidence of failure even when a producer supplied no usable diagnostic;
 /// never erase that state into an empty red strip or a success-shaped surface.
 enum DreamErrorBannerPresentation {
-    struct Banner: Equatable, Sendable {
-        let text: String
-        let isTruncated: Bool
-    }
-
     static let maximumDetailCharacters = 280
     static let missingDetailText = "Dreams operation failed, but no diagnostic detail was returned."
 
-    static func banner(for error: String?) -> Banner? {
+    static func text(for error: String?) -> String? {
         guard let error else { return nil }
         let detail = error.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !detail.isEmpty else {
-            return .init(text: missingDetailText, isTruncated: false)
+            return missingDetailText
         }
         let isTruncated = detail.count > maximumDetailCharacters
         let bounded = String(detail.prefix(maximumDetailCharacters))
-        return .init(text: isTruncated ? "\(bounded)…" : bounded, isTruncated: isTruncated)
+        return isTruncated ? "\(bounded)…" : bounded
     }
 }
 
@@ -191,20 +164,18 @@ struct DreamsView: View {
         VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
             controlBar
 
-            if let banner = DreamErrorBannerPresentation.banner(for: appModel.dreamError) {
-                Text(banner.text)
+            if let errorText = DreamErrorBannerPresentation.text(for: appModel.dreamError) {
+                Text(errorText)
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.trouble)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .accessibilityLabel("Dreams error: \(banner.text)")
+                    .accessibilityLabel("Dreams error: \(errorText)")
             }
 
             content
         }
         .alivePageLine(headerLine, id: "dreams.line")
-        // ui-taste-sweep 2026-06-07: was falling back to the bundle name
-        // ("NativeAgent") because no title was set on the body root.
         .navigationTitle("Dreams")
         .task {
             await loadREMPolicy()
@@ -217,8 +188,7 @@ struct DreamsView: View {
         }
     }
 
-    /// The header's one sentence in my own voice (alive glass, 2026-09-23).
-    /// Nil until the diary has been read; the tab row's page keeps its line.
+    /// The header speaks in the agent's voice once the diary has been read.
     private var headerLine: String? {
         if diaryLoadFailed && entries.isEmpty { return "I couldn't read my dream diary just now." }
         guard hasReadDiaryGate else { return nil }
@@ -232,8 +202,6 @@ struct DreamsView: View {
     // ── Controls ──────────────────────────────────────────────────────────────
     private var controlBar: some View {
         VStack(alignment: .leading, spacing: 12) {
-            // Alive glass (2026-09-23): one group card, the runs on one row.
-            // The two cycle switches live on Settings ▸ Inner life.
             AliveGroupCard {
                 HStack(spacing: 8) {
                     Button {
@@ -250,7 +218,7 @@ struct DreamsView: View {
                         Text(isRunningRem ? "Consolidating…" : "Run a REM pass")
                     }
                     .disabled(isRunningRem || !remRunAvailability.canRun)
-                    .help(remRunAvailability.help)
+                    .help(remRunHelp)
 
                     Spacer()
 
@@ -525,22 +493,45 @@ struct DreamsView: View {
     }
 
     private var dreamRunHelp: String {
-        dreamRunAvailability.help
+        switch dreamRunAvailability {
+        case .checking:
+            return "Checking dream-cycle availability."
+        case .enabled:
+            return "Run a dream reflection pass against recent sessions."
+        case .disabled:
+            return "Dreams at night is off. Turn it on in Settings \u{25B8} Inner life."
+        case .unavailable:
+            return "Dream-cycle availability could not be read. Refresh the diary and retry."
+        }
     }
 
     private var dreamRunAvailability: DreamRunAvailability {
         DreamRunAvailability.resolve(
-            hasReadDiaryGate: hasReadDiaryGate,
-            diaryLoadFailed: diaryLoadFailed,
-            dreamEnabledFromDiary: dreamEnabledFromDiary
+            hasReadAuthority: hasReadDiaryGate,
+            loadFailed: diaryLoadFailed,
+            enabled: dreamEnabledFromDiary
         )
     }
 
-    private var remRunAvailability: DreamsREMRunAvailability {
-        DreamsREMRunAvailability.resolve(
-            policy: appModel.engine.trust.policy,
-            policyLoadFailed: remPolicyLoadFailed
+    private var remRunAvailability: DreamRunAvailability {
+        DreamRunAvailability.resolve(
+            hasReadAuthority: appModel.engine.trust.policy != nil,
+            loadFailed: remPolicyLoadFailed,
+            enabled: appModel.engine.trust.policy?.trainingPolicy?.rem_cycle_enabled == true
         )
+    }
+
+    private var remRunHelp: String {
+        switch remRunAvailability {
+        case .checking:
+            return "Checking REM-cycle permission."
+        case .enabled:
+            return "I reread the last week of dreams, draft up to five growth notes from patterns that recur on two or more days, and send them to you for approval. Dreams older than two weeks move to the archive."
+        case .disabled:
+            return "Weekly dream consolidation is off. Turn it on in Settings \u{25B8} Inner life."
+        case .unavailable:
+            return "REM-cycle permission could not be read. Refresh and retry."
+        }
     }
 
     private var diaryRefreshPresentation: DreamDiaryRefreshPresentation {
@@ -643,37 +634,6 @@ private struct DreamDateRow: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 4)
-    }
-}
-
-/// The manual REM button has three distinct policy states. An unresolved
-/// authority read cannot be presented as an enabled cycle, and an explicit
-/// false remains a normal disabled state rather than an execution failure.
-enum DreamsREMRunAvailability: Equatable {
-    case checking
-    case enabled
-    case disabled
-    case unavailable
-
-    static func resolve(policy: TrustPolicy?, policyLoadFailed: Bool) -> Self {
-        if policyLoadFailed { return .unavailable }
-        guard let policy else { return .checking }
-        return policy.trainingPolicy?.rem_cycle_enabled == true ? .enabled : .disabled
-    }
-
-    var canRun: Bool { self == .enabled }
-
-    var help: String {
-        switch self {
-        case .checking:
-            return "Checking REM-cycle permission."
-        case .enabled:
-            return "I reread the last week of dreams, draft up to five growth notes from patterns that recur on two or more days, and send them to you for approval. Dreams older than two weeks move to the archive."
-        case .disabled:
-            return "Weekly dream consolidation is off. Turn it on in Settings \u{25B8} Inner life."
-        case .unavailable:
-            return "REM-cycle permission could not be read. Refresh and retry."
-        }
     }
 }
 

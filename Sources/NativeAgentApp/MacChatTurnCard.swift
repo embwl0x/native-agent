@@ -42,9 +42,7 @@ struct MacChatTurnCard: View {
     /// inbox. The card carries no authority: it hands "approved"/"denied" to
     /// the same resolve path every other approval surface uses.
     var onDecideApproval: ((String) -> Void)?
-    /// 2026-09-06: a decision is already on its way to the inbox. Both buttons
-    /// stay visible and go inert — leaving them live invited a second press
-    /// whose opposite decision the resolver could only discard.
+    /// Both decision buttons remain visible but inert while an approval resolves.
     var isResolvingApproval: Bool = false
 
     @State private var isShowingPreviewSheet = false
@@ -55,16 +53,7 @@ struct MacChatTurnCard: View {
         return "Thought for \(MacChatTurnCardFormat.duration(max(1, thoughtFor)))"
     }
 
-    /// Thumbnail geometry. 16:10 — a window shape, not a square — and sized to
-    /// the height the card ALREADY has: its two text rows (title, then the
-    /// caption line) measure ~30pt at default text size. Agent's rule, 2026-09-13:
-    /// the pane may not buy itself room. A taller thumbnail grew the card and
-    /// ate the gap above the composer, so the thumbnail fits the card instead of
-    /// the card growing for the thumbnail.
-    /// Measured, not guessed: the card's two text rows are 29pt at default text
-    /// size (rendered card 61pt tall, less GlassCard's 16pt top and bottom), so
-    /// 28pt fits inside them with a point to spare and the card's height is
-    /// byte-identical with the pane and without it.
+    /// A 16:10 thumbnail fits the existing text rows without increasing card height.
     private static let thumbnailHeight: CGFloat = 28
     private static let thumbnailWidth: CGFloat = 44.8
 
@@ -81,8 +70,7 @@ struct MacChatTurnCard: View {
 
     private var tint: Color {
         switch model.tone {
-        // A running turn is not "waiting on you", so it never wears the
-        // teal accent (2026-09-23): a neutral dot on house glass.
+        // Working uses a neutral dot; teal is reserved for waiting on the person.
         case .working: return NativeAgentShell.secondary
         case .attention: return NativeAgentTheme.warn
         case .failed: return NativeAgentTheme.fail
@@ -130,13 +118,7 @@ struct MacChatTurnCard: View {
                         .allowsHitTesting(false)
                     }
 
-                    // Controls outrank ALL text at narrow widths: at the
-                    // detached-window floor (380pt) with a long meta readout,
-                    // the approval decision — the card's only real steering
-                    // affordance — used to be the thing squeezed off the
-                    // right edge (sweep 2026-08-21). Priority order is now
-                    // controls (3) > title (2) > badge (1) > meta (0), and
-                    // fixedSize keeps button labels from clipping mid-glyph.
+                    // Layout priority is controls > title > badge > meta; fixedSize preserves button labels.
                     if let approval = model.approval, approval.isActionable, let onDecideApproval {
                         Button("Approve") {
                             guard !isResolvingApproval else { return }
@@ -233,9 +215,7 @@ struct MacChatTurnCard: View {
                     }
                 }
 
-                // 2026-09-06: what the tool would run with. A decision asked
-                // for over a tool name and "autonomy=<level>" is a decision
-                // made blind.
+                // Approval shows the tool input so the decision has context.
                 if let approval = model.approval, approval.isActionable,
                    let input = approval.inputSummary {
                     Text(input)
@@ -373,18 +353,7 @@ struct MacChatTurnCard: View {
     }
 }
 
-/// The trailing timing readout, and the ONLY part of the card on a one-second
-/// schedule.
-///
-/// The 04:05 pin (2026-09-04) was a transcript layout cost, and this card is
-/// one of the invalidations that never let it settle: the whole card — glass,
-/// title, detail, buttons, pulsing dot — used to be rebuilt every second
-/// because a string inside it counts seconds. Now the schedule sits on the
-/// string. The card above it re-renders only when the turn's state actually
-/// changes.
-///
-/// A terminal turn has nothing left to count, so it renders statically with no
-/// schedule at all — as does a model built without a clock.
+/// Only the timing text ticks each second; terminal turns and models without a clock render statically.
 struct MacChatTurnCardMetaText: View {
     @Environment(\.chatPageIsVisible) private var chatPageIsVisible
     let clock: MacChatTurnCardModel.Clock?
@@ -437,11 +406,7 @@ struct MacChatTurnCardMetaText: View {
     }
 }
 
-/// Fluid glass A1: "Thinking… 0:08", the card's title while she thinks before
-/// saying or doing anything. A soft light crosses the word every 2s (none
-/// under Reduce Motion); the clock is the system's timer text, so it advances
-/// without re-rendering anything. When she starts, the card's title says
-/// "Thought for 8s" while her reply streams.
+/// The system timer advances thinking text without view re-renders; shimmer respects Reduce Motion.
 struct MacChatTurnThinkingTitle: View {
     let since: Date
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -526,13 +491,13 @@ struct MacChatTurnCardHost: View {
         // `appModel.engine.approvals.records` IS the canonical inbox as this process last read
         // it — the same rows Activity → Approvals renders, refreshed by the
         // existing approvals file watch. The card opens no reader of its own.
-        if let model = MacChatTurnCardProjection.card(
+        if let model = TurnCardReadout.card(
             for: state,
             sessionId: sessionId,
             personaName: appModel.agentDisplayName,
             at: instant,
             approvals: appModel.engine.approvals.records,
-            parseTimestamp: UserDisplayFormatters.parseFoundationISOTimestamp
+            parseTimestamp: NativeTimestampFormat.parseISO8601FractionalFirst
         ) {
             MacChatTurnCard(
                 model: model,
@@ -541,7 +506,7 @@ struct MacChatTurnCardHost: View {
                     ? { decision in decideApproval(model, decision: decision) }
                     : nil,
                 isResolvingApproval: model.approval.map {
-                    appModel.isResolvingApproval(id: $0.approvalId)
+                    appModel.engine.approvals.isResolving(id: $0.approvalId)
                 } ?? false,
                 // Present only while this session's turn is actually driving the
                 // Mac; the app clears the slot when the turn opens and when its

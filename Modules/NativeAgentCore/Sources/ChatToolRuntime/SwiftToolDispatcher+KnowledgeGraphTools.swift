@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import MemoryV2
@@ -10,7 +11,7 @@ import MacControl
 import Context
 import SwarmRuns
 import WorkshopExecution
-// Blueprint: | `SwiftToolDispatcher+KnowledgeGraphTools.swift` | `SwiftToolDispatcher`: `impl_search_kg`, `kgSeenDate` |
+// Blueprint: | `SwiftToolDispatcher+KnowledgeGraphTools.swift` | `SwiftToolDispatcher`: `impl_search_kg`, `kgSeenDate`; failed semantic recall or graph hydration returns partial search with the checked read's cause |
 
 // MARK: - Knowledge graph tools
 
@@ -143,12 +144,7 @@ extension SwiftToolDispatcher {
                 "search_kg did not receive a results array"
             )
         }
-        // User, 2026-09-05: "get the embeddings right." Every fact node in the
-        // graph is one memory row, and every memory row already carries its
-        // MiniLM vector, so meaning-search over the graph is memory recall
-        // mapped onto fact-node ids. Text hits and meaning hits are fused by
-        // reciprocal rank (1 / (60 + rank)), which needs no shared scale:
-        // a node found both ways rises, a node found either way still shows.
+        // Fact nodes reuse memory vectors; lexical and meaning hits fuse by reciprocal rank, 1 / (60 + rank).
         func entityID(_ ent: JSONValue) -> String? {
             guard case .object(let o) = ent, case .string(let id)? = o["id"] else { return nil }
             return id
@@ -164,6 +160,7 @@ extension SwiftToolDispatcher {
             via[id, default: []].append("text")
         }
         var meaningSearch = "ok"
+        var meaningSearchError: String?
         do {
             let response = try await memoryV2.recall(MemoryV2RecallRequest(
                 text: query,
@@ -171,16 +168,13 @@ extension SwiftToolDispatcher {
                 persona: nil,
                 surface: surface
             ))
-            // 2026-09-06: recall degrades to the keyword lane when the query
-            // vector's epoch does not match the corpus. Those hits are lexical;
-            // calling them meaning matches, on a lane reported as `ok`,
-            // overstated the answer.
+            // An epoch-mismatched query vector yields lexical hits, which cannot count as meaning matches.
             let lexical = response.hits.contains { $0.source == "swift-native-keyword-fallback" }
             if lexical { meaningSearch = "keyword-fallback" }
             var missing = Set<String>()
             let missingIDs = response.scored.map { SwiftNativeKnowledgeGraphIndexer.memoryFactEntityID(for: $0.record.id) }
                 .filter { entities[$0] == nil && missing.insert($0).inserted }
-            let recalledEntities = (try? await reader.entitiesChecked(ids: missingIDs)) ?? [:]
+            let recalledEntities = try await reader.entitiesChecked(ids: missingIDs)
             for (rank, scored) in response.scored.enumerated() {
                 let nodeID = SwiftNativeKnowledgeGraphIndexer.memoryFactEntityID(for: scored.record.id)
                 if entities[nodeID] == nil {
@@ -191,9 +185,10 @@ extension SwiftToolDispatcher {
                 via[nodeID, default: []].append(lexical ? "keyword" : "meaning")
             }
         } catch {
-            // The embedder fails closed when the model will not load; say so
-            // rather than letting text-only pass as a full answer.
+            // Preserve text hits, but neither a failed recall nor failed graph
+            // hydration proves complete semantic coverage.
             meaningSearch = "unavailable"
+            meaningSearchError = error.localizedDescription
         }
         let ranked = order.sorted { (fused[$0] ?? 0) > (fused[$1] ?? 0) }.prefix(limit)
         let capped: [JSONValue] = ranked.compactMap { id in
@@ -201,17 +196,15 @@ extension SwiftToolDispatcher {
             o["matched_by"] = .array((via[id] ?? []).map { .string($0) })
             return .object(o)
         }
-        return .object(["status": .string("ok"), "results": .array(capped), "meaning_search": .string(meaningSearch)])
+        var answer: [String: JSONValue] = ["status": .string(meaningSearchError == nil ? "ok" : "partial"),
+            "results": .array(capped), "meaning_search": .string(meaningSearch)]
+        if let meaningSearchError { answer["meaning_search_error"] = .string(meaningSearchError) }
+        return .object(answer)
     }
 
     /// The Knowledge Graph page's date reading (KnowledgeGraphView.parseKGDate).
     static func kgSeenDate(_ s: String) -> Date? {
-        let isoFull = ISO8601DateFormatter()
-        isoFull.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = isoFull.date(from: s) { return d }
-        let isoNoFrac = ISO8601DateFormatter()
-        isoNoFrac.formatOptions = [.withInternetDateTime]
-        if let d = isoNoFrac.date(from: s) { return d }
+        if let date = NativeTimestampFormat.parseISO8601FractionalFirst(s) { return date }
         let dateOnly = DateFormatter()
         dateOnly.locale = Locale(identifier: "en_US_POSIX")
         dateOnly.timeZone = TimeZone(secondsFromGMT: 0)

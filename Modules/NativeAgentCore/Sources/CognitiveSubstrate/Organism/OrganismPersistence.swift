@@ -1,14 +1,13 @@
 import Foundation
 import CryptoKit
 
-// Blueprint: | `OrganismPersistence.swift` | `OrganismPersistentState`: persisted body field, chemistry, predictions and caring encounter; restore decay and identity validation |
+// Blueprint: | `OrganismPersistence.swift` | `OrganismPersistentState`: persisted body field, chemistry, predictions and caring encounter; restore decay, identity validation and pending plan rekeying by source name or unnamed due instant, recovering Desk names retained in sourceOrgan |
 
 public struct OrganismPersistentState: Codable, Sendable, Equatable {
     static let maximumDecayHours: Double = 72
     private static let maximumPersistedNodes = 96
     private static let maximumPersistedEdges = 192
     private static let maximumPersistedPredictions = 96
-    private static let maximumSignalCount = 1_000_000
 
     public var schemaVersion: Int
     public var savedAt: Date
@@ -22,17 +21,22 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
     private var reflexState = RetiredReflexState()
     public var signalCount: Int
     public var lastSignalAt: Date?
-    /// ONE ENCOUNTER, ONE DOSE (2026-09-11). The rolling caring-encounter
-    /// window, persisted WITH the chemistry because it is part of the same law:
-    /// the axis level and "am I still inside the exchange that raised it" have
-    /// to come back from a relaunch together, or quitting the app mid-exchange
-    /// doses the next turn of it a second time.
+    /// The encounter window persists with chemistry so relaunch cannot dose the same exchange twice.
     public var caringEncounter: OrganismCaringEvent.Encounter
+    /// The body's FORGETTING EPOCH. Reset and Clear bump it in the same atomic
+    /// file write that empties the body, so a moment admitted under an older
+    /// epoch is refused by the body's parts however late it arrives. Absent in
+    /// files written before epochs: 0.
+    public var epoch: UInt64
+    /// The fold seq of the last lived moment the body lived (its whole share:
+    /// dose, reaction and correction cause, in one `OrganismKernel.foldTurn`).
+    /// Saved in the same atomic file write as the chemistry it describes.
+    public var lived: UInt64
 
     private enum CodingKeys: String, CodingKey {
         case schemaVersion, savedAt, chemicalState, bodySchema, field
         case predictionLedger, dreamRepairState, reflexState, signalCount, lastSignalAt
-        case caringEncounter
+        case caringEncounter, epoch, lived
     }
 
     public init(from decoder: Decoder) throws {
@@ -52,6 +56,8 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         caringEncounter = try container.decodeIfPresent(
             OrganismCaringEvent.Encounter.self, forKey: .caringEncounter
         ) ?? .empty
+        epoch = try container.decodeIfPresent(UInt64.self, forKey: .epoch) ?? 0
+        lived = try container.decodeIfPresent(UInt64.self, forKey: .lived) ?? 0
 
         // Decay rebuilds these dictionaries by embedded ID. Validate before
         // restoration so inconsistent JSON reaches the restore-failed handler
@@ -83,7 +89,8 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
                parts[2] == OrganismToken.canonicalToken(scope.sessionID),
                parts[3] == OrganismToken.canonicalToken(scope.turnID),
                parts[4] != "unknown", parts[4] == OrganismToken.canonicalToken(parts[4]),
-               parts[5] == String(Int(prediction.createdAt.timeIntervalSince1970)) {
+               let createdSecond = Int(exactly: prediction.createdAt.timeIntervalSince1970.rounded(.towardZero)),
+               parts[5] == String(createdSecond) {
                 let digest = SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
                 prediction.id = "\(OrganismSemanticExpectation.idPrefix):\(digest)"
                 normalizedKey = prediction.id
@@ -96,6 +103,48 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
             }
         }
         try requireMatchingIDs(predictions, id: \.id, key: .predictionLedger)
+        // A source's name is its identity. Old time-word names identify unnamed
+        // atoms; due-keyed rows can still carry a Desk name in sourceOrgan.
+        // Recover these before absence can mean relief, without changing what
+        // she held, settling it or minting a replacement.
+        // Terminal IDs stay intact: a repeated resolution must keep its event ID.
+        for key in predictions.keys.sorted() {
+            guard var row = predictions[key], row.status == .pending,
+                  row.kind == .semanticExpectation,
+                  let horizon = row.horizon, horizon.sourceKind == .statedPlan
+            else { continue }
+            let prefix = [OrganismHorizonRegister.idPrefix, horizon.sourceKind.rawValue].joined(separator: ":")
+            let labelID = "\(prefix):\(OrganismHorizonRegister.canonicalLabel(horizon.label))"
+            let duePrefix = "\(prefix):due:"
+            let epoch = row.dueAt.timeIntervalSince1970
+            let isDueKey = key.hasPrefix(duePrefix) && Double(key.dropFirst(duePrefix.count)).map {
+                $0.isFinite && ($0 == epoch || $0 == epoch.rounded())
+            } == true
+            guard key == labelID || isDueKey else { continue }
+            var label = horizon.label
+            let organPrefix = "\(OrganismHorizonRegister.sourceOrgan)."
+            let sourceName = row.sourceOrgan.hasPrefix(organPrefix)
+                ? String(row.sourceOrgan.dropFirst(organPrefix.count)) : ""
+            if isDueKey, !sourceName.isEmpty, sourceName != "unknown",
+               !OrganismHorizonRegister.isStatedPlanTimeLabel(sourceName) {
+                label = sourceName
+            } else if OrganismHorizonRegister.isStatedPlanTimeLabel(label) {
+                label = ""
+            }
+            row.horizon = OrganismHorizonExpectation(
+                sourceKind: horizon.sourceKind, label: label, valence: horizon.valence
+            )
+            let id = OrganismHorizonRegister.rowID(
+                sourceKind: horizon.sourceKind, label: label, dueAt: row.dueAt
+            )
+            predictions.removeValue(forKey: key)
+            // Several old keys can name one source. Keep the latest held state
+            // deterministically, without a settlement or new expectation.
+            if let existing = predictions[id],
+               existing.status != .pending || existing.lastUpdatedAt >= row.lastUpdatedAt { continue }
+            row.id = id
+            predictions[id] = row
+        }
         predictionLedger.predictions = predictions
         // Interpret the old shared clock only from already-recorded felt
         // misses, before restore decay can expire a pending row at today's time.
@@ -118,7 +167,9 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         dreamRepairState: OrganismDreamRepairState = .empty,
         signalCount: Int = 0,
         lastSignalAt: Date? = nil,
-        caringEncounter: OrganismCaringEvent.Encounter = .empty
+        caringEncounter: OrganismCaringEvent.Encounter = .empty,
+        epoch: UInt64 = 0,
+        lived: UInt64 = 0
     ) {
         self.schemaVersion = max(1, schemaVersion)
         self.savedAt = savedAt
@@ -130,11 +181,14 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         self.signalCount = max(0, signalCount)
         self.lastSignalAt = lastSignalAt
         self.caringEncounter = caringEncounter
+        self.epoch = epoch
+        self.lived = lived
     }
 
     public func decayed(
         at now: Date,
         settleBodySchema: Bool = true,
+        fatigueDecayLimit: TimeInterval = .infinity,
         deferringPredictionExpiry deferredIDs: Set<String> = []
     ) -> OrganismPersistentState {
         let elapsedHours = max(0, now.timeIntervalSince(savedAt) / 3_600)
@@ -143,25 +197,21 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
 
         var next = self
         next.savedAt = now
-        // TENDERNESS SPENDS THE WHOLE GAP (2026-09-11, review c4 item 2). Every
-        // other axis is bounded at 72 hours because a week offline should not
-        // wipe a field or a ledger to nothing. Tenderness is the one axis whose
-        // fade IS a three-day half-life, so the same cap silently made a six-day
-        // absence cost one half-life instead of two — and `savedAt` then advanced
-        // to now, so the unspent three days were gone for good. This axis gets
-        // the real elapsed time; the cap stands everywhere else.
+        // Tenderness and capability evidence spend the full gap; fatigue is capped only on cold restore.
         next.chemicalState = decayedChemistry(
-            chemicalState, hours: boundedHours, tendernessHours: elapsedHours)
+            chemicalState, hours: boundedHours, tendernessHours: elapsedHours,
+            fatigueElapsed: min(now.timeIntervalSince(savedAt), fatigueDecayLimit))
         next.bodySchema = settleBodySchema ? settledBodySchema(bodySchema) : bodySchema
         next.field = decayedField(field, hours: boundedHours)
         next.predictionLedger = decayedPredictions(
-            predictionLedger, now: now, hours: boundedHours, deferredIDs: deferredIDs)
-        next.signalCount = min(max(0, signalCount), Self.maximumSignalCount)
+            predictionLedger, now: now, hours: boundedHours,
+            evidenceHours: elapsedHours, deferredIDs: deferredIDs)
+        next.signalCount = max(0, signalCount)
         return next
     }
 
     private func decayedChemistry(
-        _ state: ChemicalState, hours: Double, tendernessHours: Double
+        _ state: ChemicalState, hours: Double, tendernessHours: Double, fatigueElapsed: TimeInterval
     ) -> ChemicalState {
         let quick = pow(0.78, hours)
         let slow = pow(0.92, hours)
@@ -176,26 +226,10 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
             warmth: towardZero(state.warmth, factor: slow),
             vigilance: towardZero(state.vigilance),
             curiosity: towardZero(state.curiosity, factor: slow),
-            fatigue: towardZero(state.fatigue),
+            fatigue: OrganismChemistry.relaxedFatigue(state.fatigue, elapsed: fatigueElapsed),
             coherence: towardNeutral(state.coherence, neutral: neutral.coherence),
             agency: towardZero(state.agency, factor: slow),
-            // TENDERNESS FADES OVER DAYS (2026-09-11). The `slow` 0.92^h factor
-            // is an 8.3-hour half-life — it spent a caring moment overnight,
-            // which is the wrong clock for the caregiving axis now that discrete
-            // moments are what fill it (`OrganismCaringEvent`). This axis only;
-            // every other one keeps the factor it had.
-            //
-            // AND THIS IS THE ONLY PLACE TENDERNESS DECAYS (Astra finding 8).
-            // The per-signal settle no longer touches the axis, so this elapsed
-            // -time curve is the single owner of the fade: the half-life is a
-            // flat three days of wall clock whether the gap carried one signal
-            // or ten thousand. The kernel's `settleElapsedTime` advances
-            // `lastSettledAt` only when it actually applies this curve, so no
-            // elapsed time is ever dropped on the floor between runs.
-            //
-            // AND IT SPENDS `tendernessHours`, NOT `hours`: the generic 72-hour
-            // elapsed cap does not apply to this axis (review c4 item 2), so six
-            // days away costs two half-lives and nothing is left unspent.
+            // Tenderness decays only here over uncapped wall time with a three-day half-life, independently of signal count.
             tenderness: towardZero(
                 state.tenderness,
                 factor: pow(0.5, tendernessHours / (OrganismChemistry.tendernessHalfLife / 3_600))
@@ -257,6 +291,7 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         _ ledger: OrganismPredictionLedger,
         now: Date,
         hours: Double,
+        evidenceHours: Double,
         deferredIDs: Set<String>
     ) -> OrganismPredictionLedger {
         var next = ledger
@@ -305,10 +340,10 @@ public struct OrganismPersistentState: Codable, Sendable, Equatable {
         // expiry this sweep just found is fresh and must not be decayed by the
         // same window that aged everything preceding it.
         next.outcomeCountsByKind = next.outcomeCountsByKind
-            .map { forgottenOutcomeCounts($0, at: now, hours: hours) }
-        next.expiredCount += expiredHorizons
+            .map { forgottenOutcomeCounts($0, at: now, hours: evidenceHours) }
+        next.expiredCount = min(next.expiredCount, Int.max - expiredHorizons) + expiredHorizons
         for kind in expiredKinds.sorted(by: { $0.rawValue < $1.rawValue }) {
-            next.expiredCount += 1
+            next.expiredCount = min(next.expiredCount, Int.max - 1) + 1
             OrganismPredictiveBody.recordOutcome(.expired, kind: kind, at: now, ledger: &next)
         }
         next.predictions = Dictionary(OrganismPredictionRetention

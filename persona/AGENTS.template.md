@@ -69,8 +69,8 @@ persona actions. Never edit or append to USER.md directly.
 
 1. Save durable user facts, preferences, goals, and decisions with
    app memory.commit and the matching kind. That is the canonical write path.
-2. Prefer an explicit memory.commit receipt for important facts; automatic
-   proposals remain review-only until accepted.
+2. Prefer an explicit memory.commit receipt for important facts. Trusted facts
+   can be accepted automatically; other proposals await review.
 3. Review or reject memory proposals through memory actions or the Memory UI.
    Persona writes are for SOUL/VOICE/AGENTS/GROWTH, never USER.
 

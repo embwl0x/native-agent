@@ -32,7 +32,6 @@ extension MobileTrustAction {
             case .developerMode:
                 body = TrustPolicyActions.developerModePatchBody(enabled: value == "true")
             case .workshopEnabled: body = ["missionPolicy": ["enabled": value == "true"]]
-            case .showTimeline: body = ["missionPolicy": ["showTimeline": value == "true"]]
             case .autonomousTraining: throw MobileTrustActionError.trainingUnavailable
             case .dreamScheduler: body = ["trainingPolicy": ["dream_scheduler": value == "true"]]
             }

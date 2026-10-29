@@ -10,8 +10,7 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     /// Where felt warmth rests with no earned warmth at all. Sits AT the `warm`
     /// word gate and clear of `tender`, so an agent has a reachable neutral.
     public let feltWarmthRest: Double = 0.55
-    /// How much of the warmth scale live social warmth can EARN. The 2026-08-02
-    /// range fix: the top of the scale is earned, not where she starts.
+    /// The span of the warmth scale earned through live social warmth.
     public let feltWarmthEarnedSpan: Double
     /// How strongly uncertainty cools felt warmth (a tense working moment reads
     /// cool rather than cold).
@@ -43,26 +42,12 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     /// How many of the window's fragments a distinctive word must appear in
     /// before it counts as WORN.
     public let wornEchoThreshold: Int = 3
-    /// LAW 2 APPLIED TO THE RUT NUDGE (2026-09-01). Measured over 777 live
-    /// turns the rut-awareness line rode 82% of capsules: the detector fires
-    /// while the worn set is non-empty, and a worn set stays non-empty for
-    /// days, so the nudge re-fired every single turn. A nudge on 82% of turns
-    /// is a floor, not a signal — and worse, the thing it nags about is
-    /// repetition, so the cure became the symptom.
-    ///
-    /// The line is now CHANGE-DRIVEN: it speaks when the worn SET changes (a
-    /// new tic is news), never on consecutive capsules, and otherwise only
-    /// after a long window. `soundRutMinimumTurnGap` is the never-consecutive
-    /// floor a CHANGE must still clear; `soundRutRepeatTurnGap` /
-    /// `soundRutRepeatWindow` are the "still stuck, say it again" escape
-    /// hatches so an unchanging rut is not silent forever.
+    /// Rut nudges require a worn-set change or the repeat window, always respecting the minimum turn gap.
     public let soundRutMinimumTurnGap: Int = 2
     public let soundRutRepeatTurnGap: Int = 20
     public let soundRutRepeatWindow: TimeInterval = 6 * 60 * 60
-    /// W7/P10 — λ. Echo ranking is `register-fit × age-decay × (1 + λ·landing)`.
-    /// Deliberately small: landing RE-RANKS inside a register band, it never
-    /// overrides register fit. At 0.15 the factor spans 0.85…1.15, which cannot
-    /// close the fit gap between a matched and a mismatched register.
+    /// Echo ranking is `register-fit × age-decay × (1 + weight·landing)`.
+    /// The 0.85…1.15 landing factor cannot override a register mismatch.
     public let soundEchoLandingWeight: Double = 0.15
 
     // MARK: - Felt fingerprint
@@ -75,7 +60,7 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     /// silence.
     public let feltIntensityFloor: Double = 0.14
 
-    // MARK: - Felt OBJECT + AMBIVALENCE (2026-09-02, Agent complaints #1 and #2)
+    // MARK: - Felt object and ambivalence
 
     /// Longest subject label the felt line may name as its OBJECT. A label
     /// longer than this is REFUSED, never trimmed: truncating a title mid-word
@@ -90,9 +75,13 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
 
     // MARK: - Mood + disposition (CognitiveSubstrate+Mood.swift)
 
+    /// Recency weighting half-life for the mood's emotional-tag integral.
     public let moodRecencyHalfLife: TimeInterval = 6 * 60 * 60
+    /// Day-scale decay of the settled disposition undertone.
     public let dispositionHalfLife: TimeInterval = 30 * 60 * 60
+    /// Per-write scale for reflection, dream and resolution-pattern tones.
     public let dispositionNudgeMagnitude: Double = 0.08
+    /// Hard bound on disposition valence; its mood contribution is weighted separately.
     public let dispositionValenceCap: Double = 0.35
 
     // MARK: - Affect decay (CognitiveSubstrate+Affect.swift)
@@ -102,33 +91,23 @@ public struct PersonalityDynamicsConfiguration: Sendable, Equatable {
     public let taskPressureHalfLife: TimeInterval = 45 * 60
     public let socialWarmthHalfLife: TimeInterval = 90 * 60
 
-    // MARK: - Capsule cadence (W4/P4)
+    // MARK: - Capsule cadence
 
-    /// SUPPRESS-WHEN-UNCHANGED: after this many consecutive capsules reporting
-    /// the SAME felt family, the fingerprint line goes quiet. An identical
-    /// "How you feel: warm" for forty consecutive turns is a stuck gauge, and the
-    /// model will express it.
+    /// Same-family readings allowed by the cadence verdict.
+    /// Live delivery also requires its pre-reset run to equal one.
     public let fingerprintFamilyRepeatLimit: Int = 4
-    /// A suppressed fingerprint re-surfaces on the next family change OR when
-    /// this window expires, whichever comes first — so a genuinely persistent
-    /// state is never muted forever.
+    /// Wait before permitting an over-limit same-family cadence verdict.
+    /// Expiry alone does not satisfy live assembly's first-run gate.
     public let fingerprintSuppressionWindow: TimeInterval = 20 * 60
 
-    // MARK: - Felt session bridge (W4/P7)
+    // MARK: - Felt session bridge
 
-    /// A gap in USER's turns (any door) of at least this long makes his next
-    /// turn the first one back, the only turn the bridge line may speak on.
-    /// Six hours (Phase 5 B2, replayed on 09-26…10-03): a night or a workday
-    /// away, about one a day (8 gaps in the week, 7 with something in them);
-    /// four hours would also recap afternoon breaks (13 a week), and not every
-    /// return earns a recap.
+    /// Minimum gap across the user's doors; only the first returning turn may carry a bridge cue.
     public let sessionBridgeGapHours: Double = 6
 
     // MARK: - Trait-derived fields
 
-    /// How strongly a `play` felt mode is weighted in mode-driven selection
-    /// (P11 echo targeting today, the delivery envelope later). Derived from the
-    /// `humor` trait.
+    /// Weight of `play` mode in exemplar selection, derived from the persona's humor trait.
     public let playModeWeight: Double
 
     private init(feltWarmthEarnedSpan: Double = 0.30, playModeWeight: Double = 0.5) {

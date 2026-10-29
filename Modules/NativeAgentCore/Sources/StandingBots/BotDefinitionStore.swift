@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `BotDefinitionStore.swift` | Definition persistence and editor model/budget/schedule/event admission; launch leaves saved definitions and model choices untouched, with no migration marker |
+// Blueprint: | `BotDefinitionStore.swift` | Definition persistence and exact helper session ownership; editor model/budget/schedule/event admission; launch leaves saved definitions and model choices untouched, with no migration marker |
 
 /// Empty until explicitly populated. Definition and audit rows commit in the same atomic JSON file.
 public struct BotDefinitionStore: Sendable {
@@ -34,6 +34,14 @@ public struct BotDefinitionStore: Sendable {
 
     public func get(_ id: UUID) throws -> BotDefinition {
         try disk.locked { try disk.definition(id).definition }
+    }
+
+    /// Exact helper ownership for policies that apply to helpers alone.
+    /// Resolve the owner's locator before reading only its definition. An
+    /// unrelated damaged definition cannot block an ordinary conversation.
+    public func definition(forSession sessionID: String?) throws -> BotDefinition? {
+        guard let id = BotDefinition.id(forSession: sessionID) else { return nil }
+        return try get(id)
     }
 
     public func list(includeDeleted: Bool = false) throws -> [BotDefinition] {
@@ -81,6 +89,9 @@ public struct BotDefinitionStore: Sendable {
     public func pause(_ id: UUID, paused: Bool = true, at: Date = Date()) throws -> BotDefinition {
         let result = try disk.locked {
             var document = try disk.definition(id)
+            guard document.definition.cadence != .manual || document.definition.eventTrigger != nil else {
+                throw StandingBotsError.invalidValue("This helper has no schedule to pause or resume. Manual messages and Run once remain available.")
+            }
             document.definition.updatedAt = try updatedTime(at, after: document.definition.updatedAt)
             document.definition.paused = paused
             if !paused { document.definition.offReason = nil }
@@ -95,8 +106,16 @@ public struct BotDefinitionStore: Sendable {
 
     public func delete(_ id: UUID) throws {
         try disk.locked {
-            _ = try disk.definition(id)
-            try FileManager.default.removeItem(at: disk.definitionPath(id))
+            var document = try disk.definition(id)
+            guard document.definition.deleted != true else { return }
+            let at = Date()
+            document.definition.updatedAt = try updatedTime(at, after: document.definition.updatedAt)
+            document.definition.deleted = true
+            // Keep the definition and audit available to an already-owned run's
+            // shelf/claim settlement. Lists and admission exclude this tombstone.
+            document.audit.append(BotAuditRow(id: UUID(), at: at, operation: .update,
+                                             definition: document.definition))
+            try disk.write(document, at: disk.definitionPath(id))
         }
         NotificationCenter.default.post(name: BotRunQueue.didChange, object: nil)
     }
@@ -123,8 +142,7 @@ extension BotDefinitionStore {
         }
         let tokenLimit = tokens.isEmpty ? BotRunLimits.maximumTokens : Int(tokens) ?? 0
         let timeLimit = seconds.isEmpty ? BotRunLimits.maximumSeconds : Double(seconds) ?? 0
-        // Blank means no daily ceiling: only a limit someone sets is enforced
-        // (10-24: an unset ceiling silently became 256K and stopped a helper).
+        // Blank means no daily ceiling: only a limit someone sets is enforced.
         let dailyLimit: Int? = daily.isEmpty ? nil : Int(daily) ?? 0
         guard tokenLimit > 0, timeLimit.isFinite, timeLimit > 0, dailyLimit.map({ $0 > 0 }) ?? true else {
             throw EditorError.message("Limits must be positive numbers, or blank for the defaults.")
@@ -136,6 +154,9 @@ extension BotDefinitionStore {
             switch when {
             case "Manual only": timing = .manual
             case "Daily", "Weekdays", "Weekly":
+                if when == "Weekly", !StandingBotSchedule.weekdays.indices.contains(weekday) {
+                    throw EditorError.message("Choose a valid weekday.")
+                }
                 timing = try StandingBotSchedule.parse(when == "Weekly"
                     ? "weekly on \(StandingBotSchedule.weekdays[weekday]) at \(clockText)" : "\(when) at \(clockText)")
             case "Every N hours":

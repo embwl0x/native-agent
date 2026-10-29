@@ -12,7 +12,7 @@ enum TurnSettle {
     /// The obligation rides on the result's own durable row. Delivery readers
     /// can retry it without asking the provider or replaying any tool.
     static func requestedResultIntent(
-        message: String, plan: TurnPlan?, result: TurnEngineResult,
+        message: String, result: TurnEngineResult,
         sessionID: String, runID: String, surface: String,
         resumedRequest: Bool
     ) -> JSONValue? {
@@ -29,10 +29,9 @@ enum TurnSettle {
                 && !($0.name == "app" && $0.input["find"] != nil && $0.input["action"] == nil)
         }
         let authored = NaturalExpressionGuidance.authoredHead(message)
-        let routedQuestion = plan?.goalType != "chat" && plan?.goalType != "personality" &&
-            !meaningfulTools.isEmpty && UserMessageIntentSignals.isWorkQuestion(authored)
+        let workQuestion = !meaningfulTools.isEmpty && UserMessageIntentSignals.isWorkQuestion(authored)
         guard completion != nil || resumedRequest || UserMessageIntentSignals.explicitlyRequestsWork(authored) ||
-            (routedQuestion && !NaturalExpressionGuidance.isSocialServe(authored)) else { return nil }
+            (workQuestion && !NaturalExpressionGuidance.isSocialServe(authored)) else { return nil }
         // An accepted asynchronous assignment is still owed. Its resident
         // continuation, carrying the completion binding, supplies the result.
         if meaningfulTools.contains(where: { dispatch in
@@ -67,9 +66,7 @@ enum TurnSettle {
         ])
     }
 
-    /// The card-lane sentence `ChatTurnExecution.waitingReply` added after the last delta,
-    /// taken once by the lane about to yield `.final`, which streams it
-    /// first: a consumer that rebuilds the reply from deltas has to see it.
+    /// Take the synthesized card prose once, for progress inside the execution scope.
     static func takeStreamSuffix() -> String? {
         guard let suffix = ChatTurnExecution.takeStreamSuffix(), !suffix.isEmpty else { return nil }
         return suffix

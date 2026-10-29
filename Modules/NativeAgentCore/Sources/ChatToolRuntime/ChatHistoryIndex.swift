@@ -3,8 +3,10 @@ import Darwin
 import Foundation
 import GRDB
 import NativeAgentCore
+import PersistenceCore
 import Transcripts
-// Blueprint: | `ChatHistoryIndex.swift` | `ChatHistoryIndex` class; `shared`, `absorb`, `absorbAll`, `livedLines`; durable content-addressed index of transcript lines for history search (chat/index/history.sqlite) |
+import ToolRegistry
+// Blueprint: | `ChatHistoryIndex.swift` | SQLite-owned content-addressed history; on-demand rows and receipts, semantics-versioned cancellable absorption, transactional manifest reference reclamation |
 
 /// One durable index per history. Every transcript line is projected for
 /// search once in its life and kept by the hash of its bytes, so a line that
@@ -16,21 +18,16 @@ import Transcripts
 /// changed while she was away, so a read never replays history.
 ///
 /// Derived and rebuildable: chat/index can be dropped at the cost of one
-/// rebuild. The database mirrors the in-memory index; a database that cannot
-/// open or write leaves search working from memory and says so in her pulse.
+/// rebuild. SQLite owns cold rows, receipts and manifests; reads materialize
+/// only the requested transcript. Storage failures surface to the reader.
 /// SQLite/WAL/SHM are excluded from backup, export and phone sync; PrivacyMap: chat.
 public final class ChatHistoryIndex: @unchecked Sendable {
-    /// The code that projects rows. Projection applies redaction, peer
-    /// provenance and tool names owned elsewhere, so each row carries the build
-    /// that projected it: reads keep serving an older build's rows while this
-    /// build's first launch projects them again behind her.
-    static let projector: String = {
-        let build = NativeAgentBuildIdentity.current
-        return build.sourceContentID ?? build.sourceRevision.map { "\($0) \(build.build)" } ?? "\(build.version) \(build.build)"
-    }()
+    /// Bump only when row, receipt redaction or provenance semantics change.
+    /// Old build identities are upgraded once; unrelated builds keep valid rows.
+    static let projector = "history-projection-2"
 
     /// The stored table shapes; bump when the tables below change.
-    static let schema = 2
+    static let schema = 3
 
     public static func shared(dataRoot: URL) -> ChatHistoryIndex {
         let root = dataRoot.resolvingSymlinksInPath().standardizedFileURL
@@ -45,13 +42,17 @@ public final class ChatHistoryIndex: @unchecked Sendable {
     /// The writer's call: absorb a transcript it just committed, behind it.
     public static func absorb(_ file: URL, dataRoot: URL) {
         let index = shared(dataRoot: dataRoot)
-        Task.detached(priority: .utility) { _ = try? index.lines(at: file, current: true) }
+        Task.detached(priority: .utility) {
+            do { _ = try index.lines(at: file, current: true) }
+            catch is CancellationError { }
+            catch { index.noteStoreError(error) }
+        }
     }
 
     /// Launch: absorb every transcript (the first launch with this index
     /// builds it, later launches read only what changed). Returns lines
     /// parsed and seconds taken.
-    public func absorbAll() -> (files: Int, parsed: Int, seconds: Double) {
+    public func absorbAll() async -> (files: Int, parsed: Int, seconds: Double) {
         let started = Date()
         let listed: [(String, URL)]
         do {
@@ -62,13 +63,23 @@ public final class ChatHistoryIndex: @unchecked Sendable {
             return (0, 0, 0)
         }
         let before = parsedCount()
-        // Transcripts absorb independently, so a build's first launch uses every core once.
-        DispatchQueue.concurrentPerform(iterations: listed.count) { _ = try? lines(at: listed[$0].1, current: true) }
+        do {
+            try pruneMissingFiles()
+            // One utility task leaves cores available to interaction. Projection
+            // batches check cancellation; each transcript yields to other work.
+            for (_, file) in listed {
+                try Task.checkCancellation()
+                do { _ = try lines(at: file, current: true) }
+                catch is CancellationError { throw CancellationError() }
+                catch { noteStoreError(error) }
+                await Task.yield()
+            }
+        } catch is CancellationError {
+            return (listed.count, parsedCount() - before, Date().timeIntervalSince(started))
+        } catch { noteStoreError(error) }
         let parsed = parsedCount() - before
         let seconds = Date().timeIntervalSince(started)
-        lock.lock()
-        let storeError = self.storeError
-        lock.unlock()
+        let storeError = lock.withLock { self.storeError }
         OrganPulse.record("history_index", found: parsed,
             note: "\(listed.count) transcripts, \(parsed) new lines, \(String(format: "%.1f", seconds)) s"
                 + (storeError.map { "; not durable: \($0)" } ?? ""))
@@ -117,12 +128,16 @@ public final class ChatHistoryIndex: @unchecked Sendable {
     /// The rows of one transcript, in file order, with the receipt lane on
     /// tool rows when asked. Throws when the file cannot be read as UTF-8.
     func rows(at file: URL, receipts: Bool) throws -> [ChatHistorySearchRow] {
-        try materialize(lines(at: file), receipts: receipts)
+        absorption.lock()
+        defer { absorption.unlock() }
+        return try materialize(lines(at: file), receipts: receipts)
     }
 
     /// The transcript's line hashes, absorbing whatever changed since last read;
-    /// `current` also re-projects lines an older build projected.
+    /// `current` also upgrades rows with older projection semantics.
     private func lines(at file: URL, current: Bool = false) throws -> [Data] {
+        absorption.lock()
+        defer { absorption.unlock() }
         let path = key(file)
         var info = stat()
         func check() throws {
@@ -131,14 +146,8 @@ public final class ChatHistoryIndex: @unchecked Sendable {
             guard access(file.path, R_OK) == 0 else { throw CocoaError(.fileReadNoPermission) }
         }
         try check()
-        // A read serves the index as it stands, never waiting behind an absorber.
-        if !current, let previous = manifest(path), previous.stamp == Stamp(info) { return previous.lines }
-        let fileLock = lock(for: path)
-        fileLock.lock()
-        defer { fileLock.unlock() }
-        try check()
-        let previous = manifest(path)
-        let older = current && previous.map { holdsOlder($0.lines) } == true
+        let previous = try manifest(path)
+        let older = try current && previous.map { try known($0.lines, current: true).count != Set($0.lines).count } == true
         if let previous, previous.stamp == Stamp(info), !older { return previous.lines }
         // Changed: read what the open file's own stamp describes.
         let handle = try FileHandle(forReadingFrom: file)
@@ -165,7 +174,7 @@ public final class ChatHistoryIndex: @unchecked Sendable {
         func take(_ bytes: Data) {
             let hash = Data(SHA256.hash(data: bytes).prefix(16))
             lines.append(hash)
-            if !known(hash, current: current) { unseen.append((hash, bytes)) }
+            unseen.append((hash, bytes))
         }
         // Lines split as Swift strings split them: CR LF is one character, not a break.
         var search = cursor
@@ -179,35 +188,63 @@ public final class ChatHistoryIndex: @unchecked Sendable {
         // An unfinished last line is read as it stands and read again once it grows.
         if cursor < data.endIndex { take(data[cursor...]) }
 
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let whole = ISO8601DateFormatter()
-        var projected: [Data: ChatHistorySearchRow] = [:]
-        var receipts: [Data: Receipt] = [:]
-        for (hash, bytes) in unseen where projected[hash] == nil {
-            // A file that is not UTF-8 stays unreadable, as it was before the index.
-            guard let line = String(data: bytes, encoding: .utf8) else {
-                throw CocoaError(.fileReadInapplicableStringEncoding)
+        var known = try known(unseen.map(\.hash), current: current)
+        unseen.removeAll { known.contains($0.hash) }
+        for batch in stride(from: 0, to: unseen.count, by: 64) {
+            var projected: [Data: ChatHistorySearchRow] = [:]
+            var receipts: [Data: Receipt] = [:]
+            try AppActionBinding.withCatalog {
+                for (hash, bytes) in unseen[batch..<min(batch + 64, unseen.count)] where !known.contains(hash) && projected[hash] == nil {
+                    try Task.checkCancellation()
+                    guard let line = String(data: bytes, encoding: .utf8) else {
+                        throw CocoaError(.fileReadInapplicableStringEncoding)
+                    }
+                    let (row, receipt) = SwiftToolDispatcher.chatHistorySearchRow(line)
+                    projected[hash] = row
+                    if let receipt { receipts[hash] = try Receipt(receipt) }
+                }
             }
-            let (row, receipt) = SwiftToolDispatcher.chatHistorySearchRow(line, fractional: fractional, whole: whole)
-            projected[hash] = row
-            if let receipt { receipts[hash] = try Receipt(receipt) }
+            // Commit each bounded batch. Cancellation preserves completed work;
+            // its path holds the hashes until the final manifest replaces them.
+            try store(path: path, manifest: nil, projected: projected, receipts: receipts)
+            known.formUnion(projected.keys)
         }
         let manifest = Manifest(stamp: stamp, absorbed: absorbed, terminated: terminated, lines: lines)
-        store(path: path, manifest: manifest, projected: projected, receipts: receipts)
+        try store(path: path, manifest: manifest, projected: [:], receipts: [:])
         return lines
     }
 
     private func materialize(_ lines: [Data], receipts: Bool) throws -> [ChatHistorySearchRow] {
-        lock.lock()
-        let rows = lines.map { (projected[$0], self.receipts[$0]) }
-        lock.unlock()
-        return try rows.map { row, receipt in
-            // Only a transcript deleted mid-read loses its lines here.
-            guard let row else { throw CocoaError(.fileReadNoSuchFile) }
-            guard receipts, row.isToolRow else { return row }
-            guard let receipt else { throw CocoaError(.fileReadCorruptFile) }
-            return try receipt.applied(to: row)
+        try openDatabase().read { db in
+            var rows: [Data: ChatHistorySearchRow] = [:]
+            for start in stride(from: 0, to: lines.count, by: 256) {
+                let hashes = Array(lines[start..<min(start + 256, lines.count)])
+                let marks = Array(repeating: "?", count: hashes.count).joined(separator: ",")
+                let receiptColumns = receipts ? ", r.content AS receipt_content, r.searchable AS receipt_searchable, r.instant AS receipt_instant, r.peer AS receipt_peer" : ""
+                let join = receipts ? " LEFT JOIN receipt r ON r.hash = l.hash" : ""
+                for line in try Row.fetchAll(db, sql: "SELECT l.*\(receiptColumns) FROM line l\(join) WHERE l.hash IN (\(marks))",
+                                             arguments: StatementArguments(hashes)) {
+                    let role: String? = line["role"], messageId: String? = line["message_id"], raw: String? = line["raw_content"]
+                    let content: String = line["content"] ?? (role?.lowercased() == "tool" ? "" : raw ?? "")
+                    let searchable: String = line["searchable"] ?? content
+                    var row = ChatHistorySearchRow(valid: line["valid"], identity: line["identity"] ?? messageId ?? "",
+                        role: role, runId: line["run_id"], messageId: messageId, timestamp: line["timestamp"], rawContent: raw,
+                        content: content, searchable: searchable, folded: searchable.lowercased(),
+                        instant: (line["instant"] as Double?).map(Date.init(timeIntervalSince1970:)),
+                        author: line["author"], route: line["route"], peer: line["peer"], tool: line["tool"],
+                        displayPrefix: line["display_prefix"], shape: line["shape"], mechanical: line["mechanical"])
+                    if receipts, row.isToolRow {
+                        guard let content: Data = line["receipt_content"] else { throw CocoaError(.fileReadCorruptFile) }
+                        row = try Receipt(content: content, searchable: line["receipt_searchable"],
+                                          instant: line["receipt_instant"], peer: line["receipt_peer"]).applied(to: row)
+                    }
+                    rows[line["hash"]] = row
+                }
+            }
+            return try lines.map {
+                guard let row = rows[$0] else { throw CocoaError(.fileReadNoSuchFile) }
+                return row
+            }
         }
     }
 
@@ -269,16 +306,12 @@ public final class ChatHistoryIndex: @unchecked Sendable {
 
     private let dataRoot: URL
     private let lock = NSLock()
-    private var loaded = false
+    /// Serial absorption keeps one transcript's projection in flight, and a
+    /// manifest/row read cannot race reference reclamation by another writer.
+    private let absorption = NSRecursiveLock()
     private var parsed = 0
     private var storeError: String?
     private var database: DatabaseQueue?
-    private var projected: [Data: ChatHistorySearchRow] = [:]
-    private var receipts: [Data: Receipt] = [:]
-    /// Lines an older build projected: still served, projected again at launch.
-    private var older: Set<Data> = []
-    private var manifests: [String: Manifest] = [:]
-    private var fileLocks: [String: NSLock] = [:]
 
     private init(dataRoot: URL) {
         self.dataRoot = dataRoot
@@ -286,38 +319,44 @@ public final class ChatHistoryIndex: @unchecked Sendable {
 
     /// Paths inside the data root are kept relative, so a moved root keeps its index.
     private func key(_ file: URL) -> String {
-        let path = file.standardizedFileURL.path, root = dataRoot.path + "/"
-        return path.hasPrefix(root) ? String(path.dropFirst(root.count)) : path
+        let path = file.standardizedFileURL.path
+        guard let tail = NativeAgentWorkspaceRoot.relativePath(path, under: dataRoot.path), !tail.isEmpty else { return path }
+        return tail
     }
 
-    private func lock(for path: String) -> NSLock {
-        lock.lock()
-        defer { lock.unlock() }
-        if let existing = fileLocks[path] { return existing }
-        let created = NSLock()
-        fileLocks[path] = created
-        return created
+    private func manifest(_ path: String) throws -> Manifest? {
+        try openDatabase().read { db in
+            guard let file = try Row.fetchOne(db, sql: "SELECT * FROM file WHERE path = ?", arguments: [path]) else { return nil }
+            return Self.manifest(file)
+        }
     }
 
-    private func manifest(_ path: String) -> Manifest? {
-        lock.lock()
-        defer { lock.unlock() }
-        loadIfNeeded()
-        return manifests[path]
+    private static func manifest(_ file: Row) -> Manifest? {
+        let packed: Data = file["lines"], size: Int = file["size"], absorbed: Int = file["absorbed"], terminated: Int = file["terminated"]
+        guard packed.count % 16 == 0, 0 <= absorbed, absorbed <= size else { return nil }
+        let lines = stride(from: 0, to: packed.count, by: 16).map { packed.subdata(in: $0..<$0 + 16) }
+        guard 0 <= terminated, terminated <= lines.count else { return nil }
+        return Manifest(stamp: Stamp(inode: UInt64(bitPattern: file["inode"]), size: size, modified: file["modified"]),
+                        absorbed: absorbed, terminated: terminated, lines: lines)
     }
 
-    /// Projected already; with `current`, by this build.
-    private func known(_ hash: Data, current: Bool) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let row = projected[hash], !(current && older.contains(hash)) else { return false }
-        return !row.isToolRow || receipts[hash] != nil
-    }
-
-    private func holdsOlder(_ lines: [Data]) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return !older.isEmpty && lines.contains(where: older.contains)
+    /// Only hashes cross this read; receipt payloads stay in SQLite until requested.
+    private func known(_ hashes: [Data], current: Bool) throws -> Set<Data> {
+        try openDatabase().read { db in
+            var found: Set<Data> = []
+            for start in stride(from: 0, to: hashes.count, by: 256) {
+                let batch = Array(hashes[start..<min(start + 256, hashes.count)])
+                let marks = Array(repeating: "?", count: batch.count).joined(separator: ",")
+                var arguments = StatementArguments(batch)
+                if current { arguments += [Self.projector] }
+                found.formUnion(try Data.fetchAll(db, sql: """
+                    SELECT l.hash FROM line l LEFT JOIN receipt r ON r.hash = l.hash
+                    WHERE l.hash IN (\(marks)) AND (lower(coalesce(l.role, '')) != 'tool' OR r.hash IS NOT NULL)
+                    \(current ? "AND l.projector = ?" : "")
+                    """, arguments: arguments))
+            }
+            return found
+        }
     }
 
     private func parsedCount() -> Int {
@@ -326,48 +365,52 @@ public final class ChatHistoryIndex: @unchecked Sendable {
         return parsed
     }
 
-    // MARK: - Durable mirror
+    // MARK: - Durable owner
 
-    private func store(path: String, manifest: Manifest, projected new: [Data: ChatHistorySearchRow],
-                       receipts newReceipts: [Data: Receipt]) {
-        lock.lock()
-        projected.merge(new) { _, fresh in fresh }
-        receipts.merge(newReceipts) { _, fresh in fresh }
-        older.subtract(new.keys)
-        manifests[path] = manifest
-        parsed += new.count
-        let database = database
-        lock.unlock()
-        guard let database else { return }
-        do {
-            try database.write { db in
-                for (hash, row) in new {
-                    let content: String? = row.content == (row.isToolRow ? "" : row.rawContent ?? "") ? nil : row.content
-                    try db.execute(sql: """
-                        INSERT OR REPLACE INTO line (hash, valid, identity, role, run_id, message_id, timestamp,
-                            raw_content, content, searchable, instant, author, route, peer, tool, display_prefix, shape,
-                            projector, mechanical)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """, arguments: [hash, row.valid, row.identity == row.messageId ? nil : row.identity,
-                                         row.role, row.runId, row.messageId, row.timestamp, row.rawContent, content,
-                                         row.searchable == row.content ? nil : row.searchable,
-                                         row.instant?.timeIntervalSince1970, row.author, row.route, row.peer,
-                                         row.tool, row.displayPrefix, row.shape, Self.projector, row.mechanical])
-                }
-                for (hash, receipt) in newReceipts {
-                    try db.execute(sql: "INSERT OR REPLACE INTO receipt (hash, content, searchable, instant, peer) VALUES (?, ?, ?, ?, ?)",
-                                   arguments: [hash, receipt.content, receipt.searchable, receipt.instant, receipt.peer])
-                }
+    private func store(path: String, manifest: Manifest?, projected new: [Data: ChatHistorySearchRow],
+                       receipts newReceipts: [Data: Receipt]) throws {
+        try openDatabase().write { db in
+            for (hash, row) in new {
+                let content: String? = row.content == (row.isToolRow ? "" : row.rawContent ?? "") ? nil : row.content
                 try db.execute(sql: """
-                    INSERT OR REPLACE INTO file (path, inode, size, modified, absorbed, terminated, lines)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, arguments: [path, Int64(bitPattern: manifest.stamp.inode), manifest.stamp.size,
-                                     manifest.stamp.modified, manifest.absorbed, manifest.terminated,
-                                     manifest.lines.reduce(into: Data()) { $0.append($1) }])
+                    INSERT OR REPLACE INTO line (hash, valid, identity, role, run_id, message_id, timestamp,
+                        raw_content, content, searchable, instant, author, route, peer, tool, display_prefix, shape,
+                        projector, mechanical)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, arguments: [hash, row.valid, row.identity == row.messageId ? nil : row.identity,
+                                     row.role, row.runId, row.messageId, row.timestamp, row.rawContent, content,
+                                     row.searchable == row.content ? nil : row.searchable,
+                                     row.instant?.timeIntervalSince1970, row.author, row.route, row.peer,
+                                     row.tool, row.displayPrefix, row.shape, Self.projector, row.mechanical])
             }
-        } catch {
-            noteStoreError(error)
+            for (hash, receipt) in newReceipts {
+                try db.execute(sql: "INSERT OR REPLACE INTO receipt (hash, content, searchable, instant, peer) VALUES (?, ?, ?, ?, ?)",
+                               arguments: [hash, receipt.content, receipt.searchable, receipt.instant, receipt.peer])
+            }
+            guard let manifest else {
+                for hash in new.keys {
+                    try db.execute(sql: "INSERT OR IGNORE INTO held(path, hash) VALUES (?, ?)", arguments: [path, hash])
+                }
+                return
+            }
+            let previous = Set(try Data.fetchAll(db, sql: "SELECT hash FROM held WHERE path = ?", arguments: [path]))
+            try db.execute(sql: """
+                INSERT OR REPLACE INTO file (path, inode, size, modified, absorbed, terminated, lines)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, arguments: [path, Int64(bitPattern: manifest.stamp.inode), manifest.stamp.size,
+                                 manifest.stamp.modified, manifest.absorbed, manifest.terminated,
+                                 manifest.lines.reduce(into: Data()) { $0.append($1) }])
+            for hash in Set(manifest.lines).subtracting(previous) {
+                try db.execute(sql: "INSERT INTO held(path, hash) VALUES (?, ?)", arguments: [path, hash])
+            }
+            for hash in previous.subtracting(manifest.lines) {
+                try db.execute(sql: "DELETE FROM held WHERE path = ? AND hash = ?", arguments: [path, hash])
+                try Self.reclaim(hash, db: db)
+            }
         }
+        lock.lock()
+        parsed += new.count
+        lock.unlock()
     }
 
     private func noteStoreError(_ error: Error) {
@@ -377,26 +420,29 @@ public final class ChatHistoryIndex: @unchecked Sendable {
         OrganPulse.record("history_index", .skipped, note: "not durable: \(error.localizedDescription)")
     }
 
-    /// Caller holds `lock`. Opens the mirror and loads it whole, once.
-    private func loadIfNeeded() {
-        guard !loaded else { return }
-        loaded = true
-        do {
-            let url = dataRoot.appendingPathComponent("chat/index/history.sqlite")
-            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            var configuration = Configuration()
-            configuration.busyMode = .timeout(2)
-            configuration.prepareDatabase { db in
-                // Rebuildable: a power cut may cost the newest absorbs, never correctness.
-                try db.execute(sql: "PRAGMA journal_mode = WAL")
-                try db.execute(sql: "PRAGMA synchronous = NORMAL")
-            }
-            let database = try DatabaseQueue(path: url.path, configuration: configuration)
-            try database.write { db in
-                // The table shapes are this file's; a different shape starts over.
-                guard try Int.fetchOne(db, sql: "PRAGMA user_version") != Self.schema else { return }
+    /// Open only the store. No transcript payload is retained by this owner.
+    private func openDatabase() throws -> DatabaseQueue {
+        lock.lock()
+        defer { lock.unlock() }
+        if let database { return database }
+        let url = dataRoot.appendingPathComponent("chat/index/history.sqlite")
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        var configuration = Configuration()
+        configuration.busyMode = .timeout(2)
+        configuration.prepareDatabase { db in
+            try db.execute(sql: "PRAGMA journal_mode = WAL")
+            try db.execute(sql: "PRAGMA synchronous = NORMAL")
+        }
+        let database = try DatabaseQueue(path: url.path, configuration: configuration)
+        try database.write { db in
+            let version = try Int.fetchOne(db, sql: "PRAGMA user_version") ?? 0
+            guard version != Self.schema else { return }
+            // Version 2's rows and packed manifests survive the one-time reference migration.
+            // Older derived shapes are rebuilt, as before.
+            if version != 2 {
                 try db.execute(sql: """
-                    DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS line; DROP TABLE IF EXISTS receipt; DROP TABLE IF EXISTS file;
+                    DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS held;
+                    DROP TABLE IF EXISTS line; DROP TABLE IF EXISTS receipt; DROP TABLE IF EXISTS file;
                     CREATE TABLE line (hash BLOB PRIMARY KEY, valid INTEGER NOT NULL, shape INTEGER NOT NULL, identity TEXT, role TEXT,
                         run_id TEXT, message_id TEXT, timestamp TEXT, raw_content TEXT, content TEXT,
                         searchable TEXT, instant REAL, author TEXT, route TEXT, peer TEXT, tool TEXT,
@@ -404,82 +450,52 @@ public final class ChatHistoryIndex: @unchecked Sendable {
                     CREATE TABLE receipt (hash BLOB PRIMARY KEY, content BLOB NOT NULL, searchable TEXT,
                         instant REAL, peer TEXT);
                     CREATE TABLE file (path TEXT PRIMARY KEY, inode INTEGER NOT NULL, size INTEGER NOT NULL,
-                        modified REAL NOT NULL, absorbed INTEGER NOT NULL, terminated INTEGER NOT NULL,
-                        lines BLOB NOT NULL);
-                    PRAGMA user_version = \(Self.schema);
+                        modified REAL NOT NULL, absorbed INTEGER NOT NULL, terminated INTEGER NOT NULL, lines BLOB NOT NULL);
                     """)
             }
-            try database.read { db in
-                let lines = try Row.fetchCursor(db, sql: """
-                    SELECT hash, valid, identity, role, run_id, message_id, timestamp, raw_content, content,
-                        searchable, instant, author, route, peer, tool, display_prefix, shape, projector, mechanical FROM line
-                    """)
-                while let line = try lines.next() {
-                    let role: String? = line[3], messageId: String? = line[5], rawContent: String? = line[7]
-                    let isTool = role?.lowercased() == "tool"
-                    let content: String = line[8] ?? (isTool ? "" : rawContent ?? "")
-                    let searchable: String = line[9] ?? content
-                    let hash: Data = line[0]
-                    if line[17] as String != Self.projector { older.insert(hash) }
-                    projected[hash] = ChatHistorySearchRow(
-                        valid: line[1], identity: line[2] ?? messageId ?? "", role: role, runId: line[4],
-                        messageId: messageId, timestamp: line[6], rawContent: rawContent, content: content,
-                        searchable: searchable, folded: searchable.lowercased(),
-                        instant: (line[10] as Double?).map(Date.init(timeIntervalSince1970:)),
-                        author: line[11], route: line[12], peer: line[13], tool: line[14], displayPrefix: line[15],
-                        shape: line[16], mechanical: line[18])
+            try db.execute(sql: """
+                CREATE TABLE held (path TEXT NOT NULL, hash BLOB NOT NULL, PRIMARY KEY(path, hash));
+                CREATE INDEX held_hash ON held(hash);
+                """)
+            for file in try Row.fetchAll(db, sql: "SELECT * FROM file") {
+                guard let manifest = Self.manifest(file) else {
+                    try db.execute(sql: "DELETE FROM file WHERE path = ?", arguments: [file["path"] as String])
+                    continue
                 }
-                let receiptRows = try Row.fetchCursor(db, sql: "SELECT hash, content, searchable, instant, peer FROM receipt")
-                while let receipt = try receiptRows.next() {
-                    receipts[receipt[0]] = Receipt(content: receipt[1], searchable: receipt[2],
-                                                   instant: receipt[3], peer: receipt[4])
-                }
-                let files = try Row.fetchCursor(db, sql: "SELECT path, inode, size, modified, absorbed, terminated, lines FROM file")
-                while let file = try files.next() {
-                    let packed: Data = file[6], size: Int = file[2], absorbed: Int = file[4], terminated: Int = file[5]
-                    // A manifest that does not decode, or names a line the mirror lost, is re-read whole.
-                    guard packed.count % 16 == 0, 0 <= absorbed, absorbed <= size else { continue }
-                    let lines = stride(from: 0, to: packed.count, by: 16).map {
-                        packed.subdata(in: packed.startIndex + $0 ..< packed.startIndex + $0 + 16)
-                    }
-                    guard 0 <= terminated, terminated <= lines.count, lines.allSatisfy({ hash in
-                        projected[hash].map { !$0.isToolRow || receipts[hash] != nil } ?? false
-                    }) else { continue }
-                    manifests[file[0]] = Manifest(
-                        stamp: Stamp(inode: UInt64(bitPattern: file[1]), size: size, modified: file[3]),
-                        absorbed: absorbed, terminated: terminated, lines: lines)
+                for hash in Set(manifest.lines) {
+                    try db.execute(sql: "INSERT INTO held(path, hash) VALUES (?, ?)", arguments: [file["path"] as String, hash])
                 }
             }
-            // Before this process absorbs anything: forget transcripts that are
-            // gone and lines no transcript holds, so no read races the sweep.
-            let gone = manifests.keys.filter {
-                !FileManager.default.fileExists(atPath: $0.hasPrefix("/") ? $0 : dataRoot.appendingPathComponent($0).path)
+            try db.execute(sql: """
+                DELETE FROM receipt WHERE NOT EXISTS (SELECT 1 FROM held WHERE held.hash = receipt.hash);
+                DELETE FROM line WHERE NOT EXISTS (SELECT 1 FROM held WHERE held.hash = line.hash);
+                PRAGMA user_version = \(Self.schema);
+                """)
+        }
+        self.database = database
+        return database
+    }
+
+    private static func reclaim(_ hash: Data, db: Database) throws {
+        try db.execute(sql: "DELETE FROM receipt WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM held WHERE hash = ?)",
+                       arguments: [hash, hash])
+        try db.execute(sql: "DELETE FROM line WHERE hash = ? AND NOT EXISTS (SELECT 1 FROM held WHERE hash = ?)",
+                       arguments: [hash, hash])
+    }
+
+    /// Check manifests without loading any row or receipt body.
+    private func pruneMissingFiles() throws {
+        absorption.lock()
+        defer { absorption.unlock() }
+        try openDatabase().write { db in
+            for path in try String.fetchAll(db, sql: "SELECT path FROM file UNION SELECT path FROM held") {
+                let file = path.hasPrefix("/") ? path : dataRoot.appendingPathComponent(path).path
+                guard !FileManager.default.fileExists(atPath: file) else { continue }
+                let hashes = try Data.fetchAll(db, sql: "SELECT hash FROM held WHERE path = ?", arguments: [path])
+                try db.execute(sql: "DELETE FROM file WHERE path = ?", arguments: [path])
+                try db.execute(sql: "DELETE FROM held WHERE path = ?", arguments: [path])
+                for hash in hashes { try Self.reclaim(hash, db: db) }
             }
-            for path in gone { manifests.removeValue(forKey: path) }
-            let held = Set(manifests.values.flatMap(\.lines))
-            let orphans = projected.keys.filter { !held.contains($0) }
-            for hash in orphans {
-                projected.removeValue(forKey: hash)
-                receipts.removeValue(forKey: hash)
-                older.remove(hash)
-            }
-            do {
-                try database.write { db in
-                    for path in gone { try db.execute(sql: "DELETE FROM file WHERE path = ?", arguments: [path]) }
-                    for hash in orphans {
-                        try db.execute(sql: "DELETE FROM line WHERE hash = ?", arguments: [hash])
-                        try db.execute(sql: "DELETE FROM receipt WHERE hash = ?", arguments: [hash])
-                    }
-                }
-            } catch {
-                // Leftover rows cost space, never correctness; the next launch sweeps again.
-                storeError = error.localizedDescription
-                OrganPulse.record("history_index", .skipped, note: "not swept: \(error.localizedDescription)")
-            }
-            self.database = database
-        } catch {
-            storeError = error.localizedDescription
-            OrganPulse.record("history_index", .skipped, note: "not durable: \(error.localizedDescription)")
         }
     }
 }

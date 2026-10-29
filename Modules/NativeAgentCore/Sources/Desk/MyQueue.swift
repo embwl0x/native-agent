@@ -1,8 +1,8 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `MyQueue.swift` | `MyQueue` enum; `entries`, `add`, `isReady`; `Entry.owedToPerson` derives reply obligation from recorded origin, independent of readiness and taint |
+// Blueprint: | `MyQueue.swift` | `MyQueue` enum; `entries`, `add`, `isReady`; `Entry.owedToPerson` derives reply obligation from recorded origin and canonical session kind, independent of readiness and taint |
 
-/// MY QUEUE (Wave 2 #7/#8): what she said she would do later, kept as Desk
+/// MY QUEUE: what she said she would do later, kept as Desk
 /// items of hers until she marks each done or dropped. A step's `DeskStep`
 /// says when it is ready, so one waiting on User or a card does not nag her.
 public enum MyQueue {
@@ -16,7 +16,7 @@ public enum MyQueue {
         /// Queued on a turn a peer steered. Its steer applies only where this
         /// step resumes; reading it on the Desk carries none of it.
         public var peerBorn: Bool { !(step.peers.isEmpty && step.elevated.isEmpty) }
-        public var owedToPerson: Bool { step.owedToPerson }
+        public func owedToPerson(dataRoot: URL) -> Bool { step.owedToPerson(dataRoot: dataRoot) }
     }
 
     /// The open queue step an item is, or nil. Its newest step ref wins: a
@@ -67,7 +67,7 @@ public enum MyQueue {
         }
 
         static func time(_ text: String) -> Date? {
-            if let date = DeskClock.parseISO(text) ?? ISO8601DateFormatter().date(from: text) { return date }
+            if let date = DeskClock.parseISO(text) { return date }
             let format = DateFormatter()
             format.locale = Locale(identifier: "en_US_POSIX")
             for pattern in ["yyyy-MM-dd HH:mm", "yyyy-MM-dd'T'HH:mm", "yyyy-MM-dd"] {
@@ -147,18 +147,6 @@ public enum MyQueue {
         public var errorDescription: String? { "MY QUEUE already holds \(MyQueue.inferredCap) inferred steps" }
     }
 
-    /// Inferred steps left untouched for a week are dropped as expired, never
-    /// deleted. Returns how many.
-    @discardableResult
-    public static func expireInferred(store: SwiftNativeDeskStore, now: Date = Date()) async throws -> Int {
-        let stale = entries(try await store.liveState()).filter { entry in
-            entry.step.source != nil
-                && (DeskClock.parseISO(entry.item.updatedAt).map { now.timeIntervalSince($0) > 7 * 86_400 } ?? false)
-        }
-        for entry in stale { try await finish(entry, dropped: true, why: "expired", store: store) }
-        return stale.count
-    }
-
     public struct Superseded: Error, LocalizedError, Sendable {
         public var errorDescription: String? { "The queued step changed or closed before settlement; the newer state was kept." }
     }
@@ -171,7 +159,7 @@ public enum MyQueue {
         }
     }
 
-    /// A skill run still stopped at turn end (skills-as-code PR 3) waits here
+    /// A skill run still stopped at turn end waits here
     /// for her own turn, and holds what it landed until she resumes or drops it.
     public static func skillRunPrefix(skill: String, run: String) -> String { "Resume \(skill) run \(run):" }
 

@@ -1,6 +1,8 @@
 import Foundation
+import NativeAgentShared
 import CryptoKit
 import PersistenceCore
+import NativeAgentCore
 // Blueprint: | `AgentWorkspaceSavedReply.swift` | `AgentWorkspaceSavedReply` struct; `title`, `evidence` |
 
 /// A selected shelf reference, not another reply store. The normal reader
@@ -27,11 +29,7 @@ struct AgentWorkspaceSavedReply: Sendable {
         } else { name = "Helper" }
         var date = "Saved reply"
         if case .string(let timestamp)? = row["runAt"] {
-            let parser = ISO8601DateFormatter()
-            let parsed = parser.date(from: timestamp)
-            parser.formatOptions.insert(.withFractionalSeconds)
-            // Relative like every other room (walk 4: these alone read in UTC).
-            if let time = parsed ?? parser.date(from: timestamp) {
+            if let time = NativeTimestampFormat.parseISO8601(timestamp) {
                 guard let now else { return (name.isEmpty ? "Helper" : name) + " — " + subject(row) }
                 date = HerScreen.age(now.timeIntervalSince(time)) + " ago"
             }

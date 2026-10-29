@@ -4,13 +4,9 @@ import PersistenceCore
 // Blueprint: | `SecurityCenter+FullMacPolicy.swift` | `SwiftNativeSecurityCenter`: `fullMacActive`, `fullMacYoloAuthority`, checked local `localFullMacYoloAdmitted`, `drivenAgentLaunchPermission` |
 
 extension SwiftNativeSecurityCenter {
-    /// Full Mac is on when the saved policy is Full Mac. No timer
-    /// (2026-09-10) - see `MacControlGate.fullMacActive`.
+    /// Full Mac follows the saved policy without a timer.
     static func fullMacActive(policy: [String: JSONValue]) -> Bool {
-        guard let trust = MacControlPolicy.fromTrustPolicyObject(policy).trustPolicy else {
-            return false
-        }
-        return MacControlGate.fullMacActive(trust)
+        PermissionLaw.posture(policy) == .fullMac
     }
 
     /// The local operator has one admission for every native action. Read
@@ -28,7 +24,6 @@ extension SwiftNativeSecurityCenter {
     /// cannot obtain YOLO authority by supplying only a surface label.
     /// Effect owners may pass the fresh checked generation they just read.
     public func fullMacYoloAuthority(
-        tool: String,
         origin: SecurityOriginContext,
         snapshot: TrustPolicyAuthorizationSnapshot? = nil
     ) async -> FullMacYoloAuthorityAssessment {
@@ -57,10 +52,9 @@ extension SwiftNativeSecurityCenter {
     /// or an origin not admitted for Full Mac runs it restricted, and an
     /// unreadable policy launches nothing.
     public func drivenAgentLaunchPermission(
-        tool: String,
         origin: SecurityOriginContext
     ) async -> DrivenAgentLaunchPermission {
-        let authority = await fullMacYoloAuthority(tool: tool, origin: origin)
+        let authority = await fullMacYoloAuthority(origin: origin)
         switch authority.state {
         case .admitted: return .fullMac
         case .inactive, .untrustedOrigin: return .restricted
@@ -75,6 +69,9 @@ extension SwiftNativeSecurityCenter {
         originAssessment: OriginAssessment,
         snapshot: TrustPolicyAuthorizationSnapshot
     ) -> FullMacYoloAuthorityAssessment {
+        if let paused = Self.killSwitchRefusal(policy: snapshot.policy) {
+            return FullMacYoloAuthorityAssessment(state: .explicitlyBlocked, reason: paused.reason)
+        }
         guard Self.fullMacActive(policy: snapshot.policy) else {
             return FullMacYoloAuthorityAssessment(
                 state: .inactive,
@@ -97,7 +94,6 @@ extension SwiftNativeSecurityCenter {
     /// Checked-snapshot variant for TrustCenter consumers that already received
     /// the concrete origin proof from SecurityCenter.
     public nonisolated static func fullMacYoloAuthority(
-        tool: String,
         surface: String,
         originTrusted: Bool,
         snapshot: TrustPolicyAuthorizationSnapshot

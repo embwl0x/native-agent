@@ -2,16 +2,12 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `LLMClient+OpenAIAdapter.swift` | `OpenAIAdapter`: API-key Responses/Chat Completions selection, message/tool encoding and bounded completion/stream transport |
+// Blueprint: | `LLMClient+OpenAIAdapter.swift` | `OpenAITransport`: API-key Responses/Chat Completions selection, message/tool encoding and bounded completion/stream transport |
 
 /// OpenAI API-key adapter: GPT-6 uses Responses; older models use Chat Completions.
-public final class OpenAIAdapter: LLMAdapter {
+public final class OpenAITransport: LLMTransport {
     public static let toolWire = ProviderToolWire.native
     public let providerId: String = "openai"
-    /// Request timeout for the API-key lane. Same resolved value the OAuth
-    /// direct adapters use (240s), so both lanes fail a stalled request the
-    /// same way instead of inheriting whatever the injected session carries.
-    static let requestTimeoutSeconds: TimeInterval = 240
 
     private let session: URLSession
     private let endpoint: URL
@@ -41,7 +37,7 @@ public final class OpenAIAdapter: LLMAdapter {
 
     public init(
         session: URLSession = .shared,
-        endpoint: URL = OpenAIAdapter.defaultEndpoint,
+        endpoint: URL = OpenAITransport.defaultEndpoint,
         apiKeyOverride: String? = nil,
         dataRootOverride: URL? = nil,
         telemetryDataRootOverride: URL? = nil
@@ -59,92 +55,33 @@ public final class OpenAIAdapter: LLMAdapter {
         )
     }
 
-    public func complete(prompt: String, system: String?, model: String) async throws -> String {
-        try await complete(prompt: prompt, system: system, model: model, tools: nil)
-    }
-
-    /// F-B2 (2026-08-02): the api-key OpenAI lane used to inherit the protocol's
-    /// default tools-aware `complete`, which DROPS `tools` on the floor — the
-    /// request body carried only model+messages, no `.toolCall` was ever
-    /// emitted, and the agent silently believed it had zero tools. The Moonshot
-    /// and xAI adapters speak the identical Chat-Completions wire; this brings
-    /// OpenAI to parity (tools / tool_choice / parallel_tool_calls out,
-    /// tool_calls parsed back in on BOTH the streaming and non-streaming paths).
-    ///
-    /// BYTE-IDENTITY: `tools == nil || tools!.isEmpty` produces the exact body
-    /// this method sent before the change.
+    /// Streaming and non-streaming completions serialize tools and parse returned tool calls.
+    /// Nil or empty tools leave the plain completion body unchanged.
     public func complete(
         prompt: String,
         system: String?,
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
-        if OpenAIExecutionControls.usesResponses(model: model) {
-            return try await completeResponses(messages: [.user(prompt)], system: system, model: model, tools: tools)
-        }
-        guard let key = apiKeyOverride
-                ?? LLMCredentialResolver.resolveAPIKey(
-                    providerConfigFile: "openai.json",
-                    dataRoot: credentialRoot),
-              !key.isEmpty else {
-            throw LLMError.notConfigured(provider: "openai")
-        }
-
-        var req = URLRequest(url: endpoint)
-        req.httpMethod = "POST"
-        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        // An injected session may carry URLSession's 60s default (or none at
-        // all); match the OAuth lanes' resolved 240s so a stalled completion
-        // fails instead of hanging the turn.
-        req.timeoutInterval = ProviderStreamContext.stallOnly ? .infinity : Self.requestTimeoutSeconds
-
-        var messages: [[String: String]] = []
-        if let sys = system, !sys.isEmpty {
-            messages.append(["role": "system", "content": sys])
-        }
-        messages.append(["role": "user", "content": prompt])
-
-        var body: [String: Any] = [
-            "model": model,
-            "messages": messages,
-        ]
-        try Self.applyTools(to: &body, tools: tools)
-        OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model)
-        if let limit = (LLMCallContext.turnTokenBudget?.available ?? LLMCallContext.botOutputTokenLimit) { body["max_completion_tokens"] = limit }
-        req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
-
-        return try await performCompletion(request: req, model: model)
+        try await LLMMessageStreamEvent.reply(collecting:
+            streamMessages(messages: [.user(prompt)], system: system, model: model, tools: tools))
     }
 
     // MARK: - Structured messages (native vision)
 
-    /// Native-vision `completeMessages` override for the Chat Completions API.
-    /// The api-key OpenAI path is a fallthrough in the user's OAuth setup, but we
-    /// wire real vision here too so no provider/credential combo silently loses
-    /// images.
-    ///
-    /// BYTE-IDENTITY: when no `.image` block is present we DELEGATE to the same
-    /// flatten → `complete(prompt:)` the default produced, keeping the text-only
-    /// body byte-identical. We only build a multi-part content body when an
-    /// image is present.
+    /// On the `openai` Chat Completions wire, images and tool blocks stay structured.
+    /// Text-only conversations retain role-prefixed compatibility flattening
+    /// so their prompt shape and wire body stay unchanged.
     public func completeMessages(
         messages: [LLMMessage],
         system: String?,
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
-        if OpenAIExecutionControls.usesResponses(model: model) {
-            return try await completeResponses(messages: messages, system: system, model: model, tools: tools)
-        }
         let hasImage = messages.contains { m in
             m.content.contains { if case .image = $0 { return true }; return false }
         }
-        // F-B2: tool_use / tool_result blocks now demand the STRUCTURED body
-        // (assistant.tool_calls + role:"tool" messages). Flattening them into
-        // "[tool_use …]" text is what made the api-key OpenAI lane unable to
-        // run a second tool-loop turn. A plain text-only conversation still
-        // takes the byte-identical flatten path below.
+        // Tool-use and tool-result blocks require structured assistant.tool_calls and role:"tool" messages.
         let hasToolBlocks = messages.contains { m in
             m.content.contains {
                 switch $0 {
@@ -153,101 +90,21 @@ public final class OpenAIAdapter: LLMAdapter {
                 }
             }
         }
-        guard hasImage || hasToolBlocks else {
+        guard hasImage || hasToolBlocks || OpenAIExecutionControls.usesResponses(model: model) else {
             // Text-only: the role-prefixed flatten (llmCompatibilityPrompt), unchanged.
-            let flattened = llmCompatibilityPrompt(messages: messages) { role in
+            let flattened = try llmCompatibilityPrompt(messages: messages) { role in
                 role == .user ? "USER:" : "ASSISTANT:"
             }
             let combined = flattened.text
             return try await complete(prompt: combined, system: system, model: model, tools: tools)
         }
 
-        guard let key = apiKeyOverride
-                ?? LLMCredentialResolver.resolveAPIKey(
-                    providerConfigFile: "openai.json",
-                    dataRoot: credentialRoot),
-              !key.isEmpty else {
-            throw LLMError.notConfigured(provider: "openai")
-        }
-
-        var req = URLRequest(url: endpoint)
-        req.httpMethod = "POST"
-        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        // An injected session may carry URLSession's 60s default (or none at
-        // all); match the OAuth lanes' resolved 240s so a stalled completion
-        // fails instead of hanging the turn.
-        req.timeoutInterval = ProviderStreamContext.stallOnly ? .infinity : Self.requestTimeoutSeconds
-
-        var body: [String: Any] = [
-            "model": model,
-            "messages": Self.chatMessages(messages: messages, system: system),
-        ]
-        if let limit = (LLMCallContext.turnTokenBudget?.available ?? LLMCallContext.botOutputTokenLimit) { body["max_completion_tokens"] = limit }
-        try Self.applyTools(to: &body, tools: tools)
-        OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model)
-        req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
-
-        return try await performCompletion(request: req, model: model)
-    }
-
-
-    /// Shared transport, response validation, parsing, and success telemetry.
-    private func performCompletion(request req: URLRequest, model: String) async throws -> String {
-        let requestStartNs = DispatchTime.now().uptimeNanoseconds
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await session.data(for: req)
-        } catch {
-            throw mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "openai")"))
-        }
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        try throwIfChatCompletionsError(status: status, data: data, response: response)
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw LLMError.invalidResponse(status: status)
-        }
-        let terminal = Result { try Self.parseCompletion(obj, status: status) }
-        let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-        await telemetry.record(
-            requestBody: req.httpBody,
-            provider: providerId,
-            model: model,
-            streaming: false,
-            usage: LLMUsage.fromOpenAIChatCompletions(obj["usage"] as? [String: Any]),
-            ttftMs: nil,
-            durationMs: durationMs,
-            status: try terminal.chatCompletionsTerminalStatus()
-        )
-        return try terminal.get()
-    }
-
-    // MARK: - Streaming (SSE)
-
-    /// OpenAI Chat Completions in streaming mode. Parses SSE frames of shape:
-    ///   data: {"choices":[{"delta":{"content":"..."}}]}
-    ///   data: [DONE]
-    /// Yields delta.content strings only. Skips empty deltas and role-only
-    /// frames; ignores tool_calls (those route through ToolLoop).
-    public func stream(
-        prompt: String,
-        system: String?,
-        model: String
-    ) -> AsyncThrowingStream<String, Error> {
-        streamMessages(messages: [.user(prompt)], system: system, model: model, tools: nil)
-            .textDeltas(omittingEmpty: true)
+        return try await LLMMessageStreamEvent.reply(collecting:
+            streamMessages(messages: messages, system: system, model: model, tools: tools))
     }
 
     // MARK: - Structured streaming (tool calls)
 
-    public func messagesStreamKind(tools: [LLMToolSchema]?) -> LLMMessagesStreamKind { .incremental }
-
-    /// F-B2 (2026-08-02): the api-key OpenAI lane had NO `streamMessages`
-    /// override, so it fell through to the protocol default — one
-    /// `completeMessages` round-trip yielded as a single `.textDelta`, and a
-    /// `.toolCall` event was structurally impossible. Every tool the chat spine
-    /// offered vanished on this provider with no error and no log. This mirrors
-    /// `MoonshotAdapter.streamMessages` on the identical Chat-Completions wire.
     public func streamMessages(
         messages: [LLMMessage],
         system: String?,
@@ -266,8 +123,8 @@ public final class OpenAIAdapter: LLMAdapter {
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    guard let key = apiKeyOverride
-                            ?? LLMCredentialResolver.resolveAPIKey(
+                    guard let key = try apiKeyOverride
+                            ?? LLMCredentialResolver.checkedAPIKey(
                                 providerConfigFile: "openai.json",
                                 dataRoot: credentialRoot),
                           !key.isEmpty else {
@@ -286,7 +143,7 @@ public final class OpenAIAdapter: LLMAdapter {
                     ]
                     try Self.applyTools(to: &body, tools: tools)
                     OpenAIExecutionControls.applyChatCompletionsControls(to: &body, model: model)
-                    if let limit = LLMCallContext.turnTokenBudget?.available ?? LLMCallContext.botOutputTokenLimit {
+                    if let limit = LLMCallContext.turnTokenBudget?.available {
                         body["max_completion_tokens"] = limit
                     }
                     req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
@@ -300,68 +157,13 @@ public final class OpenAIAdapter: LLMAdapter {
                         throw mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "openai")"))
                     }
                     defer { bytes.task.cancel() }
-                    let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                    if !(200..<300).contains(status) {
-                        // User, 2026-09-06: this drained the body with no
-                        // deadline, so the status — including a 429 whose
-                        // Retry-After was already in hand — was mapped only
-                        // after the read finished. A provider that answers the
-                        // headers and then stalls the body wedged the turn for
-                        // as long as it cared to. `ProviderErrorBodyDrain`
-                        // bounds the read (4 KiB / 2s) and keeps a user Stop
-                        // as cancellation instead of a provider verdict; an
-                        // empty body still maps the status correctly.
-                        let errData = try await ProviderErrorBodyDrain.read(
-                            bytes, maxBytes: 4096, timeout: 2.0
-                        )
-                        try throwIfChatCompletionsError(
-                            status: status, data: errData,
-                            response: response
-                        )
-                        throw LLMError.invalidResponse(status: status)
-                    }
-
-                    var ttftMs: Int?
-                    var sawContent = false
+                    try await ProviderWire.validateChatCompletions(bytes, response)
                     var decoder = ChatCompletionsStreamDecoder(providerLabel: "OpenAI")
-                    try await decoder.consume(SSEEventStream(bytes)) { frame in
-                        if ttftMs == nil, frame.content != nil || frame.toolCallDeltaCount > 0 {
-                            ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                        }
-                        // Liveness: reasoning frames and tool-argument deltas are
-                        // real model output but not reply text — keep the idle
-                        // clock in ProviderStreamGuard advancing during a long
-                        // thinking phase or a big argument accumulation.
-                        if frame.reasoning != nil { continuation.yield(.keepAlive) }
-                        if let content = frame.content {
-                            sawContent = true
-                            continuation.yield(.textDelta(content))
-                        }
-                        for _ in 0..<frame.toolCallDeltaCount { continuation.yield(.keepAlive) }
-                    }
-                    let terminal = Result {
-                        try decoder.finalizedToolCalls(
-                            idPrefix: "openai", providerID: "openai", sawContent: sawContent
-                        )
-                    }
-                    let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                    await telemetry.record(
-                        requestBody: req.httpBody,
-                        provider: providerId, model: model, streaming: true,
-                        usage: decoder.usage, ttftMs: ttftMs, durationMs: durationMs,
-                        status: decoder.toolBoundaryReason != nil ? "incomplete" : (try terminal.chatCompletionsTerminalStatus()),
-                        stopReason: decoder.toolBoundaryReason?.rawValue,
-                        errorDetail: decoder.errorDetail
+                    try await decoder.consume(
+                        SSEEventStream(bytes), continuation: continuation,
+                        request: req, providerID: providerId, model: model, idPrefix: "openai",
+                        started: requestStartNs, telemetry: telemetry
                     )
-                    let completed = try terminal.get()
-                    for call in completed {
-                        continuation.yield(.toolCall(.init(
-                            id: call.id,
-                            name: call.name,
-                            inputJSON: Data(call.arguments.utf8)
-                        )))
-                    }
-                    if let reason = decoder.toolBoundaryReason { continuation.yield(.toolBoundary(reason)) }
                     continuation.finish()
                 } catch let err as LLMError {
                     continuation.finish(throwing: err)
@@ -377,19 +179,11 @@ public final class OpenAIAdapter: LLMAdapter {
 
     // MARK: - Public Responses API
 
-    private func completeResponses(
-        messages: [LLMMessage], system: String?, model: String, tools: [LLMToolSchema]?
-    ) async throws -> String {
-        try await OpenAIOAuthDirectAdapter.collectResponsesReply(
-            streamResponses(messages: messages, system: system, model: model, tools: tools)
-        )
-    }
-
     private func responsesRequest(
         messages: [LLMMessage], system: String?, model: String, tools: [LLMToolSchema]?
     ) throws -> URLRequest {
-        guard let key = apiKeyOverride
-                ?? LLMCredentialResolver.resolveAPIKey(
+        guard let key = try apiKeyOverride
+                ?? LLMCredentialResolver.checkedAPIKey(
                     providerConfigFile: "openai.json", dataRoot: credentialRoot),
               !key.isEmpty else {
             throw LLMError.notConfigured(provider: "openai")
@@ -403,15 +197,11 @@ public final class OpenAIAdapter: LLMAdapter {
         req.httpMethod = "POST"
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         applyStreamingLLMHeaders(to: &req)
-        // Public schemas must encode successfully; do not substitute empty parameters.
-        for tool in tools ?? [] {
-            _ = try JSONSerialization.jsonObject(with: tool.parametersJSON)
-        }
-        var body = OpenAIOAuthDirectAdapter.buildResponsesBodyFromMessages(
+        var body = try ChatGPTTransport.buildResponsesBodyFromMessages(
             model: model, messages: messages, system: system, tools: tools, transport: .publicAPI
         )
         body["prompt_cache_options"] = ["ttl": "30m"]
-        if let limit = LLMCallContext.turnTokenBudget?.available ?? LLMCallContext.botOutputTokenLimit {
+        if let limit = LLMCallContext.turnTokenBudget?.available {
             body["max_output_tokens"] = limit
         }
         req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
@@ -435,7 +225,7 @@ public final class OpenAIAdapter: LLMAdapter {
                         try throwIfChatCompletionsError(status: status, data: data, response: response)
                         throw LLMError.invalidResponse(status: status)
                     }
-                    try await OpenAIOAuthDirectAdapter.consumeResponsesStream(
+                    try await ChatGPTTransport.consumeResponsesStream(
                         bytes: bytes, request: req, model: model,
                         providerId: providerId, telemetry: telemetry, requestStartNs: requestStartNs,
                         providerLabel: "openai", errorPrefix: "openai",
@@ -488,33 +278,5 @@ public final class OpenAIAdapter: LLMAdapter {
         return out
     }
 
-    /// Non-streaming reply → text plus `<tool_use …>` markers, the same shape
-    /// the Anthropic / Moonshot / xAI adapters return for the tool loop.
-    /// A tool-ONLY reply carries `content: null` — that used to fail the
-    /// `content as? String` guard and throw `.invalidResponse`.
-    static func parseCompletion(_ obj: [String: Any], status: Int) throws -> String {
-        let message = try chatCompletionsMessage(obj, status: status)
-        // User, 2026-09-06: all-or-nothing on the tool set, same as the streams
-        // — a `compactMap` used to drop the entries it could not execute and
-        // run their siblings, which is half a plan the model wrote as one
-        // decision.
-        let toolSet = finalizeChatCompletionsToolCalls(
-            message["tool_calls"] as? [[String: Any]] ?? [],
-            idPrefix: "openai"
-        )
-        // User, 2026-09-06: an empty `content` string used to be returned
-        // AS an empty reply, so a silent no-reply reached the chat as a
-        // blank turn. The streaming lanes call that `.streamTruncated`;
-        // this one does now too, and the ladder can retry it.
-        return try chatCompletionsReply(
-            content: (message["content"] as? String) ?? "",
-            toolCalls: toolSet.calls, incompleteNote: toolSet.incompleteNote, provider: "openai"
-        )
-    }
 
-    /// R-M1: shared status→error mapping for the api-key OpenAI Chat Completions
-    /// paths. 5xx is unified to `.transient` (was `.underlying`).
-    /// 2026-07-21 audit: closures are empty-body-safe so an empty error body
-    /// keeps a meaningful message (the streaming path now routes through this
-    /// mapping too; its hand-check used to say "rate limited" unconditionally).
 }

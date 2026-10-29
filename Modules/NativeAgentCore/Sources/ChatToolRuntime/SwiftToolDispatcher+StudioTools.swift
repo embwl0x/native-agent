@@ -1,12 +1,13 @@
 import CognitiveSubstrate
 import Foundation
+import NativeAgentShared
 import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import Studio
 // Blueprint: | `SwiftToolDispatcher+StudioTools.swift` | `SwiftToolDispatcher`: `impl_studio_shelf`, `studioImageInvitation`, `impl_studio_consult`; journal refresh holds the existing journal flock from read through graph commit and audit |
 
-// MARK: - Studio chat lane (studio_*) — desk 903 phases 1–2
+// MARK: - Studio chat lane (studio_*)
 //
 // Four chat tools over SwiftNativeStudioStore: the agent's aesthetic journal and
 // the consults filed against her taste.
@@ -19,8 +20,7 @@ import Studio
 //                         written. Appends a record beside the journal; the
 //                         journal line itself is never edited.
 //
-// WIRING CANON: same as the desk / task-ledger lanes — catalog-visible,
-// LAZY-LOADED (in builtInToolNames, NOT alwaysOnCoreNames). The store is
+// WIRING CANON: schema-factory inventory, reached through app actions. The store is
 // obtained exactly like SwiftNativeDeskStore(dataRoot:) — pointed at THIS
 // dispatcher's data root.
 //
@@ -35,12 +35,12 @@ import Studio
 //     than dropping it, so a caller can never believe one was recorded.
 //   • There is no update tool and no delete tool. Revision is a later entry
 //     linked with `relations` — the contradiction is kept, never flattened.
-//     studio_journal_amend (0.4.14) is NOT an exception: it appends a separate
+//     studio_journal_amend appends a separate
 //     correction record and changes no line of the journal. A superseded
 //     passage stays visible, struck through, with the correction's date and
 //     reason — the record shows it was corrected, never silently rewritten.
 //
-// WHAT A FILED ENTRY NOW SETS IN MOTION (desk 903 phases 2, 3, 5) — all three
+// WHAT A FILED ENTRY SETS IN MOTION — all three
 // in `studioJournalDidAppend`, all three after the append is already durable,
 // none of them able to fail the write:
 //   1. a context-index wake-up, so the entry's POINTER is reachable next turn;
@@ -48,67 +48,6 @@ import Studio
 //      cite the entry as provenance;
 //   3. a publish onto the cognitive bus, so the entry is FELT — sized by the
 //      judgment she wrote, not by the act of filing.
-
-/// The EXACT field tree `studio_journal` accepts, to any depth.
-///
-/// Top-level-only checking was a hole: `stance: {kind: "formed", confidence:
-/// 0.9}` sailed through and the confidence was silently dropped, which is
-/// precisely the smuggled score the veto forbids (gpt-5.5 review). The refusal
-/// now walks the whole payload, so there is nowhere in an entry to hide one.
-private indirect enum StudioFieldSpec {
-    /// A value whose interior is the caller's own content (a string, a list of
-    /// strings) — nothing to police inside it.
-    case leaf
-    case object([String: StudioFieldSpec])
-    case arrayOfObjects([String: StudioFieldSpec])
-
-    static let journalEntry = StudioFieldSpec.object([
-        "encountered_at": .leaf,
-        "work": .object([
-            "title": .leaf, "creator": .leaf, "medium": .leaf,
-            "date": .leaf, "version": .leaf, "edition": .leaf,
-        ]),
-        "reception": .object(["how": .leaf, "whole_or_part": .leaf]),
-        "artifact_refs": .leaf,
-        "origin": .object(["kind": .leaf, "ref": .leaf]),
-        "response": .leaf,
-        "stance": .object(["kind": .leaf, "reason": .leaf]),
-        "relations": .arrayOfObjects(["kind": .leaf, "entry_id": .leaf]),
-        "tags": .leaf,
-    ])
-
-    /// Dotted paths of every field this spec does not name, e.g.
-    /// `stance.confidence`, `relations[0].weight`. Sorted, so the refusal reads
-    /// the same way twice.
-    func unknownPaths(in value: JSONValue, prefix: String = "") -> [String] {
-        switch self {
-        case .leaf:
-            return []
-        case .object(let fields):
-            guard case .object(let obj) = value else { return [] }
-            var found: [String] = []
-            for key in obj.keys.sorted() {
-                guard let child = fields[key] else {
-                    found.append(prefix + key)
-                    continue
-                }
-                guard let nested = obj[key] else { continue }
-                found.append(contentsOf: child.unknownPaths(in: nested, prefix: prefix + key + "."))
-            }
-            return found
-        case .arrayOfObjects(let fields):
-            guard case .array(let elements) = value else { return [] }
-            var found: [String] = []
-            for (index, element) in elements.enumerated() {
-                found.append(contentsOf: StudioFieldSpec.object(fields).unknownPaths(
-                    in: element,
-                    prefix: "\(prefix.dropLast())[\(index)]."
-                ))
-            }
-            return found
-        }
-    }
-}
 
 extension SwiftToolDispatcher {
 
@@ -148,7 +87,8 @@ extension SwiftToolDispatcher {
                 do {
                     let candidate = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
                     let generated = self.dataRoot.standardizedFileURL.resolvingSymlinksInPath().appendingPathComponent("generated_images")
-                    let url = candidate.path.hasPrefix(generated.path + "/") ? candidate : try await self.resolveTrustedFilePath(path)
+                    let tail = NativeAgentWorkspaceRoot.relativePath(candidate.path, under: generated.path)
+                    let url = tail != nil && tail != "" ? candidate : try await self.resolveTrustedFilePath(path)
                     try self.requireNonSensitiveReadPath(url, tool: "studio_shelf_read")
                     guard FileManager.default.fileExists(atPath: url.path) else { return "missing" }
                     return FileManager.default.isReadableFile(atPath: url.path) ? "local-present" : "inaccessible"
@@ -228,30 +168,6 @@ extension SwiftToolDispatcher {
         }
     }
 
-    private func studioBool(_ input: [String: JSONValue], _ key: String) -> Bool {
-        switch input[key] {
-        case .some(.bool(let b)): return b
-        case .some(.string(let s)): return ["true", "1", "yes", "y", "on"].contains(s.lowercased())
-        default: return false
-        }
-    }
-
-    /// A nested object argument, or nil when absent.
-    private func studioObject(_ input: [String: JSONValue], _ key: String, tool: String) throws -> [String: JSONValue]? {
-        switch input[key] {
-        case .none, .some(.null): return nil
-        case .some(.object(let obj)): return obj
-        default:
-            throw AutonomyGateError.toolDenied(reason: "\(tool): \(key) must be an object")
-        }
-    }
-
-    private func studioNestedString(_ obj: [String: JSONValue], _ key: String) -> String? {
-        guard case .string(let s)? = obj[key] else { return nil }
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
     // MARK: - studio_consult
 
     /// studio_consult — file one consult against the agent's taste.
@@ -277,7 +193,7 @@ extension SwiftToolDispatcher {
                 stage: optionalString(input, "stage"),
                 constraints: optionalString(input, "constraints"),
                 priorDiscussion: optionalString(input, "prior_discussion"),
-                descriptionOnly: studioBool(input, "description_only")
+                descriptionOnly: flag(input, "description_only")
             )
             return .object([
                 "status": .string("ok"),
@@ -316,13 +232,13 @@ extension SwiftToolDispatcher {
     /// studio_journal — write ONE journal entry. The server stamps `id` and
     /// `recorded_at`; everything else is hers.
     ///
-    /// Unknown top-level fields are REFUSED, not ignored. That is what makes
+    /// Unknown fields are REFUSED, not ignored. That is what makes
     /// "there is no rating field" true rather than merely undocumented: a
     /// `rating`/`score`/`sentiment` argument fails loudly instead of being
     /// silently dropped while the caller believes it was recorded.
     func impl_studio_journal(input: [String: JSONValue]) async throws -> JSONValue {
-        // The dispatcher injects its session marker into every lazy tool call
-        // (extractSessionId's key set). That is runtime plumbing, not caller
+        // The dispatcher injects its session marker into each tool call
+        // (explicitSessionId's key set). That is runtime plumbing, not caller
         // payload — strip it at the TOP level only, so a nested
         // `stance.session_id` is still refused like any other unknown field.
         await ensureStudioGraphIndexed()
@@ -330,82 +246,73 @@ extension SwiftToolDispatcher {
         for key in ["__session_id", "session_id", "sessionId"] {
             input.removeValue(forKey: key)
         }
-        // Recursive, not just top-level: a score hidden one level down inside
-        // `stance` or a `relations` item is the same veto violation as one at
-        // the top, and dropping it silently would let the caller believe it was
-        // recorded.
-        let unknown = StudioFieldSpec.journalEntry.unknownPaths(in: .object(input))
-        guard unknown.isEmpty else {
+        guard let schema = try await listAvailableToolSchemas(named: ["studio_journal"]).first else {
+            throw ToolFailureError("Studio journal schema is unavailable.", effects: .none)
+        }
+        if let problem = JSONValue.object(input).schemaProblem(schema: try JSONValue.parse(schema.parametersJSON)) {
             throw ToolFailureError(
-                "Unknown journal fields: \(unknown.joined(separator: ", ")). No rating, score, confidence or sentiment field exists at any depth.",
-                argumentPath: unknown.joined(separator: ", "), effects: .none,
+                "Journal field \(problem.path) must be \(problem.expected). No rating, score, confidence or sentiment field exists at any depth.",
+                argumentPath: problem.path, effects: .none,
                 nextCall: ToolFailureError.call("app", ["find": .string("studio.journal")]),
                 code: "studio_journal_unknown_fields", status: .refused,
                 instruction: "Remove unknown fields; put judgment in response and stance in stance.kind. Read accepted fields with next_call.",
                 recovery: .correctArguments)
         }
 
-        guard let workObject = try studioObject(input, "work", tool: "studio_journal"),
-              let title = studioNestedString(workObject, "title") else {
+        // Normalize validated tool fields here; stored journal reads remain verbatim.
+        func normalized(_ value: JSONValue) -> JSONValue {
+            switch value {
+            case .string(let text): return .string(text.trimmingCharacters(in: .whitespacesAndNewlines))
+            case .object(let object): return .object(object.mapValues(normalized))
+            case .array(let array): return .array(array.map(normalized))
+            default: return value
+            }
+        }
+        let fields = input.mapValues(normalized)
+        guard let work = fields["work"].flatMap(StudioWork.fromJSON), !work.title.isEmpty else {
             return studioRefusal(.journalWorkTitleMissing)
         }
-        let work = StudioWork(
-            title: title,
-            creator: studioNestedString(workObject, "creator"),
-            medium: studioNestedString(workObject, "medium"),
-            date: studioNestedString(workObject, "date"),
-            version: studioNestedString(workObject, "version"),
-            edition: studioNestedString(workObject, "edition")
-        )
+        let reception = fields["reception"].map(StudioReception.fromJSON) ?? StudioReception()
 
-        let reception: StudioReception
-        if let receptionObject = try studioObject(input, "reception", tool: "studio_journal") {
-            reception = StudioReception(
-                how: studioNestedString(receptionObject, "how"),
-                wholeOrPart: studioNestedString(receptionObject, "whole_or_part")
-            )
-        } else {
-            reception = StudioReception()
-        }
-
-        guard let originObject = try studioObject(input, "origin", tool: "studio_journal"),
-              let originKindRaw = studioNestedString(originObject, "kind") else {
+        guard case .object(var originObject)? = fields["origin"],
+              case .string(let originKindRaw)? = originObject["kind"], !originKindRaw.isEmpty else {
             throw AutonomyGateError.toolDenied(
                 reason: "studio_journal: origin is required — {kind: wandering|consult|project, ref?}"
             )
         }
-        guard let originKind = StudioOriginKind(rawValue: originKindRaw.lowercased()) else {
+        originObject["kind"] = .string(originKindRaw.lowercased())
+        guard let origin = StudioOrigin.fromJSON(.object(originObject)) else {
             return studioRefusal(.unknownOriginKind(originKindRaw))
         }
-        let origin = StudioOrigin(kind: originKind, ref: studioNestedString(originObject, "ref"))
 
-        guard let stanceObject = try studioObject(input, "stance", tool: "studio_journal"),
-              let stanceKindRaw = studioNestedString(stanceObject, "kind") else {
+        guard case .object(var stanceObject)? = fields["stance"],
+              case .string(let stanceKindRaw)? = stanceObject["kind"], !stanceKindRaw.isEmpty else {
             throw AutonomyGateError.toolDenied(
                 reason: "studio_journal: stance is required — {kind: open|formed|abstained, reason?}"
             )
         }
-        guard let stanceKind = StudioStance(rawValue: stanceKindRaw.lowercased()) else {
+        stanceObject["kind"] = .string(stanceKindRaw.lowercased())
+        guard let stance = StudioStanceValue.fromJSON(.object(stanceObject)) else {
             return studioRefusal(.unknownStanceKind(stanceKindRaw))
         }
-        let stance = StudioStanceValue(kind: stanceKind, reason: studioNestedString(stanceObject, "reason"))
 
         var relations: [StudioRelation] = []
-        if case .array(let rawRelations)? = input["relations"] {
+        if case .array(let rawRelations)? = fields["relations"] {
             for raw in rawRelations {
-                guard case .object(let relationObject) = raw,
-                      let kindRaw = studioNestedString(relationObject, "kind") else {
+                guard case .object(var relationObject) = raw,
+                      case .string(let kindRaw)? = relationObject["kind"], !kindRaw.isEmpty else {
                     throw AutonomyGateError.toolDenied(
                         reason: "studio_journal: each relation must be {kind, entry_id}"
                     )
                 }
-                guard let kind = StudioRelationKind(rawValue: kindRaw.lowercased()) else {
-                    return studioRefusal(.unknownRelationKind(kindRaw))
-                }
-                guard let entryId = studioNestedString(relationObject, "entry_id") else {
+                relationObject["kind"] = .string(kindRaw.lowercased())
+                guard let relation = StudioRelation.fromJSON(.object(relationObject)) else {
+                    if StudioRelationKind(rawValue: kindRaw.lowercased()) == nil {
+                        return studioRefusal(.unknownRelationKind(kindRaw))
+                    }
                     return studioRefusal(.relationMissingEntryId)
                 }
-                relations.append(StudioRelation(kind: kind, entryId: entryId))
+                relations.append(relation)
             }
         } else if input["relations"] != nil, input["relations"] != .null {
             throw AutonomyGateError.toolDenied(reason: "studio_journal: relations must be an array")
@@ -466,14 +373,13 @@ extension SwiftToolDispatcher {
         for key in ["__session_id", "session_id", "sessionId"] {
             input.removeValue(forKey: key)
         }
-        // Same strict refusal as studio_journal: an unknown field fails loudly
-        // rather than being dropped while the caller believes it was recorded.
-        let known: Set<String> = ["entry_id", "reason", "correction", "supersedes"]
-        let unknown = input.keys.filter { !known.contains($0) }.sorted()
-        guard unknown.isEmpty else {
+        guard let schema = try await listAvailableToolSchemas(named: ["studio_journal_amend"]).first else {
+            throw ToolFailureError("Studio amendment schema is unavailable.", effects: .none)
+        }
+        if let problem = JSONValue.object(input).schemaProblem(schema: try JSONValue.parse(schema.parametersJSON)) {
             throw ToolFailureError(
-                "Unknown amendment fields: \(unknown.joined(separator: ", ")). Amendments accept entry_id, reason, correction and optional supersedes; they cannot change work, stance, refs or entry date.",
-                argumentPath: unknown.joined(separator: ", "), effects: .none,
+                "Amendment field \(problem.path) must be \(problem.expected). Amendments cannot change work, stance, refs or entry date.",
+                argumentPath: problem.path, effects: .none,
                 nextCall: ToolFailureError.call("app", ["find": .string("studio.amend")]),
                 code: "studio_amend_unknown_fields", status: .refused,
                 instruction: "Use studio.journal with relations for a later encounter; use studio.amend only for factual corrections. Read accepted fields with next_call.",
@@ -527,7 +433,7 @@ extension SwiftToolDispatcher {
     private func studioJournalDidAppend(_ entry: StudioJournalEntry) async -> StudioGraphIndexReport? {
         // 1. Wake the resident context index so the pointer for this entry is
         //    reachable on the NEXT turn instead of after the next launch.
-        //    `NativeStudioContextProjection` consumes exactly this namespace and
+        //    `StudioContext` consumes exactly this namespace and
         //    this locator; it rereads the journal itself, as the contract
         //    requires — the event is a wake-up, never source data.
         await DerivedStateInvalidationCenter.shared.publish(DerivedSourceChange(
@@ -563,24 +469,19 @@ extension SwiftToolDispatcher {
             // Keep the journal's existing flock through the graph commit. A
             // later refresh must read after this one writes, never replace
             // newer citations with a snapshot read before their append.
-            return try await SwiftNativePersistenceCore().withFileLock(studioStore().journalPath) {
-                // 2026-09-06: hot PLUS shelf — an archived entry still names its
-                // work and its relations, and indexing only the hot file dropped
-                // those edges out of the graph on the first cap trim.
+            return try await SwiftNativePersistenceCore.withFileLock(studioStore().journalPath) {
+                // Index hot and archived entries so work and relation edges survive shelf trimming.
                 let entries = try await studioStore().journalEntriesIncludingArchive()
                 guard !entries.isEmpty else { return nil }
                 let indexer = try SwiftNativeKnowledgeGraphIndexer(
-                    // The SAME store `NativeKnowledgeGraphContextProjection` reads,
+                    // The SAME store `KnowledgeGraphContext` reads,
                     // so a studio edge is selectable exactly like the other 94.
                     memorySQLitePath: dataRoot
                         .appendingPathComponent("memory/memory.sqlite")
                         .standardizedFileURL
                 )
                 let report = try await indexer.indexStudioJournal(entries)
-                // Agent's addendum (2026-09-01): relations stay provenance-only and
-                // accepted, WITH a guard — every relation must have a graph edge
-                // citing that entry id back. Same trigger as the backfill. Fail
-                // loud, never repair, never block recall.
+                // Keep relations provenance-only; report missing citing graph edges without repair or blocking recall.
                 await StudioCanonTending.recordAudit(
                     (try? await indexer.auditStudioRelations(entries)) ?? .unavailable,
                     dataRoot: dataRoot
@@ -606,7 +507,7 @@ extension SwiftToolDispatcher {
         guard !FileManager.default.fileExists(atPath: receipt.path) else { return }
         guard let report = await indexStudioJournalIntoGraph(reason: "backfill"),
               report.graphAvailable else { return }
-        try? await SwiftNativePersistenceCore().writeJSON(
+        try? await SwiftNativePersistenceCore.writeJSON(
             .object([
                 "ran_at": .string(NativeTimestampFormat.sixDigitUTCOffset(Date())),
                 "works": .int(Int64(report.worksIndexed)),

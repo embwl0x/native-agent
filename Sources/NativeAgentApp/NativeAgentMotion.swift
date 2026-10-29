@@ -22,13 +22,11 @@ enum NativeAgentMotion {
     static var spring: Animation? {
         respecting(.spring(response: springDuration, dampingFraction: 0.88), reduceMotion: reducesMotion)
     }
-    /// Fluid glass A2: a smooth spring, bounce 0 — for chrome that grows and
-    /// shrinks in place (the composer tray). Off under Reduce Motion.
+    /// Smooth, zero-bounce layout motion for the composer tray; off under Reduce Motion.
     static var glide: Animation? {
         respecting(.smooth(duration: springDuration), reduceMotion: reducesMotion)
     }
-    /// A message landing in the transcript (wave 3, after Grok): 180ms
-    /// ease-out-quint, which lands sooner and stops cleaner than `standard`.
+    /// A message arrives in the transcript over a 180ms timing curve.
     static let arrivalCurve = Animation.timingCurve(0.22, 1, 0.36, 1, duration: 0.18)
     static var arrive: Animation? {
         respecting(arrivalCurve, reduceMotion: reducesMotion)
@@ -48,9 +46,7 @@ enum NativeAgentMotion {
 
     static var fade: AnyTransition { .opacity.animation(crossfade) }
 
-    /// Content swapped in place (fluid glass A1): the new fades in ease-out
-    /// over the old, which fades out ease-in, so text the two share never
-    /// dims (a plain crossfade dips it to 75% mid-way).
+    /// New content fades in ease-out over the old fading out ease-in, keeping shared text bright.
     static var dissolve: AnyTransition {
         .asymmetric(insertion: fade, removal: .opacity.animation(.easeIn(duration: standardDuration)))
     }

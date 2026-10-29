@@ -1,42 +1,7 @@
 import Observation
+import EngineRuntime
 import AppToolRuntime
-// TodayView.swift
-// HER DAY, IN HER WORDS. (ui-simplify 2026-09-02, lane C; rebuilt to Agent's
-// own review of the page, 2026-09-02.)
-//
-// The first draft of this page was Activity with "Today" on the door. Her
-// verdict: it should be HER telling him what happened while he was out. So:
-//
-//   · The header is the word "Today". Memories and Desk live on the rail; this
-//     page does not carry a segmented control to them.
-//   · First person, everywhere. "I dreamed", "I kept this", "I wrote up the
-//     night", "Something I'm facing". Never "She…", never "Agent dreamed".
-//   · Three things at most: what's waiting, what I did today, what's ahead.
-//     The kept moments FOLD into one row that opens; the dream is one row;
-//     the night write-up is one row. A quiet day is a short page.
-//   · "Waiting for you" NAMES the thing and OFFERS the action — the moment
-//     review opens from here, each approval carries its own approve/decline.
-//   · Provider health is machinery, not her day. It is gone from the rows; at
-//     most one grey line at the bottom says a provider is slow. Those cards
-//     are still on the classic Activity page and in Diagnostics.
-//
-// Every row still comes from a real reader — an absent source renders as
-// absence, never as invented copy:
-//
-//   moments she kept         SwiftNativeMemoryV2.listMemory(kind: "moment")
-//   last night's dream       engine.today → engine.cognitionView.dreamDiary
-//   something she's facing   NativeCognitionRuntime.towardRead() (horizon)
-//   she wrote up the night   ChatSessionRecollections (compaction_summary rows)
-//   approvals / notifications engine.approvals.records + engine.inbox.items
-//
-// Rule of the page: no counts as numerals, no valence, no weights, no ids, no
-// internal vocabulary, no markdown. Clock times and weekday names are the only
-// digits, because a day needs a spine.
-//
-// Alive glass (User approved the mockup, 2026-09-23): same three sections, now
-// drawn from AlivePageKit — a serif "Today" with one first-person sentence
-// built from the page's own counts, the waiting things in ONE group card, what
-// I did as a timeline on a haze line, and what's ahead as pills.
+// Today uses first-person evidence, hides internal metrics and numeric counts, and never invents absent sources.
 
 import SwiftUI
 import ApprovalTransactions
@@ -61,25 +26,13 @@ import DreamREMCycle
 /// render stays legible when the app is not in dark appearance; the teal is a
 /// fixed identity color in both.
 enum TodayPalette {
-    /// The waiting card's priority mark: the small-caps heading and the action
-    /// beside it, and nothing else on the page. 2026-09-12 (Agent, before User's
-    /// eye): once the waiting card became the same near-white slate as every
-    /// other card, the dark-only teal measured 1.73:1 on it — the one thing that
-    /// must be seen, invisible in light. It gets a light variant the way
-    /// `NativeAgentShell.needsYou` already does; dark keeps its exact hex.
+    /// Appearance-aware priority colour is reserved for the waiting card's heading and action.
     static let accent = Color(nsColor: NSColor(name: nil) { appearance in
         appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
             ? NSColor(srgbRed: 0x22 / 255, green: 0xD3 / 255, blue: 0xEE / 255, alpha: 1)
             : NSColor(srgbRed: 0x0E / 255, green: 0x74 / 255, blue: 0x90 / 255, alpha: 1)
     })
-    /// Silver, not slate. The cool blue base was a workaround for a lamp that
-    /// browned any neutral (User, 2026-09-10); with the lamp at 0.22 over 820pt
-    /// a neutral holds — measured R-B -0.2 in the body of the page against -17
-    /// on the old fill. User, 2026-09-12: "it's still off-putting, that color
-    /// with our dark mode... more silverish"; Agent picked this rung of three.
-    /// Lifted to L* 26.9 on a L* 13.8 ground, so a card reads by its own light.
-    /// Light rooms keep their near-white. Opaque: the stroke and the lamp are
-    /// the only things above it.
+    /// Opaque silver cards keep only the stroke and lamp above them; light rooms use near-white.
     static let cardFill = Color(nsColor: NSColor(name: nil) { appearance in
         appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
             ? NSColor(srgbRed: 0x35 / 255, green: 0x37 / 255, blue: 0x3A / 255, alpha: 1)
@@ -105,13 +58,9 @@ enum TodayMetrics {
     static let timeColumnWidth: CGFloat = 122
     static let sectionSpacing: CGFloat = 20
     static let topPadding = NativeAgentSpacing.pageTop
-    /// EVERY ROW THE SAME HEIGHT. User, 2026-09-02: the column read ragged
-    /// because a row was one line, two lines, or a three-line morning brief.
-    /// A row is now exactly a title and one clamped line, and this is the box
-    /// they share. Fixed, never minimum: a minimum drifts.
+    /// Rows with body text share a fixed title-and-clamped-line height.
     static let rowContentHeight: CGFloat = 38
-    /// A row with no body line collapses to its title; it does not carry an
-    /// empty second line just to hold height (Agent, 2026-09-02).
+    /// Title-only rows collapse without reserving an empty body line.
     static let rowContentHeightSingle: CGFloat = 18
     /// Characters that fit on that one line beside the gutter at 13pt. The
     /// text is cut at a WORD boundary (TodayWords.bounded) rather than left to
@@ -137,11 +86,7 @@ enum TodayWaitingCopy {
 
 // MARK: - Waiting on you, defined once
 
-/// "Waiting on you" — the Desk's Needs you count (`AppModel.ownerWaitingCount`,
-/// OwnerAttentionPolicy through WorkOverviewRead), so Today and the Desk say
-/// the same number (Agent, 2026-09-23: the two pages contradicted each other).
-/// The card names the approvals itself; the rest wait on the Desk. Memories
-/// she would like to keep are hers (User, 2026-10-01), on the Memories page.
+/// Today shares the Desk's ownerWaitingCount, names approvals here, and leaves memory proposals on Memories.
 @MainActor
 enum WaitingOnYou {
     static func approvals(_ appModel: AppModel) -> [ApprovalRecord] {
@@ -149,14 +94,14 @@ enum WaitingOnYou {
     }
 
     static func onDesk(_ appModel: AppModel) -> Int {
-        WorkOverviewRead.waitingOnDesk(total: appModel.ownerWaitingCount, approvals: approvals(appModel).count)
+        WorkOverviewRead.waitingOnDesk(total: appModel.engine.desk.ownerWaitingCount, approvals: approvals(appModel).count)
     }
 
     /// `onDesk` split into Desk items and notes; nil when the overview could
     /// not say, or when something else (a run waiting on a decision) is
     /// among them.
     static func split(_ appModel: AppModel) -> (items: Int, notes: Int)? {
-        WorkOverviewRead.waitingSplit(kinds: appModel.ownerWaitingKinds, onDesk: onDesk(appModel))
+        WorkOverviewRead.waitingSplit(kinds: appModel.engine.desk.ownerWaitingKinds, onDesk: onDesk(appModel))
     }
 }
 
@@ -193,7 +138,7 @@ struct TodayView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
-    private var today: TodayProjection { appModel.engine.today }
+    private var today: TodayReadout { appModel.engine.today }
     private var snapshot: TodaySnapshot { today.snapshot }
     private var didRows: [TodayRow] { today.didRows }
     private var earlierNotes: [TodayEarlierNote] { today.earlierNotes }
@@ -313,7 +258,7 @@ struct TodayView: View {
                 onAction: { actionID in
                     let outcome = await noteFlight.perform {
                         try await InboxCardActions.perform(item.id, action: actionID,
-                            dataRootOverride: appModel.dataRootOverride, effects: AppInboxCardActionEffects(inbox: appModel.engine.inbox))
+                            dataRootOverride: appModel.engine.dataRoot, effects: AppInboxCardActionEffects(inbox: appModel.engine.inbox))
                     }
                     if case .succeeded = outcome {
                         _ = await appModel.refreshForSidebarItem(.activity)
@@ -366,7 +311,6 @@ struct TodayView: View {
         }
         .onDisappear { if !quietOffscreenRead { today.stop() } }
         .quietReadTask(live: false) {
-            _ = await appModel.refreshForSidebarItem(.activity)
             await appModel.publishWorkStatus()
             await today.refresh(appModel.engine, activeSessionID: appModel.activeChatSessionId)
         }
@@ -392,7 +336,7 @@ struct TodayView: View {
     }
 
     private var queuesLine: some View {
-        let inboxCount = appModel.ownerWaitingKinds?[.inbox] ?? 0
+        let inboxCount = appModel.engine.desk.ownerWaitingKinds?[.inbox] ?? 0
         let entries: [(ActivitySection, String)] = [
             (.approvals, ActivitySection.approvals.sheetTitle),
             (.inbox, ActivitySection.inbox.sheetTitle
@@ -429,7 +373,7 @@ struct TodayView: View {
         default: day = "I've had a full \(part)."
         }
         // A store that would not open cannot vouch for "nothing".
-        guard let waiting = appModel.ownerWaitingCount else { return day }
+        guard let waiting = appModel.engine.desk.ownerWaitingCount else { return day }
         if waiting == 0 {
             return snapshot.memoryUnreadable ? day : "\(day) Nothing is waiting on you."
         }
@@ -454,7 +398,7 @@ struct TodayView: View {
     }
 
     private var hasWaiting: Bool {
-        (appModel.ownerWaitingCount ?? 0) > 0
+        (appModel.engine.desk.ownerWaitingCount ?? 0) > 0
     }
 
     // MARK: what I did today
@@ -471,7 +415,7 @@ struct TodayView: View {
             today.dreamUnavailable = true
             return false
         }
-        _ = NativeAgentAppCoordinator.shared.request(.sidebar(.dreams))
+        _ = ApplicationLifetime.shared.request(.sidebar(.dreams))
         return true
     }
 }
@@ -572,7 +516,7 @@ struct TodayWaitingCard: View {
                             .frame(height: TodayMetrics.rowContentHeightSingle)
                         Spacer(minLength: 12)
                         Button("Open the Desk") {
-                            _ = NativeAgentAppCoordinator.shared.request(.sidebar(.desk))
+                            _ = ApplicationLifetime.shared.request(.sidebar(.desk))
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
@@ -625,9 +569,7 @@ struct TodayApprovalRow: View {
 
     @State private var isDeciding = false
     @State private var errorText: String?
-    /// The reason is one line; a click opens the whole of it. User,
-    /// 2026-09-12: "I can't see the REM lesson, what it is, to approve it" —
-    /// the lesson stays one click from the button that approves it.
+    /// The full approval reason stays one click from its decision buttons.
     @State private var reasonOpen = false
 
     private var title: String {
@@ -638,9 +580,7 @@ struct TodayApprovalRow: View {
     private var reason: String {
         let stated = TodayWords.firstSentence(approval.reason)
         if !stated.isEmpty { return stated }
-        // A card with no reason line carries the thing itself in its preview
-        // (a REM lesson is the lesson; User, 2026-09-12: "I can't see the REM
-        // lesson, what it is, to approve it"). Show her words, not just a title.
+        // Without a reason line, show the payload's words so the decision has evidence.
         return TodayWords.bounded(TodayWords.plain(approval.payloadPreview), limit: 240)
     }
 
@@ -737,10 +677,8 @@ struct TodayApprovalRow: View {
                 decision: decision,
                 appModel: appModel
             )
-            await MainActor.run {
-                errorText = failure
-                isDeciding = false
-            }
+            errorText = failure
+            isDeciding = false
         }
     }
 }

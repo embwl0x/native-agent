@@ -1,4 +1,4 @@
-// PATCH-2026-05-07: ios-sync MacSyncEngine — SnapshotWriter + InboxWatcher (Mac side)
+// Mac device-sync storage and inbox bookkeeping.
 // SnapshotWriter: source mutations write app-owned Swift runtime state to iCloud Drive `snapshots/`.
 //   Touches KVS key `snapshot_updated` so iOS observes immediately.
 // InboxWatcher: NSMetadataQuery on `inbox/`. When iOS drops an action JSON, dispatch to
@@ -27,46 +27,19 @@ extension MacSyncEngine {
         }
     }
 
-    // PATCH-2026-05-08: fix-A.3 Persist processed IDs so restarts don't replay
-    // archived files. Path shape is owned by ICloudSyncStatePaths so Doctor
-    // reads exactly what this writes.
-
-    // fix-snapshot-digest-persist: persist snapshot content digests across
-    // restarts so an iCloud reconnect / bridge teardown→setup doesn't re-write
-    // every snapshot file (digest map starts empty → every write looks "changed"
-    // → full read-storm on iOS). Stored alongside processed_ids.json.
+    // Persist snapshot digests across restarts to avoid rewriting unchanged files on reconnect.
     nonisolated private static func snapshotDigestsURL(dataRoot: URL) -> URL {
         let dir = dataRoot
             .appendingPathComponent("icloud", isDirectory: true)
         return dir.appendingPathComponent("snapshot_digests.json")
     }
 
-    // PATCH-2026-05-08: fix-A.3 Persist processedMsgIds across restarts.
-    // R10-N8: wrap decode in do/catch so corruption doesn't crash.
-    //
-    // Sweep R4 item 1: MISSING and UNREADABLE are no longer the same thing.
-    // A missing file is genesis — first run, nothing has been processed, an
-    // empty set is the truth. An unreadable one (corrupt, partial, permission
-    // denied) means the id window EXISTS and we cannot see it; treating that as
-    // "nothing has been processed" is precisely what re-dispatches an already
-    // executed remote Mac action. On unreadable we keep whatever the in-memory
-    // set holds, refuse to trust the empty read, raise syncError, and preserve
-    // the bytes so the next save can't quietly destroy the evidence.
     func restoreState(generation: UInt64) async -> Bool {
         let dataRoot = sync.dataRoot
         let inMemory = processedMsgIdsOrdered
         let inMemoryDigests = snapshotFileDigests
         let retiringWriter = snapshotWriteInFlight || workActivityPublicationTask != nil
         let cap = processedIdsCap
-        // Re-apply the cap here, not just in recordProcessed: merging markers
-        // into a full stored window can push the list past it, and an
-        // uncapped window grows without bound across restarts. ACTIVE MARKER
-        // ids are EXEMPT from the trim — their whole purpose is preventing a
-        // replay while the pending file may still exist, and relying on list
-        // ordering to protect them was wrong (markers land near the front;
-        // front-eviction would drop them first — gpt-5.5 review 2026-08-06,
-        // blocking #1). Markers are bounded by the 30-day prune, so the
-        // exemption cannot grow without bound.
         let restored = await sync.storage.perform {
             let processed = Self.restoreProcessedIds(dataRoot: dataRoot, inMemory: inMemory)
             let digests: [String: SnapshotFileDigest]
@@ -87,28 +60,12 @@ extension MacSyncEngine {
         processedMsgIdsOrdered = Self.cappedPreservingMarkers(
             ids, cap: cap, markerIds: restored.0.markerIds.union(completed))
         processedMsgIds = Set(processedMsgIdsOrdered)
-        processedIdsUnreadable = restored.0.unreadable
         if let message = restored.0.message { syncError = message }
         if !retiringWriter, snapshotFileDigests == inMemoryDigests { snapshotFileDigests = restored.1 }
         return true
     }
 
-    /// What a restart should believe about already-processed commands, computed
-    /// from disk alone so it is provable without a running engine.
-    ///
-    /// Three inputs, in priority order:
-    ///  - completed-but-unarchived MARKERS: the command ran and its response
-    ///    landed; only bookkeeping failed. These are processed ids, full stop,
-    ///    and folding them in here is what makes the existing duplicate guard
-    ///    in `processInboxFiles` refuse to dispatch them again.
-    ///  - a MISSING processed_ids.json: genesis. Empty really is the truth.
-    ///  - an UNREADABLE processed_ids.json: the window exists and we cannot see
-    ///    it. We keep what memory holds, flag it, and preserve the bytes.
-    /// Oldest-first trim to `cap` that NEVER evicts an active
-    /// completed-unarchived marker id — a trimmed marker id whose pending
-    /// file still exists re-dispatches an already-executed remote action on
-    /// restart (gpt-5.5 review 2026-08-06, blocking #1). Markers are bounded
-    /// by the 30-day prune; completions settling during restoration are also protected.
+    /// Trim oldest first without evicting marker or newly completed ids; 30-day marker retention bounds the exemption.
     nonisolated static func cappedPreservingMarkers(
         _ ids: [String], cap: Int, markerIds: Set<String>
     ) -> [String] {
@@ -126,8 +83,8 @@ extension MacSyncEngine {
         return trimmed
     }
 
-    /// Missing means genesis; unreadable bytes stay preserved. Completion
-    /// markers count as processed even when filing the response failed.
+    /// Missing means genesis; unreadable state retains memory, preserves bytes and reports the error.
+    /// Completion markers prevent replay even when filing the response failed.
     nonisolated static func restoreProcessedIds(
         dataRoot: URL,
         inMemory: [String] = []
@@ -148,14 +105,12 @@ extension MacSyncEngine {
 
         let url = ICloudSyncStatePaths.processedIds(dataRoot: dataRoot)
         guard FileManager.default.fileExists(atPath: url.path) else {
-            // Genesis: no file has ever been written. Nothing to distrust.
             return (ids, false, messages.isEmpty ? nil : messages.joined(separator: " "), Set(markers))
         }
         do {
             let data = try Data(contentsOf: url)
             let stored = try JSONDecoder().decode([String].self, from: data)
-            // fix-R9-9 Restore ordered array so insertion-order eviction is
-            // preserved; marker ids append after the stored window.
+            // Preserve insertion order; append marker and in-memory ids after the stored window.
             var merged = stored
             for id in ids where !stored.contains(id) { merged.append(id) }
             return (merged, false, messages.isEmpty ? nil : messages.joined(separator: " "), Set(markers))
@@ -176,28 +131,19 @@ extension MacSyncEngine {
         }
     }
 
-    /// Returns false when the id window could NOT be persisted. Callers must
-    /// treat that as "this completion is not durable yet" and leave a marker —
-    /// the swallowed `try?` this replaced is half of the replay window.
+    /// False means the completion is not durable; callers must leave a replay-protection marker.
     @discardableResult
     func saveProcessedIds() async -> Bool {
         let ids = processedMsgIdsOrdered
         let root = sync.dataRoot
-        let saved = await sync.storage.perform { Self.persistProcessedIds(ids, dataRoot: root) }
-        if saved { processedIdsUnreadable = false }
-        return saved
+        return await sync.storage.perform { Self.persistProcessedIds(ids, dataRoot: root) }
     }
 
     nonisolated static func persistProcessedIds(_ ids: [String], dataRoot: URL) -> Bool {
         let url = ICloudSyncStatePaths.processedIds(dataRoot: dataRoot)
         do {
-            try FileManager.default.createDirectory(
-                at: url.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            // fix-R9-9 Save ordered array (already capped by recordProcessed).
             let data = try JSONEncoder().encode(ids)
-            try data.write(to: url, options: .atomic)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
             return true
         } catch {
             nativeLog("[MacSyncEngine] processed_ids.json save FAILED: %@", error.localizedDescription)
@@ -215,7 +161,6 @@ extension MacSyncEngine {
         msgId: String,
         reason: String
     ) -> Bool {
-        let dir = ICloudSyncStatePaths.completedUnarchivedDirectory(dataRoot: dataRoot)
         let url = ICloudSyncStatePaths.completedUnarchivedMarker(dataRoot: dataRoot, msgId: msgId)
         let payload: [String: String] = [
             "msgId": msgId,
@@ -223,9 +168,8 @@ extension MacSyncEngine {
             "reason": reason,
         ]
         do {
-            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let data = try JSONEncoder().encode(payload)
-            try data.write(to: url, options: .atomic)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
             return true
         } catch {
             nativeLog("[MacSyncEngine] could not write completed-unarchived marker for %@: %@",
@@ -239,7 +183,7 @@ extension MacSyncEngine {
         /// True when the completion is durable through the NORMAL path
         /// (processed-id list saved AND pending file archived).
         var clean: Bool
-        /// True when a fallback marker now guarantees no re-dispatch.
+        /// True when a durable completion marker guarantees no re-dispatch.
         var markerWritten: Bool
         /// nil only when `clean`.
         var syncError: String?
@@ -294,30 +238,19 @@ extension MacSyncEngine {
         let digests = snapshotFileDigests
         await sync.storage.perform {
             do {
-                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try JSONEncoder().encode(digests).write(to: url, options: .atomic)
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(digests), to: url)
             } catch { nativeLog("[MacSyncEngine] could not save snapshot digests: %@", error.localizedDescription) }
         }
     }
 
-    /// What the durable ledger says about one transaction id.
-    /// 2026-09-06: `absent` and `unreadable` are DIFFERENT answers and the
-    /// caller must not conflate them. Absent means no row was ever written, so
-    /// the action is fresh work. Unreadable means a row may exist and we cannot
-    /// tell what it says — the outcome is unknown, and an unknown outcome may
-    /// never be re-executed.
+    /// Absent means no ledger row; unreadable means an unknown outcome that must never be re-executed.
     enum InboxTransactionLookup: Sendable {
         case absent
         case unreadable
         case present(ICloudTransactionRecord)
     }
 
-    /// Read the durable transaction ledger row for `id`.
-    /// 2026-09-06: the CloudKit action lane needs a durable "this already began
-    /// executing" marker that survives a signing/response-write failure and a
-    /// restart; the ledger's "running" state is written before dispatch, so it
-    /// is that marker. The Drive lane gets the same guarantee from its
-    /// `pending_` file rename.
+    /// Read the durable transaction ledger row for id.
     func readTransaction(id: String) async -> InboxTransactionLookup {
         guard let transactionDir,
               let url = InboxActionFileBoundary.jsonURL(
@@ -344,31 +277,13 @@ extension MacSyncEngine {
         }.value
     }
 
-    /// SHA-256 over the same canonical body the inner HMAC covers: the action
-    /// envelope re-encoded with sorted keys and the `signature` key removed.
-    /// 2026-09-06: the ledger is keyed by `transactionId`, which the PHONE
-    /// supplies and which is only defaulted to `msgId`. Two different actions
-    /// can therefore arrive under one transaction id, so the reservation has to
-    /// be bound to the envelope itself, not just to its id.
+    /// Bind reservations to the envelope with SHA-256 over sorted-key JSON excluding signature, as the inner HMAC does.
     nonisolated static func inboxActionDigest(envelope: Data) -> String? {
-        guard let object = try? JSONSerialization.jsonObject(with: envelope) as? [String: Any]
-        else { return nil }
-        var withoutSignature = object
-        withoutSignature.removeValue(forKey: "signature")
-        guard let canonical = try? JSONSerialization.data(
-            withJSONObject: withoutSignature,
-            options: [.sortedKeys]
-        ) else { return nil }
+        guard let canonical = try? BridgeMessage.innerActionCanonicalBody(envelope) else { return nil }
         return MacSyncSnapshotIntegrity.digest(canonical)
     }
 
-    /// True when `record` is the reservation for THIS envelope rather than for
-    /// a different action that happens to carry the same transaction id.
-    /// 2026-09-06: a row written before the binding fields existed records
-    /// neither, so the transaction id was its only evidence and ANY envelope
-    /// carrying that id was served that row's outcome. Such a row still names
-    /// the action it was written for: an unbound row belongs to this envelope
-    /// only when the action names agree, and otherwise it is a collision.
+    /// Match bound fields, or action names for unbound rows, to reject transaction-id collisions.
     static func inboxLedgerRow(
         _ record: ICloudTransactionRecord,
         matchesMsgId msgId: String,
@@ -385,13 +300,8 @@ extension MacSyncEngine {
     /// True when the ledger state proves the action's effect has already been
     /// dispatched to the router, so a redelivery must never run it again.
     static func inboxActionDidExecute(_ state: String) -> Bool {
-        switch state {
-        case "running", "completed", "failed", "pending_approval",
-             "response_write_failed", "completed_unarchived", "unknown":
-            return true
-        default:
-            return false
-        }
+        ["running", "completed", "failed", "pending_approval", "outcome_unknown",
+         "response_write_failed", "completed_unarchived", "unknown"].contains(state)
     }
 
     struct InboxTransactionWrite: Sendable {
@@ -399,11 +309,7 @@ extension MacSyncEngine {
         let contents: Data
     }
 
-    /// Returns the exact durable write, or nil when the row could not be written.
-    /// 2026-09-06: this used to return Void and swallow every encode,
-    /// coordination and write failure, so the "running" reservation the
-    /// CloudKit action lane relies on could silently never land while the lane
-    /// dispatched anyway. Callers that depend on the reservation must check it.
+    /// Return the confirmed durable write; a running reservation must succeed before dispatch.
     @discardableResult
     func writeTransaction(
         id: String,
@@ -429,13 +335,7 @@ extension MacSyncEngine {
         // the same transaction id (received -> running -> done) complete in order
         // and can't clobber each other under iCloud slowness.
         let written = await Task.detached(priority: .utility) { [id, action, state, attempts, error, response, msgId, actionDigest, url, now] () -> Data? in
-            // 2026-09-06: this read used to collapse "no row yet" and "the row
-            // is there and unreadable" into the same nil, and then wrote a
-            // fresh record over the top — so a rejection (or any other state
-            // transition) taken while the ledger was unreadable DESTROYED the
-            // prior row, including a completed action's stored response. A row
-            // that cannot be read is left exactly as it is; the caller sees the
-            // write fail and the lane treats the outcome as unknown.
+            // Preserve unreadable ledger bytes and fail the write so the outcome remains unknown.
             let existing: ICloudTransactionRecord?
             switch Self.coordinatedReadOutcome(at: url) {
             case .missing:
@@ -469,7 +369,7 @@ extension MacSyncEngine {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys, .prettyPrinted]
             guard let data = try? encoder.encode(record),
-                  Self.coordinatedWrite(data: data, to: url) else { return nil }
+                  Self.coordinatedWriteReturningError(data: data, to: url) == nil else { return nil }
             return data
         }.value
         guard let written else {
@@ -574,51 +474,28 @@ extension MacSyncEngine {
         return data
     }
 
-    /// Coordinated write of `data` to an iCloud-resident `url` with `.forReplacing` intent.
-    /// Returns true only when both the coordination and the write succeeded.
+    /// Coordinated write returning an optional error description (nil = success).
     /// nonisolated static — safe to call from detached tasks off the main actor.
-    @discardableResult
-    nonisolated static func coordinatedWrite(data: Data, to url: URL) -> Bool {
-        var wrote = false
+    nonisolated static func coordinatedWriteReturningError(data: Data, to url: URL) -> String? {
+        var writeError: String?
         let coordinator = NSFileCoordinator(filePresenter: nil)
         var coordError: NSError?
         coordinator.coordinate(writingItemAt: url, options: [.forReplacing], error: &coordError) { writeURL in
             do {
                 try data.write(to: writeURL, options: .atomic)
-                wrote = true
             } catch {
-                nativeLog("[MacSyncEngine] coordinated write failed for %@: %@",
-                      writeURL.lastPathComponent, String(describing: error))
+                writeError = error.localizedDescription
             }
         }
-        if let coordError {
-            nativeLog("[MacSyncEngine] file coordination failed for %@: %@",
-                  url.lastPathComponent, coordError.localizedDescription)
-            return false
+        if writeError == nil, let coordError {
+            writeError = coordError.localizedDescription
         }
-        return wrote
+        if let writeError { nativeLog("[MacSyncEngine] coordinated write failed for %@: %@", url.lastPathComponent, writeError) }
+        return writeError
     }
 
-    // fix-KVS-quota: NSUbiquitousKeyValueStore is hard-capped at 1024 keys / 1 MB.
-    // Each processed iOS command writes a unique `inbox_response_<msgId>` key and
-    // nothing ever removed them → after ~1000 commands the store fills and ALL
-    // sync (snapshots, inbox triggers, pairing) silently dies. Sweep stale keys:
-    //   - drop a key whose corresponding `responses/<msgId>.json` file is gone
-    //     (iOS already read + the prune pass deleted it) — safe, response consumed.
-    //   - drop a key whose response file is older than the TTL (24h) — iOS has had
-    //     ample time to read it; keep recent ones so a just-written response that
-    //     iOS hasn't observed yet is preserved.
-    //   - hard cap: ONLY if still dangerously close to the 1024-key quota after
-    //     the missing-file + TTL passes. The backstop NEVER drops an under-TTL key
-    //     whose response file still exists (that would lose a pending, possibly
-    //     unread notification — see FIX (D)); it only evicts orphaned keys with no
-    //     readable response file, and logs if real pressure remains. The cap is set
-    //     high (800, well under the 1024 ceiling) so this branch effectively never
-    //     fires in normal operation; the missing-file + TTL passes are the real
-    //     quota-protection mechanism.
-    // Backstop ceiling kept well below the hard 1024-key KVS quota.
-    // Map each key → (modificationDate of its response file, fileExists).
-    // A missing file means the response was already consumed + pruned.
+
+    // Reclaim missing/expired response keys within KVS's 1024-key/1 MB quota; pressure alone cannot discard recent readable replies.
     func sweepInboxResponseKVSKeys() async {
         let keyPrefix = inboxResponseKeyPrefix
         let maybeKeys = await withCKTimeout("MacSyncEngine.sweepInboxResponseKVSKeys.readKeys") {
@@ -664,17 +541,6 @@ extension MacSyncEngine {
             ttl: inboxResponseKeyTTL,
             cap: inboxResponseKeyMaxCount
         )
-        // FIX (D): Hard cap backstop. After the missing-file + TTL passes, every
-        // remaining survivor is by definition under-TTL AND has a present
-        // response file — i.e. a still-pending, possibly-unread notification.
-        // The previous backstop evicted the oldest survivors purely to hit a
-        // count cap, which could silently drop a pending response (data loss).
-        // We now NEVER evict an under-TTL key whose response file still exists
-        // just to satisfy a count cap. The only keys eligible here are ones with
-        // no readable response file mtime (orphaned/unreadable) — provably odd,
-        // never a clean pending response. If genuine pressure remains we log it
-        // (observable) rather than dropping pending responses; the missing-file +
-        // TTL passes are the real quota-protection mechanism.
         if sweepPlan.exceedsCap {
             print("[MacSyncEngine] inbox_response_* KVS keys (\(sweepPlan.retainedCount)) exceed backstop cap \(inboxResponseKeyMaxCount); recent readable response keys were retained rather than dropped.")
         }
@@ -696,7 +562,6 @@ extension MacSyncEngine {
         }
     }
 
-    // R11-N30: Delete archive/response files older than 7 days; cap directory at 50 MB.
     private var retainedTransactionDirectories: [URL] {
         [transactionDir, PersistenceCore.defaultDataRoot()
             .appendingPathComponent("icloud/chat_transactions", isDirectory: true)].compactMap { $0 }
@@ -901,19 +766,16 @@ extension MacSyncEngine {
                 }
             }
             // Cap at 50 MB — delete oldest first
-            let remaining = ((try? fm.contentsOfDirectory(at: dirURL, includingPropertiesForKeys: [.creationDateKey, .fileSizeKey, .isDirectoryKey], options: [])) ?? []).filter { !isDir($0) }
-            let sorted = remaining.sorted {
-                let d1 = (try? $0.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantFuture
-                let d2 = (try? $1.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantFuture
-                return d1 < d2
-            }
-            var totalSize = sorted.reduce(0) { acc, url in
-                acc + ((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
-            }
-            for url in sorted {
+            let remaining = ((try? fm.contentsOfDirectory(at: dirURL, includingPropertiesForKeys: [.creationDateKey, .fileSizeKey, .isDirectoryKey], options: [])) ?? [])
+                .compactMap { url -> (url: URL, created: Date, size: Int)? in
+                    let values = try? url.resourceValues(forKeys: [.creationDateKey, .fileSizeKey, .isDirectoryKey])
+                    guard values?.isDirectory != true else { return nil }
+                    return (url, values?.creationDate ?? .distantFuture, values?.fileSize ?? 0)
+                }.sorted { $0.created < $1.created }
+            var totalSize = remaining.reduce(0) { $0 + $1.size }
+            for file in remaining {
                 guard totalSize > maxBytes else { break }
-                let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-                if remove(url) { totalSize -= size }
+                if remove(file.url) { totalSize -= file.size }
             }
         }
         for transactionDirectory in transactionDirectories {

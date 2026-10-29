@@ -1,7 +1,7 @@
 import Foundation
 import PersistenceCore
 import NativeAgentCore
-// Blueprint: | `ExistingCornersSourceProvider.swift` | `ExistingCornersSourceProvider`: contract ports for today's raw material and native pages; packageManifest owns package membership, symlink/type rejection and the 8,000 total-member bound, including watched directories, for watching and archive delivery; `SenseNativePages` owns readable Chrome places, bounded conversation/tab-scoped private continuation bindings, structural things/verbs and existing raw UTF-8 windows |
+// Blueprint: | `ExistingCornersSourceProvider.swift` | `ExistingCornersSourceProvider`: contract ports for today's raw material, native pages and source-owned live-watch inventory; packageManifest owns package membership, symlink/type rejection and the 8,000 total-member bound, including watched directories, for watching and archive delivery; `SenseNativePages` owns readable Chrome places, bounded conversation/tab-scoped private continuation bindings, structural things/verbs and existing raw UTF-8 windows |
 
 /// Launch assembly supplies the existing, gated raw readers. Keeping the ports
 /// here avoids a dependency from Senses back into the door that consults it.
@@ -9,20 +9,25 @@ public protocol SenseNativePageSource: SenseSourceProvider {
     func page(for corner: SenseCorner, address: String?) async throws -> NativePage
 }
 
-public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceWatchingProvider {
+public struct ExistingCornersSourceProvider: SenseNativePageSource, SenseSourceWatchingProvider, SenseWatchReporting {
     private let readMaterial: @Sendable (SenseCorner, String?) async throws -> SenseMaterial
     private let readPage: @Sendable (SenseCorner, String?) async throws -> NativePage
     private let readChanges: (@Sendable (SenseCorner, String?) async throws -> AsyncStream<SenseMaterial>)?
+    private let reportWatches: (@Sendable () async -> [SenseLiveWatch])?
 
     public init(
         readMaterial: @escaping @Sendable (SenseCorner, String?) async throws -> SenseMaterial,
         readPage: @escaping @Sendable (SenseCorner, String?) async throws -> NativePage,
-        readChanges: (@Sendable (SenseCorner, String?) async throws -> AsyncStream<SenseMaterial>)? = nil
+        readChanges: (@Sendable (SenseCorner, String?) async throws -> AsyncStream<SenseMaterial>)? = nil,
+        reportWatches: (@Sendable () async -> [SenseLiveWatch])? = nil
     ) {
         self.readMaterial = readMaterial
         self.readPage = readPage
         self.readChanges = readChanges
+        self.reportWatches = reportWatches
     }
+
+    public func liveWatches() async -> [SenseLiveWatch] { await reportWatches?() ?? [] }
 
     public func material(for corner: SenseCorner, address: String?) async throws -> SenseMaterial {
         try await readMaterial(corner, address)
@@ -153,13 +158,29 @@ public enum SenseNativePages {
     }
     private static let chromePlaces = ChromePlaces()
 
-    /// Continuation cursors are precise private bindings, scoped to a served
-    /// conversation and tab. The readable address is the only public key.
+    /// Continuations bind a page position, scoped to the served conversation
+    /// and tab. Recycling an element cannot delete the reading place.
     public static func chromeContinuation(_ page: [String: JSONValue], cursor: JSONValue, scope: String, alias: String? = nil) -> String? {
         guard case .object(let fields) = cursor, case .string(let url)? = page["url"],
               let host = URL(string: url)?.host, case .int(let tab)? = page["tabId"], tab >= 0,
-              case .string(let fragment)? = fields["addressFragment"], !fragment.isEmpty,
+              case .int(let frame)? = fields["frameId"], frame >= 0,
               let encoded = try? cursor.serialize(pretty: false) else { return nil }
+        let fragment: String
+        if case .object(let place)? = fields["position"] {
+            let coordinates = ["scrollX", "scrollY", "distance", "y", "x", "ordinal"].compactMap { key -> String? in
+                switch place[key] {
+                case .int(let value)?: return String(value)
+                case .double(let value)? where value.isFinite: return String(value)
+                default: return nil
+                }
+            }
+            guard coordinates.count == 6 else { return nil }
+            fragment = "view-\(frame)-" + coordinates.joined(separator: "_")
+        } else {
+            // A following embedded frame starts at its current viewport.
+            guard fields["textOffset"] == nil, fields["optionOffset"] == nil else { return nil }
+            fragment = "view-\(frame)"
+        }
         var position: [String] = []
         for key in ["textOffset", "optionOffset"] {
             if case .int(let offset)? = fields[key], offset > 0 { position.append("\(key)=\(offset)") }
@@ -167,7 +188,7 @@ public enum SenseNativePages {
         let canonical = chromeAddress(host: host, url: url, fragment: fragment)
             + "?read=more" + (position.isEmpty ? "" : "&" + position.joined(separator: "&"))
         // A grown view may retain the requested URL's spelling after a
-        // redirect. Bind its same source fragment to this exact captured tab.
+        // redirect. Bind its same page position to this exact captured tab.
         if let alias {
             guard alias.hasPrefix("site:" + host.lowercased() + "/"),
                   alias.split(separator: "#", maxSplits: 1).last == canonical.split(separator: "#", maxSplits: 1).last else { return nil }

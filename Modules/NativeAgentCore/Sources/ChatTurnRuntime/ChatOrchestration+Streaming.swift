@@ -16,11 +16,7 @@ public enum TurnStreamEvent: Sendable {
     case replyTextSettled(Bool)
     case toolUse(name: String, input: JSONValue)
     case toolResult(name: String, output: JSONValue)
-    /// In-turn user-visible status line (2026-06-09, the user: "if she freezes like
-    /// that it should let me know not just hang"). Emitted mid-dispatch by
-    /// long-running tools (invoke_claude start/heartbeat/timeout) via
-    /// ToolNoticeBus. Surfaces render it as a live status; it is NEVER part
-    /// of the durable reply. Consumers that don't care can ignore it.
+    /// Live tool status from ToolNoticeBus is visible during dispatch and never enters the durable reply.
     case notice(kind: String, text: String)
     case final(TurnEngineResult)
     case error(String)

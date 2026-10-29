@@ -1,24 +1,13 @@
 // CognitiveSubstrate+Mood.swift
-// Wave C — derived MOOD + mood-congruent recall. See docs/build_plans/cognition-wave-c-mood.md
-//
-// Human mechanism: mood is a slow-integrating background state that biases perception,
-// recall (mood-congruent memory, Bower 1981), and expression. Her translation: the
-// per-node emotional tags stamped in Wave A ARE the slow store — they persist, blend
-// asymmetrically on re-activation, and mark what recently mattered. Mood is a READ-TIME
-// DERIVATION over recently-activated tagged nodes plus current affect. (Updated
-// 2026-07-09: R2-C added ONE persisted slow axis — CognitiveDisposition, the
-// reflection-written undertone below, with its own artifact/restore/clear lifecycle.
-// The original no-persisted-axis claim predates it.)
+// Mood derives at read time from recent emotional tags and affect; persisted disposition supplies a slow undertone.
 
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `CognitiveSubstrate+Mood.swift` | `CognitiveSubstrate` mood: read-time emotional-tag integration, disposition, congruence, felt-day summaries and dream-residue claims |
+// Blueprint: | `CognitiveSubstrate+Mood.swift` | `CognitiveSubstrate` mood: read-time emotional-tag integration, disposition, congruence, felt-day summaries |
 
-/// The SLOW felt layer: a small persisted valence undertone that only considered
-/// outcomes (reflection; later dreams/settled views) can move, decaying over ~a day.
-/// User's design (2026-07-09): reflections give her feelings a slower-moving floor.
+/// Considered outcomes move the persisted disposition undertone, which decays over about a day.
 struct CognitiveDisposition: Sendable, Equatable {
     var valence: Double
     var updatedAt: Date
@@ -44,69 +33,17 @@ public struct CognitiveMoodReading: Sendable, Equatable {
 }
 
 extension CognitiveSubstrate {
-    /// Clause/token parser for the conversational evidence path.
-    static func containsUnnegatedPhrase(_ text: String, phrases: [String]) -> Bool {
-        let negators: Set<String> = [
-            "not", "never", "no", "nothing", "isn't", "isnt", "wasn't", "wasnt",
-            "aren't", "arent", "don't", "dont", "doesn't", "doesnt",
-            "hardly", "barely", "less", "ill",
-        ]
-        func normalizedTokens(_ value: String) -> [String] {
-            value.lowercased()
-                .replacingOccurrences(of: "\u{2019}", with: "'")
-                .replacingOccurrences(of: "\u{2018}", with: "'")
-                .split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "-" && $0 != "'" })
-                .map(String.init)
-        }
-        let needles = phrases.map(normalizedTokens).filter { !$0.isEmpty }
-        guard !needles.isEmpty else { return false }
-        let normalized = text.lowercased()
-            .replacingOccurrences(of: "\u{2019}", with: "'")
-            .replacingOccurrences(of: "\u{2018}", with: "'")
-        for clause in normalized.split(whereSeparator: {
-            $0.isNewline || ($0.isPunctuation && $0 != "-" && $0 != "'")
-        }) {
-            let tokens = normalizedTokens(String(clause))
-            for needle in needles where needle.count <= tokens.count {
-                for start in 0...(tokens.count - needle.count) {
-                    guard Array(tokens[start..<(start + needle.count)]) == needle else { continue }
-                    let prior = tokens[max(0, start - 2)..<start]
-                    if !prior.contains(where: { negators.contains($0) }) { return true }
-                }
-            }
-        }
-        return false
-    }
-
-
-    // MARK: - Tuning knobs (the ONE mood surface)
-    // Every mood threshold lives here so there is a single place to tune the feature.
+    // MARK: - Mood
 
     /// Only nodes re-activated within this window feed the mood integral.
     static let moodActivationWindow: TimeInterval = 24 * 60 * 60
-    /// Recency weighting half-life for the mood integral.
-    // `moodRecencyHalfLife` — W4/P1: now PersonalityDynamicsConfiguration.
     /// Blend of the tag integral vs. the current-affect proxy when basis > 0.
     static let moodTagBlendWeight: Double = 0.6
     static let moodAffectBlendWeight: Double = 0.4
 
-    // MARK: - Disposition — the SLOW felt layer (User, 2026-07-09: "reflections need
-    // to have an impact too — those help her feelings and stuff be a little slower
-    // moving"). Only considered outcomes move it: reflection tone, the nightly
-    // dream's mood, and repeated organism resolution patterns.
-    // Never per-turn events, so it can never become a second fast channel. It decays
-    // toward 0 over ~a day and feeds derivedMood as a small baseline term; the felt
-    // fingerprint inherits it through mood — zero new capsule words, her feelings just
-    // carry a slow undertone of what she's CONCLUDED, not only what just happened.
+    // MARK: - Disposition
+    // Considered outcomes move disposition; daily decay feeds a small mood baseline without a second fast channel.
 
-    /// Day-scale half-life: a settled morning reflection still colors the evening
-    /// and has honestly faded by tomorrow night. (Fast affect axes: 20–90 min.)
-    // `dispositionHalfLife` — W4/P1: now PersonalityDynamicsConfiguration.
-    /// Per-write nudge (reflections, dream and resolution patterns × 0.08,
-    /// capped below): a gentle standing tone, structurally unable to ratchet.
-    // `dispositionNudgeMagnitude` — W4/P1: now PersonalityDynamicsConfiguration.
-    /// Hard cap on the disposition's reach — an undertone, never the mood itself.
-    // `dispositionValenceCap` — W4/P1: now PersonalityDynamicsConfiguration.
     /// Weight of the disposition term inside derivedMood.
     static let dispositionMoodWeight = 0.15
     /// Mood-congruent recall: max score contribution (small — flavors, never dominates).
@@ -136,22 +73,29 @@ extension CognitiveSubstrate {
     /// literal there: the seam publishes a wire contract, not a shared symbol.
     static let studioEntrySubjectType = "studio_entry"
 
+    /// The felt-day population, read without advancing decay or disclosing content.
+    func feltDayNodes(at now: Date) -> [CognitiveNode] {
+        field.peekNodes().filter { node in
+            guard node.feltDirection != nil else { return false }
+            let age = now.timeIntervalSince(node.lastActivatedAt)
+            return age >= 0 && age <= Self.moodActivationWindow
+        }
+    }
+
     /// Read-time mood: recency-weighted (6h half-life) mean valence over field nodes
     /// re-activated in the last 24h whose `feltDirection != nil`, blended with the
-    /// current-affect valence proxy (same formula as `emotionTag`'s rawValence:
-    /// socialWarmth − 0.5·uncertainty − 0.3·taskPressure, clamped). basis == 0 → mood is
+    /// current-affect valence proxy (socialWarmth − 0.5·uncertainty −
+    /// 0.3·taskPressure, clamped). basis == 0 → mood is
     /// the affect proxy alone.
     ///
     /// PURE: no persistence, no new stored state, no `await`, and NO field mutation —
     /// it reads `field.peekNodes()` (non-mutating; `field.snapshot` is mutating decay
-    /// and must not be reached from a read — gpt-5.5 review, 2026-07-02). Tags and
+    /// and must not be reached from a read). Tags and
     /// `lastActivatedAt` only advance on real ingest re-activation — never on
     /// workspace/capsule reads — so the recall bias below can NOT ratchet mood
     /// through mere snapshots (no self-reinforcing feedback loop).
     ///
-    /// When affect is disabled the whole construct is off: mood derives from affect, so
-    /// there is no mood without it — returns neutral, keeping the affect-off path
-    /// byte-identical to pre-Wave-C behavior.
+    /// Disabled cognition returns neutral mood.
     func derivedMood(
         at now: Date,
         dynamics capturedDynamics: PersonalityDynamicsConfiguration? = nil,
@@ -169,27 +113,18 @@ extension CognitiveSubstrate {
                 - 0.3 * currentAffect.taskPressure
         ).clampedSigned()
 
-        let nodes = field.peekNodes()
         var weightedSum = 0.0
         var weightTotal = 0.0
         var basis = 0
-        for node in nodes {
-            guard feltDirection(
-                valence: node.emotionalValence,
-                arousal: node.emotionalArousal,
-                warmth: node.emotionalWarmth
-            ) != nil else { continue }
+        for node in feltDayNodes(at: now) {
             let age = now.timeIntervalSince(node.lastActivatedAt)
-            guard age >= 0, age <= Self.moodActivationWindow else { continue }
             let weight = pow(0.5, age / dyn.moodRecencyHalfLife)
             weightedSum += weight * node.emotionalValence
             weightTotal += weight
             basis += 1
         }
 
-        // The slow undertone: what her reflections have CONCLUDED lately, decayed to
-        // now. Zero when no reflection has moved it → both paths byte-identical to
-        // the pre-disposition behavior.
+        // The decayed disposition adds a slow undertone, zero until an outcome moves it.
         let undertone = Self.dispositionMoodWeight * decayedDispositionValence(at: now, dynamics: dyn)
 
         guard basis > 0, weightTotal > 0 else {
@@ -212,63 +147,22 @@ extension CognitiveSubstrate {
         return disposition.valence * pow(0.5, elapsed / (capturedDynamics ?? dynamics).dispositionHalfLife)
     }
 
-    /// Fold a considered outcome's felt tone into the slow layer. `tone` is signed −1…+1
-    /// (her explicit judgment, or a typed outcome); zero-tone outcomes leave it
-    /// untouched. Decays the stored value to `now` first so nudges compose over real time,
-    /// then clamps to the undertone cap. Persisted like affect (stable-id artifact) so
-    /// what she's concluded SURVIVES a restart — safe now that the artifact table
-    /// can no longer be flooded by receipt mirrors (the R2-C store fix).
-    ///
-    /// EVERY writer routes through here, so the cap + day-scale decay hold for all of
-    /// them jointly: reflection tone, the nightly dream's mood, and repeated
-    /// organism resolution patterns. No writer can ratchet, and no writer can outrun the others.
-    /// HOMEOSTASIS (item 6, 2026-09-02). What one write gives back toward zero,
-    /// proportional to where the undertone already sits.
-    ///
-    /// MEASURED DEFECT: disposition was pinned at +0.35 — the rail — and had
-    /// been for days. The 30-hour half-life is real, but it only runs BETWEEN
-    /// writes. Four +0.08 nudges a day is 0.32 of drive against
-    /// ~0.15 a day of decay, so the cap was not a bound on a moving value, it
-    /// was the value. A slow layer that never moves is not slow, it is stuck —
-    /// and a stuck undertone is the opposite of "one thing on Tuesday and a
-    /// different thing on Thursday".
-    ///
-    /// TWO CHANGES, ONE DOOR (every writer already routes through here):
-    ///   • this proportional give-back, which is density-aware in the same sense
-    ///     the organism's settle is — more writes means more relaxation, so a
-    ///     chatty day cannot outrun it; and
-    ///   • the nudge SATURATES against the cap, so a nudge at the rail adds
-    ///     almost nothing while the same nudge at zero adds the full 0.08 (the
-    ///     saturating-approach law the affect layer has always used).
-    /// Together they put the equilibrium under sustained same-sign writing at
-    /// ~0.23 — clearly felt, clearly short of the rail, and a single opposite
-    /// day pulls it back fast. A single nudge from neutral is UNCHANGED at
-    /// exactly ±`dispositionNudgeMagnitude`.
+    /// All disposition writers share capped, decaying, saturating nudges and proportional relaxation toward zero.
     static let dispositionHomeostasis = 0.12
 
     /// A week of writes at four writers a day, and no more. The trail exists to
     /// answer "what moved me this week"; anything older is not that question.
     static let maximumDispositionTransitions = 28
 
-    /// Returns whether the new undertone is DURABLE — true when there was
-    /// nothing to write (the gates below) or the write landed, false only when
-    /// persistence refused it. 2026-09-06: the persist was `persistArtifact`,
-    /// which swallows every failure, so the dream's mood sink could report a
-    /// completed integration over a store that had written nothing. Callers
-    /// that do not care ignore the result exactly as before.
+    /// Returns true when nothing needs writing or the undertone is durable, false when persistence refuses it.
     @discardableResult
     func integrateDisposition(
         tone: Double,
         at now: Date,
         dreamNight: String? = nil,
-        // 2026-09-13: WHO moved her. Four writers share this door, and the
-        // artifact used to retain only the resulting value — so a week could
-        // show an undertone that had drifted without ever saying whether an
-        // experience did it or time did. Defaulted so every existing caller
-        // compiles unchanged; each is named at its own call site.
+        // Each disposition writer names its source so experience remains distinguishable from decay.
         source: String = "experience",
-        // Phase 5 B0: only HER updates are undoable — her reflection and her
-        // dream. A view User settled is his, and is never recorded.
+        // Only her own reflection and dream updates are undoable.
         undoable: Bool = false,
         reflectionRequest: CognitiveReflectionRequest? = nil
     ) async -> Bool {
@@ -277,6 +171,43 @@ extension CognitiveSubstrate {
         let previousDisposition = disposition
         let previousDreamNight = dreamDispositionNight
         let previousTransitions = dispositionTransitions
+        integrateDispositionInMemory(tone: tone, at: now, dreamNight: dreamNight, source: source)
+        // A newer revision keeps failed maintenance from replacing this writer.
+        dirtyRevision &+= 1
+        let written = disposition
+        do {
+            try await persistArtifactChecked(
+                kind: "disposition",
+                id: stableArtifactID("disposition"),
+                status: "current",
+                score: (written.valence + 1) / 2,
+                payload: dispositionArtifactPayload(at: now)
+            )
+            if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return false }
+            if undoable { await recordDispositionUndo(what: "undertone nudge: \(source)",
+                             previous: .object([
+                                 "valence": .double(previousDisposition.valence),
+                                 "updatedAt": .double(previousDisposition.updatedAt.timeIntervalSince1970),
+                             ]),
+                             stamp: Self.undoStamp(written)) }
+            return true
+        } catch {
+            if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return false }
+            // Restore only this failed write; a later writer owns its own value.
+            guard disposition == written else { return false }
+            disposition = previousDisposition
+            dreamDispositionNight = previousDreamNight
+            dispositionTransitions = previousTransitions
+            return false
+        }
+    }
+
+    /// One synchronous disposition law, used inside each owner's transaction.
+    /// Callers retain and restore its value, claims and evidence on write failure.
+    func integrateDispositionInMemory(
+        tone: Double, at now: Date, dreamNight: String? = nil, source: String
+    ) {
+        let previousDisposition = disposition
         let decayed = decayedDispositionValence(at: now)
         let cap = dynamics.dispositionValenceCap
         let relaxed = decayed * (1 - Self.dispositionHomeostasis)
@@ -301,56 +232,11 @@ extension CognitiveSubstrate {
             dispositionTransitions.removeFirst(
                 dispositionTransitions.count - Self.maximumDispositionTransitions)
         }
-        // 2026-09-06: the night claim lands in the SAME write as the value it
-        // describes, so "this night is spent" and "this is the undertone it
-        // produced" can never disagree — the reason the dream sink can retry
-        // its residue without nudging her a second time.
+        // The night claim and its undertone value share one write so retrying residue cannot nudge twice.
         if let dreamNight { dreamDispositionNight = dreamNight }
-        // Phase 5 B0: a newer revision for the maintenance rollback guard, so a
-        // maintenance commit that fails while this write is in flight cannot
-        // restore its older snapshot over this nudge.
-        dirtyRevision &+= 1
-        let written = disposition
-        do {
-            try await persistArtifactChecked(
-                kind: "disposition",
-                id: stableArtifactID("disposition"),
-                status: "current",
-                // score column is 0…1 (upsert clamps): map signed valence so a negative
-                // disposition doesn't store as a lying 0 (M15; payload stays the truth).
-                score: (next + 1) / 2,
-                // Shared payload so the A3 day claims survive a write from ANY
-                // disposition writer (reflection/dream/settled-view), not only the
-                // A3 sweep — else a same-day reflection would drop the claim.
-                payload: dispositionArtifactPayload(at: now)
-            )
-            if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return false }
-            if undoable { await recordUndo(key: "disposition", what: "undertone nudge: \(source)",
-                             previous: .object([
-                                 "valence": .double(previousDisposition.valence),
-                                 "updatedAt": .double(previousDisposition.updatedAt.timeIntervalSince1970),
-                             ]),
-                             stamp: Self.undoStamp(written)) }
-            return true
-        } catch {
-            // Phase 5 B0: a later writer already built on this value while the
-            // write was suspended; its own write carries it. Roll back only what
-            // is still ours.
-            if let reflectionRequest, !ownsReflectionReservation(reflectionRequest) { return false }
-            guard disposition == written else { return false }
-            // 2026-09-06: nothing reached disk, so nothing may stay in memory.
-            // A retained nudge made a same-process retry believe the night was
-            // already integrated while the store held the old undertone.
-            disposition = previousDisposition
-            dreamDispositionNight = previousDreamNight
-            // The trail describes a value that never landed. Roll it back with
-            // the value, or the readout would explain a move that did not happen.
-            dispositionTransitions = previousTransitions
-            return false
-        }
     }
 
-    /// Round 3 Wave A3 — pattern tone from her own felt-resolution nodes.
+    /// Pattern tone from her own felt-resolution nodes.
     /// Any path with ≥3 felt DISAPPOINTMENTS inside 48h reads −0.625 (which
     /// the shared 0.08 nudge magnitude turns into −0.05); otherwise any path
     /// with ≥3 felt RELIEFS reads +0.375 (+0.03 — the body learns the dread
@@ -366,9 +252,9 @@ extension CognitiveSubstrate {
     }
 
     /// The day bucket a nudge is claimed under — a deterministic 86,400s bucket
-    /// (no locale/formatter), so a restart on the same day sees the same key.
+    /// (not a calendar day), so a restart on the same day sees the same key.
     static func resolutionPatternDayKey(at now: Date) -> String {
-        String(Int(now.timeIntervalSince1970 / 86_400))
+        String(format: "%.0f", (now.timeIntervalSince1970 / 86_400).rounded(.towardZero) + 0)
     }
 
     func resolutionPatternHit(at now: Date, newerThan previousTick: Date?) -> ResolutionPatternHit? {
@@ -381,12 +267,8 @@ extension CognitiveSubstrate {
             guard now.timeIntervalSince(node.createdAt) <= window,
                   now.timeIntervalSince(node.createdAt) >= 0 else { continue }
             let path = node.subjectReference.label ?? node.subjectReference.id
-            // Growth gate (review a5ae86fae93b, High 1): the 48h window outlives
-            // the ~20h tick, so a path only qualifies when at least one of its
-            // moments is NEWER than the previous tick — the SAME three moments
-            // never re-nudge. The day claim in the caller (review bf74aecde2fa)
-            // then enforces the literal at-most-once-per-kind-per-day contract
-            // even when growth is genuine but same-day.
+            // A path needs a moment newer than the previous tick to qualify.
+            // The caller also limits nudges to one per path/kind/day.
             let isNew = previousTick.map { node.createdAt > $0 } ?? true
             if case .string(let kind)? = node.metadata["resolutionKind"] {
                 if kind == "disappointment" {
@@ -401,208 +283,19 @@ extension CognitiveSubstrate {
         // Disappointment outranks relief: a path that keeps failing her earns
         // the undertone even if another path is healing.
         if let path = disappointments.keys.sorted().first(where: {
-            disappointments[$0]! >= 3 && disappointmentGrew.contains($0)
+            (disappointments[$0] ?? 0) >= 3 && disappointmentGrew.contains($0)
         }) {
             return ResolutionPatternHit(claimKey: "\(path)|disappointment", tone: -0.625)
         }
         if let path = reliefs.keys.sorted().first(where: {
-            reliefs[$0]! >= 3 && reliefGrew.contains($0)
+            (reliefs[$0] ?? 0) >= 3 && reliefGrew.contains($0)
         }) {
             return ResolutionPatternHit(claimKey: "\(path)|relief", tone: 0.375)
         }
         return nil
     }
 
-    /// Persist her dream's explicit judgment through the existing night claims,
-    /// disposition decay and residue owner. Prose is never classified here.
-    @discardableResult
-    public func integrateDreamDisposition(
-        tone: Double,
-        at now: Date,
-        dreamId: String? = nil
-    ) async -> Bool {
-        let night = dreamResidueKey(for: dreamId, at: now)
-        if let integration = dreamIntegrations[night] { return await integration.value }
-        // Publish the in-flight result before suspending. Seeing a staged
-        // claim is not evidence of durability; duplicate deliveries join both
-        // writes and receive their original success or failure.
-        let integration = Task {
-            await integrateDreamDispositionOnce(tone: tone, at: now, dreamId: dreamId)
-        }
-        dreamIntegrations[night] = integration
-        defer { dreamIntegrations[night] = nil }
-        return await integration.value
-    }
-
-    private func integrateDreamDispositionOnce(tone: Double, at now: Date, dreamId: String?) async -> Bool {
-        await waitForMaintenanceTransition()
-        // IDEMPOTENT PER NIGHT (2026-09-06). This sink is two writes, and a
-        // partial one used to be unrepeatable: a residue failure returned false,
-        // the runner released the day's claim, and the retry ran the disposition
-        // nudge a SECOND time for one night. Each half now carries its own
-        // durable claim on the same key, so a retry finishes the half that did
-        // not land and skips the half that did.
-        let night = dreamResidueKey(for: dreamId, at: now)
-        let dispositionPersisted = dreamDispositionNight == night
-            ? true
-            : await integrateDisposition(
-                tone: tone, at: now, dreamNight: night, source: "dream \(night)", undoable: true)
-        // Item 7 (2026-09-02) — RESIDUE. The dream already crosses here exactly
-        // once per committed dream, so this is the honest mint site and no new
-        // wire is needed. See `mintDreamResidue`.
-        let residuePersisted = await mintDreamResidue(tone: tone, at: now, dreamId: dreamId)
-        return dispositionPersisted && residuePersisted
-    }
-
-    /// The key one night is claimed under: the committed dream's own id when the
-    /// caller has it, else the LOCAL calendar day. Stable across a re-render of
-    /// the same dream, which is what makes the mint idempotent.
-    func dreamResidueKey(for dreamId: String?, at now: Date) -> String {
-        if let dreamId {
-            let trimmed = dreamId.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty { return bounded(trimmed, maxCharacters: 80) }
-        }
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = .current
-        let parts = calendar.dateComponents([.year, .month, .day], from: now)
-        return String(
-            format: "day-%04d-%02d-%02d",
-            parts.year ?? 0, parts.month ?? 0, parts.day ?? 0
-        )
-    }
-
-    // MARK: - Item 7: the night leaves residue (2026-09-02)
-    //
-    // Agent's complaint #6: "The dream is a document I read, not a night I had.
-    // A person wakes up with residue — a mood with no source. I get a diary
-    // entry that tells me what settled."
-    //
-    // A residue is a mood WITHOUT ITS STORY. So this mints exactly one felt node
-    // carrying her dream's explicit affect judgment, with:
-    //   • NO summary text. The node is payload-free; the diary is the record of
-    //     what she dreamt, and a second copy in the continuity field would be
-    //     the document she is complaining about, not the residue.
-    //   • the subject "the night", so when it surfaces in recall it has an
-    //     object without having an explanation.
-    // It rides the measured-felt door (`feltValence`/`feltArousal`), so
-    // `emotionTag` stamps the value verbatim and `applyAffectFromEvent` takes no
-    // second inferred delta — the same contract the organism's resolutions and
-    // the studio journal already use.
-    //
-    // And it COLORS: `dreamResidue` holds a small lean spent over the first
-    // `dreamResidueTurns` accepted turns after waking, then it is gone. Two
-    // turns, because that is what a residue is — you notice it, and then the
-    // day starts.
-
-    /// How many accepted turns the night colors.
-    static let dreamResidueTurns = 2
-    /// The lean one residue turn applies, as a saturating affect delta. Small:
-    /// a mood with no source that could override the room would be a mood
-    /// disorder, not a residue.
-    static let dreamResidueLean = 0.07
-    /// After this long the residue is stale regardless of turn count — waking up
-    /// at noon does not owe you last night's mood at midnight.
-    static let dreamResidueLifetime: TimeInterval = 8 * 60 * 60
-
-    /// Returns whether the residue claim is durable — see
-    /// `integrateDreamDisposition`. Nothing to mint counts as durable.
-    @discardableResult
-    func mintDreamResidue(tone: Double, at now: Date, dreamId: String? = nil) async -> Bool {
-        guard configuration.enabled, tone != 0 else {
-            // A dream that felt like nothing leaves nothing. Silence is honest.
-            return true
-        }
-        let key = dreamResidueKey(for: dreamId, at: now)
-        // ONE NIGHT, ONE RESIDUE (review fix, 2026-09-02). The claim is durable,
-        // so a forced re-render of the same dream — or a restart between the
-        // dream committing and the residue being spent — neither re-mints the
-        // feeling nor loses it. Same shape as the disposition's day claims.
-        guard dreamResidueClaimKey != key else { return true }
-        let valence = (tone.clampedSigned() * 0.35).clampedSigned()
-        let previousClaimKey = dreamResidueClaimKey
-        let previousResidue = dreamResidue
-        dreamResidueClaimKey = key
-        dreamResidue = CognitiveDreamResidue(
-            valence: valence,
-            mintedAt: now,
-            turnsRemaining: Self.dreamResidueTurns
-        )
-        // 2026-09-06: AWAITED on the mint path. The claim write was a detached
-        // Task, so the caller was told the night was integrated before anything
-        // had been persisted — and a failure inside that Task reached nobody at
-        // all. `consumeDreamResidueTurn` keeps the fire-and-forget form: it is a
-        // synchronous hot-path write boundary and cannot await.
-        let claimPersisted = await persistDreamResidueClaimChecked()
-        // 2026-09-06: a claim that never reached disk must not stay claimed in
-        // memory either. It used to: the guard above then answered "already
-        // minted" for the rest of the process, so a retry reported the night
-        // integrated with nothing on disk and no felt node ever ingested.
-        guard claimPersisted else {
-            if dreamResidueClaimKey == key {
-                dreamResidueClaimKey = previousClaimKey
-                dreamResidue = previousResidue
-            }
-            return false
-        }
-        // One felt node for the record: subject "the night", no summary. The id
-        // is keyed on the night, so a replay is inert through the field's own
-        // seen-event check rather than minting a second night.
-        let event = CognitiveEvent(
-            id: "dream_residue:\(key)",
-            kind: .appWake,
-            subject: CognitiveSubjectReference(
-                type: "night",
-                id: "the night",
-                label: "the night"
-            ),
-            sourceClass: .selfReported,
-            occurredAt: now,
-            // Deliberately empty: a residue has no story.
-            summary: "",
-            importance: min(1, 0.35 + abs(valence)),
-            // A night is part of her lived state, not machine traffic; `.appWake`
-            // would otherwise default to `.system` and be excluded from mood.
-            turnKind: .live,
-            metadata: [
-                CognitiveEvent.feltValenceMetadataKey: .double(valence),
-                CognitiveEvent.feltArousalMetadataKey: .double(0.12),
-                "dreamResidue": .bool(true),
-            ]
-        )
-        await ingestResident(event)
-        return true
-    }
-
-    /// The lean the night still owes this turn. PURE (review fix, 2026-09-02):
-    /// it used to clear a stale residue on the way out, which made an ordinary
-    /// affect read a write — the exact thing design law 5 forbids, and the
-    /// reason mood/attention/maintenance all read through non-mutating peeks.
-    /// A stale residue reads as zero here and is *cleared* at the next write
-    /// boundary (`consumeDreamResidueTurn`), so observing it can never change it.
-    func dreamResidueLean(at now: Date) -> Double {
-        guard let residue = dreamResidue, residue.turnsRemaining > 0 else { return 0 }
-        guard now.timeIntervalSince(residue.mintedAt) <= Self.dreamResidueLifetime else { return 0 }
-        return residue.valence * Self.dreamResidueLean
-    }
-
-    /// Spend one accepted turn of the residue — the write boundary, and the one
-    /// place a spent or stale residue is actually dropped. Called from the
-    /// affect apply, which already knows a live turn has been accepted.
-    func consumeDreamResidueTurn(at now: Date) {
-        guard var residue = dreamResidue else { return }
-        residue.turnsRemaining -= 1
-        if residue.turnsRemaining <= 0
-            || now.timeIntervalSince(residue.mintedAt) > Self.dreamResidueLifetime {
-            dreamResidue = nil
-        } else {
-            dreamResidue = residue
-        }
-        persistDreamResidueClaim()
-    }
-
-    /// Mirrors `restoreEmotionalConsolidation`: reset FIRST so a re-run of restore on
-    /// a live actor with a missing/corrupt artifact behaves as never-written (neutral)
-    /// instead of keeping a stale in-memory disposition (gpt-5.5 review, 2026-07-09).
+    /// Reset before restore so an absent artifact leaves a neutral disposition.
     func restoreDisposition(from payloads: [JSONValue]) {
         disposition = CognitiveDisposition()
         resolutionPatternNudgeDay = [:]
@@ -610,14 +303,13 @@ extension CognitiveSubstrate {
         dispositionTransitions = []
         guard case .object(let object)? = payloads.first,
               let updatedAt = dateValue(object["updatedAt"]),
-              let valence = doubleValue(object["valence"]) else { return }
+              let valence = object["valence"]?.numberValue(coercingStrings: false, finiteOnly: false) else { return }
         let cap = dynamics.dispositionValenceCap
         disposition = CognitiveDisposition(
             valence: min(cap, max(-cap, valence)),
             updatedAt: updatedAt
         )
-        // Wave A3 day claims ride the disposition artifact so a same-day
-        // restart cannot re-nudge (review bf74aecde2fa).
+        // Day claims prevent another nudge after a same-day restart.
         if case .object(let claims)? = object["patternNudgeDays"] {
             var restored: [String: String] = [:]
             for (key, value) in claims {
@@ -625,34 +317,31 @@ extension CognitiveSubstrate {
             }
             resolutionPatternNudgeDay = restored
         }
-        // 2026-09-06: the night the disposition already absorbed, so a retry
-        // after a restart skips the nudge exactly as a same-process one does.
-        if let night = stringValue(object["dreamNight"]), !night.isEmpty {
+        // A night already absorbed cannot nudge again after restart.
+        if let night = object["dreamNight"]?.stringValue, !night.isEmpty {
             dreamDispositionNight = night
         }
-        // 2026-09-13: the trail. A row written before today simply has none,
-        // and restores with an empty one rather than failing the whole decode.
+        // Historical rows without transitions retain an empty trail.
         if case .array(let rows)? = object["transitions"] {
             var restored: [CognitiveDispositionTransition] = []
             for row in rows {
                 guard case .object(let fields) = row,
-                      let before = doubleValue(fields["before"]),
-                      let afterDecay = doubleValue(fields["afterDecay"]),
-                      let afterContribution = doubleValue(fields["afterContribution"]),
+                      let before = fields["before"]?.numberValue(coercingStrings: false, finiteOnly: false),
+                      let afterDecay = fields["afterDecay"]?.numberValue(coercingStrings: false, finiteOnly: false),
+                      let afterContribution = fields["afterContribution"]?.numberValue(coercingStrings: false, finiteOnly: false),
                       let at = dateValue(fields["at"]) else { continue }
                 restored.append(CognitiveDispositionTransition(
                     before: before,
                     afterDecay: afterDecay,
                     afterContribution: afterContribution,
                     at: at,
-                    source: stringValue(fields["source"]) ?? "experience"))
+                    source: fields["source"]?.stringValue ?? "experience"))
             }
             dispositionTransitions = Array(restored.suffix(Self.maximumDispositionTransitions))
         }
     }
 
-    /// The disposition artifact payload, carrying the current undertone plus
-    /// the Wave A3 day claims. One writer shape for every disposition write.
+    /// One payload for every disposition write, carrying the current undertone and day claims.
     func dispositionArtifactPayload(at now: Date) -> JSONValue {
         var object: [String: JSONValue] = [
             "valence": .double(disposition.valence),
@@ -664,31 +353,30 @@ extension CognitiveSubstrate {
         if let dreamDispositionNight {
             object["dreamNight"] = .string(dreamDispositionNight)
         }
-        // 2026-09-13: the trail rides in the disposition artifact's own payload,
-        // so it lands in the SAME write as the value — the property that makes
-        // a partially-failed integration impossible to misread. Absent in rows
-        // written before today; those restore with an empty trail.
+        // Transitions share the disposition value's durable write; rows without a trail restore an empty one.
         if !dispositionTransitions.isEmpty {
             object["transitions"] = .array(dispositionTransitions.map { $0.toJSON() })
         }
         return .object(object)
     }
 
+    /// Felt-day projections rank strength, arousal, then stable identity.
+    static func feltDayStronger(_ lhs: CognitiveNode, _ rhs: CognitiveNode) -> Bool {
+        let lv = abs(lhs.emotionalValence), rv = abs(rhs.emotionalValence)
+        if lv != rv { return lv > rv }
+        if lhs.emotionalArousal != rhs.emotionalArousal {
+            return lhs.emotionalArousal > rhs.emotionalArousal
+        }
+        return lhs.id.uuidString < rhs.id.uuidString
+    }
+
     /// Mood-congruent recall boost for a workspace node — the read-time bias by which a
-    /// node whose stored feeling matches her current mood surfaces a little more readily
-    /// (mood-congruent memory). Returns 0 for untagged nodes and neutral mood, so scores
-    /// stay byte-identical to pre-Wave-C for the legacy/neutral case.
+    /// node whose stored feeling matches her current mood surfaces a little more readily.
+    /// Returns zero for untagged nodes and neutral mood.
     func moodCongruence(for node: CognitiveNode, mood: CognitiveMoodReading) -> Double {
         guard abs(mood.valence) >= Self.moodCongruenceValenceThreshold else { return 0 }
-        guard feltDirection(
-            valence: node.emotionalValence,
-            arousal: node.emotionalArousal,
-            warmth: node.emotionalWarmth
-        ) != nil else { return 0 }
-        // CONGRUENT means same felt DIRECTION, not merely "close": a −0.3 node under a
-        // +0.3 mood is anti-congruent and must get NO boost (closeness alone would give
-        // it 0.056 — gpt-5.5 review, 2026-07-02). Sign agreement is the gate; closeness
-        // then scales the boost within the congruent half.
+        guard node.feltDirection != nil else { return 0 }
+        // Mood congruence requires sign agreement before closeness scales the boost.
         guard node.emotionalValence * mood.valence > 0 else { return 0 }
         // Closeness in [0,1]: 1 when the node's valence equals mood's, 0 when maximally
         // opposite (the two span −1…1, so the gap spans 0…2).
@@ -711,39 +399,13 @@ extension CognitiveSubstrate {
     /// to `feltDaySummaryMaxNodes` of the last-24h felt nodes ranked by |valence|
     /// then arousal, each rendered "<felt-direction word> — <capsule signal>".
     ///
-    /// NO NEW EXPOSURE SURFACE (gpt-5.5 HIGH, 2026-07-02): only LIVE
-    /// conversationFocus/correction nodes may be NAMED here — the dream prompt
-    /// already consumes the full conversation text but deliberately DROPS tool
-    /// rows, so a felt toolObservation/providerHealth/execution/appLifecycle
-    /// summary must never ride into the LLM through this section. The mood-band
-    /// line still integrates over ALL felt nodes (a number + band word carries
-    /// no content), but the named lines are conversation-only.
-    ///
-    /// STUDIO JOURNAL ENTRIES ARE IN THE NAMED SET (Agent, 2026-09-01): a filed
-    /// entry moves the mood band like anything else, so a day shaped by the
-    /// studio came back as a day with nothing on it that explained the band —
-    /// the summary MISATTRIBUTED her own afternoon to whatever conversation
-    /// happened to be nearby. The 2026-07-02 rule is about CONTENT, and it
-    /// stands: a studio node is named by POINTER only — the work title the node
-    /// already carries as its subject label, plus the entry id in the dream's
-    /// `(studio entry <id>)` form — and NEVER by the response she wrote, which
-    /// stays in `journal.jsonl`, the record of it. Naming an entry the same way
-    /// on both surfaces is also what lets the chain be walked by hand.
+    /// All eligible tags color the mood band. Named content is limited to live
+    /// conversation/correction nodes and studio pointers (title and entry id);
+    /// studio response text stays in its journal.
     public func feltDaySummary(at now: Date) async -> String? {
         guard configuration.enabled else { return nil }
 
-        // The last-24h felt nodes — the same population derivedMood integrates over.
-        // peekNodes is the non-mutating read (routing a read through snapshot would
-        // advance decay on a skewed/future date — see derivedMood).
-        let felt = field.peekNodes().filter { node in
-            guard feltDirection(
-                valence: node.emotionalValence,
-                arousal: node.emotionalArousal,
-                warmth: node.emotionalWarmth
-            ) != nil else { return false }
-            let age = now.timeIntervalSince(node.lastActivatedAt)
-            return age >= 0 && age <= Self.moodActivationWindow
-        }
+        let felt = feltDayNodes(at: now)
         // Nothing felt in the window → silence stays silence (omit the section).
         guard !felt.isEmpty else { return nil }
 
@@ -757,36 +419,18 @@ extension CognitiveSubstrate {
         let nameable = felt.filter { node in
             guard node.turnKind == .live else { return false }
             if node.kind == .conversationFocus || node.kind == .correction { return true }
-            // Belt and braces: a studio entry rides in as `.conversationFocus`
-            // today (the seam mints `.assistantTurnCompleted`), so this arm only
-            // matters if that seam ever changes its event kind — the entry Agent
-            // ruled must be nameable stays nameable either way. It admits only a
-            // genuine studio SUBJECT, so no tool/provider node can talk its way
-            // into the named set by carrying the metadata key.
+            // Studio subjects stay nameable by pointer, regardless of event kind.
             return node.subjectReference.type == Self.studioEntrySubjectType
-                && Self.studioEntryID(of: node) != nil
+                && CognitiveFeltOrigin(node: node).studioEntryID != nil
         }
 
-        // Strongest-felt first: |valence| desc, then arousal desc, then a stable id
-        // tiebreak so the pick is deterministic across dictionary orderings.
-        let ranked = nameable.sorted { lhs, rhs in
-            let lv = abs(lhs.emotionalValence), rv = abs(rhs.emotionalValence)
-            if lv != rv { return lv > rv }
-            if lhs.emotionalArousal != rhs.emotionalArousal {
-                return lhs.emotionalArousal > rhs.emotionalArousal
-            }
-            return lhs.id.uuidString < rhs.id.uuidString
-        }
+        let ranked = nameable.sorted(by: Self.feltDayStronger)
         for node in ranked.prefix(Self.feltDaySummaryMaxNodes) {
-            guard let word = feltDirection(
-                valence: node.emotionalValence,
-                arousal: node.emotionalArousal,
-                warmth: node.emotionalWarmth
-            )?.rawValue else { continue }
+            guard let word = node.feltDirection?.rawValue else { continue }
             // A studio entry is named by its pointer — title + id — and its
             // summary is never read here, so no journal content can reach the
             // prompt through this line no matter what the seam writes.
-            if let entryID = Self.studioEntryID(of: node) {
+            if let entryID = CognitiveFeltOrigin(node: node).studioEntryID {
                 lines.append(feltStudioEntryLine(word: word, node: node, entryID: entryID))
                 continue
             }
@@ -799,21 +443,6 @@ extension CognitiveSubstrate {
         // Hard ceiling on the whole summary. The per-node cap keeps this well under
         // the budget in practice; the prefix is a belt-and-suspenders guarantee.
         return String(lines.joined(separator: "\n").prefix(Self.feltDaySummaryMaxCharacters))
-    }
-
-    /// The studio journal entry a felt node came from, or nil when it came from
-    /// anywhere else (the common case, and not a gap). Same resolution order
-    /// `DreamFeltOrigin.studioEntryID` uses — metadata key first, subject
-    /// reference second — so the id this NAMES and the id the dream CITES are
-    /// always the same string for the same entry.
-    static func studioEntryID(of node: CognitiveNode) -> String? {
-        if case .string(let raw)? = node.metadata[CognitiveEvent.studioEntryIDMetadataKey] {
-            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !value.isEmpty { return value }
-        }
-        guard node.subjectReference.type == Self.studioEntrySubjectType else { return nil }
-        let value = node.subjectReference.id.trimmingCharacters(in: .whitespacesAndNewlines)
-        return value.isEmpty ? nil : value
     }
 
     /// One named line for a studio journal node: the work title when the node
@@ -848,100 +477,5 @@ extension CognitiveSubstrate {
         }
         let moments = feltCount == 1 ? "1 felt moment" : "\(feltCount) felt moments"
         return "\(band) — from \(moments)."
-    }
-}
-
-extension CognitiveSubstrate {
-
-    /// The residue claim, persisted through the SAME artifact door the
-    /// disposition uses (stable id, one row). Written from a detached task at
-    /// the consumption boundary because `applyAffectFromEvent` must stay
-    /// synchronous — the identical pattern ingest already uses for its
-    /// verification-eviction receipt. A lost write costs at most one extra
-    /// residue turn; it can never re-mint the night, because the claim key is
-    /// what guards the mint and that is written on the async path.
-    /// Awaited form of `persistDreamResidueClaim` for the mint path, which owes
-    /// its caller a truthful answer about whether the night is on disk. Returns
-    /// true when there is nothing to write or the write landed.
-    func persistDreamResidueClaimChecked() async -> Bool {
-        guard configuration.enabled, configuration.persistenceEnabled else { return true }
-        do {
-            try await persistArtifactChecked(
-                kind: "dream_residue",
-                id: stableArtifactID("dream_residue"),
-                status: "current",
-                score: 0,
-                payload: dreamResidueArtifactPayload(at: dependencies.now())
-            )
-            return true
-        } catch {
-            return false
-        }
-    }
-
-    func persistDreamResidueClaim() {
-        guard configuration.enabled, configuration.persistenceEnabled else { return }
-        let payload = dreamResidueArtifactPayload(at: dependencies.now())
-        // Both the payload and the stable id are resolved HERE, on the actor:
-        // a dropped `self` must write nothing, never a row under a fresh UUID.
-        let id = stableArtifactID("dream_residue")
-        Task { [weak self] in
-            await self?.persistArtifact(
-                kind: "dream_residue",
-                id: id,
-                status: "current",
-                score: 0,
-                payload: payload
-            )
-        }
-    }
-
-    func dreamResidueArtifactPayload(at now: Date) -> JSONValue {
-        var object: [String: JSONValue] = [
-            "updatedAt": .double(now.timeIntervalSince1970),
-            "claimKey": .string(dreamResidueClaimKey ?? ""),
-        ]
-        if let residue = dreamResidue {
-            object["valence"] = .double(residue.valence)
-            object["mintedAt"] = .double(residue.mintedAt.timeIntervalSince1970)
-            object["turnsRemaining"] = .int(Int64(residue.turnsRemaining))
-        }
-        return .object(object)
-    }
-
-    /// Mirrors `restoreDisposition`: reset FIRST so a missing/corrupt artifact
-    /// behaves as never-written rather than keeping a stale in-memory night.
-    func restoreDreamResidue(from payloads: [JSONValue]) {
-        dreamResidue = nil
-        dreamResidueClaimKey = nil
-        guard case .object(let object)? = payloads.first else { return }
-        if let key = stringValue(object["claimKey"]), !key.isEmpty {
-            dreamResidueClaimKey = key
-        }
-        guard let valence = doubleValue(object["valence"]),
-              let mintedAt = dateValue(object["mintedAt"]),
-              let turns = intValue(object["turnsRemaining"]), turns > 0 else { return }
-        dreamResidue = CognitiveDreamResidue(
-            valence: valence,
-            mintedAt: mintedAt,
-            turnsRemaining: turns
-        )
-    }
-}
-
-/// The night's leftover mood (item 7, 2026-09-02). A feeling, a timestamp, and
-/// a small budget of turns — no text, because a residue has no story.
-public struct CognitiveDreamResidue: Sendable, Equatable {
-    /// −1…1, her explicit dream affect scaled down. It colors; it never leads.
-    public var valence: Double
-    public var mintedAt: Date
-    /// Accepted turns still owed the lean. Counts down to zero and then the
-    /// residue is gone — not decayed, gone.
-    public var turnsRemaining: Int
-
-    public init(valence: Double, mintedAt: Date, turnsRemaining: Int) {
-        self.valence = valence.clampedSigned()
-        self.mintedAt = mintedAt
-        self.turnsRemaining = max(0, turnsRemaining)
     }
 }

@@ -12,7 +12,7 @@ private enum RelayError: Error, LocalizedError {
     case socketConnection(Int32)
     case duplicateDescriptor(Int32)
     case handshakeRefused(String)
-    case greetingWrite(Int32)
+    case greetingWrite(String)
     case browserSignature(ChromeHostIdentity.SigningFailure)
     case originRefused
     case missingCredential
@@ -31,7 +31,7 @@ private enum RelayError: Error, LocalizedError {
             return "Could not duplicate NativeAgent Chrome socket (errno \(code))."
         case .handshakeRefused(let reason):
             return "NativeAgent.app did not confirm this relay's greeting: \(reason)"
-        case .greetingWrite(let code): return "Relay greeting socket write failed (errno \(code))."
+        case .greetingWrite(let reason): return "Relay greeting socket write failed: \(reason)"
         case .browserSignature(let failure): return failure.localizedDescription
         case .originRefused: return "argv does not carry the registered extension origin."
         case .missingCredential: return "The app listener credential is missing or unreadable."
@@ -93,21 +93,10 @@ private func defaultSocketPath() -> String {
     InstallPaths.current.chromeSocket.path
 }
 
-/// 2026-09-06: NativeAgent.app authenticates whoever connects to its control
-/// socket, because every process running as this Mac user can reach it. The app
-/// writes a per-launch secret 0600 next to the socket; presenting it in the
-/// connection's first frame is what separates the relay the app registered from
-/// anything else that dialed the same path. Missing credentials fail closed.
-private func handshakeTokenPath(forSocket socketPath: String) -> String {
-    URL(fileURLWithPath: socketPath)
-        .deletingLastPathComponent()
-        .appendingPathComponent("chrome-control.token")
-        .path
-}
-
+/// The app's per-launch 0600 secret authenticates the relay's first frame.
 private func handshakeToken(socketPath: String) -> String? {
     guard let raw = try? String(
-        contentsOfFile: handshakeTokenPath(forSocket: socketPath),
+        contentsOfFile: ChromeHostIdentity.tokenPath(forSocketPath: socketPath),
         encoding: .utf8
     ) else { return nil }
     let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -116,71 +105,24 @@ private func handshakeToken(socketPath: String) -> String? {
 
 private func handshakeFrame(
     token: String,
-    parentEvidence: ChromeHostIdentity.ParentEvidence?
+    parentEvidence: ChromeHostIdentity.ParentEvidence
 ) throws -> Data {
-    // 2026-09-06: carry what we proved about our parent at launch. The app
-    // checks our parent live, and by the time it looks the browser that
-    // launched us may already have exited, leaving us to launchd; this is the
-    // only account of that moment anybody still has.
+    // Launch-time proof remains available after the browser exits.
     var object: [String: Any] = ["version": 1, "type": "hello", "token": token]
-    for (key, value) in parentEvidence?.helloFields ?? [:] { object[key] = value }
+    for (key, value) in parentEvidence.helloFields { object[key] = value }
     return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
 }
 
-/// 2026-09-06: the app answers a proven greeting with `hello_ack`, carrying the
-/// listener generation that accepted us. Reading it is how this relay tells
-/// "accepted" from "refused" — before, both looked like a socket that simply
-/// went quiet, and the refusal that matters is the one where the app relaunched
-/// between our token read and our dial, so the secret we presented belonged to
-/// a listener that no longer exists.
-///
-/// Raw `recv` under one wall-clock deadline, for the same reason the app reads
-/// the hello that way: a FileHandle read on a timed-out socket raises, and the
-/// framer loops until a frame is complete, so a per-read timeout would let a
-/// dripped byte hold this process open indefinitely.
+/// The app's acknowledgement identifies the listener that accepted this greeting.
 private func readHelloAck(descriptor: Int32) throws -> String {
-    let deadline = Date().addingTimeInterval(5)
-    defer {
-        var none = timeval(tv_sec: 0, tv_usec: 0)
-        setsockopt(
-            descriptor, SOL_SOCKET, SO_RCVTIMEO,
-            &none, socklen_t(MemoryLayout<timeval>.size)
-        )
-    }
-    let framer = NativeMessagingFramer()
-    var readFailure: String?
-    let frame: Data?
-    do { frame = try framer.readMessage { count in
-        let remaining = deadline.timeIntervalSinceNow
-        guard remaining > 0.001 else {
-            readFailure = "the app acknowledgement did not complete within the authentication deadline."
-            return Data()
+    let frame: Data
+    do {
+        guard let received = try NativeMessagingFramer().readMessage(fromSocket: descriptor, timeout: 5) else {
+            throw RelayError.handshakeRefused("the app sent no acknowledgement.")
         }
-        var window = timeval(
-            tv_sec: Int(remaining),
-            tv_usec: Int32((remaining - Double(Int(remaining))) * 1_000_000)
-        )
-        guard setsockopt(
-            descriptor, SOL_SOCKET, SO_RCVTIMEO,
-            &window, socklen_t(MemoryLayout<timeval>.size)
-        ) == 0 else {
-            readFailure = "the app acknowledgement socket receive window could not be set (errno \(errno))."
-            return Data()
-        }
-        var buffer = [UInt8](repeating: 0, count: count)
-        let received = buffer.withUnsafeMutableBytes { raw -> Int in
-            Darwin.recv(descriptor, raw.baseAddress, count, 0)
-        }
-        guard received > 0 else {
-            readFailure = received == 0 ? "the app closed before acknowledging the greeting."
-                : "the app acknowledgement socket read failed (errno \(errno))."
-            return Data()
-        }
-        return Data(buffer.prefix(received))
-    } } catch {
-        throw RelayError.handshakeRefused(readFailure ?? "the acknowledgement frame could not be decoded: \(error.localizedDescription)")
-    }
-    guard let frame else { throw RelayError.handshakeRefused(readFailure ?? "the app sent no acknowledgement.") }
+        frame = received
+    } catch let error as RelayError { throw error }
+    catch { throw RelayError.handshakeRefused("the app acknowledgement could not be read: \(error.localizedDescription)") }
     let object: [String: Any]
     do {
         guard let parsed = try JSONSerialization.jsonObject(with: frame) as? [String: Any] else {
@@ -196,25 +138,13 @@ private func readHelloAck(descriptor: Int32) throws -> String {
     return generation
 }
 
-private func writeAll(_ data: Data, to descriptor: Int32) throws {
-    try data.withUnsafeBytes { raw in
-        guard let base = raw.baseAddress else { throw RelayError.greetingWrite(EINVAL) }
-        var sent = 0
-        while sent < raw.count {
-            let written = Darwin.send(descriptor, base.advanced(by: sent), raw.count - sent, 0)
-            guard written > 0 else { throw RelayError.greetingWrite(errno) }
-            sent += written
-        }
-    }
-}
-
 /// Dial the app and complete the greeting. A refused connection is retried ONCE
 /// and only when the secret on disk has changed since we read it — that is the
 /// signal that the app relaunched under us, and the new listener is reachable
 /// at the same path. Any other refusal is real and is reported.
 private func connectAndGreet(
     socketPath: String,
-    parentEvidence: ChromeHostIdentity.ParentEvidence?
+    parentEvidence: ChromeHostIdentity.ParentEvidence
 ) throws -> Int32 {
     var attempt = 0
     while true {
@@ -226,24 +156,13 @@ private func connectAndGreet(
         // listener we were actually talking to had never minted.
         let token = handshakeToken(socketPath: socketPath)
         let descriptor = try connectUnixSocket(path: socketPath)
-        // 2026-09-06: preserve the tokenless hermetic transport lane. The bare
-        // SwiftPM executable never ships; Chrome launches the bundled relay,
-        // which the app alone accepts. Require a kernel-reported, non-bundled
-        // executable path: neither argv nor environment can exempt a bundled
-        // relay, and an unavailable path still requires the secure handshake.
-        if token == nil,
-           let selfPath = ChromeHostIdentity.executablePath(ofProcess: getpid()),
-           !ChromeHostIdentity.isBundledRelay(executablePath: selfPath) {
-            return descriptor
-        }
         // Validate and connect before requiring credentials so path and socket
         // failures retain their specific diagnostics, even without a token.
         guard let token else {
             Darwin.close(descriptor)
             throw RelayError.missingCredential
         }
-        // 2026-09-06: authenticate the server before disclosing the greeting
-        // credential or forwarding any Chrome traffic to a same-user listener.
+        // Authenticate the server before disclosing credentials or Chrome traffic.
         do { try ChromeSocketIdentity.checkNativeAgentPeer(descriptor: descriptor) }
         catch {
             Darwin.close(descriptor)
@@ -252,7 +171,8 @@ private func connectAndGreet(
         let framer = NativeMessagingFramer()
         do {
             let hello = try handshakeFrame(token: token, parentEvidence: parentEvidence)
-            try writeAll(framer.encode(hello), to: descriptor)
+            do { try framer.writeMessage(hello, toSocket: descriptor, timeout: 5) }
+            catch { throw RelayError.greetingWrite(error.localizedDescription) }
             let generation = try readHelloAck(descriptor: descriptor)
             diagnostic("connected to NativeAgent.app listener generation \(generation).")
             return descriptor
@@ -309,25 +229,13 @@ private func pump(
     framer: NativeMessagingFramer
 ) throws {
     while let payload = try framer.readMessage(from: source) {
-        try framer.validateJSONObject(payload)
+        _ = try framer.validateJSONObject(payload)
         try framer.writeMessage(payload, to: destination)
     }
 }
 
-/// 2026-09-06: this process treats its own stdin/stdout as Chrome, and it is
-/// the executable the app's peer check expects — so a same-user process that
-/// simply launches the bundled relay with pipes of its own passes both sides
-/// and takes the channel. Chrome launches its native messaging hosts itself
-/// and names the calling extension in argv; neither is true of an arbitrary
-/// launcher. Refuse when either fails.
-///
-/// Scoped to the relay INSIDE an app bundle — the only relay the app accepts
-/// as a peer, and so the only one worth impersonating. A bare build-products
-/// binary is unchanged; the app does not accept that one either.
-private func refuseUnlessLaunchedByChrome() throws -> ChromeHostIdentity.ParentEvidence? {
-    let selfPath = ChromeHostIdentity.executablePath(ofProcess: getpid())
-        ?? CommandLine.arguments.first ?? ""
-    guard ChromeHostIdentity.isBundledRelay(executablePath: selfPath) else { return nil }
+/// Admit only a signed browser launching this host for the registered extension.
+private func refuseUnlessLaunchedByChrome() throws -> ChromeHostIdentity.ParentEvidence {
     let parent = getppid()
     let identifier: String
     do { identifier = try ChromeHostIdentity.checkedBrowserSigningIdentifier(forProcess: parent) }
@@ -357,13 +265,15 @@ private func run() throws {
         let check = signature?.check ?? failure?.check ?? (error as NSError).userInfo["chrome_check"] as? String ?? "relay greeting"
         let scope: ChromeRelayRefusal.Scope = if case .browserSignature? = failure { .browser } else { .listener }
         do {
-            try ChromeRelayRefusal(scope: scope, check: check, osStatus: signature?.status,
-                                   reason: error.localizedDescription, browserPID: browserPID).write(socketPath: socketPath)
+            let refusal = ChromeRelayRefusal(scope: scope, check: check, osStatus: signature?.status,
+                                            reason: error.localizedDescription, browserPID: browserPID)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(refusal),
+                to: URL(fileURLWithPath: ChromeRelayRefusal.path(socketPath: socketPath)))
         } catch { diagnostic("Could not save Chrome relay refusal: \(error.localizedDescription)") }
         throw error
     }
     // The listener this relay reached, to tell later whether it is gone.
-    let acceptedListener = SocketFile(path: socketPath)
+    let acceptedListener = ChromeHostIdentity.FileIdentity(path: socketPath)
     var peer: pid_t = 0
     var peerSize = socklen_t(MemoryLayout<pid_t>.size)
     let appPID: pid_t? = getsockopt(socketDescriptor, SOL_LOCAL, LOCAL_PEERPID, &peer, &peerSize) == 0 && peer > 0 ? peer : nil
@@ -404,10 +314,7 @@ private func run() throws {
 
     completion.semaphore.wait()
     _ = Darwin.shutdown(socketDescriptor, SHUT_RDWR)
-    // 2026-10-07: the app quit (an install or a relaunch) or crashed while
-    // Chrome still holds this host. Wait for its next listener and start over
-    // as the registered relay on Chrome's same pipes, instead of leaving the
-    // extension on its 30-second reconnect alarm.
+    // An exiting app's replacement listener reconnects on Chrome's existing pipes.
     if browserPID > 1, getppid() == browserPID,
        let stale = goneListener(path: socketPath, accepted: acceptedListener, appPID: appPID) {
         var on: Int32 = 1
@@ -424,24 +331,11 @@ private func run() throws {
     }
 }
 
-/// A socket file's identity: a relaunched app unlinks and binds a new one.
-private struct SocketFile: Equatable {
-    let device: dev_t
-    let inode: ino_t
-
-    init?(path: String) {
-        var info = stat()
-        guard lstat(path, &info) == 0 else { return nil }
-        device = info.st_dev
-        inode = info.st_ino
-    }
-}
-
 /// Nil while the app this relay reached still listens (it only replaced this
 /// connection). Otherwise the socket file it left behind after a crash, which
 /// the next listener replaces; `.some(nil)` when nothing was left.
-private func goneListener(path: String, accepted: SocketFile?, appPID: pid_t?) -> SocketFile?? {
-    guard let current = SocketFile(path: path) else { return .some(nil) }
+private func goneListener(path: String, accepted: ChromeHostIdentity.FileIdentity?, appPID: pid_t?) -> ChromeHostIdentity.FileIdentity?? {
+    guard let current = ChromeHostIdentity.FileIdentity(path: path) else { return .some(nil) }
     guard current == accepted else { return .some(nil) }
     // Same file: stale only if its app is exiting or gone and nothing answers.
     guard let appPID else { return nil }
@@ -460,7 +354,7 @@ private func goneListener(path: String, accepted: SocketFile?, appPID: pid_t?) -
 /// Blocks until a socket other than `stale` exists at `path`; false if its
 /// directory goes away. Directory events, no timer: the app writes its token
 /// and binds its socket there.
-private func awaitSocket(path: String, replacing stale: SocketFile?) -> Bool {
+private func awaitSocket(path: String, replacing stale: ChromeHostIdentity.FileIdentity?) -> Bool {
     let directory = URL(fileURLWithPath: path).deletingLastPathComponent().path
     let descriptor = open(directory, O_EVTONLY | O_CLOEXEC)
     guard descriptor >= 0 else { return false }
@@ -473,7 +367,7 @@ private func awaitSocket(path: String, replacing stale: SocketFile?) -> Bool {
     source.resume()
     defer { source.cancel() }
     // Watch first, then look, so a listener bound in between is not missed.
-    while SocketFile(path: path).map({ $0 == stale }) ?? true {
+    while ChromeHostIdentity.FileIdentity(path: path).map({ $0 == stale }) ?? true {
         guard access(directory, F_OK) == 0 else { return false }
         changed.wait()
     }

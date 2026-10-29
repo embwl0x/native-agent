@@ -41,8 +41,7 @@ struct TextMarkerCodec: Sendable {
                 .flatMap { try? JSONSerialization.jsonObject(with: $0.parametersJSON) as? [String: Any] }
             let properties = schema?["properties"] as? [String: Any]
             var input = call.input
-            // 2026-09-22: <invoke> text "42"/"true" parses as a number/
-            // bool; a string-schema param gets back the text as written.
+            // String-schema parameters preserve raw <invoke> text even when it parses as a number or boolean.
             if let properties {
                 for (key, raw) in call.invokeRawText {
                     guard (properties[key] as? [String: Any])?["type"] as? String == "string" else { continue }
@@ -57,12 +56,7 @@ struct TextMarkerCodec: Sendable {
                 }
             }
             var parsed = ParsedToolCall(id: call.id, name: call.name, input: input)
-            // 2026-10-01/02: she wrote results as call blocks, `<invoke
-            // name="app">` holding `result`, or a page read's about/status,
-            // and they ran as `app {}`. A block carrying a field its tool
-            // does not declare is not a call; it never dispatches. An open
-            // or unknown schema takes anything, as does one that lists no
-            // properties or declares more through a root oneOf/anyOf/allOf.
+            // Closed, nonempty property schemas reject undeclared fields; unknown, open, empty and composed schemas permit them.
             let composed = ["oneOf", "anyOf", "allOf"].contains { schema?[$0] != nil }
             if let properties, !properties.isEmpty, !composed,
                schema?["additionalProperties"] as? Bool != true {
@@ -120,8 +114,7 @@ struct TextMarkerCodec: Sendable {
         """
     }
 
-    /// 2026-09-22: once per round, not per result (51 copies in one turn);
-    /// names only the marker form the protocol teaches.
+    /// Emit continuation guidance once per round using only the protocol's marker form.
     func closeRound(_ carrier: inout String) {
         carrier += "\n\nIf work remains, send the next <function_calls> block and end at </function_calls>.\n"
         TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("P11"), "site": .string("TextMarkerCodec.swift:closeRound")]))
@@ -162,7 +155,6 @@ struct TextMarkerCodec: Sendable {
             : segments.stable + "\n\n" + floorBlock
         let reordered = SystemPromptSegments(
             stable: stable,
-            stableSuffix: segments.stableSuffix,
             dynamic: segments.dynamic
         )
         return (reordered.combined, reordered)
@@ -234,11 +226,7 @@ struct TextMarkerCodec: Sendable {
         )
     }
 
-    /// Everything up to and including the always-on catalog. With no
-    /// session-loaded tools this is byte-identical to the pre-2026-09-01
-    /// single-block renderer.
-    /// `appDoor`: this request offers app, so a folded tool is named by its
-    /// action; a lane that declares the tools themselves keeps their names.
+    /// Render through the always-on catalog; appDoor names folded tools by action, otherwise by tool name.
     private static func renderFloor(
         rows renderedRows: String,
         appDoor: Bool
@@ -251,7 +239,7 @@ struct TextMarkerCodec: Sendable {
             : "Do not ask for raw shell/git commands unless a shell tool is explicitly listed."
         TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("P10"), "site": .string("TextMarkerCodec.swift:renderFloor")]))
         return """
-        \(AnthropicOAuthDirectAdapter.textToolProtocolHeader)
+        \(AnthropicOAuthTransport.textToolProtocolHeader)
         - This provider request intentionally does not include provider-native tools. Do not infer that tools are unavailable.
         - Every tool in Available Swift tools is ready to call directly. A capability not listed: \(findLine)
         - To use a Swift tool, output only one or more exact markers, with a JSON object body, all wrapped in ONE block per reply:
@@ -276,10 +264,7 @@ struct TextMarkerCodec: Sendable {
             return ""
         }
         let required = Set((raw["required"] as? [String]) ?? [])
-        // 2026-09-22: required first — alphabetical-only hid required params
-        // past the 8 cut for act, commit_memory, invoke_codex and others.
-        // 2026-09-24: no cut at all — names are cheap, and the 8 cap hid
-        // act's `steps` (alphabetically 17th) from every plan.
+        // List every parameter, required first and alphabetical within each group.
         let ordered = properties.keys.sorted { a, b in
             required.contains(a) != required.contains(b) ? required.contains(a) : a < b
         }

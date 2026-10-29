@@ -23,13 +23,13 @@ extension SwiftNativeApprovalInbox {
             safetyPath: effectSpendPath(root: safetyRoot),
             destinationPath: effectSpendPath(root: destinationRoot),
             schema: effectSpendSchema,
-            loader: loadEffectSpends
+            actionField: "action"
         ) }
         try carry("injection_spends.json") { try mergeSpendStore(
             safetyPath: injectionSpendPath(root: safetyRoot),
             destinationPath: injectionSpendPath(root: destinationRoot),
             schema: injectionSpendSchema,
-            loader: loadSpends
+            actionField: "tool"
         ) }
         try carry("requests.json") { try mergeApprovalResolutionFacts(
             safetyPath: approvalsPath(root: safetyRoot),
@@ -38,15 +38,15 @@ extension SwiftNativeApprovalInbox {
         return notes
     }
 
-    private nonisolated static func effectSpendPath(root: URL) -> URL {
+    nonisolated static func effectSpendPath(root: URL) -> URL {
         approvalsDirectory(root: root).appendingPathComponent("effect_spends.json")
     }
 
-    private nonisolated static func injectionSpendPath(root: URL) -> URL {
+    nonisolated static func injectionSpendPath(root: URL) -> URL {
         approvalsDirectory(root: root).appendingPathComponent("injection_spends.json")
     }
 
-    private nonisolated static func approvalsPath(root: URL) -> URL {
+    nonisolated static func approvalsPath(root: URL) -> URL {
         approvalsDirectory(root: root).appendingPathComponent("requests.json")
     }
 
@@ -59,13 +59,13 @@ extension SwiftNativeApprovalInbox {
         safetyPath: URL,
         destinationPath: URL,
         schema: String,
-        loader: (URL) throws -> [String: JSONValue]
+        actionField: String
     ) throws -> String? {
         guard FileManager.default.fileExists(atPath: safetyPath.path) else { return nil }
         let safety: [String: JSONValue]
-        do { safety = try loader(safetyPath) }
+        do { safety = try loadSpends(at: safetyPath, schema: schema, actionField: actionField) }
         catch { return error.localizedDescription }
-        var destination = try loader(destinationPath)
+        var destination = try loadSpends(at: destinationPath, schema: schema, actionField: actionField)
         for (id, marker) in safety { destination[id] = marker }
         try writeRestoreJSON(
             .object(["schema": .string(schema), "spends": .object(destination)]),
@@ -91,12 +91,11 @@ extension SwiftNativeApprovalInbox {
             }
         }
 
-        let terminal: Set<String> = ["resolved", "denied", "canceled", "orphaned"]
         for value in safety {
             guard case .object(let safetyObject) = value,
                   case .string(let id)? = safetyObject["id"],
                   case .string(let status)? = safetyObject["status"],
-                  terminal.contains(status) || safetyObject["executedAction"] != nil else {
+                  terminalApprovalStatuses.contains(status) || safetyObject["executedAction"] != nil else {
                 continue
             }
             guard let index = destinationIndexes[id],
@@ -126,9 +125,6 @@ extension SwiftNativeApprovalInbox {
 
     private nonisolated static func writeRestoreJSON(_ value: JSONValue, to path: URL) throws {
         let bytes = try value.serializedData(pretty: true)
-        try FileManager.default.createDirectory(
-            at: path.deletingLastPathComponent(), withIntermediateDirectories: true
-        )
-        try bytes.write(to: path, options: .atomic)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(bytes, to: path)
     }
 }

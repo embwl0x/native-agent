@@ -1,13 +1,7 @@
 import ProviderRouting
 
 // Blueprint: | `OAuthSignInButton.swift` | `OAuthSignInButton` and presenter: in-process sign-in/sign-out, CLI session consent and current credential-state presentation |
-// Swift-native cutover (2026-06-02): OAuth flow is driven entirely in-process by
-// `NativeOAuthFlow` — provider-native OAuth for Anthropic/Grok via the
-// registered `nativeagent://oauth/...` callback, and (since 2026-07-05) the
-// codex-free native loopback flow on :1455 for ChatGPT (see
-// NativeOAuthFlow+Loopback). PKCE-exchanges the returned code via URLSession and
-// persists tokens to the same on-disk shape the read-side OAuth-direct
-// adapters already consume. No daemon, no HTTP plumbing through /v1/providers/*.
+// NativeOAuthFlow owns browser authorization and persisted credentials.
 
 import SwiftUI
 import AuthenticationServices
@@ -19,9 +13,6 @@ import PersistenceCore
 ///   OAuthSignInButton(provider: .anthropic)
 struct OAuthSignInButton: View {
     let provider: OAuthProvider
-    var onSuccess: (() -> Void)? = nil
-
-    // S.5: access AppModel so we can propagate revoke state to provider list
     @Environment(AppModel.self) private var appModel
 
     private var authStatus: NativeOAuthFlow.SignInStatus? {
@@ -38,10 +29,6 @@ struct OAuthSignInButton: View {
     }
     @State private var showingCLIConsentRepairConfirmation = false
     @State private var cliConsentRepairMessage: String? = nil
-
-    private var oauthDataRoot: URL {
-        appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -115,7 +102,7 @@ struct OAuthSignInButton: View {
                                 Button("Ignore") {
                                     NativeOAuthFlow.recordCodexCLISessionDecision(
                                         allow: false, source: "providers_offer",
-                                        dataRoot: oauthDataRoot)
+                                        dataRoot: appModel.engine.dataRoot)
                                     Task { await refreshStatus() }
                                 }
                                 .buttonStyle(.plain)
@@ -150,11 +137,7 @@ struct OAuthSignInButton: View {
                     .foregroundStyle(NativeAgentShell.secondary)
             }
         }
-        .task {
-            await refreshStatus()
-        }
         .onDisappear {
-            // B.9: cancel in-flight polling when the view disappears
             flowTask?.cancel()
         }
         .confirmationDialog(
@@ -188,7 +171,7 @@ struct OAuthSignInButton: View {
         lastError = nil
         print("[oauth-signin] starting native flow for \(provider.id)")
 
-        let result = await appModel.engine.providers.connectOAuthProvider(
+        _ = await appModel.engine.providers.connectOAuthProvider(
             platform: NativeOAuthPlatform.self, providerID: provider.id,
             present: { result in
                 NSApp.activate(ignoringOtherApps: true)
@@ -196,20 +179,13 @@ struct OAuthSignInButton: View {
                     lastError = result.error ?? "OAuth failed (no details)"
                 }
             },
-            refreshProviders: { _ = await appModel.loadProvidersForChat() },
-            failure: { error, action in appModel.setFailureStatus(error, action: action) },
-            clearOverride: { try await appModel.clearSurfaceOverride(surface: $0) }
+            failure: { error, action in appModel.setFailureStatus(error, action: action) }
         )
-        guard let result else { return }
-        if result.ok { onSuccess?() }
     }
 
     @MainActor
     private func signOut() async {
-        // User, 2026-09-06: the result was discarded, so a sign-out whose lock
-        // or delete failed left the credential on disk and still looked like it
-        // had worked. A failed sign-out now says so.
-        let cleared = NativeOAuthFlow.clearTokens(providerId: provider.id, dataRoot: oauthDataRoot)
+        let cleared = NativeOAuthFlow.clearTokens(providerId: provider.id, dataRoot: appModel.engine.dataRoot)
         await refreshStatus()
         if !cleared {
             lastError = "Sign-out did not finish — a credential file could not be removed. Check permissions on the data folder and try again."
@@ -217,9 +193,6 @@ struct OAuthSignInButton: View {
            authStatus?.isSignedIn == true {
             lastError = "Shared Codex auth is still signed in. Sign out from Codex to remove it."
         }
-        // S.5: propagate revoke to the provider list so ProviderSettingsView
-        // and the chat brain bar reflect the new auth state immediately.
-        if cleared { onSuccess?() }
     }
 
     @MainActor
@@ -233,23 +206,20 @@ struct OAuthSignInButton: View {
     /// the badge labels it as an adopted CLI session.
     @MainActor
     private func acceptCLISessionOffer() async {
+        lastError = nil
         guard await appModel.engine.providers.acceptCodexCLISession(
-            refreshStatus: { await refreshStatus() },
-            refreshProviders: { _ = await appModel.loadProvidersForChat() },
-            failure: { error, action in appModel.setFailureStatus(error, action: action) },
-            clearOverride: { try await appModel.clearSurfaceOverride(surface: $0) }
+            failure: { error, action in appModel.setFailureStatus(error, action: action) }
         ) else {
             lastError = "Could not save the choice — check disk permissions."
             return
         }
-        onSuccess?()
     }
 
     @MainActor
     private func repairCLISessionConsent() async {
         do {
             let backup = try NativeOAuthFlow.repairCodexCLISessionConsent(
-                dataRoot: oauthDataRoot)
+                dataRoot: appModel.engine.dataRoot)
             cliConsentRepairMessage = "Unreadable consent was backed up as \(backup.lastPathComponent). Choose Use it or Ignore again."
             lastError = nil
             await refreshStatus()
@@ -265,7 +235,7 @@ struct OAuthSignInButton: View {
 /// Identity for each OAuth provider exposed in NativeAgent. No brand colour:
 /// the sign-in control is bordered, so a per-provider tint has nowhere to go.
 struct OAuthProvider {
-    let id: String                  // matches the daemon's provider_id
+    let id: String                  // provider_id
     let displayShort: String        // "ChatGPT", "Claude" — used in button label
     let iconSystemName: String
 
@@ -291,35 +261,11 @@ struct OAuthProvider {
 
 // MARK: - Presentation context (AppKit hook)
 
+@MainActor
 final class OAuthSignInPresenter: NSObject, ASWebAuthenticationPresentationContextProviding {
     static let shared = OAuthSignInPresenter()
 
-    // PATCH-2026-05-07: oauth-session-retain Hold a strong ref to the
-    // ASWebAuthenticationSession while it's presenting. Without this, ARC
-    // releases the session when the local variable goes out of scope and
-    // the sheet may dismiss / never finish.
-    private var activeSessions: [ASWebAuthenticationSession] = []
     private var fallbackAnchorWindow: NSWindow?
-    private let lock = NSLock()
-
-    func retain(_ session: ASWebAuthenticationSession) {
-        lock.lock(); activeSessions.append(session); lock.unlock()
-        // B.9: timer is now a fallback only — the completion callback releases
-        // the session immediately via release(_:) on normal completion.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 600) { [weak self, weak session] in
-            guard let self = self, let session = session else { return }
-            self.lock.lock()
-            self.activeSessions.removeAll { $0 === session }
-            self.lock.unlock()
-        }
-    }
-
-    // B.9: immediate release from the session's own completion callback
-    func release(_ session: ASWebAuthenticationSession) {
-        lock.lock()
-        activeSessions.removeAll { $0 === session }
-        lock.unlock()
-    }
 
     func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
         if let window = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first(where: { $0.isVisible }) {

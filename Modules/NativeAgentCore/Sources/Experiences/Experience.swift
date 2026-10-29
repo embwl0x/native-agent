@@ -1,7 +1,7 @@
 import Foundation
+@_exported import NativeAgentShared
 import GRDB
 import NativeAgentCore
-@_exported import NativeAgentShared
 import os
 // Blueprint: | `Experience.swift` | `ExperienceStore`, the append-only owner per data root over `experiences/experiences.sqlite`; `begin`, `append`, `experience`, `open`, indexed open/recent `projection` and commit-fed `changes`. Shared `Experience`/`ObligationPhase` live in NativeAgentShared. Recording stays off reply paths; projection drains queued writes and reports persistence gaps; a write the law refuses is logged and never poisons reads. Turn owners record answer lifetimes and recover saved-answer settlements; conversation and shelf owners publish peer obligations and completed run identities |
 
@@ -11,8 +11,7 @@ import os
 /// still owes anything); `event` holds each `Change` appended after, in order,
 /// as itself. A birth and each append are one transaction, checked against the
 /// law inside it. A read is a primary-key lookup and its events; the open
-/// projection is `WHERE open`. E0's records sit beside the real ones and are
-/// advisory until a lane makes them authoritative.
+/// projection is `WHERE open`. Collection births and events share one read.
 public actor ExperienceStore {
     public enum Change: Codable, Sendable, Equatable {
         case cause(String)
@@ -56,6 +55,10 @@ public actor ExperienceStore {
     private static let pending = OSAllocatedUnfairLock(initialState: [String: (token: UUID, task: Task<Void, Never>)]())
     private static let log = ModuleLog(category: "Experiences")
 
+    static func recordIdentity(_ dataRoot: URL, _ id: String) -> String {
+        at(dataRoot).path.path + "#" + id
+    }
+
     public static func at(_ dataRoot: URL) -> ExperienceStore {
         let path = dataRoot.appendingPathComponent("experiences/experiences.sqlite").standardizedFileURL
         return owners.withLock { owners in
@@ -69,14 +72,13 @@ public actor ExperienceStore {
     /// Writes are records beside the real ones: queued per experience `id` in
     /// the order asked, never retried. A write that fails to persist is a gap;
     /// one the law refuses is only logged — the record stayed exact, so no read
-    /// is poisoned by it (10-24: one refused late answer froze every contact
-    /// read until relaunch). Delivery and failure accounting join their own
+    /// is poisoned by it. Delivery and failure accounting join their own
     /// writes before retiring the caller's work; recording never throws.
     @discardableResult
     public static func record(_ dataRoot: URL, _ id: String,
                               _ write: @escaping @Sendable (ExperienceStore) async throws -> Void) -> Task<Void, Never> {
         let store = at(dataRoot)
-        let key = store.path.path + "#" + id, token = UUID()
+        let key = recordIdentity(dataRoot, id), token = UUID()
         return pending.withLock { tails in
             let previous = tails[key]?.task
             let task = Task.detached {
@@ -145,7 +147,7 @@ public actor ExperienceStore {
     /// Everything after birth is one of these, checked against the law.
     public func append(_ changes: [Change], to id: String) throws {
         let moved = try database().write { db in
-            guard var current = try Self.fold(db, id) else { throw LawError.unknown(id) }
+            guard var current = try Self.fold(db, matching: "experience.id = ?", arguments: [id]).first else { throw LawError.unknown(id) }
             let at = NativeTimestampFormat.fractionalZulu(Date())
             var moved = false
             for change in changes {
@@ -168,14 +170,12 @@ public actor ExperienceStore {
 
     /// Read by id.
     public func experience(_ id: String) throws -> Experience? {
-        try database().read { try Self.fold($0, id) }
+        try database().read { try Self.fold($0, matching: "experience.id = ?", arguments: [id]).first }
     }
 
     /// The experiences that still owe something, oldest first.
     public func open() throws -> [Experience] {
-        try database().read { db in
-            try String.fetchAll(db, sql: "SELECT id FROM experience WHERE open ORDER BY at").compactMap { try Self.fold(db, $0) }
-        }
+        try database().read { try Self.fold($0, matching: "experience.open", order: "experience.at, experience.rowid") }
     }
 
     /// Every write queued for this store so far has landed or been logged as a
@@ -191,29 +191,32 @@ public actor ExperienceStore {
         await drained()
         if let gap { throw NSError(domain: "Experiences", code: 1, userInfo: [NSLocalizedDescriptionKey: gap]) }
         return try await database().read { db in
-            let ids = try String.fetchAll(db, sql: """
-                SELECT id FROM experience WHERE open
-                UNION SELECT id FROM (
-                    SELECT id FROM experience ORDER BY updated_at DESC LIMIT 64
-                )
-                """)
-            return try ids.compactMap { try Self.fold(db, $0) }
+            try Self.fold(db, matching: "experience.open OR experience.id IN (SELECT id FROM experience ORDER BY updated_at DESC LIMIT 64)")
                 .sorted { ($0.updatedAt ?? $0.at) > ($1.updatedAt ?? $1.at) }
         }
     }
 
     /// Replays through the same law that admitted each change; a row it cannot read is reported.
-    private static func fold(_ db: Database, _ id: String) throws -> Experience? {
-        guard let record = try Row.fetchOne(db, sql: "SELECT born, updated_at FROM experience WHERE id = ?", arguments: [id]) else { return nil }
-        var experience = try decoder.decode(Experience.self, from: Data((record["born"] as String).utf8))
-        for row in try Row.fetchAll(db, sql: "SELECT seq, at, event FROM event WHERE experience_id = ? ORDER BY seq", arguments: [id]) {
-            guard let change = try? decoder.decode(Change.self, from: Data((row["event"] as String).utf8)) else {
+    private static func fold(_ db: Database, matching: String, arguments: StatementArguments = [],
+                             order: String = "experience.id") throws -> [Experience] {
+        var experiences: [Experience] = []
+        for row in try Row.fetchAll(db, sql: """
+            SELECT experience.id, born, updated_at, seq, event FROM experience
+            LEFT JOIN event ON event.experience_id = experience.id
+            WHERE \(matching) ORDER BY \(order), event.seq
+            """, arguments: arguments) {
+            let id: String = row["id"]
+            if experiences.last?.id != id {
+                experiences.append(try decoder.decode(Experience.self, from: Data((row["born"] as String).utf8)))
+                experiences[experiences.count - 1].updatedAt = row["updated_at"]
+            }
+            guard let event: String = row["event"] else { continue }
+            guard let change = try? decoder.decode(Change.self, from: Data(event.utf8)) else {
                 throw LawError.unreadable(id, row["seq"])
             }
-            _ = try apply(change, to: &experience)
+            _ = try apply(change, to: &experiences[experiences.count - 1])
         }
-        experience.updatedAt = record["updated_at"]
-        return experience
+        return experiences
     }
 
     /// The law, in one place: applies a change and says whether it moved

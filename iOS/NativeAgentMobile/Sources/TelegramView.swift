@@ -49,7 +49,7 @@ struct TelegramView: View {
         .task { await refresh() }
         .refreshable { await refresh() }
         .confirmationDialog("Disconnect Telegram?", isPresented: $showDisconnect, titleVisibility: .visible) {
-            Button("Disconnect", role: .destructive) { Task { await change(.disconnect) } }
+            Button("Disconnect", role: .destructive) { Task { await disconnectTelegram() } }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("This removes the saved bot token and disables Telegram until new credentials are saved.")
@@ -70,13 +70,13 @@ struct TelegramView: View {
         }
     }
 
-    private func change(_ change: MobileTelegramChange) async {
+    private func disconnectTelegram() async {
         guard !saving, pairingStore.isPaired else { return }
         saving = true
         failure = nil
         defer { saving = false }
         do {
-            _ = try await sync.changeTelegram(change)
+            _ = try await sync.disconnectTelegram()
         } catch {
             failure = "Telegram change failed: \(error.localizedDescription)"
         }

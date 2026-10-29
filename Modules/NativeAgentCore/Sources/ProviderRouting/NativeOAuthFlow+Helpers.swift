@@ -1,12 +1,11 @@
 import Foundation
 import Privacy
-import Security
 import CryptoKit
 import Darwin
 import PersistenceCore
 import NativeAgentShared
 import TurnTrace
-// Blueprint: | `NativeOAuthFlow+Helpers.swift` | PKCE and NativeOAuthSupport.post, the redirect-refusing transport for all token grants; adapters retain sessions, encoding, 20/30-second request bounds and error classification; owned sessions and device polls have elapsed resource bounds. Device authorization polls at the server interval through expiry, denial or cancel |
+// Blueprint: | `NativeOAuthFlow+Helpers.swift` | PKCE and OAuthGrantOperations.post, the redirect-refusing transport for all token grants; adapters retain sessions, encoding, 20/30-second request bounds and error classification; owned sessions and device polls have elapsed resource bounds. Device authorization polls at the server interval through expiry, denial or cancel |
 
 extension NativeOAuthFlow {
     public struct InlineSetupOutcome: Sendable {
@@ -19,7 +18,7 @@ extension NativeOAuthFlow {
         }
     }
 
-    /// A failure as one fixed reason class. The raw text goes to the local log
+    /// A failure and its recovery in fixed words. The raw text goes to the local log
     /// only, through the chat secret redactor with every typed value removed
     /// too; it never reaches the card, the transcript or the agent.
     public nonisolated static func inlineSetupFailureReason(
@@ -35,21 +34,21 @@ extension NativeOAuthFlow {
         func has(_ words: String...) -> Bool { words.contains { text.contains($0) } }
         // Local allowlist checks, not service text: the person can fix these.
         if has("at least one allowed", "allowed chat id", "allowed user id", "allowlist") {
-            return "\(service) needs a valid allowed chat, channel or user ID."
+            return "\(service) needs a valid allowed chat, channel or user ID. Check the IDs, then try again."
         }
         if has("could not connect", "couldn't connect", "cannot connect", "network connection",
                "timed out", "offline", "not connected to the internet", "hostname", "could not be found",
                "unreachable") {
-            return "Couldn't reach \(service)."
+            return "Couldn't reach \(service). Check your internet connection, then try again."
         }
         // Before the scope check: the format hints name "OAuth & Permissions".
         if has("401", "reject", "unauthorized", "such as", "botfather", "isn't a setup token",
                "enter a valid", "not a valid", "invalid_auth", "invalid token", "invalid api key",
                "incorrect api key", "didn't accept", "not_authed", "bad credentials") {
-            return "\(service) rejected the \(secret)."
+            return "\(service) rejected the \(secret). Check it's pasted in full, then try again."
         }
         if has("scope", "permission", "forbidden", "403", "not accessible") {
-            return "\(service) is missing a permission or scope this needs."
+            return "\(service) is missing a permission or scope this needs. Add it in \(service), then try again."
         }
         return otherwise ?? "\(service): other error (details in the app log)."
     }
@@ -110,21 +109,15 @@ public struct PKCE {
 
     public static func generate() -> PKCE {
         var bytes = [UInt8](repeating: 0, count: 32)
-        // A zeroed PKCE verifier would silently gut the flow's CSRF /
-        // interception protection, so this must never fall back to weak
-        // bytes — but it must not take the app down from Sign in either.
-        // arc4random_buf is the platform CSPRNG and has no failure mode.
-        if SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) != errSecSuccess {
-            arc4random_buf(&bytes, bytes.count)
-        }
-        let verifier = NativeOAuthSupport.base64URLEncode(Data(bytes))
+        arc4random_buf(&bytes, bytes.count)
+        let verifier = OAuthGrantOperations.base64URLEncode(Data(bytes))
         let digest = SHA256.hash(data: Data(verifier.utf8))
-        let challenge = NativeOAuthSupport.base64URLEncode(Data(digest))
+        let challenge = OAuthGrantOperations.base64URLEncode(Data(digest))
         return PKCE(verifier: verifier, challenge: challenge)
     }
 }
 
-public enum NativeOAuthSupport {
+public enum OAuthGrantOperations {
     public static let renewalMargin: TimeInterval = 120
     public static func base64URLEncode(_ data: Data) -> String {
         data.base64EncodedString()
@@ -135,11 +128,7 @@ public enum NativeOAuthSupport {
 
     public static func randomHex(_ byteCount: Int) -> String {
         var bytes = [UInt8](repeating: 0, count: byteCount)
-        // Same rule as the PKCE verifier: never weak bytes, never a crash from
-        // Sign in. arc4random_buf is the platform CSPRNG and cannot fail.
-        if SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) != errSecSuccess {
-            arc4random_buf(&bytes, bytes.count)
-        }
+        arc4random_buf(&bytes, bytes.count)
         return bytes.map { String(format: "%02x", $0) }.joined()
     }
 
@@ -312,13 +301,6 @@ public enum NativeOAuthSupport {
         }.joined(separator: "&")
     }
 
-    public static func loadJSONObject(_ url: URL) throws -> [String: Any] {
-        let data = try Data(contentsOf: url)
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return [:] }
-        return obj
-    }
-
     static func updateProviderCredential(
         at path: URL,
         replacingXAIGrant: Bool = false,
@@ -337,15 +319,7 @@ public enum NativeOAuthSupport {
         }
     }
 
-    /// Every credential write the app makes — sign-in, token replacement, the
-    /// connector stores. User, 2026-09-06: this ran with no lock at all, so a
-    /// sign-in replacing the file raced an adapter's in-flight token refresh,
-    /// which compared the bytes and then wrote. Both sides now take the SAME
-    /// per-path lock, so the refresh's compare-and-write cannot straddle this one.
-    /// Callers that already hold that path's lock through `withFileLock` (the
-    /// connector, Slack and X credential writes all do) pass straight through:
-    /// `flock` is not recursive, so re-acquiring it here only waited out the
-    /// acquire timeout and failed the write it was protecting.
+    /// Credential writes share the refresh path lock; callers already holding it bypass nonrecursive flock.
     public static func writeJSONObject(_ obj: [String: Any], to url: URL) throws {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
@@ -361,21 +335,6 @@ public enum NativeOAuthSupport {
         try CredentialFileLock.withLock(url) {
             try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
         }
-    }
-
-    public static func isoNow() -> String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime]
-        return f.string(from: Date())
-    }
-
-    public static func isoBasic(_ d: Date) -> String {
-        let f = DateFormatter()
-        f.calendar = Calendar(identifier: .iso8601)
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.timeZone = TimeZone(secondsFromGMT: 0)
-        f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"
-        return f.string(from: d)
     }
 
     public static func redact(_ s: String, bearerReplacement: String = "Bearer ***REDACTED***") -> String {

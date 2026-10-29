@@ -104,7 +104,9 @@ func jsonlFiles(in directory: URL) -> [URL] {
     }
 }
 
-var messages: [String] = []
+var messageCount = 0
+var wordCount = 0
+var counts: [String: Int] = [:]
 for url in jsonlFiles(in: messagesDir) {
     guard let text = try? String(contentsOf: url, encoding: .utf8) else {
         continue
@@ -122,28 +124,21 @@ for url in jsonlFiles(in: messagesDir) {
         else {
             continue
         }
-        messages.append(content)
+        messageCount += 1
+        wordCount += content.split(whereSeparator: \.isWhitespace).count
+        let range = NSRange(content.startIndex..<content.endIndex, in: content)
+        for pattern in ticPatterns {
+            counts[pattern.name, default: 0] += pattern.regex.numberOfMatches(in: content, range: range)
+        }
     }
 }
 
-guard !messages.isEmpty else {
+guard messageCount > 0 else {
     print("no assistant messages in window")
     exit(1)
 }
 
-var counts: [String: Int] = [:]
-for content in messages {
-    let range = NSRange(content.startIndex..<content.endIndex, in: content)
-    for pattern in ticPatterns {
-        counts[pattern.name, default: 0] += pattern.regex.numberOfMatches(in: content, range: range)
-    }
-}
-
-let wordCount = messages.reduce(0) { total, message in
-    total + message.split(whereSeparator: \.isWhitespace).count
-}
-
-print("\(messages.count) assistant messages / \(wordCount) words, last \(days) days\n")
+print("\(messageCount) assistant messages / \(wordCount) words, last \(days) days\n")
 for (name, count) in counts.sorted(by: { lhs, rhs in
     if lhs.value == rhs.value {
         return lhs.key < rhs.key
@@ -151,5 +146,5 @@ for (name, count) in counts.sorted(by: { lhs, rhs in
     return lhs.value > rhs.value
 }) {
     let paddedName = name.padding(toLength: 28, withPad: " ", startingAt: 0)
-    print(String(format: "  %@ %5d  (%.2f/msg)", paddedName, count, Double(count) / Double(messages.count)))
+    print(String(format: "  %@ %5d  (%.2f/msg)", paddedName, count, Double(count) / Double(messageCount)))
 }

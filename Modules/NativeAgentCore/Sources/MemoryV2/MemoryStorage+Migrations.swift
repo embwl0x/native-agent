@@ -80,12 +80,7 @@ extension MemoryStorage {
                 CREATE INDEX idx_kg_rel_to ON kg_relationships(to_id);
             """)
         }
-        // v3 (2026-06-09): recall access counters. Additive — existing rows
-        // default to use_count 0 / last_used_at NULL, so old code that ignores
-        // these columns is unaffected. `use_count` is a real column (not
-        // metadata JSON) so recall can increment it atomically without a
-        // read-modify-write race under concurrent recalls. See the
-        // memory-recall-correctness build plan (#0).
+        // v3: recall counters default to 0/NULL; a real use_count column permits atomic increments.
         m.registerMigration("v3_recall_counters") { db in
             try db.execute(sql: """
                 ALTER TABLE memories ADD COLUMN use_count INTEGER NOT NULL DEFAULT 0;
@@ -93,26 +88,18 @@ extension MemoryStorage {
                 CREATE INDEX idx_memories_last_used ON memories(last_used_at);
             """)
         }
-        // v4 (2026-06-09): semantic tombstones. Additive nullable column —
-        // legacy tombstone rows keep NULL and remain exact-hash-only; new
-        // tombstones store the claim's embedding so paraphrases of a deleted
-        // claim can be blocked (memory-semantics-wave1, lane T).
+        // v4: tombstone embeddings block paraphrases; NULL preserves exact-hash-only matching.
         m.registerMigration("v4_tombstone_embeddings") { db in
             try db.execute(sql: "ALTER TABLE tombstones ADD COLUMN embedding BLOB;")
         }
-        // v5 (2026-06-20): explicit lifecycle/confidence hygiene. `status`
-        // remains the coarse storage state (active/archived); lifecycle carries
-        // fact quality: confirmed, temporary, inferred, stale, corrected,
-        // contradicted, or deleted. Additive default keeps legacy rows confirmed.
+        // v5: status tracks storage state; lifecycle tracks fact quality and defaults existing rows to confirmed.
         m.registerMigration("v5_memory_lifecycle") { db in
             try db.execute(sql: """
                 ALTER TABLE memories ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'confirmed';
                 CREATE INDEX idx_memories_lifecycle ON memories(lifecycle);
             """)
         }
-        // v6 (2026-07-14): vector-space identity. Legacy vectors remain
-        // nullable/unverified until a full-corpus candidate is embedded and
-        // atomically activated; migration never guesses their provenance.
+        // v6: vector identity remains unverified until atomic full-corpus activation; migration never guesses provenance.
         m.registerMigration("v6_embedding_epochs") { db in
             try db.execute(sql: """
                 ALTER TABLE memories ADD COLUMN embedding_epoch TEXT;
@@ -154,15 +141,8 @@ extension MemoryStorage {
                 CREATE INDEX idx_memories_observed_at ON memories(observed_at);
             """)
         }
-        // v8 (2026-08-27): adopt kg_memory_index into the migrator, making the
-        // migration lineage the SINGLE owner of every kg_* table. This table
-        // was historically created only by the KnowledgeGraph side's
-        // ensureSchema, which also let a graph-first open mint a memory.sqlite
-        // with an empty grdb_migrations ledger — the next MemoryStorage init
-        // then replayed v2 against existing tables and bricked the chain
-        // (stable-failure #4 / Desk 751.7). IF NOT EXISTS here is a one-time
-        // ADOPTION of live stores that already carry the hand-created table;
-        // the KnowledgeGraph side now verifies schema and never creates it.
+        // v8: migrations own every kg_* table; IF NOT EXISTS adopts existing kg_memory_index tables.
+        // KnowledgeGraph verifies schema without creating tables.
         m.registerMigration("v8_kg_memory_index") { db in
             try db.execute(sql: """
                 CREATE TABLE IF NOT EXISTS kg_memory_index (
@@ -178,13 +158,10 @@ extension MemoryStorage {
         m.registerMigration("v9_drop_embedding_previous") { db in
             try db.execute(sql: "DROP TABLE IF EXISTS memory_embedding_previous")
         }
-        // v10 (2026-09-26): the consolidation swap's applied marker
-        // (MemoryConsolidationGate.appliedMarkerTable), created inline by the
-        // swap until now. IF NOT EXISTS adopts a store where a swap already
-        // made it; the shape is exactly what the swap created.
+        // Preserve the retired consolidation schema in migration history.
         m.registerMigration("v10_consolidation_applied") { db in
             try db.execute(sql: """
-                CREATE TABLE IF NOT EXISTS \(MemoryConsolidationGate.appliedMarkerTable) (
+                CREATE TABLE IF NOT EXISTS consolidation_applied (
                   run_id TEXT PRIMARY KEY,
                   applied_at TEXT NOT NULL
                 )

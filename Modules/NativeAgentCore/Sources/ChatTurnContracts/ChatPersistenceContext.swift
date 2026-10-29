@@ -1,30 +1,30 @@
 import Foundation
-// Blueprint: | `ChatPersistenceContext.swift` | `ChatPersistenceContext` enum |
+import NativeAgentShared
+import TurnTrace
+// Blueprint: | `ChatPersistenceContext.swift` | Request-scoped transcript intent, declared conversation kind and exact session owner; exact assistant/question replacement identities, provenance and imported-message bindings |
 
 /// Request-scoped transcript intent. Regenerate/retry callers provide the
 /// assistant row they mean to replace without widening every provider/tool-loop
 /// protocol. Only the final successful assistant append opts into consuming it;
 /// user rows, partial recovery rows, and persisted failures remain append-only.
 public enum ChatPersistenceContext {
+    /// The creating ingress declares what its session is; continuations keep
+    /// an existing row's kind regardless of the surface carrying this message.
+    @TaskLocal public static var threadKind: ChatThreadKind?
+    /// Exact session owned by the declaring ingress. A borrowed/requested
+    /// conversation keeps its existing classification.
+    @TaskLocal public static var ownedSessionID: String?
     @TaskLocal public static var replacementAssistantMessageID: String?
+    /// Regenerate names the existing question too: context metadata updates
+    /// that exact row, and history excludes the turn being replaced.
+    @TaskLocal public static var replacementUserMessageID: String?
     @TaskLocal public static var codexCompletionBinding: CodexCompletionTranscriptBinding?
-    /// Ack-on-enqueue (2026-07-25): the runId `enqueueUserMessage` stamped on
-    /// the pre-appended user row. A turn that runs with
-    /// `suppressUserAppend: true` adopts this as ITS runId, so the history
-    /// builder's `excludeHistoryRunId` drops the pre-appended row exactly as
-    /// it drops the normal path's own append — without it the current message
-    /// enters the prompt twice (once from history, once as the live turn).
-    /// Honored ONLY on suppressed-append turns: a nested full-chat dispatch
-    /// inside the same task tree uses suppressUserAppend:false and must mint
-    /// its own runId rather than inherit this one.
+    /// Suppressed-append turns reuse the enqueued row's run ID to exclude it from history; full-chat turns mint their own.
     @TaskLocal public static var pinnedTurnRunID: String?
-    /// Session provenance (658.14): the ORIGIN of an inbound message, on its
-    /// own channel. Deliberately NOT the `surface` parameter — `surface` is
-    /// also the tool-authorization surface (the claude/codex bridges run with
-    /// `surface: "chat"` on purpose, per User's 2026-06-13 call that the bridge
-    /// gets the same tool surface as chat), so retagging it to carry origin
-    /// would silently change what the bridge is allowed to do. Stamped onto
-    /// the USER row's metadata only; assistant rows are always hers.
+    /// The id the Mac already shows for this turn's user row: the core saves the
+    /// row under it, so the optimistic row and the durable one are one row.
+    @TaskLocal public static var pinnedUserMessageID: String?
+    /// Inbound origin is stamped only on user rows, independently of the tool-authorization surface.
     @TaskLocal public static var originProvenance: ChatMessageOrigin?
     /// The originating principal, independent of the turn's door or carried steering.
     public static var originPrincipal: String {
@@ -49,19 +49,7 @@ public struct ChatMessageOrigin: Sendable, Equatable, Codable {
     /// a separate cryptographic attestation of the calling process. Nil when
     /// the lane is unattributed.
     public let agent: String?
-    /// Item 8 (2026-09-02). The lane's own statement that the AGENT composed
-    /// this text, rather than the bridge carrying the human's words through it.
-    ///
-    /// `surface` and `agent` describe the ROUTE, and a route cannot answer the
-    /// question the affect layer has to ask. Claude relaying "User says: ship
-    /// it" arrives on the same surface, from the same agent, as Claude saying
-    /// something herself — and only one of those is another person moving her.
-    /// Nil means unstated, which is read as the human: the honest default when
-    /// nobody has claimed authorship, and the same direction the render
-    /// allowlist fails in.
-    ///
-    /// Set ONLY by a lane that knows it is transcribing its own agent's output.
-    /// A future forwarding lane must leave it nil.
+    /// Only a lane transcribing its own agent's output sets authorship; forwarding leaves nil, interpreted as human.
     public let authored: ChatMessageAuthorship?
     /// The Claude inbox message this row answers, when the sender named one.
     public var replyTo: String? = nil

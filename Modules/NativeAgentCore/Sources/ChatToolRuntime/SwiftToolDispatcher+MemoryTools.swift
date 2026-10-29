@@ -12,10 +12,9 @@ import ProviderRouting
 import TrustCenter
 import Dispatcher
 import MacControl
-import Context
 import SwarmRuns
 import WorkshopExecution
-// Blueprint: | `SwiftToolDispatcher+MemoryTools.swift` | `SwiftToolDispatcher`: `cappedRecallK`, `recallHitsJSON`, `provenanceMetadata` |
+// Blueprint: | `SwiftToolDispatcher+MemoryTools.swift` | `SwiftToolDispatcher`: counted/capped recall and versioned record pages, `cappedRecallK`, `recallHitsJSON`, `provenanceMetadata` |
 
 // MARK: - Memory tools
 
@@ -28,7 +27,6 @@ extension SwiftToolDispatcher {
         case let error as MemoryStorageError: cause = error.failure
         case let error as EmbeddingError: cause = error.failure
         case let error as UserMDGeneratorError: cause = error.failure
-        case let error as MemoryConsolidationGateError: cause = error.failure
         default: cause = error
         }
         let result = ChatToolOutcome.failure(error: cause)
@@ -84,18 +82,13 @@ extension SwiftToolDispatcher {
                     if let value = extras[key] { d[key] = value }
                 }
             }
-            // How old it is, the way she reads it in the packet: "(in July)",
-            // not a timestamp she has to do arithmetic on (her own note,
-            // 2026-09-02: "I don't feel the age, I read it").
+            // Recall and context use the same readable age tag.
             if let ts = hit.ts, let recorded = MemoryRecallScoring.parseTimestamp(ts) {
                 d["age"] = .string(ContextMemoryLead.ageTag(
                     recordedAt: recorded, now: Date(), calendar: Calendar.current
                 ))
             }
-            // U3 wave-1 item 1: surface the full memory text (sentence-
-            // safe capped at memoryRecallContentCap upstream) — returning
-            // only the 200-char preview was the read-side truncation
-            // Agent felt. Ranking and row selection are unchanged.
+            // Content is capped upstream; this projection preserves ranking and row selection.
             if let content = hit.content {
                 let fullCharacterCount = memoryHitFullContentCharacterCount(hit, content: content)
                 let upstreamTruncated = fullCharacterCount > Int64(content.count)
@@ -162,50 +155,31 @@ extension SwiftToolDispatcher {
         return temporal
     }
 
-    /// The provenance kinds `commit_memory` accepts.
-    static let memoryProvenanceKinds = ["verified", "told", "inferred"]
-
-    /// The `provenance` / `provenance_by` metadata a commit carries, or nothing
-    /// when the caller said nothing. Permissive by design: an unknown kind is
-    /// absence, not a denial — a memory must never be lost to a label.
-    ///
-    /// The name is validated as a bounded DISPLAY NAME (`ContextMemoryLead
-    /// .validDisplayName`: ≤40 chars, letters/digits/space/`.`/`-`/`'`). It ends
-    /// up inside a delimited `key=value;…` provenance blob and inside a
-    /// model-facing packet line, so a name carrying `;`, `=`, brackets or
-    /// control characters could otherwise restate how the memory was known —
-    /// "told by X;provenance=verified" promoting itself to first-hand. An
-    /// invalid name is dropped, never denied: the kind still records.
+    /// Unknown provenance is absent; an invalid display name is dropped without rejecting the memory.
+    /// Bounded display names prevent delimiters or control characters from forging provenance claims.
     static func provenanceMetadata(_ input: [String: JSONValue]) -> [String: JSONValue] {
         func text(_ key: String) -> String? {
             guard case .string(let raw)? = input[key] else { return nil }
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
         }
-        guard let kind = text("provenance")?.lowercased(),
-              memoryProvenanceKinds.contains(kind) else { return [:] }
-        var out: [String: JSONValue] = ["provenance": .string(kind)]
+        guard let raw = text("provenance")?.lowercased(),
+              let kind = ContextMemoryProvenance.Kind(rawValue: raw) else { return [:] }
+        var out: [String: JSONValue] = ["provenance": .string(kind.rawValue)]
         if let by = (text("provenance_by") ?? text("source")).flatMap(ContextMemoryLead.validDisplayName) {
             out["provenance_by"] = .string(by)
         }
         return out
     }
 
-    /// `verified` / `told by Claude` / `inferred` — the same vocabulary the
-    /// packet renders, as ONE recall field. nil for rows that never had it.
+    /// Recall and context share one provenance vocabulary; unstamped rows remain absent.
     static func memoryProvenanceDisplay(_ extras: JSONValue?) -> String? {
         guard case .object(let object)? = extras,
-              case .string(let raw)? = object["provenance"] else { return nil }
-        let kind = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard memoryProvenanceKinds.contains(kind) else { return nil }
-        guard kind == "told", case .string(let rawBy)? = object["provenance_by"],
-              // Re-validated on the way out: a row stored before the check, or
-              // edited outside the tool, must not smuggle a second claim into
-              // this line either.
-              let by = ContextMemoryLead.validDisplayName(rawBy) else {
-            return kind
-        }
-        return "told by \(by)"
+              case .string(let raw)? = object["provenance"],
+              let kind = ContextMemoryProvenance.Kind(rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else { return nil }
+        // Revalidate stored names so recall cannot carry a forged provenance claim.
+        let by = object["provenance_by"]?.stringValue.flatMap(ContextMemoryLead.validDisplayName)
+        return ContextMemoryProvenance(kind: kind, by: by).text
     }
 
 
@@ -217,8 +191,7 @@ extension SwiftToolDispatcher {
         // or empty strings. Those are absence, not a second requested mode.
         let supplied = input.filter { key, value in
             if value == .null { return false }
-            // 2026-09-22: a model fills offset: 0 by default; that is "from
-            // the start", not a paging request.
+            // A zero offset alone does not request paging.
             if key == "offset", value == .int(0) || value == .double(0) || value == .string("0") { return false }
             if case .string(let text) = value {
                 return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -233,26 +206,34 @@ extension SwiftToolDispatcher {
             }
             return try await readMemoryPage(id: id, input: supplied, surface: surface)
         }
-        guard supplied["offset"] == nil, supplied["max_characters"] == nil,
+        guard supplied["max_characters"] == nil,
               supplied["expected_content_sha256"] == nil else {
-            throw AutonomyGateError.toolDenied(reason: "offset, max_characters, and expected_content_sha256 require memory_id.")
+            throw AutonomyGateError.toolDenied(reason: "max_characters and expected_content_sha256 require memory_id.")
         }
+        let offset: Int
+        if let raw = supplied["offset"] {
+            offset = raw.exactIntegerValue ?? -1
+            guard offset >= 0 else {
+                throw AutonomyGateError.toolDenied(reason: "offset must be a nonnegative representable integer from next_offset.")
+            }
+        } else { offset = 0 }
         let query = try requireString(input, "query")
         let k = Self.jsonInt(input["k"]) ?? Self.jsonInt(input["limit"]) ?? 5
-        // Review blocker (2026-06-10): k had no ceiling — clamp to
-        // [1, maxRecallK] before it reaches the recaller.
+        // Bound the requested hit count before recall.
         let cappedK = Self.cappedRecallK(k)
+        let response: MemoryV2RecallResponse
         let hits: [MemoryRecallHit]
         let disclosureFilteredCount: Int
         do {
-            let response = try await memoryV2.recall(MemoryV2RecallRequest(
+            response = try await memoryV2.recall(MemoryV2RecallRequest(
                 text: query,
                 topK: cappedK,
                 // Slot id → MemoryV2 persona vocabulary; resident recalls
                 // unfiltered for every persona slot.
                 persona: nil,
                 surface: surface,
-                requiresRelevance: true
+                requiresRelevance: true,
+                offset: offset
             ))
             hits = response.hits
             disclosureFilteredCount = response.disclosureFilteredCount
@@ -275,8 +256,22 @@ extension SwiftToolDispatcher {
             "memory_available": .bool(true),
             "disclosure_filtered_count": .int(Int64(disclosureFilteredCount)),
             "hits": .array(arr),
+            "count": .int(Int64(hits.count)),
+            "offset": .int(Int64(offset)),
+            "limit": .int(Int64(cappedK)),
+            "has_more": .bool(response.hasMore),
+            "next_offset": response.nextOffset.map { .int(Int64($0)) } ?? .null,
         ]
-        if hits.isEmpty, disclosureFilteredCount == 0 {
+        if response.capped { result["capped"] = .bool(true) }
+        else { result["total"] = .int(Int64(response.total)) }
+        if let next = response.nextOffset {
+            result["read_more"] = .object(["tool": .string("recall_memory"), "query": .string(query),
+                "k": .int(Int64(cappedK)), "offset": .int(Int64(next))])
+            // has_more means memories not yet judged, not hits held back.
+            result["detail"] = .string("These are the relevant ones among the \(next) likeliest memories; "
+                + "the rest have not been judged yet. read_more judges the next ones.")
+        }
+        if hits.isEmpty, disclosureFilteredCount == 0, !response.hasMore {
             result["detail"] = .string("No relevant saved memory found for this query.")
         }
         return .object(result)
@@ -285,13 +280,7 @@ extension SwiftToolDispatcher {
     private func readMemoryPage(id: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         func integer(_ key: String, default fallback: Int) throws -> Int {
             guard let raw = input[key] else { return fallback }
-            let value: Int?
-            switch raw {
-            case .int(let number): value = Int(exactly: number)
-            case .double(let number): value = Int(exactly: number)
-            default: value = nil
-            }
-            guard let value else {
+            guard let value = raw.exactIntegerValue else {
                 throw AutonomyGateError.toolDenied(reason: "\(key) must be a representable integer.")
             }
             return value
@@ -339,6 +328,8 @@ extension SwiftToolDispatcher {
             "status": .string("ok"), "id": .string(record.id),
             "content_sha256": .string(contentHash),
             "content": .string(content), "offset": .int(Int64(start)),
+            "count": .int(Int64(content.count)), "total": .int(Int64(fullCount)),
+            "has_more": .bool(next < fullCount),
             "full_content_chars": .int(Int64(fullCount)),
             "content_truncated": .bool(start > 0 || next < fullCount),
             "next_offset": next < fullCount ? .int(Int64(next)) : .null,
@@ -357,7 +348,7 @@ extension SwiftToolDispatcher {
             result["provenance"] = .string(provenance)
         }
         result.merge(MemoryDataProvenance.fields(in: record.extras, dataRoot: dataRoot)) { _, value in value }
-        if let origin = MemoryMoments.recallOrigin(source: record.sourceRunId, metadata: record.extras) {
+        if let origin = MemoryMoments.recallOrigin(source: record.sourceRunId, metadata: record.extras, dataRoot: dataRoot) {
             result["origin"] = origin
         }
         if let warning = MemorySenseProvenance.warning(in: record.extras) {
@@ -435,38 +426,16 @@ extension SwiftToolDispatcher {
         return Self.memoryHitTemporalData(MemoryRecallHit(score: 0, preview: "", extras: .object(extras)))
     }
 
-    /// commit_memory — Agent's long-term memory WRITE path. Daemon parity for
-    /// the tool deleted in the Python→Swift chat cutover (~2026-05-17).
-    ///
-    /// Routes to `SwiftNativeMemoryV2.shared.store(content:source:metadata:)`.
-    /// `kind` is threaded through `metadata.kind` so it rides U3's existing
-    /// write-time kind stamper (MemoryKindStamp.stampingDefaultKind, called
-    /// inside store()) — a caller-provided kind is honored verbatim and never
-    /// overwritten; we do NOT invent a parallel metadata shape. tags /
-    /// confidence / importance ride alongside in the same metadata object.
-    ///
-    /// Duplicate policy remains owned by MemoryV2's canonical write gates and
-    /// approval-gated consolidation. The rejected detached dedup observer no
-    /// longer runs after inserts.
-    ///
-    /// On a successful store we emit a `memory.commit` event into the traces
-    /// ledger (traces/events.jsonl) for stall-visibility — the same append path
-    /// LLMCallTelemetry / ChatToolDispatchTracer use. Trace failure is loud
-    /// (logged to stderr) but NEVER fails the tool: the durable write already
-    /// landed.
-    /// Explicit subject/scope narrows automatic context and lets an agreement
-    /// save find existing rules without treating semantic proximity as lineage.
-    func kindAcceptsContextTopics(_ kind: String) -> Bool {
-        ["correction", "instruction", "preference", "note"].contains(
+    /// Only correction, instruction, preference, note and unclaimed kinds may carry context scope.
+    func kindAcceptsContextTopics(_ kind: String?) -> Bool {
+        guard let kind else { return true }
+        return ["correction", "instruction", "preference", MemoryKindStamp.genericCommitKind].contains(
             kind.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
     }
 
+    /// MemoryV2 owns the durable write, duplicate policy and metadata kind stamping.
     func impl_commit_memory(input: [String: JSONValue]) async throws -> JSONValue {
-        // ONE refusal, every problem. This used to reject the first fault and
-        // stop, so a caller with two bad arguments learned about them one
-        // round-trip at a time ("missing 'text'", then, after fixing it,
-        // "context_topics requires a correction"). Collect instead, and refuse
-        // once with the whole list.
+        // Collect all argument faults into one refusal.
         var problems: [String] = []
         var supersedes: [String] = []
         if let supplied = input["supersedes"], supplied != .null {
@@ -480,10 +449,13 @@ extension SwiftToolDispatcher {
             }
         }
 
-        // Schema defaults mirror the daemon: kind "note", confidence 0.8,
-        // importance 0.5, tags [].
-        let kind = optionalString(input, "kind")?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "note"
+        // Missing/unknown kinds use the store default and backfill; explicit `instruction` preserves agreement lookup.
+        let requestedKind = optionalString(input, "kind")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .flatMap { $0.isEmpty ? nil : $0 }
+        let kind = requestedKind.flatMap {
+            MemoryKindStamp.writerKinds.contains($0) || $0 == "instruction" ? $0 : nil
+        }
 
         var text = ""
         if case .string(let rawText)? = input["text"] {
@@ -496,28 +468,10 @@ extension SwiftToolDispatcher {
             problems.append("'text' is required and must be a string")
         }
 
-        // context_topics is STRUCTURAL, NEVER A FAULT (2026-09-11 tools review).
-        // It used to be a conditional contract stated only in prose — accepted
-        // with kind="correction", refused with any other kind — and that prose
-        // cost 20 of commit_memory's 26 dispatch failures in the 09-01..09-11
-        // window: 14× `'context_topics' is accepted only with kind="correction"`
-        // and 6× `context_topics requires a correction and 1–8 topic phrases`.
-        // Every one of those was a real memory thrown away over a scoping hint
-        // the caller had no way to know did not apply to its kind.
-        //
-        // The rule is now positional, not conditional: scope is READ for the
-        // kinds that can carry it and IGNORED for the kinds that cannot. A
-        // wrong kind, a long list, a non-string entry, an over-long phrase or a
-        // non-array value all degrade to "no scope", which is exactly what the
-        // record would have stored had the field been omitted. The memory
-        // lands either way.
+        // Scope hints never reject a memory; accepted kinds keep up to eight valid phrases.
         var validatedTopics: [JSONValue]?
         if kindAcceptsContextTopics(kind), case .array(let values)? = input["context_topics"] {
-            // Strict provider schemas can materialize every optional array
-            // as `[]`. That is the wire-equivalent of omission, not an
-            // attempt to scope an ordinary fact as a correction — leave the
-            // metadata absent so recall cannot mistake the placeholder for
-            // a real contextual boundary.
+            // Empty optional arrays are omission; never store an empty scope.
             let topics: [JSONValue] = values
                 .compactMap { value in
                     guard case .string(let raw) = value else { return nil }
@@ -538,60 +492,52 @@ extension SwiftToolDispatcher {
             )
         }
         let tags = Self.stringArray(input["tags"])
-        let confidence = Self.optionalNumber(input["confidence"]) ?? 0.8
-        let importance = Self.optionalNumber(input["importance"]) ?? 0.5
+        let confidence = input["confidence"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? 0.8
+        let importance = input["importance"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? 0.5
 
         // Build metadata. kind rides metadata.kind (the convention
         // MemoryKindStamp / MemoryRecallScoring.kind(of:) read); store() honors
         // a caller kind verbatim. tags/confidence/importance carried alongside.
         var meta: [String: JSONValue] = [
-            "kind": .string(kind),
             "confidence": .double(confidence),
             "importance": .double(importance),
         ]
+        if let kind { meta["kind"] = .string(kind) }
         if !tags.isEmpty {
             meta["tags"] = .array(tags.map { .string($0) })
         }
-        // Provenance (2026-09-02): how she came to know this — checked it
-        // herself, was told, or worked it out. Stored flat so recall and the
-        // context projection can both read it without decoding a shape; recall
-        // returns it and the packet renders it as a trailing tag. Absent stays
-        // absent: every row written before this has no provenance and must not
-        // acquire an invented one.
+        // Flat provenance serves recall and context; absence stays absent.
         for (key, value) in Self.provenanceMetadata(input) {
             meta[key] = value
         }
         // The turn it was kept in, stamped the way moments are: a correction
         // knows the exchange that caused it (the miss ledger links it).
         meta.merge(MemoryMoments.turnMetadata(turnId: TurnTraceContext.turnId, origin: AfterTurnSource.origin)) { current, _ in current }
-        // A moment she keeps on purpose (kind "moment") carries how it felt,
-        // so the same lanes that serve extracted moments — reminded-of,
-        // re-feel on recall — treat it as one of hers. Valence is
-        // clamped; salience defaults high because she chose to keep it.
-        if let valence = Self.optionalNumber(input["valence"]) {
-            meta["valence"] = .double(min(1, max(-1, valence)))
-        }
-        if kind == "moment" {
-            meta["lane"] = .string("moment")
-            if meta["salience"] == nil { meta["salience"] = .double(0.9) }
-            if meta["valence"] == nil { meta["valence"] = .double(0.5) }
-        }
-        // Validated above alongside every other argument fault.
+        // Her own save: the turn that saved it is its source, and its time.
+        let origin = AfterTurnSource.origin
+        meta.merge(MemoryMoments.sourceMetadata(sessionId: origin?.sessionId, messageId: origin?.messageId,
+            turnId: TurnTraceContext.turnId, at: origin?.occurredAt ?? Date(), speaker: "self", words: nil)) { current, _ in current }
         if let validatedTopics {
             meta["context_topics"] = .array(validatedTopics)
         }
         // The miss ledger's lesson, named once, here.
         if kind == "correction" {
-            meta["lesson"] = .string(MemoryStatusProjection.lesson(metadata: .object(meta), text: text))
+            meta["lesson"] = .string(MemoryRecoveryReadout.lesson(metadata: .object(meta), text: text))
         }
 
         let record: MemoryRecord
+        let corrects = optionalString(input, "corrects")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
+        let correctionReason = optionalString(input, "correction_reason")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
         do {
             record = try await memoryV2.store(
                 content: text,
                 source: "chat.commit_memory",
                 metadata: .object(meta),
-                supersedes: supersedes
+                supersedes: supersedes,
+                corrects: corrects,
+                correctionReason: correctionReason
             )
         } catch {
             // Keep the owner's refusal, cancellation or failure and its recovery.
@@ -602,7 +548,7 @@ extension SwiftToolDispatcher {
         // the tool — the write already succeeded.
         await emitMemoryCommitTrace(
             id: record.id,
-            kind: kind,
+            kind: record.memoryKind ?? kind ?? MemoryKindStamp.defaultKind,
             source: "chat.commit_memory",
             textLength: text.count
         )
@@ -612,16 +558,10 @@ extension SwiftToolDispatcher {
             await FluidContextToolScope.current?.recordAppliedMemoryCorrection(recordID: id, replacementID: record.id)
         }
 
-        // R13: first-class correction lineage. When the model names the memory
-        // this fact CORRECTS, mark the old row lifecycle=corrected with a
-        // lineage link to the new one (single transaction in storage). The
-        // outcome is reported honestly either way — a miss (unknown id /
-        // already-terminal row) is not a silent no-op.
+        // Replacement admission owns the lineage write; report its canonical
+        // outcome or the intent still owed by a cold save.
         var correctionField: JSONValue = .null
-        if let corrects = optionalString(input, "corrects")?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !corrects.isEmpty, !supersedes.contains(corrects) {
-            let reason = optionalString(input, "correction_reason")?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let corrects, !supersedes.contains(corrects) {
             if corrects == record.id {
                 correctionField = .object([
                     "corrected_id": .string(corrects),
@@ -630,11 +570,9 @@ extension SwiftToolDispatcher {
                 ])
             } else {
                 do {
-                    let marked = try await memoryV2.markCorrected(
-                        id: corrects,
-                        by: record.id,
-                        reason: (reason?.isEmpty == false) ? reason : nil
-                    )
+                    let pending = MemoryStorage.owedSupersessions(record.extras).contains { $0.targetId == corrects }
+                    let target = try await memoryV2.authorityRecord(id: corrects)
+                    let marked = target.map { Self.memoryMetadataValue($0.extras, key: "corrected_by") == .string(record.id) } ?? false
                     if marked {
                         await FluidContextToolScope.current?.recordAppliedMemoryCorrection(
                             recordID: corrects, replacementID: record.id
@@ -643,9 +581,11 @@ extension SwiftToolDispatcher {
                     correctionField = .object([
                         "corrected_id": .string(corrects),
                         "applied": .bool(marked),
+                        "pending_admission": .bool(pending && !marked),
                         "note": .string(marked
                             ? "Old memory marked corrected; it no longer surfaces in recall."
-                            : "Correction was not applied: the old memory or its replacement was missing or no longer active and recall-eligible. The save completed before this check; no correction lineage was written."),
+                            : (pending ? "Replacement saved pending vector admission; correction will apply atomically if the target still matches when admitted."
+                                : "Correction was not applied: the old memory was missing or no longer eligible.")),
                     ])
                 } catch {
                     // A storage failure is NOT the same as an ineligible id —
@@ -653,27 +593,25 @@ extension SwiftToolDispatcher {
                     correctionField = .object([
                         "corrected_id": .string(corrects),
                         "applied": .bool(false),
-                        "note": .string("Correction write failed (\(error)). The new fact was still saved; retry the correction."),
+                        "note": .string("The save completed; reading its correction outcome failed (\(error)). Inspect the canonical records before retrying."),
                     ])
                 }
             }
         }
 
-        // Return payload mirrors the daemon: {id, layer, status ok}.
         var payload: [String: JSONValue] = [
             "status": .string("ok"),
             "id": .string(record.id),
             "layer": .string(record.layer ?? "semantic"),
-            // Echo what she asked for, so the receipt proves a kept moment
-            // landed as one (her ask, 2026-09-02): the store is one layer;
-            // kind is what separates a moment from the corrections beside it.
-            "kind": .string(kind),
+            // Report the stored kind independently of its storage layer.
+            "kind": .string(record.memoryKind ?? kind ?? MemoryKindStamp.defaultKind),
         ]
-        if case .double(let valence)? = meta["valence"] { payload["valence"] = .double(valence) }
+        if let requestedKind, requestedKind != kind { payload["kind_requested"] = .string(requestedKind) }
         if case .object = correctionField { payload["correction"] = correctionField }
         if !supersedes.isEmpty {
             payload[admitted ? "superseded" : "supersedes_once_admitted"] = .array(supersedes.map(JSONValue.string))
         } else if let validatedTopics {
+            // Scope narrows automatic context; matching agreement subjects never imply replacement lineage.
             let topics = Set(validatedTopics.compactMap { value -> String? in
                 guard case .string(let topic) = value else { return nil }
                 return topic.lowercased()
@@ -691,7 +629,7 @@ extension SwiftToolDispatcher {
                     // Legacy agreements may have declared their subject only
                     // as tags. Exact labels are evidence; similarity is not.
                     guard rowKind == "instruction" || rowKind == "correction" else { return false }
-                    return topics.isDisjoint(with: MemoryStatusProjection.genericSubjects)
+                    return topics.isDisjoint(with: MemoryRecoveryReadout.genericSubjects)
                         && topics.isSubset(of: Set((row.tags ?? []).map { $0.lowercased() }))
                 }.sorted {
                     let left = MemoryRecallScoring.parseTimestamp($0.updatedAt ?? $0.createdAt) ?? .distantPast
@@ -702,7 +640,7 @@ extension SwiftToolDispatcher {
                 payload["existing_agreements"] = .array(existing.prefix(8).map { row in
                     var fields: [String: JSONValue] = ["id": .string(row.id), "recorded_at": .string(row.createdAt)]
                     if let provenance = Self.memoryProvenanceDisplay(row.extras) { fields["provenance"] = .string(provenance) }
-                    if let origin = MemoryMoments.recallOrigin(source: row.sourceRunId, metadata: row.extras) { fields["origin"] = origin }
+                    if let origin = MemoryMoments.recallOrigin(source: row.sourceRunId, metadata: row.extras, dataRoot: dataRoot) { fields["origin"] = origin }
                     if row.text.count <= remaining {
                         fields["text"] = .string(row.text)
                         fields.merge(MemoryDataProvenance.fields(in: row.extras)) { _, value in value }
@@ -736,19 +674,13 @@ extension SwiftToolDispatcher {
         return fields[key]
     }
 
-    /// Append a `memory.commit` row to `<dataRoot>/traces/events.jsonl` using
-    /// the same flock + appendJSONL path as ChatToolDispatchTracer /
-    /// LLMCallTelemetry. Non-fatal: logs to stderr on failure.
+    /// Record memory identity and measurements without the committed text.
     private func emitMemoryCommitTrace(
         id: String,
         kind: String,
         source: String,
         textLength: Int
     ) async {
-        let tracesPath = dataRoot
-            .appendingPathComponent("traces", isDirectory: true)
-            .appendingPathComponent("events.jsonl")
-        // Turn Inspector W1: correlate the commit to its turn. Unbound → "unknown".
         let turnId = TurnTraceContext.turnId ?? "unknown"
         let payload: JSONValue = .object([
             "id": .string(id),
@@ -757,28 +689,9 @@ extension SwiftToolDispatcher {
             "textLength": .int(Int64(textLength)),
             "turnId": .string(turnId),
         ])
-        // Turn Inspector W1: mirror onto the bus + per-day turn_traces lane
-        // (fire-and-forget; skipped when no turn is bound). Carries the memory
-        // id / kind / source / length only — never the committed text body.
-        TurnTraceBus.fireFromContext(kind: "memory.commit", payload: payload)
-        let row: JSONValue = .object([
-            "id": .string(UUID().uuidString.lowercased()),
-            "kind": .string("memory.commit"),
-            "title": .string("commit_memory"),
-            "status": .string("ok"),
-            "payload": payload,
-            "createdAt": .string(ISO8601DateFormatter().string(from: Date())),
-        ])
-        let persistence = SwiftNativePersistenceCore()
-        do {
-            try await appendPathOwnedJSONL(
-                row, to: tracesPath, using: persistence,
-                logLabel: "SwiftToolDispatcher.memoryCommit"
-            )
-        } catch {
-            FileHandle.standardError.write(
-                Data("SwiftToolDispatcher: memory.commit trace append failed: \(error)\n".utf8)
-            )
-        }
+        let event = TurnTraceEvent(kind: "memory.commit", title: "commit_memory", status: "ok",
+            payload: payload, createdAt: ISO8601DateFormatter().string(from: Date()), turnId: TurnTraceContext.turnId)
+        if TurnTraceContext.turnId != nil { TurnTraceBus.fire(event, on: TurnTraceContext.bus ?? .shared) }
+        else { await TurnTracePersistLane(dataRootOverride: dataRoot).append(event) }
     }
 }

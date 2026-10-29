@@ -1,28 +1,28 @@
 import Foundation
+import NativeAgentShared
 import Darwin
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TranscriptRows.swift` | `ContactThread` owns transcript JSONL serialization, durable append and exact-byte replacement for chat, compaction and archive restoration; writes share the owner lock and compound caller lock boundaries; session-index mutate provides checked read/edit/commit. `read` shares tail/incremental byte reads; `Line` retains each row's stamp, words, speaker and answers-id; `project` is the shared presentation; displayed contact speech alone calls `consume` |
+// Blueprint: | `TranscriptRows.swift` | `ContactThread` uses PersistenceCore's canonical JSONL serialization and owns durable append and exact-byte row edits/replacement for chat, compaction and archive restoration; writes share the owner lock and compound caller lock boundaries; session-index mutate provides checked read/edit/commit. `read` shares tail/incremental byte reads; `Line` retains each row's stamp, words, speaker and answers-id; `project` is the shared presentation; displayed contact speech alone calls `consume`; `DelegatedReplyEnvelope` shares reply/header syntax for search and presentation under caller-owned provenance admission |
 
 /// The shared storage and reading of conversations. Routing extends this owner;
 /// presentation never derives a speaker from the session that holds a row.
 public enum ContactThread {
     // Transcript JSONL is locally/off-disk backed up and inventoried under chat.
-    // Production export excludes it; ChatExportService writes Markdown and
+    // Production export excludes it; ChatExport writes Markdown and
     // DeviceSync publishes bounded person-visible rows.
 
     public static func append(_ row: JSONValue, to path: URL,
-                              using persistence: PersistenceCoreProtocol = SwiftNativePersistenceCore(),
                               uniqueRunID: String? = nil) async throws {
-        try await persistence.withFileLock(path) {
+        try await SwiftNativePersistenceCore.withFileLock(path) {
             if let uniqueRunID {
-                let rows = try await persistence.readJSONL(path)
+                let rows = try await SwiftNativePersistenceCore.readJSONL(path)
                 guard !rows.contains(where: {
                     if case .object(let existing) = $0 { return existing["runId"] == .string(uniqueRunID) }
                     return false
                 }) else { return }
             }
-            try await persistence.appendJSONLDurable(row, to: path)
+            try await SwiftNativePersistenceCore.appendJSONLDurable(row, to: path)
         }
     }
 
@@ -33,13 +33,29 @@ public enum ContactThread {
         }
     }
 
+    /// Edit one admitted row; every other byte, including blank lines and
+    /// final-newline state, belongs to the original transcript.
+    public static func editingRow(in bytes: Data, last: Bool = false,
+                                  matching: ([String: JSONValue]) -> Bool,
+                                  replacement: ([String: JSONValue]) throws -> [JSONValue]) throws -> Data? {
+        var lines = bytes.split(separator: 10, omittingEmptySubsequences: false).map { Data($0) }
+        let indices = last ? Array(lines.indices.reversed()) : Array(lines.indices)
+        for index in indices {
+            guard case .object(let row)? = try? JSONValue.parse(lines[index]), matching(row) else { continue }
+            lines[index] = Data(try replacement(row).map { try $0.serialize(pretty: false) }.joined(separator: "\n").utf8)
+            var edited = Data()
+            for i in lines.indices {
+                if i > 0 { edited.append(10) }
+                edited.append(lines[i])
+            }
+            return edited
+        }
+        return nil
+    }
+
     @discardableResult
     public static func replace(_ rows: [JSONValue], to path: URL) throws -> Data {
-        var bytes = Data()
-        for row in rows {
-            bytes.append(contentsOf: try row.serialize(pretty: false).utf8)
-            bytes.append(10)
-        }
+        let bytes = try SwiftNativePersistenceCore.serializeJSONL(rows)
         try replace(bytes, to: path)
         return bytes
     }
@@ -66,7 +82,6 @@ public enum ContactThread {
         public var source: String? { contact ? stamp.source : nil }
         public var steeredBy: [String] { stamp.steeredBy }
         public var speakers: [String] { contact ? [source ?? "another agent"] : [] }
-        public var dialogue: Bool { role == "user" || mine }
         public var human: Bool {
             role == "user" && metadata["mechanicalKind"] == nil && !mine && !contact
                 && Self.object(metadata["origin"])["authored"] != .string("agent")
@@ -78,33 +93,31 @@ public enum ContactThread {
             self.byPerson = false
         }
 
-        public init(_ row: [String: JSONValue], role: String? = nil, text: String? = nil, timestamp: String? = nil) {
-            let role = role ?? Self.string(row["role"]) ?? ""
-            let metadata = Self.object(row["metadata"])
-            let id = Self.string(row["id"]) ?? ""
-            self.init(text: text ?? Self.string(row["content"] ?? row["text"]) ?? "",
+        public init(_ row: [String: JSONValue], role: String? = nil, text: String? = nil, timestamp: String? = nil, metadata: [String: JSONValue]? = nil) {
+            let role = role ?? row["role"]?.stringValue ?? ""
+            let metadata = metadata ?? Self.object(row["metadata"])
+            let id = row["id"]?.stringValue ?? ""
+            self.init(text: text ?? (row["content"] ?? row["text"])?.stringValue ?? "",
                       stamp: TranscriptRowStamp(json: row["stamp"])
-                        ?? .of(id: id, role: role, metadata: metadata, rowSource: Self.string(row["source"])), id: id, role: role)
+                        ?? .of(id: id, role: role, metadata: metadata, rowSource: row["source"]?.stringValue), id: id, role: role)
             self.metadata = metadata
-            self.timestamp = timestamp ?? Self.string(row["createdAt"] ?? row["timestamp"])
+            self.timestamp = timestamp ?? (row["createdAt"] ?? row["timestamp"])?.stringValue
             self.date = self.timestamp.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst)
-            self.run = Self.string(row["runId"])
+            self.run = row["runId"]?.stringValue
             self.byPerson = metadata["byPerson"] == .bool(true)
-            self.answers = role == "user" ? Self.string(Self.object(metadata["origin"])["replyTo"]).flatMap {
+            self.answers = role == "user" ? Self.object(metadata["origin"])["replyTo"]?.stringValue.flatMap {
                 $0.hasPrefix("agent-conversation:") ? String($0.dropFirst("agent-conversation:".count)) : nil
             } : nil
-            self.sendID = role == "assistant" ? Self.string(metadata["dotClientUserMessageID"]) : nil
-            self.sendState = Self.string(metadata["sendState"])
+            self.sendID = role == "assistant" ? metadata["dotClientUserMessageID"]?.stringValue : nil
+            self.sendState = metadata["sendState"]?.stringValue
         }
 
         public init?(jsonl data: Data) {
-            guard case .object(let row)? = try? JSONValue.parse(data), case .string? = row["content"] else { return nil }
+            guard case .object(let row)? = try? JSONValue.parse(data),
+                  case .string? = row["content"] ?? row["text"] else { return nil }
             self.init(row)
         }
 
-        fileprivate static func string(_ value: JSONValue?) -> String? {
-            if case .string(let text)? = value { return text }; return nil
-        }
         fileprivate static func object(_ value: JSONValue?) -> [String: JSONValue] {
             if case .object(let fields)? = value { return fields }
             if case .string(let text)? = value, let parsed = try? JSONValue.parse(Data(text.utf8)) { return object(parsed) }
@@ -173,8 +186,8 @@ public enum ContactThread {
             if (style == .log || owner != nil) && row.text.isEmpty { return nil }
             // A recorded route can name unattested words for display alone;
             // `consume` still sees only the stamp ("another agent").
-            let source = row.source ?? [unattested, Line.string(Line.object(row.metadata["origin"])["agent"]),
-                Line.string(Line.object(row.metadata["envelope"])["agent"])].compactMap { $0 }
+            let source = row.source ?? [unattested, Line.object(row.metadata["origin"])["agent"]?.stringValue,
+                Line.object(row.metadata["envelope"])["agent"]?.stringValue].compactMap { $0 }
                 .first { !["", "agent", "peer", "another agent"].contains($0) }
             let name = source.map { (names[$0] ?? ($0.hasPrefix("peer:") ? unlistedPeer : nil) ?? $0)
                 + (row.source == nil ? " (unattested)" : "") } ?? "another agent"
@@ -199,5 +212,64 @@ public enum ContactThread {
             rows = rows.dropFirst()
         }
         return rows.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+/// Syntax shared by delegated-reply presentation and search. Callers decide
+/// whether recorded provenance admits interpreting a row as an envelope.
+public struct DelegatedReplyEnvelope: Sendable {
+    public let text: String
+    public let header: Substring
+    public let reply: String
+    public let codexTitle: String?
+    private let marked: Bool
+
+    public init(_ content: String) {
+        let text = BridgeRoutingPrefix.stripping(content)
+        self.text = text
+        let rows = text.split(separator: "\n", maxSplits: 2, omittingEmptySubsequences: false)
+        let notice = "this is an asynchronous completion event for work you delegated."
+        let title = rows.first.map { String($0).lowercased() } ?? ""
+        let codex = rows.count == 3 && rows[1].isEmpty
+            && rows[2].prefix(notice.count).lowercased() == notice && text.contains("\nCodex result:\n")
+            && ["codex replied to ", "codex wakeup failed", "codex turn stalled", "codex wakeup produced no reply"].contains(where: title.hasPrefix)
+        codexTitle = codex ? title : nil
+        let markers = ["--- Claude's reply ---", "--- OMP's reply ---"]
+        let marker = markers.compactMap { text.range(of: $0) }.min(by: { $0.lowerBound < $1.lowerBound })
+        let codexResult = text.range(of: "\nCodex result:\n")
+        let start = codex ? codexResult : marker
+        marked = start != nil
+        header = text[..<([marker?.lowerBound, codexResult?.lowerBound].compactMap { $0 }.min() ?? text.endIndex)]
+        var body = start.map { String(text[$0.upperBound...]) } ?? content
+        if codex {
+            body = body.trimmingCharacters(in: .whitespacesAndNewlines)
+            if body.hasSuffix(" to ask whether Codex finished."),
+               let footer = body.range(of: "\n\nNow give ", options: .backwards) {
+                body = String(body[..<footer.lowerBound])
+            }
+        } else if let end = body.range(of: "--- end reply ---") {
+            body = String(body[..<end.lowerBound])
+        }
+        reply = body.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public var isHistorical: Bool {
+        let head = text.prefix(400).lowercased()
+        return head.hasPrefix("originating message id:") || head.hasPrefix("[claude-wake]")
+            || head.hasPrefix("[omp-wake]") || head.hasPrefix("[delegation update from nativeagent")
+            || codexTitle != nil
+    }
+
+    public var searchText: String {
+        if marked { return reply }
+        let head = text.prefix(400).lowercased()
+        guard head.contains("automated completion event") || head.hasPrefix("originating message id:")
+            || head.hasPrefix("[claude-wake]") || head.hasPrefix("[omp-wake]") else { return text }
+        let keys = ["originating message id:", "topic:", "priority:", "status:", "duration:"]
+        return text.split(separator: "\n", omittingEmptySubsequences: false).drop { line in
+            let lowered = line.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return lowered.isEmpty || lowered.contains("automated completion event")
+                || lowered.hasPrefix("[claude-wake] [notice]") || keys.contains(where: lowered.hasPrefix)
+        }.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

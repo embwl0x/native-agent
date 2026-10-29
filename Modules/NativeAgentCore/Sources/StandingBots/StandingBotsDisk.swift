@@ -17,14 +17,12 @@ struct StandingBotsDisk: Sendable {
     /// Resolve the configured root once, but never follow links within bot storage,
     /// including dangling links. All disk entry points share this boundary.
     func validatePath(_ path: URL) throws {
-        let components = path.standardizedFileURL.pathComponents
-        let base = dataRoot.pathComponents
-        guard components.count > base.count, Array(components.prefix(base.count)) == base else {
+        guard let relative = NativeAgentWorkspaceRoot.relativePath(path.standardizedFileURL.path, under: dataRoot.path), !relative.isEmpty else {
             throw StandingBotsError.corruptStore("bot storage outside data root")
         }
         var current = dataRoot
-        for component in components.dropFirst(base.count) {
-            current.appendPathComponent(component)
+        for component in relative.split(separator: "/") {
+            current.appendPathComponent(String(component))
             var info = stat()
             if lstat(current.path, &info) == 0 {
                 guard info.st_mode & S_IFMT != S_IFLNK else {

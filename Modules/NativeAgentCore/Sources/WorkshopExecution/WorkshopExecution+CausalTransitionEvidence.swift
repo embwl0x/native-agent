@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import Procedures
 
 // Blueprint: | `WorkshopExecution+CausalTransitionEvidence.swift` | `SwiftNativeWorkshopRunner` causal/motor projections: payload-free canonical plan interpretation, provider accounting and evidence classes without fabricated execution |
 
@@ -9,7 +10,7 @@ extension SwiftNativeWorkshopRunner: MotorActionReadModelProviding {}
 /// Pure payload-free interpretation of an already-canonical Workshop plan.
 /// It classifies schema, shape, authority, and effect classes without
 /// fabricating timeline events or implying that any step executed.
-public struct WorkshopProcedureContractProjection: Sendable, Equatable {
+public struct WorkshopProcedureContractReadout: Sendable, Equatable {
     public let taskFamily: String
     public let inputClass: String
     public let parameterSchemaClass: String
@@ -20,41 +21,51 @@ public struct WorkshopProcedureContractProjection: Sendable, Equatable {
 }
 
 public extension SwiftNativeWorkshopRunner {
+    /// One rejection-free canonical trajectory must match the complete artifact.
+    internal func matchingProcedureTrajectory(
+        for artifact: DeclarativeProcedureArtifact, record: WorkshopExecutionRecord
+    ) async throws -> ProcedureTrajectory? {
+        let timeline = try await readTimeline(record.id)
+        let extraction = ProcedureTrajectoryExtractor.extract(Self.causalTransitionEvidence(
+            executionId: record.id, timeline: timeline, record: record
+        ))
+        guard extraction.rejections.isEmpty, extraction.trajectories.count == 1,
+              let trajectory = extraction.trajectories.first else { return nil }
+        let replay = ProcedureReplayEngine.replay(artifact, against: trajectory)
+        guard replay.status == .matched,
+              replay.matchedStepCount == artifact.transitionTable.count else { return nil }
+        return trajectory
+    }
+
     nonisolated static func procedureContractProjection(
-        record: WorkshopExecutionRecord
-    ) -> WorkshopProcedureContractProjection {
-        let schemaSource = record.plan.prefix(16).map {
+        plan: [WorkshopExecutionStep], trustRequired: String, triggerSource: String
+    ) -> WorkshopProcedureContractReadout {
+        let schemaSource = plan.prefix(16).map {
             procedureArgumentShape($0.args)
         }.joined(separator: ">")
-        // GRDB is transitively visible in this module (via CognitiveSubstrate), and its
-        // `SQL` string-interpolation + `joined(separator:)` overloads can win
-        // type inference over plain String for an unannotated interpolating
-        // closure. That hashes an unstable SQL debug description (it embeds a
-        // per-process context address) instead of the token string, making the
-        // identity nondeterministic. The explicit `-> String` return annotation
-        // is load-bearing; the pinned-identity test fences the exact digest.
-        let shapeSource = record.plan.prefix(16).map { step -> String in
+        // The explicit String result prevents SQL interpolation from hashing
+        // a process-specific debug description into the procedure identity.
+        let shapeSource = plan.prefix(16).map { step -> String in
             let tool = procedureToken(step.toolOrAction, maximum: 80) ?? "unknown"
             let autonomy = procedureToken(step.autonomy, maximum: 40) ?? "unknown"
             return "\(tool)|\(autonomy)"
         }.joined(separator: ">")
-        let authorityClass: String = switch record.trustRequired {
+        let authorityClass: String = switch trustRequired {
         case "none", "draft_auto": "low_risk"
         case "send_approval": "confirm_required"
         default: "high_risk"
         }
         let inputClass: String = {
-            // workshop_submit's "agent" is the same directed input as before
-            // it was told apart from the person's own, so procedures stay one family.
-            if record.triggerSource == "manual" || record.triggerSource == "agent" { return "manual" }
-            if record.triggerSource.hasPrefix("trigger:") { return "scheduled" }
-            if record.triggerSource == "golden_eval" { return "evaluation" }
+            // Person and agent submissions share the directed-input procedure family.
+            if triggerSource == "manual" || triggerSource == "agent" { return "manual" }
+            if triggerSource.hasPrefix("trigger:") { return "scheduled" }
+            if triggerSource == "golden_eval" { return "evaluation" }
             return "background"
         }()
-        let effects = Set(record.plan.prefix(16).map { step in
+        let effects = Set(plan.prefix(16).map { step in
             procedureExternalEffectClass(event: "step_completed", tool: step.toolOrAction)
         }).union(["local_control"])
-        return WorkshopProcedureContractProjection(
+        return WorkshopProcedureContractReadout(
             taskFamily: "workshop.routine",
             inputClass: inputClass,
             parameterSchemaClass: "typed_step_arguments_v1",
@@ -161,7 +172,9 @@ public extension SwiftNativeWorkshopRunner {
             (record?.plan ?? []).prefix(16).map { ($0.id, $0) },
             uniquingKeysWith: { first, _ in first }
         )
-        let contract = record.map(procedureContractProjection)
+        let contract = record.map {
+            procedureContractProjection(plan: $0.plan, trustRequired: $0.trustRequired, triggerSource: $0.triggerSource)
+        }
 
         for (index, value) in timeline.enumerated() {
             guard case .object(let row) = value,
@@ -169,16 +182,82 @@ public extension SwiftNativeWorkshopRunner {
             let occurredAt: String
             if case .string(let timestamp)? = row["ts"] { occurredAt = timestamp }
             else { occurredAt = "unknown" }
-            let interruptedState: String? = {
-                guard event == "execution_interrupted" else { return nil }
-                if case .string(let status)? = row["status"] { return status }
-                return "blocked_on_reconciliation"
-            }()
-            let afterState = interruptedState ?? workshopState(after: event, prior: priorState)
             let step: WorkshopExecutionStep? = {
                 guard case .string(let stepID)? = row["step_id"] else { return nil }
                 return planByStepID[stepID]
             }()
+            var afterState = priorState
+            var kind = event
+            var expectedEvidence: String?
+            var terminalClass: String?
+            var verificationClass = "unknown"
+            var actionKind: String?
+            var evidenceKind = "domain_event"
+            var checkpointClass: String?
+            switch event {
+            case "enqueued":
+                afterState = "queued"
+                expectedEvidence = "execution_start"
+                actionKind = "queue_admission"
+                evidenceKind = "queue_receipt"
+                checkpointClass = "trust_center_admission"
+            case "started":
+                afterState = "running"
+                expectedEvidence = "step_or_terminal_outcome"
+                actionKind = "execute_plan"
+                evidenceKind = "execution_claim"
+            case "step_completed":
+                afterState = "running"
+                expectedEvidence = "step_or_terminal_outcome"
+                verificationClass = "observed"
+                actionKind = procedureToken(step?.toolOrAction, maximum: 80).map { "tool:\($0)" }
+                evidenceKind = "step_receipt:unknown"
+                if case .string(let rawStatus)? = row["status"],
+                   let status = procedureToken(rawStatus, maximum: 40),
+                   ["succeeded", "partial", "skipped", "failed", "cancelled", "blocked_on_approval", "stubbed"].contains(status) {
+                    evidenceKind = "step_receipt:\(status)"
+                }
+            case "step_blocked_on_approval", "approval_decision":
+                let blocked = event == "step_blocked_on_approval"
+                afterState = blocked ? "blocked_on_approval" : "running"
+                expectedEvidence = blocked ? "approval_resolution" : "step_or_terminal_outcome"
+                verificationClass = "observed"
+                actionKind = blocked ? "approval_stage" : "approval_resume"
+                evidenceKind = blocked ? "approval_request" : "approval_decision"
+                checkpointClass = "canonical_approval_owner"
+            case "execution_interrupted":
+                if case .string(let status)? = row["status"] { afterState = status }
+                else { afterState = "blocked_on_reconciliation" }
+                expectedEvidence = afterState == "queued" ? "execution_start" : "domain_reconciliation"
+                actionKind = "release_claim"
+                evidenceKind = "claim_release_receipt"
+            case "completed":
+                afterState = "completed"
+                terminalClass = record?.verification?.status == .satisfied
+                    ? "verified_success" : "unverified_success"
+                switch record?.verification?.status {
+                case .satisfied: verificationClass = "verified"
+                case .failed: verificationClass = "failed"
+                case .unverified, nil: verificationClass = "unverified"
+                }
+                evidenceKind = "domain_verification"
+                checkpointClass = "domain_outcome_verification"
+            case "failed":
+                afterState = "failed"
+                terminalClass = "verified_failure"
+                verificationClass = "verified"
+                evidenceKind = "terminal_failure"
+            case "cancelled":
+                afterState = "cancelled"
+                terminalClass = "cancelled"
+                verificationClass = "not_applicable"
+                actionKind = "cancel"
+                evidenceKind = "cancellation_receipt"
+            case "planner_fallback", "approval_decision_ignored", "synthesize_untooled", "synthesize_validation_failed":
+                break
+            default:
+                kind = "domain_specific"
+            }
             let operationID = CausalTransitionEvidence.opaqueIdentity(
                 "\(executionId)|\(index)|\(event)|\(occurredAt)"
             )
@@ -186,31 +265,6 @@ public extension SwiftNativeWorkshopRunner {
             if priorState == nil, afterState != nil { outcome = "item_created" }
             else if priorState != afterState { outcome = "state_changed" }
             else { outcome = "state_unchanged" }
-            let terminalClass: String? = {
-                switch event {
-                case "completed":
-                    return record?.verification?.status == .satisfied
-                        ? "verified_success" : "unverified_success"
-                case "failed": return "verified_failure"
-                case "cancelled": return "cancelled"
-                default: return nil
-                }
-            }()
-            let verificationClass: String? = {
-                switch event {
-                case "completed":
-                    switch record?.verification?.status {
-                    case .satisfied: return "verified"
-                    case .failed: return "failed"
-                    case .unverified, nil: return "unverified"
-                    }
-                case "failed": return "verified"
-                case "cancelled": return "not_applicable"
-                case "step_completed", "step_blocked_on_approval", "approval_decision":
-                    return "observed"
-                default: return "unknown"
-                }
-            }()
             let latencyMilliseconds: Int? = {
                 guard terminalClass != nil,
                       let createdAt = record?.createdAt,
@@ -231,12 +285,10 @@ public extension SwiftNativeWorkshopRunner {
                 operationId: operationID,
                 occurredAt: occurredAt,
                 itemIdentity: itemIdentity,
-                kind: recognizedWorkshopEvent(event),
+                kind: kind,
                 beforeState: priorState,
                 afterState: afterState,
-                expectedNextEvidence: event == "execution_interrupted"
-                    ? (afterState == "queued" ? "execution_start" : "domain_reconciliation")
-                    : expectedWorkshopEvidence(after: event),
+                expectedNextEvidence: expectedEvidence,
                 outcome: outcome,
                 trajectoryID: itemIdentity,
                 parentOperationID: priorOperationID,
@@ -253,9 +305,9 @@ public extension SwiftNativeWorkshopRunner {
                 parameterSchemaClass: contract?.parameterSchemaClass,
                 parameterSchemaIdentity: contract?.parameterSchemaIdentity,
                 procedureShapeIdentity: contract?.procedureShapeIdentity,
-                actionKind: procedureActionKind(event: event, tool: step?.toolOrAction),
-                evidenceKind: procedureEvidenceKind(event: event, row: row),
-                checkpointClass: procedureCheckpointClass(event: event),
+                actionKind: actionKind,
+                evidenceKind: evidenceKind,
+                checkpointClass: checkpointClass,
                 retryClass: event == "execution_interrupted"
                     ? (afterState == "queued" ? "deterministic_resume" : "reconciliation_required") : nil,
                 retryCount: terminalClass == nil ? nil : record?.rerunCount,
@@ -308,36 +360,6 @@ public extension SwiftNativeWorkshopRunner {
         return (providerTotal, removableTotal)
     }
 
-    private nonisolated static func workshopState(after event: String, prior: String?) -> String? {
-        switch event {
-        case "enqueued": return "queued"
-        case "started", "step_completed", "approval_decision": return "running"
-        case "step_blocked_on_approval": return "blocked_on_approval"
-        case "completed": return "completed"
-        case "failed": return "failed"
-        case "cancelled": return "cancelled"
-        default: return prior
-        }
-    }
-
-    private nonisolated static func recognizedWorkshopEvent(_ event: String) -> String {
-        let recognized: Set<String> = [
-            "planner_fallback", "enqueued", "started", "step_completed",
-            "step_blocked_on_approval", "approval_decision", "approval_decision_ignored",
-            "execution_interrupted", "synthesize_untooled",
-            "synthesize_validation_failed", "completed", "failed", "cancelled",
-        ]
-        return recognized.contains(event) ? event : "domain_specific"
-    }
-
-    private nonisolated static func expectedWorkshopEvidence(after event: String) -> String? {
-        switch event {
-        case "enqueued", "execution_interrupted": return "execution_start"
-        case "started", "step_completed", "approval_decision": return "step_or_terminal_outcome"
-        case "step_blocked_on_approval": return "approval_resolution"
-        default: return nil
-        }
-    }
 
     private nonisolated static func workshopMotorPhase(_ state: String?) -> String? {
         switch state {
@@ -351,55 +373,6 @@ public extension SwiftNativeWorkshopRunner {
         }
     }
 
-    private nonisolated static func procedureActionKind(event: String, tool: String?) -> String? {
-        switch event {
-        case "enqueued": return "queue_admission"
-        case "started": return "execute_plan"
-        case "step_completed":
-            guard let tool = procedureToken(tool, maximum: 80) else { return nil }
-            return "tool:\(tool)"
-        case "step_blocked_on_approval": return "approval_stage"
-        case "approval_decision": return "approval_resume"
-        case "execution_interrupted": return "release_claim"
-        case "cancelled": return "cancel"
-        default: return nil
-        }
-    }
-
-    private nonisolated static func procedureEvidenceKind(
-        event: String,
-        row: [String: JSONValue]
-    ) -> String? {
-        switch event {
-        case "enqueued": return "queue_receipt"
-        case "started": return "execution_claim"
-        case "step_completed":
-            if case .string(let rawStatus)? = row["status"],
-               let status = procedureToken(rawStatus, maximum: 40),
-               ["succeeded", "failed", "cancelled", "blocked_on_approval", "stubbed"]
-                .contains(status) {
-                return "step_receipt:\(status)"
-            }
-            return "step_receipt:unknown"
-        case "step_blocked_on_approval": return "approval_request"
-        case "approval_decision": return "approval_decision"
-        case "execution_interrupted": return "claim_release_receipt"
-        case "completed": return "domain_verification"
-        case "failed": return "terminal_failure"
-        case "cancelled": return "cancellation_receipt"
-        default: return "domain_event"
-        }
-    }
-
-    private nonisolated static func procedureCheckpointClass(event: String) -> String? {
-        switch event {
-        case "enqueued": return "trust_center_admission"
-        case "step_blocked_on_approval", "approval_decision":
-            return "canonical_approval_owner"
-        case "completed": return "domain_outcome_verification"
-        default: return nil
-        }
-    }
 
     private nonisolated static func procedureExternalEffectClass(
         event: String,

@@ -1,8 +1,6 @@
 // The Trust Center / Setup memory switches, read at the point of use.
 //
-// The 2026-09-04 settings audit found six memoryPolicy keys
-// round-tripped to <dataRoot>/trust/policy.json and nothing in the runtime ever
-// read them. This is the one reader every gate goes through.
+// Every memory gate reads memoryPolicy through this reader.
 //
 // FRESH ON EVERY CALL, deliberately. There is no launch-time snapshot and no
 // cache: a flip in Setup or Trust Center is written atomically to policy.json
@@ -29,13 +27,7 @@ public enum MemoryPolicyGate {
     /// file, missing block or missing key → `fallback`; unavailable, malformed
     /// or otherwise damaged saved authority → false.
     ///
-    /// 2026-09-13: this validated only the memoryPolicy block, so a policy
-    /// TrustCenter rejects WHOLE — `{"securityPolicy": false}` — closed
-    /// canonical trust while every memory feature still read as on (and the
-    /// startup KG backfill ran). It now goes through the shared
-    /// `SavedTrustPolicyAuthority` predicate, the same one TrustCenter's own
-    /// shape validation and the dream gate use, so damage anywhere in the
-    /// saved policy fails closed here too.
+    /// Shared `SavedTrustPolicyAuthority` validation fails closed on damage anywhere in the saved policy.
     public static func isEnabled(
         _ key: String,
         default fallback: Bool,
@@ -78,19 +70,9 @@ public enum MemoryPolicyGate {
         isEnabled("cross_session_recall", default: true, dataRoot: dataRoot)
     }
 
-    /// Settings ▸ "Nightly memory consolidation" (the weekly card).
-    public static func consolidationEnabled(dataRoot: URL? = nil) -> Bool {
-        isEnabled("consolidation_enabled", default: true, dataRoot: dataRoot)
-    }
-
-    /// Settings ▸ "Recurring memories are proposed as facts" (review required).
+    /// Trusted facts are accepted immediately; untrusted facts wait for review.
     public static func adaptivePromotionEnabled(dataRoot: URL? = nil) -> Bool {
         isEnabled("adaptive_promotion", default: true, dataRoot: dataRoot)
-    }
-
-    /// Settings ▸ "Memory hygiene".
-    public static func hygieneEnabled(dataRoot: URL? = nil) -> Bool {
-        isEnabled("hygiene_enabled", default: true, dataRoot: dataRoot)
     }
 
     /// The one sentence every knowledge-graph surface says when the switch is

@@ -5,30 +5,7 @@ import ToolRegistry
 
 // Blueprint: | `CapabilityTrust.swift` | `SwiftNativeCapabilityTrust`: checked capability trust/catalog values, scoring, evaluation and display projections |
 
-// MARK: - Subsystem #12b: Capability Trust Network
-//
-// Routes ported from the retired native_agentd surface:
-//   GET  /v1/capability-trust           → runtime.capability_trust_network()
-//
-//   POST /v1/capability-trust/evaluate  → runtime.evaluate_capability_trust(body)
-//
-//
-// Wave 13 disposition (2026-05-31): capabilityTrust is now FLIPPABLE.
-// All 9 dynamic prereqs have closed:
-//   1-7: list_skills / persona_skill_manifest_records / list_tools /
-//        list_workflows / list_capability_catalog
-//        (CapabilityRecords+Dynamic.swift; the manifest_registered_skills
-//        pass re-read the installed skills and is gone)
-//   8-9: catalog_sources / capability_trust_roots (ported as the two
-//        on-disk-merge actors below).
-//
-// `SwiftNativeCapabilityTrust` now serves `capability_trust_network()` and
-// `evaluate_capability_trust()` in-process. It
-// reuses `capabilityRecordsFull(...)` for the record list and the inline
-// `SwiftNativeCatalogSources` / `SwiftNativeCapabilityTrustRoots` actors
-// for the two merge-and-write sources. Side effects intentionally omitted:
-// the old evaluate() appended to `catalog/trust/events.jsonl` and called
-// `record_trace`; SwiftNative skips both to avoid double-write.
+// Capability trust is a checked metadata projection, without evaluation writes.
 
 // MARK: - Wire types
 //
@@ -99,22 +76,6 @@ public struct CapabilityPackInstall: Sendable, Codable, Hashable, Identifiable {
     public var rolledBackAt: String?
 }
 
-public struct CapabilityUpdateRecord: Sendable, Codable, Hashable, Identifiable {
-    public var id: String
-    public var packId: String?
-    public var installedVersion: String?
-    public var availableVersion: String?
-    public var status: String?
-    public var sourceId: String?
-}
-
-public struct CapabilityUpdateCheck: Sendable, Codable, Hashable {
-    public var status: String
-    public var updates: [CapabilityUpdateRecord]
-    public var sourceCount: Int?
-    public var createdAt: String?
-}
-
 // Checked projections of the catalog owner's rows: a present field of the
 // wrong type makes the row malformed, and a malformed row fails the read.
 extension CapabilityCatalogSource {
@@ -148,23 +109,6 @@ extension CapabilityPackInstall {
             version: try row.optionalString("version"), status: try row.string("status"),
             signature: try row.optionalString("signature"), installedAt: try row.optionalString("installedAt"),
             rolledBackAt: try row.optionalString("rolledBackAt"))
-    }
-}
-
-extension CapabilityUpdateCheck {
-    public init(row: JSONValue) throws {
-        let row = try JSONRow(row)
-        self.init(
-            status: try row.string("status"),
-            updates: try row.array("updates").map { value in
-                let update = try JSONRow(value)
-                return CapabilityUpdateRecord(
-                    id: try update.string("id"), packId: try update.optionalString("packId"),
-                    installedVersion: try update.optionalString("installedVersion"),
-                    availableVersion: try update.optionalString("availableVersion"),
-                    status: try update.optionalString("status"), sourceId: try update.optionalString("sourceId"))
-            },
-            sourceCount: try row.optionalInt("sourceCount"), createdAt: try row.optionalString("createdAt"))
     }
 }
 
@@ -248,16 +192,9 @@ public enum CapabilityTrustError: Error, LocalizedError {
     }
 }
 
-// MARK: - Protocol
-
-public protocol CapabilityTrustProtocol: Sendable {
-    func network() async throws -> CapabilityTrustNetwork
-    func evaluate(capabilityId: String) async throws -> CapabilityTrustEvaluation
-}
-
-// MARK: - Pure scoring (port of capability_trust_score, the retired daemon)
+// MARK: - Pure scoring
 //
-// Verified byte-equivalent to the Python algorithm: base 0.45, +0.15 if
+// Base 0.45, +0.15 if
 // sourcePackId/provenance present, +0.20 if signature present, +0.10 if
 // status ∈ {active, installed, ready}, +0.10 if lastUsedAt/useCount present,
 // -0.20 if riskClass ∈ {risky_tool, external_write, external_send}. Clamp
@@ -277,15 +214,7 @@ public func scoreCapabilityRecord(_ record: [String: JSONValue]) -> CapabilityTr
     var reasons = ["Base local capability record."]
 
     func present(_ key: String) -> Bool {
-        switch record[key] {
-        case .none, .null: return false
-        case .string(let s): return !s.isEmpty
-        case .int(let i): return i != 0
-        case .double(let d): return d != 0
-        case .bool(let b): return b
-        case .array(let a): return !a.isEmpty
-        case .object(let o): return !o.isEmpty
-        }
+        record[key]?.isTruthy == true
     }
 
     if present("sourcePackId") || present("provenance") {
@@ -363,114 +292,43 @@ public struct CapabilityRecord: Codable, Sendable, Hashable, Identifiable {
 
     /// Typed read of the dynamic catalog/intent row, without a JSON byte round-trip.
     /// The mounted catalog requires both identity and kind; malformed optional
-    /// fields reject the row just as its former Codable projection did.
+    /// fields reject the row.
     public init(catalogRow row: [String: JSONValue]) throws {
-        struct Key: CodingKey {
-            let stringValue: String
-            var intValue: Int? { nil }
-            init(stringValue: String) { self.stringValue = stringValue }
-            init?(intValue: Int) { return nil }
-        }
-        func value<T>(_ key: String, _ read: (JSONValue) -> T?) throws -> T? {
-            guard let raw = row[key], raw != .null else { return nil }
-            guard let result = read(raw) else {
-                throw DecodingError.typeMismatch(T.self,
-                    .init(codingPath: [Key(stringValue: key)], debugDescription: "Invalid capability field: \(key)"))
-            }
-            return result
-        }
-        func string(_ key: String) throws -> String? {
-            try value(key) { if case .string(let s) = $0 { return s }; return nil }
-        }
-        func requiredString(_ key: String) throws -> String {
-            let codingKey = Key(stringValue: key)
-            guard row[key] != nil else {
-                throw DecodingError.keyNotFound(codingKey,
-                    .init(codingPath: [], debugDescription: "Missing capability field: \(key)"))
-            }
-            guard let result = try string(key) else {
-                throw DecodingError.valueNotFound(String.self,
-                    .init(codingPath: [codingKey], debugDescription: "Null capability field: \(key)"))
-            }
-            return result
-        }
-        func strings(_ key: String) throws -> [String]? {
-            try value(key) { raw in
-                guard case .array(let values) = raw else { return nil }
-                let strings = values.compactMap { if case .string(let s) = $0 { return s }; return nil }
-                return strings.count == values.count ? strings : nil
-            }
-        }
-        let id = try requiredString("id")
-        let kind = try requiredString("kind")
+        let row = try JSONRow(.object(row))
         self.init(
-            id: id, sourceId: try string("sourceId"), name: try string("name"),
-            kind: kind, status: try string("status"), description: try string("description"),
-            triggers: try strings("triggers"), permissions: try strings("permissions"),
-            riskClass: try string("riskClass"),
-            autoload: try value("autoload") { if case .bool(let b) = $0 { return b }; return nil },
-            useCount: try value("useCount") {
-                switch $0 {
-                case .int(let i): return Int(exactly: i)
-                case .double(let d): return Int(exactly: d)
-                default: return nil
-                }
-            },
-            lastUsedAt: try string("lastUsedAt"), updatedAt: try string("updatedAt")
+            id: try row.string("id"), sourceId: try row.optionalString("sourceId"), name: try row.optionalString("name"),
+            kind: try row.string("kind"), status: try row.optionalString("status"), description: try row.optionalString("description"),
+            triggers: try row.optionalStrings("triggers"), permissions: try row.optionalStrings("permissions"),
+            riskClass: try row.optionalString("riskClass"), autoload: try row.optionalBool("autoload"),
+            useCount: try row.optionalInt("useCount"),
+            lastUsedAt: try row.optionalString("lastUsedAt"), updatedAt: try row.optionalString("updatedAt")
         )
     }
 }
 
-// MARK: - Sources #8/#9: catalog_sources + capability_trust_roots
-//
-// The two on-disk-merge actors (`SwiftNativeCatalogSources` and
-// `SwiftNativeCapabilityTrustRoots`) live in CapabilityCatalog.swift — both
-// wrap their read-merge-write in `persistence.withFileLock` symmetric with
-// the daemon's `with file_lock(...)` block at the retired daemon and :6661.
+// The network joins capabilityRecordsFull with catalog sources and trust roots.
 
-
-// MARK: - SwiftNative impl (wave 13 full in-process port)
-//
-// Builds the network from `capabilityRecordsFull(...)` (the 9-source
-// aggregator) + the two on-disk-merge actors above. No daemon round-trip.
-
-public actor SwiftNativeCapabilityTrust: CapabilityTrustProtocol {
+public actor SwiftNativeCapabilityTrust {
     private let dataRoot: URL
-    private let personaRoot: URL?
-    private let persistence: any PersistenceCoreProtocol
     private let clock: @Sendable () -> Date
-    private let catalogSourcesActor: SwiftNativeCatalogSources
-    private let trustRootsActor: SwiftNativeCapabilityTrustRoots
     private let connectorActionStatuses: @Sendable () async throws -> [String: String]
 
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        personaRoot: URL? = nil,
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
         clock: @escaping @Sendable () -> Date = { Date() },
         connectorActionStatuses: @escaping @Sendable () async throws -> [String: String]
     ) {
         self.dataRoot = dataRoot
-        self.personaRoot = personaRoot
-        self.persistence = persistence
         self.clock = clock
-        self.catalogSourcesActor = SwiftNativeCatalogSources(
-            dataRoot: dataRoot, persistence: persistence, clock: clock
-        )
-        self.trustRootsActor = SwiftNativeCapabilityTrustRoots(
-            dataRoot: dataRoot, persistence: persistence, clock: clock
-        )
         self.connectorActionStatuses = connectorActionStatuses
     }
 
-    /// Byte-for-byte port of the retired daemon capability_trust_network().
+    /// Score the first 200 capability records for display.
     public func network() async throws -> CapabilityTrustNetwork {
         let nowISO = SwiftNativeManifestSigner.isoTimestamp(clock())
         let allRecords = try await capabilityRecordsFull(
             dataRoot: dataRoot,
-            personaRoot: personaRoot,
             nowISO: nowISO,
-            persistence: persistence,
             connectorActionStatuses: connectorActionStatuses
         )
         let sliced = Array(allRecords.prefix(200))
@@ -488,24 +346,24 @@ public actor SwiftNativeCapabilityTrust: CapabilityTrustProtocol {
             default:          untrustedCount += 1
             }
             records.append(CapabilityTrustRecord(
-                id: jsonOptionalStringField(record, "id") ?? "",
-                name: jsonOptionalStringField(record, "name"),
-                kind: jsonOptionalStringField(record, "kind"),
-                status: jsonOptionalStringField(record, "status"),
-                riskClass: jsonOptionalStringField(record, "riskClass"),
+                id: record["id"]?.stringValue ?? "",
+                name: record["name"]?.stringValue,
+                kind: record["kind"]?.stringValue,
+                status: record["status"]?.stringValue,
+                riskClass: record["riskClass"]?.stringValue,
                 trustScore: trust.score,
                 trustTier: tier,
                 reasons: trust.reasons
             ))
         }
 
-        let rootDicts = try await trustRootsActor.capabilityTrustRoots()
-        let sourceDicts = try await catalogSourcesActor.catalogSources()
+        let rootDicts = try CapabilityCatalogStoreReader.capabilityTrustRoots(dataRoot: dataRoot, clock: clock)
+        let sourceDicts = try CapabilityCatalogStoreReader.catalogSources(dataRoot: dataRoot, clock: clock)
 
         return CapabilityTrustNetwork(
             status: "ready",
             roots: rootDicts.map(decodeTrustRoot),
-            sources: sourceDicts.map(decodeCatalogSource),
+            sources: try sourceDicts.map { try CapabilityCatalogSource(row: .object($0)) },
             records: records,
             summary: CapabilityTrustSummary(
                 trusted: trustedCount, review: reviewCount, untrusted: untrustedCount
@@ -514,21 +372,17 @@ public actor SwiftNativeCapabilityTrust: CapabilityTrustProtocol {
         )
     }
 
-    /// Byte-for-byte port of the retired daemon evaluate_capability_trust().
-    /// Side effects (events.jsonl append + record_trace) intentionally omitted —
-    /// the daemon's route still performs the audit write when the flag is OFF.
+    /// Return a read-only score for a capability ID or source ID.
     public func evaluate(capabilityId: String) async throws -> CapabilityTrustEvaluation {
         let nowISO = SwiftNativeManifestSigner.isoTimestamp(clock())
         let records = try await capabilityRecordsFull(
             dataRoot: dataRoot,
-            personaRoot: personaRoot,
             nowISO: nowISO,
-            persistence: persistence,
             connectorActionStatuses: connectorActionStatuses
         )
         let match = records.first { rec in
-            let id = jsonOptionalStringField(rec, "id") ?? ""
-            let sid = jsonOptionalStringField(rec, "sourceId") ?? ""
+            let id = rec["id"]?.stringValue ?? ""
+            let sid = rec["sourceId"]?.stringValue ?? ""
             return id == capabilityId || sid == capabilityId
         }
         guard let record = match else {
@@ -537,8 +391,8 @@ public actor SwiftNativeCapabilityTrust: CapabilityTrustProtocol {
         let trust = scoreCapabilityRecord(record)
         let tier = capabilityTrustTier(forScore: trust.score)
         return CapabilityTrustEvaluation(
-            id: jsonOptionalStringField(record, "id") ?? capabilityId,
-            name: jsonOptionalStringField(record, "name"),
+            id: record["id"]?.stringValue ?? capabilityId,
+            name: record["name"]?.stringValue,
             trustScore: trust.score,
             trustTier: tier,
             reasons: trust.reasons,
@@ -549,50 +403,18 @@ public actor SwiftNativeCapabilityTrust: CapabilityTrustProtocol {
 
 // MARK: - JSONValue → struct decoders (file-local)
 
-private func jsonOptionalStringField(_ obj: [String: JSONValue], _ key: String) -> String? {
-    if case .string(let s)? = obj[key] { return s }
-    return nil
-}
-
 private func decodeTrustRoot(_ dict: [String: JSONValue]) -> CapabilityTrustRoot {
     CapabilityTrustRoot(
-        id: jsonOptionalStringField(dict, "id") ?? "",
-        name: jsonOptionalStringField(dict, "name") ?? "",
-        kind: jsonOptionalStringField(dict, "kind"),
-        fingerprint: jsonOptionalStringField(dict, "fingerprint"),
-        status: jsonOptionalStringField(dict, "status"),
-        createdAt: jsonOptionalStringField(dict, "createdAt"),
-        updatedAt: jsonOptionalStringField(dict, "updatedAt")
+        id: dict["id"]?.stringValue ?? "",
+        name: dict["name"]?.stringValue ?? "",
+        kind: dict["kind"]?.stringValue,
+        fingerprint: dict["fingerprint"]?.stringValue,
+        status: dict["status"]?.stringValue,
+        createdAt: dict["createdAt"]?.stringValue,
+        updatedAt: dict["updatedAt"]?.stringValue
     )
 }
 
-private func decodeCatalogSource(_ dict: [String: JSONValue]) -> CapabilityCatalogSource {
-    CapabilityCatalogSource(
-        id: jsonOptionalStringField(dict, "id") ?? "",
-        name: jsonOptionalStringField(dict, "name") ?? "",
-        kind: jsonOptionalStringField(dict, "kind"),
-        url: jsonOptionalStringField(dict, "url"),
-        status: jsonOptionalStringField(dict, "status"),
-        trustedRootId: jsonOptionalStringField(dict, "trustedRootId"),
-        lastCheckedAt: jsonOptionalStringField(dict, "lastCheckedAt"),
-        createdAt: jsonOptionalStringField(dict, "createdAt"),
-        updatedAt: jsonOptionalStringField(dict, "updatedAt")
-    )
-}
-
-// MARK: - Factory
-
-/// Wave 13: SwiftNative is a full in-process port. No daemon round-trip.
-/// Records flow through `capabilityRecordsFull` (9 sources); roots/sources
-/// flow through the two on-disk-merge actors with symmetric flock against
-/// the Python side. The Python-backed impl stays available as the rollback
-/// when `capabilityTrust` is absent from `NATIVE_AGENT_SWIFT_SUBSYSTEMS`.
-public func makeCapabilityTrust(
-    dataRoot: URL = PersistenceCore.defaultDataRoot(),
-    connectorActionStatuses: @escaping @Sendable () async throws -> [String: String]
-) -> any CapabilityTrustProtocol {
-    return SwiftNativeCapabilityTrust(dataRoot: dataRoot, connectorActionStatuses: connectorActionStatuses)
-}
 extension CapabilityRecord {
     /// One case style for every row: sentence case, proper nouns kept.
     public static func title(for capability: CapabilityRecord) -> String {
@@ -653,63 +475,19 @@ extension CapabilityRecord {
     ]
 
     private static func rawTitle(for capability: CapabilityRecord) -> String {
-        switch capability.sourceId {
-        case "mac_assistant_watch_setup": return "Watch for changes on your Mac"
-        case "chat_sessions": return "Conversations"
-        case "memory_system": return "Memory"
-        case "personality_engine": return "Personality"
-        case "skills": return "Skills"
-        case "runnable_tools": return "Added tools"
-        case "capability_foundry": return "Available capabilities"
-        case "proactive_autonomy": return "Suggestions and updates"
-        case "workflows": return "Tasks with several steps"
-        case "agent_swarm": return "Help from other assistants"
-        case "research_browser": return "Web research"
-        case "connectors": return "Connected apps and accounts"
-        case "trust_doctor": return "Trust and diagnostics"
-        case "nextgen_runtime": return "Feature readiness"
-        case "native_mac_power": return "Mac controls"
-        case "eval_release_ops": return "Update checks and support"
-        case "mac.jxa": return "Automate Mac apps with JavaScript"
-        default:
-            let name = (capability.name ?? capability.id).withoutStaleNextGenPhaseCopy
-            // A skill has no title of its own, only its handle: "after-card-verify"
-            // reads "After card verify", not "After-card-verify".
-            guard capability.kind == "skill", !name.contains(" ") else { return name }
-            return name.replacingOccurrences(of: "-", with: " ").replacingOccurrences(of: "_", with: " ")
-        }
+        if capability.sourceId == "mac.jxa" { return "Automate Mac apps with JavaScript" }
+        let name = (capability.name ?? capability.id)
+        // A skill handle like "after-card-verify" reads "After card verify".
+        guard capability.kind == "skill", !name.contains(" ") else { return name }
+        return name.replacingOccurrences(of: "-", with: " ").replacingOccurrences(of: "_", with: " ")
     }
 
     public static func description(for capability: CapabilityRecord) -> String? {
-        let id = capability.sourceId ?? String(capability.id.split(separator: ":").last ?? "")
-        if capability.kind == "tool" { return ChatCatalogTool.toolDescription(id) }
-        switch id {
-        case "command_center": return "See recent activity and create tasks."
-        case "mac_assistant_watch_setup": return "Choose which apps and events I can watch for you."
-        case "chat_sessions": return "Keep separate conversations and return to them later."
-        case "memory_system": return "Find, organize, and manage what I remember."
-        case "personality_engine": return "Choose how I speak and work with you."
-        case "skills": return "Run reusable routines for familiar tasks."
-        case "runnable_tools": return "Add tools that help me complete tasks."
-        case "capability_foundry": return "See the skills, tools, and connections I can use."
-        case "proactive_autonomy": return "Let me suggest useful next steps and keep you updated."
-        case "workflows": return "View saved definitions for tasks with several steps."
-        case "agent_swarm": return "Ask several assistants to help with a task."
-        case "research_browser": return "Research topics and read web pages."
-        case "connectors": return "Connect your accounts and apps."
-        case "trust_doctor": return "Manage permissions and check the app's health."
-        case "auto_improvement": return "Review and manage work to improve the app."
-        case "nextgen_runtime": return "See which app features are ready and what needs attention."
-        case "native_mac_power": return "Use Mac apps, controls, and notifications."
-        case "eval_release_ops": return "Check updates and prepare information for support."
-        case "after-card-verify":
-            return "Check that a skill you approved really went live, running the exact version you approved."
-        case "autonomous-delegation-loop":
-            return "Run Desk campaigns step by step: hand work off, recover it, check it independently, and go on to the next step without stopping to ask."
-        default:
-            guard let description = capability.description?.withoutStaleNextGenPhaseCopy else { return nil }
-            return capability.kind == "skill" ? plainSkillLine(description) : description
+        if capability.kind == "tool" {
+            return capability.description.flatMap { $0.isEmpty ? nil : $0 } ?? "An additional tool I can use for your tasks."
         }
+        guard let description = capability.description else { return nil }
+        return capability.kind == "skill" ? plainSkillLine(description) : description
     }
 
     /// A skill's description is written for me to pick it by ("Use this when

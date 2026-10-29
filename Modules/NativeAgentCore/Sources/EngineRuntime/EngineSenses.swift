@@ -1,17 +1,22 @@
+import AuthoredCapabilities
+import Cognition
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import Observation
+import PersistenceCore
 import Senses
-// Blueprint: | `EngineSenses.swift` | One engine Senses projection for registry records, news and interactive views through `LatestRead`, committed switches through `write`; one window sampler while Senses or Work is visible |
+// Blueprint: | `EngineSenses.swift` | One engine Senses projection for registry records, actual source/helper watches, news and interactive views through `LatestRead`, committed switches through `write`; visible-window observation of canonical ability files and news/view invalidations, without idle sampling |
 
-/// The Work pane and Senses page read this engine projection. Its owners have
-/// no complete push contract, so the window samples while either is visible.
+/// The Work pane and Senses page read this engine projection only when its
+/// owners change; observation ends when both leave the window.
 @MainActor
 @Observable
 public final class SensesFacade {
     public private(set) var records: [SenseRecord] = []
     public private(set) var surfaceNames: [SenseCorner: String] = [:]
     public private(set) var news: [SenseNews] = []
+    public private(set) var watches: [SenseLiveWatch] = []
     public private(set) var interactiveView: SenseInteractiveView?
     public private(set) var isWired = false
     public private(set) var loaded = false
@@ -35,37 +40,41 @@ public final class SensesFacade {
                 readError = "Senses registry unavailable: \(error.localizedDescription)"
             }
             if news != next.news { news = next.news }
+            if watches != next.watches { watches = next.watches }
             let view = next.view.flatMap { $0.isCurrent(in: records) ? $0 : nil }
             if interactiveView != view { interactiveView = view }
             loaded = true
         })
     }
 
-    private func readPresentation() async -> (wired: Bool, registry: Result<([SenseRecord], [SenseCorner: String]), Error>, news: [SenseNews], view: SenseInteractiveView?) {
+    private func readPresentation() async -> (wired: Bool, registry: Result<([SenseRecord], [SenseCorner: String]), Error>, news: [SenseNews], watches: [SenseLiveWatch], view: SenseInteractiveView?) {
         let hub = SensesHub.shared
         let wired = hub.registry != nil
         async let news = SenseNewsBoard.shared.latest(limit: SenseNewsBoard.capacity)
         async let view = SenseNewsBoard.shared.interactiveView()
+        async let watches = hub.liveWatches()
         let registry: Result<([SenseRecord], [SenseCorner: String]), Error>
         do {
             registry = .success(try await hub.presentationRecords())
         } catch {
             registry = .failure(error)
         }
-        return (wired, registry, Array((await news).prefix(12)), await view)
+        return (wired, registry, Array((await news).prefix(12)), await watches, await view)
     }
 
-    public func observe() async {
-        while !Task.isCancelled {
-            await refresh()
-            do { try await Task.sleep(for: .seconds(5)) } catch { return }
-        }
+    public func observe(dataRoot: URL) async {
+        let root = AbilityStore(dataRoot: dataRoot).root
+        await EventDeadlinePhysiology.refreshOnChanges(
+            paths: [root, root.appendingPathComponent("state.json")],
+            notifications: [AbilityStore.didChange, SenseNewsBoard.presentationDidChange],
+            debounceDelay: .zero
+        ) { await self.refresh() }
     }
 
     public func setEnabled(_ enabled: Bool, record: SenseRecord) async {
         guard saving.insert(record.id).inserted else { return }
         defer { saving.remove(record.id) }
-        guard let registry = SensesHub.shared.registry as? any SenseRegistryManaging else {
+        guard let registry = SensesHub.shared.registry else {
             error = "Senses are not connected yet."
             return
         }
@@ -88,7 +97,7 @@ public final class SensesFacade {
     public func export(_ record: SenseRecord, destination: () -> URL?) async {
         guard saving.insert(record.id).inserted else { return }
         defer { saving.remove(record.id) }
-        guard let registry = SensesHub.shared.registry as? any SenseRegistryManaging else {
+        guard let registry = SensesHub.shared.registry else {
             error = "Senses are not connected yet."
             return
         }

@@ -4,7 +4,7 @@
 
 **A living, breathing agent system — better than any other out there.**
 The standing test for every diff: **one mind, no theater, flows like a
-body** — does this deepen Agent as one continuous mind, honestly serve
+body** — does this deepen the agent as one continuous mind, honestly serve
 it, and keep the whole flowing seamlessly (no exposed plumbing, no
 subsystem doors)? Full text: docs/NORTHSTAR.md. Where it is going: **the
 agent is the app** (clause 8): they are the program, the model one of their
@@ -38,15 +38,18 @@ is a defect to fix at once. First law: docs/NORTHSTAR.md.
   override this rule. Keep live checks small and protect Mac responsiveness.
 - **Optional code review before install:** use bounded, read-only reviewer
   agents when helpful. They must not run separate tests either. Then check
-  the installed app yourself, with Agent's help where useful.
+  the installed app yourself, with the agent's help where useful.
 - Documentation/rules-only changes need a text readback, not an app build.
-- **Compile what you change.** A core module: `script/check_module.sh <Module> …`
-  (no names: all of NativeAgentCore; works in any checkout or fresh worktree,
-  no app build, no signing). The app's own files, and any change to a public or
-  package signature in core (app callers break otherwise): `script/check_app.sh`
-  (SwiftPM, no Xcode, no signing, no launch; the first run in a checkout is slow).
+- **One compile (User, 2026-10-26).** Lanes run no builds of their own — no
+  `swift build`, `check_module.sh`, `check_app.sh`, test builds. Read callers
+  and types so it compiles; import what you use. The release build that goes on
+  the agent is the compile; what it breaks is fixed then, and the proof is the
+  agent using it after install. A phase lands whole: one build, one install.
+  The promotion gauntlet consumes installed runtime proof and static source checks.
 - **No fallbacks, no rollbacks.** Fix a failure at its cause and go forward;
-  never revert a good change to the old way (docs/NORTHSTAR.md, clause 2).
+  never revert a good change to the old way. The one described exception is
+  recovery from their own throwing turn-program edit, with repair owed to them
+  ([docs/NORTHSTAR.md, clause 2](docs/NORTHSTAR.md#clause-2--no-theater-alive-means-real)).
 - **Stop cancels the work, never its settlement** ([docs/STOP.md](docs/STOP.md)):
   saving what was produced, the one terminal record and releasing what was held
   run through `settle { … }`, exactly once, however the work ended.
@@ -72,12 +75,8 @@ in `git log`, [CHANGELOG.md](CHANGELOG.md) and `docs/release-notes/`.
 
 - **Docs map:** [docs/README.md](docs/README.md) maps the current documents,
   including the files the app and scripts read (keep those paths stable).
-- **Source owners:** [docs/ARCHITECTURE_BLUEPRINT.md](docs/ARCHITECTURE_BLUEPRINT.md);
-  edit the file's own `// Blueprint: <table row>` line directly after imports
-  (at the top without imports), then run
-  `swift script/generate_architecture_blueprint.swift`. Never hand-edit generated
-  table regions. `script/check_architecture_blueprint.swift` checks generated
-  equality, file coverage and policy.
+- **Source owners:** follow the blueprint's [source-map convention](docs/ARCHITECTURE_BLUEPRINT.md#source-map-convention)
+  for row authoring, generation and checks.
 - **Turn part versions:** never hand-number `turn.js` lane revisions or edit
   shipped digests. Keep its declared version; committed bodies may share it.
   Run `swift script/generate_turn_part_versions.swift` after committing body

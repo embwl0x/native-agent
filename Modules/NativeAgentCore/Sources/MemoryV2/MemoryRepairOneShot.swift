@@ -6,6 +6,7 @@ import Foundation
 import ApprovalInbox
 import NativeAgentCore
 import PersistenceCore
+import NativeAgentShared
 // Blueprint: | `MemoryRepairOneShot.swift` | `archiveInventoryRows` and approved canonical truncated-row execution with safety snapshots; legacy notes staging, scanning, purge, stamps and outcome files are retired without touching existing files |
 
 /// Inventory completion and pre-repair SQLite snapshots are locally backed
@@ -16,7 +17,7 @@ public enum MemoryRepairOneShot {
     public static let action = "memory.repair"
     static let truncatedRowsKind = "memory.repair.truncated_rows"
     static let inventoryRowsKind = "memory.repair.inventory_rows"
-    /// Sources of the retired inventory lanes (10-10): skill pointers are found
+    /// Sources of the retired inventory lanes: skill pointers are found
     /// through `find` and `ability.read`, executions live in Desk and Workshop
     /// history; neither is recalled as a memory.
     static let inventorySources = ["skill-index", "workshop:"]
@@ -30,12 +31,14 @@ public enum MemoryRepairOneShot {
     package static func archiveInventoryRows(dataRoot: URL) async {
         let done = receiptPath(kind: inventoryRowsKind, name: "done", dataRoot: dataRoot)
         guard !FileManager.default.fileExists(atPath: done.path) else { return }
-        let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
         var archived = 0
         do {
+            let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
             for source in inventorySources {
-                for handle in try await memory.memoryHandles(sourcePrefix: source) {
-                    try await memory.archiveMemory(id: handle.id)
+                for id in try await storage.laneMemoryIDs(sourcePrefix: source) {
+                    guard try await storage.updateMemory(id: id, patch: MemoryPatch(status: "archived")) != nil else {
+                        throw MemoryV2Error.recordNotFound
+                    }
                     archived += 1
                 }
             }
@@ -64,8 +67,6 @@ public enum MemoryRepairOneShot {
         dataRoot: URL
     ) {
         let path = receiptPath(kind: kind, name: name, dataRoot: dataRoot)
-        try? FileManager.default.createDirectory(
-            at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
         let value: JSONValue = .object([
             "kind": .string(kind),
             "status": .string(status),
@@ -75,7 +76,7 @@ public enum MemoryRepairOneShot {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         if let data = try? encoder.encode(value) {
-            try? data.write(to: path, options: .atomic)
+            try? SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: path)
         }
     }
 
@@ -190,14 +191,9 @@ public enum MemoryRepairOneShot {
         }
     }
 
-    /// Apply approved row repairs. Backs up the sqlite files FIRST, then
-    /// updates each row through MemoryStorage.updateMemory (the store's own
-    /// write path — UserMD/Spotlight/KG hooks fire). Per-row guards:
-    ///   - stale: content no longer matches the approved card at commit → skip.
-    ///   - tombstoned: proposed text is hash- or paraphrase-tombstoned → fail.
-    ///   - embedding: re-embedded via the provided embedder; when embedding
-    ///     fails (CoreML fail-closed on headless boxes) the content still
-    ///     repairs and owes a fresh vector; the outcome notes the miss.
+    /// Back up before approved edits; stale words skip, tombstoned words fail.
+    /// The canonical runtime supplies vectors unless a provider is injected.
+    /// Embedding failure still repairs the words and records the vector owed.
     static func applyTruncatedRowsRepair(
         dataRoot: URL,
         repairs: [TruncatedRowRepair],
@@ -206,9 +202,8 @@ public enum MemoryRepairOneShot {
         var outcome = TruncatedRepairOutcome()
         guard !repairs.isEmpty else { return outcome }
         outcome.backupPath = try await backupSQLiteStore(dataRoot: dataRoot)
-        let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-        let embeddingProvider: any EmbeddingProvider =
-            embedder ?? ManagedEmbeddingProvider(dataRoot: dataRoot)
+        let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot, alternateRootEmbedder: embedder)
+        guard let storage = await memory.underlyingStorage() else { throw MemoryV2Error.storageUnavailable }
         for repair in repairs {
             guard let existing = try await storage.memory(id: repair.id) else {
                 outcome.failed[repair.id] = "row not found"
@@ -225,9 +220,10 @@ public enum MemoryRepairOneShot {
                 continue
             }
             var newEmbedding: [Float]? = nil
-            var newEmbeddingEpoch: MemoryEmbeddingEpoch? = nil
-            if let batch = try? await embeddingProvider.embedWithEpoch([repair.proposedText]),
-               let vec = batch.vectors.first {
+            let batch: MemoryEmbeddingBatch?
+            if let embedder { batch = try? await embedder.embedWithEpoch([repair.proposedText]) }
+            else { batch = try? await memory.embedForDerivedContextWithEpoch([repair.proposedText]) }
+            if let batch, let vec = batch.vectors.first {
                 if try await storage.matchesTombstone(
                     embedding: vec,
                     embeddingEpoch: batch.epoch
@@ -236,12 +232,11 @@ public enum MemoryRepairOneShot {
                     continue
                 }
                 newEmbedding = vec
-                newEmbeddingEpoch = batch.epoch
             }
             let patch = MemoryPatch(
                 content: repair.proposedText,
                 embedding: newEmbedding,
-                embeddingEpoch: newEmbeddingEpoch?.rawValue
+                embeddingEpoch: newEmbedding == nil ? nil : batch?.epoch.rawValue
             )
             guard try await storage.updateMemory(
                 id: repair.id, patch: patch, expectedContent: repair.currentText

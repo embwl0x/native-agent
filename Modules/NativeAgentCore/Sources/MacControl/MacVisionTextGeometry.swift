@@ -60,6 +60,29 @@ public struct VisionRect: Sendable, Equatable, Hashable {
         return VisionRect(x: left, y: top, w: right - left, h: bottom - top)
     }
 
+    /// Group against each first member after strict sorting; pairwise tolerances are not transitive.
+    static func readingOrder<Value>(
+        _ values: [Value], rect: KeyPath<Value, VisionRect>, tolerance: Double,
+        geometryPrecedes: (Value, Value) -> Bool, finalPrecedes: (Value, Value) -> Bool
+    ) -> [Value] {
+        func groups(_ values: [Value], coordinate: (Value) -> Double) -> [[Value]] {
+            var groups: [[Value]] = []
+            for value in values {
+                if let anchor = groups.last?.first, coordinate(value) - coordinate(anchor) <= tolerance {
+                    groups[groups.count - 1].append(value)
+                } else { groups.append([value]) }
+            }
+            return groups
+        }
+        return groups(values.sorted(by: geometryPrecedes), coordinate: { $0[keyPath: rect].y }).flatMap { row in
+            let byX = row.sorted {
+                let x = $0[keyPath: rect].x, otherX = $1[keyPath: rect].x
+                return x == otherX ? geometryPrecedes($0, $1) : x < otherX
+            }
+            return groups(byX, coordinate: { $0[keyPath: rect].x }).flatMap { $0.sorted(by: finalPrecedes) }
+        }
+    }
+
     public func toJSON() -> JSONValue {
         .object([
             "x": .double(x.rounded()),

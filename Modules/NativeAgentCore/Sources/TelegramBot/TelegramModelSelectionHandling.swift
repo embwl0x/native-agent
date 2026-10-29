@@ -19,32 +19,12 @@ public struct TelegramModelSelectionCallback: Sendable, Equatable {
     public let fromUserId: Int?
 
     public init?(_ raw: JSONValue) {
-        guard case .object(let obj) = raw,
-              case .string(let callbackId)? = obj["id"],
-              case .string(let data)? = obj["data"],
-              let action = Self.parseAction(data) else {
-            return nil
-        }
-        let fromUserId: Int? = {
-            guard case .object(let from)? = obj["from"] else { return nil }
-            return TelegramCallbackNumbers.int(from["id"])
-        }()
-        let message: [String: JSONValue]? = {
-            guard case .object(let message)? = obj["message"] else { return nil }
-            return message
-        }()
-        let chatId: Int? = {
-            guard case .object(let chat)? = message?["chat"] else { return nil }
-            return TelegramCallbackNumbers.int(chat["id"])
-        }()
-        let messageId = TelegramCallbackNumbers.int(message?["message_id"]) ?? TelegramCallbackNumbers.int(message?["messageId"])
-        guard let chatId, let messageId else { return nil }
-
-        self.callbackId = callbackId
-        self.action = action
-        self.chatId = chatId
-        self.messageId = messageId
-        self.fromUserId = fromUserId
+        guard let payload = TelegramCallbackPayload(raw, parseData: Self.parseAction) else { return nil }
+        callbackId = payload.callbackId
+        action = payload.command
+        chatId = payload.chatId
+        messageId = payload.messageId
+        fromUserId = payload.fromUserId
     }
 
     public static func selectionKey(_ identity: String) -> String {

@@ -2,30 +2,21 @@ import SwiftUI
 import EngineRuntime
 import AppKit
 import CoreGraphics
-import ScreenCaptureKit
 import ScreenVision
-import Speech
-import AVFoundation
 import UniformTypeIdentifiers
 import NativeAgentShared
 import MemoryV2
 import PersistenceCore
 import ProviderRouting
 import TelegramBot
-#if canImport(CoreSpotlight)
-import CoreSpotlight
-#endif
-#if canImport(CloudKit)
-import CloudKit
-#endif
 
-// Blueprint: | `ChatPlatformAdapters.swift` | Chat platform adapters: attachment drops, editor-scoped paste interception and scroll event bridges with mounted-page visibility |
+// Blueprint: | `ChatPlatformAdapters.swift` | Chat platform adapters: attachment drops and scroll event bridges with mounted-page visibility |
 
 /// The whole room accepts attachments, including its scrollback and composer.
 /// A neutral, stationary outline is also quiet with Reduce Motion enabled.
 struct ChatAttachmentDropTarget: ViewModifier {
     var isEnabled = true
-    var contentTypes = ChatComposerSupport.attachmentContentTypes
+    var contentTypes = ChatAttachmentTypeResolver.attachmentContentTypes
     var onDrop: ([NSItemProvider]) -> Bool
     @State private var isTargeted = false
 
@@ -56,59 +47,8 @@ struct ChatAttachmentDropTarget: ViewModifier {
     }
 }
 
-/// The native field editor can handle Command-V before SwiftUI's paste command.
-/// Intercept attachments only while this composer's editor owns the keyboard;
-/// ordinary text paste keeps the native selection and undo behavior.
-struct ChatAttachmentPasteHandler: NSViewRepresentable {
-    var isFocused: Bool
-    var onPaste: ([NSItemProvider]) -> Void
-    @Environment(\.isEnabled) private var isEnabled
-
-    func makeNSView(context: Context) -> PasteView { PasteView() }
-
-    func updateNSView(_ view: PasteView, context: Context) {
-        view.active = isFocused && isEnabled
-        view.onPaste = onPaste
-    }
-
-    static func dismantleNSView(_ view: PasteView, coordinator: ()) { view.stop() }
-
-    final class PasteView: NSView {
-        var active = false
-        var onPaste: (([NSItemProvider]) -> Void)?
-        private var monitor: Any?
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            stop()
-            guard window != nil else { return }
-            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                guard let self, active, !isHiddenOrHasHiddenAncestor,
-                      event.window === window,
-                      event.charactersIgnoringModifiers?.lowercased() == "v",
-                      event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command,
-                      window?.firstResponder is NSTextView else { return event }
-                let providers = ChatComposerSupport.clipboardAttachmentProviders()
-                guard !providers.isEmpty else { return event }
-                onPaste?(providers)
-                return nil
-            }
-        }
-
-        func stop() {
-            if let monitor { NSEvent.removeMonitor(monitor) }
-            monitor = nil
-        }
-    }
-}
-
 struct ScrollWheelCatcher: NSViewRepresentable {
-    /// False while the chat this catcher belongs to is mounted but hidden
-    /// behind another page (ContentView, 2026-09-13). The monitor below is
-    /// WINDOW-WIDE and matched on coordinates alone, so a scroll over
-    /// Settings or Memories — drawn where the hidden transcript still lies —
-    /// was disarming chat follow. The monitor stays installed (its state, and
-    /// the follow state it feeds, survive the trip); it just stops reporting.
+    /// Hidden chats keep their monitor installed but do not report scroll events.
     var isActive: Bool = true
     /// A left press inside the view, as its distance from the view's top.
     var onPress: ((CGFloat) -> Void)? = nil
@@ -227,5 +167,3 @@ func telegramReasoningEffortMismatch(
     guard normalized != selected else { return nil }
     return "Saved think level '\(selected)' is unsupported for \(model). Save to use \(normalized)."
 }
-
-// PATCH-2026-05-07: proactive-inbox-1 InboxStripContainer — loads and renders unread inbox items

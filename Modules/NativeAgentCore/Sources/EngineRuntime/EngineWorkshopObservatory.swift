@@ -2,21 +2,9 @@ import Foundation
 import PersistenceCore
 import Desk
 import WorkshopExecution
-// Blueprint: | `EngineWorkshopObservatory.swift` | `WorkshopScoreView`, `DeskPursuitVetoRationale`; Workshop read projections |
+// Blueprint: | `EngineWorkshopObservatory.swift` | `WorkshopPursuitRow`, `DeskPursuitVetoRationale`; Workshop read projections |
 
 // MARK: - Pure view-models (data-shaping, no SwiftUI)
-
-/// A pursuit's blended selection score, flattened for display. Mirrors
-/// `WorkshopPump.PursuitChoiceScore` but decoupled so the view never depends on
-/// the pump's shape.
-public struct WorkshopScoreView: Equatable, Sendable {
-    public let total: Double
-    public let evidenceStrength: Double
-    public let momentum: Double
-    public let closureProximity: Double
-    public let noProgressPenalty: Double
-    public let recentAttentionPenalty: Double
-}
 
 /// The two hard caps a pursuit lives under, with the current draw against each.
 public struct WorkshopBudget: Equatable, Sendable {
@@ -39,7 +27,7 @@ public struct WorkshopPursuitRow: Identifiable, Equatable, Sendable {
     public let status: String
     /// nil when the item is origin=agent but carries no decodable pursuit payload
     /// (a corrupt row) — shown as "score unavailable", never a misleading 0.
-    public let score: WorkshopScoreView?
+    public let score: PursuitChoiceScore?
     public let budget: WorkshopBudget?
     public let lastWorkedAt: String?
     /// The most recent "chose: …" rationale from her notes (the recorded volition).
@@ -61,22 +49,13 @@ public struct WorkshopPursuitRow: Identifiable, Equatable, Sendable {
         let p = item.pursuit
         let today = DeskClock.dayStamp(now)
 
-        let score = WorkshopPump.choiceScore(for: item, now: now).map {
-            WorkshopScoreView(
-                total: $0.total,
-                evidenceStrength: $0.evidenceStrength,
-                momentum: $0.momentum,
-                closureProximity: $0.closureProximity,
-                noProgressPenalty: $0.noProgressPenalty,
-                recentAttentionPenalty: $0.recentAttentionPenalty
-            )
-        }
+        let score = WorkshopPump.choiceScore(for: item, now: now)
 
         let budget: WorkshopBudget? = p.map { pursuit in
             WorkshopBudget(
-                sessionsUsed: pursuit.sessionsUsed,
+                sessionsUsed: pursuit.sessionsUsed(in: item.workAttempts),
                 maxSessions: pursuit.maxSessions,
-                todayCount: pursuit.workSessions(on: today),
+                todayCount: (pursuit.retiredSessionsByDay[today] ?? 0) + item.workAttempts.filter { $0.lane == .pursuit && $0.day == today && $0.disposition != .unstarted }.count,
                 perDayCap: SwiftNativeDeskStore.maxWorkSessionsPerPursuitPerDay
             )
         }
@@ -308,8 +287,7 @@ public enum DeskPursuitVetoRationale {
 extension WorkshopReceiptRow {
     public var displayStatus: String {
         guard self.isDirectedTask,
-              ["completed", "done", "succeeded"].contains(
-                self.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) else {
+              WorkshopExecutionRecord.isSuccessful(self.status.trimmingCharacters(in: .whitespacesAndNewlines)) else {
             return self.status
         }
         switch self.verificationStatus?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {

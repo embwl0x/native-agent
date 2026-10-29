@@ -52,9 +52,9 @@ import TrustPersistence
     func saveProviderKey(_ key: String, provider: String) async -> NativeOAuthFlow.InlineSetupOutcome {
         await NativeOAuthFlow.saveInlineProviderKey(
             key, providerName: InlineInteractionRegistry.providerDisplayName(provider),
-            testProvider: { try await appModel.testProvider(provider, apiKeyOverride: key) },
+            testProvider: { try await appModel.engine.providers.testProvider(provider, apiKeyOverride: key) },
             configureProvider: {
-                try await appModel.configureProvider(provider, apiKey: key, authMode: "api_key", defaultModel: nil)
+                try await appModel.engine.configureProvider(provider, apiKey: key, authMode: "api_key", defaultModel: nil)
             })
     }
     func upkeepFence(verb: String, input: [String: JSONValue]) async -> JSONValue? {
@@ -74,7 +74,6 @@ import TrustPersistence
                 return (true, "Support report: \(report.app) \(report.version), health \(report.doctorStatus ?? "unknown"), made \(report.generatedAt). A file to send the developer: export.bundle {support:true}.",
                         ["report": (try? JSONValue.fromEncodable(report)) ?? .null])
             case .unavailable(let detail): return (false, detail, [:])
-            case .failed(let detail): return (false, "Support report failed: \(detail)\(detail.hasSuffix(".") ? "" : ".")" + retry, [:])
             }
         case "export_bundle":
             let support = input["support"] == .bool(true)
@@ -103,13 +102,9 @@ import TrustPersistence
             download.start(createOnly: false, reconcile: true)
             return (true, "Checking and resuming the memory-search model download. \(AppToolExecutor.doorDoctor) shows its progress.", ["changed": .bool(true)])
         case "spotlight_reindex":
-            let outcome = await MemorySpotlightReindexOperation.run(dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            let outcome = await MemorySpotlightReindexOperation.run(dataRoot: appModel.engine.dataRoot)
             if case .indexed = outcome { return (true, outcome.userMessage, [:]) }
             return (false, outcome.agentMessage, [:])
-        case "consolidate_now", "hygiene_now":
-            let feedback = verb == "consolidate_now" ? await appModel.consolidateMemory() : await appModel.runMemoryHygiene()
-            return (!feedback.isAdverse,
-                    UserFacingError.forAgent(feedback.message, cause: feedback.isAdverse ? appModel.statusCause : nil), [:])
         // User's two below Full Mac; the door refuses them there.
         case "backup_restore":
             let backup: BackupRecord
@@ -121,8 +116,8 @@ import TrustPersistence
             guard case .saved? = appModel.trustCenterActionOutcome else { return (false, appModel.statusForAgent + retry, [:]) }
             // Awaited: a restore that stages restarts the app once this turn ends.
             _ = await HarnessDecidedRow.record(requester: "Full Mac", tool: "backup.restore \(backup.id)",
-                                               sessionID: AppToolExecutor.inputString(input["__session_id"]),
-                                               dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+                                               sessionID: input["__session_id"]?.scalarText,
+                                               dataRoot: appModel.engine.dataRoot)
             return (true, appModel.statusForAgent, ["id": .string(backup.id)])
         case "activity_wipe":
             let activity = appModel.engine.activityWatch
@@ -133,38 +128,13 @@ import TrustPersistence
                 return (false, message + " Deletion could not be confirmed." + retry, [:])
             }
             HarnessDecidedRow.post(requester: "Full Mac", tool: "history.clear",
-                                   sessionID: AppToolExecutor.inputString(input["__session_id"]),
-                                   dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+                                   sessionID: input["__session_id"]?.scalarText,
+                                   dataRoot: appModel.engine.dataRoot)
             return (true, "Deleted all recorded activity (\(removed) spans). Recording settings are kept, "
                 + "so if capture is on it keeps going.", ["removed_rows": .int(Int64(removed))])
         default:
             return (false, "No upkeep button is called \(verb).", [:])
         }
-    }
-}
-
-/// The agent's own hands on a card (card.answer): every settle is `byAgent`.
-@MainActor struct AppToolInteractionResolver: ToolInteractionResolving {
-    func waitForAnswer(_ interaction: InlineInteraction, tool: String, input: [String: JSONValue], sessionID: String, dataRoot: URL) async -> JSONValue {
-        await InlineInteractionResolver.waitForAnswer(interaction, tool: tool, input: input, sessionID: sessionID, dataRoot: dataRoot)
-    }
-    func sessionID(ofCard id: String, dataRoot: URL) async -> String? {
-        try? await InlineInteractionDelivery.pointer(id: "interaction:\(id)", dataRoot: dataRoot).sessionID
-    }
-    func cardFields(_ interaction: InlineInteraction, descriptor: InlineInteractionDescriptor) -> [String: JSONValue] {
-        let card = InlineCardProjection.model(interaction, descriptor: descriptor)
-        return [
-                "title": .string(card.title),
-                "state": .string(card.state.rawValue),
-                "why": .string(card.why),
-                "primary": .string(card.primaryLabel),
-                "secondary": .string(card.secondaryLabel),
-                "scope_lines": .array(card.scopeLines.map { .string($0) }),
-                "outcome": card.outcome.map { JSONValue.string($0) } ?? .null,
-                "outcome_meta": card.outcomeMeta.map { JSONValue.string($0) } ?? .null,
-                "can_retry": .bool(card.canRetry),
-                "revision": .int(Int64(interaction.revision)),
-            ]
     }
 }
 
@@ -186,7 +156,7 @@ extension AppQuietToolHost: QuietInboxHost {
             dataRootOverride: dataRootOverride, effects: AppInboxCardActionEffects(inbox: appModel.engine.inbox))
     }
     func withdrawApproval(id: String, decidedBy: String) async throws {
-        _ = try await ApprovalTransactionCoordinator.app(dataRootOverride: appModel.dataRootOverride)
+        _ = try await ApprovalExecution.app()
             .resolveApproval(id: id, decision: "cancel", provenance: .local(decidedBy: decidedBy))
     }
     func inboxFence(verb: String, input: [String: JSONValue]) async -> JSONValue? {
@@ -209,7 +179,7 @@ extension AppQuietToolHost: QuietInboxHost {
             default: return "Selected the card's choice: \(item.effectiveActions.first { $0.id == action }?.label ?? action)."
             }
         }
-        switch InboxCardActions.resolvePrimaryAction(for: item, effects: AppInboxCardActionEffects(inbox: appModel.engine.inbox)) {
+        switch InboxCardActions.resolvePrimaryAction(for: item) {
         case .openApprovals: return "Marked the note read; its approvals wait on the Approvals page. The person's screen was not moved."
         case .openDeskExecution: return "Marked the note read; its work is on the Desk. The person's screen was not moved."
         case .chatDraft: return "Marked the note read. Its action only drafts a chat message for the person, so nothing was put in their composer."
@@ -224,21 +194,21 @@ extension AppQuietToolHost: QuietInboxHost {
 extension AppQuietToolHost {
     func provider(verb: String, input: [String: JSONValue]) async -> JSONValue {
         await ProvidersFacade.runQuietProvider(
-            verb: verb, input: input, dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+            verb: verb, input: input, dataRoot: appModel.engine.dataRoot,
             refresh: {
                 switch await appModel.engine.providers.refreshSettings(refreshCatalog: true, cause: UserFacingError.cause) {
                 case .loaded(let snapshot):
                     return (snapshot.providers, nil)
                 case .failed(let detail): return ([], detail)
                 }
-            }, list: { try await appModel.engine.providers.list() },
-            test: { try await appModel.testProvider($0) },
+            }, list: { try await appModel.engine.providers.list().providers },
+            test: { try await appModel.engine.providers.testProvider($0) },
             authMode: {
                 let mode = ProvidersFacade.authModePickerState(
                     advertisedModes: $0.auth_modes, savedMode: $0.auth_mode, providerIsReady: true)
                 return (mode.canSave, mode.selectedMode)
             },
-            configure: { try await appModel.configureProvider($0, apiKey: nil, authMode: $1, defaultModel: $2) },
+            configure: { try await appModel.engine.configureProvider($0, apiKey: nil, authMode: $1, defaultModel: $2) },
             reload: { _ = await appModel.loadProvidersForChat() },
             disconnect: {
                 let outcome = await appModel.disconnectProvider($0)

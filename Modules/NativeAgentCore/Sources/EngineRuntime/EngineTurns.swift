@@ -17,7 +17,7 @@ import AppToolRuntime
 import Senses
 // Blueprint: | `EngineTurns.swift` | TurnsFacade owns turn lifecycle/Stop/queue/screen-preview presentation, one Capabilities trace feed without an extracted copy, and read-only Agent View pane text/subscriptions keyed by conversation and room; LatestRead orders trace publication and each pane independently. The preview binds L0's pure helper face to its native root without effects and preserves last-seen semantics |
 
-/// `NativeAgentEngine.turns` (S10): the Mac's running chat turns for one data
+/// `NativeAgentEngine.turns`: the Mac's running chat turns for one data
 /// root — which sessions are thinking, streaming and replying, each session's
 /// turn lifecycle (the working card), the live computer pane, the queue behind
 /// a running turn, and Stop. Chat, detached panels, the sidebar, Simple view
@@ -58,8 +58,7 @@ public final class TurnsFacade {
         }
     }
 
-    // PATCH-2026-05-13: parallel-sessions — per-session chat state so the user
-    // can work in multiple sessions concurrently.
+    // Per-session chat state supports concurrent conversations.
     public var activityDidChange: (@MainActor () -> Void)? {
         get { runtime.activityDidChange }
         set { runtime.activityDidChange = newValue }
@@ -75,8 +74,9 @@ public final class TurnsFacade {
     /// Sessions whose running turn has started to publish reply text. Written
     /// once when the first non-empty snapshot lands and cleared with the
     /// turn, never per token — the window haze reads it (WindowHaze.swift).
-    public var replyingSessions: Set<String> = [] {
-        didSet { if replyingSessions != oldValue { activityDidChange?() } }
+    public var replyingSessions: Set<String> {
+        get { runtime.replyingSessions }
+        set { runtime.replyingSessions = newValue }
     }
     public var tasks: [String: Task<Void, Never>] {
         get { runtime.tasks }
@@ -97,7 +97,10 @@ public final class TurnsFacade {
     /// and dies with the turn's card: opened by the first Mac verb of a turn,
     /// cleared when the next turn opens or this one's intake closes. Empty for
     /// every turn that never touches the Mac.
-    public var screenPreviewBySession: [String: MacChatScreenPreview] = [:]
+    public var screenPreviewBySession: [String: MacChatScreenPreview] {
+        get { runtime.screenPreviewBySession }
+        set { runtime.screenPreviewBySession = newValue }
+    }
     public var activeTurnIDsBySession: [String: String] {
         get { runtime.activeTurnIDsBySession }
         set { runtime.activeTurnIDsBySession = newValue }
@@ -119,24 +122,12 @@ public final class TurnsFacade {
         get { runtime.pausedQueueSessions }
         set { runtime.pausedQueueSessions = newValue }
     }
-    /// 2026-09-06: why the queue paused, when it paused because a queued turn
-    /// FAILED to start. The drain used to discard the typed rejection's
-    /// message, so the strip read "Paused" and the person was never told what
-    /// went wrong. Absent for an ordinary Stop-pause, which needs no reason.
+    /// Queue pause reasons preserve queued-start rejections so the person can see why work paused.
     public var queuePauseReasons: [String: String] {
         get { runtime.queuePauseReasons }
         set { runtime.queuePauseReasons = newValue }
     }
-    // PATCH-2026-05-13: parallel-sessions — when a session is streaming but
-    // not active, we still need to know (a) the live delta-buffer and (b)
-    // the in-flight bubble id so that switching back to the session can
-    // restore the live-text bubble without waiting for the next refresh.
-    // 2026-09-13 (performance pass 3): this buffer is written on EVERY delta —
-    // the only uncoalesced per-token write in the turn — and it is read only by
-    // `selectChatSession`'s restore path, never by a view. Keeping it out of
-    // observation means a token costs a dictionary store and nothing else; the
-    // one write the UI reacts to stays the coalesced
-    // `updateChatMessageContent` below it.
+    // Unobserved text and bubble IDs restore an in-flight session; views receive coalesced message updates.
     @ObservationIgnored public var streamingTexts: [String: String] = [:]
     public var streamingBubbleIds: [String: String] = [:]
     // Keep the optimistic user turn while switching between in-flight sessions,
@@ -177,7 +168,7 @@ public final class TurnsFacade {
     }
 
     public func isReplyTextSettled(_ sessionId: String) -> Bool {
-        lifecycleBySession[sessionId]?.replyTextSettled == true
+        runtime.replyTextSettledSessions.contains(sessionId)
     }
 
     public var visiblyWorkingSessionIDs: Set<String> {
@@ -189,9 +180,6 @@ public final class TurnsFacade {
         guard let lifecycle = lifecycle(for: sessionId) else { return true }
         return !lifecycle.presentation.isTerminal && lifecycle.presentation.streamedTextLength == 0
     }
-
-    /// True if any session anywhere is streaming.
-    public var anyStreaming: Bool { !streamingSessions.isEmpty }
 
     public func queued(for sessionId: String) -> [QueuedChatTurn] {
         guard !sessionId.isEmpty else { return [] }
@@ -281,18 +269,14 @@ public final class TurnsFacade {
 
 
 struct EngineWorkshopSessionEffects: WorkshopSessionEffects {
+    /// A turn's app door, the authored-program host included; the session
+    /// turn's own gate resolves autonomy once.
     func makeToolDispatcher(dataRoot: URL) -> any ToolDispatchClient {
-        SwiftToolDispatcher(
-            dataRoot: dataRoot,
-            allowProcessGlobalTools: dataRoot == PersistenceCore.defaultDataRoot(),
-            agentBridgeConfigRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot)
-        )
+        NativeAgentEngine.forRoot(dataRoot).toolDispatchClient(enforceAppAutonomy: false)
     }
 
-    /// The production turn: one ephemeral tool turn on the "workshop" surface
-    /// (P2-3; "missions" on 0.3.x installs), under User's posture like any other.
-    /// No chat session state, no transcript, her pinned model resolves from the
-    /// surface picker.
+    /// One ephemeral tool turn on "workshop" ("missions" on historical installs), under User's posture.
+    /// No chat session or transcript is created; its pinned model comes from the surface picker.
     func productionTurnExecutor(
         dataRoot: URL
     ) -> @Sendable (_ request: WorkshopSessionRequest, _ tools: any ToolDispatchClient) async throws -> (model: String, output: String) {

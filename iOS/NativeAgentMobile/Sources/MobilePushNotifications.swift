@@ -5,6 +5,7 @@ import UIKit
 import NativeAgentShared
 #if canImport(CloudKit)
 import CloudKit
+import CloudKit
 // Blueprint: | `MobilePushNotifications.swift` | `NativeAgentPushTokenSyncCache` struct; `load`, `shouldSync` |
 #endif
 
@@ -89,18 +90,8 @@ enum NativeAgentAPNSEnvironment: String, Equatable {
     case production
 }
 
-struct NativeAgentAPNSEnvironmentResolution: Equatable {
-    enum Source: Equatable {
-        case embeddedProvisioningProfile
-        case distributionWithoutEmbeddedProfile
-    }
-
-    var environment: NativeAgentAPNSEnvironment
-    var source: Source
-}
-
 enum NativeAgentAPNSEnvironmentResolver {
-    static func current(bundle: Bundle = .main) -> NativeAgentAPNSEnvironmentResolution? {
+    static func current(bundle: Bundle = .main) -> NativeAgentAPNSEnvironment? {
         guard let profileURL = bundle.url(forResource: "embedded", withExtension: "mobileprovision") else {
             // App Store and TestFlight installs do not carry an embedded profile;
             // their APNS tokens use the production environment.
@@ -115,13 +106,8 @@ enum NativeAgentAPNSEnvironmentResolver {
     static func resolve(
         embeddedProfileData: Data?,
         embeddedProfilePresent: Bool
-    ) -> NativeAgentAPNSEnvironmentResolution? {
-        guard embeddedProfilePresent else {
-            return NativeAgentAPNSEnvironmentResolution(
-                environment: .production,
-                source: .distributionWithoutEmbeddedProfile
-            )
-        }
+    ) -> NativeAgentAPNSEnvironment? {
+        guard embeddedProfilePresent else { return .production }
         guard let embeddedProfileData,
               let entitlements = entitlements(in: embeddedProfileData),
               let rawValue = entitlements["aps-environment"] as? String,
@@ -130,10 +116,7 @@ enum NativeAgentAPNSEnvironmentResolver {
               ) else {
             return nil
         }
-        return NativeAgentAPNSEnvironmentResolution(
-            environment: environment,
-            source: .embeddedProvisioningProfile
-        )
+        return environment
     }
 
     private static func entitlements(in profileData: Data) -> [String: Any]? {
@@ -149,69 +132,6 @@ enum NativeAgentAPNSEnvironmentResolver {
             return nil
         }
         return dictionary["Entitlements"] as? [String: Any]
-    }
-}
-
-/// The remote-push fetch contract is deliberately separate from UIKit so the
-/// completion result stays truthful under every transport outcome. Reporting
-/// `.noData` after a successful inbox load or CloudKit drain causes iOS to
-/// throttle later background wakes.
-@MainActor
-enum NativeAgentRemotePushProcessor {
-    enum FetchOutcome: Equatable {
-        case newData
-        case noData
-
-        var backgroundFetchResult: UIBackgroundFetchResult {
-            switch self {
-            case .newData: .newData
-            case .noData: .noData
-            }
-        }
-    }
-
-    static func process(
-        userInfo: [AnyHashable: Any],
-        recordReceipt: ([AnyHashable: Any]) -> PushReceiptEntry,
-        sendReceipt: (String) async throws -> Void,
-        drainDeviceSyncPush: @MainActor @Sendable ([AnyHashable: Any]) async throws -> Bool,
-        refreshChatReply: () async throws -> Bool = { false },
-        refreshInbox: () async throws -> Bool,
-        refreshActivity: () async throws -> Void
-    ) async -> FetchOutcome {
-        let pushReceipt = recordReceipt(userInfo)
-
-        // Each lane is independently best-effort. A failed CloudKit drain
-        // must not suppress the inbox/activity refreshes (and vice versa).
-        let cloudKitDelivered = NADeviceSyncRecoveryBudget.hasTime
-            ? ((try? await drainDeviceSyncPush(userInfo)) ?? false) : false
-        if cloudKitDelivered { NADeviceSyncRecoveryBudget.didApplyData?() }
-        // The Mac's visible reply notification is an ordinary APNS payload,
-        // not the CloudKit subscription push recognized above. Treat its exact
-        // source as a bounded transport nudge so an open Chat view receives the
-        // signed reply record immediately instead of showing only the banner.
-        let chatReplyLoaded = NADeviceSyncRecoveryBudget.hasTime && isChatReplyNudge(userInfo)
-            ? ((try? await refreshChatReply()) ?? false)
-            : false
-        if chatReplyLoaded { NADeviceSyncRecoveryBudget.didApplyData?() }
-        let inboxLoaded = NADeviceSyncRecoveryBudget.hasTime
-            ? ((try? await refreshInbox()) ?? false) : false
-        if inboxLoaded { NADeviceSyncRecoveryBudget.didApplyData?() }
-        if NADeviceSyncRecoveryBudget.hasTime { try? await refreshActivity() }
-        // 2026-09-06: the receipt used to be sent BEFORE any of the lanes above.
-        // Its send can wait the full 30 s the iCloud action write allows, while
-        // the background-push callback has to report at 25 s — so a missed reply
-        // was never recovered on the very push that announced it. Recovery runs
-        // first now; the acknowledgement takes whatever budget is left.
-        if NADeviceSyncRecoveryBudget.hasTime, let eventID = pushReceipt.eventId {
-            try? await sendReceipt(eventID)
-        }
-        return (inboxLoaded || cloudKitDelivered || chatReplyLoaded) ? .newData : .noData
-    }
-
-    static func isChatReplyNudge(_ userInfo: [AnyHashable: Any]) -> Bool {
-        ["icloud_chat_reply", "requested_result"].contains(userInfo["source"] as? String ?? "")
-            && (userInfo["screen"] as? String) == "chat"
     }
 }
 
@@ -243,9 +163,7 @@ final class NativeAgentRemotePushCompletionGate: @unchecked Sendable {
         completed = true
         let finalResult: UIBackgroundFetchResult = appliedData ? .newData : result
         lock.unlock()
-        // UIKit updates the app snapshot inside this callback and asserts it is
-        // on the main thread; the timeout lane fires from a background task
-        // (crash 2026-09-25: "Call must be made on main thread").
+        // UIKit requires the background-fetch completion callback on the main thread.
         if Thread.isMainThread {
             completionHandler(finalResult)
         } else {
@@ -264,11 +182,11 @@ final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
     ) {
         let token = deviceToken.map { String(format: "%02x", $0) }.joined()
         let bundleId = Bundle.main.bundleIdentifier ?? "io.github.embwl0x.nativeagent.ios"
-        guard let apnsResolution = NativeAgentAPNSEnvironmentResolver.current() else {
+        guard let apnsEnvironment = NativeAgentAPNSEnvironmentResolver.current() else {
             NSLog("[NativeAgentMobile] APNS token sync skipped: signed aps-environment could not be resolved")
             return
         }
-        let environment = apnsResolution.environment.rawValue
+        let environment = apnsEnvironment.rawValue
         NSLog("[NativeAgentMobile] APNS token registered suffix=%@", String(token.suffix(8)))
         Task { @MainActor in
             guard let pairingStore = iCloudSyncEngine.shared.pairingStore,
@@ -322,9 +240,7 @@ final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
         fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
     ) {
         let completionGate = NativeAgentRemotePushCompletionGate(completionHandler)
-        // 2026-09-06: the wall clock the whole push has to finish inside. The
-        // receipt lane races it so an acknowledgement can never eat the budget
-        // the reply-recovery lanes need.
+        // Recovery and acknowledgement share one push deadline.
         let deadline = Date().addingTimeInterval(
             Double(Self.backgroundPushDeadlineNanoseconds) / 1_000_000_000
         )
@@ -334,84 +250,59 @@ final class NativeAgentMobilePushDelegate: NSObject, UIApplicationDelegate {
             completionGate.complete(.noData)
         }
         Task { @MainActor in
-            // CK-3c: if this is a CloudKit silent push for our device-sync
-            // subscription AND CloudKit is active, drain the transport. Both
-            // guards live inside drainIfDeviceSyncPush; a flag-off build returns
-            // immediately without parsing. Every other push — and the legacy
-            // snapshot refresh below — is untouched.
-            let outcome = await NADeviceSyncRecoveryBudget.$deadline.withValue(deadline) {
+            await NADeviceSyncRecoveryBudget.$deadline.withValue(deadline) {
                 await NADeviceSyncRecoveryBudget.$didApplyData.withValue({ completionGate.noteAppliedData() }) {
-                    await NativeAgentRemotePushProcessor.process(
-                userInfo: userInfo,
-                // 2026-07-04: ledger every arrival so delivered-but-silenced
-                // (Focus, Scheduled Summary) is distinguishable from never
-                // delivered.
-                recordReceipt: PushReceiptLedger.record(userInfo:),
-                sendReceipt: { eventID in
-                    let remaining = deadline.timeIntervalSinceNow - 1
-                    guard remaining > 0 else { return }
-                    _ = await withCKTimeout(
-                        "NativeAgentMobile.push.notificationReceipt",
-                        seconds: remaining
-                    ) {
-                        await iCloudSyncEngine.shared.sendNotificationReceipt(
-                            eventID: eventID,
-                            channel: "apns"
-                        )
+                    let receipt = PushReceiptLedger.record(userInfo: userInfo)
+                    if NADeviceSyncRecoveryBudget.hasTime,
+                       await iCloudBridge.shared.drainIfDeviceSyncPush(userInfo) {
+                        completionGate.noteAppliedData()
                     }
-                },
-                drainDeviceSyncPush: { userInfo in
-                    await iCloudBridge.shared.drainIfDeviceSyncPush(userInfo)
-                },
-                refreshChatReply: {
-                    let delivered = await iCloudBridge.shared.pollIncomingNow()
-                    if delivered { completionGate.noteAppliedData() }
-                    // The transport record is primary. The transcript snapshot
-                    // is the independent missed-record backstop and publishes
-                    // through ChatView's existing snapshot merge owner.
-                    if NADeviceSyncRecoveryBudget.hasTime {
-                        _ = await withCKTimeout("NativeAgentMobile.push.chatSnapshot", seconds: max(0, deadline.timeIntervalSinceNow)) {
-                            guard deadline.timeIntervalSinceNow > 0 else { return }
-                            await iCloudSyncEngine.shared.refreshChatTranscriptsSnapshot()
+                    // Visible reply pushes nudge signed transport and its transcript backstop.
+                    if NADeviceSyncRecoveryBudget.hasTime,
+                       ["icloud_chat_reply", "requested_result"].contains(userInfo["source"] as? String ?? ""),
+                       (userInfo["screen"] as? String) == "chat" {
+                        if await iCloudBridge.shared.pollIncomingNow() { completionGate.noteAppliedData() }
+                        if NADeviceSyncRecoveryBudget.hasTime {
+                            _ = await withCKTimeout("NativeAgentMobile.push.chatSnapshot", seconds: max(0, deadline.timeIntervalSinceNow)) {
+                                guard deadline.timeIntervalSinceNow > 0 else { return }
+                                await iCloudSyncEngine.shared.refreshChatTranscriptsSnapshot()
+                            }
                         }
                     }
-                    return delivered
-                },
-                refreshInbox: {
-                    await withCKTimeout("NativeAgentMobile.push.inboxSnapshot", seconds: max(0, deadline.timeIntervalSinceNow)) {
-                        guard deadline.timeIntervalSinceNow > 0 else { return false }
-                        let loaded = await iCloudSyncEngine.shared.refreshInboxSnapshot()
-                        if loaded { completionGate.noteAppliedData() }
-                        return loaded
-                    } ?? false
-                },
-                refreshActivity: {
-                    _ = await withCKTimeout("NativeAgentMobile.push.activitySnapshot", seconds: max(0, deadline.timeIntervalSinceNow)) {
-                        guard deadline.timeIntervalSinceNow > 0 else { return }
-                        await iCloudSyncEngine.shared.refreshActivitySnapshot()
+                    // Activity publishes Inbox independently and reports its acceptance to the gate.
+                    if NADeviceSyncRecoveryBudget.hasTime {
+                        _ = await withCKTimeout("NativeAgentMobile.push.activitySnapshot", seconds: max(0, deadline.timeIntervalSinceNow)) {
+                            guard deadline.timeIntervalSinceNow > 0 else { return }
+                            await NADeviceSyncRecoveryBudget.$deadline.withValue(deadline) {
+                                await NADeviceSyncRecoveryBudget.$didApplyData.withValue({ completionGate.noteAppliedData() }) {
+                                    _ = await iCloudSyncEngine.shared.refreshActivitySnapshot()
+                                }
+                            }
+                        }
                     }
-                }
-            )
+                    if NADeviceSyncRecoveryBudget.hasTime, let eventID = receipt.eventId {
+                        let remaining = deadline.timeIntervalSinceNow - 1
+                        guard remaining > 0 else { return }
+                        _ = await withCKTimeout("NativeAgentMobile.push.notificationReceipt", seconds: remaining) {
+                            await iCloudSyncEngine.shared.sendNotificationReceipt(eventID: eventID, channel: "apns")
+                        }
+                    }
                 }
             }
             timeoutTask.cancel()
-            completionGate.complete(outcome.backgroundFetchResult)
+            completionGate.complete(.noData)
         }
     }
 }
 
 final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
-    // Completion-handler forms, answered on the main thread. UIKit updates the
-    // app snapshot inside these callbacks and traps off the main thread; the
-    // async forms returned on a background thread, so tapping a notification
-    // crashed the app (2026-09-25: "Call must be made on main thread").
+    // UIKit notification completion handlers must run on the main thread.
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        // 2026-09-06: the reply this alert announces may already be rendered in
-        // the chat the user is looking at. Alerting on top of it is noise.
+        // Suppress the alert when its reply is already displayed in the current chat.
         let keys = ChatReplyNotificationKeys(userInfo: notification.request.content.userInfo)
         nonisolated(unsafe) let done = completionHandler
         Task { @MainActor in
@@ -440,17 +331,12 @@ final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterD
             DispatchQueue.main.async { done() }
             return
         }
-        // F7: route per notification payload's `screen` field instead of always
-        // landing on Activity. Allowed values: activity, chat, memories, desk, skills, more.
         let userInfo = response.notification.request.content.userInfo
         let screen = NativeAgentRemoteNotificationPayload.string(
             directKey: "screen",
             cloudKitRecordKey: "notificationScreen",
             in: userInfo
         )
-        // 2026-09-06: a reply notification names the conversation that answered.
-        // Routing on `screen` alone landed the tap on whichever chat was already
-        // selected, which is not the one the user tapped.
         let sessionID = NativeAgentRemoteNotificationPayload.string(
             directKey: "sessionId",
             cloudKitRecordKey: "notificationSessionId",
@@ -463,61 +349,10 @@ final class NativeAgentNotificationDelegate: NSObject, UNUserNotificationCenterD
             // Persist before posting. ContentView consumes this intent from
             // UserDefaults on appearance, so a cold-launch view tree that has
             // not installed its ephemeral observer yet still receives the tap.
-            MobileNotifiedChatSessionIntent.stage(screen == "chat" ? sessionID : nil)
-            MobileDeskTaskNotificationIntent.stage(
-                screen: screen,
-                taskID: taskID
-            )
-            MobileDeskItemNotificationIntent.stage(screen: screen, handle: taskID)
-            NativeAgentNotificationLaunchIntent.markOpenActivityPending(screen: screen)
-            NotificationCenter.default.post(
-                name: .nativeagentOpenActivity,
-                object: nil,
-                userInfo: ["screen": screen ?? "activity"]
-            )
+            NativeAgentNotificationLaunchIntent.stage(screen: screen, sessionID: sessionID, taskID: taskID)
+            NotificationCenter.default.post(name: .nativeagentOpenActivity, object: nil)
             done()
         }
-    }
-}
-
-enum MobileDeskItemNotificationIntent {
-    private static let key = "NativeAgentMobile.pendingDeskItemNotification"
-
-    static func stage(screen: String?, handle: String?) {
-        guard screen?.lowercased() == "desk", let handle, !handle.isEmpty else {
-            UserDefaults.standard.removeObject(forKey: key)
-            return
-        }
-        UserDefaults.standard.set(handle, forKey: key)
-    }
-
-    static func consume() -> String? {
-        defer { UserDefaults.standard.removeObject(forKey: key) }
-        return UserDefaults.standard.string(forKey: key)
-    }
-}
-
-/// Carries the directed-task destination across delegate delivery before the
-/// view tree exists. Kept alongside the legacy screen intent, whose allowlist
-/// predates the directed-task surface.
-struct MobileDeskTaskNotificationIntent: Codable, Identifiable, Hashable {
-    var id = UUID()
-    let taskID: String?
-    private static let key = "NativeAgentMobile.pendingDeskTaskNotification"
-
-    static func stage(screen: String?, taskID: String?) {
-        guard screen?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "workshop" else {
-            UserDefaults.standard.removeObject(forKey: key)
-            return
-        }
-        let intent = Self(taskID: taskID.flatMap { $0.isEmpty ? nil : $0 })
-        UserDefaults.standard.set(try? JSONEncoder().encode(intent), forKey: key)
-    }
-
-    static func consume() -> Self? {
-        defer { UserDefaults.standard.removeObject(forKey: key) }
-        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
-        return try? JSONDecoder().decode(Self.self, from: data)
     }
 }
 
@@ -554,7 +389,7 @@ enum NativeAgentNotificationEventGate {
         }) {
             return false
         }
-        let categorized = MobileNotificationRouting.categorized(content)
+        let categorized = try MobileNotificationRouting.categorized(content)
         let alert: UNNotificationContent
         do { alert = try await CommunicationNotification.decorate(categorized) }
         catch {
@@ -618,10 +453,7 @@ enum NativeAgentBridgeNotificationScheduler {
         content.body = body
         content.sound = .default
         content.userInfo = userInfo
-        // 2026-07-04 (review): the iCloud-bridge fallback lane must match the
-        // APNS lane — urgent pushes are time-sensitive so Focus (e.g. Sleep at
-        // 3:30am dream time) shows them on the lock screen instead of
-        // silencing them into Notification Center.
+        // Urgent bridge notifications use time-sensitive interruption, matching APNS.
         if (metadata["urgency"] ?? (userInfo["urgency"] as? String))?.lowercased() == "urgent" {
             content.interruptionLevel = .timeSensitive
         }

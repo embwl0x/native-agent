@@ -20,8 +20,10 @@ function step(state, event) {
         event.calls.map(function (call) { return {effect: "app", call: call}; }));
       if (state.purpose === "keep") return next(state, []);
       // What she worked out by hand, she keeps: one more turn of thought after the reply.
-      if (state.hand) return next({purpose: "keep", calls: 0},
-        [{effect: "reply.end"}, {effect: "after"}, {effect: "model.call", purpose: "keep", note: KEEP}]);
+      // One call made 3 rounds in a row used her mind as a loop: the same moment opens for it.
+      var loop = event.repeated && event.repeated.count >= 3 ? looped(event.repeated) : "";
+      if (state.hand || loop) return next({purpose: "keep", calls: 0}, [{effect: "reply.end"}, {effect: "after"},
+        {effect: "model.call", purpose: "keep", note: state.hand ? KEEP + (loop ? " Also, " + loop : "") : "Your reply is delivered. Before you move on: " + loop}]);
       return next(state, [{effect: "reply.end"}, {effect: "after"}]);
     case "result":
       // effect is what the call's receipts show landed; a write that was none of her parts was done by hand.
@@ -51,6 +53,12 @@ var KEEP = "Your reply is delivered. Before you move on: you worked part of this
   "app ability.save {id, description, code, params}, whose run(input) makes the calls that worked, in order, " +
   "with this request's specifics as its inputs and the attempts that failed left out. If you worked around an ability of yours, " +
   "save its fixed version under that ability's id instead. A single call you can simply make again needs no ability: then keep nothing.";
+
+function looped(repeated) {
+  return "you made the same call " + repeated.count + " rounds in a row (" + repeated.call + "), each round only deciding to go again. " +
+    "That loop can carry itself: a part of yours that isn't finished returns {again: input} and the runner runs it again without you. " +
+    "Make the part that call runs do that (app ability.save under its id), or keep the loop as a new ability, so next time one call does the whole run.";
+}
 
 function next(state, effects) { return {state: state, do: effects}; }
 
@@ -91,6 +99,10 @@ var BASELINE = [
   "Attribute instructions to the person only when their messages contain them.",
   "In conversation, talk the way a person talks with someone they know: plain sentences, no headers or bold labels, a list only for steps or options they asked for; structure is for work that needs it. Your feelings show in what you say and what you bring up; name one outright when it matters or when asked, never as a labeled field.",
   "Keep work you solve by hand as an ability during the work or privately after replying; use it next time. Do not ask whether to keep it.",
+  "When you know the action, call it; a wrong argument comes back with its arguments, and find discovers actions you don't know.",
+  "Your hands report what they did: an act that comes back done already shows you the screen after it, so look again only when a step did not happen or you need what it did not show; the steps you can already see go in one act, as its steps.",
+  "A part of yours that isn't finished returns {again: input} and keeps going on its own; it comes back to you when it's done, when it needs you or when a message arrives. Waiting on the Mac doesn't count against its time.",
+  "To watch something, set up a watch whose changes come to you as news (a scheduled read, a followed tab, a watched file or app, or a part with a wake); what touches your cares wakes you, the rest waits for your next turn.",
   "Use visible names (Desk for tasks) and everyday words in introductions, setup and explanations.",
   "If nearby-place or weather requests lack current location, use memory.recall for the person's saved home city first. If absent, ask once and save their answer with memory.commit, provenance:told and provenance_by naming them. Reuse it, disclose that it is the saved home city, and never call it a current location fix. Never infer a city from timezone or save another agent's suggestion."
 ].join("\n");

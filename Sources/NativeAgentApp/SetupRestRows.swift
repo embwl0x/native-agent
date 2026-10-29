@@ -1,34 +1,9 @@
+import NativeAgentShared
 import EngineRuntime
 import AppToolRuntime
 
 // Blueprint: | `SetupRestRows.swift` | `SetupRestRows`: remaining settings controls in shared page rows, build identity and bundled data-limit reference handoff |
-// The rest of Settings, on the Settings page.
-//
-// SetupView used to end in a door ("All settings") that pushed the old grouped
-// Form in SlimSettingsView. The door is going away, so the sections that were
-// behind it come onto the page in the page's own row format (`SetupRow`,
-// SetupView.swift): a 14pt title and one 12pt sentence pinned to
-// `SetupMetrics.rowContentHeight`, a spacer, and the control on the trailing
-// edge. Alive glass (2026-09-23): the rows sit inside group cards —
-// `.everyday` joins the "And the rest" card, `.app` is its own section.
-//
-// NOTHING IS FORKED. Every card here reads and writes the SAME storage, the
-// SAME controller and the SAME presentation types the Form rows used, so the
-// two surfaces can never disagree:
-//   Global shortcut   → globalHotkeyEnabled + GlobalHotkeyManager
-//   Context window    → nativeagent.contextWindowMode + nativeagent.compactionThresholdTokens
-//                                                  (SlimSettingsView.swift:330-359)
-//   Updates           → UpdateController.shared + SoftwareUpdateRowPresentation
-//                                                  (SlimSettingsView.swift:405-415)
-//   Help and reference→ OnboardingTourReplayCoordinator, SlimSettingsDataLimitsReference
-//                                                  (SlimSettingsView.swift:362-385)
-//   About             → NativeAgentBuildIdentity + buildIdentityLine
-//                                                  (SlimSettingsView.swift:388-403)
-//   App status        → DoctorFacade.runtimeStatus (also used by Status)
-//
-// Devices and Integrations are deliberately absent: Telegram and iPhone already
-// have their own cards on this page (SetupView.swift:549-567) and the rail
-// carries Connectors.
+// Settings rows share canonical storage and controllers inside the page's group cards.
 
 import SwiftUI
 import Onboarding
@@ -42,7 +17,7 @@ struct SetupRestRows: View {
 
     // The app menu and every Settings surface share one Sparkle scheduler.
     @State private var updateController = UpdateController.shared
-    @State private var tourReplayCoordinator = OnboardingTourReplayCoordinator.shared
+    @State private var tourReplayCoordinator = OnboardingTourReplay.shared
     @AppStorage("nativeagent.showTour") private var showTour = false
     // Her context window (ChatSessionAutocompactionConfig.effectiveWindowTokens):
     // the model's default is 60% of its window; Custom is this size, still never
@@ -90,7 +65,7 @@ struct SetupRestRows: View {
     // MARK: Haze
 
     private var hazeRow: some View {
-        SetupRestCard(
+        SetupRow(
             title: "Haze",
             detail: "The color of the soft light drifting behind the window.",
             identifier: "setup.rest.haze"
@@ -106,7 +81,7 @@ struct SetupRestRows: View {
     @AppStorage("globalHotkeyEnabled") private var hotkeyEnabled: Bool = true
 
     private var shortcutRow: some View {
-        SetupRestCard(
+        SetupRow(
             title: "Global shortcut",
             detail: "⌘⇧J brings the window forward from anywhere. Hold it to talk, which needs Microphone and Speech Recognition.",
             identifier: "setup.rest.shortcut"
@@ -116,7 +91,7 @@ struct SetupRestRows: View {
                 .toggleStyle(.switch)
                 .hazeTinted()
                 .onChange(of: hotkeyEnabled) { _, newValue in
-                    GlobalHotkeyManager.shared.setEnabled(newValue)
+                    GlobalHotkey.shared.setEnabled(newValue)
                 }
                 .accessibilityLabel("Global shortcut")
         }
@@ -130,7 +105,7 @@ struct SetupRestRows: View {
     /// choices, since launchers and other AI apps often own ⌥Space.
     private var shotgunShortcutRow: some View {
         let taken = ShotgunController.shared.shortcutTaken
-        return SetupRestCard(
+        return SetupRow(
             title: "Shotgun shortcut",
             detail: taken.map { "\($0.title) is taken by another app. Pick another, or use View ▸ Show Shotgun." }
                 ?? "Shows or hides Shotgun, the small chat this window steps aside into.",
@@ -167,7 +142,7 @@ struct SetupRestRows: View {
     }
 
     private var compactionRow: some View {
-        SetupRestCard(
+        SetupRow(
             title: "Context window",
             detail: "How much \(agentName) keeps in mind before compacting. On a model with a smaller window, \(agentName) uses 60% of that model's window.",
             identifier: "setup.rest.compaction"
@@ -215,7 +190,7 @@ struct SetupRestRows: View {
             canCheckForUpdates: updateController.canCheckForUpdates,
             unavailableDetail: updateController.settingsDetail
         )
-        return SetupRestCard(
+        return SetupRow(
             title: "Updates",
             detail: state.detail.isEmpty ? state.title : "\(state.title). \(state.detail)",
             identifier: "setup.rest.updates"
@@ -233,7 +208,7 @@ struct SetupRestRows: View {
     // MARK: Help and reference
 
     private var helpRow: some View {
-        SetupRestCard(
+        SetupRow(
             title: "Help and reference",
             detail: "The onboarding tour, and what the app keeps and for how long.",
             identifier: "setup.rest.help"
@@ -246,18 +221,14 @@ struct SetupRestRows: View {
                 .buttonStyle(.bordered)
                 .tint(NativeAgentShell.text)
                 Button("Show data limits") {
-                    let outcome = SlimSettingsDataLimitsReference.open(
-                        resourceLookup: { name, ext, subdirectory in
-                            Bundle.main.url(
-                                forResource: name,
-                                withExtension: ext,
-                                subdirectory: subdirectory
-                            )
-                        },
-                        opener: { NSWorkspace.shared.open($0) }
-                    )
-                    if let failure = outcome.failureMessage {
-                        dataLimitsFailure = failure
+                    guard let url = Bundle.main.url(
+                        forResource: "data-bounds", withExtension: "md", subdirectory: "docs"
+                    ) else {
+                        dataLimitsFailure = "Tell the person: the data-limits reference is missing from this copy of NativeAgent."
+                        return
+                    }
+                    if !NSWorkspace.shared.open(url) {
+                        dataLimitsFailure = "NativeAgent found the data-limits reference but macOS could not open it. Try again or open the document from the installed app bundle."
                     }
                 }
                 .buttonStyle(.bordered)
@@ -274,7 +245,7 @@ struct SetupRestRows: View {
         // and a release build must never render identically in a bug report.
         let identity = NativeAgentBuildIdentity.current
         let line = "\(Self.appName) \(Self.buildIdentityLine(identity))"
-        return SetupRestCard(
+        return SetupRow(
             title: "About",
             detail: line,
             identifier: "setup.rest.about"
@@ -294,7 +265,7 @@ struct SetupRestRows: View {
     private var appStatusRow: some View {
         let state = appModel.engine.doctor.runtimeStatus(lastRefreshError: appModel.lastRefreshError)
         return VStack(alignment: .leading, spacing: 6) {
-            SetupRestCard(
+            SetupRow(
                 title: "App status",
                 detail: state.text,
                 identifier: "setup.rest.appStatus"
@@ -352,20 +323,6 @@ struct SetupRestRows: View {
         return "\(n) tokens"
     }
 }
-/// One row, in the page's one row shape (`SetupRow`) — a second spelling of
-/// that shape is how a column starts reading ragged.
-private struct SetupRestCard<Control: View>: View {
-    let title: String
-    let detail: String
-    let identifier: String
-    @ViewBuilder var control: Control
-
-    var body: some View {
-        SetupRow(title: title, detail: detail) { control }
-            .accessibilityIdentifier(identifier)
-    }
-}
-
 /// The haze palette as a row of small swatches, the chosen one ringed.
 /// Setup's Haze card and Simple view's settings share it.
 struct HazeSwatches: View {
@@ -394,48 +351,5 @@ struct HazeSwatches: View {
                 .accessibilityAddTraits(color == selected ? .isSelected : [])
             }
         }
-    }
-}
-
-/// The Settings link opens the same bounded-data reference that ships in a
-/// release bundle. Its result is explicit so a missing or unopenable resource
-/// cannot look like a successful button press.
-enum SlimSettingsDataLimitsOpenOutcome: Equatable {
-    case opened
-    case resourceUnavailable
-    case openFailed
-
-    var failureMessage: String? {
-        switch self {
-        case .opened:
-            return nil
-        case .resourceUnavailable:
-            return "Tell the person: the data-limits reference is missing from this copy of NativeAgent."
-        case .openFailed:
-            return "NativeAgent found the data-limits reference but macOS could not open it. Try again or open the document from the installed app bundle."
-        }
-    }
-}
-
-enum SlimSettingsDataLimitsReference {
-    static let resourceName = "data-bounds"
-    static let resourceExtension = "md"
-    static let preferredSubdirectory = "docs"
-
-    typealias ResourceLookup = (_ name: String, _ extension: String?, _ subdirectory: String?) -> URL?
-
-    /// install_app.sh and release.sh stage the document at Resources/docs.
-    static func bundledURL(using resourceLookup: ResourceLookup) -> URL? {
-        resourceLookup(resourceName, resourceExtension, preferredSubdirectory)
-    }
-
-    static func open(
-        resourceLookup: ResourceLookup,
-        opener: (URL) -> Bool
-    ) -> SlimSettingsDataLimitsOpenOutcome {
-        guard let url = bundledURL(using: resourceLookup) else {
-            return .resourceUnavailable
-        }
-        return opener(url) ? .opened : .openFailed
     }
 }

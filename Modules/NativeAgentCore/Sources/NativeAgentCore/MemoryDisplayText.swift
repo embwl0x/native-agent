@@ -1,38 +1,18 @@
-// The ONE canonical rendering of a MemoryV2 row's text.
-//
-// Two consumers used to own two independently-maintained renderers and then
-// compare their outputs for byte equality:
-//
-//   * USER.md autogen lines  — MemoryTextClip.memoryDisplayText (kind-aware
-//     leading-timestamp stripping)
-//   * memory context atoms   — NativeMemoryContextProjection.normalizedText
-//     (CRLF fold + trim, nothing else)
-//
-// ContextFlowCoordinator.generatedUserProjectionPrecoverage joins those two
-// strings with `==`. Any row whose stored text carried a leading timestamp
-// rendered differently on the two sides, and because the join is all-or-
-// nothing, ONE such row silently disabled USER.md precoverage for the whole
-// document — USER.md was then injected in full alongside the identical memory
-// atoms, every turn, with no log line.
-//
-// This type is the single owner of that rendering. `display` is what a human
-// reads (USER.md, recall output); `projectionJoinKey` is what the precoverage
-// join compares. Both sides of the join MUST go through `projectionJoinKey` —
-// neither side may normalize on its own.
-//
-// The join key is a (core, stamp) PAIR, not a reduced string, because a key
-// that converges the renderers must not also merge records that genuinely
-// differ — see `Key` and `projectionJoinKey`.
-//
-// This lives in the base `NativeAgentCore` target on purpose: MemoryV2 (the
-// USER.md producer) and Context (the join) both depend on it, and neither
-// depends on the other.
+// Both sides of USER.md precoverage use `projectionJoinKey`, never independent normalization.
 
 import Foundation
 
-// Blueprint: | `MemoryDisplayText.swift` | `MemoryDisplayText`: canonical memory text rendering and USER.md coverage/join keys, preserving date-critical kinds |
+// Blueprint: | `MemoryDisplayText.swift` | `MemoryDisplayText`: canonical memory text, shared author suffix and USER.md coverage/join keys, preserving date-critical kinds |
 
 public enum MemoryDisplayText {
+    /// Author labels travel beside the fact, through every prompt projection.
+    public static func attributed(_ text: String, sources: [String]) -> String {
+        let names = sources.map { source in
+            String(source.components(separatedBy: .controlCharacters).joined(separator: " ")
+                .split(whereSeparator: \.isWhitespace).joined(separator: " ").prefix(160))
+        }.filter { !$0.isEmpty }
+        return names.isEmpty ? text : text + " — from " + names.joined(separator: ", ")
+    }
 
     /// Memory text as it should appear in prompts / USER.md / recall output.
     /// Durable storage may keep timestamps for sorting and audit, but ordinary
@@ -54,39 +34,9 @@ public enum MemoryDisplayText {
 
     /// Canonical comparison key for the USER.md ⇄ memory-atom precoverage join.
     ///
-    /// The join asserts: *every generated USER.md line is carried by an
-    /// eligible memory atom*. Both sides derive from the SAME stored row, but
-    /// they arrive in different shapes — a USER.md line has been through the
-    /// kind-AWARE `display(_:kind:)`, an atom body is the raw stored text
-    /// (CRLF fold + trim). The only lawful difference between them is therefore
-    /// a leading machine stamp that one side stripped and the other kept.
-    ///
-    /// A key must do two things, and the earlier stamp-destroying reduction
-    /// only did the first:
-    ///
-    ///   1. CONVERGE the two renderers — `"User likes X"` (fact) must match
-    ///      `"[2026-07-30] User likes X"` (body).
-    ///   2. Keep records that genuinely DIFFER distinguishable. Date-critical
-    ///      rows keep their stamp on BOTH sides because the date IS the fact;
-    ///      reducing them to a bare core collapsed
-    ///      `"2026-08-01 09:00 Dentist appointment downtown."` and
-    ///      `"2026-09-01 09:00 Dentist appointment downtown."` into one key, so
-    ///      one admitted atom "covered" both facts and the unadmitted one was
-    ///      silently deleted from the turn.
-    ///
-    /// So the key is a PAIR, not a reduced string: the stamp-stripped `core`
-    /// plus the leading `stamp` that was removed (nil when there was none).
-    /// `Key.covers(_:)` then encodes the asymmetry exactly — a stamp-LESS fact
-    /// is covered by any body with the same core (that is case 1, the renderer
-    /// convergence), while a fact that KEPT its stamp demands a body carrying
-    /// the same stamp (case 2). No kind lookup is needed on either side: the
-    /// presence of the stamp on the USER.md line is already the kind-aware
-    /// renderer's verdict, carried in the data.
-    ///
-    /// Stripping runs to a FIXPOINT because it is not idempotent on stacked
-    /// stamps ("2026-01-01 2026-01-02 foo" needs two passes); everything the
-    /// passes removed becomes the stamp. Bounded to a handful of passes; the
-    /// string strictly shrinks or the loop exits.
+    /// Matching requires the same core; a stamped fact also requires the same stamp.
+    /// A fact's retained stamp carries the kind-aware renderer's date-critical verdict.
+    /// Removed stamps form the stamp; stripping reaches a fixed point or the pass limit.
     public struct Key: Hashable, Sendable, CustomStringConvertible {
         /// Text with every leading machine stamp removed.
         public let core: String

@@ -1,5 +1,13 @@
 import Foundation
-// Blueprint: | `MobileTrustAction.swift` | `MobileTrustAction` enum |
+// Blueprint: | `MobileTrustAction.swift` | Shared `TrustWorkshopPolicy` value and closed `MobileTrustAction` requests; TrustCenter retains policy authority |
+
+public struct TrustWorkshopPolicy: Sendable, Codable, Hashable {
+    public var enabled: Bool?
+
+    public init(enabled: Bool? = nil) {
+        self.enabled = enabled
+    }
+}
 
 /// Closed, non-secret requests accepted only from a verified paired phone.
 public enum MobileTrustAction: Sendable {
@@ -40,7 +48,7 @@ public enum MobileTrustAction: Sendable {
 
     public enum Field: String, CaseIterable, Sendable {
         case permissionLevel, autonomyDefault, requireBackups, outsideDefault, developerMode
-        case workshopEnabled, showTimeline, autonomousTraining, dreamScheduler
+        case workshopEnabled, autonomousTraining, dreamScheduler
 
         public var values: [String] {
             switch self {

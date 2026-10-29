@@ -1,5 +1,6 @@
 import ChatToolParsing
 import ChatToolRuntime
+import ChatSessionWork
 import NativeAgentShared
 import Foundation
 import Dispatcher
@@ -48,32 +49,6 @@ extension SwiftNativeTurnEngine {
         ConversationPrefixSeeding.appendUserText(text, to: &conversation)
     }
 
-    /// Shared pre-loop context resolution. Prefer a caller-provided context
-    /// (e.g. one already threaded with session history); otherwise build a fresh
-    /// per-turn context AND lazy-filter ctx.toolSchemas so the
-    /// no-preBuiltContext path can't expose the full eager catalog.
-    func resolveToolLoopContext(surface: String, userMessage: String, sessionId: String?,
-                                preBuiltContext: TurnContext?) async throws -> TurnContext {
-        // This is the production structured-chat shape. Its context already
-        // contains the chosen persona, threaded history/session digest, and
-        // cognitive capsule, and has already received its turn-scoped lazy
-        // tool filter. Rebuilding here would silently discard those inputs.
-        if let preBuiltContext { return preBuiltContext }
-        let rawCtx = try await buildTurnContext(
-            surface: surface,
-            userMessage: userMessage,
-            personaOverride: nil,
-            imageBlocks: [],
-            sessionID: sessionId,
-            offeredToolNames: SwiftToolDispatcher.normalModelToolNames(activeTools: LLMCallContext.turnActiveTools ?? [])
-        )
-        // The one lazy filter: always-on core plus this turn's own scope.
-        return SwiftNativeChatOrchestrationClient.applyLazyToolFilter(
-            to: rawCtx,
-            activeTools: LLMCallContext.turnActiveTools ?? []
-        ) ?? rawCtx
-    }
-
     /// Settles reply.end, including incomplete/waiting work. ContextFlow records
     /// `.completed` for this loop exit; the result's completionState describes work.
     /// Runs after-turn work only when the part requested it.
@@ -82,35 +57,29 @@ extension SwiftNativeTurnEngine {
         ctx: TurnContext,
         dispatches: [TurnEngineResult.ToolDispatchRecord],
         startNs: UInt64,
-        rawLLMResponse: String,
         providerCallCount: Int,
         userMessage: String,
         sessionId: String?,
         surface: String,
         workingCommentaryCharacters: Int? = nil,
         completionState: TurnEngineResult.CompletionState = .completed,
-        afterTurn: Bool = true
+        afterTurn: Bool = true,
+        took: String? = nil,
+        afterReply: AfterReply? = nil
     ) async -> TurnEngineResult {
         let recalledIds = ctx.resolvedRecalledIds
         await ctx.fluidContextTurn?.recordOutcome(.completed)
-        var promotionTicket: UUID?
+        var held = afterReply
         if afterTurn {
-            await queuePromises(in: reply, dispatches: dispatches, surface: surface)
-            // NOT run here (Astra audit 2, finding 4, 2026-09-11): this used to hold
-            // the TurnEngineResult — and therefore the caller's assistant-row persist
-            // and output milestone — for the whole promotion, 8-10 s on live bridge
-            // turns. This only CAPTURES the promotion's inputs; the caller's
-            // `startDeferredMemoryPromotion(ticket:)` starts it once the assistant
-            // row is durable, so the work is deferred behind the append, not dropped.
-            // The ticket rides home on the result: it is what makes the start
-            // per-turn instead of "whatever this actor last captured" (Astra comb 3
-            // review, finding 1, 2026-09-12).
-            promotionTicket = deferMemoryPromotion(
+            await queueStoppedRuns(dispatches: dispatches, surface: surface)
+            held = deferMemoryPromotion(
                 userMessage: userMessage,
                 assistantMessage: reply,
                 toolDispatches: dispatches,
                 sessionId: sessionId,
-                surface: surface
+                surface: surface,
+                took: took,
+                afterReply: held
             )
         }
         let endNs = DispatchTime.now().uptimeNanoseconds
@@ -121,24 +90,16 @@ extension SwiftNativeTurnEngine {
             recalledIds: recalledIds,
             toolDispatches: dispatches,
             elapsedMs: elapsedMs,
-            rawLLMResponse: rawLLMResponse,
             providerCallCount: providerCallCount,
             completionState: completionState,
-            memoryPromotionTicket: promotionTicket,
+            afterReply: held,
             workingCommentaryCharacters: workingCommentaryCharacters
         )
     }
 
-    /// Wave 2 #7: work her reply promises for a later turn goes to MY QUEUE,
-    /// in her words, tagged inferred with the sentence it came from
-    /// (`ToolCallParser.crossTurnDeferrals`). Only on the doors people and
-    /// peers talk to her through, and not when she queued a step herself this
-    /// turn. "Once you approve" follows the card this turn filed, if it filed
-    /// one. The turn's steer rides along (`PeerDataTaint.carried`). Inferred
-    /// steps untouched for a week expire here (`MyQueue.expireInferred`).
-    func queuePromises(in reply: String, dispatches: [TurnEngineResult.ToolDispatchRecord], surface: String) async {
-        let doors: Set<String> = ["chat", "mac", "telegram", "slack", "ios", "iphone", "mobile", "icloud", "mac_ios",
-                                  "ios_icloud", "agent-bridge", "claude-bridge", "codex-bridge"]
+    /// Typed stopped-run receipts retain their continuation and origin.
+    /// Reply prose never creates work; explicit commitments use queue.add.
+    func queueStoppedRuns(dispatches: [TurnEngineResult.ToolDispatchRecord], surface: String) async {
         guard let root = remPinsDataRoot else { return }
         let store = SwiftNativeDeskStore(dataRoot: root)
         let origin = ChatPersistenceContext.originPrincipal
@@ -173,31 +134,6 @@ extension SwiftNativeTurnEngine {
                 nativeLog("[my-queue] a stopped skill run was not queued: \(error)")
             }
         }
-        guard doors.contains(surface.lowercased()),
-              !dispatches.contains(where: { $0.name == "app" && $0.input["action"] == .string("queue.add") }) else { return }
-        do { try await MyQueue.expireInferred(store: store) } catch { nativeLog("[my-queue] expiry failed: \(error)") }
-        let promises = ToolCallParser.crossTurnDeferrals(reply)
-        guard !promises.isEmpty else { return }
-        let card = dispatches.last { ChatToolOutcome.isWaitingApproval($0.result) }.flatMap { dispatch -> String? in
-            guard case .object(let object) = dispatch.result,
-                  case .string(let id)? = object["approvalId"] ?? object["approval_id"] else { return nil }
-            return id
-        }
-        for promise in promises {
-            let after = promise.when == "after_card" ? card : nil
-            let when = promise.when == "after_card" && after == nil ? "next_turn" : promise.when
-            do {
-                let queued = try await MyQueue.add(DeskStep(words: promise.sentence, when: when, card: after, source: promise.sentence,
-                                                   peers: steer.sources, elevated: steer.elevated,
-                                                   session: ChatToolSessionContext.verifiedSessionId, origin: origin,
-                                                   replyRoute: TurnEnvelope.current(surface: surface).persistedMetadata()), store: store)
-                if queued.change == .added {
-                    TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("L24"), "site": .string("ChatOrchestration+ToolLoop.swift:queuePromises")]))
-                }
-            } catch {
-                nativeLog("[my-queue] a promise was not queued: \(error)")
-            }
-        }
     }
 
     /// The card a result waits on and what it waits for, when it waits on a person.
@@ -222,7 +158,7 @@ extension SwiftNativeTurnEngine {
         surface: String,
         sessionId: String?,
         tools: any ToolDispatchClient,
-        progress: ChatOrchestrationProgressHandler?,
+        progress: TurnEventSink?,
         conversation: inout [LLMMessage],
         dispatches: inout [TurnEngineResult.ToolDispatchRecord],
         providerTools: ProviderToolNameMap,
@@ -245,29 +181,18 @@ extension SwiftNativeTurnEngine {
         } else if !prose.isEmpty {
             assistantBlocks.append(.text(prose))
         }
-        // If the parser didn't recover an id (legacy marker), mint a stable one
-        // keyed on round base + call index + name so the provider has SOMETHING
-        // to round-trip. The index matters: two id-less calls to the SAME tool in
-        // one round must not collide (audit 2026-06-09). pairedIds keeps the
-        // result side echoing the exact assistant-side id by position.
+        // Missing ids use round base, call index and name; pairedIds echoes each unique id by position.
         let roundBase = dispatches.count
-        var pairedIds: [String] = []
-        for (idx, call) in providerCalls.enumerated() {
-            let id = call.id.isEmpty
+        let pairedIds = providerCalls.enumerated().map { idx, call in
+            call.id.isEmpty
                 ? "toolu_synth_\(roundBase + idx)_\(call.name)"
                 : call.id
-            pairedIds.append(id)
-            if markerCodec == nil {
-                let argsJSON = (try? JSONValue.object(call.input).serializedData(pretty: false)) ?? Data("{}".utf8)
-                assistantBlocks.append(.toolUse(id: id, name: call.name, inputJSON: argsJSON))
-            }
         }
-        conversation.append(LLMMessage(role: .assistant, content: assistantBlocks))
+        conversation.append(try ToolCallCodec.assistantMessage(prose: assistantBlocks, calls: providerCalls,
+            pairedIDs: pairedIds, markerCodec: markerCodec))
 
-        // Dispatch the iteration's calls (parallel-safe runs concurrent, cap 4,
-        // everything else serial in order — U1 step 6) and append the results as
-        // ONE user message of tool_result blocks paired by id in original order.
-        var (toolResultBlocks, iterationRecords) = await dispatchIterationCalls(
+        // Dispatch safe calls concurrently and append one user message of results paired by id in original order.
+        let (toolResultBlocks, iterationRecords) = await dispatchIterationCalls(
             providerCalls: providerCalls,
             pairedIds: pairedIds,
             providerTools: providerTools,
@@ -282,32 +207,9 @@ extension SwiftNativeTurnEngine {
             cancelFlagPath: cancelFlagPath,
             neutralizingTextResults: markerCodec != nil
         )
-        if let markerCodec {
-            // The round's results as the marker protocol returns them: one
-            // text carrier in call order, closed once, pixels after it.
-            var carrier = ""
-            var images: [LLMContentBlock] = []
-            var resultIndex = 0
-            for block in toolResultBlocks {
-                guard case .toolResult(_, let content, let isError) = block else {
-                    images.append(block)
-                    continue
-                }
-                markerCodec.appendResult(
-                    index: resultIndex,
-                    toolName: iterationRecords[resultIndex].name,
-                    ok: !isError,
-                    content: content,
-                    to: &carrier
-                )
-                resultIndex += 1
-            }
-            if resultIndex > 0 { markerCodec.closeRound(&carrier) }
-            toolResultBlocks = (carrier.isEmpty ? [] : [.text(carrier)]) + images
-        }
         dispatches.append(contentsOf: iterationRecords)
-        ChatTurnExecution.current?.keepTools(iterationRecords)
-        conversation.append(contentsOf: LocalToolImage.continuation(toolResultBlocks))
+        conversation.append(contentsOf: LocalToolImage.continuation(ToolCallCodec.resultBlocks(toolResultBlocks,
+            toolNames: iterationRecords.map(\.name), markerCodec: markerCodec)))
         if let toolBoundaryReason {
             TurnObservation.apply(.boundary(toolBoundaryReason), to: &conversation, surface: surface)
         }

@@ -157,157 +157,6 @@ verify_no_derived_context_state() {
   echo "[resources] verified no derived ContextFlow state in $context: $scan_root"
 }
 
-MINILM_SOURCE_RESOURCE_PATH="Modules/NativeAgentCore/Sources/MemoryV2/Resources"
-MINILM_SWIFTPM_BUNDLE_NAME="NativeAgentCore_MemoryV2.bundle"
-
-# Required byte sizes and SHA-256 hashes are the release resource manifest.
-# Updating the model requires an intentional manifest change in this script.
-MINILM_REQUIRED_FILES=(
-  $'minilm_vocab.txt\t231508\t07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3'
-  $'minilm.mlpackage/Manifest.json\t617\t911f501a4c3f06b795ddced1606dca39f1b6c3f2bd88a06455a65a04cda4c3a3'
-  $'minilm.mlpackage/Data/com.apple.CoreML/model.mlmodel\t71688\t8ce9abd3d498444303732974cdc7e9d959d9463e18e240f6d22f81502fe86318'
-  $'minilm.mlpackage/Data/com.apple.CoreML/weights/weight.bin\t44939136\tf6d040d94a3a476264c26cb3b6d260aa695784121667e6bff6690f56de558d41'
-)
-MINILM_EXPECTED_PATHS=(
-  "minilm.mlpackage"
-  "minilm.mlpackage/Data"
-  "minilm.mlpackage/Data/com.apple.CoreML"
-  "minilm.mlpackage/Data/com.apple.CoreML/model.mlmodel"
-  "minilm.mlpackage/Data/com.apple.CoreML/weights"
-  "minilm.mlpackage/Data/com.apple.CoreML/weights/weight.bin"
-  "minilm.mlpackage/Manifest.json"
-  "minilm_vocab.txt"
-)
-
-verify_minilm_resource_tree() {
-  local resource_root="$1" context="$2"
-  local spec relative_path expected_bytes expected_sha resource_path actual_bytes actual_sha
-  local actual_paths missing_paths unexpected_paths first_path symlink_path
-
-  [[ -d "$resource_root" && ! -L "$resource_root" ]] \
-    || fail "$context missing required MiniLM resource directory: $resource_root"
-
-  symlink_path="$(release_find_checked "$context MiniLM symlink" "$resource_root" -type l -print)" \
-    || fail "$context MiniLM symlink scan of $resource_root did not run correctly"
-  symlink_path="$(printf '%s\n' "$symlink_path" | sed '/^$/d' | head -1)"
-  [[ -z "$symlink_path" ]] \
-    || fail "$context contains unexpected MiniLM resource symlink: $symlink_path"
-
-  for spec in "${MINILM_REQUIRED_FILES[@]}"; do
-    IFS=$'\t' read -r relative_path expected_bytes expected_sha <<<"$spec"
-    resource_path="$resource_root/$relative_path"
-    [[ -f "$resource_path" && ! -L "$resource_path" ]] \
-      || fail "$context missing required MiniLM resource: $resource_path"
-    actual_bytes="$(wc -c < "$resource_path" | tr -d '[:space:]')"
-    [[ "$actual_bytes" =~ ^[0-9]+$ ]] \
-      || fail "$context could not measure MiniLM resource: $resource_path"
-    [[ "$actual_bytes" == "$expected_bytes" ]] \
-      || fail "$context has wrong-sized MiniLM resource: $resource_path ($actual_bytes bytes; require $expected_bytes)"
-    actual_sha="$(shasum -a 256 "$resource_path" | awk '{print $1}')"
-    [[ "$actual_sha" == "$expected_sha" ]] \
-      || fail "$context has hash-mismatched MiniLM resource: $resource_path"
-  done
-
-  actual_paths="$(
-    cd "$resource_root"
-    find . -mindepth 1 -print | sed 's#^\./##' | LC_ALL=C sort
-  )"
-  missing_paths="$(
-    comm -23 \
-      <(printf '%s\n' "${MINILM_EXPECTED_PATHS[@]}" | LC_ALL=C sort) \
-      <(printf '%s\n' "$actual_paths")
-  )"
-  if [[ -n "$missing_paths" ]]; then
-    first_path="${missing_paths%%$'\n'*}"
-    fail "$context missing required MiniLM resource path: $resource_root/$first_path"
-  fi
-  unexpected_paths="$(
-    comm -13 \
-      <(printf '%s\n' "${MINILM_EXPECTED_PATHS[@]}" | LC_ALL=C sort) \
-      <(printf '%s\n' "$actual_paths")
-  )"
-  if [[ -n "$unexpected_paths" ]]; then
-    first_path="${unexpected_paths%%$'\n'*}"
-    fail "$context contains unexpected MiniLM resource path: $resource_root/$first_path"
-  fi
-}
-
-verify_minilm_source_resources() {
-  local repo_root="$1"
-  local resource_root="$repo_root/$MINILM_SOURCE_RESOURCE_PATH"
-  verify_minilm_resource_tree "$resource_root" "source tree"
-  echo "[resources] verified required MiniLM source resources: $resource_root"
-}
-
-verify_minilm_swiftpm_resources() {
-  local contents_resources="$1"
-  local expected_bundle="$contents_resources/$MINILM_SWIFTPM_BUNDLE_NAME"
-  local candidate expected_package expected_vocab
-
-  [[ -d "$contents_resources" && ! -L "$contents_resources" ]] \
-    || fail "missing app Contents/Resources directory: $contents_resources"
-  [[ -d "$expected_bundle" && ! -L "$expected_bundle" ]] \
-    || fail "missing expected SwiftPM resource bundle: $expected_bundle"
-
-  # Swift 6.4 (2026-09-16) lays the macOS resource bundle out as
-  # <bundle>/Contents/Resources/<files>; earlier toolchains put the files at
-  # the bundle root. Bundle(path:) at runtime resolves both, so both verify.
-  local bundle_resources="$expected_bundle"
-  if [[ -d "$expected_bundle/Contents/Resources" && ! -L "$expected_bundle/Contents/Resources" ]]; then
-    bundle_resources="$expected_bundle/Contents/Resources"
-  fi
-
-  verify_minilm_resource_tree "$bundle_resources" "staged SwiftPM bundle"
-
-  expected_package="$bundle_resources/minilm.mlpackage"
-  expected_vocab="$bundle_resources/minilm_vocab.txt"
-  local minilm_candidates
-  minilm_candidates="$(release_find_checked "staged MiniLM" "$contents_resources" \
-    \( -name 'minilm.mlpackage' -o -name 'minilm_vocab.txt' \) -print)" \
-    || fail "staged MiniLM scan of $contents_resources did not run correctly"
-  while IFS= read -r candidate; do
-    [[ -n "$candidate" ]] || continue
-    [[ "$candidate" == "$expected_package" || "$candidate" == "$expected_vocab" ]] \
-      || fail "MiniLM resource staged outside expected SwiftPM resource bundle: $candidate"
-  done <<< "$minilm_candidates"
-
-  echo "[resources] verified staged MiniLM SwiftPM bundle: $expected_bundle"
-}
-
-verify_bridge_helper_source_resources() {
-  local repo_root="$1" codex_helper omp_helper
-  codex_helper="$repo_root/script/codex_thread_wakeup.js"
-  [[ -f "$codex_helper" && ! -L "$codex_helper" ]] \
-    || fail "source tree missing required Codex bridge helper: $codex_helper"
-  [[ "$(wc -c < "$codex_helper" | tr -d '[:space:]')" -gt 10000 ]] \
-    || fail "Codex bridge helper is unexpectedly small: $codex_helper"
-  omp_helper="$repo_root/script/omp_thread_wakeup.js"
-  [[ -f "$omp_helper" && ! -L "$omp_helper" ]] \
-    || fail "source tree missing required OMP bridge helper: $omp_helper"
-  [[ "$(wc -c < "$omp_helper" | tr -d '[:space:]')" -gt 10000 ]] \
-    || fail "OMP bridge helper is unexpectedly small: $omp_helper"
-  echo "[resources] verified bridge helper source resources"
-}
-
-verify_bridge_helper_bundle_resources() {
-  local contents_resources="$1" codex_hits omp_hits codex_count omp_count
-  codex_hits="$(release_find_checked "Codex bridge helper" "$contents_resources" -type f -name 'codex_thread_wakeup.js' -print)" \
-    || fail "Codex bridge helper scan of $contents_resources did not run correctly"
-  omp_hits="$(release_find_checked "OMP bridge helper" "$contents_resources" -type f -name 'omp_thread_wakeup.js' -print)" \
-    || fail "OMP bridge helper scan of $contents_resources did not run correctly"
-  codex_count="$(printf '%s\n' "$codex_hits" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
-  omp_count="$(printf '%s\n' "$omp_hits" | sed '/^$/d' | wc -l | tr -d '[:space:]')"
-  [[ "$codex_count" == "1" ]] \
-    || fail "release resources require exactly one Codex bridge helper; found $codex_count"
-  [[ "$omp_count" == "1" ]] \
-    || fail "release resources require exactly one OMP bridge helper; found $omp_count"
-  [[ "$(wc -c < "$codex_hits" | tr -d '[:space:]')" -gt 10000 ]] \
-    || fail "bundled Codex bridge helper is unexpectedly small: $codex_hits"
-  [[ "$(wc -c < "$omp_hits" | tr -d '[:space:]')" -gt 10000 ]] \
-    || fail "bundled OMP bridge helper is unexpectedly small: $omp_hits"
-  echo "[resources] verified staged Codex and OMP bridge helpers"
-}
-
 verify_data_bounds_bundle_resource() {
   local contents_resources="$1" data_bounds
   [[ -d "$contents_resources" && ! -L "$contents_resources" ]] \
@@ -320,7 +169,7 @@ verify_data_bounds_bundle_resource() {
   echo "[resources] verified bundled data-limits reference: $data_bounds"
 }
 
-# U1: the shipped release notes are how the agent answers "what changed?" after
+# The shipped release notes are how the agent answers "what changed?" after
 # an update. A bundle without this version's note leaves it with nothing to say.
 verify_release_notes_bundle_resource() {
   local contents_resources="$1" version="$2" notes_dir note count
@@ -349,11 +198,9 @@ if (( SPECIAL_MODE_COUNT == 1 )); then
   [[ "$ARTIFACT_OPTION_SET" == "false" ]] \
     || fail "focused verification modes cannot be combined with artifact options"
   if [[ -n "$RESOURCE_SOURCE_ROOT" ]]; then
-    verify_minilm_source_resources "$RESOURCE_SOURCE_ROOT"
-    verify_bridge_helper_source_resources "$RESOURCE_SOURCE_ROOT"
+    ruby "$ROOT/script/sync_build_declarations.rb" --verify-resources "$RESOURCE_SOURCE_ROOT"
   elif [[ -n "$RESOURCE_BUNDLE_ROOT" ]]; then
-    verify_minilm_swiftpm_resources "$RESOURCE_BUNDLE_ROOT"
-    verify_bridge_helper_bundle_resources "$RESOURCE_BUNDLE_ROOT"
+    ruby "$ROOT/script/sync_build_declarations.rb" --verify-resources "$ROOT" "$RESOURCE_BUNDLE_ROOT"
   else
     verify_no_derived_context_state "$DERIVED_CONTEXT_SCAN_ROOT" "selected tree"
   fi
@@ -372,20 +219,11 @@ require_dir() {
   [[ -d "$1" ]] || fail "missing required directory: $1"
 }
 
-verify_chrome_payload() {
-  local bundle="$1" relative
+verify_chrome_relay() {
+  local bundle="$1"
   local relay="$bundle/Contents/MacOS/NativeAgentChromeRelay"
-  local extension="$bundle/Contents/Resources/NativeAgentChrome"
   [[ -f "$relay" && -x "$relay" && ! -L "$relay" ]] \
     || fail "missing Chrome relay executable: $relay"
-  # Every source module the extension ships, from the tree itself — a list
-  # kept by hand drifted (lease-manager.js stayed required after its deletion).
-  local sources="${RESOURCE_SOURCE_ROOT:-$ROOT}/Extensions/NativeAgentChrome"
-  [[ -d "$sources/src" ]] || fail "missing Chrome extension source tree: $sources/src"
-  for relative in manifest.json $(cd "$sources" && ls src/*.js); do
-    [[ -s "$extension/$relative" && ! -L "$extension/$relative" ]] \
-      || fail "missing Chrome extension resource: $relative"
-  done
 }
 
 plist_value() {
@@ -398,20 +236,12 @@ require_plist_value() {
   [[ "$actual" == "$expected" ]] || fail "Info.plist $key expected '$expected', got '$actual'"
 }
 
-# A2.1 round 2 (gpt-5.5 MED): PlistBuddy STRINGIFIES everything, so
-# <string>true</string> printed "true" and passed the updater-honesty gates below
-# while UpdateController.swift reads `info[key] as? Bool` and saw nil — i.e. an
-# artifact could pass verification with its updater silently disabled. Assert the
-# plist value TYPE, never the printed text. plist_bool_state / plist_string_state
-# live in script/lib/plist_types.sh so the guard tests exercise this exact code.
-
+# Assert the value's type, matching the app's Swift Bool reads.
 # Fails when the key exists but is not a real plist Boolean. Absent is allowed —
 # the callers decide what absence means.
 #
-# Result lands in the global PLIST_BOOL_STATE ("true"/"false"/"" for absent)
-# rather than on stdout ON PURPOSE: `x="$(fn)"` would run fail()'s `exit 1` in a
-# SUBSHELL, so the verifier would print the error and keep going with an empty
-# value — a fail-open verifier is worse than none.
+# Result lands in PLIST_BOOL_STATE ("true"/"false"/"" for absent) so fail() exits
+# the verifier itself rather than a command-substitution subshell.
 PLIST_BOOL_STATE=""
 require_plist_bool_or_absent() {
   local plist="$1" key="$2" state
@@ -425,10 +255,6 @@ require_plist_bool_or_absent() {
        (\`info[\"$key\"] as? Bool\`), which silently disables the updater."
       ;;
   esac
-}
-
-require_absent() {
-  [[ ! -e "$1" ]] || fail "forbidden release artifact present: $1"
 }
 
 MOUNT_BASE="$(mktemp -d "${TMPDIR:-/tmp}/nativeagent-artifact-verify.XXXXXX")"
@@ -473,7 +299,7 @@ require_dir "$BUNDLE"
 require_file "$INFO"
 require_file "$EXECUTABLE"
 [[ -x "$EXECUTABLE" ]] || fail "main executable is not executable: $EXECUTABLE"
-verify_chrome_payload "$BUNDLE"
+verify_chrome_relay "$BUNDLE"
 
 if [[ -z "$BUNDLE_PATH" ]]; then
   [[ -L "$MOUNT_POINT/Applications" ]] || fail "DMG missing /Applications symlink"
@@ -482,10 +308,7 @@ fi
 
 require_plist_value "$INFO" "CFBundleIdentifier" "$EXPECTED_MAC_BUNDLE_ID"
 require_plist_value "$INFO" "CFBundleExecutable" "$PRODUCT"
-# Internal (non-publish) lanes stamp CFBundleShortVersionString with a
-# -dev.<sha8>[.dirty] marker so an internal build can never impersonate the
-# published release (seat-hygiene, 2026-08-21). release.sh exports the
-# expected marked value; a bare invocation still requires the plain VERSION.
+# release.sh supplies the expected short version; standalone verification requires VERSION.
 require_plist_value "$INFO" "CFBundleShortVersionString" \
   "${NATIVEAGENT_EXPECTED_SHORT_VERSION:-$VERSION}"
 require_plist_value "$INFO" "CFBundleVersion" "$VERSION"
@@ -552,42 +375,12 @@ SOURCE_DIRTY="$(plist_value "$INFO" "NativeAgentSourceDirty")"
 if [[ "$REQUIRE_CLEAN_SOURCE" == "true" && "$SOURCE_DIRTY" != "false" ]]; then
   fail "release artifact was built from a dirty or unknown source tree"
 fi
-verify_minilm_swiftpm_resources "$RESOURCES"
-verify_bridge_helper_bundle_resources "$RESOURCES"
+ruby "$ROOT/script/sync_build_declarations.rb" --verify-resources "$ROOT" "$RESOURCES"
 verify_data_bounds_bundle_resource "$RESOURCES"
 verify_release_notes_bundle_resource "$RESOURCES" "$VERSION"
 verify_no_derived_context_state "$RESOURCES" "release resources"
-require_absent "$RESOURCES/daemon"
-require_absent "$RESOURCES/native_agentd.py"
-require_absent "$RESOURCES/python"
-
-for forbidden in \
-  REPO_PATH data .runtime workspace secrets .secrets cognition memory memory_proposals \
-  chat_sessions self_worktrees config providers approvals pairings tokens credentials \
-  oauth keychain .env daemon native_agentd.py python
-do
-  require_absent "$RESOURCES/$forbidden"
-done
-
-LOCAL_STATE_DIR_RE='/(activity|approvals|browser|catalog|chat_sessions|cognition|connectors|context|credentials|dreams|evolution|inbox|keychain|knowledge_graph|memory|memory_proposals|missions|nextgen|oauth|pairings|providers|scheduler|self_worktrees|tokens|traces|trust|workflow|workflows)(/|$)'
-# SCANNER-INTEGRITY CONTRACT (2026-08-21, round 2): every walk below goes
-# through release_find_checked, which keeps find's exit status. The old
-# `find ... 2>/dev/null || true` form made a partially-failed walk (unreadable
-# subdirectory) look exactly like a clean bundle, and `-print -quit` threw the
-# status away a second time by exiting 0 after the error.
-local_state_dirs="$(release_find_checked "artifact state-directory" "$RESOURCES" -type d -print)" \
-  || fail "state-directory scan of $RESOURCES did not run correctly"
-local_state_dir_hit="$(
-  printf '%s\n' "$local_state_dirs" \
-  | awk 'NF' \
-  | awk '{ low=tolower($0); print low "\t" $0 }' \
-  | awk -F '\t' -v root="$(printf '%s' "$RESOURCES" | tr '[:upper:]' '[:lower:]')" -v re="$LOCAL_STATE_DIR_RE" '
-      index($1, root "/") == 1 {
-        rel = substr($1, length(root) + 1)
-        if (rel ~ re) { print $2; exit }
-      }'
-)"
-[[ -z "$local_state_dir_hit" ]] || fail "live NativeAgent state directory shipped in release resources: $local_state_dir_hit"
+release_assert_no_user_state_in_bundle "$BUNDLE" \
+  || fail "release artifact contains user/runtime state or its scan failed"
 
 first_line() { printf '%s\n' "$1" | sed '/^$/d' | head -1; }
 
@@ -599,101 +392,12 @@ bad_readable="$(release_find_checked "readability" "$BUNDLE" \( -type f ! -perm 
   || fail "readability scan of $BUNDLE did not run correctly"
 [[ -z "$bad_readable" ]] || fail "path is not readable/traversable by normal users: $(first_line "$bad_readable")"
 
-pycache_hits="$(release_find_checked "__pycache__" "$RESOURCES" -type d -name '__pycache__' -print)" \
-  || fail "__pycache__ scan of $RESOURCES did not run correctly"
-[[ -z "$pycache_hits" ]] || fail "Python cache directory shipped in release bundle: $(first_line "$pycache_hits")"
-bytecode_hits="$(release_find_checked "bytecode" "$RESOURCES" -type f \( -name '*.pyc' -o -name '*.pyo' \) -print)" \
-  || fail "bytecode scan of $RESOURCES did not run correctly"
-[[ -z "$bytecode_hits" ]] || fail "Python bytecode shipped in release bundle: $(first_line "$bytecode_hits")"
 backup_hits="$(release_find_checked "backup-file" "$RESOURCES" -type f -name '*.bak*' -print)" \
   || fail "backup-file scan of $RESOURCES did not run correctly"
 [[ -z "$backup_hits" ]] || fail "backup file shipped in release bundle: $(first_line "$backup_hits")"
-test_artifact_hits="$(release_find_checked "test-artifact" "$RESOURCES" -type f \( -name '*_tests.py' -o -name 'test_*.py' \) -print)" \
-  || fail "test-artifact scan of $RESOURCES did not run correctly"
-[[ -z "$test_artifact_hits" ]] || fail "test artifact shipped in release bundle: $(first_line "$test_artifact_hits")"
 
-# ONBOARDING-2026-05-26: a public release bundle MUST NOT contain a persona
-# directory. Earlier revisions shipped *.template.md placeholders here, but
-# that caused _resolve_persona_root() step 3 to resolve inside the read-only
-# signed .app on public installs, which auto-scaffolded SOUL.md and locked
-# users out of the first-run onboarding wizard. The contract is now: no
-# persona dir in the bundle; Swift onboarding resolves first-run data under
-# the writable data root. Any file under Contents/Resources/persona is a
-# regression that must fail the artifact verifier.
-[[ ! -e "$RESOURCES/persona" ]] || fail "Contents/Resources/persona must not ship — see release.sh ONBOARDING-2026-05-26"
-
-# SCANNER-INTEGRITY CONTRACT (2026-08-21): these scans go through the
-# release_scan_* helpers, which validate the pattern, assert the scan had a
-# subject, and never swallow the scanner's exit code. See the long note at the
-# top of script/lib/release_bundle_gates.sh.
-# The secret VALUE pattern is no longer copied here: release_scan_dir_for_
-# secret_values owns it, so the verifier and the release leak guard cannot drift
-# apart on either the pattern or the binary-pass flag.
-SECRET_FILE_RE="$RELEASE_SECRET_FILE_RE"
-
-release_assert_scanner_canary "artifact verifier" \
-  || fail "artifact-verifier scanner self-test failed; its clean verdicts cannot be trusted"
-
-secret_file_hits="$(release_scan_dir_for_filename_re "$RESOURCES" "artifact secret filename" "$SECRET_FILE_RE")" \
-  || fail "secret-filename scan of $RESOURCES did not run correctly"
-[[ -z "$secret_file_hits" ]] || fail "secret-bearing filename shipped in release bundle: $(printf '%s' "$secret_file_hits" | head -1)"
-
-PRIVACY_DENYLIST_FILE="${NATIVEAGENT_PRIVACY_DENYLIST_FILE:-$ROOT/local/privacy_denylist.regex}"
-PERSONAL_RE="${NATIVEAGENT_PRIVACY_RE:-}"
-if [[ -n "$PERSONAL_RE" ]]; then
-  release_require_valid_regex "$PERSONAL_RE" "NATIVEAGENT_PRIVACY_RE" \
-    || fail "NATIVEAGENT_PRIVACY_RE is not a usable pattern"
-fi
-if [[ -f "$PRIVACY_DENYLIST_FILE" ]]; then
-  FILE_PRIVACY_RE="$(release_denylist_regex_from_file "$PRIVACY_DENYLIST_FILE")" \
-    || fail "privacy denylist $PRIVACY_DENYLIST_FILE is unusable; a broken pattern scans nothing"
-  if [[ -n "$FILE_PRIVACY_RE" ]]; then
-    if [[ -n "$PERSONAL_RE" ]]; then
-      PERSONAL_RE="($PERSONAL_RE)|($FILE_PRIVACY_RE)"
-    else
-      PERSONAL_RE="$FILE_PRIVACY_RE"
-    fi
-  fi
-fi
-raw_personal_hits=""
-if [[ -n "$PERSONAL_RE" ]]; then
-  raw_personal_hits="$(release_personal_identity_hit_files "$BUNDLE" "$PERSONAL_RE")" \
-    || fail "personal-identity scan of $BUNDLE did not run correctly"
-else
-  echo "  WARNING: no NATIVEAGENT_PRIVACY_RE and no usable privacy denylist — personal-identifier scan SKIPPED." >&2
-fi
-# Read line-wise: word-splitting shredded any hit path containing a space, so
-# the verifier reported a fragment of the file it was rejecting.
-while IFS= read -r hit; do
-  [[ -n "$hit" ]] || continue
-  fail "configured personal identifier found in release artifact: $hit"
-done <<< "$raw_personal_hits"
-
-# Binary pass included — see release_scan_binary_files_for_regex. `grep -I`
-# alone reports rc 1 "no match" for every binary resource, so a token inside a
-# binary plist or compiled asset used to pass the verifier untouched.
-secret_value_hits="$(release_scan_dir_for_secret_values "$RESOURCES" "artifact secret value")" \
-  || fail "secret-value scan of $RESOURCES did not run correctly"
-[[ -z "$secret_value_hits" ]] || fail "credential-looking value shipped in release resources: $(printf '%s' "$secret_value_hits" | head -1)"
-
-PUBLIC_IDENTITY_RE="${NATIVEAGENT_LOCAL_IDENTITY_RE:-}"
-identity_text_hits=""
-identity_binary_hit=""
-if [[ -n "$PUBLIC_IDENTITY_RE" ]]; then
-  identity_text_hits="$(
-    release_scan_dir_for_regex "$RESOURCES" "artifact resource identity" ci "$PUBLIC_IDENTITY_RE" \
-      '*/minilm_vocab.txt' '*/minilm.mlpackage/*' '*/embedding/vocab.txt' '*/embedding/embedding.mlpackage/*'
-  )" || fail "identity resource scan of $RESOURCES did not run correctly"
-  identity_binary_hit="$(release_scan_binary_for_local_identity "$EXECUTABLE" "artifact executable identity" "$PUBLIC_IDENTITY_RE")" \
-    || fail "identity executable scan of $EXECUTABLE did not run correctly"
-else
-  # release_github.sh REQUIRES this input; a direct verifier run must at least
-  # say out loud that the identity check did not happen.
-  echo "  WARNING: NATIVEAGENT_LOCAL_IDENTITY_RE is unset — local-identity scans of" >&2
-  echo "           release resources AND of the executable were SKIPPED." >&2
-fi
-[[ -z "$identity_text_hits" ]] || fail "local identity name found in release resources: $(printf '%s' "$identity_text_hits" | head -1)"
-[[ -z "$identity_binary_hit" ]] || fail "local identity name found in release executable strings: $(printf '%s' "$identity_binary_hit" | head -1)"
+release_assert_no_leaked_data "$BUNDLE" "$PRODUCT" "$ROOT" \
+  || fail "release artifact failed content-leak validation"
 
 echo "  app codesign verify..."
 codesign --verify --deep --strict --verbose=2 "$BUNDLE" >/dev/null
@@ -768,13 +472,8 @@ if [[ "$DEVICE_SYNC" == "cloudkit" ]]; then
   echo "  signed entitlements and embedded profile match team, app, container, and production environments..."
 fi
 
-python_artifact_hits="$(release_find_checked "python-artifact" "$RESOURCES" \
-  \( -type d \( -name python -o -name __pycache__ -o -name daemon \) \
-     -o -type f \( -name '*.py' -o -name '*.pyc' -o -name '*.pyo' -o -name '*python*' -o -name 'native_agentd.py' \) \
-     -o -type l \( -name '*python*' -o -name 'native_agentd.py' \) \) \
-  -print)" \
-  || fail "python-artifact scan of $RESOURCES did not run correctly"
-[[ -z "$python_artifact_hits" ]] || fail "Python artifact shipped in release bundle: $(first_line "$python_artifact_hits")"
+nativeagent_assert_no_python_artifacts "$BUNDLE" '[verify_release_artifact]' shipped release \
+  || fail 'Python artifact validation failed'
 
 echo "  public first-run guard marker strings..."
 MARKER_STRINGS="$MOUNT_BASE/nativeagent-executable.strings"

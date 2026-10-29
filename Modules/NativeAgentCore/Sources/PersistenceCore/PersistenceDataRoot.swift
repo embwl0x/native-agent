@@ -1,7 +1,7 @@
 import Foundation
 import Darwin
 import NativeAgentCore
-// Blueprint: | `PersistenceDataRoot.swift` | `ResolvedDataRootCache` class; `resolve` |
+// Blueprint: | `PersistenceDataRoot.swift` | Swift initializes the stable process data root once; explicit resolver arguments bypass it; literalFileURL preserves configuration path spelling; `DataRootLife.life(of:)` interprets JSON stamps, with a missing or non-string stamp naming the first life |
 
 // MARK: - Data root resolution
 
@@ -14,31 +14,17 @@ private let repoMarkerFiles: [String] = [
 
 /// The native data root, decided once per process by what kind of process it
 /// is, without creating directories. One rule each; none tries the next:
-///   - `NATIVE_AGENT_DATA_ROOT` set: that path, literally (a literal `~` is
+///   - `NATIVE_AGENT_DATA_ROOT` nonempty: that path, literally (a literal `~` is
 ///     kept). The children the app spawns set it.
 ///   - a bundle carrying a REPO_PATH stamp (every dev install): `<stamp>/data`,
 ///     whether or not it exists; launch names what is missing.
 ///   - anything else, the public release among them: Application Support.
-private let processDataRoot = ResolvedDataRootCache()
+private let processDataRoot = resolveDefaultDataRoot()
 
 /// The process default is stable. Explicit resolver arguments below deliberately
-/// bypass this cache (tests and callers resolving a different environment).
+/// bypass it for callers resolving a different environment.
 public func defaultDataRoot() -> URL {
-    processDataRoot.resolve { resolveDefaultDataRoot() }
-}
-
-internal final class ResolvedDataRootCache: @unchecked Sendable {
-    private let lock = NSLock()
-    private var root: URL?
-
-    func resolve(_ resolver: () -> URL) -> URL {
-        lock.lock()
-        defer { lock.unlock() }
-        if let root { return root }
-        let resolved = resolver()
-        root = resolved
-        return resolved
-    }
+    processDataRoot
 }
 
 public func defaultDataRoot(
@@ -55,28 +41,8 @@ internal func resolveDefaultDataRoot(
     fileManager: FileManager = .default,
     environment: [String: String] = ProcessInfo.processInfo.environment
 ) -> URL {
-    // 1. Env var wins. Empty string is treated as unset (matches Python:
-    //    `if env: return Path(env)` — Python treats "" as falsy). The env
-    //    var is used LITERALLY — `~` is NOT expanded, to match Python.
-    //
-    //    GOTCHA: every `URL(fileURLWithPath:)` / `URL(fileURLWithFileSystem-
-    //    Representation:)` variant on Darwin Foundation silently expands a
-    //    leading `~` ("`~/foo`" → "`$HOME/foo`"). Python's `Path(env)` does
-    //    NOT expand. The only Foundation constructor that preserves a leading
-    //    tilde is `URLComponents(scheme: "file", path: raw)` — that path
-    //    bypasses the implicit tilde expansion entirely. Validated by
-    //    `defaultDataRoot_envVarPreservesLeadingTilde` in PersistenceCoreTests.
     if let raw = environment["NATIVE_AGENT_DATA_ROOT"], !raw.isEmpty {
-        var components = URLComponents()
-        components.scheme = "file"
-        components.path = raw
-        if let url = components.url {
-            return url
-        }
-        // Defensive fallback if URLComponents.url returns nil for some edge
-        // case (shouldn't happen for well-formed paths). Accepts the
-        // tilde-expansion divergence rather than crashing.
-        return URL(fileURLWithPath: raw)
+        return literalFileURL(raw)
     }
 
     // 2. Dev bundle: the checkout its REPO_PATH stamp names.
@@ -87,6 +53,14 @@ internal func resolveDefaultDataRoot(
     // 3. Everything else, the public release among them (bare — no /data
     //    suffix, no dir creation).
     return libraryAppSupportFallback(fileManager: fileManager)
+}
+
+/// Configuration paths keep literal whitespace and `~`, without home expansion.
+public func literalFileURL(_ path: String) -> URL {
+    var components = URLComponents()
+    components.scheme = "file"
+    components.path = path
+    return components.url ?? URL(fileURLWithPath: path)
 }
 
 /// The Swift-native persona root, decided by the data root alone: a
@@ -105,10 +79,8 @@ public func defaultPersonaRoot(
     return dataRoot.appendingPathComponent("persona", isDirectory: true)
 }
 
-/// Launch preflight: what the roots above are missing, one line each. The
-/// app used to start on an empty root silently when a REPO_PATH stamp's repo
-/// had no data/ or no SOUL.md. Empty result = nothing missing. Public first
-/// runs are expected to be blank, so the app does not call this for them.
+/// Launch preflight: missing roots, one line each; empty means none missing.
+/// Public first runs are expected to be blank and do not call this.
 public func missingLaunchRoots(
     dataRoot: URL,
     fileManager: FileManager = .default,
@@ -138,9 +110,7 @@ public func missingLaunchRoots(
 }
 
 /// `~/Library/Application Support/NativeAgent` BARE — no `/data` suffix, no
-/// directory creation. Matches Python's fallback at the retired daemon.
-/// Subsystems (ApprovalInbox) used to duplicate this resolution;
-/// they now delegate here.
+/// directory creation; shared by every subsystem.
 public func libraryAppSupportFallback(
     fileManager: FileManager = .default,
     appBundleIdentifier: String? = currentAppBundleIdentifier()
@@ -169,10 +139,7 @@ public func currentAppBundleIdentifier(bundle: Bundle = .main) -> String? {
     return bundle.bundleIdentifier
 }
 
-/// Two public installs with DIFFERENT bundle ids used to share one data root —
-/// same conversations, same trust policy, same secrets — because the fallback
-/// had no bundle-id component at all. Any id that is not the canonical public
-/// one now gets its own sibling folder.
+/// Every noncanonical bundle id gets its own sibling data folder.
 func appSupportFolderName(for bundleIdentifier: String?) -> String {
     guard let identifier = bundleIdentifier?
             .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -252,8 +219,15 @@ public func resolveSandboxRepoRoot(
         || parent.path.hasSuffix("/Library/Application Support") {
         return nil
     }
-    // The proof: the parent must be a real NativeAgent repo (all three markers),
-    // mirroring the daemon's `self.repo_root` being a validated checkout.
+    // The parent must be a NativeAgent repo with all three markers.
     guard isValidRepoRootDir(parent, fileManager: fileManager) else { return nil }
     return parent
+}
+
+extension DataRootLife {
+    /// The life a stored JSON stamp names; no stamp is her first life.
+    public static func life(of stamp: JSONValue?) -> String {
+        if case .string(let id)? = stamp { return id }
+        return first
+    }
 }

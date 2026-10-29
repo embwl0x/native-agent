@@ -7,10 +7,7 @@ struct NaturalExpressionGuidance {
     /// Still used by TurnSettle's requested-result obligation. The expression
     /// cues are gone; this classifier keeps that independent caller unchanged.
     static func isSocialServe(_ userMessage: String) -> Bool {
-        // The live pipeline appends machine blocks to the user's text before
-        // the history builder sees it (e.g. "\n\n[tool routing …]") — classify
-        // only the user-AUTHORED head, or the newline guard rejects every real
-        // serve (live-gap found 2026-08-11 via data/logs/nexpr_diag).
+        // Classify only the user-authored head, excluding appended machine blocks.
         let authored = userMessage.components(separatedBy: "\n\n[").first ?? userMessage
         let text = authored.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, text.count <= 80,
@@ -31,9 +28,7 @@ struct NaturalExpressionGuidance {
         }) {
             return true
         }
-        // Bare-words path: short and unpunctuated is NOT enough on its own
-        // (gpt-5.5 review: "merge it" is short too) — require an explicit
-        // social/greeting marker word.
+        // Bare words require an explicit social or greeting marker.
         let socialMarkers: Set<Substring> = [
             "hey", "hi", "yo", "hiya", "morning", "gm", "night", "goodnight",
             "thanks", "thank", "ouch", "aww", "hehe", "babe", "baby",

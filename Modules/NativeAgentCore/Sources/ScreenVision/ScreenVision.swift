@@ -1,21 +1,5 @@
-// MARK: - SwiftNativeScreenVision
-//
-// v1 of NativeAgent's vision pipeline: capture the primary display as PNG
-// using ScreenCaptureKit, fail-closed on permission denial or capture failure.
-// No Python, no daemon HTTP fallback, no mock data — if ScreenCaptureKit
-// refuses we throw a typed error so the caller can surface a real message
-// in chat.
-//
-// The capture pipeline previously lived inline in the macOS app as a private
-// `NativeScreenCapture` enum (Sources/NativeAgentApp/ContentView.swift). This
-// module extracts that work into a Swift-native subsystem so it's reusable
-// from NativeClient, future vision-decision loops, and tests.
-//
-// Out of scope for v1 (defer to v2): window-by-window capture, multi-display
-// selection, streaming SCStream output. (OCR lives in MacControl and
-// runs on the four-verb path; this file still does no text extraction.)
-
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import ScreenCaptureKit
 import CoreGraphics
@@ -24,57 +8,14 @@ import AppKit
 // Blueprint: | `ScreenVision.swift` | Screen vision owner; NativeScreenCapture encoding and capture error mapping |
 #endif
 
-// MARK: - Errors
-
-public enum ScreenVisionError: Error, LocalizedError {
-    /// Screen Recording permission was denied or has never been granted.
-    /// The OS prompt fires the first time we ask; subsequent calls preflight
-    /// the existing TCC decision. Surface this to the user with instructions
-    /// to enable Screen Recording in System Settings.
-    case permissionDenied
-    /// SCShareableContent returned no displays. Rare — would indicate the
-    /// app is running with no attached display.
-    case noDisplay
-    /// ScreenCaptureKit accepted the request but the capture or encode step
-    /// failed. The associated string is the underlying reason.
-    case captureFailed(String)
-
-    public var errorDescription: String? {
-        switch self {
-        case .permissionDenied:
-            return "Screen Recording permission is required for NativeAgent. Enable it in System Settings → Privacy & Security → Screen Recording, then restart NativeAgent."
-        case .noDisplay:
-            return "NativeAgent could not find a display to capture."
-        case .captureFailed(let reason):
-            return "Screen capture failed: \(reason)"
-        }
-    }
-}
-
-// MARK: - Public actor
-
-/// Swift-native screen-capture surface. Single public entry point for v1:
-/// `captureScreen()` returns raw PNG bytes for the primary display, or
-/// throws a `ScreenVisionError` on permission / display / encoding failure.
-public actor SwiftNativeScreenVision {
-    public init() {}
-
-    /// Capture the primary display as PNG-encoded `Data`. Fails closed.
-    ///
-    /// - Throws: `ScreenVisionError.permissionDenied` if the user has not
-    ///   granted Screen Recording permission (preflight false AND the
-    ///   subsequent request returns false).
-    /// - Throws: `ScreenVisionError.noDisplay` if `SCShareableContent.current`
-    ///   reports no displays.
-    /// - Throws: `ScreenVisionError.captureFailed(_)` if ScreenCaptureKit or
-    ///   the PNG encode step fails.
-    public func captureScreen() async throws -> Data {
+public enum NativeScreenCapture {
+    private static func captureScreen() async throws -> CGImage {
         // Preflight + request. CGRequestScreenCaptureAccess returns the
         // CURRENT state on subsequent calls (it only triggers the prompt
         // the first time), so it's safe to call here unconditionally if
         // preflight is false.
         guard CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() else {
-            throw ScreenVisionError.permissionDenied
+            throw CaptureError.permissionRequired
         }
 
         // Discover displays. The spec asks for the *primary* (first) display.
@@ -82,7 +23,9 @@ public actor SwiftNativeScreenVision {
         do {
             content = try await SCShareableContent.current
         } catch {
-            throw ScreenVisionError.captureFailed("SCShareableContent: \(error.localizedDescription)")
+            let reason = "SCShareableContent: \(error.localizedDescription)"
+            ModuleLog.app("%@", "[screen-capture] failed: \(reason)")
+            throw CaptureError.captureFailed(reason)
         }
         // Select the PRIMARY display strictly by CGMainDisplayID match —
         // ScreenCaptureKit's display order is not guaranteed to put the
@@ -93,7 +36,7 @@ public actor SwiftNativeScreenVision {
         // happens to be first in the list.
         let mainID = CGMainDisplayID()
         guard let display = content.displays.first(where: { $0.displayID == mainID }) else {
-            throw ScreenVisionError.noDisplay
+            throw CaptureError.noDisplay
         }
 
         // Configure a one-shot screenshot. `pixelFormat` is set for parity
@@ -123,30 +66,19 @@ public actor SwiftNativeScreenVision {
                 configuration: configuration
             )
         } catch {
-            throw ScreenVisionError.captureFailed("SCScreenshotManager: \(error.localizedDescription)")
+            let reason = "SCScreenshotManager: \(error.localizedDescription)"
+            ModuleLog.app("%@", "[screen-capture] failed: \(reason)")
+            throw CaptureError.captureFailed(reason)
         }
 
-        // Encode CGImage -> PNG via NSBitmapImageRep (AppKit, macOS-only).
-        // NSBitmapImageRep is the simplest path that handles colorspace and
-        // alpha correctly without us hand-rolling a CGImageDestination.
-        let bitmap = NSBitmapImageRep(cgImage: image)
-        guard let png = bitmap.representation(using: .png, properties: [:]) else {
-            throw ScreenVisionError.captureFailed("PNG encoding failed")
-        }
-        return png
+        return image
     }
-}
-
-public enum NativeScreenCapture {
     public enum CaptureError: LocalizedError {
         case permissionRequired
         case noDisplay
         case encodingFailed
         case tooLarge
-        // ScreenVision v1 (2026-06-06): carries the underlying
-        // ScreenCaptureKit reason when SwiftNativeScreenVision throws
-        // .captureFailed(_). The reason goes to the log; the toast says it
-        // plainly.
+        // The underlying capture reason is logged; chat receives a short message.
         case captureFailed(String)
 
         public var errorDescription: String? {
@@ -169,47 +101,8 @@ public enum NativeScreenCapture {
     public static let maxCaptureBytes = 6 * 1024 * 1024
 
     public static func captureImageBase64() async throws -> (base64: String, mime: String, name: String, byteSize: Int) {
-        // v1 vision pipeline (2026-06-06): the capture itself is delegated to
-        // the Swift-native ScreenVision module. The size-cap / re-encode path
-        // below stays here because ScreenVision returns raw PNG bytes; the
-        // chat surface still wants a JPEG-with-quality-ladder fallback for
-        // anything that would exceed `maxCaptureBytes`.
-        //
-        // ScreenVision v1 captures the primary display only. There is no
-        // display-selection argument here because accepting one we cannot
-        // honor would silently send the wrong screen on a multi-display Mac.
-
-        let png: Data
-        do {
-            png = try await SwiftNativeScreenVision().captureScreen()
-        } catch let e as ScreenVisionError {
-            // Map the ScreenVision error surface back onto the existing
-            // CaptureError cases. The underlying ScreenCaptureKit reason is
-            // logged here rather than shown in the toast.
-            switch e {
-            case .permissionDenied:
-                throw CaptureError.permissionRequired
-            case .noDisplay:
-                throw CaptureError.noDisplay
-            case .captureFailed(let reason):
-                ModuleLog.app("%@", "[screen-capture] failed: \(reason)")
-                throw CaptureError.captureFailed(reason)
-            }
-        }
-
-        // Decode the PNG back into a CGImage so the existing encodeForChat
-        // ladder (JPEG quality fallbacks, then PNG, then tooLarge) can run
-        // unchanged.
-        guard let provider = CGDataProvider(data: png as CFData),
-              let cg = CGImage(
-                pngDataProviderSource: provider,
-                decode: nil,
-                shouldInterpolate: false,
-                intent: .defaultIntent
-              ) else {
-            throw CaptureError.encodingFailed
-        }
-        let encoded = try encodeForChat(cg)
+        let image = try await captureScreen()
+        let encoded = try encodeForChat(image)
         return (
             encoded.data.base64EncodedString(),
             encoded.mime,

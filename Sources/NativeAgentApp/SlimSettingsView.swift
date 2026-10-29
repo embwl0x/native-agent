@@ -1,4 +1,4 @@
-// The Settings page's shared presentation rules: control owners, the app
+// The Settings page's shared presentation rules: Fluid Context labels, the app
 // status line, the updater row, and the embeddings status/actions. The rows
 // themselves live on the Settings page (SetupView, SetupRestRows,
 // SetupFeatureRows).
@@ -9,46 +9,10 @@ import MemoryV2
 import NativeAgentShared
 import NativeAgentCore
 
-// Blueprint: | `SlimSettingsView.swift` | Operational settings presentation: canonical control homes, status wording and updater availability shared by settings page rows |
+// Blueprint: | `SlimSettingsView.swift` | Operational settings presentation: Fluid Context labels, status wording and updater availability shared by settings page rows |
 
-/// One canonical owner for each live operational control. Views consume these
-/// labels rather than repeating storage-oriented wording, which keeps a
-/// control from quietly acquiring a second settings home.
+/// The Settings rows share the same words for Fluid Context's two modes.
 enum OperationalSettingsControlPresentation {
-    enum Control: CaseIterable, Hashable, Sendable {
-        case providerRoute
-        case macIntegrationPermission
-        case subconsciousMaster
-        case fluidContext
-        case softwareUpdate
-        case globalHotkey
-    }
-
-    enum Owner: String, Hashable, Sendable {
-        case providers
-        case macIntegration
-        case settings
-    }
-
-    static func owner(for control: Control) -> Owner {
-        switch control {
-        case .providerRoute: .providers
-        case .macIntegrationPermission: .macIntegration
-        case .subconsciousMaster, .fluidContext, .softwareUpdate, .globalHotkey: .settings
-        }
-    }
-
-    static func title(for control: Control) -> String {
-        switch control {
-        case .providerRoute: "Provider"
-        case .macIntegrationPermission: "Mac Integration"
-        case .subconsciousMaster: "Subconscious"
-        case .fluidContext: "Fluid Context"
-        case .softwareUpdate: "Software Update"
-        case .globalHotkey: "Global Shortcut"
-        }
-    }
-
     static func fluidContextLabel(_ mode: ContextFlowMode) -> String {
         switch mode {
         case .active: "Active"
@@ -65,8 +29,6 @@ enum SoftwareUpdateRowPresentation {
     struct State: Equatable {
         let title: String
         let detail: String
-        let status: String
-        let systemImage: String
         let actionEnabled: Bool
     }
 
@@ -81,8 +43,6 @@ enum SoftwareUpdateRowPresentation {
             return State(
                 title: "NativeAgent \(version) is available",
                 detail: "Select Update Available to review and install the signed release.",
-                status: "ok",
-                systemImage: "arrow.down.circle.fill",
                 actionEnabled: true
             )
         }
@@ -90,8 +50,6 @@ enum SoftwareUpdateRowPresentation {
             return State(
                 title: "Automatic updates aren’t available in this build",
                 detail: unavailableDetail,
-                status: "warn",
-                systemImage: "info.circle",
                 actionEnabled: true
             )
         }
@@ -100,8 +58,6 @@ enum SoftwareUpdateRowPresentation {
                 title: "An update check is already in progress",
                 detail: (automaticChecksEnabled ? "Automatic checks are on. " : "Automatic checks are off. ")
                     + "Wait for the current signed-feed check to finish before starting another one.",
-                status: "info",
-                systemImage: "arrow.triangle.2.circlepath",
                 actionEnabled: false
             )
         }
@@ -110,8 +66,6 @@ enum SoftwareUpdateRowPresentation {
             detail: automaticChecksEnabled
                 ? "NativeAgent checks the signed release feed automatically. You can also check now."
                 : "You can check the signed release feed manually.",
-            status: automaticChecksEnabled ? "ok" : "info",
-            systemImage: automaticChecksEnabled ? "checkmark.circle" : "info.circle",
             actionEnabled: true
         )
     }

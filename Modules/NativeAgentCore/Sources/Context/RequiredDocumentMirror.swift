@@ -52,14 +52,13 @@ public struct ContextSurfaceVariant: RawRepresentable, Hashable, Comparable, Sen
 /// ONE name for the persona source lane, and one way to read a persona
 /// source's locator.
 ///
-/// Both the precoverage gate (`ContextFlowCoordinator`) and the stable-prefix
+/// Both the precoverage gate (`ContextPreparation`) and the stable-prefix
 /// renderer must agree about which sources are persona sources, which document
 /// a source carries, and — the reason this exists — whether that source permits
 /// the CURRENT turn's surface. Three copies of a string literal and a
 /// `split("/").last` is how those two places drift apart.
 public enum ContextPersonaSourceNaming {
-    /// Owner string every persona document source is registered under
-    /// (`NativeContextFlowRuntime.owner`).
+    /// Owner string every persona document source is registered under.
     public static let owner = "nativeagent.persona"
 
     /// `persona/<personaID>/` — the locator prefix scoping a source to one
@@ -70,32 +69,10 @@ public enum ContextPersonaSourceNaming {
 
 }
 
-/// The live PersonaCompiler full-document contract. Custom personas may still
-/// supply arbitrary declarations; this is the default order for personas that
-/// use the standard NativeAgent document set.
-public enum RequiredPersonaDocumentKind: String, CaseIterable, Sendable, Codable {
-    case soul = "SOUL.md"
-    case voice = "VOICE.md"
-    case user = "USER.md"
-    case growth = "GROWTH.md"
-    case memory = "MEMORY.md"
-    case agents = "AGENTS.md"
-
-    public var id: RequiredDocumentID {
-        RequiredDocumentID(rawValue: rawValue)
-    }
-
-    public var canonicalOrder: Int {
-        Self.allCases.firstIndex(of: self) ?? 0
-    }
-}
-
 public enum RequiredDocumentMirrorError: Error, Equatable, Sendable {
     case emptyDocumentID
     case negativeCanonicalOrder(documentID: RequiredDocumentID)
     case emptySourceHash(documentID: RequiredDocumentID)
-    case negativeTokenCount(documentID: RequiredDocumentID)
-    case negativeKernelTokenCount
     case emptyPersonaID
     case emptySourceFingerprint
     case noRequiredDocuments
@@ -115,9 +92,6 @@ public struct RequiredDocument: Sendable, Equatable {
     public let canonicalOrder: Int
     public let sourceHash: String
     public let text: String
-    public let tokenCount: Int
-    public let characterCount: Int
-    public let utf8ByteCount: Int
     public let logicalByteCount: Int
     /// PROVENANCE, carried with the bytes. The context source this document was
     /// mirrored from, and the surfaces that source permits.
@@ -131,7 +105,7 @@ public struct RequiredDocument: Sendable, Equatable {
     /// `nil` means UNPROVEN, not "permitted": a document built without
     /// provenance is unavailable to the stable prefix and falls back to the
     /// packet's own surface rules. Every production mirror populates these
-    /// (`NativeContextFlowRuntime.makeMirror`); only fixtures leave them nil.
+    /// (`PersonaContextFlowProvider.makeMirror`); only fixtures leave them nil.
     public let sourceID: ContextSourceID?
     public let permittedSurfaces: Set<ContextSurface>?
 
@@ -153,7 +127,6 @@ public struct RequiredDocument: Sendable, Equatable {
         canonicalOrder: Int,
         sourceHash: String,
         text: String,
-        tokenCount: Int,
         sourceID: ContextSourceID? = nil,
         permittedSurfaces: Set<ContextSurface>? = nil
     ) throws {
@@ -166,21 +139,13 @@ public struct RequiredDocument: Sendable, Equatable {
         guard !sourceHash.isEmpty else {
             throw RequiredDocumentMirrorError.emptySourceHash(documentID: id)
         }
-        guard tokenCount >= 0 else {
-            throw RequiredDocumentMirrorError.negativeTokenCount(documentID: id)
-        }
-
         self.id = id
         self.canonicalOrder = canonicalOrder
         self.sourceHash = sourceHash
         self.text = text
-        self.tokenCount = tokenCount
         self.sourceID = sourceID
         self.permittedSurfaces = permittedSurfaces
-        self.characterCount = text.count
-        self.utf8ByteCount = text.utf8.count
-        // Provenance contributes 0 bytes when absent, so the accounting of a
-        // document without it is byte-identical to before this field existed.
+        // Absent provenance contributes zero logical bytes.
         let provenanceBytes = try ContextLogicalByteAccounting.checkedSum(
             [sourceID?.rawValue.utf8.count ?? 0]
                 + (permittedSurfaces?.map { $0.rawValue.utf8.count } ?? []),
@@ -198,24 +163,6 @@ public struct RequiredDocument: Sendable, Equatable {
         )
     }
 
-    public init(
-        kind: RequiredPersonaDocumentKind,
-        sourceHash: String,
-        text: String,
-        tokenCount: Int,
-        sourceID: ContextSourceID? = nil,
-        permittedSurfaces: Set<ContextSurface>? = nil
-    ) throws {
-        try self.init(
-            id: kind.id,
-            canonicalOrder: kind.canonicalOrder,
-            sourceHash: sourceHash,
-            text: text,
-            tokenCount: tokenCount,
-            sourceID: sourceID,
-            permittedSurfaces: permittedSurfaces
-        )
-    }
 }
 
 public struct StablePromptKernelKey: Hashable, Comparable, Sendable {
@@ -257,34 +204,23 @@ public struct StablePromptKernel: Sendable, Equatable {
     /// preference observed after asynchronous compilation. Nil means default.
     public let requestedPersonaOverride: String?
     public let renderedPrompt: String
-    /// 2026-09-18: surface instructions follow the permission-checked documents.
+    /// Surface instructions follow the permission-checked documents.
     public let surfaceGuidance: String
     public let includedDocumentIDs: [RequiredDocumentID]
-    public let tokenCount: Int
-    public let characterCount: Int
-    public let utf8ByteCount: Int
     public let logicalByteCount: Int
 
     public init(
         key: StablePromptKernelKey,
         renderedPrompt: String,
         includedDocumentIDs: [RequiredDocumentID],
-        tokenCount: Int,
         requestedPersonaOverride: String? = nil,
         surfaceGuidance: String = ""
     ) throws {
-        guard tokenCount >= 0 else {
-            throw RequiredDocumentMirrorError.negativeKernelTokenCount
-        }
-
         self.key = key
         self.requestedPersonaOverride = requestedPersonaOverride
         self.renderedPrompt = renderedPrompt
         self.surfaceGuidance = surfaceGuidance
         self.includedDocumentIDs = includedDocumentIDs
-        self.tokenCount = tokenCount
-        self.characterCount = renderedPrompt.count + surfaceGuidance.count
-        self.utf8ByteCount = renderedPrompt.utf8.count + surfaceGuidance.utf8.count
         let includedIDBytes = try ContextLogicalByteAccounting.checkedSum(
             includedDocumentIDs.map { $0.rawValue.utf8.count },
             overflowError: RequiredDocumentMirrorError.logicalByteOverflow
@@ -311,9 +247,7 @@ public struct RequiredDocumentMirror: Sendable, Equatable {
     public let personaID: ContextPersonaID
     public let sourceFingerprint: String
     public let documents: [RequiredDocument]
-    public let kernels: [StablePromptKernelKey: StablePromptKernel]
-    public let characterCount: Int
-    public let tokenCount: Int
+    public let kernels: [ContextSurfaceVariant: StablePromptKernel]
     public let logicalByteCount: Int
 
     public init(
@@ -350,7 +284,7 @@ public struct RequiredDocumentMirror: Sendable, Equatable {
         }
 
         let canonicalIDs = orderedDocuments.map(\.id)
-        var kernelsByKey: [StablePromptKernelKey: StablePromptKernel] = [:]
+        var kernelsBySurface: [ContextSurfaceVariant: StablePromptKernel] = [:]
         for kernel in kernels {
             guard kernel.key.personaID == personaID else {
                 throw RequiredDocumentMirrorError.kernelPersonaMismatch(
@@ -373,7 +307,7 @@ public struct RequiredDocumentMirror: Sendable, Equatable {
                     surface: kernel.key.surfaceVariant
                 )
             }
-            guard kernelsByKey.updateValue(kernel, forKey: kernel.key) == nil else {
+            guard kernelsBySurface.updateValue(kernel, forKey: kernel.key.surfaceVariant) == nil else {
                 throw RequiredDocumentMirrorError.duplicateKernelKey(kernel.key)
             }
         }
@@ -381,15 +315,7 @@ public struct RequiredDocumentMirror: Sendable, Equatable {
         self.personaID = personaID
         self.sourceFingerprint = sourceFingerprint
         self.documents = orderedDocuments
-        self.kernels = kernelsByKey
-        self.characterCount = try ContextLogicalByteAccounting.checkedSum(
-            orderedDocuments.map(\.characterCount),
-            overflowError: RequiredDocumentMirrorError.logicalByteOverflow
-        )
-        self.tokenCount = try ContextLogicalByteAccounting.checkedSum(
-            orderedDocuments.map(\.tokenCount),
-            overflowError: RequiredDocumentMirrorError.logicalByteOverflow
-        )
+        self.kernels = kernelsBySurface
         let documentBytes = try ContextLogicalByteAccounting.checkedSum(
             orderedDocuments.map(\.logicalByteCount),
             overflowError: RequiredDocumentMirrorError.logicalByteOverflow
@@ -415,14 +341,7 @@ public struct RequiredDocumentMirror: Sendable, Equatable {
     }
 
     public func kernel(for surfaceVariant: ContextSurfaceVariant) -> StablePromptKernel? {
-        guard let key = try? StablePromptKernelKey(
-            personaID: personaID,
-            surfaceVariant: surfaceVariant,
-            sourceFingerprint: sourceFingerprint
-        ) else {
-            return nil
-        }
-        return kernels[key]
+        kernels[surfaceVariant]
     }
 }
 

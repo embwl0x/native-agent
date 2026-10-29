@@ -1,9 +1,9 @@
 import Foundation
+import NativeAgentShared
+import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MacAppMaps.swift` | `MacAppMapStore` owns per-app control maps and learned choices; malformed maps remain in place without overwrite; no quarantine/reset copy |
+// Blueprint: | `MacAppMaps.swift` | `MacAppMapStore` owns per-app control maps and control-scoped press outcome evidence; reads and flush outcomes are checked, failed writes stay dirty, and malformed maps remain in place without overwrite |
 
-// Her-screen Phase 5 — MUSCLE MEMORY: per-app maps.
-//
 // After a VERIFIED act (the closed loop saw the effect, and the element acted
 // on answered the name asked), the app remembers where that named control
 // lives: `data/her_screen/app_maps/<bundle id>.json`. `screen` lists the
@@ -19,9 +19,8 @@ import PersistenceCore
 // bar carries. Never a field's value, a secure field, a row, or anything that
 // could be a name, subject or file name — when in doubt, nothing is stored.
 //
-// `learned` is the part's learned property, kept by the stem for every app
-// (docs/AGENT_IS_THE_APP.md): which route a press of a kind of control takes
-// in this app, `"press tab": "pointer"`, folded from what showed a consequence.
+// Legacy app-wide `learned` values remain readable on disk. Press routing
+// uses only control-scoped evidence below, never those exclusive claims.
 
 /// One remembered control.
 public struct MacAppMapEntry: Codable, Sendable, Equatable {
@@ -40,10 +39,22 @@ public struct MacAppMapEntry: Codable, Sendable, Equatable {
     public var hits: Int
 }
 
+/// Outcomes for one exact control/context. Counts retain contrary and
+/// uncertain attempts; only the latest verified pointer outcome nominates it.
+public struct MacPressRouteEvidence: Codable, Sendable, Equatable {
+    public var counts: [String: Int] = [:]
+    public var lastMethod = ""
+    public var lastOutcome = ""
+    public var observedAt = ""
+    public var suggestsPointer: Bool { lastMethod == "pointer" && lastOutcome == "satisfied" }
+}
+
 /// One app's file: its remembered controls and what use has taught.
 public struct MacAppMap: Codable, Sendable, Equatable {
     public var controls: [MacAppMapEntry] = []
-    public var learned: [String: String] = [:]
+    // Retain old file bytes on a later save; no live app-wide learning API.
+    private var learned: [String: String] = [:]
+    public var pressRoutes: [String: MacPressRouteEvidence] = [:]
 
     public init() {}
 
@@ -56,6 +67,7 @@ public struct MacAppMap: Codable, Sendable, Equatable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         controls = try container.decode([MacAppMapEntry].self, forKey: .controls)
         learned = try container.decodeIfPresent([String: String].self, forKey: .learned) ?? [:]
+        pressRoutes = try container.decodeIfPresent([String: MacPressRouteEvidence].self, forKey: .pressRoutes) ?? [:]
     }
 }
 
@@ -119,22 +131,24 @@ public actor MacAppMapStore {
     }
 
     /// Malformed maps remain in place and are not overwritten.
-    private func load(_ bundle: String) -> MacAppMap? {
-        guard let url = url(bundle) else { return nil }
-        // Unflushed changes are newer than the file.
+    private func load(_ bundle: String) throws -> MacAppMap {
+        guard let url = url(bundle) else {
+            throw ToolFailureError("Invalid app-map bundle identity.", effects: .none)
+        }
         if dirty.contains(bundle), let cached = cache[bundle] { return cached.map }
-        let mtime = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+        let attributes: [FileAttributeKey: Any]
+        do { attributes = try FileManager.default.attributesOfItem(atPath: url.path) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
+            let empty = MacAppMap()
+            cache[bundle] = (nil, empty)
+            return empty
+        }
+        let mtime = attributes[.modificationDate] as? Date
         if let cached = cache[bundle], cached.mtime == mtime { return cached.map }
-        guard mtime != nil else {
-            cache[bundle] = (nil, MacAppMap())
-            return MacAppMap()
-        }
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        if let map = try? JSONDecoder().decode(MacAppMap.self, from: data) {
-            cache[bundle] = (mtime, map)
-            return map
-        }
-        return nil
+        let data = try Data(contentsOf: url)
+        let map = try JSONDecoder().decode(MacAppMap.self, from: data)
+        cache[bundle] = (mtime, map)
+        return map
     }
 
     private func store(_ bundle: String, _ map: MacAppMap) {
@@ -142,42 +156,54 @@ public actor MacAppMapStore {
         dirty.insert(bundle)
     }
 
-    public func entries(bundle: String, window: String) -> [MacAppMapEntry] {
-        (load(bundle)?.controls ?? []).filter { $0.window == window }
+    public func entries(bundle: String, window: String) throws -> [MacAppMapEntry] {
+        (try load(bundle).controls).filter { $0.window == window }
     }
 
-    public func learned(bundle: String, _ choice: String) -> String? {
-        load(bundle)?.learned[choice]
+    public func pressRoute(bundle: String, control: String) throws -> MacPressRouteEvidence? {
+        try load(bundle).pressRoutes[control]
     }
 
-    /// What use taught: `value` for `choice` in this app, or nil to forget it.
-    public func learn(bundle: String, _ choice: String, _ value: String?) {
-        guard var map = load(bundle), map.learned[choice] != value else { return }
-        map.learned[choice] = value
+    public func recordPress(bundle: String, control: String, pointer: Bool, outcome: String) throws {
+        var map = try load(bundle)
+        var evidence = map.pressRoutes[control] ?? MacPressRouteEvidence()
+        let method = pointer ? "pointer" : "accessibility"
+        let key = method + ":" + outcome
+        let count = evidence.counts[key] ?? 0
+        evidence.counts[key] = count < Int.max ? count + 1 : count
+        evidence.lastMethod = method
+        evidence.lastOutcome = outcome
+        evidence.observedAt = NativeTimestampFormat.plainZulu(Date())
+        map.pressRoutes[control] = evidence
+        if map.pressRoutes.count > MacAppMaps.maxEntriesPerApp,
+           let oldest = map.pressRoutes.keys.sorted(by: {
+               let left = map.pressRoutes[$0]?.observedAt ?? ""
+               let right = map.pressRoutes[$1]?.observedAt ?? ""
+               return left == right ? $0 < $1 : left < right
+           }).first {
+            map.pressRoutes.removeValue(forKey: oldest)
+        }
         store(bundle, map)
-    }
-
-    public func paths(bundle: String, window: String) -> Set<[Int]> {
-        Set(entries(bundle: bundle, window: window).map(\.path))
     }
 
     /// Whether this exact control is already remembered (its label was vetted
     /// as chrome when it was first stored).
-    public func has(bundle: String, window: String, asked: String, label: String) -> Bool {
-        entries(bundle: bundle, window: window).contains { $0.asked == asked && $0.label == label }
+    public func has(bundle: String, window: String, asked: String, label: String) throws -> Bool {
+        try entries(bundle: bundle, window: window).contains { $0.asked == asked && $0.label == label }
     }
 
     /// A verified act: add the entry, or refresh it (live path/label, date,
     /// hit). LRU-evicts past the cap.
-    public func record(bundle: String, window: String, asked: String, label: String, kind: String, path: [Int], at date: Date = Date()) {
-        guard !asked.isEmpty, !label.isEmpty, !path.isEmpty, var map = load(bundle) else { return }
+    public func record(bundle: String, window: String, asked: String, label: String, kind: String, path: [Int], at date: Date = Date()) throws {
+        guard !asked.isEmpty, !label.isEmpty, !path.isEmpty else { return }
+        var map = try load(bundle)
         var entries = map.controls
-        let stamp = ISO8601DateFormatter().string(from: date)
+        let stamp = NativeTimestampFormat.plainZulu(date)
         if let index = entries.firstIndex(where: { $0.window == window && $0.asked == asked && $0.kind == kind }) {
             entries[index].label = label
             entries[index].path = path
             entries[index].verified = stamp
-            entries[index].hits += 1
+            if entries[index].hits < Int.max { entries[index].hits += 1 }
         } else {
             entries.append(MacAppMapEntry(window: window, asked: asked, label: label, kind: kind,
                                           path: path, verified: stamp, hits: 1))
@@ -192,27 +218,31 @@ public actor MacAppMapStore {
 
     /// The live window no longer agreed. `evict` when something ELSE is at that
     /// path now; otherwise one hit is taken off and the entry goes at zero.
-    public func penalize(bundle: String, window: String, path: [Int], evict: Bool) {
-        guard var map = load(bundle),
-              let index = map.controls.firstIndex(where: { $0.window == window && $0.path == path }) else { return }
-        map.controls[index].hits -= 1
+    public func penalize(bundle: String, window: String, path: [Int], evict: Bool) throws {
+        var map = try load(bundle)
+        guard let index = map.controls.firstIndex(where: { $0.window == window && $0.path == path }) else { return }
+        if map.controls[index].hits > 0 { map.controls[index].hits -= 1 }
         if evict || map.controls[index].hits <= 0 { map.controls.remove(at: index) }
         store(bundle, map)
     }
 
     /// One write per act call. A failed write stays dirty for the next one.
-    public func flush() {
-        guard !dirty.isEmpty else { return }
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    public func flush() -> [String: String] {
+        var failures: [String: String] = [:]
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        for bundle in dirty {
-            guard let url = url(bundle), let map = cache[bundle]?.map,
-                  let data = try? encoder.encode(map),
-                  (try? data.write(to: url, options: .atomic)) != nil else { continue }
-            let mtime = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
-            cache[bundle] = (mtime, map)
-            dirty.remove(bundle)
+        for bundle in Array(dirty) {
+            do {
+                guard let url = url(bundle), let map = cache[bundle]?.map else {
+                    throw ToolFailureError("Dirty app-map has no valid destination or cached map.", effects: .none)
+                }
+                let data = try encoder.encode(map)
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
+                let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+                cache[bundle] = (attributes[.modificationDate] as? Date, map)
+                dirty.remove(bundle)
+            } catch { failures[bundle] = error.localizedDescription }
         }
+        return failures
     }
 }

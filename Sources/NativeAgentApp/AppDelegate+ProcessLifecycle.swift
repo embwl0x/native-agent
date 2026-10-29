@@ -1,27 +1,12 @@
 import NativeAgentCore
+import NativeAgentShared
 import Foundation
 import AppKit
 import ServiceManagement
 import DeviceSync
 import PersistenceCore
+import os
 // Blueprint: | `AppDelegate+ProcessLifecycle.swift` | `AppDelegate`: `claimSingleAppInstance`, `presentSingleInstanceWedgedAlert`, `presentPublicReleaseDataRootError` |
-
-private final class SingleInstanceActivationBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var storedValue: Bool?
-
-    func set(_ value: Bool?) {
-        lock.lock()
-        storedValue = value
-        lock.unlock()
-    }
-
-    var value: Bool? {
-        lock.lock()
-        defer { lock.unlock() }
-        return storedValue
-    }
-}
 
 extension AppDelegate {
     @MainActor
@@ -33,7 +18,7 @@ extension AppDelegate {
         guard let existing else { return true }
         let existingPID = existing.processIdentifier
         let semaphore = DispatchSemaphore(value: 0)
-        let activationBox = SingleInstanceActivationBox()
+        let activationResult = OSAllocatedUnfairLock<Bool?>(initialState: nil)
         Task.detached(priority: .userInitiated) {
             let activated = await withCKTimeout("singleInstanceActivate", seconds: 2) {
                 guard let target = NSRunningApplication.runningApplications(withBundleIdentifier: bundleId)
@@ -42,11 +27,11 @@ extension AppDelegate {
                 }
                 return target.activate(options: [.activateAllWindows])
             }
-            activationBox.set(activated)
+            activationResult.withLock { $0 = activated }
             semaphore.signal()
         }
         _ = semaphore.wait(timeout: .now() + 2.5)
-        guard activationBox.value != nil else {
+        guard activationResult.withLock({ $0 }) != nil else {
             ModuleLog.app("[launch] existing pid wedged — cannot evict (kernel UE state); user must reboot")
             Self.presentSingleInstanceWedgedAlert(pid: existingPID)
             return false

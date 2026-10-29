@@ -1,4 +1,6 @@
 import Foundation
+import NativeAgentShared
+import os
 
 // Blueprint: | `CapabilityLifecycle.swift` | `CapabilityLifecycle`: common ability store paths, lifecycle actions, version rules and current peer/owner keep authority |
 
@@ -21,24 +23,26 @@ public enum CapabilityLifecycle {
     /// Capture existing turn provenance; the returned check reads current trust.
     /// Storage stays below chat; no bound turn means no peer steering.
     public static var turnWriteCheck: @Sendable () -> (@Sendable () -> ToolFailureError?) {
-        get { provenanceLock.withLock { provenance } }
-        set { provenanceLock.withLock { provenance = newValue } }
+        get { authority.withLock { $0.provenance } }
+        set { authority.withLock { $0.provenance = newValue } }
     }
-    private static let provenanceLock = NSLock()
-    nonisolated(unsafe) private static var provenance: @Sendable () -> (@Sendable () -> ToolFailureError?) = { { nil } }
 
     public static var ownerTrusts: @Sendable (String) -> Bool {
-        get { provenanceLock.withLock { peerTrust } }
-        set { provenanceLock.withLock { peerTrust = newValue } }
+        get { authority.withLock { $0.peerTrust } }
+        set { authority.withLock { $0.peerTrust = newValue } }
     }
-    nonisolated(unsafe) private static var peerTrust: @Sendable (String) -> Bool = { _ in false }
 
     /// The engine binds the checked Trust reader; publication supplies its own root.
     public static var keepAuthority: @Sendable (URL) -> Bool {
-        get { provenanceLock.withLock { keepTrust } }
-        set { provenanceLock.withLock { keepTrust = newValue } }
+        get { authority.withLock { $0.keepTrust } }
+        set { authority.withLock { $0.keepTrust = newValue } }
     }
-    nonisolated(unsafe) private static var keepTrust: @Sendable (URL) -> Bool = { _ in false }
+    private struct Authority {
+        var provenance: @Sendable () -> (@Sendable () -> ToolFailureError?) = { { nil } }
+        var peerTrust: @Sendable (String) -> Bool = { _ in false }
+        var keepTrust: @Sendable (URL) -> Bool = { _ in false }
+    }
+    private static let authority = OSAllocatedUnfairLock(initialState: Authority())
 
     public static var writeRefusal: String? { turnWriteCheck()()?.message }
 

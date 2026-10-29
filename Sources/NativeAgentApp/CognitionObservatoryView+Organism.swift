@@ -1,7 +1,7 @@
+import NativeAgentShared
 import Foundation
 
 // Blueprint: | `CognitionObservatoryView+Organism.swift` | Observatory organism panel: read-only kernel rows distinguish off, empty, stale and malformed readings |
-// Move-only extraction (tightness Wave C) from CognitionObservatoryView.swift
 
 import Cognition
 import SwiftUI
@@ -107,27 +107,27 @@ struct CognitionObservatoryOrganismPresentation: Equatable, Sendable {
         now: Date = Date(),
         maximumSampleAge: TimeInterval = 5 * 60
     ) {
-        guard let snapshot else {
+        if let snapshot {
+            if !snapshot.enabled {
+                state = .disabled("Moods, energy, and a clock of my own are off in Settings — there is no live body readout.")
+                sampledAtText = "body readout off"
+            } else if !snapshot.observatorySampleIsCurrent(now: now, maximumSampleAge: maximumSampleAge) {
+                state = .unavailable("The last organism body sample is stale or has an invalid timestamp; refresh it before reading these values.")
+                sampledAtText = "sample stale"
+            } else if !snapshot.observatoryValuesAreValid {
+                state = .unavailable("The organism body sample contains an invalid value and is withheld.")
+                sampledAtText = "sample invalid"
+            } else {
+                state = .live
+                sampledAtText = "sampled \(snapshot.generatedAt.formatted(date: .omitted, time: .shortened))"
+            }
+        } else {
             state = .absent("No organism body snapshot has arrived yet.")
-            statusText = "Unavailable"
-            statusKind = "warn"
             sampledAtText = "sample absent"
-            signalCountText = "absent"
-            lastSignalText = "absent"
-            bodyLine = nil
-            chemicalRows = []
-            fieldRows = []
-            predictionRows = []
-            dreamRepairRows = []
-            bodyRows = []
-            return
         }
-
-        guard snapshot.enabled else {
-            state = .disabled("Moods, energy, and a clock of my own are off in Settings — there is no live body readout.")
-            statusText = "Off"
+        guard let snapshot, state == .live else {
+            if case .disabled = state { statusText = "Off" } else { statusText = "Unavailable" }
             statusKind = "warn"
-            sampledAtText = "body readout off"
             signalCountText = "absent"
             lastSignalText = "absent"
             bodyLine = nil
@@ -139,42 +139,8 @@ struct CognitionObservatoryOrganismPresentation: Equatable, Sendable {
             return
         }
 
-        guard snapshot.observatorySampleIsCurrent(now: now, maximumSampleAge: maximumSampleAge) else {
-            state = .unavailable("The last organism body sample is stale or has an invalid timestamp; refresh it before reading these values.")
-            statusText = "Unavailable"
-            statusKind = "warn"
-            sampledAtText = "sample stale"
-            signalCountText = "absent"
-            lastSignalText = "absent"
-            bodyLine = nil
-            chemicalRows = []
-            fieldRows = []
-            predictionRows = []
-            dreamRepairRows = []
-            bodyRows = []
-            return
-        }
-
-        guard snapshot.observatoryValuesAreValid else {
-            state = .unavailable("The organism body sample contains an invalid value and is withheld.")
-            statusText = "Unavailable"
-            statusKind = "warn"
-            sampledAtText = "sample invalid"
-            signalCountText = "absent"
-            lastSignalText = "absent"
-            bodyLine = nil
-            chemicalRows = []
-            fieldRows = []
-            predictionRows = []
-            dreamRepairRows = []
-            bodyRows = []
-            return
-        }
-
-        state = .live
         statusText = "Enabled"
         statusKind = "ok"
-        sampledAtText = "sampled \(snapshot.generatedAt.formatted(date: .omitted, time: .shortened))"
         signalCountText = "\(snapshot.signalCount) signals"
         lastSignalText = Self.optionalDate(snapshot.lastSignalAt)
         bodyLine = snapshot.projectedBodyLine?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -193,37 +159,28 @@ struct CognitionObservatoryOrganismPresentation: Equatable, Sendable {
             Self.decimal("Total charge", snapshot.fieldSummary.totalCharge),
             Self.decimal("Uncertainty", snapshot.fieldSummary.averageUncertainty),
         ]
-        if let belief = snapshot.bodySchema.providerPathBelief {
-            predictionRows = [
-                .init(label: "Predictions pending", value: "\(snapshot.predictionSummary.pendingCount)"),
-                .init(label: "Prediction errors", value: "\(snapshot.predictionSummary.violatedCount)"),
-                .init(label: "Expired predictions", value: "\(snapshot.predictionSummary.expiredCount)"),
-                Self.decimal("Peripheral uncertainty", snapshot.predictionSummary.peripheralUncertainty),
-                Self.decimal("Strategy caution", snapshot.predictionSummary.strategyCaution),
-                Self.decimal("Tool confidence", snapshot.predictionSummary.bodyConfidence.toolPath),
-                Self.decimal("Provider confidence", snapshot.predictionSummary.bodyConfidence.providerPath),
-                Self.decimal("Phone confidence", snapshot.predictionSummary.bodyConfidence.phonePath),
+        predictionRows = [
+            .init(label: "Predictions pending", value: "\(snapshot.predictionSummary.pendingCount)"),
+            .init(label: "Prediction errors", value: "\(snapshot.predictionSummary.violatedCount)"),
+            .init(label: "Expired predictions", value: "\(snapshot.predictionSummary.expiredCount)"),
+            Self.decimal("Peripheral uncertainty", snapshot.predictionSummary.peripheralUncertainty),
+            Self.decimal("Strategy caution", snapshot.predictionSummary.strategyCaution),
+            Self.decimal("Tool confidence", snapshot.predictionSummary.bodyConfidence.toolPath),
+            Self.decimal("Provider confidence", snapshot.predictionSummary.bodyConfidence.providerPath),
+            Self.decimal("Phone confidence", snapshot.predictionSummary.bodyConfidence.phonePath),
+        ] + (snapshot.bodySchema.providerPathBelief.map { belief -> [Row] in
+            [
                 .init(label: "Provider belief", value: belief.state.rawValue),
                 Self.decimal("Provider belief estimate", belief.estimate),
                 Self.decimal("Provider belief uncertainty", belief.uncertainty),
                 Self.decimal("Provider evidence freshness", belief.freshness),
             ]
-        } else {
-            predictionRows = [
-                .init(label: "Predictions pending", value: "\(snapshot.predictionSummary.pendingCount)"),
-                .init(label: "Prediction errors", value: "\(snapshot.predictionSummary.violatedCount)"),
-                .init(label: "Expired predictions", value: "\(snapshot.predictionSummary.expiredCount)"),
-                Self.decimal("Peripheral uncertainty", snapshot.predictionSummary.peripheralUncertainty),
-                Self.decimal("Strategy caution", snapshot.predictionSummary.strategyCaution),
-                Self.decimal("Tool confidence", snapshot.predictionSummary.bodyConfidence.toolPath),
-                Self.decimal("Provider confidence", snapshot.predictionSummary.bodyConfidence.providerPath),
-                Self.decimal("Phone confidence", snapshot.predictionSummary.bodyConfidence.phonePath),
-                .init(label: "Provider belief", value: "absent"),
-                .init(label: "Provider belief estimate", value: "absent"),
-                .init(label: "Provider belief uncertainty", value: "absent"),
-                .init(label: "Provider evidence freshness", value: "absent"),
-            ]
-        }
+        } ?? [
+            .init(label: "Provider belief", value: "absent"),
+            .init(label: "Provider belief estimate", value: "absent"),
+            .init(label: "Provider belief uncertainty", value: "absent"),
+            .init(label: "Provider evidence freshness", value: "absent"),
+        ])
         dreamRepairRows = [
             .init(label: "Dream repairs", value: "\(snapshot.dreamRepairSummary.receiptCount)"),
             .init(label: "Last repair ops", value: "\(snapshot.dreamRepairSummary.lastOperationCount)"),

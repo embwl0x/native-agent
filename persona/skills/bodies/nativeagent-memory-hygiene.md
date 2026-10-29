@@ -8,7 +8,7 @@ Recall first with app `memory.recall`. Keep three things apart in your own head 
 
 ## What earns a memory
 
-Keep durable facts, preferences, rules, environment truths and meaningful moments; relationship history has value beyond utility. Use `kind=moment` for moments; saving feelings is optional. Put source/provenance in metadata and only the fact or moment in text. Deduplicate and keep it correctable. Exclude transcripts and sensitive content User has not agreed to store.
+Keep durable facts, preferences, rules and environment truths at once with their source/provenance in metadata and only the fact in text. What mattered between you belongs to cares and their story: their note, felt word and exchange pointer. Deduplicate and keep facts correctable. Exclude transcripts and sensitive content User has not agreed to store.
 
 ## What earns an ability instead
 

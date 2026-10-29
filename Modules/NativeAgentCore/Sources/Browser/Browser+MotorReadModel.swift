@@ -1,5 +1,6 @@
 import NativeAgentCore
 import Foundation
+import NativeAgentShared
 import PersistenceCore
 
 // Blueprint: | `Browser+MotorReadModel.swift` | `SwiftNativeBrowserClient.motorActionReadModel`: payload-free projection from canonical runs only; Browser retains outcome and effect authority |
@@ -26,15 +27,10 @@ extension SwiftNativeBrowserClient: MotorActionReadModelProviding {
     public func motorActionReadModel(actionId: String) async throws -> MotorActionReadModel? {
         let runID = actionId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !runID.isEmpty else { return nil }
-        guard FileManager.default.fileExists(atPath: runsPath.path) else { return nil }
-
-        let raw: JSONValue
+        let rows: [JSONValue]
         do {
-            raw = try JSONValue.parse(Data(contentsOf: runsPath))
+            rows = try await Self.readCanonicalRuns(at: runsPath)
         } catch {
-            throw BrowserMotorReadModelError.invalidRunsDocument
-        }
-        guard case .array(let rows) = raw else {
             throw BrowserMotorReadModelError.invalidRunsDocument
         }
 
@@ -185,10 +181,6 @@ extension SwiftNativeBrowserClient: MotorActionReadModelProviding {
                 || byte == 46  // .
         }) else { return false }
 
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if formatter.date(from: value) != nil { return true }
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter.date(from: value) != nil
+        return NativeTimestampFormat.parseISO8601FractionalFirst(value) != nil
     }
 }

@@ -8,7 +8,7 @@ extension MacSyncActionRouter {
         do {
             let recovered: MobileTelegramSnapshot
             if action.action == "disconnect_telegram", payload == ["confirmed": "true"] {
-                recovered = try await sync.host.changeTelegram(.disconnect)
+                recovered = try await sync.host.disconnectTelegram()
             } else if action.action == "set_telegram_settings",
                       let setting = payload["setting"], ["enabled", "requireMention"].contains(setting),
                       let value = payload["value"], ["true", "false"].contains(value),

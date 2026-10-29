@@ -12,8 +12,6 @@ extension MacSyncEngine {
         workActivityObservationTask = Task {
             for await _ in await ExperienceStore.at(sync.dataRoot).changes() {
                 guard !Task.isCancelled, generation == snapshotLifecycleGeneration, isActive else { return }
-                workActivityVersion &+= 1
-                requestWorkActivityPublication()
                 await writeSnapshots()
             }
         }
@@ -44,16 +42,7 @@ extension MacSyncEngine {
                 status: status, updatedAt: DeskActivityState.movementDate(experience.updatedAt) ?? started))
     }
 
-    func projectWorkshopWorkActivities(_ data: Data) throws {
-        struct Source: Decodable {
-            var id: String
-            var title: String
-            var status: String
-            var createdAt: String
-            var updatedAt: String?
-            var lastMovementAt: String?
-        }
-        let records = try JSONDecoder().decode([Source].self, from: data)
+    func projectWorkshopWorkActivities(_ records: [WorkshopTaskRecord]) {
         for record in records {
             guard let started = DeskActivityState.movementDate(record.createdAt),
                   let updated = DeskActivityState.movementDate(record.updatedAt) else { continue }
@@ -76,10 +65,7 @@ extension MacSyncEngine {
             let row = MobileWorkActivity(id: id, sessionID: nil, startedAt: started,
                 content: .init(title: String(TurnTraceRedactor.redactText(record.title).prefix(96)),
                     state: state, status: status, updatedAt: updated))
-            if workActivities[id] != row {
-                workActivities[id] = row
-                workActivityVersion &+= 1
-            }
+            workActivities[id] = row
         }
         let retained = Set(workActivities.values.sorted { $0.content.updatedAt > $1.content.updatedAt }.prefix(64).map(\.id))
         workActivities = workActivities.filter { retained.contains($0.key) }
@@ -87,61 +73,64 @@ extension MacSyncEngine {
     }
 
     func requestWorkActivityPublication() {
-        guard isActive, workActivityPublicationTask == nil else { return }
+        guard isActive else { return }
+        if snapshotWriteInFlight {
+            snapshotWriteQueuedScope = SnapshotWriteScope.workActivity.including(snapshotWriteQueuedScope)
+            return
+        }
+        guard workActivityPublicationTask == nil else { return }
         let generation = snapshotLifecycleGeneration
         workActivityPublicationTask = Task {
-            defer {
-                workActivityPublicationTask = nil
-                if generation != snapshotLifecycleGeneration { requestWorkActivityPublication() }
-            }
+            defer { workActivityPublicationTask = nil }
             do {
                 try await Task.sleep(for: .milliseconds(500))
-                var publishedVersion: UInt64
-                repeat {
-                    publishedVersion = workActivityVersion
-                    guard !Task.isCancelled, generation == snapshotLifecycleGeneration, isActive,
-                          let snapshotDir else { return }
-                    let experiences: [Experience]
-                    let unavailable: String?
-                    do {
-                        experiences = try await ExperienceStore.at(sync.dataRoot).projection()
-                        unavailable = nil
-                    } catch {
-                        experiences = []
-                        unavailable = error.localizedDescription
-                    }
-                    var rows = Array((experiences.compactMap(activity) + workActivities.values)
-                        .sorted { $0.content.updatedAt > $1.content.updatedAt }.prefix(64))
-                    if let unavailable {
-                        rows.append(.init(id: "experience:unavailable", sessionID: nil, startedAt: Date(),
-                            content: .init(title: "Work state unavailable", state: .unknown,
-                                status: unavailable, updatedAt: Date())))
-                    }
-                    guard let pairing = try PairingSecretManager.existingSecretBase64() else { return }
-                    let configuration = await sync.apns.workActivityConfiguration(dataRoot: sync.dataRoot)
-                    var snapshot = MobileWorkActivitySnapshot(activities: rows,
-                        pairingFingerprint: WorkActivityPushRegistration.fingerprint(pairing), pushConfigured: configuration.configured,
-                        pushConfigurationError: configuration.error)
-                    snapshot.experiences = experiences.map(\.mobile)
-                    snapshot.unavailable = unavailable
-                    let data = try await MobileSnapshotBuilder.shared.encode(snapshot)
-                    var changed: Set<String> = []
-                    switch await writeSnapshotData(data, to: "work_activity.json", in: snapshotDir, lifecycleGeneration: generation, readRevision: Date().timeIntervalSince1970) {
-                    case .changed: changed.insert("work_activity.json")
-                    case .failed(let reason): syncError = "Work activity sync failed: \(reason)"
-                    case .unchanged: break
-                    }
-                    await publishChangedSnapshots(changed, in: snapshotDir,
-                        lifecycleGeneration: generation, scope: .standard)
-                    guard !Task.isCancelled, generation == snapshotLifecycleGeneration, isActive else { return }
-                    if configuration.usable {
-                        let errors = await sync.relay.sendWorkActivities(rows, dataRoot: sync.dataRoot)
-                        if !errors.isEmpty { syncError = "Live Activity push failed: \(errors.joined(separator: "; "))" }
-                    }
-                } while publishedVersion != workActivityVersion
-            } catch is CancellationError {} catch {
-                syncError = "Work activity sync failed: \(error.localizedDescription)"
+                guard !Task.isCancelled, generation == snapshotLifecycleGeneration, isActive else { return }
+                await writeSnapshots(scope: .workActivity)
+            } catch {}
+        }
+    }
+
+    func writeWorkActivitySnapshots(in snapshotDir: URL, lifecycleGeneration generation: UInt64) async {
+        do {
+            let experiences: [Experience]
+            let unavailable: String?
+            do {
+                experiences = try await ExperienceStore.at(sync.dataRoot).projection()
+                unavailable = nil
+            } catch {
+                experiences = []
+                unavailable = error.localizedDescription
             }
+            var rows = Array((experiences.compactMap(activity) + workActivities.values)
+                .sorted { $0.content.updatedAt > $1.content.updatedAt }.prefix(64))
+            if let unavailable {
+                rows.append(.init(id: "experience:unavailable", sessionID: nil, startedAt: Date(),
+                    content: .init(title: "Work state unavailable", state: .unknown,
+                        status: unavailable, updatedAt: Date())))
+            }
+            guard let pairing = try PairingSecret.existingSecretBase64() else { return }
+            let configuration = await sync.apns.workActivityConfiguration(dataRoot: sync.dataRoot)
+            var snapshot = MobileWorkActivitySnapshot(activities: rows,
+                pairingFingerprint: WorkActivityPushRegistration.fingerprint(pairing), pushConfigured: configuration.configured,
+                pushConfigurationError: configuration.error)
+            snapshot.experiences = experiences.map(\.mobile)
+            snapshot.unavailable = unavailable
+            var changed: [String: Data] = [:]
+            var skipped: [String: String] = [:]
+            var attempted = Set<String>()
+            let revision = Date().timeIntervalSince1970
+            await writeSnapshot(snapshot, to: "work_activity.json", in: snapshotDir,
+                lifecycleGeneration: generation, readRevision: revision,
+                changed: &changed, skipped: &skipped, attempted: &attempted)
+            await commitSnapshots(changed, skipped: skipped, attempted: attempted, in: snapshotDir,
+                lifecycleGeneration: generation, readRevision: revision, scope: .workActivity)
+            guard !Task.isCancelled, generation == snapshotLifecycleGeneration, isActive else { return }
+            if configuration.usable {
+                let errors = await sync.relay.sendWorkActivities(rows, dataRoot: sync.dataRoot)
+                if !errors.isEmpty { syncError = "Live Activity push failed: \(errors.joined(separator: "; "))" }
+            }
+        } catch {
+            syncError = "Work activity sync failed: \(error.localizedDescription)"
         }
     }
 }

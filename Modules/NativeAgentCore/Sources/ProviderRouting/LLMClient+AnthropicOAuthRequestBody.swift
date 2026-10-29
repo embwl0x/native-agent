@@ -2,11 +2,11 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `LLMClient+AnthropicOAuthRequestBody.swift` | `AnthropicOAuthDirectAdapter`: `ephemeralCacheControl`, `currentTurnUserIndex`, `currentBoundaryIndex` |
+// Blueprint: | `LLMClient+AnthropicOAuthRequestBody.swift` | `AnthropicOAuthTransport`: `ephemeralCacheControl`, `currentTurnUserIndex`, shared encoded conversation cache boundaries |
 
 /// Anthropic OAuth wire layout and cache placement. Transport and token
 /// ownership remain in the adapter; these helpers preserve model-visible bytes.
-extension AnthropicOAuthDirectAdapter {
+extension AnthropicOAuthTransport {
     /// First line of the text-lane tool protocol in the system prompt; its
     /// presence is what marks a request as a text-tool-lane chat call.
     public static let textToolProtocolHeader =
@@ -36,7 +36,7 @@ extension AnthropicOAuthDirectAdapter {
         @TaskLocal public static var withinTurnReuse: Bool = false
     }
 
-    // MARK: - cache_control body helpers (U1 step 3 + 2b/3b, 2026-06-10)
+    // MARK: - cache_control body helpers
     //
     // Anthropic prompt caching matches the system → messages prefix. A valid
     // segment split puts one system breakpoint at the stable end, covering the
@@ -57,65 +57,15 @@ extension AnthropicOAuthDirectAdapter {
         return ["type": "ephemeral", "ttl": ttl]
     }
 
-    // MESSAGE-ORDER CONTRACT (live 400, 2026-09-01): a mid-conversation
-    // system message must IMMEDIATELY FOLLOW a user turn and either end the
-    // array or precede an assistant turn. The seeded v2 shape is therefore
-    //     [ history… , assistant(N-1), user(N), system(volatile) ]
-    // with the system message LAST, and within-turn rounds append AFTER it
-    // (assistant tool_use, user tool_result, …). The three index helpers
-    // below all read that shape; none of them may ever return a `.system`
-    // index, because a system message must never carry cache_control.
-
-    /// The CURRENT TURN's user message.
-    ///
-    /// AUTHORITATIVE SOURCE: `ConversationPrefixBoundary.currentUserIndex`,
-    /// bound per turn by the seeding layer, which knows the answer exactly.
-    /// Validated before use (in range, and actually a `.user` message) so a
-    /// stale binding degrades to the fallback instead of mis-marking.
-    ///
-    /// FALLBACK — anchor on the TRAILING SYSTEM RUN, never on
-    /// `lastIndex(.system)`. Replayed history carries ARCHIVED system blocks
-    /// of its own, positioned after their own user messages. When the turn's
-    /// volatile block is not delivered as a system message — it was empty, or
-    /// the model has no mid-conversation system support — `lastIndex(.system)`
-    /// selects one of those archived blocks, and the cross-turn 1h marker
-    /// lands near the START of the conversation, caching almost nothing. That
-    /// is a silent, expensive miss, so this reads only a system run that ENDS
-    /// the array (the seeded shape) and otherwise answers nil: no cross-turn
-    /// marker at all beats one in the wrong place.
+    /// The seeding owner binds the current user index for the whole loop.
+    /// Calls without a seeded turn have no cross-turn boundary to mark.
     static func currentTurnUserIndex(_ messages: [LLMMessage]) -> Int? {
         if let bound = ConversationPrefixBoundary.currentUserIndex,
            messages.indices.contains(bound),
            messages[bound].role == .user {
             return bound
         }
-        guard let last = messages.indices.last, messages[last].role == .system
-        else { return nil }
-        var runStart = last
-        while runStart > 0, messages[runStart - 1].role == .system { runStart -= 1 }
-        return messages[..<runStart].lastIndex { $0.role == .user }
-    }
-
-    /// Where the CURRENT (5m) boundary marker goes: the newest message that
-    /// is NOT a system message. In the seeded shape that is exactly the
-    /// current user message (the system message is last); once a within-turn
-    /// round has appended past the trailing system it is the newest appended
-    /// message, so the next round still reads the whole established prefix.
-    static func currentBoundaryIndex(_ messages: [LLMMessage]) -> Int? {
-        messages.lastIndex { $0.role != .system }
-    }
-
-    /// The v2 PREVIOUS-TURN boundary: the last ASSISTANT message strictly
-    /// before the current turn's user message — the end of the transcript
-    /// prefix this turn re-sends verbatim, so a marker there is the read the
-    /// next turn is built on. Anchored on the current USER message, not on
-    /// the system message and not on the current boundary: anchoring on
-    /// either would let a within-turn round stamp THIS turn's own assistant
-    /// tool_use with the cross-turn 1h TTL. It stays correct however many
-    /// messages the turn appended.
-    static func previousTurnBoundaryIndex(_ messages: [LLMMessage]) -> Int? {
-        guard let userIndex = currentTurnUserIndex(messages) else { return nil }
-        return messages[..<userIndex].lastIndex { $0.role == .assistant }
+        return nil
     }
 
     /// ONE extended-TTL decision for the WHOLE request.
@@ -133,8 +83,7 @@ extension AnthropicOAuthDirectAdapter {
     static func requestLongTTL(
         usesPrefixShape: Bool
     ) -> String? {
-        // User 2026-09-29: the stable prefix lives an hour from the first turn,
-        // so a reply after a pause still reads it from cache.
+        // The stable prefix has a one-hour cache lifetime.
         guard usesPrefixShape else { return nil }
         return "1h"
     }
@@ -147,10 +96,9 @@ extension AnthropicOAuthDirectAdapter {
     /// i.e. no `ttl` key on the wire, byte-identical to the legacy marker).
     ///
     /// INVARIANT, enforced HERE because this is the one place message markers
-    /// are written: a `system` message NEVER receives cache_control. The
-    /// volatile mid-conversation system message is turn-scoped (it may even
-    /// carry `clear_at`), so caching it is meaningless at best and pins
-    /// disappearing bytes into the prefix at worst.
+    /// are written: a `system` message never receives cache_control. The
+    /// reusable boundary is a user/assistant content block; changing context
+    /// is sent and retained on its user turn.
     static func addConversationCacheControls(
         _ messages: inout [[String: Any]],
         previousBoundaryIndex: Int?,
@@ -159,12 +107,13 @@ extension AnthropicOAuthDirectAdapter {
         currentBoundaryTTL: String? = nil
     ) {
         func mark(_ index: Int, ttl: String?) {
+            // The marker goes on the last block that carries something: never an empty text block.
             guard messages.indices.contains(index),
                   messages[index]["role"] as? String != "system",
                   var content = messages[index]["content"] as? [[String: Any]],
-                  var lastBlock = content.last else { return }
-            lastBlock["cache_control"] = ephemeralCacheControl(ttl: ttl)
-            content[content.count - 1] = lastBlock
+                  let at = content.lastIndex(where: { $0["type"] as? String != "text" || !(($0["text"] as? String) ?? "").isEmpty })
+            else { return }
+            content[at]["cache_control"] = ephemeralCacheControl(ttl: ttl)
             messages[index]["content"] = content
         }
         if let previousBoundaryIndex,
@@ -176,13 +125,46 @@ extension AnthropicOAuthDirectAdapter {
         }
     }
 
-    /// DEBUG-ONLY diagnostic: when NATIVE_AGENT_LLM_BODY_DUMP_DIR is set,
-    /// write every outgoing request body to that directory so cache-breakpoint
-    /// placement can be inspected offline (U1 finding #1 hunt, 2026-06-10).
-    /// Bodies contain persona/conversation content, so this is compiled OUT
-    /// of release builds entirely (#if DEBUG) — a stray env var in a
-    /// production launch context can never activate it (gpt-5.5 review
-    /// blocker, 2026-06-10). The Authorization header is never dumped.
+    /// Both Anthropic builders place markers on encoded entries, whose source
+    /// indices survive native encoding's omission of empty messages. Tools and
+    /// system consume their slots first; the current and previous boundaries
+    /// share the remaining slots of Anthropic's four-marker request budget.
+    static func cacheConversationPrefix(
+        _ body: inout [String: Any], sourceMessages: [LLMMessage],
+        wireSourceIndices: [Int], usesPrefixShape: Bool
+    ) {
+        guard usesPrefixShape || MessagesCacheHint.withinTurnReuse,
+              var wire = body["messages"] as? [[String: Any]],
+              wire.count == wireSourceIndices.count else { return }
+        let markers = cacheMarkers(in: body)
+        let slots = 4 - markers.count
+        guard slots > 0 else { return }
+        let eligible = wire.indices.filter {
+            wire[$0]["role"] as? String != "system"
+                && (wire[$0]["content"] as? [[String: Any]])?.isEmpty == false
+        }
+        guard let current = eligible.last else { return }
+        let previous: Int?
+        if let user = currentTurnUserIndex(sourceMessages) {
+            previous = eligible.last { index in
+                let source = wireSourceIndices[index]
+                return sourceMessages.indices.contains(source) && source < user
+                    && sourceMessages[source].role == .assistant
+            }
+        } else {
+            previous = MessagesCacheHint.withinTurnReuse && wire.count >= 3
+                ? eligible.last(where: { $0 <= wire.count - 3 }) : nil
+        }
+        // A longer-lived entry may not follow a shorter-lived tool/system
+        // entry. Native API markers use 5m; OAuth's segmented prefix uses 1h.
+        let previousTTL = usesPrefixShape && !markers.isEmpty && markers.allSatisfy { $0.ttl == "1h" }
+            ? "1h" : nil
+        addConversationCacheControls(&wire, previousBoundaryIndex: slots >= 2 ? previous : nil,
+            currentBoundaryIndex: current, previousBoundaryTTL: previousTTL)
+        body["messages"] = wire
+    }
+
+    /// NATIVE_AGENT_LLM_BODY_DUMP_DIR enables body dumps only in DEBUG builds, never Authorization headers.
     static func dumpBodyIfEnabled(_ body: [String: Any], call: String) {
         #if DEBUG
         guard let dir = ProcessInfo.processInfo.environment["NATIVE_AGENT_LLM_BODY_DUMP_DIR"],
@@ -200,43 +182,10 @@ extension AnthropicOAuthDirectAdapter {
         #endif
     }
 
-    /// system blocks: identity (+ stable + dynamic | + combined sys).
-    ///
-    /// `segments` defaults to the request-scoped TaskLocal so every call
-    /// path (complete / completeMessages / runStream — all run inside the
-    /// task that inherited the loop's binding) picks the split up without
-    /// signature churn at the call sites.
-    ///
-    /// SAFETY GUARD: the split is used ONLY when the segments reassemble
-    /// byte-for-byte into `system` (INVARIANT: system == stable + "\n\n" +
-    /// dynamic — see TurnContext.systemSegments). Any mismatch — stale
-    /// binding, caller-mutated sys — falls back to the combined block, so
-    /// model-visible content can never change.
-    ///
-    /// BYTE FAITHFULNESS (gpt-5.5 review blocker, 2026-06-10): the emitted
-    /// stable+dynamic block TEXTS must concatenate byte-for-byte to the
-    /// combined `system` string — the API does not guarantee any particular
-    /// join between adjacent text blocks, so the "\n\n" separator is carried
-    /// as a SUFFIX on the stable block's text (cache-safe: the suffix is
-    /// exactly as stable as the block it rides on). The identity block is
-    /// different: it has ALWAYS been its own block, never part of the `sys`
-    /// string (pre-U1 shape was already [identity][sys]), so it carries no
-    /// join contract with the blocks that follow it.
-    ///
-    /// Segmented prefix shape (only when segments are present and reassemble):
-    ///   [identity — NO cache_control] [stable] [stableSuffix?] [dynamic?]
-    /// The identity block is a strict PREFIX of the stable mass, so a
-    /// breakpoint at the end of the stable mass already caches it; its own
-    /// breakpoint bought nothing and spent one of the four slots. The freed
-    /// slot funds the previous-turn conversation boundary marker. The LAST
-    /// stable block (stableSuffix when present, else stable) carries the
-    /// single system breakpoint, at the GA 1h TTL when `longTTL` says so —
-    /// see `requestLongTTL`, so the render order never puts 5m ahead of 1h.
-    /// An empty `dynamic`
-    /// emits no dynamic block at all.
-    /// Byte faithfulness is unchanged: separators ride as SUFFIXES on the
-    /// preceding block, so the emitted non-identity block texts concatenate to
-    /// `sys` exactly.
+    /// Request-scoped segments apply only when they reassemble byte-for-byte into `system`.
+    /// Non-identity block texts concatenate to `system`, with separators on preceding blocks.
+    /// The last stable block carries the single system breakpoint, after identity and before dynamic text.
+    /// Long-TTL markers precede short-TTL markers; empty dynamic text emits no block.
     static func makeSystemBlocks(
         _ system: String?,
         segments: SystemPromptSegments? = LLMCallContext.systemSegments,
@@ -259,32 +208,13 @@ extension AnthropicOAuthDirectAdapter {
             return blocks
         }
         if usesPrefixShape, let seg = segments {
-            // Separator suffixes: each emitted block carries the "\n\n" that
-            // joins it to the NEXT emitted block, so the concatenation of the
-            // block texts is `sys` byte-for-byte.
-            let hasSuffix = !seg.stableSuffix.isEmpty
-            let hasDynamic = !seg.dynamic.isEmpty
-            let stableTTL: String? = longTTL
-            var stableBlock: [String: Any] = [
-                "type": "text",
-                "text": seg.stable + ((hasSuffix || hasDynamic) ? "\n\n" : ""),
-            ]
-            if !hasSuffix {
-                stableBlock["cache_control"] = ephemeralCacheControl(ttl: stableTTL)
-            }
-            blocks.append(stableBlock)
-            if hasSuffix {
-                blocks.append([
-                    "type": "text",
-                    "text": seg.stableSuffix + (hasDynamic ? "\n\n" : ""),
-                    "cache_control": ephemeralCacheControl(ttl: stableTTL),
-                ])
-            }
-            if hasDynamic {
-                blocks.append([
-                    "type": "text",
-                    "text": seg.dynamic,
-                ])
+            let layout = seg.textBlockLayout
+            blocks += layout.texts.enumerated().map { index, text in
+                var block: [String: Any] = ["type": "text", "text": text]
+                if index == layout.lastStableIndex {
+                    block["cache_control"] = ephemeralCacheControl(ttl: longTTL)
+                }
+                return block
             }
             return blocks
         }
@@ -347,16 +277,8 @@ extension AnthropicOAuthDirectAdapter {
         return true
     }
 
-    /// 2026-09-22 WHY: on this text tool lane Claude writes its own
-    /// `<function_calls>` blocks; without the stop the API normally applies,
-    /// Opus 5.5 went on to invent `<function_results>` and ran 421s to the
-    /// 65,536-token cap (turn 37802ab2). Stop where a real call would —
-    /// chat calls carrying the text-lane protocol only, never side calls.
-    /// Every transport (messages and the legacy prompt stream) reads it.
-    /// `</tool_use>`/`</invoke>` are deliberately NOT stops: bare markers have
-    /// no outer block, so stopping at the first would drop parallel calls.
-    /// A repeated bare block ends at the last good block's closing tag instead —
-    /// `RunawayOutputDetector(endsAtToolBoundary:)`, 2026-09-23.
+    /// Text-tool chat requests stop at the outer call boundary, never at bare parallel-call markers.
+    /// RunawayOutputDetector ends repeated bare blocks at the last complete call.
     static func applyTextLaneStops(to body: inout [String: Any], system: String?) {
         if system?.contains(textToolProtocolHeader) == true {
             body["stop_sequences"] = ["</function_calls>", "<function_results>", "\n<tool_result", "\nNativeAgent tool result #"]
@@ -364,18 +286,7 @@ extension AnthropicOAuthDirectAdapter {
         }
     }
 
-    // MARK: - Shared messages-request body builder (U1 items 8 + 9)
-    //
-    // ONE encoder behind completeMessages AND the streaming runStreamMessages
-    // so the wire shape (block encoding, breakpoint layout)
-    // cannot drift between the non-streaming and SSE transports. The bodies
-    // are test-pinned deep-equal modulo the `stream` key
-    // (LLMCallTelemetryTests + AnthropicStreamMessagesSSETests).
-    //
-    // Reads two task-locals at call time (all inherited through the
-    // adapter's inner Task per the LLMCallContext propagation contract):
-    //   - LLMCallContext.systemSegments (via makeSystemBlocks' default arg)
-    //   - MessagesCacheHint.withinTurnReuse (item 9 — see enum doc above)
+    /// Completion and streaming share message retention, ordering and cache boundaries.
     static func makeMessagesRequestBody(
         messages: [LLMMessage],
         system: String?,
@@ -383,36 +294,9 @@ extension AnthropicOAuthDirectAdapter {
         maxTokens: Int,
         stream: Bool
     ) -> [String: Any] {
-        // Conversation-cache INVARIANT: caching ships iff the call is a v2
-        // prefix turn OR withinTurnReuse-hinted (the tool loop's explicit "I
-        // re-send this conversation as a prefix next round" signal — see
-        // MessagesCacheHint), and trailing-eligible.
-        // V2: EVERY turn is a prefix-reuse turn — the transcript is re-sent
-        // as a cached prefix across turns, not only inside one tool loop — so
-        // the conversation breakpoints are unconditional (still subject to
-        // trailing-eligibility). The v2 system-block
-        // shape only engages when the segments actually reassemble; when it
-        // does not, the identity block keeps its own breakpoint and there is
-        // no free slot, so no previous-turn boundary is marked.
         let usesPrefixShape = Self.usesV2PrefixShape(
             system, segments: LLMCallContext.systemSegments
         )
-        // Prove a conversation breakpoint CAN ship before
-        // suppressing dynamic-end — an empty messages
-        // array (or an empty last content) would otherwise lose BOTH
-        // breakpoints silently. Eligibility on the source LLMMessages
-        // mirrors the encoder exactly (every content block encodes to
-        // one Anthropic block).
-        // Eligibility is about the message the CURRENT marker would land on
-        // — the newest NON-system message, not `messages.last` (which is the
-        // volatile system message in the seeded v2 shape and can never be
-        // marked). An empty content array there would silently lose both
-        // markers.
-        let boundaryIndex = Self.currentBoundaryIndex(messages)
-        let trailingEligible = boundaryIndex.map { !messages[$0].content.isEmpty } ?? false
-        let useConversationCache =
-            (usesPrefixShape || MessagesCacheHint.withinTurnReuse)
-            && trailingEligible
         let longTTL = Self.requestLongTTL(
             usesPrefixShape: usesPrefixShape
         )
@@ -424,83 +308,15 @@ extension AnthropicOAuthDirectAdapter {
         // the array-of-blocks form.
         var anthropicMessages: [[String: Any]] = []
         for m in messages {
-            var blocks: [[String: Any]] = []
-            for block in m.content {
-                switch block {
-                case .text(let t):
-                    blocks.append(["type": "text", "text": t])
-                case .toolUse(let id, let name, let inputJSON):
-                    let inputObj: Any = (try? JSONSerialization.jsonObject(with: inputJSON)) ?? [String: Any]()
-                    blocks.append([
-                        "type": "tool_use",
-                        "id": id,
-                        "name": name,
-                        "input": inputObj,
-                    ])
-                case .toolResult(let toolUseId, let content, let isError):
-                    var entry: [String: Any] = [
-                        "type": "tool_result",
-                        "tool_use_id": toolUseId,
-                        "content": content,
-                    ]
-                    if isError { entry["is_error"] = true }
-                    blocks.append(entry)
-                case .image(let mediaType, let base64, _, _):
-                    // Native vision — Anthropic Messages API base64 image block.
-                    // userWithImages emits image blocks FIRST, then the text
-                    // block, so the canonical [image..., text] order is held by
-                    // the content array's own order here.
-                    blocks.append([
-                        "type": "image",
-                        "source": [
-                            "type": "base64",
-                            "media_type": mediaType,
-                            "data": base64,
-                        ],
-                    ])
-                }
-            }
-            var entry: [String: Any] = [
+            // Empty text is never sent beside real content (a tool-only reply
+            // leaves one); the API rejects it and a cache marker on it fails the turn.
+            let kept = m.content.filter { if case .text(let text) = $0 { !text.isEmpty } else { true } }
+            let blocks = (kept.isEmpty ? m.content : kept).map(AnthropicTransport.anthropicBlock)
+            let entry: [String: Any] = [
                 "role": Self.wireRole(m.role),
                 "content": blocks,
             ]
-            // Mid-conversation system message the provider drops as soon as
-            // the next user message arrives. The `clear_at` key rides on the
-            // MESSAGE, and its beta is added per-request in apiHeaders.
-            if m.turnScopedClearAtNextUserMessage {
-                entry["clear_at"] = "next_user_message"
-            }
             anthropicMessages.append(entry)
-        }
-        if useConversationCache {
-            let currentIndex = boundaryIndex
-            let previousBoundaryIndex: Int?
-            let previousBoundaryTTL: String?
-            if usesPrefixShape {
-                // Indices are computed on the SOURCE messages and applied to
-                // `anthropicMessages`: this encoder is 1:1 (every LLMMessage
-                // yields exactly one wire entry, empty content included), so
-                // the two arrays share indices.
-                previousBoundaryIndex = Self.previousTurnBoundaryIndex(messages)
-                previousBoundaryTTL = longTTL
-                // Budget: stable-end + previous + current = 3.
-                // Nothing else can ship a marker on v2, so this is closed.
-            } else {
-                // Unsegmented within-turn helper calls retain their existing
-                // preceding-round marker; they have no seeded turn boundary.
-                let retain = MessagesCacheHint.withinTurnReuse
-                previousBoundaryIndex =
-                    (retain && anthropicMessages.count >= 3)
-                    ? anthropicMessages.count - 3
-                    : nil
-                previousBoundaryTTL = nil
-            }
-            Self.addConversationCacheControls(
-                &anthropicMessages,
-                previousBoundaryIndex: previousBoundaryIndex,
-                currentBoundaryIndex: currentIndex,
-                previousBoundaryTTL: previousBoundaryTTL
-            )
         }
         var body: [String: Any] = [
             "model": coercedModel,
@@ -508,6 +324,8 @@ extension AnthropicOAuthDirectAdapter {
             "messages": anthropicMessages,
             "system": systemBlocks,
         ]
+        Self.cacheConversationPrefix(&body, sourceMessages: messages,
+            wireSourceIndices: Array(messages.indices), usesPrefixShape: usesPrefixShape)
         if stream {
             body["stream"] = true
         }

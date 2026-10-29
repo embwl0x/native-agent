@@ -105,7 +105,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
             )
             ORDER BY mention_count DESC, last_seen DESC
             """, arguments: [configuredLower, configuredLower])
-        guard !rows.isEmpty else { return PrimaryUserConsolidation() }
+        guard let first = rows.first else { return PrimaryUserConsolidation() }
 
         func role(_ row: Row) -> String? {
             let raw: String? = row["metadata_json"]
@@ -129,12 +129,12 @@ extension SwiftNativeKnowledgeGraphIndexer {
                     && name($0).caseInsensitiveCompare(primaryUserName) == .orderedSame
             })
             ?? rows.first(where: { name($0).lowercased() == "the user" })
-            ?? rows[0]
-        let canonicalID: String = canonical["id"]
+            ?? first
+        let canonicalID: String = try canonical.decode(forColumn: "id")
         var report = PrimaryUserConsolidation()
 
         for row in rows {
-            let duplicateID: String = row["id"]
+            let duplicateID: String = try row.decode(forColumn: "id")
             guard duplicateID != canonicalID else { continue }
             let relationships = try Row.fetchAll(db, sql: """
                 SELECT id, from_id, to_id, type, weight, mention_count,
@@ -143,15 +143,23 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 WHERE from_id = ? OR to_id = ?
                 """, arguments: [duplicateID, duplicateID])
             for relationship in relationships {
-                let relationshipID: Int64 = relationship["id"]
-                let oldFrom: String = relationship["from_id"]
-                let oldTo: String = relationship["to_id"]
+                let relationshipID: Int64 = try relationship.decode(forColumn: "id")
+                let oldFrom: String = try relationship.decode(forColumn: "from_id")
+                let oldTo: String = try relationship.decode(forColumn: "to_id")
                 let newFrom = oldFrom == duplicateID ? canonicalID : oldFrom
                 let newTo = oldTo == duplicateID ? canonicalID : oldTo
                 if newFrom != newTo {
-                    let relationshipType: String = relationship["type"]
+                    let relationshipType: String = try relationship.decode(forColumn: "type")
                     let weight: Double? = relationship["weight"]
-                    let mentionCount: Int = relationship["mention_count"] ?? 0
+                    let mentionCount: Int64 = try relationship.decode(Int64?.self, forColumn: "mention_count") ?? 0
+                    let priorCount = try Int64.fetchOne(db, sql: """
+                        SELECT COALESCE(mention_count, 0) FROM kg_relationships
+                        WHERE from_id = ? AND to_id = ? AND type = ?
+                        """, arguments: [newFrom, newTo, relationshipType]) ?? 0
+                    let (combinedCount, overflow) = priorCount.addingReportingOverflow(mentionCount)
+                    guard !overflow else {
+                        throw MemoryStorageError.databaseUnavailable("kg_relationships mention_count overflow while merging row \(relationshipID)")
+                    }
                     let provenance: String? = relationship["provenance"]
                     let metadataJSON: String? = relationship["metadata_json"]
                     try db.execute(sql: """
@@ -163,8 +171,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                             COALESCE(kg_relationships.weight, 0),
                             COALESCE(excluded.weight, 0)
                           ),
-                          mention_count = COALESCE(kg_relationships.mention_count, 0)
-                            + COALESCE(excluded.mention_count, 0),
+                          mention_count = ?,
                           provenance = COALESCE(
                             kg_relationships.provenance,
                             excluded.provenance
@@ -176,6 +183,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                         """, arguments: [
                             newFrom, newTo, relationshipType, weight, mentionCount,
                             provenance, metadataJSON,
+                            combinedCount,
                         ])
                 }
                 try db.execute(
@@ -244,7 +252,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         fact: KnowledgeGraphMemoryFact
     ) throws -> String {
         if let row = try Row.fetchOne(db, sql: """
-            SELECT id, aliases_json, metadata_json
+            SELECT id, aliases_json, metadata_json, mention_count
             FROM kg_entities
             WHERE lower(type) = 'person'
               AND (
@@ -257,7 +265,12 @@ extension SwiftNativeKnowledgeGraphIndexer {
               mention_count DESC
             LIMIT 1
             """, arguments: [primaryUserName]) {
-            let id: String = row["id"]
+            let id: String = try row.decode(forColumn: "id")
+            let count: Int64? = try row.decode(forColumn: "mention_count")
+            let (nextCount, overflow) = (count ?? 0).addingReportingOverflow(1)
+            guard !overflow else {
+                throw MemoryStorageError.databaseUnavailable("kg_entities mention_count overflow for row \(id)")
+            }
             var metadata = metadataObject(row["metadata_json"])
             metadata["role"] = .string("primary_user")
             metadata["embedding_text"] = .string("person: \(primaryUserName)")
@@ -272,7 +285,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                   type = 'person',
                   summary = ?,
                   aliases_json = ?,
-                  mention_count = COALESCE(mention_count, 0) + 1,
+                  mention_count = ?,
                   last_seen = ?,
                   metadata_json = ?
                 WHERE id = ?
@@ -280,6 +293,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                     primaryUserName,
                     "NativeAgent's primary user.",
                     String(decoding: aliasData, as: UTF8.self),
+                    nextCount,
                     now,
                     metadataJSON(metadata),
                     id,

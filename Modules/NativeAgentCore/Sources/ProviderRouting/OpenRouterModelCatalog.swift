@@ -1,58 +1,29 @@
 import Foundation
 import PersistenceCore
+import NativeAgentShared
 
 // Blueprint: | `OpenRouterModelCatalog.swift` | `OpenRouterModelCatalog`: live-backed model availability, capability parsing and checked catalog cache through shared TTL machinery |
 
-public struct ProviderModelDescriptor: Sendable, Equatable {
-    public var id: String
-    public var name: String
-    /// Tokens, or 0 when the provider's catalog states none: never a guess.
-    public var contextLength: Int
-    public var supportsStreaming: Bool
-    public var supportsVision: Bool
-    public var supportsTools: Bool
-    public var supportsJSONMode: Bool
-    public var costPer1KIn: Double?
-    public var costPer1KOut: Double?
-
-    public init(
-        id: String,
-        name: String,
-        contextLength: Int,
-        supportsStreaming: Bool = true,
-        supportsVision: Bool = false,
-        supportsTools: Bool = false,
-        supportsJSONMode: Bool = false,
-        costPer1KIn: Double? = nil,
-        costPer1KOut: Double? = nil
-    ) {
-        self.id = id
-        self.name = name
-        self.contextLength = contextLength
-        self.supportsStreaming = supportsStreaming
-        self.supportsVision = supportsVision
-        self.supportsTools = supportsTools
-        self.supportsJSONMode = supportsJSONMode
-        self.costPer1KIn = costPer1KIn
-        self.costPer1KOut = costPer1KOut
-    }
-
+extension ProviderModelInfo {
     public func providerJSON() -> [String: JSONValue] {
         var obj: [String: JSONValue] = [
             "id": .string(id),
             "name": .string(name),
-            "context_length": .int(Int64(contextLength)),
-            "supports_streaming": .bool(supportsStreaming),
-            "supports_vision": .bool(supportsVision),
-            "supports_tools": .bool(supportsTools),
-            "supports_json_mode": .bool(supportsJSONMode),
+            "context_length": .int(Int64(context_length)),
+            "supports_streaming": .bool(supports_streaming),
+            "supports_vision": .bool(supports_vision),
+            "supports_tools": .bool(supports_tools),
+            "supports_json_mode": .bool(supports_json_mode),
         ]
-        if let costPer1KIn {
-            obj["cost_per_1k_in"] = .double(costPer1KIn)
+        if let cost_per_1k_in {
+            obj["cost_per_1k_in"] = .double(cost_per_1k_in)
         }
-        if let costPer1KOut {
-            obj["cost_per_1k_out"] = .double(costPer1KOut)
+        if let cost_per_1k_out {
+            obj["cost_per_1k_out"] = .double(cost_per_1k_out)
         }
+        obj["default_reasoning_effort"] = default_reasoning_effort.map(JSONValue.string)
+        obj["supported_reasoning_efforts"] = supported_reasoning_efforts.map { .array($0.map(JSONValue.string)) }
+        obj["supports_fast"] = supports_fast.map(JSONValue.bool)
         return obj
     }
 }
@@ -69,9 +40,7 @@ public enum OpenRouterModelCatalog {
     }
     public static let endpoint = URL(string: "https://openrouter.ai/api/v1/models?output_modalities=text")!
 
-    /// Shared TTL + backoff machinery (R-M3). OpenRouter keeps only its own
-    /// parse / fetch / capability specifics; the read/refresh/backoff state
-    /// machine lives in `ModelCatalogTTLCache`.
+    /// ModelCatalogTTLCache owns TTL and backoff; OpenRouter supplies parsing, fetching and capabilities.
     static let ttlCache = ModelCatalogTTLCache(
         cachePath: { cachePath(dataRoot: $0) },
         endpoint: endpoint,
@@ -84,12 +53,11 @@ public enum OpenRouterModelCatalog {
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         session: URLSession = .shared,
         refresh: Bool = false
-    ) async -> [ProviderModelDescriptor] {
+    ) async -> [ProviderModelInfo] {
         await ttlCache.models(dataRoot: dataRoot, session: session, refresh: refresh)
     }
 
-    /// The same read, saying whether it reached OpenRouter (User, 2026-09-06)
-    /// and, if not, why.
+    /// The read reports whether it reached OpenRouter and why it did not.
     public static func modelsWithFreshness(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         session: URLSession = .shared,
@@ -104,10 +72,7 @@ public enum OpenRouterModelCatalog {
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         now: Date = Date()
     ) -> CachedModelAvailability {
-        // User, 2026-09-06: membership and completeness used to come from two
-        // separate reads of this file, so a refresh landing between them could
-        // convict a model against a generation that never listed it. Both
-        // facts now come from ONE decode of one set of bytes.
+        // Membership and completeness come from one decode of the same bytes.
         guard let cached = readDecodedCache(dataRoot: dataRoot),
               !ttlCache.cacheIsStale(fetchedAt: cached.fetchedAt, now: now),
               !cached.models.isEmpty else {
@@ -116,23 +81,16 @@ public enum OpenRouterModelCatalog {
         let wanted = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !wanted.isEmpty else { return .unavailable }
         if cached.models.contains(where: { $0.id == wanted }) { return .available }
-        // A cache written from a TRUNCATED page lists only part of the
-        // catalogue, so a missing id there is no evidence of absence — it reads
-        // as `.unknown` and the pin stands. Only a cache whose source response
-        // carried the whole list may say `.unavailable`. User, 2026-09-06: a
-        // cache carrying NO completeness stamp is unknown for the same reason —
-        // absence of the stamp is not authority to convict.
+        // Only a cache stamped complete can declare a missing model unavailable.
         return cached.isComplete == true ? .unavailable : .unknown
     }
 
-    static func parseModelsResponse(_ data: Data) throws -> [ProviderModelDescriptor] {
-        let raw = try JSONSerialization.jsonObject(with: data, options: [])
-        guard let root = raw as? [String: Any],
-              let rows = root["data"] as? [[String: Any]] else {
+    static func parseModelsResponse(_ root: [String: Any]?) -> [ProviderModelInfo] {
+        guard let rows = root?["data"] as? [[String: Any]] else {
             return []
         }
 
-        var byId: [String: ProviderModelDescriptor] = [:]
+        var byId: [String: ProviderModelInfo] = [:]
         for row in rows {
             guard let model = parseModel(row) else { continue }
             byId[model.id] = model
@@ -148,19 +106,10 @@ public enum OpenRouterModelCatalog {
     /// Envelope keys that may nest those continuation markers.
     private static let continuationContainerKeys = ["pagination", "links", "meta"]
 
-    /// User, 2026-09-06: only a complete list may prune rows a caller no longer
-    /// sees. Complete means the envelope carries no marker that says MORE —
-    /// `has_more == true`, or a non-null continuation cursor/link. The mere
-    /// PRESENCE of `page`, `links` or `has_more: false` is a paginated API
-    /// describing its LAST page, not evidence of truncation. The old
-    /// count-against-the-disk-cache comparison is gone entirely: it wedged a
-    /// legitimately shrunk catalogue as permanently incomplete (the shrunk list
-    /// was never persisted, so every later fetch met the same tall baseline),
-    /// and it never caught a marker-free truncation anyway.
-    static func responseIsComplete(_ data: Data) -> Bool {
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return true
-        }
+    /// Only a complete list may exclude a selected model. Pagination metadata
+    /// marks an incomplete list only when it names another page.
+    static func responseIsComplete(_ root: [String: Any]?) -> Bool {
+        guard let root else { return true }
         if envelopeSaysMore(root) { return false }
         for key in continuationContainerKeys {
             if let nested = root[key] as? [String: Any], envelopeSaysMore(nested) {
@@ -209,13 +158,14 @@ public enum OpenRouterModelCatalog {
         guard (200..<300).contains(code) else {
             throw ProviderRoutingError.invalidResponse(status: code)
         }
+        let root = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         return ModelCatalogFetch(
-            models: try parseModelsResponse(data),
-            isComplete: responseIsComplete(data)
+            models: parseModelsResponse(root),
+            isComplete: responseIsComplete(root)
         )
     }
 
-    private static func parseModel(_ row: [String: Any]) -> ProviderModelDescriptor? {
+    private static func parseModel(_ row: [String: Any]) -> ProviderModelInfo? {
         guard let rawID = row["id"] as? String else { return nil }
         let id = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty, !id.hasPrefix("~") else { return nil }
@@ -231,21 +181,21 @@ public enum OpenRouterModelCatalog {
         let inputModalities = stringSet(architecture?["input_modalities"])
         let supportedParameters = stringSet(row["supported_parameters"])
 
-        return ProviderModelDescriptor(
+        return ProviderModelInfo(
             id: id,
             name: name,
-            contextLength: context,
+            context_length: context,
             // Capability = upstream declaration AND a NativeAgent wire path.
             // The adapter implements SSE for every text model; the remaining
             // capabilities stay model-specific and come from OpenRouter's
             // own live metadata.
-            supportsStreaming: true,
-            supportsVision: inputModalities.contains("image"),
-            supportsTools: supportedParameters.contains("tools"),
-            supportsJSONMode: supportedParameters.contains("response_format")
+            supports_streaming: true,
+            supports_vision: inputModalities.contains("image"),
+            supports_tools: supportedParameters.contains("tools"),
+            supports_json_mode: supportedParameters.contains("response_format")
                 || supportedParameters.contains("structured_outputs"),
-            costPer1KIn: pricePer1K((row["pricing"] as? [String: Any])?["prompt"]),
-            costPer1KOut: pricePer1K((row["pricing"] as? [String: Any])?["completion"])
+            cost_per_1k_in: pricePer1K((row["pricing"] as? [String: Any])?["prompt"]),
+            cost_per_1k_out: pricePer1K((row["pricing"] as? [String: Any])?["completion"])
         )
     }
 
@@ -263,7 +213,7 @@ public enum OpenRouterModelCatalog {
         return outputModalities.contains("text")
     }
 
-    private static func sortModels(_ models: [ProviderModelDescriptor]) -> [ProviderModelDescriptor] {
+    private static func sortModels(_ models: [ProviderModelInfo]) -> [ProviderModelInfo] {
         models.sorted { lhs, rhs in
             let lKey = providerModelSortKey(lhs)
             let rKey = providerModelSortKey(rhs)
@@ -280,7 +230,7 @@ public enum OpenRouterModelCatalog {
         }
     }
 
-    private static func providerModelSortKey(_ model: ProviderModelDescriptor) -> (provider: String, model: String) {
+    private static func providerModelSortKey(_ model: ProviderModelInfo) -> (provider: String, model: String) {
         let id = model.id.trimmingCharacters(in: .whitespacesAndNewlines)
         let parts = id.split(separator: "/", maxSplits: 1).map(String.init)
         if parts.count == 2 {
@@ -295,19 +245,12 @@ public enum OpenRouterModelCatalog {
             .appendingPathComponent("openrouter-models-cache.json")
     }
 
-    /// Sweep item A9: `ContextBudgetPolicy.resolve` reaches this reader through
-    /// `ProviderRouting.verifiedContextLength` at FOUR points in a single chat
-    /// turn (history window, packet budget, turn budget, cognitive capsule), and
-    /// each one used to re-read and re-parse the whole 130KB / 400-row catalog.
-    /// Measured on the real cache: 28.4ms per turn of pure decode. The mtime
-    /// key keeps every caller's fail-closed semantics — a rewritten or removed
-    /// file is visible on the very next read — while the unchanged case costs
-    /// one stat.
+    /// Path/mtime caching preserves fail-closed reads and exposes replacement or removal on the next read.
     static func cacheFault(dataRoot: URL) -> String? {
         modelCatalogFault(at: cachePath(dataRoot: dataRoot), read: readCache(dataRoot: dataRoot) != nil, owner: "OpenRouter")
     }
 
-    static func readCache(dataRoot: URL) -> [ProviderModelDescriptor]? {
+    static func readCache(dataRoot: URL) -> [ProviderModelInfo]? {
         readDecodedCache(dataRoot: dataRoot)?.models
     }
 
@@ -333,22 +276,22 @@ public enum OpenRouterModelCatalog {
         } else {
             isComplete = nil
         }
-        let models = rows.compactMap { value -> ProviderModelDescriptor? in
+        let models = rows.compactMap { value -> ProviderModelInfo? in
             guard case .object(let row) = value,
                   let id = string(row["id"]),
                   let name = string(row["name"]) else {
                 return nil
             }
-            return ProviderModelDescriptor(
+            return ProviderModelInfo(
                 id: id,
                 name: name,
-                contextLength: int(row["context_length"]) ?? 0,
-                supportsStreaming: bool(row["supports_streaming"]) ?? true,
-                supportsVision: bool(row["supports_vision"]) ?? false,
-                supportsTools: bool(row["supports_tools"]) ?? false,
-                supportsJSONMode: bool(row["supports_json_mode"]) ?? false,
-                costPer1KIn: double(row["cost_per_1k_in"]),
-                costPer1KOut: double(row["cost_per_1k_out"])
+                context_length: row["context_length"]?.integerValue.flatMap { Int(exactly: $0) } ?? 0,
+                supports_streaming: row["supports_streaming"]?.boolValue ?? true,
+                supports_vision: row["supports_vision"]?.boolValue ?? false,
+                supports_tools: row["supports_tools"]?.boolValue ?? false,
+                supports_json_mode: row["supports_json_mode"]?.boolValue ?? false,
+                cost_per_1k_in: row["cost_per_1k_in"]?.numberValue(coercingStrings: false, finiteOnly: false),
+                cost_per_1k_out: row["cost_per_1k_out"]?.numberValue(coercingStrings: false, finiteOnly: false)
             )
         }
         guard !models.isEmpty else { return nil }
@@ -393,26 +336,5 @@ public enum OpenRouterModelCatalog {
         guard case .string(let s)? = value else { return nil }
         let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private static func int(_ value: JSONValue?) -> Int? {
-        switch value {
-        case .int(let i)?: return Int(i)
-        case .double(let d)?: return Int(exactly: d.rounded(.towardZero))
-        default: return nil
-        }
-    }
-
-    private static func double(_ value: JSONValue?) -> Double? {
-        switch value {
-        case .double(let d)?: return d
-        case .int(let i)?: return Double(i)
-        default: return nil
-        }
-    }
-
-    private static func bool(_ value: JSONValue?) -> Bool? {
-        guard case .bool(let value)? = value else { return nil }
-        return value
     }
 }

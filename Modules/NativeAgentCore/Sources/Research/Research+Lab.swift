@@ -11,19 +11,17 @@ public struct ResearchLabProposal: Codable, Sendable {
 }
 
 extension SwiftNativeResearchClient {
-    // MARK: research lab (wave 30 W17)
+    // MARK: research lab
 
     /// Lock-free so the read-modify-write below can hold the file lock.
     public func researchLabRuns() async throws -> [JSONValue] {
-        let raw = try await persistence.readJSON(labRunsPath, ifMissing: .array([]))
+        let raw = try await SwiftNativePersistenceCore.readJSON(labRunsPath, ifMissing: .array([]))
         guard case .array(let rows) = raw else {
             throw PersistenceCoreError.ioFailure(
                 "Saved research runs must be an array. Original contents have been preserved."
             )
         }
-        // Python: sorted(runs, key=createdAt, reverse=True). Stable sort with
-        // empty-string default for missing createdAt (matches Python's
-        // `str(item.get("createdAt") or "")`).
+        // Sort by createdAt descending, using an empty string for missing or non-string values; preserve ties.
         let decorated = rows.enumerated().map { (idx, row) -> (Int, String, JSONValue) in
             var created = ""
             if case .object(let obj) = row, case .string(let s) = obj["createdAt"] ?? .null {
@@ -40,8 +38,7 @@ extension SwiftNativeResearchClient {
 
     public func runResearchLab(objective rawObjective: String, maxResults rawMax: Int,
         compose: @Sendable (JSONValue) async throws -> ResearchLabProposal) async throws -> ResearchLabRun {
-        // Mirror Python: objective = (objective or query).strip(); empty ->
-        // ValueError("Research objective is required").
+        // Trim the objective and reject an empty result.
         let objective = rawObjective.trimmingCharacters(in: .whitespacesAndNewlines)
         if objective.isEmpty {
             throw ResearchClientError.malformedResponse("Research objective is required")
@@ -54,7 +51,7 @@ extension SwiftNativeResearchClient {
             let resp = try await search(query: objective)
             results = resp.results
             engines = resp.unresponsiveEngines
-            if results.isEmpty, !engines.isEmpty {
+            if resp.enginesFailed {
                 failure = "engines_failed"
                 searchError = "Search engines returned no sources: " + engines.joined(separator: "; ")
             }
@@ -113,9 +110,9 @@ extension SwiftNativeResearchClient {
             var existing = try await self.researchLabRuns()
             existing.insert(run.toJSON(), at: 0)
             let capped = Array(existing.prefix(100))
-            try await self.persistence.writeJSON(.array(capped), to: labRunsPath)
+            try await SwiftNativePersistenceCore.writeJSON(.array(capped), to: labRunsPath)
         }
-        try await persistence.withFileLock(labRunsPath, writeBack)
+        try await SwiftNativePersistenceCore.withFileLock(labRunsPath, writeBack)
 
         // Emit activity and trace side effects so the Mac activity feed and
         // trace ledger stay complete for in-process research runs.

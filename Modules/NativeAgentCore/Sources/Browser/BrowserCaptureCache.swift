@@ -56,7 +56,7 @@ public actor BrowserCaptureCache {
               artifacts.values.allSatisfy({ $0.count <= policy.maxArtifactBytes }) else {
             throw failure("capture_too_large", "Browser capture exceeds the per-artifact cache limit.")
         }
-        let incomingBytes = artifacts.values.reduce(0) { $0 + $1.count }
+        let incomingBytes = try checkedBytes(artifacts.values.map(\.count))
         guard incomingBytes <= policy.maxGroupBytes, incomingBytes <= policy.maxBytes else {
             throw failure("capture_too_large", "Browser capture exceeds the cache limit.")
         }
@@ -90,13 +90,19 @@ public actor BrowserCaptureCache {
                     [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey, .contentModificationDateKey])
                 guard values.isRegularFile == true, values.isSymbolicLink != true,
                       let captureID = Self.captureID(filename: url.lastPathComponent, directory: directory) else { continue }
-                groups[captureID, default: []].append(Entry(url: url, bytes: values.fileSize ?? 0,
+                // Existing sparse/inherited files obey the same bounds as new
+                // artifacts. An invalid inventory is reported before eviction.
+                guard let size = values.fileSize, size >= 0, size <= policy.maxArtifactBytes else {
+                    throw failure("capture_cache_invalid_size")
+                }
+                groups[captureID, default: []].append(Entry(url: url, bytes: size,
                                                            date: values.contentModificationDate ?? now))
             }
         }
-        let currentBytes = groups[id, default: []].reduce(0) { $0 + $1.bytes }
-        guard currentBytes + incomingBytes <= policy.maxGroupBytes,
-              currentBytes + incomingBytes <= policy.maxBytes else {
+        let currentBytes = try checkedBytes(groups[id, default: []].map(\.bytes))
+        let combinedBytes = try checkedBytes([currentBytes, incomingBytes])
+        guard combinedBytes <= policy.maxGroupBytes,
+              combinedBytes <= policy.maxBytes else {
             throw failure("capture_too_large", "Combined browser capture exceeds the cache limit.")
         }
         var destinations: [Kind: URL] = [:] // Validate destinations before eviction.
@@ -110,7 +116,7 @@ public actor BrowserCaptureCache {
             destinations[kind] = destination
         }
 
-        var bytes = groups.values.flatMap { $0 }.reduce(0) { $0 + $1.bytes } + incomingBytes
+        var bytes = try checkedBytes(groups.values.flatMap { $0 }.map(\.bytes) + [incomingBytes])
         var count = groups.count + (groups[id] == nil ? 1 : 0)
         let oldest = groups.filter { $0.key != id }.map { (_, entries) in
             (entries: entries, date: entries.lazy.map(\.date).max() ?? .distantPast)
@@ -138,6 +144,14 @@ public actor BrowserCaptureCache {
             try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
         }
         return destinations
+    }
+
+    private func checkedBytes(_ sizes: [Int]) throws -> Int {
+        try sizes.reduce(0) { total, size in
+            let (next, overflow) = total.addingReportingOverflow(size)
+            guard size >= 0, !overflow else { throw failure("capture_cache_invalid_size") }
+            return next
+        }
     }
 
     private func requireOrdinaryDirectory(_ url: URL, create: Bool) throws {

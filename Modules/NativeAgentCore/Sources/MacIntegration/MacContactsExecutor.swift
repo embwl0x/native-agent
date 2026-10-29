@@ -23,18 +23,6 @@ public enum MacContactsExecutor {
         }
     }
 
-    /// Triggers the Contacts TCC prompt if status is not_determined; otherwise
-    /// returns the current status without prompting. Returns the post-request
-    /// status in the same vocabulary as `currentAuthorizationStatus()`.
-    public static func requestAccess() async -> String {
-        let store = CNContactStore()
-        let status = CNContactStore.authorizationStatus(for: .contacts)
-        if status == .notDetermined {
-            _ = try? await store.requestAccess(for: .contacts)
-        }
-        return currentAuthorizationStatus()
-    }
-
     // MARK: - Public API
 
     /// Search contacts by name fragment, phone number, or email.
@@ -42,7 +30,7 @@ public enum MacContactsExecutor {
     /// Optional: "limit" (int, default 20, clamped 1..100).
     public static func search(input: [String: JSONValue]) async throws -> JSONValue {
         let store = CNContactStore()
-        guard try await ensureAuthorized(store: store) else {
+        guard SystemPermissionPreflight.status(.contacts) == .granted else {
             return permissionDeniedEnvelope()
         }
 
@@ -60,16 +48,12 @@ public enum MacContactsExecutor {
             CNContactIdentifierKey,
         ] as [CNKeyDescriptor]
 
-        // gpt-5.5 review NEEDS_FIX: wrap real CNContactStore throws in a
-        // `failed` envelope so callers get the same shape they do from the
-        // AppleScript path (status: completed | denied | failed) instead of a
-        // raw NSError bubbling through.
         do {
             var matches: [CNContact] = []
             // 0) One exact card by its identifier (a workspace contacts.N).
             // A saved card that no longer resolves is gone: never another
             // person who happens to share its name.
-            if let id = stringValue(input["identifier"]), !id.isEmpty {
+            if let id = input["identifier"]?.stringValue, !id.isEmpty {
                 guard let found = try? store.unifiedContact(withIdentifier: id, keysToFetch: keys) else {
                     return failedEnvelope(reason: "That contact card is gone (deleted or merged); search again with contacts_search.")
                 }
@@ -100,7 +84,7 @@ public enum MacContactsExecutor {
             if matches.isEmpty {
                 result["message"] = .string(trimmed.isEmpty ? "Nothing to search for: give part of a name, a phone number, or an email in query."
                     : "No contact matches \"\(trimmed)\"; try part of the name, a phone number, or an email. Someone who emails you often has their number and address in their mail signature.")
-                // A person missing from Contacts is often in Mail (10-08).
+                // A person missing from Contacts is often in Mail.
                 if !trimmed.isEmpty, !looksLikePhone(trimmed) {
                     result["next_call"] = .object(["tool": .string("app"), "input": .object(["action": .string("mail.search"),
                         "args": .object(["from": .string(trimmed), "limit": .int(3), "sort": .string("newest")])])])
@@ -119,24 +103,23 @@ public enum MacContactsExecutor {
     /// If `identifier` is provided, the matching contact is updated; else new.
     public static func createOrUpdate(input: [String: JSONValue]) async throws -> JSONValue {
         let store = CNContactStore()
-        guard try await ensureAuthorized(store: store) else {
+        guard SystemPermissionPreflight.status(.contacts) == .granted else {
             return permissionDeniedEnvelope()
         }
 
-        let givenName = stringValue(input["given_name"] ?? input["givenName"])?
+        let givenName = (input["given_name"] ?? input["givenName"])?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let familyName = stringValue(input["family_name"] ?? input["familyName"])?
+        let familyName = (input["family_name"] ?? input["familyName"])?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
-        let identifier = stringValue(input["identifier"])?
+        let identifier = input["identifier"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         // An update by identifier needs no name; a new contact does.
         guard !givenName.isEmpty || !familyName.isEmpty || !identifier.isEmpty else {
-            // gpt-5.5 review NEEDS_FIX: return failed envelope, don't throw raw.
             return failedEnvelope(reason: "Give given_name or family_name for a new contact, or identifier (from contacts_search) to update one.")
         }
 
-        let organization = stringValue(input["organization"] ?? input["organizationName"])?
+        let organization = (input["organization"] ?? input["organizationName"])?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let phones = parseLabeledValues(input["phones"])
         let emails = parseLabeledValues(input["emails"])
@@ -153,24 +136,19 @@ public enum MacContactsExecutor {
         let mutable: CNMutableContact
         let action: String
 
-        // gpt-5.5 review NEEDS_FIX: wrap the rest of the body so CNContactStore
-        // throws turn into a `failed` envelope, matching the AppleScript path.
         do {
-        // 2026-09-24: no identifier but exactly one contact already has this
-        // full name ("add a number to Mom") updates it instead of making a twin.
+        // Without an identifier, one exact full-name match is updated.
         let sameName = identifier.isEmpty
             ? try exactNameMatches(store: store, name: [givenName, familyName].filter { !$0.isEmpty }.joined(separator: " "), keys: writeKeys)
             : []
-        var target = sameName.count == 1 ? sameName[0].identifier : ""
+        var target: CNContact? = sameName.count == 1 ? sameName[0] : nil
         if !identifier.isEmpty {
             let resolved = try resolveContact(store: store, identifier, keys: writeKeys)
-            guard let id = resolved.id else { return failedEnvelope(reason: resolved.problem ?? "No such contact.") }
-            target = id
+            guard let contact = resolved.contact else { return failedEnvelope(reason: resolved.problem ?? "No such contact.") }
+            target = contact
         }
-        if !target.isEmpty {
-            // UPDATE path: fetch the existing record so the save request mutates
-            // it in place (a fresh CNMutableContact would clobber other fields).
-            let existing = try store.unifiedContact(withIdentifier: target, keysToFetch: writeKeys)
+        if let existing = target {
+            // Copy the selected card to preserve fields the update does not name.
             guard let copy = existing.mutableCopy() as? CNMutableContact else {
                 return failedEnvelope(reason: "Failed to copy existing contact for update")
             }
@@ -184,8 +162,7 @@ public enum MacContactsExecutor {
         if !givenName.isEmpty { mutable.givenName = givenName }
         if !familyName.isEmpty { mutable.familyName = familyName }
         if !organization.isEmpty { mutable.organizationName = organization }
-        // Phones and emails are added to what the card already has, never a
-        // replacement that silently drops the others (2026-09-24).
+        // Phones and emails extend existing values without replacing them.
         func digits(_ text: String) -> String { text.filter(\.isNumber) }
         let havePhones = Set(mutable.phoneNumbers.map { digits($0.value.stringValue) })
         mutable.phoneNumbers += phones.filter { !havePhones.contains(digits($0.value)) }.map { entry in
@@ -236,14 +213,14 @@ public enum MacContactsExecutor {
     }
 
     /// Delete a contact by identifier (CNContact.identifier from a prior
-    /// search result). Phase 3 — gated on contacts/.write. Required: "identifier".
+    /// search result). Gated on contacts/.write. Required: "identifier".
     /// Returns: {status, action: "deleted", identifier}.
     public static func delete(input: [String: JSONValue]) async throws -> JSONValue {
         let store = CNContactStore()
-        guard try await ensureAuthorized(store: store) else {
+        guard SystemPermissionPreflight.status(.contacts) == .granted else {
             return permissionDeniedEnvelope()
         }
-        guard let identifier = stringValue(input["identifier"])?
+        guard let identifier = input["identifier"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines),
               !identifier.isEmpty else {
             return failedEnvelope(reason: "Say which contact: its identifier from contacts_search, or its exact full name.")
@@ -255,8 +232,7 @@ public enum MacContactsExecutor {
         ] as [CNKeyDescriptor]
         do {
             let resolved = try resolveContact(store: store, identifier, keys: writeKeys)
-            guard let id = resolved.id else { return failedEnvelope(reason: resolved.problem ?? "No such contact.") }
-            let existing = try store.unifiedContact(withIdentifier: id, keysToFetch: writeKeys)
+            guard let existing = resolved.contact else { return failedEnvelope(reason: resolved.problem ?? "No such contact.") }
             guard let mutable = existing.mutableCopy() as? CNMutableContact else {
                 return failedEnvelope(reason: "Failed to obtain mutable copy")
             }
@@ -267,7 +243,7 @@ public enum MacContactsExecutor {
             return .object([
                 "status": .string("completed"),
                 "action": .string("deleted"),
-                "identifier": .string(id),
+                "identifier": .string(existing.identifier),
                 "name": .string([existing.givenName, existing.familyName].filter { !$0.isEmpty }.joined(separator: " ")),
             ])
         } catch {
@@ -278,43 +254,84 @@ public enum MacContactsExecutor {
     // MARK: - Names for handles (Messages)
 
     private static let nameCache = NSLock()
-    nonisolated(unsafe) private static var namesByHandle: (built: Date, map: [String: String])?
+    nonisolated(unsafe) private static var namesByHandle: [String: String]?
+    nonisolated(unsafe) private static let contactChanges = NotificationCenter.default.addObserver(
+        forName: .CNContactStoreDidChange, object: nil, queue: nil
+    ) { _ in invalidateNameCache() }
 
     private static func invalidateNameCache() {
         nameCache.lock(); defer { nameCache.unlock() }
         namesByHandle = nil
     }
 
-    /// A phone's last ten digits or a lowercased email: how a Messages handle
-    /// and a card's number meet whatever their formatting.
+    /// Emails and explicit international numbers retain their whole identity.
+    /// A local number has no region evidence here, so cannot name a person.
+    /// Names map keys for cards whose number has no country: the ten digits.
+    private static let tailKeyPrefix = "tail:"
+
     private static func handleKey(_ raw: String) -> String {
         if raw.contains("@") { return raw.lowercased().trimmingCharacters(in: .whitespaces) }
-        let digits = raw.filter(\.isNumber)
-        return digits.count > 10 ? String(digits.suffix(10)) : digits
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("+"), trimmed.dropFirst().allSatisfy({ "0123456789 ()-.".contains($0) }) else { return "" }
+        let digits = trimmed.filter { "0123456789".contains($0) }
+        guard (7...15).contains(digits.count), digits.first != "0" else { return "" }
+        return "+" + digits
     }
 
-    /// Handle → contact name, from one pass over Contacts kept ten minutes.
+    /// Handle → contact name, invalidated by the Contacts store's change signal.
     /// Only when Contacts access is already granted: this never asks.
     private static func contactNames() -> [String: String] {
+        _ = contactChanges
         nameCache.lock(); defer { nameCache.unlock() }
-        let status = CNContactStore.authorizationStatus(for: .contacts)
-        guard status == .authorized || status.rawValue == 4 else {
+        guard SystemPermissionPreflight.status(.contacts) == .granted else {
             namesByHandle = nil
             return [:]
         }
-        if let cached = namesByHandle, Date().timeIntervalSince(cached.built) < 600 { return cached.map }
+        if let cached = namesByHandle { return cached }
         let store = CNContactStore()
         var map: [String: String] = [:]
-        let keys = [CNContactGivenNameKey, CNContactFamilyNameKey, CNContactOrganizationNameKey,
+        var owners: [String: String] = [:]
+        var ambiguous: Set<String> = []
+        // A card's number written locally ("(555) 123-4567") has no country
+        // to make a "+" key. Its ten digits still name the card: a handle
+        // whose digits end in them is matched by that tail, inferring nothing.
+        var tails: [String: String] = [:], tailOwners: [String: String] = [:], ambiguousTails: Set<String> = []
+        let keys = [CNContactIdentifierKey, CNContactGivenNameKey, CNContactFamilyNameKey, CNContactOrganizationNameKey,
                     CNContactPhoneNumbersKey, CNContactEmailAddressesKey] as [CNKeyDescriptor]
-        try? store.enumerateContacts(with: CNContactFetchRequest(keysToFetch: keys)) { contact, _ in
-            let name = [contact.givenName, contact.familyName].filter { !$0.isEmpty }.joined(separator: " ")
-            let shown = name.isEmpty ? contact.organizationName : name
-            guard !shown.isEmpty else { return }
-            for phone in contact.phoneNumbers { let key = handleKey(phone.value.stringValue); if key.count >= 7 { map[key] = map[key] ?? shown } }
-            for email in contact.emailAddresses { map[handleKey(email.value as String)] = map[handleKey(email.value as String)] ?? shown }
+        do {
+            try store.enumerateContacts(with: CNContactFetchRequest(keysToFetch: keys)) { contact, _ in
+                let name = [contact.givenName, contact.familyName].filter { !$0.isEmpty }.joined(separator: " ")
+                let shown = name.isEmpty ? contact.organizationName : name
+                guard !shown.isEmpty else { return }
+                func include(_ raw: String) {
+                    let key = handleKey(raw)
+                    if key.isEmpty, !raw.contains("@") {
+                        let digits = raw.filter(\.isNumber)
+                        guard digits.count == 10, !ambiguousTails.contains(digits) else { return }
+                        if let owner = tailOwners[digits], owner != contact.identifier {
+                            ambiguousTails.insert(digits); tails.removeValue(forKey: digits); return
+                        }
+                        tailOwners[digits] = contact.identifier; tails[digits] = shown
+                        return
+                    }
+                    guard !key.isEmpty, !ambiguous.contains(key) else { return }
+                    if let owner = owners[key], owner != contact.identifier {
+                        ambiguous.insert(key)
+                        map.removeValue(forKey: key)
+                        return
+                    }
+                    owners[key] = contact.identifier
+                    map[key] = shown
+                }
+                for phone in contact.phoneNumbers { include(phone.value.stringValue) }
+                for email in contact.emailAddresses { include(email.value as String) }
+            }
+        } catch {
+            NSLog("Contacts name enumeration failed: %@", error.localizedDescription)
+            return [:]
         }
-        namesByHandle = (Date(), map)
+        for (tail, name) in tails where map[tailKeyPrefix + tail] == nil { map[tailKeyPrefix + tail] = name }
+        namesByHandle = map
         return map
     }
 
@@ -323,15 +340,15 @@ public enum MacContactsExecutor {
     public static func naming(_ result: [String: JSONValue]) async -> [String: JSONValue] {
         let names = await MacIntegrationPermissionStore.shared.allows(MacIntegrationID.contacts, mode: .read) ? contactNames() : [:]
         // A number with no card reads as a person would write it, so a reply
-        // copies it instead of re-typing raw digits (10-08: a model swapped
-        // digits rewriting +1248… by hand).
+        // copies it instead of re-typing raw digits.
         func name(_ handle: JSONValue?) -> String? {
             guard case .string(let raw)? = handle else { return nil }
             let key = handleKey(raw)
             if key.isEmpty { return nil }
             if let found = names[key] { return found }
             let digits = raw.filter(\.isNumber)
-            guard !raw.contains("@"), digits.count == 10 || (digits.count == 11 && digits.hasPrefix("1")) else { return nil }
+            if digits.count >= 10, let found = names[tailKeyPrefix + String(digits.suffix(10))] { return found }
+            guard key.hasPrefix("+1"), digits.count == 11 else { return nil }
             let d = Array(digits.suffix(10))
             return "(\(String(d[0..<3]))) \(String(d[3..<6]))-\(String(d[6..<10]))"
         }
@@ -365,42 +382,21 @@ public enum MacContactsExecutor {
         }
     }
 
-    /// A CNContact identifier, or a name only one contact has (2026-09-24:
-    /// "Mom" is what she has in hand when she asks).
-    private static func resolveContact(store: CNContactStore, _ raw: String, keys: [CNKeyDescriptor]) throws -> (id: String?, problem: String?) {
-        if let found = try? store.unifiedContact(withIdentifier: raw, keysToFetch: keys) { return (found.identifier, nil) }
+    /// Resolves a CNContact identifier or a name unique to one contact.
+    private static func resolveContact(store: CNContactStore, _ raw: String, keys: [CNKeyDescriptor]) throws -> (contact: CNContact?, problem: String?) {
+        if let found = try? store.unifiedContact(withIdentifier: raw, keysToFetch: keys) { return (found, nil) }
         // An identifier that no longer resolves means the card is gone; only
         // a plain name ("Mom") is looked up by name.
         if raw.contains(":AB") || raw.range(of: #"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-"#, options: .regularExpression) != nil {
             return (nil, "That contact card is gone (deleted or merged); nothing changed. Search again with contacts_search.")
         }
         let named = try exactNameMatches(store: store, name: raw, keys: keys)
-        if named.count == 1 { return (named[0].identifier, nil) }
+        if named.count == 1 { return (named[0], nil) }
         if named.count > 1 { return (nil, "\(named.count) contacts are named \"\(raw)\"; pass the identifier of one from contacts_search.") }
         return (nil, "No contact has the identifier or full name \"\(raw)\"; find it with contacts_search.")
     }
 
     // MARK: - Authorization
-
-    private static func ensureAuthorized(store: CNContactStore) async throws -> Bool {
-        let status = CNContactStore.authorizationStatus(for: .contacts)
-        // gpt-5.5 review NEEDS_FIX: `.limited` was added in macOS 15.
-        // The app target is macOS 14 so referencing the symbol breaks the
-        // build. Compare via rawValue (CNAuthorizationStatus.limited.rawValue
-        // == 4) so we still accept limited-access users on macOS 15+ without
-        // referencing the unavailable symbol on the 14 target.
-        if status.rawValue == 4 {
-            return true
-        }
-        switch status {
-        case .authorized:
-            return true
-        case .notDetermined, .denied, .restricted:
-            return false
-        @unknown default:
-            return false
-        }
-    }
 
     private static func permissionDeniedEnvelope() -> JSONValue {
         if SkillRunContext.handsBack { return SkillRunContext.handBack("macOS Contacts permission") }
@@ -440,15 +436,9 @@ public enum MacContactsExecutor {
 
     // MARK: - Input helpers
 
-    private static func stringValue(_ value: JSONValue?) -> String? {
-        guard let value else { return nil }
-        if case .string(let s) = value { return s }
-        return nil
-    }
-
     private static func firstNonEmptyString(_ values: JSONValue?...) -> String? {
         for value in values {
-            if let s = stringValue(value), !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if let s = value?.stringValue, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return s
             }
         }
@@ -472,10 +462,10 @@ public enum MacContactsExecutor {
                     let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
                     return trimmed.isEmpty ? nil : ("other", trimmed)
                 case .object(let dict):
-                    let raw = stringValue(dict["value"])?
+                    let raw = dict["value"]?.stringValue?
                         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     guard !raw.isEmpty else { return nil }
-                    let label = stringValue(dict["label"])?
+                    let label = dict["label"]?.stringValue?
                         .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                     return (label.isEmpty ? "other" : label, raw)
                 default:

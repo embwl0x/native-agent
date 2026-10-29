@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 
 enum MacScreenCaptureWindowSelection {
     static func selectedID(
@@ -10,14 +11,19 @@ enum MacScreenCaptureWindowSelection {
               [frame.x, frame.y, frame.w, frame.h].allSatisfy(\.isFinite) else { return nil }
         let matches = windows.filter { window in
             window.pid == requested.pid
-                && abs(window.frame.x - frame.x) <= 2 && abs(window.frame.y - frame.y) <= 2
-                && abs(window.frame.w - frame.w) <= 2 && abs(window.frame.h - frame.h) <= 2
+                && MacAXWindowIdentity.rectsMatch(window.frame, frame)
         }
         return matches.count == 1 ? matches[0].id : nil
     }
 }
 #if canImport(CoreGraphics)
 import CoreGraphics
+#endif
+#if canImport(AppKit)
+import AppKit
+#endif
+#if canImport(ApplicationServices)
+import ApplicationServices
 #endif
 #if canImport(ScreenCaptureKit) && os(macOS)
 import ScreenCaptureKit
@@ -84,8 +90,44 @@ public struct MacVisualObstruction: Sendable, Equatable {
 public struct SystemMacVisualObstructionProbe: Sendable {
     public init() {}
 
+    /// What a pointer at the target's centre would land on is the one real
+    /// test of cover. The window server's stacking list alone is not: it
+    /// carries windows that pass input through (loginwindow's full-screen
+    /// backings sit in front of everything, at layers 2001 and 2004, on an
+    /// unlocked Mac), so every act would read as obstructed by them.
     public func obstructions(over frame: MacAXFrame, targetPID: Int32) -> [MacVisualObstruction] {
-        Self.obstructions(in: Self.windows(), over: frame, targetPID: targetPID)
+        let windows = Self.windows()
+        let listed = Self.obstructions(in: windows, over: frame, targetPID: targetPID)
+        guard let hit = Self.hitPID(x: frame.x + frame.w / 2, y: frame.y + frame.h / 2) else { return listed }
+        if hit == targetPID { return [] }
+        if !listed.isEmpty { return listed }
+        #if canImport(AppKit)
+        let name = NSRunningApplication(processIdentifier: hit)?.localizedName ?? "another app"
+        #else
+        let name = "another app"
+        #endif
+        return [MacVisualObstruction(ownerPID: hit, ownerName: name, coverage: 1, frame: frame)]
+    }
+
+    /// The process owning the accessibility element under a screen point;
+    /// nil when accessibility cannot answer (no permission, nothing there).
+    /// A system-wide hit can land in this process (the point is over her own
+    /// window); AppKit then walks her SwiftUI accessibility tree on the calling
+    /// thread, which is main-thread work, so the hit runs on the AX main lane
+    /// (10-28 23:52: a sight over her own window from a tool's task trapped).
+    static func hitPID(x: Double, y: Double) -> Int32? {
+        #if canImport(ApplicationServices)
+        MacAXExecutionLane.sync {
+            var element: AXUIElement?
+            guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(x), Float(y), &element) == .success,
+                  let element else { return nil }
+            var pid: pid_t = 0
+            guard AXUIElementGetPid(element, &pid) == .success, pid > 0 else { return nil }
+            return pid
+        }
+        #else
+        return nil
+        #endif
     }
 
     /// The window a pointer at (x, y) lands on: the topmost there that would
@@ -94,24 +136,11 @@ public struct SystemMacVisualObstructionProbe: Sendable {
         windows.first { covers($0) && x >= $0.frame.x && x < $0.frame.x + $0.frame.w && y >= $0.frame.y && y < $0.frame.y + $0.frame.h }
     }
 
-    /// A window that takes what lands on it: visible, not below the desktop, not system chrome.
-    /// A window at or above the Dock's level that spans a whole display is a
-    /// system overlay (the Dock's, Notification Center's) and covers nothing;
-    /// a system dialog above that level is display-sized only if it is one.
+    /// Visible windows above the desktop can take input. Owner names and
+    /// display-sized geometry do not establish that input passes through;
+    /// known person-only pass-through windows are excluded by `windows()`.
     private static func covers(_ window: MacVisualWindowRecord) -> Bool {
-        window.alpha > 0.05 && window.layer >= 0 && !["Window Server", "Dock", "Control Center"].contains(window.ownerName)
-            && !(window.layer >= Int(CGWindowLevelForKey(.dockWindow)) && spansDisplay(window.frame))
-    }
-
-    private static func spansDisplay(_ frame: MacAXFrame) -> Bool {
-        var count: UInt32 = 0
-        guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else { return false }
-        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
-        guard CGGetActiveDisplayList(count, &displays, &count) == .success else { return false }
-        return displays.prefix(Int(count)).contains { display in
-            let bounds = CGDisplayBounds(display)
-            return bounds.minX == frame.x && bounds.minY == frame.y && bounds.width == frame.w && bounds.height == frame.h
-        }
+        window.alpha > 0.05 && window.layer >= 0
     }
 
     /// On-screen windows, front to back.
@@ -181,73 +210,33 @@ struct MacScreenCaptureValue<Value>: @unchecked Sendable {
     let value: Value
 }
 
-final class MacScreenCaptureRequest<Value>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var continuation: CheckedContinuation<MacScreenCaptureValue<Value>, Error>?
-    private var cancelled = false
-    private var returned = false
-
-    func install(_ continuation: CheckedContinuation<MacScreenCaptureValue<Value>, Error>) -> Bool {
-        lock.lock()
-        guard !cancelled else {
-            lock.unlock()
-            continuation.resume(throwing: CancellationError())
-            return false
-        }
-        self.continuation = continuation
-        lock.unlock()
-        return true
-    }
-
-    func invalidate() {
-        lock.lock()
-        cancelled = true
-        let continuation = self.continuation
-        self.continuation = nil
-        lock.unlock()
-        continuation?.resume(throwing: CancellationError())
-    }
-
-    func receive(_ value: Value?, _ error: Error?) {
-        lock.lock()
-        guard !returned else { lock.unlock(); return }
-        returned = true
-        let continuation = self.continuation
-        self.continuation = nil
-        lock.unlock()
-        if let error { continuation?.resume(throwing: error) }
-        else if let value { continuation?.resume(returning: MacScreenCaptureValue(value: value)) }
-        else { continuation?.resume(throwing: CocoaError(.coderValueNotFound)) }
-    }
-}
-
 func macScreenCaptureWait<Value>(
-    issue: (MacScreenCaptureRequest<Value>) -> Void
+    issue: (@escaping @Sendable (Value?, Error?) -> Void) -> Void
 ) async throws -> Value {
     try Task.checkCancellation()
-    let request = MacScreenCaptureRequest<Value>()
-    let value: MacScreenCaptureValue<Value> = try await withTaskCancellationHandler {
-        try await withCheckedThrowingContinuation { continuation in
-            if request.install(continuation) { issue(request) }
+    let request = ContinuationOnce<Result<MacScreenCaptureValue<Value>, Error>>()
+    let result = await withTaskCancellationHandler {
+        await withCheckedContinuation { continuation in
+            if request.install(continuation) {
+                issue { value, error in
+                    if let error { request.resume(.failure(error)) }
+                    else if let value { request.resume(.success(MacScreenCaptureValue(value: value))) }
+                    else { request.resume(.failure(CocoaError(.coderValueNotFound))) }
+                }
+            }
         }
     } onCancel: {
-        request.invalidate()
+        request.resume(.failure(CancellationError()))
     }
     try Task.checkCancellation()
-    return value.value
+    return try result.get().value
 }
 
 /// Live capture.
 ///
-/// ScreenCaptureKit, not `CGWindowListCreateImage`: that call is OBSOLETED as
-/// of macOS 15 and does not compile against the current SDK, so there is no
-/// legacy path to fall back to.
-///
-/// Deliberately NOT reusing `SwiftNativeScreenVision`: that organ captures the
-/// whole primary display and returns encoded PNG bytes, which is a different
-/// capability from "this sub-rect, as a CGImage I still have to draw markers
-/// onto". Sharing it would mean either widening its contract or re-decoding a
-/// PNG to annotate it. The permission it reads is the same one.
+/// Captures window sub-rects for annotation through ScreenCaptureKit.
+/// NativeScreenCapture owns whole-primary-display chat attachments;
+/// this source retains window identity and reads the same permission.
 public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
     public init() {}
 
@@ -257,18 +246,38 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
         CGPreflightScreenCaptureAccess()
     }
 
+    private static func windowImage(_ window: SCWindow, maxPixelWidth: Int? = nil) async throws -> MacScreenShot {
+        try Task.checkCancellation()
+        let filter = SCContentFilter(desktopIndependentWindow: window)
+        let configuration = SCStreamConfiguration()
+        let rect = filter.contentRect
+        var scale = max(1, min(Double(filter.pointPixelScale), 4))
+        if let maxPixelWidth { scale = min(scale, Double(max(1, maxPixelWidth)) / max(1, rect.width)) }
+        configuration.width = max(1, Int((rect.width * scale).rounded()))
+        configuration.height = max(1, Int((rect.height * scale).rounded()))
+        configuration.ignoreShadowsSingleWindow = true
+        configuration.showsCursor = false
+        configuration.captureResolution = .best
+        configuration.pixelFormat = kCVPixelFormatType_32BGRA
+        let image: CGImage = try await macScreenCaptureWait { receive in
+            SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration, completionHandler: receive)
+        }
+        try Task.checkCancellation()
+        return MacScreenShot(bounds: MacAXFrame(
+            x: window.frame.minX, y: window.frame.minY, w: window.frame.width, h: window.frame.height),
+            pixelWidth: image.width, pixelHeight: image.height, cgImage: image)
+    }
+
     public func capture(window requested: MacAXWindowIdentity) async -> Result<MacScreenShot, MacScreenCaptureFailure> {
         guard isScreenRecordingTrusted() else { return .failure(.screenRecordingNotTrusted) }
         var operation = "SCShareableContent.getExcludingDesktopWindows"
         do {
             try Task.checkCancellation()
-            let content: SCShareableContent = try await macScreenCaptureWait { request in
-                SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
-                    request.receive(content, error)
-                }
+            let content: SCShareableContent = try await macScreenCaptureWait { receive in
+                SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true, completionHandler: receive)
             }
             try Task.checkCancellation()
-            // Shotgun is the person's window, never hers to capture.
+            // Person-only windows cannot be captured.
             let windows = content.windows.filter { !PersonOnlyWindows.contains(number: Int($0.windowID)) }
             let selected = MacScreenCaptureWindowSelection.selectedID(windows: windows.compactMap { window in
                 guard let owner = window.owningApplication else { return nil }
@@ -279,27 +288,8 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
             guard let selected, let window = windows.first(where: { $0.windowID == selected }) else {
                 return .failure(.operationFailed("window selection", "The requested window is absent, ambiguous, or person-only; read the app again for its current window."))
             }
-            try Task.checkCancellation()
-            let filter = SCContentFilter(desktopIndependentWindow: window)
-            let configuration = SCStreamConfiguration()
-            let scale = max(1, min(Double(filter.pointPixelScale), 4))
-            configuration.width = max(1, Int((filter.contentRect.width * scale).rounded()))
-            configuration.height = max(1, Int((filter.contentRect.height * scale).rounded()))
-            configuration.ignoreShadowsSingleWindow = true
-            configuration.showsCursor = false
-            configuration.captureResolution = .best
-            configuration.pixelFormat = kCVPixelFormatType_32BGRA
             operation = "SCScreenshotManager.captureImage"
-            let image: CGImage = try await macScreenCaptureWait { request in
-                SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration) { image, error in
-                    request.receive(image, error)
-                }
-            }
-            try Task.checkCancellation()
-            return .success(MacScreenShot(bounds: MacAXFrame(
-                x: window.frame.minX, y: window.frame.minY,
-                w: window.frame.width, h: window.frame.height),
-                pixelWidth: image.width, pixelHeight: image.height, cgImage: image))
+            return .success(try await Self.windowImage(window))
         } catch {
             return .failure(.operationFailed(operation, error.localizedDescription))
         }
@@ -309,10 +299,8 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
         guard isScreenRecordingTrusted() else { return { _, _ in .failure(.screenRecordingNotTrusted) } }
         let content: MacScreenCaptureValue<SCShareableContent>
         do {
-            content = MacScreenCaptureValue(value: try await macScreenCaptureWait { request in
-                SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
-                    request.receive(content, error)
-                }
+            content = MacScreenCaptureValue(value: try await macScreenCaptureWait { receive in
+                SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true, completionHandler: receive)
             })
         } catch {
             let failure = MacScreenCaptureFailure.operationFailed("SCShareableContent.getExcludingDesktopWindows", error.localizedDescription)
@@ -325,24 +313,7 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
                       !PersonOnlyWindows.contains(number: windowNumber) else {
                     return .failure(.operationFailed("window selection", "The requested window is absent or person-only; read the app again for its current window."))
                 }
-                let filter = SCContentFilter(desktopIndependentWindow: window)
-                let configuration = SCStreamConfiguration()
-                let rect = filter.contentRect
-                let scale = min(max(1, min(Double(filter.pointPixelScale), 4)), Double(max(1, maxPixelWidth)) / max(1, rect.width))
-                configuration.width = max(1, Int((rect.width * scale).rounded()))
-                configuration.height = max(1, Int((rect.height * scale).rounded()))
-                configuration.ignoreShadowsSingleWindow = true
-                configuration.showsCursor = false
-                configuration.captureResolution = .best
-                configuration.pixelFormat = kCVPixelFormatType_32BGRA
-                let image: CGImage = try await macScreenCaptureWait { request in
-                    SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration) { image, error in
-                        request.receive(image, error)
-                    }
-                }
-                return .success(MacScreenShot(bounds: MacAXFrame(
-                    x: window.frame.minX, y: window.frame.minY, w: window.frame.width, h: window.frame.height),
-                    pixelWidth: image.width, pixelHeight: image.height, cgImage: image))
+                return .success(try await Self.windowImage(window, maxPixelWidth: maxPixelWidth))
             } catch {
                 return .failure(.operationFailed("SCScreenshotManager.captureImage", error.localizedDescription))
             }
@@ -353,10 +324,8 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
         guard isScreenRecordingTrusted() else { return .failure(.screenRecordingNotTrusted) }
         let content: SCShareableContent
         do {
-            content = try await macScreenCaptureWait { request in
-                SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { content, error in
-                    request.receive(content, error)
-                }
+            content = try await macScreenCaptureWait { receive in
+                SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true, completionHandler: receive)
             }
         } catch {
             return .failure(.operationFailed("SCShareableContent.getExcludingDesktopWindows", error.localizedDescription))
@@ -414,10 +383,8 @@ public struct SystemMacScreenCaptureSource: MacScreenCaptureSource {
 
         let image: CGImage
         do {
-            image = try await macScreenCaptureWait { request in
-                SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration) { image, error in
-                    request.receive(image, error)
-                }
+            image = try await macScreenCaptureWait { receive in
+                SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration, completionHandler: receive)
             }
         } catch {
             return .failure(.operationFailed("SCScreenshotManager.captureImage", error.localizedDescription))

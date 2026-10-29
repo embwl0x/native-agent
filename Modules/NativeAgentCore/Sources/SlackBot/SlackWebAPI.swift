@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `SlackWebAPI.swift` | Shared HTTP response normalization for replies, history's injected session and explicit setup tokens; replies retain grant checks and record proofs through ConnectorActionReceipt, history/setup retain strict rejection; uploads and `requireConfiguredToken` |
@@ -30,9 +31,9 @@ public enum SlackWebAPI {
         tokenOverride: String? = nil
     ) async throws -> JSONValue {
         let input = input.filter { $0.value != .null && $0.value != .string("") }
-        let channel = string(input["channel"])?
+        let channel = input["channel"]?.scalarText?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let text = string(input["text"] ?? input["message"])?
+        let text = (input["text"] ?? input["message"])?.scalarText?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !channel.isEmpty else {
             throw NSError(domain: "NativeAgentSlack", code: -400, userInfo: [
@@ -44,7 +45,7 @@ public enum SlackWebAPI {
                 NSLocalizedDescriptionKey: "slack.post_message requires text"
             ])
         }
-        let threadTs = string(input["thread_ts"] ?? input["threadTs"])?
+        let threadTs = (input["thread_ts"] ?? input["threadTs"])?.scalarText?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         var body: [String: Any] = [
             "channel": channel,
@@ -56,7 +57,7 @@ public enum SlackWebAPI {
         if let metadata = try messageMetadata(input: input) {
             body["metadata"] = metadata
         }
-        if let idempotencyKey = string(input["client_msg_id"])?
+        if let idempotencyKey = input["client_msg_id"]?.scalarText?
             .trimmingCharacters(in: .whitespacesAndNewlines),
            !idempotencyKey.isEmpty {
             body["client_msg_id"] = idempotencyKey
@@ -76,46 +77,22 @@ public enum SlackWebAPI {
         )
     }
 
-    public static func uploadFile(
-        input: [String: JSONValue],
+    static func uploadFile(
+        _ upload: SlackPreparedUpload,
+        data: Data,
+        channel: String,
+        threadTs: String?,
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         tokenOverride: String? = nil
     ) async throws -> JSONValue {
-        let input = input.filter { $0.value != .null && $0.value != .string("") }
-        let channel = string(input["channel"] ?? input["channel_id"])?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let path = string(input["file_path"] ?? input["path"])?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let channel = channel.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !channel.isEmpty else {
             throw NSError(domain: "NativeAgentSlack", code: -400, userInfo: [
                 NSLocalizedDescriptionKey: "slack.upload_file requires channel"
             ])
         }
-        guard !path.isEmpty else {
-            throw NSError(domain: "NativeAgentSlack", code: -400, userInfo: [
-                NSLocalizedDescriptionKey: "slack.upload_file requires file_path"
-            ])
-        }
-
-        let fileURL = URL(fileURLWithPath: path)
-        let data = try Data(contentsOf: fileURL)
-        guard !data.isEmpty else {
-            throw NSError(domain: "NativeAgentSlack", code: -400, userInfo: [
-                NSLocalizedDescriptionKey: "slack.upload_file file is empty"
-            ])
-        }
-        let filename = string(input["filename"])?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nilIfEmpty ?? fileURL.lastPathComponent
-        let title = string(input["title"])?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nilIfEmpty ?? filename
-        let threadTs = string(input["thread_ts"] ?? input["threadTs"])?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nilIfEmpty
-        let initialComment = string(input["initial_comment"] ?? input["initialComment"])?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .nilIfEmpty
+        let name = upload.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let filename = name.isEmpty ? URL(fileURLWithPath: upload.path).lastPathComponent : name
 
         let uploadURLResponse = try await callForm(
             method: "files.getUploadURLExternal",
@@ -163,7 +140,7 @@ public enum SlackWebAPI {
         }
 
         let filesData = try JSONSerialization.data(
-            withJSONObject: [["id": fileId, "title": title]],
+            withJSONObject: [["id": fileId, "title": filename]],
             options: []
         )
         let filesJSON = String(data: filesData, encoding: .utf8) ?? "[{\"id\":\"\(fileId)\"}]"
@@ -171,8 +148,9 @@ public enum SlackWebAPI {
             "files": filesJSON,
             "channel_id": channel,
         ]
-        if let threadTs { completeForm["thread_ts"] = threadTs }
-        if let initialComment { completeForm["initial_comment"] = initialComment }
+        if let threadTs = threadTs?.trimmingCharacters(in: .whitespacesAndNewlines), !threadTs.isEmpty {
+            completeForm["thread_ts"] = threadTs
+        }
         let completeResponse = try await callForm(
             method: "files.completeUploadExternal",
             form: completeForm,
@@ -240,6 +218,7 @@ public enum SlackWebAPI {
             _ = try await ConnectorActionReceipt.append(
                 actionId: "slack.http", connectorId: "slack", name: nil,
                 status: response["ok"] as? Bool == true ? "completed" : "failed",
+                ok: response["ok"] as? Bool == true,
                 dryRun: false, approvalId: nil, createdAt: ISO8601DateFormatter().string(from: Date()),
                 output: .object([
                     "error": .string(response["error"] as? String ?? ""),
@@ -275,7 +254,7 @@ public enum SlackWebAPI {
         return try loadToken(dataRoot: dataRoot)
     }
 
-    /// Keychain only (SlackCredentials); the files hold no token since 10-07.
+    /// SlackCredentials owns tokens in Keychain.
     private static func loadToken(dataRoot root: URL = PersistenceCore.defaultDataRoot()) throws -> String {
         guard let token = try SlackCredentials.read(.bot, dataRoot: root) else {
             throw NSError(domain: "NativeAgentSlack", code: -401, userInfo: [
@@ -329,16 +308,6 @@ public enum SlackWebAPI {
         return url
     }
 
-    private static func string(_ raw: JSONValue?) -> String? {
-        switch raw {
-        case .string(let s): return s
-        case .int(let i): return String(i)
-        case .double(let d): return String(d)
-        case .bool(let b): return b ? "true" : "false"
-        default: return nil
-        }
-    }
-
     private static func formURLEncoded(_ form: [String: String]) -> Data {
         let encoded = form
             .sorted { $0.key < $1.key }
@@ -351,12 +320,6 @@ public enum SlackWebAPI {
         var allowed = CharacterSet.alphanumerics
         allowed.insert(charactersIn: "-._~")
         return value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
-    }
-}
-
-private extension String {
-    var nilIfEmpty: String? {
-        isEmpty ? nil : self
     }
 }
 

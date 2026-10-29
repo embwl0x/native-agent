@@ -1,31 +1,19 @@
 import AgentWorkspace
 import NativeAgentCore
+import NativeAgentShared
 import Foundation
 import PersistenceCore
 import SwarmRuns
 // Blueprint: | `SwiftToolDispatcher+DelegationTools.swift` | `SwiftToolDispatcher`: `impl_delegation_status`, `delegationStatusLimit`, `delegationStatusOffset` |
 
-// MARK: - delegation_status (W2, upgrade campaign 2026-08 Track A)
-//
-// The read side of the delegation loop. `claude_message` / `codex_message`
-// enqueue work; until now nothing in Swift could READ the resulting job
-// records, so the window between enqueue and the terminal bridge event was
-// dark. This tool is that window's instrument: a pure local read over the two
-// wake-job stores, no writes, no process spawn, no network.
-//
-// Wiring canon (same as task_ledger_list / workshop_status): catalog-visible +
-// builtInToolNames and alwaysOnCoreNames, `safe_read`/.low in
-// SecurityCenter. It is NOT a notification-tier tool — nothing leaves the
-// machine, so the external_send carve-out does not apply.
+// Local read of delegated job stores through app actions: no writes, processes or network.
 
 extension SwiftToolDispatcher {
 
-    /// delegation_status — list the newest delegated jobs across the Claude
-    /// Claude, Codex, and OMP wake-job stores with their real lifecycle timestamps.
+    /// List the newest delegated jobs across Claude, Codex and OMP stores with their lifecycle timestamps.
     ///
     /// Read-only. Store roots come from `agentBridgeConfigRoot` (the same
-    /// injection point `claude_message` uses), so tests never touch the live
-    /// `~/.config`.
+    /// injection point `claude_message` uses).
     func impl_delegation_status(input: [String: JSONValue]) async throws -> JSONValue {
         if case .string(let agent)? = input["agent"], agent.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "swarm" {
             return inspectRetainedSwarm(input: input)
@@ -70,12 +58,14 @@ extension SwiftToolDispatcher {
         // Not answered yet: her inbox says whether her live session read it.
         // An answer reads below, in full, as every exact read does.
         if let messageID, let inbox,
-           snapshot.jobs.allSatisfy({ ($0.runStatus ?? $0.status) == "delivered_live" && $0.agentReplyTextHead == nil }),
-           inbox.retained || DelegationStatusProjector.requestTexts(inbox: inbox.url, ids: [messageID], field: "id")[messageID] != nil {
-            let read = DelegationStatusProjector.requestTexts(inbox: inbox.url, ids: [messageID], field: "read")[messageID] == "true"
-            return .object(["status": .string(read ? "read" : "queued"), "message_id": .string(messageID),
-                "filePath": .string(inbox.url.path), "read": .bool(read),
-                "detail": .string(read ? "The recipient read this exact message; no answer is recorded yet." : "No recipient read is recorded. Delivery remains owed at the original inbox; nothing was resent.")])
+           snapshot.jobs.allSatisfy({ ($0.runStatus ?? $0.status) == "delivered_live" && $0.agentReplyTextHead == nil }) {
+            let record = DelegationStatusProjector.requestRecords(inbox: inbox.url, ids: [messageID])[messageID]
+            if inbox.retained || record?["id"] != nil {
+                let read = record?["read"] == "true"
+                return .object(["status": .string(read ? "read" : "queued"), "message_id": .string(messageID),
+                    "filePath": .string(inbox.url.path), "read": .bool(read),
+                    "detail": .string(read ? "The recipient read this exact message; no answer is recorded yet." : "No recipient read is recorded. Delivery remains owed at the original inbox; nothing was resent.")])
+            }
         }
 
         let matchedCount = snapshot.matchedCount
@@ -155,9 +145,7 @@ extension SwiftToolDispatcher {
             // Naming the stores in the envelope keeps a "no jobs" answer
             // honest: an empty list because the directory is absent reads
             // very differently from an empty list because nothing is queued.
-            // Home-relative, never absolute (gpt-5.5 BLOCKING: an absolute
-            // path leaks the account name into model-visible output on
-            // public installs).
+            // Home-relative paths keep account names out of model-visible output.
             "stores": .object([
                 "claude": .string(Self.homeRelativePath(projector.claudeJobsDirectory)),
                 "codex": .string(Self.homeRelativePath(projector.codexJobsDirectory)),
@@ -261,11 +249,8 @@ extension SwiftToolDispatcher {
     /// Model-visible store labels are home-relative: "~/x/y" for anything
     /// under the user's home, last-two-components fallback otherwise.
     static func homeRelativePath(_ url: URL) -> String {
-        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
         let path = url.standardizedFileURL.path
-        if path.hasPrefix(home + "/") {
-            return "~" + path.dropFirst(home.count)
-        }
-        return url.pathComponents.suffix(2).joined(separator: "/")
+        let shown = UserDisplayFormatters.tildifyPath(path)
+        return shown == path ? url.pathComponents.suffix(2).joined(separator: "/") : shown
     }
 }

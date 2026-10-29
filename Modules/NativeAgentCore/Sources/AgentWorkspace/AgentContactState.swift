@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `AgentContactState.swift` | Folds validated contact projections from `AgentPeerStore` into presentation identities; labels only ACP/MCP schemes as such. `AgentLocalHealth` owns 600-second freshness and 300-second refresh spacing; exact pull-reply read receipts. |
+import NativeAgentShared
+// Blueprint: | `AgentContactState.swift` | Folds validated contact projections from `AgentPeerStore` into presentation identities; labels only ACP/MCP schemes as such. `AgentLocalHealth` owns 600-second freshness and 300-second refresh spacing; exact pull-reply read receipts. Authentication recovery requires structured failure evidence for the exact observed operation; reply prose cannot erase failures. |
 
 /// Who each saved contact is (docs/agent-communication.md, "Every agent is
 /// itself"): its own who, or the who it is explicitly associated with
@@ -10,6 +11,14 @@ public struct AgentContactIdentity: Sendable {
     public let aliases: [String: String]
     public let doors: [String: String]
     let peers: [[String: String]]
+
+    /// Exact peer handles keep the contact's own display name, including associated doors.
+    package var peerNames: [String: String] {
+        Dictionary(uniqueKeysWithValues: peers.compactMap { peer in
+            guard let id = peer["id"], let name = peer["name"]?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty else { return nil }
+            return ("peer:" + id, name)
+        })
+    }
 
     package init(peers: [[String: String]], handles: [String: [String]] = [:]) {
         self.peers = peers
@@ -152,22 +161,14 @@ public struct AgentLocalHealth: Codable, Sendable, Equatable {
 
     /// Auth recovery clears only an auth error, not an unrelated execution failure.
     public func resolves(_ record: AgentConversationRecord) -> Bool {
-        guard current, authenticated, checkedAt >= record.updatedAt, record.phase == "attention" else { return false }
+        guard current, authenticated, checkedAt >= record.updatedAt, record.phase == "attention",
+              failureOperation == record.operationID else { return false }
         return Self.authenticationFailure(record.receipt)
     }
     public static func authenticationFailure(_ receipt: JSONValue?) -> Bool {
-        func matches(_ text: String) -> Bool {
-            ["failed to authenticate", "oauth session expired", "not logged in", "signed out", "authentication_required"]
-                .contains { text.lowercased().contains($0) }
-        }
-        if case .string(let text)? = receipt { return matches(text) }
-        guard case .object(var fields)? = receipt else { return false }
-        if case .array(let jobs)? = fields["jobs"], jobs.count == 1, case .object(let job) = jobs[0] { fields = job }
-        if fields["needs_authentication"] == .bool(true) { return true }
-        return ["execution_error", "error", "detail", "agent_reply_text", "agent_reply_text_head"].contains { key in
-            if case .string(let text)? = fields[key] { return matches(text) }
-            return false
-        }
+        // Only the route owner's structured authentication evidence qualifies.
+        // Reply prose may describe an entirely different service's failure.
+        AgentConversationRecord.sendEvidence(receipt)["needs_authentication"] == .bool(true)
     }
 
     public static func nextRefresh(_ root: URL, now: Date) -> Date {

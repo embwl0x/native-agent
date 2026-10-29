@@ -6,7 +6,7 @@ import Senses
 import TrustCenter
 import ToolRegistry
 import MacControl
-// Blueprint: | `PartHost.swift` | `Parts.rehearse`, `ToolHost`: a part's declared actions, files by reach and primitives through the broker; nested part calls are programs, retaining preview and their typed result while child effects stay suppressed; projection execution refuses host effects, model tool thinking retains this same restricted host and passes its native effect envelope through unchanged |
+// Blueprint: | `PartHost.swift` | rehearsal shares one lazy helper across fixtures and decision replays; `Parts.rehearse`, `ToolHost`: a part's declared actions, files by reach and primitives through the broker; nested part calls are programs, retaining preview and their typed result while child effects stay suppressed; projection execution refuses host effects, model tool thinking retains this same restricted host and passes its native effect envelope through unchanged; `Parts.rehearse`, `ToolHost`: a part's declared actions and the exact shared capability action map and primitives through the broker |
 
 extension Parts {
     /// Rehearses one version through the shipped runner with every host call
@@ -20,7 +20,7 @@ extension Parts {
         let broker = ToolPrimitiveBroker(permissions: Set(candidate.program.permissions), abilityID: candidate.id)
         let host = ToolHost(base: base, candidate: candidate, broker: broker, dataRoot: root, admission: {})
         do {
-            let proof = try await store.validate(candidate, key: key, capture: capture, input: input, runner: runner(), host: { host }) {
+            let proof = try await store.validate(candidate, key: key, capture: capture, input: input, runner: OwnedProgramRunner(dataRoot: root).rehearsal(), host: { host }) {
                 if let problem = $0.schemaProblem(schema: candidate.program.schema) {
                     throw SenseFailure(code: "bad_input", message: "Its input \(problem.path) must be \(problem.expected).", remedy: .object([
                         "kind": .string("correct_arguments"), "instruction": .string("Correct input \(problem.path) to match \(problem.expected) in ability.validate for \(candidate.id)."), "next_call": .null]))
@@ -68,8 +68,7 @@ struct ToolHost: OwnedProgramHostProfile {
         if projection { return nil }
         guard let action = base.action(id) else { return nil }
         let permissions = candidate.program.permissions
-        return declaredDependency(id) != nil || action.page == "files" && (permissions.contains("app_data_write")
-            || action.read && permissions.contains("app_data_read")) ? action : nil
+        return declaredDependency(id) != nil || AbilityStore.reachActions(permissions).contains(base.canonicalAction(id)) ? action : nil
     }
     func canonicalAction(_ id: String) -> String { base.canonicalAction(id) }
     func doorInput(id: String, given: [JSONValue]) -> Result<[String: JSONValue], OwnedProgramRunner.ScriptError> {
@@ -169,7 +168,7 @@ struct ToolHost: OwnedProgramHostProfile {
                 guard access == "write" || AuthoredToolEffects.appReadOnly(args) else {
                     throw SenseFailure(code: "read_only", message: "A read-declared app refuses modifying or unclassified events.")
                 }
-                try SystemAppleScriptAdapter.checkAppScript(args)
+                try AppleScriptExecution.checkAppScript(args)
             } else { try await broker.check(operation, arguments: arguments) }
             return nil
         } catch {
@@ -254,7 +253,7 @@ struct ToolHost: OwnedProgramHostProfile {
             guard await !broker.closed else { throw CancellationError() }
             dispatched = true
             let result = if operation == "apps.call" {
-                try await SystemAppleScriptAdapter().callApp(arguments, targets: appTargets)
+                try await AppleScriptExecution().callApp(arguments, targets: appTargets)
             } else { try await broker.perform(operation, arguments: arguments, host: base, profile: self) }
             // The thought's envelope already carries its nested tool effects.
             if operation == "model.call" { return result }
@@ -294,18 +293,17 @@ struct ToolHost: OwnedProgramHostProfile {
     static func failure(_ error: Error, effects: String, execution: String) -> JSONValue {
         let owned = error as? ToolFailureError
         let sense = error as? SenseFailure
-        let reason = owned?.code ?? (owned?.argumentPath != nil ? "invalid_arguments" : nil) ?? sense?.code ?? (error is CancellationError ? "cancelled" : "world_error")
-        let status = owned?.status.rawValue ?? (reason == "cancelled" ? "cancelled" : ["timeout", "fetch_timeout"].contains(reason) ? "timeout"
-            : execution == "not_run" && sense != nil ? "refused" : "failed")
-        var fields = Parts.fields(failure(reason, error.localizedDescription, effects: owned?.effects.rawValue ?? effects,
-                                          execution: execution, status: status))
+        let reason = owned?.failureCode ?? sense?.code ?? (error is CancellationError ? "cancelled" : "world_error")
+        var fields = sense?.failureEvidence() ?? Parts.fields(failure(reason, error.localizedDescription,
+            effects: owned?.effects.rawValue ?? effects, execution: execution,
+            status: owned?.status.rawValue ?? (reason == "cancelled" ? "cancelled" : "failed")))
+        fields["effects"] = .string(owned?.effects.rawValue ?? effects)
+        fields["execution"] = .string(execution)
+        fields["result"] = .null
         fields["failure_code"] = .string(reason)
         if let owned {
-            fields["remedy"] = Parts.remedy(owned)
-            fields["argument_path"] = owned.argumentPath.map(JSONValue.string)
-            fields["accepted"] = owned.accepted.map(JSONValue.string)
-        } else if let remedy = sense?.remedy { fields["remedy"] = remedy }
-        else if reason == "cancelled" {
+            fields.merge(owned.failureEvidence(defaultCode: reason)) { _, owned in owned }
+        } else if fields["remedy"] == nil, reason == "cancelled" {
             fields["remedy"] = Repair.terminal(instruction: "The caller cancelled this work; do not resume it without a new request.")
         }
         return .object(fields)

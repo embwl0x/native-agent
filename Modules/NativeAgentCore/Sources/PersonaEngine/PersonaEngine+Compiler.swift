@@ -6,15 +6,6 @@ import NativeAgentShared
 // Blueprint: | `PersonaEngine+Compiler.swift` | `PersonaCompiler`: `compile`, `fingerprint`, `renderPrompt`; batched context surfaces share canonical persona documents and identity, with separate surface overrides; USER core projection |
 
 // MARK: - PersonalityPacket
-//
-// Mirrors the retired daemon `compiled_personality_packet(surface)`
-// (~L35364-35550). Phase-B+ scope: load canonical persona docs, apply
-// custom-persona dir overrides, append surface guidance, concatenate in
-// canonical order, derive a stable fingerprint. Deliberately simplified vs. daemon:
-//   - no REM-pin retrieval (subsystem #10).
-//   - no chat-turn-time slotting (`compiled_personality_packet_for_turn`
-//     additions like KG snippets) — that's the next layer.
-//   - no live-tone augmentation, no prompt-cache key derivation.
 
 public struct PersonalityPacket: Sendable, Codable, Equatable {
     public let surface: String
@@ -92,11 +83,6 @@ public struct PersonaContextSourceSnapshot: Sendable, Equatable {
 }
 
 // MARK: - CompiledPersonalityProfile
-//
-// Mirrors the retired daemon `personality()` (L35081-35084) which reads
-// `<dataRoot>/memory/profile.json`, normalizes it via `normalize_personality`
-// (L35035-35079) seeded with `default_personality()` (L34989-35033), and
-// returns the typed profile, preserving extras beyond the shared field set.
 
 public typealias CompiledPersonalityTraits = PersonalityTraits
 
@@ -116,18 +102,7 @@ public struct CompiledPersonalityProfile: Sendable, Equatable {
     public let surfaceOverrides: [String: String]
     public let updatedAt: String
 
-    /// Lossless carry-over of profile.json keys OUTSIDE the fixed field set —
-    /// the Swift mirror of Python `normalize_personality`'s
-    /// `{**default, **{k:v for k,v in raw.items() if k not in {"traits","gender"}}, ...}`
-    /// splat. The fixed struct above models the
-    /// KNOWN keys; this dictionary preserves any UNKNOWN key a caller (or a
-    /// future schema rev / a hand-edited profile.json) put on disk, so a
-    /// native `savePersonality` round-trip does NOT silently drop it the way a
-    /// plain fixed-struct re-serialize would (the §6.76 W19 item-B.2 gap that
-    /// kept the write path PARTIAL). Keys here are guaranteed disjoint from the
-    /// known field set + `{traits, gender}` (see `PersonaCompiler.normalize`).
-    /// Default empty so every existing positional constructor keeps compiling
-    /// and a profile with no extras compares equal to the pre-extras shape.
+    /// Unknown profile.json keys round-trip losslessly, disjoint from normalized fields and the consumed gender alias.
     public let extras: [String: JSONValue]
 
     public init(
@@ -164,9 +139,7 @@ public struct CompiledPersonalityProfile: Sendable, Equatable {
         self.extras = extras
     }
 
-    /// Defaults matching Python `default_personality()` at
-    /// the retired daemon. Used as the seed any time
-    /// profile.json is missing or a field is absent / malformed.
+    /// Normalization seed for missing profile storage and absent or malformed fields.
     public static let defaults: CompiledPersonalityProfile = CompiledPersonalityProfile(
         schemaVersion: 2,
         personaEngineVersion: "2.0",
@@ -204,10 +177,7 @@ public struct CompiledPersonalityProfile: Sendable, Equatable {
 
 // MARK: - PersonaCompiler
 
-/// Compiles the personality packet for a surface. Reads from the same
-/// persona root the SwiftNativePersonaEngine sees (so the resolver chain
-/// from PersonaEngine.swift is honored — env var, stamped repo, dev repo,
-/// legacy fallback).
+/// Compiles each surface from the engine's persona and data roots.
 /// Optional active.json, selected persona documents, MEMORY.md and surface
 /// overrides remain accepted file inputs. Local/off-disk backup and data export
 /// include the persona root; phone sync excludes it; PrivacyMap: persona.
@@ -216,21 +186,14 @@ public actor PersonaCompiler {
         let packet: PersonalityPacket
         let personaRoot: URL
         let activePersonaDirectory: URL?
+        let documents: [PersonaContextDocumentSource]
     }
 
     /// Source engine for this compiler's persona and data roots.
     internal let engine: SwiftNativePersonaEngine
     private let fileManager: FileManager
 
-    /// Canonical docs in the order they get concatenated into the system
-    /// prompt. Carve order (fix 5):
-    ///   SOUL → VOICE → USER → GROWTH → MEMORY (if present) → AGENTS
-    /// MEMORY.md is injected after GROWTH and before AGENTS when the file
-    /// exists on disk as an optional file input; no runtime writer generates it.
-    /// Missing MEMORY.md is silently omitted (no effect on
-    /// fingerprint or any other doc). AGENTS is always last so operating-
-    /// manual instructions land freshest in the context window.
-    /// Surface guidance is appended after AGENTS.
+    /// Canonical prompt order: MEMORY.md is an optional input with no runtime writer; surface guidance follows AGENTS.
     private static let canonicalDocOrder: [String] = [
         "SOUL", "VOICE", "USER", "GROWTH", "MEMORY", "AGENTS",
     ]
@@ -280,25 +243,26 @@ public actor PersonaCompiler {
         let persona = try Self.resolveActivePersona(
             root: root, personaOverride: personaOverride, fileManager: fileManager
         )
-        var documents = try canonicalDocuments(root: root, personaSubdir: persona.subdir)
+        let documents = try canonicalDocuments(root: root, personaSubdir: persona.subdir)
+        var identity: String?
         // Unless a turn requires it, an unreadable profile omits the line;
         // her documents still carry her name.
         do {
-            documents["IDENTITY"] = try Self.identityPrompt(dataRoot: await engine.dataRootURL)
+            identity = try Self.identityPrompt(dataRoot: await engine.dataRootURL)
         } catch where !identityRequired {}
         return try resolvedCompilation(
             surface: surface, root: root, persona: persona,
-            documents: documents, userMemoryCore: userMemoryCore
+            documents: documents, identity: identity, userMemoryCore: userMemoryCore
         )
     }
 
-    private func canonicalDocuments(root: URL, personaSubdir: URL?) throws -> [String: String] {
-        var documents: [String: String] = [:]
-        for id in Self.canonicalDocOrder {
-            if let personaSubdir, let override = try readDoc(root: personaSubdir, id: id) {
-                documents[id] = override
-            } else if let canonical = try readDoc(root: root, id: id) {
-                documents[id] = canonical
+    private func canonicalDocuments(root: URL, personaSubdir: URL?) throws -> [PersonaContextDocumentSource] {
+        var documents: [PersonaContextDocumentSource] = []
+        for (order, id) in Self.canonicalDocOrder.enumerated() {
+            if let personaSubdir, let override = try readDoc(root: personaSubdir, id: id, order: order) {
+                documents.append(override)
+            } else if let canonical = try readDoc(root: root, id: id, order: order) {
+                documents.append(canonical)
             }
         }
         return documents
@@ -308,13 +272,17 @@ public actor PersonaCompiler {
         surface: String,
         root: URL,
         persona: (kind: String, id: String, subdir: URL?),
-        documents: [String: String],
+        documents: [PersonaContextDocumentSource],
+        identity: String?,
         userMemoryCore: [String]? = nil
     ) throws -> ResolvedCompilation {
-        var activeDocs = documents
-        if let surfaceBody = try readSurfaceOverride(root: root, surface: surface) {
-            activeDocs["surface:\(surface)"] = surfaceBody
+        var documents = documents
+        if let guidance = try readDoc(root: root.appendingPathComponent("surfaces", isDirectory: true),
+            id: surface, order: Self.canonicalDocOrder.count, surfaceOverride: true) {
+            documents.append(guidance)
         }
+        var activeDocs = Dictionary(uniqueKeysWithValues: documents.map { ($0.id, $0.content) })
+        activeDocs["IDENTITY"] = identity
         let compiledSystemPrompt = Self.renderPrompt(
             documents: activeDocs, surface: surface, userMemoryCore: userMemoryCore
         )
@@ -334,15 +302,13 @@ public actor PersonaCompiler {
         return ResolvedCompilation(
             packet: packet,
             personaRoot: root,
-            activePersonaDirectory: persona.subdir
+            activePersonaDirectory: persona.subdir,
+            documents: documents
         )
     }
 
-    /// 2026-09-18: one ordering for cold compilation and the resident kernel.
-    /// A relaunch must not move surface guidance across the remaining persona
-    /// documents and invalidate an otherwise unchanged provider prefix.
-    /// Chat, background work and reflection project USER through the same core
-    /// rule. Source documents and their fingerprints remain whole.
+    /// Cold compilation and the resident kernel share prompt ordering and USER core projection.
+    /// Source documents and their fingerprints remain whole.
     public static func renderPrompt(
         documents: [String: String],
         surface: String? = nil,
@@ -366,9 +332,7 @@ public actor PersonaCompiler {
         return "Your name is \(name). This saved name is authoritative even when your personal documents use an earlier name."
     }
 
-    /// ContextFlow source discovery using the exact same active/custom/surface
-    /// decisions as the live compiler. The derived index must not maintain a
-    /// second persona-root or active-persona resolver.
+    /// ContextFlow retains each document's supplying file from the live compiler's read.
     public func contextSourceSnapshot(
         surface: String,
         personaOverride: String? = nil
@@ -390,7 +354,7 @@ public actor PersonaCompiler {
         let selected = PersonaSelection.current() ?? ""
         let identity = try? Self.identityPrompt(dataRoot: await engine.dataRootURL)
         var resolvedByOverride: [String: (kind: String, id: String, subdir: URL?)] = [:]
-        var documentsByPersona: [String: [String: String]] = [:]
+        var documentsByPersona: [String: [PersonaContextDocumentSource]] = [:]
         var snapshots: [PersonaContextSourceSnapshot] = []
         for surface in surfaces {
             let override = personaOverrides[surface] ?? selected
@@ -403,17 +367,16 @@ public actor PersonaCompiler {
                 )
                 resolvedByOverride[override] = persona
             }
-            let documents: [String: String]
+            let documents: [PersonaContextDocumentSource]
             if let cached = documentsByPersona[persona.id] {
                 documents = cached
             } else {
-                var loaded = try canonicalDocuments(root: root, personaSubdir: persona.subdir)
-                loaded["IDENTITY"] = identity
+                let loaded = try canonicalDocuments(root: root, personaSubdir: persona.subdir)
                 documentsByPersona[persona.id] = loaded
                 documents = loaded
             }
             let resolved = try resolvedCompilation(
-                surface: surface, root: root, persona: persona, documents: documents
+                surface: surface, root: root, persona: persona, documents: documents, identity: identity
             )
             snapshots.append(contextSourceSnapshot(resolved))
         }
@@ -421,42 +384,9 @@ public actor PersonaCompiler {
     }
 
     private func contextSourceSnapshot(_ resolved: ResolvedCompilation) -> PersonaContextSourceSnapshot {
-        let surface = resolved.packet.surface
         let packet = resolved.packet
         let root = resolved.personaRoot
         let activeDirectory = resolved.activePersonaDirectory
-        var documents: [PersonaContextDocumentSource] = []
-        for (order, id) in Self.canonicalDocOrder.enumerated() {
-            guard let content = packet.activeDocs[id] else { continue }
-            let overrideURL = activeDirectory?.appendingPathComponent("\(id).md")
-            let selectedURL: URL
-            if let overrideURL, fileManager.fileExists(atPath: overrideURL.path) {
-                selectedURL = overrideURL
-            } else {
-                selectedURL = root.appendingPathComponent("\(id).md")
-            }
-            documents.append(PersonaContextDocumentSource(
-                id: id,
-                fileURL: selectedURL,
-                content: content,
-                canonicalOrder: order,
-                optional: id == "MEMORY",
-                surfaceOverride: false
-            ))
-        }
-        if let surfaceContent = packet.activeDocs["surface:\(surface)"] {
-            documents.append(PersonaContextDocumentSource(
-                id: "surface:\(surface)",
-                fileURL: root
-                    .appendingPathComponent("surfaces", isDirectory: true)
-                    .appendingPathComponent("\(surface).md"),
-                content: surfaceContent,
-                canonicalOrder: Self.canonicalDocOrder.count,
-                optional: true,
-                surfaceOverride: true
-            ))
-        }
-
         var watched = Set<URL>([
             root,
             root.deletingLastPathComponent(),
@@ -467,7 +397,7 @@ public actor PersonaCompiler {
             packet: packet,
             personaRoot: root,
             activePersonaDirectory: activeDirectory,
-            documents: documents,
+            documents: resolved.documents,
             watchedDirectories: watched.sorted { $0.path < $1.path }
         )
     }
@@ -495,7 +425,7 @@ public actor PersonaCompiler {
         }
     }
 
-    /// Legacy display and trait readers retain their default-seeded projection.
+    /// Display and trait readers use a default-seeded projection when storage is unavailable.
     /// Authoritative identity and profile editing use the checked compiler.
     public nonisolated static func loadProfile(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
@@ -511,11 +441,7 @@ public actor PersonaCompiler {
         NativeAgentIdentity.displayName(profile.name)
     }
 
-    /// Convenience wrapper: load the profile from disk and return its
-    /// daemon-equivalent display name. Use this from non-actor callers
-    /// that previously read
-    /// `loadProfile(dataRoot:).name` raw — that path skipped the
-    /// generic-label fallback. Matches daemon `agent_display_name()` 1:1.
+    /// Read and normalize the saved display name, including generic-label replacement.
     public nonisolated static func agentDisplayName(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> String {
@@ -524,10 +450,7 @@ public actor PersonaCompiler {
 
     // MARK: - Internals
 
-    /// Persona-doc filenames that, when present in a subdir, mark that
-    /// subdir as a custom persona. Notes/jsonl files alone do NOT count —
-    /// the daemon treats a custom persona as one that actually overrides
-    /// at least one canonical doc.
+    /// A custom persona must override at least one canonical marker document.
     private static let personaMarkerDocs: Set<String> = ["SOUL", "VOICE", "GROWTH", "USER", "AGENTS"]
 
     public static func customPersonaNames(root: URL) throws -> [String] {
@@ -614,7 +537,7 @@ public actor PersonaCompiler {
         let resolvedRoot = root.standardizedFileURL.resolvingSymlinksInPath()
         let candidate = root.appendingPathComponent(name, isDirectory: true)
             .standardizedFileURL.resolvingSymlinksInPath()
-        guard candidate.path.hasPrefix(resolvedRoot.path + "/") else {
+        guard let tail = NativeAgentWorkspaceRoot.relativePath(candidate.path, under: resolvedRoot.path), !tail.isEmpty else {
             throw PersonaEngineError.rootUnreadable(reason: "selected persona directory is outside the persona root")
         }
         return candidate
@@ -631,18 +554,12 @@ public actor PersonaCompiler {
         return false
     }
 
-    private func readDoc(root: URL, id: String) throws -> String? {
+    private func readDoc(root: URL, id: String, order: Int, surfaceOverride: Bool = false) throws -> PersonaContextDocumentSource? {
         let url = root.appendingPathComponent("\(id).md")
         guard fileManager.fileExists(atPath: url.path) else { return nil }
-        return try readPersonaDocument(at: url)
-    }
-
-    private func readSurfaceOverride(root: URL, surface: String) throws -> String? {
-        let url = root
-            .appendingPathComponent("surfaces", isDirectory: true)
-            .appendingPathComponent("\(surface).md")
-        guard fileManager.fileExists(atPath: url.path) else { return nil }
-        return try readPersonaDocument(at: url)
+        return PersonaContextDocumentSource(id: surfaceOverride ? "surface:\(id)" : id,
+            fileURL: url, content: try readPersonaDocument(at: url), canonicalOrder: order,
+            optional: surfaceOverride || id == "MEMORY", surfaceOverride: surfaceOverride)
     }
 
     private func readPersonaDocument(at url: URL) throws -> String {
@@ -674,85 +591,5 @@ public actor PersonaCompiler {
         let digest = hasher.finalize()
         let hex = digest.map { String(format: "%02x", $0) }.joined()
         return String(hex.prefix(16))
-    }
-}
-
-// MARK: - CompiledGrowthSummary
-//
-// Mirrors the retired daemon `personality_growth_summary()` (~L16456).
-// `feedbackMemories` is supplied by the caller via `feedbackMemoryProvider`
-// so this module stays free of a MemoryV2 dependency — NativeClient wires
-// the count in by listing memories tagged `persona-feedback`.
-
-public struct CompiledGrowthSummary: Sendable, Codable, Equatable {
-    public let engineVersion: String
-    public let activeKind: String?
-    public let fingerprint: String?
-    /// WHAT CHANGED THIS WEEK, AND WHY — one line per lesson or view, already
-    /// rendered by the substrate that owns the records (2026-09-13).
-    ///
-    /// This replaced `growthEntries`, a count of non-empty lines in GROWTH.md.
-    /// That number answered "how long is the file", which rises when text is
-    /// appended and never falls when she changes her mind — so a week of real
-    /// becoming and a week of accumulated prose read exactly alike. The rows
-    /// are supplied by the caller via `growthWeekProvider` for the same reason
-    /// `feedbackMemories` is: this module must not depend on CognitiveSubstrate.
-    public let growthWeek: [String]
-    public let feedbackMemories: Int
-    public let nextActions: [String]
-    public let createdAt: String
-
-    public init(
-        engineVersion: String,
-        activeKind: String?,
-        fingerprint: String?,
-        growthWeek: [String],
-        feedbackMemories: Int,
-        nextActions: [String],
-        createdAt: String
-    ) {
-        self.engineVersion = engineVersion
-        self.activeKind = activeKind
-        self.fingerprint = fingerprint
-        self.growthWeek = growthWeek
-        self.feedbackMemories = feedbackMemories
-        self.nextActions = nextActions
-        self.createdAt = createdAt
-    }
-}
-
-extension PersonaCompiler {
-    /// Daemon-equivalent fixed next-actions copy. Matches L16469-16473 verbatim.
-    public static let growthNextActions: [String] = [
-        "Use direct chat feedback as growth material.",
-        "Keep persona docs small enough to compile fast.",
-        "Run chat calibration after major voice edits.",
-    ]
-
-    /// Growth diagnostics use the shared active chat persona.
-    public func growthSummary(
-        feedbackMemoryProvider: (@Sendable () async throws -> Int)? = nil,
-        growthWeekProvider: (@Sendable () async throws -> [String])? = nil,
-        now: () -> Date = Date.init
-    ) async throws -> CompiledGrowthSummary {
-        let packet = try await compile(surface: "chat")
-
-        // growthWeek: the substrate's own seven-day readout. NOT derived from
-        // GROWTH.md at all — the file's length was never the question.
-        // A provider that cannot answer fails the readout with its cause;
-        // an unread week is never a week without growth.
-        let growthWeek = try await growthWeekProvider?() ?? []
-        let feedbackCount = try await feedbackMemoryProvider?() ?? 0
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return CompiledGrowthSummary(
-            engineVersion: "2.0",
-            activeKind: packet.personaKind,
-            fingerprint: packet.fingerprint,
-            growthWeek: growthWeek,
-            feedbackMemories: feedbackCount,
-            nextActions: Self.growthNextActions,
-            createdAt: formatter.string(from: now())
-        )
     }
 }

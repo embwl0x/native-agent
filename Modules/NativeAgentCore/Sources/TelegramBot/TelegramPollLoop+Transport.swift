@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `TelegramPollLoop+Transport.swift` | `TelegramPollLoop`: `answerRecordedCallback`, `_tgDestinationFields`, `_tgDestinationBody` |
@@ -23,10 +24,7 @@ extension TelegramPollLoop {
         }
     }
 
-    /// 2026-09-06: `chat_id` plus, for a forum topic, `message_thread_id`.
-    /// Telegram drops a send into General when the thread is missing, which is
-    /// how every topic reply used to land in the wrong conversation. Edits and
-    /// callback answers are addressed by message id and take no thread.
+    /// Sends include a topic's `message_thread_id`; edits and callback answers take no thread.
     static func _tgDestinationFields(_ destination: TelegramDestination) -> [String: JSONValue] {
         var fields: [String: JSONValue] = ["chat_id": .int(Int64(destination.chatId))]
         if let threadId = destination.threadId {
@@ -110,39 +108,6 @@ extension TelegramPollLoop {
             }
         }
 
-    /// Send one ordinary system message and return its created message_id.
-    public static let defaultSendMessageReturningId: @Sendable (String, TelegramDestination, String) async throws -> Int = { token, destination, text in
-        return try await _tgRetryAfterFloodControl(chatId: destination.chatId) {
-            let result = try await _tgPostJSON(
-                token: token,
-                method: "sendMessage",
-                resultType: TelegramAPIMessageResult.self
-            ) {
-                var body = _tgDestinationBody(destination)
-                body["text"] = text
-                return try JSONSerialization.data(withJSONObject: body)
-            }
-            return result.value.messageId
-        }
-    }
-
-    /// Update an ordinary system message in place. Telegram
-    /// 400s "message is not modified" when text is unchanged — treated as
-    /// success (the draft already shows this text).
-    public static let defaultEditMessageText: @Sendable (String, Int, Int, String) async throws -> Void = { token, chatId, messageId, text in
-        try await _tgRetryAfterFloodControl(chatId: chatId) {
-            _ = try await _tgPostJSON(
-                token: token,
-                method: "editMessageText",
-                resultType: TelegramAPIMessageResult.self,
-                allowMessageNotModified: true
-            ) {
-                let body: [String: Any] = ["chat_id": chatId, "message_id": messageId, "text": text]
-                return try JSONSerialization.data(withJSONObject: body)
-            }
-        }
-    }
-
     public static let defaultEditMessageTextWithReplyMarkup:
         @Sendable (String, Int, Int, String, JSONValue?) async throws -> Void = { token, chatId, messageId, text, replyMarkup in
         try await _tgRetryAfterFloodControl(chatId: chatId) {
@@ -179,9 +144,7 @@ extension TelegramPollLoop {
         }
     }
 
-    /// 2026-09-22: the plain-text cleanup a live reply gets, for senders that
-    /// hand raw model text to `defaultSendMessage` (bridge, attention). Not
-    /// applied inside the shared sender: a second pass is not idempotent.
+    /// Clean raw plain-text replies once; the cleanup is not idempotent.
     public static func cleanedPlainText(_ text: String) -> String {
         TelegramRichMessageRenderer.sanitize(TelegramRichMessageRenderer.stripBoldMarkers(text))
     }
@@ -203,16 +166,12 @@ extension TelegramPollLoop {
         chatId: Int,
         text: String,
         threadId: Int? = nil,
-        // nil = the bounded reply session. `.shared` here overrode every bound
-        // (7-day resource timeout), so a stalled send could hold the chat lane.
+        // nil uses the bounded reply session.
         session: URLSession? = nil,
         sleep: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
     ) async throws {
-        // Telegram hard-rejects messages over 4096 chars with HTTP 400 —
-        // before chunking, any long Agent reply (code, lists) silently
-        // died: typing indicator for the whole turn, then nothing
-        // (audit 2026-06-09). Split on newline boundaries when possible.
-        for chunk in _tgChunkMessage(text, limit: 4000) {
+        // Split below Telegram's 4096-character limit, preferring newline boundaries.
+        for chunk in try _tgChunkMessage(text, limit: 4000) {
             try await _tgRetryAfterFloodControl(chatId: chatId, sleep: sleep) {
                 _ = try await _tgPostJSON(
                     token: token,
@@ -262,7 +221,7 @@ extension TelegramPollLoop {
             _tgAppendMultipartFile(
                 name: "photo",
                 filename: fileURL.lastPathComponent.isEmpty ? "image.png" : fileURL.lastPathComponent,
-                mimeType: _tgImageUploadMimeType(for: fileURL),
+                mimeType: TelegramPollLoop.imageMime(forFilename: fileURL.lastPathComponent, fallbackMime: nil) ?? "application/octet-stream",
                 data: imageData,
                 boundary: boundary,
                 to: &body
@@ -301,7 +260,7 @@ extension TelegramPollLoop {
 
     /// Build each JSON request inside its caller's existing retry attempt.
     /// Keep serialization lazy so an invalid bot URL still fails first.
-    private static func _tgPostJSON<Result: Decodable & Sendable>(
+    static func _tgPostJSON<Result: Decodable & Sendable>(
         token: String,
         method: String,
         resultType: Result.Type,
@@ -386,8 +345,8 @@ extension TelegramPollLoop {
         allowMessageNotModified: Bool = false,
         validateResult: (Result) -> Bool = { _ in true }
     ) throws -> TelegramValidatedResult<Result> {
-        let envelope = try? JSONDecoder().decode(TelegramAPIResponse.self, from: data)
-        let sanitizedDescription = envelope?.description.map(_tgRedactToken)
+        let envelope = try? JSONDecoder().decode(TelegramAPIResponse<Result>.self, from: data)
+        let sanitizedDescription = envelope?.description.map(TurnSecretRedactor.redactText)
         let isNotModified = sanitizedDescription?
             .localizedCaseInsensitiveContains("message is not modified") == true
 
@@ -422,9 +381,7 @@ extension TelegramPollLoop {
                 parameters: envelope.parameters
             )
         }
-        guard let rawResult = envelope.result,
-              let resultData = try? rawResult.serializedData(pretty: false),
-              let result = try? JSONDecoder().decode(resultType, from: resultData),
+        guard let result = envelope.result,
               validateResult(result) else {
             throw TelegramAPIFailure(
                 kind: .malformedResult,
@@ -439,13 +396,17 @@ extension TelegramPollLoop {
     }
 
     /// Split a message into Telegram-safe chunks. Telegram's 4096 limit
-    /// counts UTF-16 code units, NOT Swift Characters — 4000 emoji
-    /// graphemes can be 8000 units (gpt-5.5 review 2026-06-09) — so all
+    /// counts UTF-16 code units: 4000 emoji graphemes can be 8000 units. All
     /// budgeting below is in UTF-16 units while cuts stay on Character
-    /// boundaries. Prefers newline boundaries (lines are preserved exactly,
+    /// boundaries, splitting an oversized grapheme at scalar boundaries.
+    /// Prefers newline boundaries (lines are preserved exactly,
     /// including blank lines; only the single boundary newline between two
     /// chunks is consumed). Always returns at least one element.
-    static func _tgChunkMessage(_ text: String, limit: Int) -> [String] {
+    static func _tgChunkMessage(_ text: String, limit: Int) throws -> [String] {
+        // A scalar needs at most two UTF-16 units; every hard split consumes one.
+        guard limit >= 2 else {
+            throw TelegramBotError.underlying("Telegram chunk budget must fit a Unicode scalar (at least two UTF-16 units)")
+        }
         guard text.utf16.count > limit else { return [text] }
         var chunks: [String] = []
         var current = ""
@@ -466,9 +427,17 @@ extension TelegramPollLoop {
                     head.append(ch)
                     units += u
                 }
+                if head.isEmpty {
+                    for scalar in line.unicodeScalars {
+                        let u = scalar.utf16.count
+                        if units + u > limit { break }
+                        head.unicodeScalars.append(scalar)
+                        units += u
+                    }
+                }
                 flush()
                 chunks.append(head)
-                line = String(line.dropFirst(head.count))
+                line = String(line.unicodeScalars.dropFirst(head.unicodeScalars.count))
             }
             let sepUnits = current.isEmpty ? 0 : 1
             if current.utf16.count + sepUnits + line.utf16.count > limit {
@@ -482,28 +451,11 @@ extension TelegramPollLoop {
         return chunks.isEmpty ? [text] : chunks
     }
 
-    /// 2026-09-06: `getMe`, wanted for exactly one thing — this bot's
-    /// username. A group delivers `/cmd@OtherBot` to every bot in the room and
-    /// the command parser stripped the `@suffix` without reading it, so
-    /// `/stop@OtherBot` stopped the agent's own turn. Called only when a
-    /// command actually names a bot, and the answer is cached in
-    /// telegram/state.json, so this is not a per-tick round trip.
+    /// Cache the bot username for commands that explicitly name a bot.
     public static let defaultFetchBotUsername: @Sendable (String) async throws -> String = { token in
         try await _tgRetryAfterFloodControl {
-            guard let url = _tgBuildBotURL(token: token, method: "getMe") else {
-                throw TelegramBotError.invalidRequest
-            }
-            var req = URLRequest(url: url)
-            req.httpMethod = "POST"
-            req.timeoutInterval = 20
-            let (data, resp) = try await URLSession.shared.data(for: req)
-            let result = try _tgValidateResponse(
-                data,
-                response: resp,
-                operation: "getMe",
-                resultType: TelegramAPIBotIdentity.self,
-                validateResult: { !$0.username.isEmpty }
-            )
+            let result = try await _tgPostJSON(token: token, method: "getMe",
+                resultType: TelegramAPIBotIdentity.self, validateResult: { !$0.username.isEmpty }) { Data("{}".utf8) }
             return result.value.username
         }
     }
@@ -575,14 +527,7 @@ extension TelegramPollLoop {
     }
 }
 
-/// 2026-09-06: Telegram's flood control is per CHAT (roughly one message a
-/// second, about 20 a minute in a group), but a supergroup's topics now each
-/// run their own turn, so two topics in one chat could put two sends on the
-/// wire at the same instant and a 429 was answered only by the single request
-/// that earned it. This lane is the one wire queue for a chat: sends to the
-/// same chatId are serialised, and the retry window any of them is handed
-/// becomes a chat-level cooldown the next send waits out instead of earning a
-/// second 429. Turns stay concurrent — only the sends line up.
+/// Serializes sends per chat and shares flood-control cooldowns across its topics.
 actor TelegramChatSendLane {
     static let shared = TelegramChatSendLane()
 
@@ -602,14 +547,9 @@ actor TelegramChatSendLane {
     ) async throws -> T {
         try await acquire(chatId)
         defer { release(chatId) }
-        // 2026-09-06: `release` hands the lane straight to the next waiter, so a
-        // waiter cancelled in that instant is past `acquire`'s cancellation
-        // check and its `abandon` is a no-op. Re-check here, and let a cancelled
-        // cooldown wait THROW: `try?` swallowed the cancellation, skipped the
-        // rest of the flood cooldown, and sent into a chat Telegram had told to
-        // be quiet — for a turn the user had already stopped.
+        // Check cancellation after lane handoff; cooldown cancellation must propagate.
         try Task.checkCancellation()
-        if let wait = cooldownNanoseconds(chatId) {
+        if let wait = try cooldownNanoseconds(chatId) {
             try await sleep(wait)
         }
         do {
@@ -617,18 +557,13 @@ actor TelegramChatSendLane {
         } catch let error as TelegramAPIFailure {
             if error.httpStatus == 429 || error.errorCode == 429,
                let seconds = error.parameters?.retryAfter, seconds > 0 {
-                noteRetryAfter(chatId, seconds: seconds)
+                try noteRetryAfter(chatId, seconds: seconds)
             }
             throw error
         }
     }
 
-    /// 2026-09-06: the wait for the lane is CANCELLABLE. It used to be a
-    /// non-throwing continuation, so a stopped turn queued behind a chat in a
-    /// 30s flood cooldown ignored its cancellation and sent anyway, long after
-    /// the user asked it to stop. A cancelled waiter leaves the queue and
-    /// throws; a waiter that already owns the lane keeps it and releases it in
-    /// the normal way.
+    /// Cancellation removes queued waiters; lane owners release through run's defer.
     private func acquire(_ chatId: Int) async throws {
         guard busy.contains(chatId) else {
             busy.insert(chatId)
@@ -666,17 +601,18 @@ actor TelegramChatSendLane {
         next.continuation.resume()
     }
 
-    private func cooldownNanoseconds(_ chatId: Int) -> UInt64? {
+    private func cooldownNanoseconds(_ chatId: Int) throws -> UInt64? {
         guard let until = cooldownUntil[chatId] else { return nil }
         let remaining = until.timeIntervalSinceNow
         guard remaining > 0 else {
             cooldownUntil[chatId] = nil
             return nil
         }
-        return UInt64(remaining * 1_000_000_000)
+        return try _tgDurationNanoseconds(remaining)
     }
 
-    private func noteRetryAfter(_ chatId: Int, seconds: Int) {
+    private func noteRetryAfter(_ chatId: Int, seconds: Int) throws {
+        _ = try _tgDurationNanoseconds(TimeInterval(seconds))
         let until = Date().addingTimeInterval(TimeInterval(seconds))
         guard cooldownUntil[chatId].map({ $0 < until }) ?? true else { return }
         cooldownUntil[chatId] = until
@@ -689,11 +625,7 @@ actor TelegramChatSendLane {
 /// the request. This keeps a successful retry from being duplicated while
 /// refusing to invent a replay after an ambiguous transport outcome.
 ///
-/// 2026-09-06: `chatId` puts the attempt in that chat's send lane above. The
-/// retry sleep stays OUTSIDE the lane so a waiting topic is not held behind a
-/// sleeping request — it hits the published cooldown instead. Methods with no
-/// chat of their own (getMe, setMyCommands, answerCallbackQuery, getUpdates)
-/// pass nil and go straight to the wire.
+/// Chat-bound attempts share a send lane; retry sleeps stay outside it.
 func _tgRetryAfterFloodControl<T: Sendable>(
     chatId: Int? = nil,
     sleep: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) },
@@ -715,9 +647,19 @@ func _tgRetryAfterFloodControl<T: Sendable>(
         // future API error happens to carry the same-shaped field.
         guard (error.httpStatus == 429 || error.errorCode == 429),
               let seconds = error.parameters?.retryAfter, seconds > 0 else { throw error }
-        try await sleep(UInt64(seconds) * 1_000_000_000)
+        try await sleep(_tgDurationNanoseconds(TimeInterval(seconds)))
         return try await attempt()
     }
+}
+
+/// Reject unrepresentable server durations before recording or sleeping them.
+private func _tgDurationNanoseconds(_ seconds: TimeInterval) throws -> UInt64 {
+    guard seconds.isFinite, seconds >= 0,
+          let value = UInt64(exactly: (seconds * 1_000_000_000).rounded(.up)) else {
+        throw TelegramAPIFailure(kind: .invalidDuration, operation: "retry_after",
+                                 telegramDescription: "Server retry duration cannot be represented by the transport timer")
+    }
+    return value
 }
 
 private func _tgAppendMultipartField(
@@ -749,18 +691,6 @@ private func _tgAppendMultipartFile(
 
 private func _tgAppendString(_ value: String, to body: inout Data) {
     body.append(Data(value.utf8))
-}
-
-private func _tgImageUploadMimeType(for url: URL) -> String {
-    switch url.pathExtension.lowercased() {
-    case "jpg", "jpeg": return "image/jpeg"
-    case "png": return "image/png"
-    case "gif": return "image/gif"
-    case "webp": return "image/webp"
-    case "bmp": return "image/bmp"
-    case "heic": return "image/heic"
-    default: return "application/octet-stream"
-    }
 }
 
 public func defaultTelegramOffsetURL() -> URL {

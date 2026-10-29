@@ -2,10 +2,10 @@
 
 `project.yml` copies this folder intact to `Contents/Resources/Senses/`.
 `builtin.json` is a package manifest, not a serialized SenseRecord: parse
-`corner` with SenseCorner(key:), then construct a JavaScript, on_call,
-built_in record at version 1, on, with empty reach and the listed verbs.
-Registry/assembly owners import each entry's bytes into its version folder
-and register through SensesHub. Do not overwrite an existing grown sense.
+`corner` with SenseCorner(key:), then construct a JavaScript, built_in record
+using its declared mode, version and verbs. All ten entries are live:
+OOXML/iWork/EPUB v7, RTF/RTFD v6 and Figma v5. Source comes from the matching
+ability file or the bundled built-in source. Preserve existing grown senses.
 Each entry is already self-contained; no dependency loader is needed.
 The SDK's local `sense.redactText(text)` uses the shared Swift policy before
 source fragments are composed into news. It sends no plug messages and grants
@@ -56,13 +56,14 @@ owner; filesystem access is deliberately absent in the kit.
   described as dependent on tree layout. Thin/empty AX is a visible failure.
 - ZIP64, encryption, unknown compression, oversized entries, invalid
   checksums and ambiguous identities fail explicitly. ZIP member limit:
-  8,000; entry expansion: 32 MiB; total expansion/file input: 128 MiB.
+  8,000; captured source/ZIP input: 16 MiB; decoded member: 32 MiB;
+  cumulative decoded expansion: 128 MiB.
 
 ## Bounded check after integration and install
 
 1. Confirm the installed bundle contains Senses/builtin.json, frame.js,
    AUTHORING.md and each of the ten manifest entry paths. Confirm the
-   registry has those corners and provenance identifies their IDs at v1.
+   registry has those corners and provenance matches the declared modes/versions.
 2. Through the existing files.read/mac.read door, read one existing small
    document of each supported kind, using its real path. Confirm a known
    paragraph, worksheet A1, named Numbers table/cell, slide and EPUB

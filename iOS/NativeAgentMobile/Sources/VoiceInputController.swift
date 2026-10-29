@@ -108,7 +108,7 @@ final class VoiceInputController {
             return
         }
 
-        // 2. Microphone auth (required separately on iOS 17+)
+        // 2. Microphone authorization is separate from speech recognition.
         statusText = "Requesting microphone permission..."
         let micGranted = await requestMicrophoneAuthorization()
         guard desiredListening, generation == startGeneration else { return }
@@ -122,7 +122,7 @@ final class VoiceInputController {
         let token = UUID()
         audioToken = token
         do {
-            let preparationError = try await MobileAudioService.shared.prepareInput(token: token, onAudio: { [weak self] in
+            let preparationError = try await MobileDictation.shared.prepareInput(token: token, onAudio: { [weak self] in
                 Task { @MainActor in
                     guard let self, self.startGeneration == generation
                         || (self.waitingForFinalAfterStop && self.startGeneration == generation + 1) else { return }
@@ -166,7 +166,7 @@ final class VoiceInputController {
 
         // 6. Start engine after the recognition task is ready to consume buffers.
         do {
-            try await MobileAudioService.shared.startInput(token: token)
+            try await MobileDictation.shared.startInput(token: token)
             hasStartedAudioSession = true
         } catch {
             teardownAudio(cancelTask: true)
@@ -228,7 +228,7 @@ final class VoiceInputController {
         }
         Task {
             do {
-                let attachment = try await MobileAudioService.shared.finishInput(token: token, utterance: utterance)
+                let attachment = try await MobileDictation.shared.finishInput(token: token, utterance: utterance)
                 guard startGeneration == generation else { return }
                 lastAttachment = attachment
                 lastFinalTranscript = utterance.text
@@ -247,7 +247,7 @@ final class VoiceInputController {
         if cancelTask { hasRecognitionTask = false }
         if let token = audioToken {
             Task {
-                do { try await MobileAudioService.shared.stopInput(token: token, cancelTask: cancelTask) }
+                do { try await MobileDictation.shared.stopInput(token: token, cancelTask: cancelTask) }
                 catch { NSLog("[VoiceInputController] audio session deactivate failed: %@", error.localizedDescription) }
             }
             if cancelTask { audioToken = nil }
@@ -272,19 +272,11 @@ final class VoiceInputController {
     }
 
     nonisolated private static func requestMicrophonePermission() async -> Bool {
-        if #available(iOS 17.0, *) {
-            return await AVAudioApplication.requestRecordPermission()
-        }
-        return await withCheckedContinuation { cont in
-            AVCaptureDevice.requestAccess(for: .audio) { granted in
-                cont.resume(returning: granted)
-            }
-        }
+        await AVAudioApplication.requestRecordPermission()
     }
 }
-
-actor MobileAudioService {
-    static let shared = MobileAudioService()
+actor MobileDictation {
+    static let shared = MobileDictation()
     private var engine: AVAudioEngine?
     private var recognizer: SFSpeechRecognizer?
     private var request: SFSpeechAudioBufferRecognitionRequest?

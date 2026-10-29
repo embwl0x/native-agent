@@ -28,7 +28,7 @@ extension AppToolExecutor {
     /// Read the last report, or explicitly run checks (false) or repair (true).
     @MainActor
     static func doctorStatus(repair: Bool?, checkID: String?) async throws -> JSONValue {
-        guard let appModel = NativeAgentAppCoordinator.shared.appModel else {
+        guard let appModel = ApplicationLifetime.shared.appModel else {
             return AppToolExecutor.unattachedFailure()
         }
         if let repair {
@@ -71,11 +71,12 @@ extension AppToolExecutor {
             },
             proactiveSpeechClient: { NativeAgentEngine.forRoot($0).chatClient(profile: .background) },
             workshopStepDecider: { id, approve in
-                try await ApprovalTransactionCoordinator.app().decideBlockedWorkshopStep(
+                try await ApprovalExecution.app().decideBlockedWorkshopStep(
                     id: id, approve: approve, runner: { NativeAgentEngine.makeWorkshopExecutionRunner() })
             },
-            quietHost: { NativeAgentAppCoordinator.shared.appModel.map(AppQuietToolHost.init) },
-            presentation: AppQuietToolPresentation(), interactions: AppToolInteractionResolver()
+            attention: { AttentionRouter.shared },
+            quietHost: { ApplicationLifetime.shared.appModel.map(AppQuietToolHost.init) },
+            presentation: AppQuietToolPresentation()
         )
     }
     static func defaultBrowserActionRunner(
@@ -93,7 +94,7 @@ extension AppToolExecutor {
                 },
                 readStatus: {
                     try await BrowserActionRoutes.app.visibleBrowserStatus(JSONValue.fromEncodable(
-                        try await RuntimeReadProjection.getBrowserStatus(dataRoot: PersistenceCore.defaultDataRoot())))
+                        try await RuntimeReadouts.getBrowserStatus(dataRoot: PersistenceCore.defaultDataRoot())))
                 },
                 runNativeAction: { actionId, dryRun, input in
                     let receipt = try await NativeActionRoutes.runNativeAction(

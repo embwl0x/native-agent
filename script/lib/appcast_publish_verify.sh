@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# Publish an appcast and prove the advertised feed and enclosure are actually
-# live. Kept outside generate_appcast.sh so the no-op-publisher boundary can be
-# exercised without requiring Sparkle's generator to be installed.
+# Publication requires the advertised feed and enclosure to match the local bytes.
 
 # shellcheck disable=SC2034
 NATIVEAGENT_APPCAST_PUBLISH_VERIFY_LIB_LOADED=1
@@ -60,6 +58,7 @@ nativeagent_verify_published_appcast() {
     return 2
   fi
 
+  # Default propagation budget: 12 attempts, 15 seconds between unsuccessful attempts.
   verify_attempts="${NATIVEAGENT_APPCAST_VERIFY_ATTEMPTS:-12}"
   verify_delay="${NATIVEAGENT_APPCAST_VERIFY_DELAY:-15}"
   if [[ ! "$verify_attempts" =~ ^[0-9]+$ || "$verify_attempts" -lt 1 ]]; then

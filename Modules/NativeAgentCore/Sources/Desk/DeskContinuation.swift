@@ -1,6 +1,9 @@
 import Foundation
 import PersistenceCore
 import NativeAgentCore
+import NativeAgentShared
+
+private let nestedOpenLog = ModuleLog(category: "Receipts", trail: true)
 // Blueprint: | `DeskContinuation.swift` | `DeskContinuation`; life-stamped resumable work, stopped/restored projection; receiptIsUnresolved and toJSON |
 
 public struct DeskContinuation: Codable, Sendable, Equatable {
@@ -83,31 +86,50 @@ public struct DeskContinuation: Codable, Sendable, Equatable {
     /// unsatisfied — including inside MCP `content`/`structuredContent` and
     /// JSON text bodies. Such an effect is never settled by its own receipt.
     public static func receiptIsUnresolved(_ value: JSONValue, depth: Int = 0) -> Bool {
-        guard depth < 8 else { return true }
+        guard let path = unresolvedPath(value, depth: depth, path: "") else { return false }
+        // Measuring before cutting (10-29): an open child under a closed outer receipt is a producer
+        // that does not own its child's evidence. Each one logged here is a producer to fix; when none
+        // log, this dig becomes a read of the outer receipt alone.
+        if depth == 0, path.contains("."), case .object(let outer) = value {
+            let who = ["action", "tool", "verb", "kind", "source"].compactMap { outer[$0]?.scalarText }.first ?? "?"
+            nestedOpenLog("receipt.nested_open who=%@ path=%@ keys=%@", who, path,
+                          outer.keys.sorted().prefix(12).joined(separator: ","))
+        }
+        return true
+    }
+
+    /// Where a receipt says its effect is still open, as a dotted path; nil when it is settled.
+    static func unresolvedPath(_ value: JSONValue, depth: Int, path: String) -> String? {
+        guard depth < 8 else { return path + "(depth)" }
         switch value {
         case .array(let values):
-            return values.contains { receiptIsUnresolved($0, depth: depth + 1) }
+            for (i, v) in values.enumerated() { if let p = unresolvedPath(v, depth: depth + 1, path: path + "[\(i)]") { return p } }
+            return nil
         case .string(let text):
             guard text.first == "{" || text.first == "[",
-                  let parsed = try? JSONValue.parse(Data(text.utf8)) else { return false }
-            return receiptIsUnresolved(parsed, depth: depth + 1)
+                  let parsed = try? JSONValue.parse(Data(text.utf8)) else { return nil }
+            return unresolvedPath(parsed, depth: depth + 1, path: path + "(json)")
         case .object(let object):
             if case .string(let status)? = object["status"],
                unresolvedStatuses.contains(status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) {
-                return true
+                return path + ".status=" + status
             }
-            if object["effects"] == .string("unknown") || object["effects_unknown"] == .bool(true)
-                || object["verified"] == .bool(false) || object["timed_out"] == .bool(true)
-                || object["completed"] == .bool(false) { return true }
+            if object["effects"] == .string("unknown") { return path + ".effects=unknown" }
+            if object["effects_unknown"] == .bool(true) { return path + ".effects_unknown" }
+            if object["verified"] == .bool(false) { return path + ".verified=false" }
+            if object["timed_out"] == .bool(true) { return path + ".timed_out" }
+            if object["completed"] == .bool(false) { return path + ".completed=false" }
             if let verification = object["verification"], verification != .null {
                 let status: JSONValue?
                 if case .object(let fields) = verification { status = fields["status"] } else { status = verification }
-                if ![.string("satisfied"), .string("verified"), .string("not_required")].contains(status) { return true }
+                if ![.string("satisfied"), .string("verified"), .string("not_required")].contains(status) { return path + ".verification" }
             }
-            return ["detail", "result", "receipt", "execution", "output", "structuredContent", "content", "text"]
-                .contains { object[$0].map { receiptIsUnresolved($0, depth: depth + 1) } ?? false }
+            for key in ["detail", "result", "receipt", "execution", "output", "structuredContent", "content", "text"] {
+                if let child = object[key], let p = unresolvedPath(child, depth: depth + 1, path: path + "." + key) { return p }
+            }
+            return nil
         default:
-            return false
+            return nil
         }
     }
 
@@ -120,23 +142,6 @@ public struct DeskContinuation: Codable, Sendable, Equatable {
     public func toJSON() -> JSONValue {
         do { return try JSONValue.fromEncodable(self) }
         catch { preconditionFailure("Invalid continuation encoding: \(error)") }
-    }
-
-    public func summaryJSON() -> JSONValue {
-        func bounded(_ value: String, bytes: Int) -> JSONValue {
-            .string(String(decoding: value.utf8.prefix(bytes), as: UTF8.self))
-        }
-        return .object([
-            "state": .string(state.rawValue),
-            "originRunID": bounded(originRunID, bytes: 128),
-            "resumeCount": .int(Int64(resumeCount)),
-            "settledCount": .int(Int64(settled.count)),
-            "pendingCount": .int(Int64(pending.count)),
-            "reason": reason.map { bounded($0, bytes: 512) } ?? .null,
-            "remainingWork": bounded(remainingWork, bytes: 2048),
-            "remainingWorkTruncated": .bool(remainingWork.utf8.count > 2048),
-            "responseCached": .bool(response != nil),
-        ])
     }
 
     public static func fromJSON(_ value: JSONValue) -> Self? {
@@ -309,7 +314,7 @@ public actor DeskContinuationTurn {
         retainPeerSources(peerSources)
         record.state = .ready
         record.reason = "reply_ready"
-        record.nextRunAt = Date().addingTimeInterval(30)
+        record.nextRunAt = Date()
         try await save()
     }
 

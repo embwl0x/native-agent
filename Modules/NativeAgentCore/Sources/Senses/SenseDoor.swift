@@ -41,9 +41,19 @@ public enum SenseDoor {
         let record: SenseRecord?
         do {
             record = try await selectedRecord(for: corner, nativeCorner: nativeCorner)
-        } catch {
-            return signedRaw(try await $readingRaw.withValue(true) { try await raw() },
-                line: "raw view · \(error.localizedDescription)")
+        } catch is CancellationError { throw CancellationError() }
+        catch {
+            let failure = SenseFailure(error, code: "registry_failure")
+            var fields = failure.failureEvidence().merging([
+                "ok": .bool(false), "error_code": .string(failure.code), "error": .string(failure.message),
+                "remedy": failure.remedy ?? Repair.reconcile(
+                    instruction: "Inspect and repair the sense registry failure; no sense page was served.",
+                    nextCall: .object(["tool": .string("app"), "input": .object(["page": .string("senses")])])),
+            ]) { _, owned in owned }
+            do { fields["raw"] = try await $readingRaw.withValue(true) { try await raw() } }
+            catch is CancellationError { throw CancellationError() }
+            catch { fields["raw_error"] = .string(error.localizedDescription) }
+            return .object(fields)
         }
         var readInput = input
         if case .app = corner, input["wrong"] == .bool(true) { readInput.removeValue(forKey: "wrong") }
@@ -311,7 +321,7 @@ public enum SenseDoor {
         return .object(["raw": result, "sense_provenance": .string(line)])
     }
 
-    private static func recordRead(_ record: SenseRecord, registry: (any SenseRegistry)?) async throws {
+    private static func recordRead(_ record: SenseRecord, registry: FileSenseRegistry?) async throws {
         try await registry?.recordUse(senseID: record.id, version: record.version)
     }
 
@@ -385,10 +395,10 @@ public enum SenseDoor {
             "args": .object(["sense_id": .string(record.id)])])])
         let remedy = failure.remedy ?? Repair.remedy(owner: "sense \(record.id) v\(record.version)", nextCall: read, tap: nil,
             instruction: "Read this sense's retained versions and failure. Reread the original place with raw:true, then revise its code with sense.make for place \(record.corner.key); inspect the trial's page, then keep that exact trial_id and digest with keep:true. Do not turn an owner-disabled sense on yourself.")
-        return signedRaw(.object(["ok": .bool(false), "status": .string("failed"),
-            "reason": .string(failure.code), "error_code": .string(failure.code), "error": .string(failure.message), "raw": result,
+        return signedRaw(.object(failure.failureEvidence().merging(["ok": .bool(false),
+            "error_code": .string(failure.code), "error": .string(failure.message), "raw": result,
             "sense_id": .string(record.id), "sense_version": .int(Int64(record.version)),
-            "remedy": remedy]),
+            "remedy": remedy]) { _, owned in owned }),
             line: "raw view · sense \(record.id) v\(record.version) unavailable: \(failure.code); no sense page served")
     }
 }
@@ -552,11 +562,7 @@ public final class SenseDoorViews: @unchecked Sendable {
     public var latest: [View] { lock.withLock { views } }
 
     public static func placeIdentity(_ value: String) -> String {
-        var path = value
-        if path.hasPrefix("file:"), let base = path.dropFirst(5).split(separator: "#", maxSplits: 1).first,
-           let decoded = String(base).removingPercentEncoding {
-            path = decoded
-        }
+        let path = URL(string: value).flatMap { $0.isFileURL ? $0.path : nil } ?? value
         return path.hasPrefix("/") ? URL(fileURLWithPath: path).standardizedFileURL.path : value
     }
 

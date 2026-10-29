@@ -4,24 +4,8 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `VisionPerceptionCompiler.swift` | `VisionPerceptionError`, `VisionRowDraft`, `VisionPerceptionCompiler` |
 
-// MARK: - FUSION: CGImage → vision rows
-//
-// The whole pipeline, in one place and in one pass over the frame:
-//
-//   text layer (OCR, conditional tiling)
-//        │
-//        ├─ redaction (shared redactor + OCR-box caption geometry)
-//        │
-//   element layer  (a) colour regions   (b) y-band rows   (c) saliency
-//        │
-//   fusion → roles · states · handles · ABSTAIN · five confidences
-//        │
-//   VisionPercept → the shared screen/target adapter
-//
-// PURE: a CGImage in, a percept out. No capture, no injection here; the
-// production caller is SwiftToolDispatcher+FourVerbPerception.swift (the
-// four verbs), not the legacy mac_look. Which is also why every
-// stage of this is testable headless, on real pixels.
+// OCR, positional redaction, colour regions, text bands and saliency fuse into
+// bounded pixel evidence. This compiler neither captures nor sends input.
 
 public enum VisionPerceptionError: Error, LocalizedError {
     case undecodableImage
@@ -144,7 +128,6 @@ public struct VisionPerceptionCompiler: Sendable {
             notes.append("saliency layer failed (\(error.localizedDescription)); controls only it would find were not looked for")
         }
         candidates = candidates.filter { isVisible($0.rect) }
-        let considered = candidates.count
         if candidates.count > maxAffordances {
             notes.append(
                 "\(candidates.count - maxAffordances) candidate(s) beyond the "
@@ -162,9 +145,7 @@ public struct VisionPerceptionCompiler: Sendable {
                 rect: candidate.rect,
                 imageSize: imageSize,
                 sources: candidate.sources,
-                containedText: contained.map(\.box),
-                fillLuminance: candidate.fillLuminance,
-                backgroundLuminance: colorResult.backgroundLuminance
+                containedText: contained.map(\.box)
             ))
             // The LABEL is assembled from what redaction LET THROUGH. A
             // withheld string contributes nothing — not its characters, not a
@@ -179,7 +160,7 @@ public struct VisionPerceptionCompiler: Sendable {
             } else {
                 let joined = visible.joined(separator: " ")
                 label = VisionRedactedText(
-                    raw: joined, json: .string(joined), secret: false
+                    raw: joined, json: .string(joined)
                 )
             }
             let fill = candidate.fillLuminance ?? grid.meanLuminance(in: candidate.rect)
@@ -199,24 +180,24 @@ public struct VisionPerceptionCompiler: Sendable {
         }
 
         let rowFills = drafts.filter { $0.guess.role == VisionRoleGuess.row }
-            .compactMap(\.fill)
+            .compactMap(\.fill).sorted()
+        let rowFillBaseline: Double? = rowFills.count >= 2 ? rowFills[rowFills.count / 2] : nil
 
-        // 6. ABSTAIN — computed BEFORE handles so the marker cannot be
-        //    forgotten on a row that already has an identity.
+        // 6. ABSTAIN — every row retains its refusal reason.
         let abstainReasons = abstain(drafts.map { ($0.candidate.rect, $0.guess.role, $0.label?.display) })
 
-        // 7. HANDLES.
-        let fingerprints = drafts.map { draft in
-            VisionHandles.fingerprint(
+        // 7. Token collisions lower target confidence, including hash collisions.
+        let tokens = drafts.map { draft in
+            VisionHandles.token(fingerprint: VisionHandles.fingerprint(
                 roleGuess: draft.guess.role,
                 label: draft.label?.display,
                 rect: draft.candidate.rect,
                 imageSize: imageSize
-            )
+            ))
         }
-        let minted = VisionHandles.mint(fingerprints: fingerprints)
+        let tokenCounts = tokens.reduce(into: [String: Int]()) { $0[$1, default: 0] += 1 }
 
-        // 8. ROWS with the five confidences.
+        // 8. Affordances retain bounds and target confidence; each state has its own.
         var rows: [VisionAffordanceRow] = []
         for (index, draft) in drafts.enumerated() {
             let state = VisionRoleGuess.stateGuess(
@@ -224,7 +205,7 @@ public struct VisionPerceptionCompiler: Sendable {
                 fillLuminance: draft.fill,
                 captionContrast: draft.captionContrast,
                 backgroundLuminance: colorResult.backgroundLuminance,
-                peerFillLuminances: draft.guess.role == VisionRoleGuess.row ? rowFills : []
+                rowFillBaseline: rowFillBaseline
             )
             let textConfidence = draft.containedText.map(\.box.confidence).max() ?? 0
             let ambiguous = abstainReasons[index]
@@ -235,19 +216,14 @@ public struct VisionPerceptionCompiler: Sendable {
                 hasLabel: draft.label?.display?.isEmpty == false,
                 salience: draft.candidate.salience,
                 ambiguous: ambiguous != nil,
-                handleAmbiguous: minted[index].ambiguity != nil
+                tokenCollision: (tokenCounts[tokens[index]] ?? 0) > 1
             )
             rows.append(VisionAffordanceRow(
-                handle: minted[index].handle,
-                handleAmbiguity: minted[index].ambiguity,
                 roleGuess: draft.guess.role,
                 label: draft.label,
                 rect: draft.candidate.rect,
                 confidence: VisionConfidence(
                     bounds: draft.candidate.boundsConfidence,
-                    role: draft.guess.confidence,
-                    state: state.aggregateConfidence,
-                    text: textConfidence,
                     target: target
                 ),
                 state: state,
@@ -275,13 +251,12 @@ public struct VisionPerceptionCompiler: Sendable {
         return VisionPercept(
             rows: rows,
             readouts: readouts,
-            droppedBeyondCap: max(0, considered - rows.count),
             frameSize: imageSize,
             textTiled: textResult.tiled,
             textTilingReason: textResult.tilingReason,
             recognizedStrings: visibleTextBoxes.count,
             recognizedText: zip(redactedTexts, visibleTextBoxes).map {
-                VisionRecognizedText(text: $0.0, confidence: $0.1.confidence, rect: $0.1.rect)
+                VisionRecognizedText(text: $0.0, confidence: VisionConfidence.clamp($0.1.confidence), rect: $0.1.rect)
             },
             notes: notes
         )
@@ -370,12 +345,12 @@ public struct VisionPerceptionCompiler: Sendable {
         hasLabel: Bool,
         salience: Double,
         ambiguous: Bool,
-        handleAmbiguous: Bool
+        tokenCollision: Bool
     ) -> Double {
         var value = 0.45 * bounds + 0.3 * role + 0.15 * (hasLabel ? textConfidence : 0.1)
             + 0.1 * salience
         if !hasLabel { value *= 0.8 }
-        if handleAmbiguous { value = min(value, 0.5) }
+        if tokenCollision { value = min(value, 0.5) }
         if ambiguous { value = min(value, 0.25) }
         return value
     }
@@ -412,15 +387,7 @@ public struct VisionPerceptionCompiler: Sendable {
                     handle: VisionHandles.token(fingerprint: fingerprint),
                     text: redacted,
                     rect: box.rect,
-                    confidence: VisionConfidence(
-                        bounds: 0.8,
-                        role: 0.5,
-                        state: 0,
-                        text: box.confidence,
-                        // A readout is not an act target. Saying otherwise
-                        // would invite a click on a label.
-                        target: 0.2
-                    )
+                    confidence: box.confidence
                 )
             }
     }

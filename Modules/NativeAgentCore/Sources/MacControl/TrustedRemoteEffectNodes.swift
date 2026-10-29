@@ -1,8 +1,9 @@
 import CryptoKit
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `TrustedRemoteEffectNodes.swift` | Reads operator-provisioned trusted node JSON and returns SSH execution receipts to the caller; unused provisioning APIs and unread receipt-file writes are retired |
+// Blueprint: | `TrustedRemoteEffectNodes.swift` | Reads operator-provisioned trusted node JSON and returns SSH execution receipts to the caller |
 
 public struct TrustedRemoteEffectNode: Codable, Identifiable, Hashable, Sendable {
     public let id: String
@@ -15,30 +16,6 @@ public struct TrustedRemoteEffectNode: Codable, Identifiable, Hashable, Sendable
     public var allowedExecutables: [String]
     public var enabled: Bool
     public var updatedAt: String
-
-    public init(
-        id: String = UUID().uuidString.lowercased(),
-        name: String,
-        host: String,
-        port: Int = 22,
-        user: String,
-        hostKeyAlgorithm: String,
-        hostKey: String,
-        allowedExecutables: [String],
-        enabled: Bool = false,
-        updatedAt: String = ISO8601DateFormatter().string(from: Date())
-    ) {
-        self.id = id
-        self.name = name
-        self.host = host
-        self.port = port
-        self.user = user
-        self.hostKeyAlgorithm = hostKeyAlgorithm
-        self.hostKey = hostKey
-        self.allowedExecutables = allowedExecutables
-        self.enabled = enabled
-        self.updatedAt = updatedAt
-    }
 
     public var hostKeyFingerprint: String? {
         guard let bytes = Data(base64Encoded: hostKey) else { return nil }
@@ -129,20 +106,20 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
             command: command,
             timeoutSeconds: max(1, min(timeoutSeconds, 300))
         )
-        return TrustedRemoteEffectReceipt(
+        return await settle { TrustedRemoteEffectReceipt(
             id: UUID().uuidString.lowercased(),
             nodeId: node.id,
             nodeName: node.name,
             commandDigest: digest,
             executable: executable,
-            startedAt: ISO8601DateFormatter().string(from: started),
-            finishedAt: ISO8601DateFormatter().string(from: Date()),
+            startedAt: NativeTimestampFormat.plainZulu(started),
+            finishedAt: NativeTimestampFormat.plainZulu(Date()),
             exitCode: result.exitCode,
             stdout: Self.bounded(result.stdout),
             stderr: Self.bounded(result.stderr + (result.timedOut
                 ? (result.stderr.isEmpty ? "Timed out." : "\nTimed out.") : "")),
             hostKeyFingerprint: node.hostKeyFingerprint ?? "invalid"
-        )
+        ) }
     }
 
     private func loadStrict() throws -> [TrustedRemoteEffectNode] {
@@ -208,44 +185,34 @@ public final class TrustedRemoteEffectNodeStore: @unchecked Sendable {
         timeoutSeconds: Int
     ) async throws -> ProcessRunResult {
         try Task.checkCancellation()
-        let task = Task.detached(priority: .userInitiated) {
-            try Task.checkCancellation()
-            let temp = FileManager.default.temporaryDirectory
-                .appendingPathComponent(InstallPaths.current.name("nativeagent-known-hosts-\(UUID().uuidString)"))
-            let hostToken = node.port == 22 ? node.host : "[\(node.host)]:\(node.port)"
-            let line = "\(hostToken) \(node.hostKeyAlgorithm) \(node.hostKey)\n"
-            try Data(line.utf8).write(to: temp, options: [.atomic])
-            defer { try? FileManager.default.removeItem(at: temp) }
-            let arguments = [
-                "-o", "BatchMode=yes",
-                "-o", "IdentitiesOnly=no",
-                "-o", "StrictHostKeyChecking=yes",
-                "-o", "ControlPath=none",
-                "-o", "VerifyHostKeyDNS=no",
-                "-o", "KnownHostsCommand=none",
-                "-o", "UserKnownHostsFile=\(temp.path)",
-                "-o", "GlobalKnownHostsFile=/dev/null",
-                "-o", "ConnectTimeout=\(min(timeoutSeconds, 30))",
-                "-o", "ServerAliveInterval=10",
-                "-o", "ServerAliveCountMax=2",
-                "-p", String(node.port),
-                "\(node.user)@\(node.host)",
-                command,
-            ]
-            try Task.checkCancellation()
-            return try await SystemProcessAdapter().run(
-                executable: "/usr/bin/ssh", arguments: arguments,
-                currentDirectory: nil, environment: nil, standardInput: nil,
-                timeoutSeconds: TimeInterval(timeoutSeconds), outputByteLimit: 32_768,
-                launchFailure: { TrustedRemoteEffectError.transport($0.localizedDescription) }
-            )
-        }
-        return try await withTaskCancellationHandler {
-            let result = try await task.value
-            try Task.checkCancellation()
-            return result
-        } onCancel: {
-            task.cancel()
-        }
+        let temp = FileManager.default.temporaryDirectory
+            .appendingPathComponent(InstallPaths.current.name("nativeagent-known-hosts-\(UUID().uuidString)"))
+        let hostToken = node.port == 22 ? node.host : "[\(node.host)]:\(node.port)"
+        let line = "\(hostToken) \(node.hostKeyAlgorithm) \(node.hostKey)\n"
+        try Data(line.utf8).write(to: temp, options: [.atomic])
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let arguments = [
+            "-o", "BatchMode=yes",
+            "-o", "IdentitiesOnly=no",
+            "-o", "StrictHostKeyChecking=yes",
+            "-o", "ControlPath=none",
+            "-o", "VerifyHostKeyDNS=no",
+            "-o", "KnownHostsCommand=none",
+            "-o", "UserKnownHostsFile=\(temp.path)",
+            "-o", "GlobalKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=\(min(timeoutSeconds, 30))",
+            "-o", "ServerAliveInterval=10",
+            "-o", "ServerAliveCountMax=2",
+            "-p", String(node.port),
+            "\(node.user)@\(node.host)",
+            command,
+        ]
+        try Task.checkCancellation()
+        return try await ProcessExecution().run(
+            executable: "/usr/bin/ssh", arguments: arguments,
+            currentDirectory: nil, environment: nil, standardInput: nil,
+            timeoutSeconds: TimeInterval(timeoutSeconds), outputByteLimit: 32_768,
+            launchFailure: { TrustedRemoteEffectError.transport($0.localizedDescription) }
+        )
     }
 }

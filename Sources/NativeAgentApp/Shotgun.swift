@@ -1,21 +1,7 @@
 import AttentionRouting
+import NativeAgentShared
 
 // Blueprint: | `Shotgun.swift` | `ShotgunController`: person-only floating chat/window lifecycle while the agent drives, with step-aside, resume and saved placement |
-// Shotgun (User, 2026-10-04): when the agent starts driving the Mac in the chat
-// on screen, the main window steps aside and this small floating glass chat
-// takes its place — she drives, User rides shotgun. User's rulings:
-//   1. She sees straight through it and clicks straight through it, so it
-//      never needs moving (PersonOnlyWindows in Core: her captures leave it
-//      out, her own pointer events fall through it, her keystrokes wait while
-//      its composer has the keyboard).
-//   2. While it is up, Stop is the only hand-back: his input anywhere never
-//      takes the Mac from her (MacAttention). She has her own pointer: her
-//      pointer actions unhook his mouse for their length and put his cursor
-//      back (AgentPointerHold in MacControl), and AgentPointerOverlay below
-//      shows where hers is.
-// The composer's Shotgun switch turns the stepping aside off; the Shotgun
-// shortcut (⌥Space by default, chosen in Settings) and View ▸ Show Shotgun
-// work either way.
 
 import AppKit
 import AppToolRuntime
@@ -54,9 +40,7 @@ final class ShotgunPanel: NSPanel {
         isOpaque = false
         hasShadow = true
         animationBehavior = .none
-        // Ruling 1: her own captures leave it out by window number
-        // (PersonOnlyWindows). The person's recordings keep it (10-17: the
-        // Resolve showcase recording showed no Shotgun at all).
+        // PersonOnlyWindows excludes agent captures; person recordings retain this window.
         sharingType = .readOnly
         setFull(true)
     }
@@ -152,8 +136,11 @@ final class ShotgunController: NSObject, NSWindowDelegate {
     /// call itself: its running state and Stop are the ones Shotgun shows,
     /// whichever surface the turn came from (a Telegram drive is not the chat
     /// on screen and has no Mac lifecycle; it is stopped by its session).
-    private(set) var driver: PersonOnlyWindows.Driver?
-    var drivingSessionID: String? { driver?.session }
+    private(set) var driver: PersonOnlyWindows.Driver? {
+        didSet { if let driver { selectedSessionID = driver.session } }
+    }
+    /// The conversation stays on screen after its driving authority ends.
+    private(set) var selectedSessionID: String?
     /// True while the panel is placed or animated, so only User's drag becomes
     /// the remembered spot.
     @ObservationIgnored private var placing = false
@@ -229,7 +216,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
             main.alphaValue = 1
             main.makeKeyAndOrderFront(nil)
         } else {
-            NativeAgentAppCoordinator.shared.request(.sidebar(.chat))
+            ApplicationLifetime.shared.request(.sidebar(.chat))
         }
     }
 
@@ -361,10 +348,8 @@ final class ShotgunController: NSObject, NSWindowDelegate {
 
     // MARK: - Stepping aside
 
-    /// A turn driving the Mac, from any surface (Telegram's drive of WoW
-    /// never stepped aside, 10-16): the chat on screen first, then any other
-    /// session busy with a Mac verb (its live screen pane opens with the
-    /// first Mac verb of the turn).
+    /// Prefer the visible chat's driving turn, then another busy session with
+    /// a screen pane, which opens on its first Mac verb.
     private func drivingTurnID() -> String? { drivingSession()?.turn }
 
     private func drivingSession() -> (session: String, turn: String)? {
@@ -419,6 +404,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
     /// the call returns once it is out of the picture. The composer's switch
     /// still rules; User bringing the window back is still his.
     func stepAsideForScreen(driver named: PersonOnlyWindows.Driver?) async {
+        guard !Task.isCancelled else { return }
         // The call's own session and turn bind Shotgun first, whatever the
         // window is doing; a busy session is the fallback.
         let driving = named ?? drivingSession().map { PersonOnlyWindows.Driver(session: $0.session, turn: $0.turn) }
@@ -433,9 +419,11 @@ final class ShotgunController: NSObject, NSWindowDelegate {
             guard driving.turn != steppedAsideTurn else { return }
             steppedAsideTurn = driving.turn
         }
-        stepAside()
-        // The fade is 0.3 s; the capture or verb waits for the window to be gone.
-        for _ in 0..<10 where main.isVisible { try? await Task.sleep(for: .milliseconds(50)) }
+        // This operation owns the fade; settlement releases the waiter even
+        // if the person brings the window back during it.
+        await withCheckedContinuation { continuation in
+            stepAside { continuation.resume() }
+        }
     }
 
     private func agentPointerMoved(to point: CGPoint, pressed: Bool) {
@@ -445,17 +433,18 @@ final class ShotgunController: NSObject, NSWindowDelegate {
 
     /// The main window fades and orders out (never minimizes); Shotgun comes
     /// in from where the composer was. Shotgun stays after the turn ends.
-    private func stepAside() {
+    private func stepAside(completion: @escaping @MainActor @Sendable () -> Void = {}) {
         setCollapsed(false)
         let main = Self.mainWindow().flatMap { $0.isVisible && !$0.isMiniaturized ? $0 : nil }
         show(from: main.map { Self.composerRect(in: $0.frame) }, makeKey: false)
-        guard let main else { return }
+        guard let main else { completion(); return }
         hiddenMain = main
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.3
             main.animator().alphaValue = 0
         } completionHandler: {
             Task { @MainActor in
+                defer { completion() }
                 // Brought back mid-fade: leave it on screen.
                 guard ShotgunController.shared.hiddenMain === main else { return }
                 main.orderOut(nil)
@@ -502,6 +491,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
     }
 
     private func show(from start: NSRect?, makeKey: Bool) {
+        if !isShown { selectedSessionID = driver?.session ?? appModel?.activeChatSessionId }
         let panel = makePanel()
         applyAppearance(AppearanceController.shared.appearance)
         if isShown {
@@ -625,7 +615,7 @@ final class ShotgunController: NSObject, NSWindowDelegate {
     }
 
     static func mainWindow() -> NSWindow? {
-        NSApp.windows.first { $0.identifier?.rawValue.contains(NativeAgentAppCoordinator.mainSceneID) == true }
+        NSApp.windows.first { $0.identifier?.rawValue.contains(ApplicationLifetime.mainSceneID) == true }
     }
 
     // MARK: - Rulings 1 and 2, through Core's registry

@@ -130,7 +130,7 @@ public actor DeskContinuationScheduler {
                     // Reopening a stopped task settles nothing: every pending step
                     // is re-checked through its domain, except a read by its
                     // tool's declared class, which changed nothing to verify.
-                    if Self.declaredRead(step, dataRoot: dataRoot) { verdict = .settled("interrupted read; no effects") }
+                    if Self.declaredRead(step) { verdict = .settled("interrupted read; no effects") }
                     else if step.owner == "helper" { verdict = try helperReceipt(step) }
                     else { verdict = try await verify(step, record) }
                     switch verdict {
@@ -251,8 +251,8 @@ public actor DeskContinuationScheduler {
 
     /// A read only when its whole input reads: a saved input that does not
     /// parse (a truncated checkpoint) is unknown, and goes to its domain.
-    static func declaredRead(_ step: DeskContinuation.Step, dataRoot: URL) -> Bool {
+    static func declaredRead(_ step: DeskContinuation.Step) -> Bool {
         guard case .object(let input)? = try? JSONValue.parse(Data(step.input.utf8)) else { return false }
-        return PermissionLaw.judge(tool: step.tool, input: input, policy: [:], dataRoot: dataRoot).toolClass == .read
+        return PermissionLaw.toolClass(step.tool, input: input) == .read
     }
 }

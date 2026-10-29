@@ -40,23 +40,13 @@ extension SwiftNativeTurnEngine {
         let segments = context.systemSegments
         let systemPrompt = context.systemPrompt ?? segments?.combined ?? ""
         let stable = segments?.stable ?? ""
-        // v2Prefix (live turn c83a39b8): the per-turn mass — packet, recall,
-        // capsule, clock — no longer lives in `segments.dynamic`; it was lifted
-        // into `turnVolatileBlock` and ships as a message. Scanning the system
-        // segments alone reported `dynamicBytes: 0`,
-        // `containsCognitiveSubstrate: false` and `cognitiveCapsuleBytes: 0` on
-        // a turn that carried 11,304 characters of exactly that. The Inspector
-        // was measuring the wrong string, not observing an empty one.
+        // Per-turn material may travel in the user block instead of system segments.
         let volatileBlock = context.turnVolatileBlock ?? ""
         let ridesVolatileBlock = !volatileBlock.isEmpty
         let dynamic = ridesVolatileBlock ? volatileBlock : (segments?.dynamic ?? "")
-        // Same redaction and preview discipline either way — only the source
-        // string moves.
-        let cognitiveSource = ridesVolatileBlock ? volatileBlock : systemPrompt
-        let cognitive = extractCognitiveSubstrate(from: cognitiveSource, matchingRunId: runId)
-        let resolvedRunId = runId ?? extractRuntimeValue("run_id", from: cognitive ?? cognitiveSource)
-        let resolvedSessionId = sessionId
-            ?? extractRuntimeValue("session_id", from: cognitive ?? cognitiveSource)
+        let cognitive = context.cognitiveRuntimeContext.flatMap { fragment in
+            Self.deliveredInput(context).contains(fragment) ? fragment : nil
+        }
         let sourceSizes = context.personaDocs.keys.sorted().map { id in
             let content = context.personaDocs[id] ?? ""
             return JSONValue.object([
@@ -117,7 +107,7 @@ extension SwiftNativeTurnEngine {
         TurnLifecycleTelemetry.emit(
             .contextReady,
             surface: surface,
-            sessionId: resolvedSessionId,
+            sessionId: sessionId,
             observedBy: "context.snapshot.input",
             counts: [
                 "systemBytes": Int64(systemBytes),
@@ -179,14 +169,11 @@ extension SwiftNativeTurnEngine {
             payload["preparationMs"] = .int(preparationMs)
         }
         payload["shapeVersion"] = .string("v2Prefix")
-        // What the seeding ladder chooses for this model/provider — the same
-        // pure function the lanes call, so the snapshot cannot describe a
-        // delivery the turn did not use. `none` when nothing is being lifted.
+        // One user-leading delivery on every provider. An empty delta has
+        // no new block to send; its unchanged paragraphs remain in history.
         payload["volatileDelivery"] = .string(
             ridesVolatileBlock
-                ? ConversationPrefixSeeding.delivery(
-                    model: context.modelId, providerId: context.providerId
-                ).rawValue
+                ? ConversationPrefixSeeding.VolatileDelivery.userLeadingBlock.rawValue
                 : ConversationPrefixSeeding.VolatileDelivery.none.rawValue
         )
         let historyDelivery = context.historyMessages.isEmpty ? "none" : "messages"
@@ -222,7 +209,7 @@ extension SwiftNativeTurnEngine {
         // floor inside the system prompt and this session's loads in the turn
         // brief. Measure those rows where they actually sit, so the receipt
         // can name the tool cost without counting JSON that never left.
-        if systemPrompt.contains(AnthropicOAuthDirectAdapter.textToolProtocolHeader) {
+        if systemPrompt.contains(AnthropicOAuthTransport.textToolProtocolHeader) {
             let catalog = TextMarkerCodec.catalogSections(
                 schemas: context.toolSchemas,
                 names: context.toolsAvailable
@@ -238,11 +225,11 @@ extension SwiftNativeTurnEngine {
         if let prefix = ConversationPrefixTelemetry.current {
             for (key, value) in prefix.payload { payload[key] = value }
         }
-        if let resolvedRunId, !resolvedRunId.isEmpty {
-            payload["runId"] = .string(resolvedRunId)
+        if let runId, !runId.isEmpty {
+            payload["runId"] = .string(runId)
         }
-        if let resolvedSessionId, !resolvedSessionId.isEmpty {
-            payload["sessionId"] = .string(resolvedSessionId)
+        if let sessionId, !sessionId.isEmpty {
+            payload["sessionId"] = .string(sessionId)
         }
 
         if segments != nil {
@@ -285,10 +272,7 @@ extension SwiftNativeTurnEngine {
         payload["toolNames"] = .array(toolNames.map { .string($0) })
 
         if !context.recalled.isEmpty {
-            // Sweep R4 W3: recall breadth is window-dependent now (5 → 10 on
-            // wide windows). A hardcoded 5 here would silently under-report the
-            // rows a large-window turn actually served, which is the exact
-            // "consumer assumes k=5" residue this wave has to close.
+            // Bound this recalled-hit trace slice by ContextBudgetPolicy.wideRecallRowLimit.
             payload["recalled"] = .array(context.recalled
                 .prefix(ContextBudgetPolicy.wideRecallRowLimit).map { hit in
                 var row: [String: JSONValue] = [
@@ -305,11 +289,15 @@ extension SwiftNativeTurnEngine {
 
         TurnTraceBus.fireFromContext(
             kind: "context.snapshot",
-            sessionId: resolvedSessionId,
+            sessionId: sessionId,
             surface: surface,
             payload: .object(payload)
         )
-        return resolvedSessionId
+        if let sessionId, !sessionId.isEmpty {
+            ContextFedRecord.save(sessionId: sessionId, surface: surface, fed: dynamic,
+                                  brief: ridesVolatileBlock ? "" : volatileBlock)
+        }
+        return sessionId
     }
 
     private nonisolated static func promptFingerprint(
@@ -322,45 +310,12 @@ extension SwiftNativeTurnEngine {
         updateFingerprint(&hasher, label: "user", data: Data(userMessage.utf8))
         for (index, block) in imageBlocks.enumerated() {
             let prefix = "image.\(index)"
-            switch block {
-            case .image(let mediaType, let base64, let name, let byteSize):
-                updateFingerprint(&hasher, label: prefix + ".mediaType", data: Data(mediaType.utf8))
-                updateFingerprint(&hasher, label: prefix + ".base64", data: Data(base64.utf8))
-                updateFingerprint(&hasher, label: prefix + ".name", data: Data((name ?? "").utf8))
-                updateFingerprint(
-                    &hasher,
-                    label: prefix + ".byteSize",
-                    data: Data(String(max(0, byteSize)).utf8)
-                )
-            case .text(let text):
-                updateFingerprint(&hasher, label: prefix + ".text", data: Data(text.utf8))
-            case .toolUse(let id, let name, let inputJSON):
-                updateFingerprint(&hasher, label: prefix + ".toolUse.id", data: Data(id.utf8))
-                updateFingerprint(&hasher, label: prefix + ".toolUse.name", data: Data(name.utf8))
-                updateFingerprint(&hasher, label: prefix + ".toolUse.input", data: inputJSON)
-            case .toolResult(let toolUseId, let content, let isError):
-                updateFingerprint(
-                    &hasher,
-                    label: prefix + ".toolResult.id",
-                    data: Data(toolUseId.utf8)
-                )
-                updateFingerprint(
-                    &hasher,
-                    label: prefix + ".toolResult.content",
-                    data: Data(content.utf8)
-                )
-                updateFingerprint(
-                    &hasher,
-                    label: prefix + ".toolResult.error",
-                    data: Data(String(isError).utf8)
-                )
-            }
+            updateFingerprint(&hasher, label: prefix, block: block, imageLabel: prefix)
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    // internal (was private): the v2 conversation-prefix fingerprint folds the
-    // tool contract in, and it must be the SAME digest the snapshot reports.
+    // Prefix telemetry and snapshots share the same tool-contract digest.
     nonisolated static func toolSchemaFingerprint(_ schemas: [LLMToolSchema]) -> String {
         var hasher = SHA256()
         for (index, schema) in schemas.enumerated() {
@@ -379,111 +334,36 @@ extension SwiftNativeTurnEngine {
     nonisolated static func updateFingerprint(
         _ hasher: inout SHA256,
         label: String,
+        block: LLMContentBlock,
+        imageLabel: String? = nil
+    ) {
+        switch block {
+        case .text(let text):
+            updateFingerprint(&hasher, label: label + ".text", data: Data(text.utf8))
+        case .toolUse(let id, let name, let inputJSON):
+            updateFingerprint(&hasher, label: label + ".toolUse.id", data: Data(id.utf8))
+            updateFingerprint(&hasher, label: label + ".toolUse.name", data: Data(name.utf8))
+            updateFingerprint(&hasher, label: label + ".toolUse.input", data: inputJSON)
+        case .toolResult(let toolUseId, let content, let isError):
+            updateFingerprint(&hasher, label: label + ".toolResult.id", data: Data(toolUseId.utf8))
+            updateFingerprint(&hasher, label: label + ".toolResult.content", data: Data(content.utf8))
+            updateFingerprint(&hasher, label: label + ".toolResult.error", data: Data(String(isError).utf8))
+        case .image(let mediaType, let base64, let name, let byteSize):
+            let prefix = imageLabel ?? label + ".image"
+            updateFingerprint(&hasher, label: prefix + ".mediaType", data: Data(mediaType.utf8))
+            updateFingerprint(&hasher, label: prefix + ".base64", data: Data(base64.utf8))
+            updateFingerprint(&hasher, label: prefix + ".name", data: Data((name ?? "").utf8))
+            updateFingerprint(&hasher, label: prefix + ".byteSize", data: Data(String(max(0, byteSize)).utf8))
+        }
+    }
+
+    nonisolated static func updateFingerprint(
+        _ hasher: inout SHA256,
+        label: String,
         data: Data
     ) {
         hasher.update(data: Data("\(label.utf8.count):\(label)\(data.count):".utf8))
         hasher.update(data: data)
-    }
-
-    /// Where the capsule SPAN ends.
-    ///
-    /// The capsule is `[CognitiveSubstrate] … [OrganismBehavior] …` — two
-    /// sections of one rendered runtime-context string. Everything else in the
-    /// volatile block is other per-turn mass, and the span has to stop at it.
-    ///
-    /// It used to run from the marker to END OF STRING, stopping only at two
-    /// markers that exist in the v1 COMBINED system prompt. On v2 the capsule
-    /// sits inside `turnVolatileBlock` alongside the packet, recall, history
-    /// blocks, clock and plan hint — so with any of those AFTER the capsule the
-    /// span swallowed them and `cognitiveCapsuleBytes` reported the whole
-    /// block (live 92023f8c: 9,299 of 9,299). That is the wrong-value-no-error
-    /// class again: a plausible number that is silently measuring the wrong
-    /// region.
-    ///
-    /// Listing every known non-capsule section header makes the span
-    /// order-independent — whichever block follows the capsule, the span ends
-    /// where it begins. `[OrganismBehavior]` is deliberately NOT here: it is
-    /// the capsule's own second half.
-    private nonisolated static let capsuleSpanTerminators: [String] = [
-        // v1 combined-prompt neighbours (unchanged).
-        "\n\nNativeAgent Swift tool protocol",
-        "\n\n# Since last session",
-        // v2 volatile-block neighbours.
-        "\n\nEarlier messages are history",
-        "\n\nSESSION_CONTINUITY_STATE:",
-        "\n\nRelevant earlier session snippets:",
-        "\n\nConversation history:",
-        "\n\nImmediate reply reference:",
-        "\n\nRecent memory:",
-        "\n\nLocal time:",
-        "\n\nCurrent runtime:",
-    ]
-
-    private nonisolated static func extractCognitiveSubstrate(
-        from text: String,
-        matchingRunId expectedRunId: String? = nil
-    ) -> String? {
-        let markerText = "[CognitiveSubstrate]"
-        let expectedRunId = expectedRunId?.trimmingCharacters(in: .whitespacesAndNewlines)
-        var searchRange = text.startIndex..<text.endIndex
-        var runtimeMarker: Range<String.Index>?
-
-        while let marker = text.range(of: markerText, range: searchRange) {
-            if cognitiveMarkerHasRuntimeHeader(in: text, after: marker.upperBound),
-               cognitiveMarkerMatchesExpectedRunId(in: text, after: marker.upperBound, expectedRunId: expectedRunId) {
-                runtimeMarker = marker
-            }
-            searchRange = marker.upperBound..<text.endIndex
-        }
-
-        guard let marker = runtimeMarker else { return nil }
-        var extracted = String(text[marker.lowerBound...])
-        for stop in capsuleSpanTerminators {
-            if let stopRange = extracted.range(of: stop) {
-                extracted = String(extracted[..<stopRange.lowerBound])
-            }
-        }
-        extracted = extracted
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return extracted.isEmpty ? nil : extracted
-    }
-
-    private nonisolated static func cognitiveMarkerHasRuntimeHeader(
-        in text: String,
-        after markerEnd: String.Index
-    ) -> Bool {
-        let headerEnd = text.index(markerEnd, offsetBy: 500, limitedBy: text.endIndex) ?? text.endIndex
-        let header = String(text[markerEnd..<headerEnd])
-        return header.hasPrefix(" private —")
-            || (header.contains("\nrun_id:")
-                && (header.contains("\nsession_id:") || header.contains("\nsurface:")))
-    }
-
-    private nonisolated static func cognitiveMarkerMatchesExpectedRunId(
-        in text: String,
-        after markerEnd: String.Index,
-        expectedRunId: String?
-    ) -> Bool {
-        guard let expectedRunId, !expectedRunId.isEmpty else { return true }
-        let headerEnd = text.index(markerEnd, offsetBy: 500, limitedBy: text.endIndex) ?? text.endIndex
-        let header = String(text[markerEnd..<headerEnd])
-        // The one-line header (Phase 5A) carries no run id: the capsule is
-        // rebuilt per turn inside the volatile block, so there is no older one
-        // in the same string to confuse it with.
-        if header.hasPrefix(" private —") { return true }
-        return extractRuntimeValue("run_id", from: header) == expectedRunId
-    }
-
-    private nonisolated static func extractRuntimeValue(_ key: String, from text: String) -> String? {
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            let prefix = key + ":"
-            guard trimmed.hasPrefix(prefix) else { continue }
-            let value = trimmed.dropFirst(prefix.count)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            return value.isEmpty ? nil : value
-        }
-        return nil
     }
 
     private nonisolated static func cognitiveCue(_ cognitive: String) -> JSONValue? {
@@ -547,5 +427,46 @@ extension SwiftNativeTurnEngine {
             cursor = end
         }
         return chunks
+    }
+}
+
+
+/// What a conversation's latest turn was fed, whole: the changing part of the
+/// system prompt (pinned facts, recalled memories, inner state, clock) and any
+/// turn brief. The trace keeps a preview; this keeps the text, one small file
+/// per conversation, overwritten each turn, so the composer can show it.
+public enum ContextFedRecord {
+    public struct Record: Codable, Sendable {
+        public let at: Date
+        public let surface: String
+        public let fed: String
+        public let brief: String
+    }
+
+    static func url(sessionId: String, dataRoot: URL) -> URL? {
+        guard let safe = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else { return nil }
+        return dataRoot.appendingPathComponent("diagnostics/fed", isDirectory: true)
+            .appendingPathComponent(safe + ".json")
+    }
+
+    static func save(sessionId: String, surface: String, fed: String, brief: String,
+                     dataRoot: URL = defaultDataRoot()) {
+        guard let url = url(sessionId: sessionId, dataRoot: dataRoot) else { return }
+        let record = Record(at: Date(), surface: surface, fed: fed, brief: brief)
+        DispatchQueue.global(qos: .utility).async {
+            let encoder = JSONEncoder()
+            encoder.dateEncodingStrategy = .iso8601
+            guard let data = try? encoder.encode(record) else { return }
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    public static func load(sessionId: String, dataRoot: URL) -> Record? {
+        guard let url = url(sessionId: sessionId, dataRoot: dataRoot),
+              let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(Record.self, from: data)
     }
 }

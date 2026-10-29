@@ -59,8 +59,7 @@ public enum ToolNotRunStatus: String, Sendable, Equatable {
         } else {
             fields["detail"] = .string(sentence(location: location))
         }
-        // Wave 2 #8: the step she means to take once the card is decided
-        // rides MY QUEUE, and the follow-up hands it back to her.
+        // Queue steps wait for the card's decision before the follow-up returns them to her.
         if self == .approvalFiled, case .string(let id)? = fields["approvalId"] {
             fields["then"] = .string("app {action:\"queue.add\", args:{text:\"…\", when:\"after_card \(id)\"}} "
                 + "keeps the step you will take once it is decided")
@@ -68,9 +67,7 @@ public enum ToolNotRunStatus: String, Sendable, Equatable {
         return .object(fields)
     }
 
-    /// 2026-09-22: most `toolDenied` throws are argument checks, and the
-    /// generic "access rule" sentence buried them. Say the real reason; a
-    /// real policy block names the tool and the Settings rule behind it.
+    /// Denials state their reason; policy blocks name the tool and its Settings rule.
     public static func blockedSentence(reason: String?, tool: String? = nil) -> String {
         let reason = reason?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if reason.isEmpty { return ToolNotRunStatus.blocked.sentence() }
@@ -86,6 +83,7 @@ public enum AutonomyGateError: Error, LocalizedError, Equatable {
     case notRun(ToolNotRunStatus)
     case noApprovalInboxWired
     case approvalFilingFailed(String)
+    case invalidApprovalTimeout
 
     public var notRunStatus: ToolNotRunStatus {
         switch self {
@@ -93,10 +91,12 @@ public enum AutonomyGateError: Error, LocalizedError, Equatable {
         case .notRun(let status): return status
         case .noApprovalInboxWired: return .approvalUnavailable
         case .approvalFilingFailed: return .approvalFilingFailed
+        case .invalidApprovalTimeout: return .approvalUnavailable
         }
     }
 
     public var errorDescription: String? {
+        if case .invalidApprovalTimeout = self { return "Approval timeout must be finite, nonnegative and representable in nanoseconds; no request was filed." }
         if case .toolDenied(let reason, _) = self { return ToolNotRunStatus.blockedSentence(reason: reason) }
         return notRunStatus.sentence()
     }
@@ -105,8 +105,7 @@ public enum AutonomyGateError: Error, LocalizedError, Equatable {
 // MARK: - ApprovalFiler
 
 /// Narrow protocol for staging an approval request and awaiting the user's
-/// decision. Kept separate from ApprovalInboxProtocol because the latter
-/// only exposes list/get/resolve/archive on the SwiftNative side today.
+/// decision. The canonical approval actor owns durable records and decisions.
 public protocol ApprovalFiler: Sendable {
     /// Stage an approval request. Returns the new record's id.
     func fileApprovalRequest(
@@ -116,7 +115,7 @@ public protocol ApprovalFiler: Sendable {
         reason: String
     ) async throws -> String
 
-    /// Poll/await resolution for the given approval id.
+    /// Read resolution for the given approval id when the filer supports waiting.
     func awaitResolution(id: String) async throws -> ApprovalDecision
 }
 
@@ -132,4 +131,12 @@ public protocol NonBlockingApprovalFiler: ApprovalFiler {
         payload: JSONValue,
         reason: String
     ) async -> JSONValue
+}
+
+public extension NonBlockingApprovalFiler {
+    func awaitResolution(id: String) async throws -> ApprovalDecision {
+        throw NSError(domain: "NativeAgentChatApprovalFiler", code: -1,
+            userInfo: [NSLocalizedDescriptionKey:
+                "This approval filer is nonblocking; resolved approvals execute through the canonical inbox."])
+    }
 }

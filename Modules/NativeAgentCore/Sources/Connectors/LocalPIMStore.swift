@@ -59,11 +59,26 @@ final class LocalPIMStore {
         list.source = calendar.source
         return list
     }
-    func save(_ calendar: EKCalendar) throws { try store.saveCalendar(calendar, commit: true) }
-    func save(_ event: EKEvent) throws { try store.save(event, span: .thisEvent, commit: true) }
-    func save(_ reminder: EKReminder) throws { try store.save(reminder, commit: true) }
-    func remove(_ event: EKEvent) throws { try store.remove(event, span: .thisEvent, commit: true) }
-    func remove(_ reminder: EKReminder) throws { try store.remove(reminder, commit: true) }
+    func save(_ calendar: EKCalendar) throws {
+        try Task.checkCancellation()
+        try store.saveCalendar(calendar, commit: true)
+    }
+    func save(_ event: EKEvent) throws {
+        try Task.checkCancellation()
+        try store.save(event, span: .thisEvent, commit: true)
+    }
+    func save(_ reminder: EKReminder) throws {
+        try Task.checkCancellation()
+        try store.save(reminder, commit: true)
+    }
+    func remove(_ event: EKEvent) throws {
+        try Task.checkCancellation()
+        try store.remove(event, span: .thisEvent, commit: true)
+    }
+    func remove(_ reminder: EKReminder) throws {
+        try Task.checkCancellation()
+        try store.remove(reminder, commit: true)
+    }
 
     func fetchReminders(in calendars: [EKCalendar]?, incompleteOnly: Bool,
                         completion: @escaping @Sendable ([EKReminder]?) -> Void) {
@@ -71,9 +86,7 @@ final class LocalPIMStore {
             ? store.predicateForIncompleteReminders(withDueDateStarting: nil, ending: nil, calendars: calendars)
             : store.predicateForReminders(in: calendars)
         store.fetchReminders(matching: predicate) { reminders in
-            // EventKit invokes this on its private queue. Never capture an
-            // actor-isolated processor (the 2026-06-07 isolation SIGTRAP).
-            // Objects stay on this queue; Core resumes with Sendable values.
+            // Render Sendable values on EventKit's callback queue without capturing actor-isolated processors.
             completion(reminders)
         }
     }

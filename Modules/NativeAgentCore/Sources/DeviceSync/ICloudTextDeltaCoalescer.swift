@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `ICloudTextDeltaCoalescer.swift` | `ICloudTextDeltaCoalescer` struct; `push`, `flush` |
+// Blueprint: | `ICloudTextDeltaCoalescer.swift` | Owns the accumulating stream text; `push` appends deltas, `flush` emits full-text replacements |
 
 struct ICloudTextDeltaFlush: Equatable, Sendable {
     enum Reason: String, Sendable {
@@ -20,14 +20,11 @@ struct ICloudTextDeltaCoalescer: Sendable {
     var maxCharactersBetweenFlushes: Int
 
     private(set) var sequence: Int = 0
-    private var pendingText: String = ""
+    private(set) var text: String = ""
     private var lastFlushedTextCount: Int = 0
     private var lastFlushUptimeNanoseconds: UInt64?
 
-    /// 2026-10-07: 1 s / 120 characters, from 1.5 s / 320. A short reply
-    /// never reached 320 between flushes, so the phone saw its first words and
-    /// then the whole answer. Each flush is one awaited CloudKit write, so the
-    /// writes still come at most about once a second.
+    /// Full-text flushes replace unsent snapshots losslessly; transport publication stays outside stream consumption.
     init(
         minIntervalNanoseconds: UInt64 = 1_000_000_000,
         minCharactersBetweenFlushes: Int = 120,
@@ -38,8 +35,8 @@ struct ICloudTextDeltaCoalescer: Sendable {
         self.maxCharactersBetweenFlushes = max(self.minCharactersBetweenFlushes, maxCharactersBetweenFlushes)
     }
 
-    mutating func push(snapshot: String, nowUptimeNanoseconds: UInt64) -> ICloudTextDeltaFlush? {
-        pendingText = snapshot
+    mutating func push(delta: String, nowUptimeNanoseconds: UInt64) -> ICloudTextDeltaFlush? {
+        text += delta
         return flushIfNeeded(nowUptimeNanoseconds: nowUptimeNanoseconds, force: false)
     }
 
@@ -51,8 +48,8 @@ struct ICloudTextDeltaCoalescer: Sendable {
         nowUptimeNanoseconds: UInt64,
         force: Bool
     ) -> ICloudTextDeltaFlush? {
-        guard !pendingText.isEmpty else { return nil }
-        guard pendingText.count > lastFlushedTextCount else { return nil }
+        guard !text.isEmpty else { return nil }
+        guard text.count > lastFlushedTextCount else { return nil }
 
         let reason: ICloudTextDeltaFlush.Reason?
         if force {
@@ -60,7 +57,7 @@ struct ICloudTextDeltaCoalescer: Sendable {
         } else if lastFlushUptimeNanoseconds == nil {
             reason = .first
         } else {
-            let charDelta = pendingText.count - lastFlushedTextCount
+            let charDelta = text.count - lastFlushedTextCount
             let elapsed = nowUptimeNanoseconds &- (lastFlushUptimeNanoseconds ?? nowUptimeNanoseconds)
             if charDelta >= maxCharactersBetweenFlushes {
                 reason = .size
@@ -74,7 +71,7 @@ struct ICloudTextDeltaCoalescer: Sendable {
         guard let reason else { return nil }
         sequence += 1
         lastFlushUptimeNanoseconds = nowUptimeNanoseconds
-        lastFlushedTextCount = pendingText.count
-        return ICloudTextDeltaFlush(sequence: sequence, text: pendingText, reason: reason)
+        lastFlushedTextCount = text.count
+        return ICloudTextDeltaFlush(sequence: sequence, text: text, reason: reason)
     }
 }

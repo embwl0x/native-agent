@@ -1,10 +1,7 @@
-// NativeCognitionRuntime+MindLedger.swift
-// Phase 5 B0 (2026-10-03) — `mind.why`, `mind.reject`, `mind.undo`.
-//
 // Why reads the turn trace, where each delivered turn records why its felt cue
 // (or none) won and each context build records which memories competed. The
 // prompt never carries any of it. Reject and undo are her own verbs over her
-// own mind; the substrate owns both lists and their caps.
+// own mind; the substrate owns bounded rejections and one disposition undo.
 
 import ChatTurnContracts
 import AgentConversations
@@ -17,7 +14,7 @@ import Privacy
 import Studio
 import TurnTrace
 
-// Blueprint: | `NativeCognitionRuntime+MindLedger.swift` | `NativeCognitionRuntime` mind ledger: trace-backed why, association rejection and undertone undo through substrate owners |
+// Blueprint: | `NativeCognitionRuntime+MindLedger.swift` | `NativeCognitionRuntime` mind ledger: trace-backed why (cue, memory, outreach, expansion and interpretation lanes), association rejection and undertone undo through substrate owners |
 
 extension NativeCognitionRuntime {
     /// Why and terminal rows of today and yesterday (calendar days), newest
@@ -98,14 +95,6 @@ extension NativeCognitionRuntime {
             out[Self.lane(row.event)] = row.payload
             out["at"] = out["at"] ?? .string(ISO8601DateFormatter().string(from: row.event.ts))
         }
-        // Phase 5 D (Agent): the personal recall lane (Phase 5 C) on its own,
-        // not buried inside the memory lane — or said plainly when it is absent.
-        if case .object(let memory)? = out["memory"], let personal = memory["personal"] {
-            out["personal"] = personal
-        } else if !rows.isEmpty {
-            out["personal"] = .object(["pick": .null, "detail": .string(
-                "No personal memory is available for this turn.")])
-        }
         out["recent_turns"] = .array(recent.map { .string($0) })
         return .object(out)
     }
@@ -115,7 +104,7 @@ extension NativeCognitionRuntime {
     private func disclosedWhyPayload(_ payload: JSONValue, surface: String) async -> JSONValue? {
         guard case .object(let fields) = payload,
               case .string(let lane)? = fields["lane"],
-              ["cue", "memory", "outreach"].contains(lane) else { return nil }
+              ["cue", "memory", "outreach", "expansion", "interpretation"].contains(lane) else { return nil }
         if lane != "memory",
            MemoryRecordDisclosurePolicy.classify(
             personaID: nil, status: nil, lifecycle: nil, tags: nil, metadata: nil

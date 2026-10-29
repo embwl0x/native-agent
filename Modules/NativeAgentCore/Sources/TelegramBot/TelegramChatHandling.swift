@@ -1,26 +1,13 @@
 import Foundation
 import PersistenceCore
 import ChatSessionWork
+import ChatTurnRuntime
 
 // Blueprint: | `TelegramChatHandling.swift` | Telegram chat contracts: progress/compaction sinks and attempt context carrying decoded sender identity separately from chat identity |
 
-public typealias TelegramCompactionHandler = @Sendable (_ sessionId: String) async throws -> ChatSessionCompactionOutcome
+public typealias TelegramCompaction = @Sendable (_ sessionId: String) async throws -> ChatSessionCompactionOutcome
 
-public enum TelegramChatProgressEvent: Sendable, Equatable {
-    case replyTextSettled(Bool)
-    case status(text: String)
-    case toolUse(name: String, input: JSONValue?)
-    case toolResult(name: String, output: JSONValue?)
-    /// In-turn notice (invoke_claude start / heartbeat / timeout). `kind`
-    /// lets the sink throttle heartbeats while always delivering terminal
-    /// notices like `invoke_timeout`.
-    case notice(kind: String, text: String)
-    /// Accumulated reply text so far. Routed to the native draft preview,
-    /// never rendered as a discrete progress message.
-    case textDelta(accumulated: String)
-}
-
-public typealias TelegramChatProgressSink = @Sendable (TelegramChatProgressEvent) async -> Void
+public typealias TelegramChatProgressSink = @Sendable (TurnStreamEvent) async -> Void
 
 public struct TelegramChatAttemptContext: Sendable, Equatable {
     public let replyTo: TelegramReplyContext?
@@ -29,16 +16,10 @@ public struct TelegramChatAttemptContext: Sendable, Equatable {
     /// configure `allowed_user_ids`, which TrustCenter must be able to prove at
     /// the effect-time gate.
     public let fromUserId: Int?
-    /// 2026-09-06: the chat session this turn must run in, when the caller
-    /// already knows it. Only an approval continuation sets it — it has to
-    /// resume the session the interrupted turn ran in, not whichever session
-    /// the chat is bound to now. Nil means "resolve the chat's active session".
+    /// Approval continuations pin their original session; nil resolves the chat's active session.
     public let sessionId: String?
     public let runId: String?
-    /// 2026-09-06: the forum topic this turn arrived in, when there is one.
-    /// The handler keys its chat session on (chatId, threadId): a topic in a
-    /// supergroup is its own conversation, and nil means the whole chat — a
-    /// DM, an ordinary group, or a forum's General topic.
+    /// Sessions key on (chatId, threadId); nil addresses a chat-only conversation.
     public let threadId: Int?
     public let suppressUserAppend: Bool
 

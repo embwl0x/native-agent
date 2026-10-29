@@ -1,10 +1,14 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 #if canImport(CryptoKit)
 import CryptoKit
 #endif
 #if canImport(AppKit)
+import AppKit
+import IOKit.hidsystem
+import CryptoKit
 import AppKit
 import IOKit.hidsystem
 // Blueprint: | `MacControl+SystemActions.swift` | `SwiftNativeMacControl`: `handleFileRead`, `handleFileWrite`, `handleFileList`, `handleMedia` (Now Playing system keys and running-player observations) |
@@ -16,19 +20,19 @@ extension SwiftNativeMacControl {
     // Synchronous filesystem calls may wait for permission or a volume. They
     // must not hold the actor that owns the operation deadline and settlement.
     nonisolated func handleFileRead(_ body: [String: JSONValue]) async throws -> MacControlResult {
-        guard let path = body.stringValue("path"), !path.isEmpty else {
+        guard let path = body["path"]?.stringValue, !path.isEmpty else {
             throw MacControlError.missingField("path")
         }
         if let reason = MacControlSensitivePathFence.reason(forPath: path) {
             throw MacControlError.sensitivePathDenied(reason)
         }
-        let maxBytes = max(1, min(Self.intValue(body, "max_bytes") ?? 1_000_000, 1_000_000))
+        let maxBytes = max(1, min(body["max_bytes"]?.integerValue.flatMap(Int.init(exactly:)) ?? 1_000_000, 1_000_000))
         let started = now()
-        let expanded = (path as NSString).expandingTildeInPath
         // TOCTOU shrink: re-resolve right before the syscall + re-fence.
         // Foundation has no O_NOFOLLOW open, so this still leaves a window
         // between resolve and FileManager open — see fence doc comment.
-        let url = URL(fileURLWithPath: expanded).resolvingSymlinksInPath()
+        let url = NativeAgentWorkspaceRoot.canonicalFileURL(NativeAgentWorkspaceRoot.fileCandidate(
+            path, relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)))
         if let reason = MacControlSensitivePathFence.reason(forPath: url.path) {
             throw MacControlError.sensitivePathDenied(reason)
         }
@@ -66,7 +70,7 @@ extension SwiftNativeMacControl {
     // MARK: file/write
 
     nonisolated func handleFileWrite(_ body: [String: JSONValue]) async throws -> MacControlResult {
-        guard let path = body.stringValue("path"), !path.isEmpty else {
+        guard let path = body["path"]?.stringValue, !path.isEmpty else {
             throw MacControlError.missingField("path")
         }
         if let reason = MacControlSensitivePathFence.reason(forPath: path) {
@@ -81,8 +85,8 @@ extension SwiftNativeMacControl {
         var append = false
         if case .bool(let b) = body["append"] ?? .null { append = b }
         let started = now()
-        let expanded = (path as NSString).expandingTildeInPath
-        let url = URL(fileURLWithPath: expanded).resolvingSymlinksInPath()
+        let url = NativeAgentWorkspaceRoot.canonicalFileURL(NativeAgentWorkspaceRoot.fileCandidate(
+            path, relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)))
         if let reason = MacControlSensitivePathFence.reason(forPath: url.path) {
             throw MacControlError.sensitivePathDenied(reason)
         }
@@ -99,12 +103,14 @@ extension SwiftNativeMacControl {
             throw MacControlError.ioFailure("write \(path): \(error)")
         }
         let verified: Bool = {
+            let expected = Data(content.utf8)
             guard fileManagerAdapter.itemExists(at: url),
-                  let observed = try? fileManagerAdapter.readData(at: url, maxBytes: 10_000_000) else {
+                  let observed = try? fileManagerAdapter.readData(
+                    at: url, maxBytes: expected.count + (append ? 0 : 1), fromEnd: append
+                  ) else {
                 return false
             }
-            let expected = Data(content.utf8)
-            return append ? observed.suffix(expected.count) == expected[...] : observed == expected
+            return observed == expected
         }()
         let durationMs = Int(now().timeIntervalSince(started) * 1000)
         return MacControlResult(
@@ -124,15 +130,15 @@ extension SwiftNativeMacControl {
     // MARK: file/list
 
     nonisolated func handleFileList(_ body: [String: JSONValue]) async throws -> MacControlResult {
-        guard let path = body.stringValue("path"), !path.isEmpty else {
+        guard let path = body["path"]?.stringValue, !path.isEmpty else {
             throw MacControlError.missingField("path")
         }
         if let reason = MacControlSensitivePathFence.reason(forPath: path) {
             throw MacControlError.sensitivePathDenied(reason)
         }
         let started = now()
-        let expanded = (path as NSString).expandingTildeInPath
-        let url = URL(fileURLWithPath: expanded).resolvingSymlinksInPath()
+        let url = NativeAgentWorkspaceRoot.canonicalFileURL(NativeAgentWorkspaceRoot.fileCandidate(
+            path, relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)))
         if let reason = MacControlSensitivePathFence.reason(forPath: url.path) {
             throw MacControlError.sensitivePathDenied(reason)
         }
@@ -160,10 +166,10 @@ extension SwiftNativeMacControl {
     // MARK: file/move
 
     nonisolated func handleFileMove(_ body: [String: JSONValue]) async throws -> MacControlResult {
-        guard let src = body.stringValue("src"), !src.isEmpty else {
+        guard let src = body["src"]?.stringValue, !src.isEmpty else {
             throw MacControlError.missingField("src")
         }
-        guard let dst = body.stringValue("dst"), !dst.isEmpty else {
+        guard let dst = body["dst"]?.stringValue, !dst.isEmpty else {
             throw MacControlError.missingField("dst")
         }
         if let reason = MacControlSensitivePathFence.mutationReason(forPath: src) {
@@ -179,20 +185,21 @@ extension SwiftNativeMacControl {
             throw MacControlError.sensitivePathDenied(reason)
         }
         let started = now()
-        let srcURL = URL(fileURLWithPath: (src as NSString).expandingTildeInPath)
-            .resolvingSymlinksInPath()
-        let dstURL = URL(fileURLWithPath: (dst as NSString).expandingTildeInPath)
-            .resolvingSymlinksInPath()
-        if let reason = MacControlSensitivePathFence.mutationReason(forPath: srcURL.path) {
+        let base = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let srcURL = NativeAgentWorkspaceRoot.canonicalFileURL(NativeAgentWorkspaceRoot.fileCandidate(src, relativeTo: base), followFinalLink: false)
+        let dstURL = NativeAgentWorkspaceRoot.canonicalFileURL(NativeAgentWorkspaceRoot.fileCandidate(dst, relativeTo: base), followFinalLink: false)
+        let resolvedSrc = NativeAgentWorkspaceRoot.canonicalFileURL(srcURL)
+        let resolvedDst = NativeAgentWorkspaceRoot.canonicalFileURL(dstURL)
+        if let reason = MacControlSensitivePathFence.mutationReason(forPath: resolvedSrc.path) {
             throw MacControlError.sensitivePathDenied(reason)
         }
-        if let reason = MacControlSensitivePathFence.mutationReason(forPath: dstURL.path) {
+        if let reason = MacControlSensitivePathFence.mutationReason(forPath: resolvedDst.path) {
             throw MacControlError.sensitivePathDenied(reason)
         }
-        if let reason = MacControlSensitivePathFence.protectedSystemMutationReason(forPath: srcURL.path) {
+        if let reason = MacControlSensitivePathFence.protectedSystemMutationReason(forPath: resolvedSrc.path) {
             throw MacControlError.sensitivePathDenied(reason)
         }
-        if let reason = MacControlSensitivePathFence.protectedSystemMutationReason(forPath: dstURL.path) {
+        if let reason = MacControlSensitivePathFence.protectedSystemMutationReason(forPath: resolvedDst.path) {
             throw MacControlError.sensitivePathDenied(reason)
         }
         do {
@@ -218,7 +225,7 @@ extension SwiftNativeMacControl {
     // MARK: file/trash
 
     nonisolated func handleFileTrash(_ body: [String: JSONValue]) async throws -> MacControlResult {
-        guard let path = body.stringValue("path"), !path.isEmpty else {
+        guard let path = body["path"]?.stringValue, !path.isEmpty else {
             throw MacControlError.missingField("path")
         }
         if let reason = MacControlSensitivePathFence.mutationReason(forPath: path) {
@@ -228,12 +235,13 @@ extension SwiftNativeMacControl {
             throw MacControlError.sensitivePathDenied(reason)
         }
         let started = now()
-        let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
-            .resolvingSymlinksInPath()
-        if let reason = MacControlSensitivePathFence.mutationReason(forPath: url.path) {
+        let url = NativeAgentWorkspaceRoot.canonicalFileURL(NativeAgentWorkspaceRoot.fileCandidate(
+            path, relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)), followFinalLink: false)
+        let resolved = NativeAgentWorkspaceRoot.canonicalFileURL(url)
+        if let reason = MacControlSensitivePathFence.mutationReason(forPath: resolved.path) {
             throw MacControlError.sensitivePathDenied(reason)
         }
-        if let reason = MacControlSensitivePathFence.protectedSystemMutationReason(forPath: url.path) {
+        if let reason = MacControlSensitivePathFence.protectedSystemMutationReason(forPath: resolved.path) {
             throw MacControlError.sensitivePathDenied(reason)
         }
         do {
@@ -256,7 +264,7 @@ extension SwiftNativeMacControl {
     }
 
     func handleVolume(_ body: [String: JSONValue]) async throws -> MacControlResult {
-        let level = Self.intValue(body, "level"), adjust = Self.intValue(body, "adjust")
+        let level = body["level"]?.integerValue.flatMap(Int.init(exactly:)), adjust = body["adjust"]?.integerValue.flatMap(Int.init(exactly:))
         guard !(level != nil && adjust != nil),
               level.map({ (0...100).contains($0) }) ?? true,
               adjust.map({ (-100...100).contains($0) }) ?? true else {
@@ -285,9 +293,15 @@ extension SwiftNativeMacControl {
     }
 
     func handleMedia(_ body: [String: JSONValue]) async throws -> MacControlResult {
-        guard let action = body.stringValue("action")?.lowercased(),
+        guard let action = body["action"]?.stringValue?.lowercased(),
               ["play", "resume", "pause", "toggle", "next", "skip", "previous"].contains(action) else {
             throw MacControlError.missingField("action: play, resume, pause, toggle, next, skip or previous")
+        }
+        if ["play", "resume", "pause"].contains(action) {
+            return MacControlResult(ok: false, action: "media", output: .object([
+                "action": .string(action), "effects": .string("none"),
+                "message": .string("The Now Playing owner and playback state cannot be established, so this idempotent action was not sent. Use the player's own action; toggle explicitly requests a play/pause toggle.")
+            ]), error: "playback_owner_unavailable", durationMs: 0)
         }
         #if canImport(AppKit)
         let started = now()
@@ -331,7 +345,7 @@ extension SwiftNativeMacControl {
     // MARK: applescript
 
     func handleAppleScript(_ body: [String: JSONValue]) async throws -> MacControlResult {
-        guard let script = body.stringValue("script"), !script.isEmpty else {
+        guard let script = body["script"]?.stringValue, !script.isEmpty else {
             throw MacControlError.missingField("script")
         }
         let started = now()
@@ -394,10 +408,10 @@ extension SwiftNativeMacControl {
     // MARK: focus_app / quit_app
 
     private func requestedAppName(_ body: [String: JSONValue]) throws -> String {
-        let value = body.stringValue("app")
-            ?? body.stringValue("name")
-            ?? body.stringValue("bundle_id")
-            ?? body.stringValue("bundleId")
+        let value = body["app"]?.stringValue
+            ?? body["name"]?.stringValue
+            ?? body["bundle_id"]?.stringValue
+            ?? body["bundleId"]?.stringValue
             ?? ""
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -407,7 +421,7 @@ extension SwiftNativeMacControl {
     }
 
     func handleFocusApp(_ body: [String: JSONValue]) async throws -> MacControlResult {
-        if let rawPid = Self.intValue(body, "pid") {
+        if let rawPid = body["pid"]?.integerValue.flatMap(Int.init(exactly:)) {
             return await handleFocusExact(pid: Int32(clamping: rawPid), body: body)
         }
         if let continuation = MacWorkContinuation.current, continuation.isPending, body["background"] != .bool(true) {
@@ -450,24 +464,14 @@ extension SwiftNativeMacControl {
                 "error": .string(error.localizedDescription),
             ]
             if let evidence = error as? ToolFailureError {
-                output["effects"] = .string(evidence.effects.rawValue)
-                if let owner = evidence.owner {
-                    let call = evidence.nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }
-                    output["remedy"] = if evidence.personDecides, let tap = evidence.tap {
-                        Repair.why(owner: owner, tap: tap)
-                    } else { Repair.remedy(owner: owner, nextCall: call, tap: evidence.tap) }
-                } else if let argument = evidence.argumentPath {
-                    output["remedy"] = .object(["kind": .string("correct_arguments"),
-                        "argument_path": .string(argument), "accepted": evidence.accepted.map(JSONValue.string) ?? .null,
-                        "instruction": .string(evidence.message)])
-                }
+                output.merge(evidence.failureEvidence(defaultCode: "focus_failed")) { _, owned in owned }
             }
         }
         return MacControlResult(ok: failure == nil, action: "focus_app", output: .object(output),
             error: failure, durationMs: Int(now().timeIntervalSince(started) * 1000))
     }
 
-    /// Her-screen Phase 4 — focus an EXACT process, and optionally one exact
+    /// Focus an exact process, and optionally one exact
     /// window of it: `frame_id` (the window a look was of — must still be
     /// there) or `window` (a recorded identity; falls back to the app's top
     /// window). Never by name, never another instance, never a launch: a pid
@@ -497,21 +501,16 @@ extension SwiftNativeMacControl {
             return finish("app_gone")
         }
         if pid == getpid() {
-            // Our own app: activate it, never an AX read of ourselves. From the
-            // back, NSRunningApplication.activate is cooperative on macOS 14+
-            // and the raised app never yields, so NativeAgent was never put
-            // back (3 of 3 in her traces, 09-24). NSApp's own call still takes it.
+            // Activate our own app without an AX read of ourselves.
             let binding = MacDriverContext.binding
             await MainActor.run {
                 if binding?.allowsEmission == true { NSApplication.shared.activate(ignoringOtherApps: true) }
             }
             if accessibilitySource.frontmostApp()?.processIdentifier != pid, binding?.allowsEmission == true { _ = app.activate() }
-            for _ in 0..<20 where accessibilitySource.frontmostApp()?.processIdentifier != pid {
-                try? await Task.sleep(nanoseconds: 50_000_000)
-            }
+            try? await MacApplications.observeActivation(of: pid, within: 1)
             return finish("focused")
         }
-        let exact = body.stringValue("frame_id")
+        let exact = body["frame_id"]?.stringValue
         let continuation = MacWorkContinuation.current.flatMap { $0.isPending ? $0 : nil }
         var identity = continuation?.window
         if continuation != nil {
@@ -546,9 +545,7 @@ extension SwiftNativeMacControl {
             guard identity == nil, exact == nil else { return finish("app_has_no_window") }
             guard MacDriverContext.binding?.allowsEmission == true else { return finish("yielded_to_user") }
             _ = app.activate()
-            for _ in 0..<20 where accessibilitySource.frontmostApp()?.processIdentifier != pid {
-                try? await Task.sleep(nanoseconds: 50_000_000)
-            }
+            try? await MacApplications.observeActivation(of: pid, within: 1)
             return finish("focused", ["window_matched": .bool(false)])
         }
         if let refusal = continuation?.refusal() {
@@ -573,7 +570,7 @@ extension SwiftNativeMacControl {
     /// result stays explicitly unverified; the four-verb surface follows this
     /// operation with a fresh screen and speaks only what that read shows.
     func handleOpenTarget(_ body: [String: JSONValue]) async throws -> MacControlResult {
-        guard let raw = body.stringValue("url")?.trimmingCharacters(in: .whitespacesAndNewlines),
+        guard let raw = body["url"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty,
               let url = URL(string: raw),
               let scheme = url.scheme?.lowercased(),
@@ -652,11 +649,11 @@ extension SwiftNativeMacControl {
     // MARK: spotlight
 
     func handleSpotlight(_ body: [String: JSONValue]) async throws -> MacControlResult {
-        let query = body.stringValue("query") ?? body.stringValue("q") ?? ""
+        let query = body["query"]?.stringValue ?? body["q"]?.stringValue ?? ""
         if query.isEmpty {
             throw MacControlError.missingField("query")
         }
-        let limit = max(1, min(Self.intValue(body, "limit") ?? 10, 200))
+        let limit = max(1, min(body["limit"]?.integerValue.flatMap(Int.init(exactly:)) ?? 10, 200))
         let started = now()
         // Her files and the Mac's apps, never the whole disk: unscoped, one
         // query took 10 s and timed out, then 15 s (fresh install, 10-19).
@@ -694,12 +691,11 @@ extension SwiftNativeMacControl {
             .filter { MacControlSensitivePathFence.reason(forPath: $0) == nil }
             .prefix(limit)
         let durationMs = Int(now().timeIntervalSince(started) * 1000)
-        let iso = ISO8601DateFormatter()
         let files: [JSONValue] = lines.map { path in
             let dates = try? URL(fileURLWithPath: path).resourceValues(forKeys: [.contentModificationDateKey, .addedToDirectoryDateKey])
             return .object(["path": .string(path),
-                "modified_at": dates?.contentModificationDate.map { .string(iso.string(from: $0)) } ?? .null,
-                "added_at": dates?.addedToDirectoryDate.map { .string(iso.string(from: $0)) } ?? .null])
+                "modified_at": dates?.contentModificationDate.map { .string(NativeTimestampFormat.plainZulu($0)) } ?? .null,
+                "added_at": dates?.addedToDirectoryDate.map { .string(NativeTimestampFormat.plainZulu($0)) } ?? .null])
         }
         var output: [String: JSONValue] = [
             "query": .string(query),
@@ -728,10 +724,10 @@ extension SwiftNativeMacControl {
     // MARK: shell
 
     func handleShell(_ body: [String: JSONValue]) async throws -> MacControlResult {
-        guard let command = body.stringValue("command"), !command.isEmpty else {
+        guard let command = body["command"]?.stringValue, !command.isEmpty else {
             throw MacControlError.missingField("command")
         }
-        let timeout = max(1, min(Self.intValue(body, "timeout") ?? 60, 120))
+        let timeout = max(1, min(body["timeout"]?.integerValue.flatMap(Int.init(exactly:)) ?? 60, 120))
         let started = now()
         let result = try await processAdapter.run(
             executable: "/bin/sh",

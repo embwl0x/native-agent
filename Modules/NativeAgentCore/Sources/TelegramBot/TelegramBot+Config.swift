@@ -3,6 +3,7 @@ import Darwin
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
+import NativeAgentShared
 // Blueprint: | `TelegramBot+Config.swift` | Saved shape validation, exact positive `voice_max_bytes` and TransportAllowlist's normalized integer IDs. Model/effort fields are legacy routing metadata; voice model metadata does not select recognition. Loads can remove retired credentials and migrate plaintext to Keychain. Conditional saves resolve kept tokens under the config lock and advance revisions, including disconnect |
 
 /// Credential-free configuration for management surfaces. Runtime configuration
@@ -29,7 +30,7 @@ public struct TelegramConfigurationSummary: Sendable, Equatable {
 
 // MARK: - TelegramConfig
 //
-// CANONICAL PATH (fix2/F1): `<dataRoot>/telegram/config.json`. The legacy
+// Canonical path: `<dataRoot>/telegram/config.json`. The legacy
 // `<dataRoot>/config/config.json["telegram"]` block is retired: only its
 // plaintext credential fields are removed, never imported or used for routing.
 // See docs/canonical_data_paths.md.
@@ -53,8 +54,6 @@ public struct TelegramConfig: Sendable, Equatable {
     private static let tokenReferenceField = "bot_token_keychain_ref"
     private static let tokenService = "NativeAgent.telegram-bot"
     public static let defaultVoiceTranscriptionEnabled = true
-    public static let defaultVoiceTranscriptionBackend = TelegramVoiceTranscriptionBackends.appleSpeech
-    public static let defaultVoiceTranscriptionModel = TelegramVoiceTranscriptionBackends.appleSpeechModel
     public static let defaultVoiceMaxBytes = 24 * 1024 * 1024
 
     public let botToken: String
@@ -74,9 +73,6 @@ public struct TelegramConfig: Sendable, Equatable {
     public let model: String?
     public let reasoningEffort: String?
     public let voiceTranscriptionEnabled: Bool
-    public let voiceTranscriptionBackend: String
-    /// Legacy saved metadata; recognition uses Apple Speech and reports `apple-speech`.
-    public let voiceTranscriptionModel: String
     public let voiceMaxBytes: Int
 
     public init(
@@ -88,8 +84,6 @@ public struct TelegramConfig: Sendable, Equatable {
         model: String? = nil,
         reasoningEffort: String? = nil,
         voiceTranscriptionEnabled: Bool = TelegramConfig.defaultVoiceTranscriptionEnabled,
-        voiceTranscriptionBackend: String = TelegramConfig.defaultVoiceTranscriptionBackend,
-        voiceTranscriptionModel: String = TelegramConfig.defaultVoiceTranscriptionModel,
         voiceMaxBytes: Int = TelegramConfig.defaultVoiceMaxBytes,
         tokenConfigured: Bool? = nil
     ) {
@@ -102,13 +96,6 @@ public struct TelegramConfig: Sendable, Equatable {
         self.model = model
         self.reasoningEffort = reasoningEffort
         self.voiceTranscriptionEnabled = voiceTranscriptionEnabled
-        let canonicalVoiceBackend = TelegramVoiceTranscriptionBackends.canonical(voiceTranscriptionBackend)
-        let trimmedVoiceModel = voiceTranscriptionModel
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        self.voiceTranscriptionBackend = canonicalVoiceBackend
-        self.voiceTranscriptionModel = trimmedVoiceModel.isEmpty
-            ? TelegramVoiceTranscriptionBackends.appleSpeechModel
-            : trimmedVoiceModel
         self.voiceMaxBytes = max(1, voiceMaxBytes)
     }
 
@@ -142,13 +129,8 @@ public struct TelegramConfig: Sendable, Equatable {
         }
         let path = dataRoot.appendingPathComponent("telegram/config.json")
         return try CredentialFileLock.withLock(path) {
-            try validateSavedConfiguration(dataRoot: dataRoot)
-            var info = stat()
-            if lstat(path.path, &info) != 0 {
-                if errno == ENOENT { return nil }
-                throw PersistenceCoreError.ioFailure("Saved Telegram settings are unreadable")
-            }
-            return try parseFlat(path, includeDisconnected: includeDisconnected, resolveCredential: resolveCredential)
+            guard let fields = try validateSavedConfiguration(dataRoot: dataRoot) else { return nil }
+            return try parseFlat(fields, at: path, includeDisconnected: includeDisconnected, resolveCredential: resolveCredential)
         }
     }
 
@@ -173,19 +155,17 @@ public struct TelegramConfig: Sendable, Equatable {
             // same lock excludes disconnect and every other config writer.
             let token = keepExistingToken
                 ? (try loadSavedConfiguration(dataRoot: dataRoot)?.botToken ?? "") : cfg.botToken
-            var payload: [String: Any] = [
-                "configuration_revision": UUID().uuidString,
-                "allowed_chat_ids": cfg.allowedChatIds.sorted().map { NSNumber(value: $0) },
-                "allowed_user_ids": cfg.allowedUserIds.sorted().map { NSNumber(value: $0) },
-                "require_mention": cfg.requireMention,
-                "enabled": cfg.enabled && !token.isEmpty,
+            var payload: [String: JSONValue] = [
+                "configuration_revision": .string(UUID().uuidString),
+                "allowed_chat_ids": .array(cfg.allowedChatIds.sorted().map(JSONValue.int)),
+                "allowed_user_ids": .array(cfg.allowedUserIds.sorted().map(JSONValue.int)),
+                "require_mention": .bool(cfg.requireMention),
+                "enabled": .bool(cfg.enabled && !token.isEmpty),
             ]
-            if let m = cfg.model, !m.isEmpty { payload["model"] = m }
-            if let e = cfg.reasoningEffort, !e.isEmpty { payload["reasoning_effort"] = e }
-            payload["voice_transcription_enabled"] = cfg.voiceTranscriptionEnabled
-            payload["voice_transcription_backend"] = cfg.voiceTranscriptionBackend
-            payload["voice_transcription_model"] = cfg.voiceTranscriptionModel
-            payload["voice_max_bytes"] = cfg.voiceMaxBytes
+            if let m = cfg.model, !m.isEmpty { payload["model"] = .string(m) }
+            if let e = cfg.reasoningEffort, !e.isEmpty { payload["reasoning_effort"] = .string(e) }
+            payload["voice_transcription_enabled"] = .bool(cfg.voiceTranscriptionEnabled)
+            payload["voice_max_bytes"] = .int(Int64(cfg.voiceMaxBytes))
             try writePayload(payload, token: token, to: url)
         }
     }
@@ -214,65 +194,12 @@ public struct TelegramConfig: Sendable, Equatable {
                 guard try JSONSerialization.jsonObject(with: original) is [String: Any],
                       String(data: original, encoding: .utf8) != nil else { throw failure }
                 let bytes = Array(original)
-                let whitespace: Set<UInt8> = [0x20, 0x09, 0x0A, 0x0D]
-                func skipWhitespace(_ index: inout Int) {
-                    while index < bytes.count, whitespace.contains(bytes[index]) { index += 1 }
-                }
-                func skipString(_ index: inout Int) throws {
-                    guard index < bytes.count, bytes[index] == 0x22 else { throw failure }
-                    index += 1
-                    while index < bytes.count {
-                        let byte = bytes[index]
-                        index += 1
-                        if byte == 0x22 { return }
-                        if byte == 0x5C { index += 1 }
-                    }
-                    throw failure
-                }
-                // JSON validity is checked above; this scan only locates byte
-                // ranges, including escaped keys and nested unrelated values.
-                func members(at start: Int) throws -> [(key: String, start: Int, value: Int, end: Int, comma: Int?)] {
-                    guard start < bytes.count, bytes[start] == 0x7B else { throw failure }
-                    var result: [(key: String, start: Int, value: Int, end: Int, comma: Int?)] = []
-                    var index = start + 1
-                    skipWhitespace(&index)
-                    while index < bytes.count, bytes[index] != 0x7D {
-                        let keyStart = index
-                        try skipString(&index)
-                        guard let key = try JSONSerialization.jsonObject(
-                            with: Data(bytes[keyStart..<index]), options: [.fragmentsAllowed]
-                        ) as? String else { throw failure }
-                        skipWhitespace(&index)
-                        guard index < bytes.count, bytes[index] == 0x3A else { throw failure }
-                        index += 1
-                        skipWhitespace(&index)
-                        let valueStart = index
-                        var depth = 0
-                        while index < bytes.count {
-                            let byte = bytes[index]
-                            if byte == 0x22 { try skipString(&index); continue }
-                            if depth == 0, byte == 0x2C || byte == 0x7D { break }
-                            if byte == 0x7B || byte == 0x5B { depth += 1 }
-                            if byte == 0x7D || byte == 0x5D { depth -= 1 }
-                            index += 1
-                        }
-                        guard index < bytes.count else { throw failure }
-                        var valueEnd = index
-                        while valueEnd > valueStart, whitespace.contains(bytes[valueEnd - 1]) { valueEnd -= 1 }
-                        let comma = bytes[index] == 0x2C ? index : nil
-                        result.append((key, keyStart, valueStart, valueEnd, comma))
-                        if comma == nil { break }
-                        index += 1
-                        skipWhitespace(&index)
-                    }
-                    return result
-                }
                 var root = bytes.starts(with: [0xEF, 0xBB, 0xBF]) ? 3 : 0
-                skipWhitespace(&root)
+                JSONByteScanner.skipWhitespace(bytes, &root)
                 var removals: [Range<Int>] = []
-                for block in try members(at: root) where block.key == "telegram" {
-                    guard bytes[block.value] == 0x7B else { continue }
-                    let fields = try members(at: block.value)
+                for block in try JSONByteScanner.members(bytes, from: root).members where block.key == "telegram" {
+                    guard bytes[block.valueStart] == 0x7B else { continue }
+                    let fields = try JSONByteScanner.members(bytes, from: block.valueStart).members
                     var index = 0
                     while index < fields.count {
                         guard fields[index].key == "token" || fields[index].key == "bot_token" else {
@@ -308,70 +235,72 @@ public struct TelegramConfig: Sendable, Equatable {
 
     /// Missing settings may bootstrap; present legacy aliases must retain
     /// their documented scalar types before any reader defaults or writer runs.
-    public static func validateSavedConfiguration(dataRoot: URL) throws {
+    @discardableResult
+    public static func validateSavedConfiguration(dataRoot: URL) throws -> [String: JSONValue]? {
         let path = dataRoot.appendingPathComponent("telegram/config.json")
-        var info = stat()
-        if lstat(path.path, &info) != 0 {
-            if errno == ENOENT { return }
-            throw PersistenceCoreError.ioFailure("Saved Telegram settings are unreadable")
-        }
-        guard (info.st_mode & S_IFMT) == S_IFREG else {
-            throw PersistenceCoreError.ioFailure("Saved Telegram settings must be a regular file")
-        }
-        guard case .object(let fields) = try JSONValue.parse(Data(contentsOf: path)) else {
-            throw PersistenceCoreError.ioFailure("Saved Telegram settings must be a JSON object")
-        }
-        if let value = fields[tokenReferenceField] {
-            guard case .string(let reference) = value, UUID(uuidString: reference) != nil else {
-                throw PersistenceCoreError.ioFailure("Saved Telegram Keychain reference must be a UUID string")
+        return try CredentialFileLock.withLock(path) {
+            var info = stat()
+            if lstat(path.path, &info) != 0 {
+                if errno == ENOENT { return nil }
+                throw PersistenceCoreError.ioFailure("Saved Telegram settings are unreadable")
             }
-        }
-        for field in ["configuration_revision", "bot_token", "token", "model", "reasoning_effort", "reasoningEffort",
-                      "voice_transcription_backend", "voice_backend", "voice_transcription_model", "voice_model"] {
-            guard let value = fields[field] else { continue }
-            guard case .string = value else {
-                throw PersistenceCoreError.ioFailure("Saved Telegram field \(field) must be a string")
+            guard (info.st_mode & S_IFMT) == S_IFREG else {
+                throw PersistenceCoreError.ioFailure("Saved Telegram settings must be a regular file")
             }
-        }
-        for field in ["enabled", "require_mention", "voice_transcription_enabled", "voice_enabled"] {
-            guard let value = fields[field] else { continue }
-            guard case .bool = value else {
-                throw PersistenceCoreError.ioFailure("Saved Telegram field \(field) must be a boolean")
+            guard case .object(let fields) = try JSONValue.parse(Data(contentsOf: path)) else {
+                throw PersistenceCoreError.ioFailure("Saved Telegram settings must be a JSON object")
             }
-        }
-        _ = try TransportAllowlist.telegram(fields: fields)
-        for field in ["voice_max_bytes", "voice_max_mb"] {
-            guard let value = fields[field] else { continue }
-            if field == "voice_max_bytes" {
-                switch value {
-                case .int(let bytes) where bytes > 0: continue
-                case .double(let bytes) where Int(exactly: bytes).map({ $0 > 0 }) == true: continue
-                case .string(let bytes) where Int(bytes).map({ $0 > 0 }) == true: continue
-                default: throw PersistenceCoreError.ioFailure("Saved Telegram field \(field) must be a positive size")
+            if let value = fields[tokenReferenceField] {
+                guard case .string(let reference) = value, UUID(uuidString: reference) != nil else {
+                    throw PersistenceCoreError.ioFailure("Saved Telegram Keychain reference must be a UUID string")
                 }
             }
-            let number: Double?
-            switch value {
-            case .int(let value): number = Double(value)
-            case .double(let value): number = value
-            case .string(let value): number = Double(value)
-            default: number = nil
+            for field in ["configuration_revision", "bot_token", "token", "model", "reasoning_effort", "reasoningEffort",
+                          "voice_transcription_backend", "voice_backend", "voice_transcription_model", "voice_model"] {
+                guard let value = fields[field] else { continue }
+                guard case .string = value else {
+                    throw PersistenceCoreError.ioFailure("Saved Telegram field \(field) must be a string")
+                }
             }
-            guard let number, number.isFinite, number > 0,
-                  Int(exactly: (number * 1_048_576).rounded(.towardZero)).map({ $0 > 0 }) == true else {
-                throw PersistenceCoreError.ioFailure("Saved Telegram field \(field) must be a positive size")
+            for field in ["enabled", "require_mention", "voice_transcription_enabled", "voice_enabled"] {
+                guard let value = fields[field] else { continue }
+                guard case .bool = value else {
+                    throw PersistenceCoreError.ioFailure("Saved Telegram field \(field) must be a boolean")
+                }
             }
+            _ = try TransportAllowlist.telegram(fields: fields)
+            for field in ["voice_max_bytes", "voice_max_mb"] {
+                guard let value = fields[field] else { continue }
+                if field == "voice_max_bytes" {
+                    switch value {
+                    case .int(let bytes) where bytes > 0: continue
+                    case .double(let bytes) where Int(exactly: bytes).map({ $0 > 0 }) == true: continue
+                    case .string(let bytes) where Int(bytes).map({ $0 > 0 }) == true: continue
+                    default: throw PersistenceCoreError.ioFailure("Saved Telegram field \(field) must be a positive size")
+                    }
+                }
+                let number: Double?
+                switch value {
+                case .int(let value): number = Double(value)
+                case .double(let value): number = value
+                case .string(let value): number = Double(value)
+                default: number = nil
+                }
+                guard let number, number.isFinite, number > 0,
+                      Int(exactly: (number * 1_048_576).rounded(.towardZero)).map({ $0 > 0 }) == true else {
+                    throw PersistenceCoreError.ioFailure("Saved Telegram field \(field) must be a positive size")
+                }
+            }
+            return fields
         }
     }
 
-    private static func parseFlat(_ url: URL, includeDisconnected: Bool, resolveCredential: Bool) throws -> TelegramConfig? {
-        let data = try Data(contentsOf: url)
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    private static func parseFlat(_ obj: [String: JSONValue], at url: URL, includeDisconnected: Bool, resolveCredential: Bool) throws -> TelegramConfig? {
         let token: String
         if obj["bot_token"] != nil || obj["token"] != nil {
-            token = (obj["bot_token"] as? String) ?? (obj["token"] as? String) ?? ""
+            token = obj["bot_token"]?.stringValue ?? obj["token"]?.stringValue ?? ""
             if resolveCredential { try writePayload(obj, token: token, to: url) }
-        } else if resolveCredential, let reference = obj[tokenReferenceField] as? String {
+        } else if resolveCredential, let reference = obj[tokenReferenceField]?.stringValue {
             guard let bytes = try DeviceSecretKeychain.read(service: tokenService, account: reference),
                   let saved = String(data: bytes, encoding: .utf8), !saved.isEmpty else {
                 throw DeviceSecretKeychain.Failure.unavailable
@@ -383,12 +312,12 @@ public struct TelegramConfig: Sendable, Equatable {
         // enabled=false MUST round-trip — return the config with enabled=false
         // so the UI's saved-disabled toggle survives a restart.
         if token.isEmpty && !includeDisconnected { return nil }
-        let enabled = (obj["enabled"] as? Bool) ?? true
-        let allowed = try TransportAllowlist.telegram(fields: obj.mapValues { JSONValue(fromFoundation: $0) })
-        let requireMention = (obj["require_mention"] as? Bool) ?? false
-        let model = (obj["model"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let effort = (obj["reasoning_effort"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            ?? (obj["reasoningEffort"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let enabled = obj["enabled"] != .bool(false)
+        let allowed = try TransportAllowlist.telegram(fields: obj)
+        let requireMention = obj["require_mention"] == .bool(true)
+        let model = obj["model"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effort = obj["reasoning_effort"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? obj["reasoningEffort"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let voice = parseVoiceOptions(obj)
         return TelegramConfig(
             botToken: token,
@@ -399,17 +328,15 @@ public struct TelegramConfig: Sendable, Equatable {
             model: (model?.isEmpty == false) ? model : nil,
             reasoningEffort: (effort?.isEmpty == false) ? effort : nil,
             voiceTranscriptionEnabled: voice.enabled,
-            voiceTranscriptionBackend: voice.backend,
-            voiceTranscriptionModel: voice.model,
             voiceMaxBytes: voice.maxBytes,
             tokenConfigured: !token.isEmpty || obj[tokenReferenceField] != nil
         )
     }
 
-    private static func writePayload(_ object: [String: Any], token: String, to url: URL) throws {
+    private static func writePayload(_ object: [String: JSONValue], token: String, to url: URL) throws {
         let previous = FileManager.default.fileExists(atPath: url.path) ? try Data(contentsOf: url) : nil
-        let previousObject = previous.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
-        let oldReference = previousObject?[tokenReferenceField] as? String
+        let previousObject = previous.flatMap { try? JSONValue.parse($0) }
+        let oldReference = previousObject?.objectValue?[tokenReferenceField]?.stringValue
         let reuseReference = oldReference.map {
             (try? DeviceSecretKeychain.read(service: tokenService, account: $0)) == Data(token.utf8)
         } ?? false
@@ -420,9 +347,9 @@ public struct TelegramConfig: Sendable, Equatable {
         var payload = object
         payload.removeValue(forKey: "bot_token")
         payload.removeValue(forKey: "token")
-        payload[tokenReferenceField] = reference
+        payload[tokenReferenceField] = reference.map(JSONValue.string)
         do {
-            let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            let data = try JSONValue.object(payload).serializedData(pretty: true)
             try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
             guard try Data(contentsOf: url) == data else { throw DeviceSecretKeychain.Failure.unavailable }
         } catch {
@@ -443,81 +370,59 @@ public struct TelegramConfig: Sendable, Equatable {
     /// Carry a readable current grant (including disconnect); return the source
     /// failure for the restore receipt, while installation write failures throw.
     public static func preserveCredential(safetyRoot: URL, destinationRoot: URL) throws -> String? {
-        let source = safetyRoot.appendingPathComponent("telegram/config.json")
         let destination = destinationRoot.appendingPathComponent("telegram/config.json")
         return try CredentialFileLock.withLock(destination) {
-            let current: [String: Any]?
+            let current: [String: JSONValue]?
             do {
-                try validateSavedConfiguration(dataRoot: safetyRoot)
-                current = FileManager.default.fileExists(atPath: source.path)
-                    ? try JSONSerialization.jsonObject(with: Data(contentsOf: source)) as? [String: Any] : nil
-                if let reference = current?[tokenReferenceField] as? String {
+                current = try validateSavedConfiguration(dataRoot: safetyRoot)
+                if let reference = current?[tokenReferenceField]?.stringValue {
                     guard let bytes = try DeviceSecretKeychain.read(service: tokenService, account: reference),
                           let token = String(data: bytes, encoding: .utf8), !token.isEmpty else {
                         throw DeviceSecretKeychain.Failure.unavailable
                     }
                 }
             } catch { return error.localizedDescription }
-            try validateSavedConfiguration(dataRoot: destinationRoot)
-            let restored = FileManager.default.fileExists(atPath: destination.path)
-                ? try JSONSerialization.jsonObject(with: Data(contentsOf: destination)) as? [String: Any] : current
+            let restored = try validateSavedConfiguration(dataRoot: destinationRoot) ?? current
             guard var payload = restored else { return nil }
             payload.removeValue(forKey: "bot_token")
             payload.removeValue(forKey: "token")
             payload[tokenReferenceField] = current?[tokenReferenceField]
-            if !(current?[tokenReferenceField] is String),
-               let token = (current?["bot_token"] as? String) ?? (current?["token"] as? String), !token.isEmpty {
+            if current?[tokenReferenceField]?.stringValue == nil,
+               let token = current?["bot_token"]?.stringValue ?? current?["token"]?.stringValue, !token.isEmpty {
                 // Legacy safety snapshots keep their bytes; migrate only the destination.
                 try writePayload(payload, token: token, to: destination)
-                _ = try parseFlat(destination, includeDisconnected: true, resolveCredential: false)
+                _ = try loadSavedConfiguration(dataRoot: destinationRoot, resolveCredential: false)
                 return nil
             }
-            let bytes = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            let bytes = try JSONValue.object(payload).serializedData(pretty: true)
             try SwiftNativePersistenceCore.writeDataAtomicDurable(bytes, to: destination)
             guard try Data(contentsOf: destination) == bytes else { throw DeviceSecretKeychain.Failure.unavailable }
-            _ = try parseFlat(destination, includeDisconnected: true, resolveCredential: false)
+            _ = try loadSavedConfiguration(dataRoot: destinationRoot, resolveCredential: false)
             return nil
         }
     }
 
-    private static func parseVoiceOptions(_ obj: [String: Any]) -> (
-        enabled: Bool,
-        backend: String,
-        model: String,
-        maxBytes: Int
-    ) {
-        let enabled = (obj["voice_transcription_enabled"] as? Bool)
-            ?? (obj["voice_enabled"] as? Bool)
-            ?? defaultVoiceTranscriptionEnabled
-        let backendRaw = (obj["voice_transcription_backend"] as? String)
-            ?? (obj["voice_backend"] as? String)
-            ?? defaultVoiceTranscriptionBackend
-        let backend = TelegramVoiceTranscriptionBackends.canonical(backendRaw)
-        let modelRaw = (obj["voice_transcription_model"] as? String)
-            ?? (obj["voice_model"] as? String)
-            ?? defaultVoiceTranscriptionModel
-        let model = modelRaw.trimmingCharacters(in: .whitespacesAndNewlines)
-        let maxBytes: Int = {
-            if let n = obj["voice_max_bytes"] as? NSNumber {
-                return max(1, n.intValue)
+    private static func parseVoiceOptions(_ obj: [String: JSONValue]) -> (enabled: Bool, maxBytes: Int) {
+        let enabled = (obj["voice_transcription_enabled"] ?? obj["voice_enabled"]) != .bool(false)
+        let number: (JSONValue?) -> Double? = {
+            switch $0 {
+            case .int(let value)?: return Double(value)
+            case .double(let value)?: return value
+            case .string(let value)?: return Double(value)
+            default: return nil
             }
-            if let n = obj["voice_max_mb"] as? NSNumber {
-                return Int(exactly: (n.doubleValue * 1024.0 * 1024.0).rounded(.towardZero)).map { max(1, $0) } ?? defaultVoiceMaxBytes
+        }
+        let bytes: Int?
+        switch obj["voice_max_bytes"] {
+        case .int(let value)?: bytes = Int(exactly: value)
+        case .double(let value)?: bytes = Int(exactly: value)
+        default:
+            switch obj["voice_max_mb"] {
+            case .int?, .double?: bytes = number(obj["voice_max_mb"]).flatMap { Int(exactly: ($0 * 1_048_576).rounded(.towardZero)) }
+            default: bytes = obj["voice_max_bytes"]?.stringValue.flatMap { Int($0) }
+                ?? number(obj["voice_max_mb"]).flatMap { Int(exactly: ($0 * 1_048_576).rounded(.towardZero)) }
             }
-            if let s = obj["voice_max_bytes"] as? String, let n = Int(s) {
-                return max(1, n)
-            }
-            if let s = obj["voice_max_mb"] as? String, let mb = Double(s) {
-                return Int(exactly: (mb * 1024.0 * 1024.0).rounded(.towardZero)).map { max(1, $0) } ?? defaultVoiceMaxBytes
-            }
-            return defaultVoiceMaxBytes
-        }()
-        return (
-            enabled: enabled,
-            backend: backend.isEmpty ? defaultVoiceTranscriptionBackend : backend,
-            // Apple Speech is the only backend now; a saved OpenAI model name is stale.
-            model: TelegramVoiceTranscriptionBackends.appleSpeechModel,
-            maxBytes: maxBytes
-        )
+        }
+        return (enabled, bytes ?? defaultVoiceMaxBytes)
     }
 }

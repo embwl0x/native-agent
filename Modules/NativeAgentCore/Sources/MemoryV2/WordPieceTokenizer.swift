@@ -1,16 +1,17 @@
-// WordPieceTokenizer.swift
+// Pure-Swift WordPiece tokenizer for bge's BERT vocabulary.
 //
-// Pure-Swift WordPiece tokenizer compatible with BERT/MiniLM vocabularies.
-//
-// Resources/minilm_vocab.txt contains the full 30,522-entry MiniLM vocabulary.
+// The vocabulary is resolved beside bge's embedding.json as vocab.txt.
 
 import Foundation
 
-// Blueprint: | `WordPieceTokenizer.swift` | `WordPieceTokenizer`: BERT/MiniLM vocabulary tokenization, greedy subwords and encoded token IDs |
+// Blueprint: | `WordPieceTokenizer.swift` | `WordPieceTokenizer`: bge BERT vocabulary tokenization, greedy subwords and encoded token IDs |
 
-public final class WordPieceTokenizer: @unchecked Sendable {
+public final class WordPieceTokenizer: Sendable {
     public let vocab: [String: Int]
-    private let unkToken = "[UNK]"
+    private let unkID: Int
+    private let clsID: Int
+    private let sepID: Int
+    private let padID: Int
 
     public init(vocabURL: URL) throws {
         let raw = try String(contentsOf: vocabURL, encoding: .utf8)
@@ -19,15 +20,30 @@ public final class WordPieceTokenizer: @unchecked Sendable {
         for line in raw.split(omittingEmptySubsequences: false, whereSeparator: { $0 == "\n" || $0 == "\r\n" }) {
             let tok = String(line).trimmingCharacters(in: CharacterSet(charactersIn: "\r"))
             if tok.isEmpty { continue }
+            guard Int32(exactly: idx) != nil else {
+                throw EmbeddingError.modelNotLoaded(reason: "WordPiece vocabulary ID exceeds Int32 range")
+            }
             if dict[tok] == nil {
                 dict[tok] = idx
             }
-            idx += 1
+            let (next, overflow) = idx.addingReportingOverflow(1)
+            guard !overflow else { throw EmbeddingError.modelNotLoaded(reason: "WordPiece vocabulary is too large") }
+            idx = next
         }
+        guard let unk = dict["[UNK]"], let cls = dict["[CLS]"],
+              let sep = dict["[SEP]"], let pad = dict["[PAD]"] else {
+            throw EmbeddingError.modelNotLoaded(reason: "WordPiece vocabulary lacks required [UNK], [CLS], [SEP] or [PAD] token")
+        }
+        self.unkID = unk
+        self.clsID = cls
+        self.sepID = sep
+        self.padID = pad
         self.vocab = dict
     }
 
-    public func tokenize(_ text: String) -> [String] {
+    public func encode(_ text: String, maxLength: Int) -> (inputIds: [Int], attentionMask: [Int], isComplete: Bool) {
+        let maxLength = max(0, maxLength)
+        let bodyMax = max(0, maxLength - 2)
         var s = text.lowercased()
         s = (s as NSString).precomposedStringWithCanonicalMapping
         s = String(String.UnicodeScalarView(s.decomposedStringWithCanonicalMapping.unicodeScalars.filter {
@@ -38,62 +54,38 @@ public final class WordPieceTokenizer: @unchecked Sendable {
             return scalar.value >= 0x20 && scalar.value != 0x7F ? scalar : nil
         }))
 
-        let words = splitOnWhitespaceAndPunctuation(s)
-        var output: [String] = []
-        for word in words {
-            if word.isEmpty { continue }
-            if word.count > 100 {
-                output.append(unkToken)
-                continue
-            }
-            output.append(contentsOf: wordpieceGreedy(word))
+        var ids: [Int] = []
+        func appendWord(_ word: String) {
+            guard !word.isEmpty else { return }
+            // Finish the word: an unmatched suffix replaces all its pieces with UNK.
+            let pieces = word.count > 100 ? [unkID] : wordpieceGreedy(word)
+            ids.append(contentsOf: pieces.prefix(bodyMax + 1 - ids.count))
         }
-        return output
-    }
-
-    public func convertTokensToIds(_ tokens: [String]) -> [Int] {
-        let unkId = vocab[unkToken] ?? 1
-        return tokens.map { vocab[$0] ?? unkId }
-    }
-
-    public func encode(_ text: String, maxLength: Int) -> (inputIds: [Int], attentionMask: [Int]) {
-        let cls = vocab["[CLS]"] ?? 2
-        let sep = vocab["[SEP]"] ?? 3
-        let pad = vocab["[PAD]"] ?? 0
-
-        let tokens = tokenize(text)
-        var ids = convertTokensToIds(tokens)
-        let bodyMax = max(0, maxLength - 2)
-        if ids.count > bodyMax { ids = Array(ids.prefix(bodyMax)) }
-
-        var inputIds: [Int] = [cls] + ids + [sep]
+        var word = ""
+        for scalar in s.unicodeScalars {
+            if CharacterSet.whitespacesAndNewlines.contains(scalar) || isPunctuation(scalar) || isChineseCharacter(scalar) {
+                appendWord(word)
+                word = ""
+                if ids.count > bodyMax { break }
+                if !CharacterSet.whitespacesAndNewlines.contains(scalar) { appendWord(String(scalar)) }
+                if ids.count > bodyMax { break }
+            } else {
+                word.unicodeScalars.append(scalar)
+            }
+        }
+        if ids.count <= bodyMax { appendWord(word) }
+        let isComplete = ids.count <= bodyMax
+        var inputIds: [Int] = [clsID] + ids.prefix(bodyMax) + [sepID]
         var mask = [Int](repeating: 1, count: inputIds.count)
         while inputIds.count < maxLength {
-            inputIds.append(pad)
+            inputIds.append(padID)
             mask.append(0)
         }
         if inputIds.count > maxLength {
             inputIds = Array(inputIds.prefix(maxLength))
             mask = Array(mask.prefix(maxLength))
         }
-        return (inputIds, mask)
-    }
-
-    private func splitOnWhitespaceAndPunctuation(_ s: String) -> [String] {
-        var result: [String] = []
-        var cur = ""
-        for scalar in s.unicodeScalars {
-            if CharacterSet.whitespacesAndNewlines.contains(scalar) {
-                if !cur.isEmpty { result.append(cur); cur = "" }
-            } else if isPunctuation(scalar) || isChineseCharacter(scalar) {
-                if !cur.isEmpty { result.append(cur); cur = "" }
-                result.append(String(scalar))
-            } else {
-                cur.unicodeScalars.append(scalar)
-            }
-        }
-        if !cur.isEmpty { result.append(cur) }
-        return result
+        return (inputIds, mask, isComplete)
     }
 
     private func isPunctuation(_ scalar: Unicode.Scalar) -> Bool {
@@ -115,24 +107,24 @@ public final class WordPieceTokenizer: @unchecked Sendable {
         }
     }
 
-    private func wordpieceGreedy(_ word: String) -> [String] {
+    private func wordpieceGreedy(_ word: String) -> [Int] {
         let chars = Array(word)
-        var subTokens: [String] = []
+        var subTokens: [Int] = []
         var start = 0
         while start < chars.count {
             var end = chars.count
-            var match: String? = nil
+            var match: Int? = nil
             while start < end {
                 var piece = String(chars[start..<end])
                 if start > 0 { piece = "##" + piece }
-                if vocab[piece] != nil {
-                    match = piece
+                if let id = vocab[piece] {
+                    match = id
                     break
                 }
                 end -= 1
             }
             guard let m = match else {
-                return [unkToken]
+                return [unkID]
             }
             subTokens.append(m)
             start = end

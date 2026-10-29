@@ -4,7 +4,7 @@ import Foundation
 
 public enum ChatSlashCommandRoute: String, Sendable, CaseIterable {
     case clear, compact, model, think, fast, persona, remember, note, scratch
-    case help, tools, nextgen, export, new
+    case help, tools, export, new
 }
 
 public struct ChatSlashCommandDescriptor: Identifiable, Equatable, Sendable {
@@ -14,6 +14,7 @@ public struct ChatSlashCommandDescriptor: Identifiable, Equatable, Sendable {
     public let placeholder: String
 
     public var id: String { command }
+    public var selection: String { placeholder.isEmpty ? command : command + " " }
     public var displayedInvocation: String { "/" + (placeholder.isEmpty ? command : placeholder) }
     public var helpLine: String { "\(displayedInvocation) — \(description)" }
 }
@@ -31,7 +32,6 @@ public enum ChatSlashCommandRegistry {
         .init(route: .note, command: "note", description: "Commit a note to agent memory", placeholder: "note <text>"),
         .init(route: .scratch, command: "scratch", description: "Write ephemeral session scratchpad", placeholder: "scratch <key> <value>"),
         .init(route: .tools, command: "tools", description: "Open the Tools catalog", placeholder: ""),
-        .init(route: .nextgen, command: "nextgen", description: "Open NextGen in Capabilities", placeholder: ""),
         .init(route: .export, command: "export", description: "Export chat as Markdown to Downloads", placeholder: ""),
         .init(route: .help, command: "help", description: "Show all slash commands", placeholder: ""),
     ]
@@ -43,11 +43,7 @@ public enum ChatSlashCommandRegistry {
     }
 
     public static func helpText() -> String {
-        let lines = all.map(\.helpLine)
-        return (["Slash commands:"] + lines + [
-            "",
-            "Available registered tool names also work as slash commands.",
-        ]).joined(separator: "\n")
+        (["Slash commands:"] + all.map(\.helpLine)).joined(separator: "\n")
     }
 }
 
@@ -66,12 +62,9 @@ public enum ChatSlashCommandRouting {
         case unsupportedHere(String)
     }
 
-    /// `dynamicToolNames` carries the capability tools a surface can dispatch
-    /// (empty on surfaces with no capabilities store). `supportsDispatch` is
-    /// the surface's own answer to "can I run a slash command at all?".
+    /// `supportsDispatch` is the surface's answer to whether it can run commands.
     public static func decide(
         text: String,
-        dynamicToolNames: Set<String> = [],
         supportsDispatch: Bool
     ) -> Decision {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -79,9 +72,7 @@ public enum ChatSlashCommandRouting {
         let body = String(trimmed.dropFirst())
         let name = (body.components(separatedBy: .whitespacesAndNewlines).first ?? "")
             .lowercased()
-        guard ChatSlashCommandRegistry.commandNames.contains(name)
-            || dynamicToolNames.contains(name)
-        else {
+        guard ChatSlashCommandRegistry.commandNames.contains(name) else {
             return .sendAsMessage
         }
         return supportsDispatch ? .dispatch(body) : .unsupportedHere(name)
@@ -115,7 +106,6 @@ public extension ChatSlashCommandRouting {
         case presentation(ChatSlashCommandRoute)
         case consumed
         case deferred
-        case tool(name: String, argument: String)
         case refused(String)
     }
 
@@ -123,7 +113,6 @@ public extension ChatSlashCommandRouting {
     static func perform(
         _ raw: String,
         sessionId: String,
-        tools: [(name: String, available: Bool)],
         host: any ChatSlashCommandHost,
         toast: @escaping @MainActor (String) -> Void,
         mutationFinished: @escaping @MainActor (Bool, String) -> Void
@@ -137,7 +126,6 @@ public extension ChatSlashCommandRouting {
         case .clear: return .presentation(.clear)
         case .help: return .presentation(.help)
         case .tools: return .presentation(.tools)
-        case .nextgen: return .presentation(.nextgen)
         case .export: return .presentation(.export)
         case .compact:
             if host.activeChatSessionId.isEmpty {
@@ -199,10 +187,6 @@ public extension ChatSlashCommandRouting {
             }
             return .deferred
         case nil:
-            if let tool = tools.first(where: { $0.name == command }) {
-                return tool.available ? .tool(name: command, argument: argument)
-                    : .refused("/\(command) is not available now — check tool status in /tools")
-            }
             return .refused("Unknown command /\(command). Type /help for the list.")
         }
         return .consumed

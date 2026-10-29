@@ -51,12 +51,10 @@ public struct CoreGraphicsMacScreenImageRenderer: MacScreenImageRenderer {
         context.draw(source, in: CGRect(x: 0, y: 0, width: width, height: height))
 
         context.setFillColor(gray: 0.08, alpha: 1)
+        let geometry = MacScreenViewGeometry(bounds: shot.bounds, pixelWidth: width, pixelHeight: height)
         for frame in secretFrames {
-            let x = (frame.x - shot.bounds.x) * Double(width) / shot.bounds.w
-            let y = (frame.y - shot.bounds.y) * Double(height) / shot.bounds.h
-            let w = frame.w * Double(width) / shot.bounds.w
-            let h = frame.h * Double(height) / shot.bounds.h
-            context.fill(CGRect(x: x, y: Double(height) - y - h, width: w, height: h).integral)
+            let rect = geometry.imageRect(frame)
+            context.fill(CGRect(x: rect.x, y: Double(height) - rect.y - rect.h, width: rect.w, height: rect.h).integral)
         }
 
         // Marker scale: tie the badge to the IMAGE's own size so a 1x window

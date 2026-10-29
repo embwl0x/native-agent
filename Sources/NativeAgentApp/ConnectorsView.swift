@@ -95,7 +95,6 @@ enum ConnectorPrimaryAction: Equatable {
 struct ConnectorRowActionPolicy: Equatable {
     var primaryTitle: String?
     var primaryAction: ConnectorPrimaryAction?
-    var showsEnabledMutation: Bool
 
     static func resolve(
         id rawID: String,
@@ -106,58 +105,25 @@ struct ConnectorRowActionPolicy: Equatable {
         let state = ConnectorUIState.resolve(authState: authState, healthStatus: healthStatus)
 
         if id == "browser" {
-            return Self(primaryTitle: "Show browser", primaryAction: .showBrowser, showsEnabledMutation: false)
+            return Self(primaryTitle: "Show browser", primaryAction: .showBrowser)
         }
         if id == "telegram" {
             return Self(
                 primaryTitle: (state == .live || state == .unverified) ? "Manage" : "Configure",
-                primaryAction: .openTelegramSettings,
-                showsEnabledMutation: false
+                primaryAction: .openTelegramSettings
             )
         }
         let verifiedWizard = ConnectorWizardSetupRoute.resolve(provider: id) != .unavailable
-        if verifiedWizard,
-           state == .needsAuth || state == .planned || state == .live
-            || state == .unverified || state == .comingSoon {
+        if verifiedWizard {
             // An unverified row still holds a credential, so its route is
             // Reconnect (re-prove it), not Connect (start from nothing).
             return Self(
                 primaryTitle: (state == .needsAuth || state == .comingSoon) ? "Connect" : "Reconnect",
-                primaryAction: .openWizard(provider: id),
-                showsEnabledMutation: state == .live || state == .unverified
+                primaryAction: .openWizard(provider: id)
             )
         }
 
-        // Local connectors have no separate setup wizard. Local File
-        // Workspaces' enabled bit is consumed by connector-action readiness;
-        // the other runtime-derived rows are display-only here.
-        if id == "local_files" {
-            return Self(primaryTitle: nil, primaryAction: nil, showsEnabledMutation: true)
-        }
-        return Self(primaryTitle: nil, primaryAction: nil, showsEnabledMutation: false)
-    }
-}
-
-struct ConnectorWizardPresentationState: Equatable {
-    private(set) var provider: String?
-
-    var isPresented: Bool {
-        provider != nil
-    }
-
-    mutating func present(provider rawProvider: String) {
-        let normalized = rawProvider
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        guard ConnectorWizardSetupRoute.resolve(provider: normalized) != .unavailable else {
-            provider = nil
-            return
-        }
-        provider = normalized
-    }
-
-    mutating func dismiss() {
-        provider = nil
+        return Self(primaryTitle: nil, primaryAction: nil)
     }
 }
 
@@ -282,8 +248,7 @@ struct ConnectorsView: View {
     @State private var workspaceQuery = ""
     @State private var workspaceSearchState: SharedFolderSearchState = .notSearched
     @State private var workspaceRead = LatestRead()
-    // PATCH-2026-05-07: connector-wizard-b ConnectorWizard sheet per card
-    @State private var wizardPresentation = ConnectorWizardPresentationState()
+    @State private var wizardProvider: String?
     @State private var connectorStatusMessage: ConnectorsStatusMessagePresentation.Message?
     @State private var isAddingWorkspace = false
     @State private var removingSecret: String?
@@ -307,13 +272,11 @@ struct ConnectorsView: View {
                     case nil:
                         EmptyView()
                     case .failure(let error)?:
-                        ConnectorsCard {
-                            ConnectorsNote(text: "I couldn't read the keyring: \(error.localizedDescription)", color: NativeAgentShell.trouble)
-                        }
+                        ConnectorsNote(text: "I couldn't read the keyring: \(error.localizedDescription)", color: NativeAgentShell.trouble)
+                            .padding(16).settingsCardSurface()
                     case .success(let kept)? where kept.isEmpty:
-                        ConnectorsCard {
-                            ConnectorsNote(text: "No secrets kept yet.", color: NativeAgentShell.secondary)
-                        }
+                        ConnectorsNote(text: "No secrets kept yet.", color: NativeAgentShell.secondary)
+                            .padding(16).settingsCardSurface()
                     case .success(let kept)?:
                         AliveGroupCard {
                             ForEach(kept, id: \.name) { secretRow($0) }
@@ -331,16 +294,14 @@ struct ConnectorsView: View {
                     )
                     if registryRowsForDisplay.isEmpty {
                         if !accountsReading && !accountsReadFailed && appModel.panelRefreshStatus[.connectors] != nil {
-                            ConnectorsCard {
-                                ConnectorsNote(
-                                    text: "No accounts connected yet.",
-                                    color: NativeAgentShell.secondary
-                                )
-                            }
+                            ConnectorsNote(
+                                text: "No accounts connected yet.",
+                                color: NativeAgentShell.secondary
+                            )
+                            .padding(16).settingsCardSurface()
                         }
                     } else {
-                        // Alive glass (2026-09-23): one group card, a row
-                        // per account, hairlines between.
+                        // One group card, a row per account, hairlines between.
                         AliveGroupCard {
                             ForEach(registryRowsForDisplay) { connector in
                                 connectorRow(connector)
@@ -351,16 +312,15 @@ struct ConnectorsView: View {
 
                 AdvancedSection(title: "Folders I may open", card: .bare) {
                     if appModel.engine.connectors.workspaces.isEmpty {
-                        ConnectorsCard {
-                            ConnectorsNote(
+                        ConnectorsNote(
                                 text: appModel.engine.connectors.workspaceSnapshot == nil && appModel.engine.connectors.workspacesReadError == nil
                                     ? "Shared folders haven't loaded yet. Choose Refresh to load them."
                                     : appModel.engine.connectors.workspacesReadError != nil
                                         ? "Shared folders could not be refreshed. Try Refresh to load them."
                                         : "No folder is shared yet. Add one below and I can read the files in it.",
                                 color: NativeAgentShell.secondary
-                            )
-                        }
+                        )
+                        .padding(16).settingsCardSurface()
                     } else {
                         AliveGroupCard {
                             ForEach(appModel.engine.connectors.workspaces) { workspace in
@@ -419,20 +379,15 @@ struct ConnectorsView: View {
         } message: {
             Text("What uses it stops reaching where it went until it is granted again.")
         }
-        // PATCH-2026-05-07: connector-wizard-b Sheet for ConnectorWizardView
         .sheet(
             isPresented: Binding(
-                get: { wizardPresentation.isPresented },
-                set: { isPresented in
-                    if !isPresented {
-                        wizardPresentation.dismiss()
-                    }
-                }
+                get: { wizardProvider != nil },
+                set: { if !$0 { wizardProvider = nil } }
             )
         ) {
-            if let provider = wizardPresentation.provider {
+            if let provider = wizardProvider {
                 ConnectorWizardView(provider: provider) {
-                    wizardPresentation.dismiss()
+                    wizardProvider = nil
                 }
                 .environment(appModel)
             }
@@ -441,7 +396,7 @@ struct ConnectorsView: View {
 
     /// One kept secret: its name, where it may go, its account and when it
     /// was granted. Never its value.
-    private func secretRow(_ entry: ConnectorStatusProjection.SecretMetadata) -> some View {
+    private func secretRow(_ entry: ConnectorReadiness.SecretMetadata) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(entry.name)
                 .font(ShellType.rowTitle)
@@ -466,8 +421,7 @@ struct ConnectorsView: View {
 
     private var shareFolderSection: some View {
         AdvancedSection(title: "Share a folder", card: .bare) {
-            ConnectorsCard {
-                VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 12) {
                     ConnectorsField(title: "Name") {
                         TextField("", text: appModel.editBinding("workspace:new:workspaceName", seed: ""))
                             .accessibilityLabel("Folder name")
@@ -493,15 +447,14 @@ struct ConnectorsView: View {
                     .buttonStyle(.bordered)
                     .font(ShellType.labelMedium)
                     .disabled(isAddingWorkspace || cleanWorkspaceName.isEmpty || cleanWorkspacePath.isEmpty)
-                }
             }
+            .padding(16).settingsCardSurface()
         }
     }
 
     private var searchFolderSection: some View {
         AdvancedSection(title: "Search the shared folders", card: .bare) {
-            ConnectorsCard {
-                VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 12) {
                     HStack(spacing: 8) {
                         TextField("Search shared folders", text: $workspaceQuery)
                             .textFieldStyle(.roundedBorder)
@@ -544,8 +497,8 @@ struct ConnectorsView: View {
                             )
                         }
                     }
-                }
             }
+            .padding(16).settingsCardSurface()
         }
     }
 
@@ -637,7 +590,7 @@ struct ConnectorsView: View {
                         .controlSize(.small)
                         .disabled(actionPolicy.primaryAction == nil)
                     }
-                    if actionPolicy.showsEnabledMutation {
+                    if connector.canToggle {
                         Button(connector.enabled ? "Turn off" : "Turn on") {
                             Task {
                                 let outcome = await appModel.updateConnector(connector, enabled: !connector.enabled)
@@ -807,9 +760,9 @@ struct ConnectorsView: View {
                 connectorStatusMessage = ConnectorsStatusMessagePresentation.browserOpened()
             }
         case .openTelegramSettings:
-            NativeAgentAppCoordinator.shared.request(.sidebar(.telegram))
+            ApplicationLifetime.shared.request(.sidebar(.telegram))
         case .openWizard(let provider):
-            wizardPresentation.present(provider: provider)
+            wizardProvider = provider
         }
     }
 
@@ -824,21 +777,6 @@ struct ConnectorsView: View {
 
 // MARK: - Page kit
 //
-// The page's own small vocabulary: the card a row or a group of controls sits
-// in, and the two quiet line shapes.
-
-struct ConnectorsCard<Content: View>: View {
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        content
-            .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .aliveCard()
-            .accessibilityElement(children: .contain)
-    }
-}
-
 /// A row's status, as a pill: a dot in the state's tone and the word in text
 /// colour. The word never rides on the tone alone — light calm and trouble
 /// fail 4.5:1 on the card fill.

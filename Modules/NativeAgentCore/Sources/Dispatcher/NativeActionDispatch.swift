@@ -10,10 +10,10 @@ public enum NativeActionDispatch {
         dryRun: Bool,
         dataRoot: URL? = nil
     ) async throws -> Dispatcher.DispatchResult {
-        let ledger = DispatchLedger(ledgerPath: DispatchLedger.defaultLedgerPath(
-            dataRoot: dataRoot ?? PersistenceCore.defaultDataRoot()
-        ))
-        let dispatcher = makeDispatcher(ledger: ledger, localActions: .nativeReadOnly)
+        let dispatcher = SwiftNativeDispatcher(
+            ledgerPath: (dataRoot ?? PersistenceCore.defaultDataRoot()).appendingPathComponent("traces/events.jsonl"),
+            localActions: .nativeReadOnly
+        )
         let ctx = try strictDispatchContextForTool(tool, surface: "native_actions", dataRoot: dataRoot)
         return try await dispatcher.dispatch(tool: tool, input: input, ctx: ctx, dryRun: dryRun)
     }
@@ -24,10 +24,8 @@ public enum NativeActionDispatch {
             // Ordinary clients retain the established persona/workspace
             // resolver. Only an explicit isolated root overrides those reads.
             if let dataRoot {
-                context.extra["_na_data_root"] = .string(dataRoot.path)
-                context.extra["_na_workspace_root"] = .string(
-                    NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot, environment: [:]).path
-                )
+                context.dataRoot = dataRoot
+                context.workspaceRoot = NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot, environment: [:])
             }
             return context
         }
@@ -37,25 +35,18 @@ public enum NativeActionDispatch {
                 NSLocalizedDescriptionKey: "Cannot run \(tool): Swift file sandbox root is unavailable"
             ])
         }
-        let repoRoot = repoRootURL.path
-        var extra: [String: JSONValue] = [
+        let extra: [String: JSONValue] = [
             "file_access": .object([
                 "mode": .string("read_only"),
                 "sandbox": .string("read_only"),
             ]),
         ]
-        let dataRootPath = dataRoot.path
-        if !dataRootPath.isEmpty {
-            extra["_na_data_root"] = .string(dataRootPath)
-        }
         return DispatchContext(
-            repoRoot: repoRoot,
-            cwd: repoRoot,
+            repoRoot: repoRootURL,
             surface: surface,
-            sessionId: "",
             persona: "",
-            activeProvider: "",
-            extra: extra
+            extra: extra,
+            dataRoot: dataRoot
         )
     }
 

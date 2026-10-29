@@ -25,9 +25,8 @@ public struct MacSyncMobileNotificationRelay: Sendable {
     ) async throws {
         let now = ISO8601DateFormatter().string(from: Date())
         let path = dataRoot.appendingPathComponent("notifications/push_tokens.json")
-        let persistence = SwiftNativePersistenceCore()
         let registrationLock = dataRoot.appendingPathComponent("notifications/push-token-registration")
-        try await persistence.withFileLock(registrationLock) {
+        try await SwiftNativePersistenceCore.withFileLock(registrationLock) {
             var root = try readObjectStore(path)
             // A push token is one device credential. When APNs reassigns or a
             // restored phone presents an existing token under a new device id,
@@ -35,7 +34,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
             root = root.filter { existingDeviceID, value in
                 guard existingDeviceID != deviceId,
                       case .object(let existing) = value else { return true }
-                return jsonString(existing["token"]) != token
+                return existing["token"]?.stringValue != token
             }
             var entry: [String: JSONValue]
             if case .object(let existing)? = root[deviceId] { entry = existing } else { entry = [:] }
@@ -47,7 +46,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
             entry["bundleId"] = .string(bundleId)
             entry["lastSeen"] = .string(now)
             root[deviceId] = .object(entry)
-            try await persistence.writeJSON(.object(root), to: path)
+            try await SwiftNativePersistenceCore.writeJSON(.object(root), to: path)
         }
     }
 
@@ -58,23 +57,22 @@ public struct MacSyncMobileNotificationRelay: Sendable {
     /// token since keeps it. A live phone re-registers on launch.
     static func prunePushToken(_ token: String, unregisteredAt: Date, dataRoot: URL) async throws {
         let path = dataRoot.appendingPathComponent("notifications/push_tokens.json")
-        let persistence = SwiftNativePersistenceCore()
         @Sendable func registeredBefore(_ stamp: JSONValue?) -> Bool {
-            guard let text = jsonString(stamp), let date = ISO8601DateFormatter().date(from: text) else { return false }
+            guard let text = stamp?.stringValue, let date = ISO8601DateFormatter().date(from: text) else { return false }
             return date < unregisteredAt
         }
-        try await persistence.withFileLock(dataRoot.appendingPathComponent("notifications/push-token-registration")) {
+        try await SwiftNativePersistenceCore.withFileLock(dataRoot.appendingPathComponent("notifications/push-token-registration")) {
             var root = try readObjectStore(path)
             var rootChanged = false
             for (deviceID, value) in root {
-                guard case .object(var entry) = value, jsonString(entry["token"]) == token,
+                guard case .object(var entry) = value, entry["token"]?.stringValue == token,
                       registeredBefore(entry["lastSeen"]) else { continue }
                 entry.removeValue(forKey: "token")
                 root[deviceID] = .object(entry)
                 rootChanged = true
             }
             if rootChanged {
-                try await persistence.writeJSON(.object(root), to: path)
+                try await SwiftNativePersistenceCore.writeJSON(.object(root), to: path)
             }
         }
     }
@@ -95,13 +93,12 @@ public struct MacSyncMobileNotificationRelay: Sendable {
     ) async throws {
         let path = dataRoot.appendingPathComponent("notifications/push_tokens.json")
         let lock = dataRoot.appendingPathComponent("notifications/push-token-registration")
-        let pairing = try PairingSecretManager.existingSecretBase64()
+        let pairing = try PairingSecret.existingSecretBase64()
         guard let pairing, !deviceID.isEmpty, !bundleID.isEmpty else {
             throw CocoaError(.validationMissingMandatoryProperty)
         }
         let fingerprint = WorkActivityPushRegistration.fingerprint(pairing)
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(lock) {
+        try await SwiftNativePersistenceCore.withFileLock(lock) {
             var root = try readObjectStore(path)
             var entry: [String: JSONValue]
             if case .object(let existing)? = root[deviceID] { entry = existing } else { entry = [:] }
@@ -137,19 +134,18 @@ public struct MacSyncMobileNotificationRelay: Sendable {
             }
             entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
             root[deviceID] = .object(entry)
-            try await persistence.writeJSON(.object(root), to: path)
+            try await SwiftNativePersistenceCore.writeJSON(.object(root), to: path)
         }
     }
 
     func sendWorkActivities(_ rows: [MobileWorkActivity], dataRoot: URL) async -> [String] {
         do {
             let config = try SwiftNativeAPNSSender.APNSConfig.load(from: dataRoot)
-            guard let pairing = try PairingSecretManager.existingSecretBase64() else { return [] }
+            guard let pairing = try PairingSecret.existingSecretBase64() else { return [] }
             let fingerprint = WorkActivityPushRegistration.fingerprint(pairing)
-            let persistence = SwiftNativePersistenceCore()
             let path = dataRoot.appendingPathComponent("notifications/push_tokens.json")
             let lock = dataRoot.appendingPathComponent("notifications/push-token-registration")
-            let value = try await persistence.readJSON(path, ifMissing: .object([:]))
+            let value = try await SwiftNativePersistenceCore.readJSON(path, ifMissing: .object([:]))
             guard case .object(let root) = value else { throw CocoaError(.propertyListReadCorrupt) }
             let jwt = try await sync.apns.providerToken(keyId: config.keyId, teamId: config.teamId, keyPath: config.keyPath)
             var errors: [String] = []
@@ -160,15 +156,15 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                 let ids = Set(rows.map(\.id))
                 let eligibleStartIDs = Set(rows.filter { !$0.content.state.isTerminal && $0.staleDate > Date() }.map(\.id))
                 // Cleanup also runs with no current rows or with opt-in revoked.
-                try await persistence.withFileLock(lock) {
-                    let latest = try await persistence.readJSON(path, ifMissing: .object([:]))
+                try await SwiftNativePersistenceCore.withFileLock(lock) {
+                    let latest = try await SwiftNativePersistenceCore.readJSON(path, ifMissing: .object([:]))
                     guard case .object(var root) = latest, case .object(var entry)? = root[deviceID],
                           var registration = try WorkActivityPushRegistration.read(entry["workActivity"]),
                           registration.pairing == fingerprint else { return }
                     registration.retireInactiveStarts(activeIDs: eligibleStartIDs, now: Date())
                     entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
                     root[deviceID] = .object(entry)
-                    try await persistence.writeJSON(.object(root), to: path)
+                    try await SwiftNativePersistenceCore.writeJSON(.object(root), to: path)
                 }
                 guard original.enabled else { continue }
                 let removed = original.activityTokens.keys.filter { !ids.contains($0) }.compactMap { id -> MobileWorkActivity? in
@@ -180,12 +176,12 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                 }
                 for row in rows + removed {
                     if Task.isCancelled { return errors }
-                    let failure: String? = try await persistence.withFileLock(lock) {
-                        let latest = try await persistence.readJSON(path, ifMissing: .object([:]))
+                    let failure: String? = try await SwiftNativePersistenceCore.withFileLock(lock) {
+                        let latest = try await SwiftNativePersistenceCore.readJSON(path, ifMissing: .object([:]))
                         guard case .object(var root) = latest, case .object(var entry)? = root[deviceID],
                               var registration = try WorkActivityPushRegistration.read(entry["workActivity"]),
                               registration.enabled, registration.pairing == fingerprint,
-                              let currentPairing = try PairingSecretManager.existingSecretBase64(),
+                              let currentPairing = try PairingSecret.existingSecretBase64(),
                               WorkActivityPushRegistration.fingerprint(currentPairing) == fingerprint else { return nil }
                         if registration.lastContents[row.id] == row.content { return nil }
                         if let previous = registration.lastContents[row.id], previous.updatedAt > row.content.updatedAt { return nil }
@@ -209,7 +205,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                             registration.startReservations?[row.id] = .init(retainedAt: Date(), expiresAt: row.staleDate)
                             entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
                             root[deviceID] = .object(entry)
-                            try await persistence.writeJSON(.object(root), to: path)
+                            try await SwiftNativePersistenceCore.writeJSON(.object(root), to: path)
                         }
                         let failure = try await sync.apns.sendWorkActivity(row, event: event, token: token, registration: registration, jwt: jwt)
                         if let failure {
@@ -226,7 +222,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                             if event == "start" || failure.tokenIsInvalid {
                                 entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
                                 root[deviceID] = .object(entry)
-                                try await persistence.writeJSON(.object(root), to: path)
+                                try await SwiftNativePersistenceCore.writeJSON(.object(root), to: path)
                             }
                             return failure.message
                         }
@@ -236,7 +232,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
                         registration.retireInactiveStarts(activeIDs: eligibleStartIDs, now: Date())
                         entry["workActivity"] = try JSONValue.parse(JSONEncoder().encode(registration))
                         root[deviceID] = .object(entry)
-                        try await persistence.writeJSON(.object(root), to: path)
+                        try await SwiftNativePersistenceCore.writeJSON(.object(root), to: path)
                         return nil
                     }
                     if let failure { errors.append(failure) }
@@ -312,8 +308,7 @@ public struct MacSyncMobileNotificationRelay: Sendable {
             bridgeError: bridgeError,
             apnsReceipts: apns.receipts,
             apnsErrors: apns.errors,
-            eventID: eventID,
-            cloudKitVisualPushEligible: false
+            eventID: eventID
         )
         guard receipt.bridgeQueued || receipt.apnsSent else {
             if predictDelivery {
@@ -418,18 +413,19 @@ public struct MacSyncMobileNotificationRelay: Sendable {
         }
 
         await beginDeliveryPrediction(eventID: request.eventID, source: "icloud_chat_reply")
-        let providerResult = await replyPushProviderResult(request)
-        let outcome = Self.iCloudReplyPushNotificationOutcome(providerResult: providerResult)
-        switch outcome {
-        case .providerAccepted:
-            nativeLog("[iCloudBridge] APNS chat reply notification provider-accepted correlation=%@", correlationID)
+        var userInfo = request.userInfo
+        if let urgency = request.urgency { userInfo["urgency"] = urgency }
+        do {
+            _ = try await sendNotification(title: request.title, body: request.body,
+                userInfo: userInfo, predictDelivery: false)
+            nativeLog("[iCloudBridge] chat reply notification accepted correlation=%@", correlationID)
             return true
-        case .providerNotAccepted(let reason):
-            await failDeliveryPrediction(eventID: request.eventID, source: "icloud_chat_reply")
-            nativeLog("[iCloudBridge] APNS chat reply notification not accepted correlation=%@: %@",
-                  correlationID, reason)
-            return false
+        } catch {
+            nativeLog("[iCloudBridge] chat reply notification not accepted correlation=%@: %@",
+                correlationID, error.localizedDescription)
         }
+        await failDeliveryPrediction(eventID: request.eventID, source: "icloud_chat_reply")
+        return false
     }
 
     /// Builds the exact provider payload used by `sendICloudReplyPushNotification`.
@@ -474,68 +470,6 @@ public struct MacSyncMobileNotificationRelay: Sendable {
         ))
     }
 
-    static func iCloudReplyPushNotificationOutcome(
-        providerResult: ICloudReplyPushNotificationProviderResult
-    ) -> ICloudReplyPushNotificationOutcome {
-        let attemptedTargets = max(0, providerResult.attemptedTargets)
-        // The live sender derives both values from the same receipt array, but
-        // normalize the boundary anyway: an inconsistent adapter result must
-        // not transform zero provider receipts into an acceptance claim.
-        let acceptedTargets = min(max(0, providerResult.acceptedTargets), attemptedTargets)
-        guard acceptedTargets > 0 else {
-            let reason: String
-            if !providerResult.errors.isEmpty {
-                reason = providerResult.errors.joined(separator: " | ")
-            } else if attemptedTargets > 0 {
-                reason = "APNS returned \(attemptedTargets) non-accepted provider receipt(s)."
-            } else {
-                reason = "APNS returned no provider receipts."
-            }
-            return .providerNotAccepted(reason: reason)
-        }
-        return .providerAccepted(
-            attemptedTargets: attemptedTargets,
-            acceptedTargets: acceptedTargets
-        )
-    }
-
-    private func replyPushProviderResult(
-        _ request: ICloudReplyPushNotificationRequest
-    ) async -> ICloudReplyPushNotificationProviderResult {
-        // The record wakes sync; direct APNS alone owns the remote alert.
-        // A phone without an APNS token schedules the record locally using
-        // the same event ID. Session identity stays intact for tap navigation.
-        var userInfo = request.userInfo
-        if let urgency = request.urgency { userInfo["urgency"] = urgency }
-        do {
-            let receipt = try await sendNotification(
-                title: request.title,
-                body: request.body,
-                userInfo: userInfo,
-                // This caller already opened the prediction for `eventID`.
-                predictDelivery: false
-            )
-            // A queued CloudKit notification record is a real delivery
-            // route, not a silent failure, so it counts as one target.
-            let bridgeTargets = receipt.bridgeQueued ? 1 : 0
-            return ICloudReplyPushNotificationProviderResult(
-                attemptedTargets: receipt.apnsReceipts.count + bridgeTargets,
-                acceptedTargets: receipt.apnsReceipts.filter(\.isSuccess).count + bridgeTargets,
-                errors: receipt.apnsErrors + [receipt.bridgeError].compactMap { $0 }
-            )
-        } catch {
-            return ICloudReplyPushNotificationProviderResult(
-                attemptedTargets: 0,
-                acceptedTargets: 0,
-                errors: [error.localizedDescription]
-            )
-        }
-    }
-
-    private static func jsonString(_ value: JSONValue?) -> String? {
-        guard case .string(let string)? = value else { return nil }
-        return string
-    }
 }
 
 /// The bounded, redacted notification request that crosses from an iCloud chat
@@ -547,20 +481,6 @@ struct ICloudReplyPushNotificationRequest: Sendable, Equatable {
     let userInfo: [String: String]
     let urgency: String?
     let eventID: String
-}
-
-/// APNS's provider-side outcome, reduced to the facts this bridge can honestly
-/// observe. `acceptedTargets` means Apple accepted the request, not that a
-/// device received or rendered it.
-struct ICloudReplyPushNotificationProviderResult: Sendable, Equatable {
-    let attemptedTargets: Int
-    let acceptedTargets: Int
-    let errors: [String]
-}
-
-enum ICloudReplyPushNotificationOutcome: Equatable {
-    case providerAccepted(attemptedTargets: Int, acceptedTargets: Int)
-    case providerNotAccepted(reason: String)
 }
 
 enum ICloudReplyPushNotificationPreparation: Equatable {

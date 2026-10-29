@@ -3,50 +3,11 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `MacFourVerbs.swift` | `MacFourVerbs` struct |
 
-// MARK: - THE FOUR VERBS — screen · act · go · wait (docs/build_plans/four-verbs.md)
-//
-// User, verbatim: "she needs a live screen to look at and hands to use it, in a
-// native LLM way… give her exactly that, that's it nothing more."
-//
-// Ten acceptance rounds proved the snapshot model wrong. `mac_look` hands back a
-// `frame_id` and opaque handle tokens; `mac_act` demands both back; and nearly
-// every failure lived in that bookkeeping — `stale_frame`, `handle_drifted`,
-// `window_not_key` — rather than in the work she was doing. THIS FILE IS THE
-// REPLACEMENT SURFACE, and its whole contract is stated in one line:
-//
-//     Ordinary interaction uses names and actionable words. Workspace screens
-//     may additionally carry exact control bindings; the workspace, rather
-//     than Agent, manages those tokens and fresh selections after refusal.
-//
-// EYES `screen(part:)` · HANDS `act(verb:target:text:)` · LEGS `go(name:)` ·
-// PATIENCE `wait(until:seconds:)`. Nothing else.
-//
-// ORCHESTRATION, NOT REIMPLEMENTATION. Every one of these four calls the organs
-// that already exist, through the client's own public `dispatch`:
-//
-//   screen → `look` + fused AX/view/vision perception → MacScreenRender
-//   act    → semantic `act` when AX can name the target, otherwise the existing
-//            hand repertoire aimed at a fused screen region; then a fresh screen
-//   go     → `focus_app` or canonical `open_target`; then screen
-//   wait   → observer-driven screen reads, at least 0.5 s apart, with timed reads
-//
-// So there is NO new gate, NO new guard, NO new verdict class and NO second
-// resolver here. The honesty and safety layers live BELOW this file and every
-// call passes straight through them. What this file adds is exactly two things
-// the layers below deliberately do not do: RESOLVE A NAME AGAINST THE SCREEN AT
-// THE MOMENT OF ACTING, and SAY THE ANSWER IN WORDS.
-//
-// App-specific routing guidance and destination matching adapt the shared verbs.
-//
-// REDACTION IS NOT RE-IMPLEMENTED HERE, and cannot be bypassed here. Every
-// SCREEN-DERIVED string this file prints comes out of `MacScreenRender` via
-// `MacScreenText`, carrying the compiler's own redaction verdict (the
-// `label`/`value`/`text` JSON the look emitted). A withheld string prints as
-// `⟨redacted⟩` and — this is the part that matters for the hands — CANNOT BE
-// NAMED: resolution matches only against `display` text, so a control whose
-// label redaction withheld is unaddressable by name rather than addressable by
-// a secret. The other reply strings are the caller's own target/destination
-// and fixed operation guidance; typed text is never echoed.
+// MARK: - Four verbs — screen · act · go · wait
+// Resolve names against fresh perception and return results in words through the existing dispatch and safety owners.
+// Workspace screens may carry exact control bindings; the workspace owns their tokens and fresh selections after refusal.
+// Screen text retains compiler redaction through `MacScreenRender` and `MacScreenText`.
+// Withheld labels cannot be named; resolution uses display text only, and typed text is never echoed.
 //
 // THE PHYSICAL TIER IS INTERNAL. `act` can move, hover, hold, drag, press keys,
 // and aim at regions discovered by the fused screen. Coordinates, view ids, and

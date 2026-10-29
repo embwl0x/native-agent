@@ -59,7 +59,7 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
         "\(peersPrefix)\(String(decoding: try JSONEncoder().encode(peers), as: UTF8.self)) -->\n"
     }
 
-    static func transcriptCause(_ row: [String: JSONValue], session: String) -> CognitiveReflectionCause? {
+    static func transcriptCause(_ row: [String: JSONValue], session: String, dataRoot: URL) -> CognitiveReflectionCause? {
         guard case .string(let role)? = row["role"] else { return nil }
         var metadata: [String: JSONValue] = [:]
         if case .object(let value)? = row["metadata"] { metadata = value }
@@ -70,7 +70,7 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
         }
         guard ["user", "assistant"].contains(role), case .string(let content)? = row["content"] else { return nil }
         let text = "\(role):\n\(content)"
-        var peers = CognitiveSubstrate.peerIdentity(metadata: metadata).map { [$0] } ?? []
+        var peers = CognitiveSubstrate.peerIdentity(metadata: metadata, dataRoot: dataRoot).map { [$0] } ?? []
         let binding = ChatSessionRecollections.continuityBinding(role: role, metadata: metadata)
         if case .object(let value)? = binding, case .string(let participant)? = value["participant"],
            participant.hasPrefix("peer:") { peers.append(participant) }
@@ -96,7 +96,7 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
         var journal: [StudioJournalEntry]?
         for ref in refs.sorted() {
             if let message = messages[ref] {
-                material[ref] = transcriptCause(message.row, session: message.session)
+                material[ref] = transcriptCause(message.row, session: message.session, dataRoot: dataRoot)
                 continue
             }
             let parts = ref.split(separator: ":", maxSplits: 1).map(String.init)
@@ -135,7 +135,7 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
 
     /// The claims her prose backs, as lineage lines. A claim the prose or the dream's reading
     /// does not back is left without lineage and named in `dropped`; it never costs the night.
-    static func renderBlock(_ claims: [Self], content: String, sources: [DreamSourceRef], dropped: inout [String]) throws -> String {
+    static func renderBlock(_ claims: [DreamClaim], content: String, sources: [DreamSourceRef], dropped: inout [String]) throws -> String {
         guard !content.contains("<!-- claim-sources"), !content.contains("<!-- dream-peers") else {
             throw NSError(domain: "NativeAgent.DreamEntryProvenance", code: 1, userInfo: [NSLocalizedDescriptionKey:
                 "The dream's claim check refused the model's reply: its prose contains the reserved markers <!-- claim-sources or <!-- dream-peers. Nothing was written; the night stays owed and the next run retries it."])
@@ -143,44 +143,46 @@ public struct DreamEntryProvenance: Sendable, Codable, Equatable {
         // The model cites a source by its identity; the @date tail it may leave
         // off or misquote. What is kept is the dream's own reference and date.
         let canonical = Dictionary(sources.map { (undated($0.reference), $0.reference) }, uniquingKeysWith: { first, _ in first })
+        let prose = plain(content)
         var result = ""
-        for (index, claim) in claims.enumerated() {
+        for (index, original) in claims.enumerated() {
+            let claim = original.provenance
             let quote = "claims[\(index)] \"" + String(claim.quote.prefix(80)) + "\""
             guard !claim.quote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { dropped.append("claims[\(index)] has an empty quote"); continue }
             // A quote is the same words whatever the typography: curly or straight quotes, spacing.
-            guard plain(content).contains(plain(claim.quote)) else { dropped.append(quote + " is not in the dream's prose"); continue }
+            guard prose.contains(plain(claim.quote)) else { dropped.append(quote + " is not in the dream's prose"); continue }
             let unbound = claim.sourceRefs.filter { canonical[undated($0)] == nil }
             guard unbound.isEmpty else {
                 dropped.append(quote + " cites sources this dream did not read: " + unbound.prefix(5).joined(separator: ", "))
                 continue
             }
-            var admitted = claim
-            admitted.sourceRefs = claim.sourceRefs.compactMap { canonical[undated($0)] }
+            var admitted = original
+            admitted.provenance.sourceRefs = claim.sourceRefs.compactMap { canonical[undated($0)] }
             let data = try JSONEncoder().encode(admitted)
             result += "\(prefix)\(String(decoding: data, as: UTF8.self)) -->\n"
         }
         return result
     }
 
-    /// Each dream section of a day's entry (split at its `## ` heading) ends
-    /// with its own claim lines; only that trailing block of each is read.
-    static func sources(for quote: String? = nil, in content: String) -> [String] {
-        var refs = Set<String>()
-        for section in content.components(separatedBy: "\n## ") {
-            for line in section.trimmingCharacters(in: .newlines).components(separatedBy: "\n").reversed() {
-                guard line.hasPrefix(prefix), line.hasSuffix(" -->") else { break }
-                let json = line.dropFirst(prefix.count).dropLast(4)
-                guard let claim = try? JSONDecoder().decode(Self.self, from: Data(json.utf8)),
-                      quote == nil || plain(claim.quote) == quote.map(plain) else { continue }
-                refs.formUnion(claim.sourceRefs)
+    /// Decode only the trailing claim block of each dream section, in written order.
+    static func readClaims<Claim: Decodable>(in content: String, as: Claim.Type) -> [Claim] {
+        content.components(separatedBy: "\n## ").flatMap { section in
+            let lines = section.components(separatedBy: "\n").reversed().drop(while: {
+                $0.trimmingCharacters(in: .whitespaces).isEmpty
+                    || ($0.hasPrefix(DreamCycleRunner.consumedFooter) && $0.hasSuffix(" -->"))
+            }).prefix(while: { $0.hasPrefix(prefix) && $0.hasSuffix(" -->") })
+            return lines.reversed().compactMap { line in
+                try? JSONDecoder().decode(Claim.self, from: Data(line.dropFirst(prefix.count).dropLast(4).utf8))
             }
         }
+    }
+
+    static func sources(in content: String) -> [String] {
+        var refs = Set(readClaims(in: content, as: Self.self).flatMap(\.sourceRefs))
         // Historical diary-wide refs recover material, never support a quoted claim.
-        if quote == nil {
-            for line in content.components(separatedBy: "\n") where line.hasPrefix("_Sources: ") && line.hasSuffix("_") {
-                refs.formUnion(line.dropFirst(10).dropLast().components(separatedBy: " · ")
-                    .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })
-            }
+        for line in content.components(separatedBy: "\n") where line.hasPrefix("_Sources: ") && line.hasSuffix("_") {
+            refs.formUnion(line.dropFirst(10).dropLast().components(separatedBy: " · ")
+                .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })
         }
         return refs.sorted()
     }

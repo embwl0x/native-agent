@@ -10,34 +10,25 @@ import NotificationInbox
 
 /// Assembly and presentation bindings; the transaction owns ordering and receipts.
 public protocol InboxCardActionEffects: Sendable {
-    var heartbeatActionIDs: Set<String> { get }
-    var heartbeatOpenApprovalsActionID: String { get }
-    var heartbeatRepairActionID: String { get }
     func interactionAction(id: String, action: String, dataRoot: URL, quiet: Bool) async throws
     func resolveApproval(id: String, decision: String, dataRootOverride: URL?) async throws
     func inboxItems(dataRoot: URL) async throws -> [InboxItemRecord]
-    func primaryActionProjection(for item: InboxItemRecord) -> (opensApprovals: Bool, isProactive: Bool)
-    func repairHeartbeatInboxItem(id: String, dataRoot: URL) async throws -> String
     func cleanUpDiskHygiene(dataRoot: URL) async throws -> String
     func chatClient(dataRoot: URL) -> SwiftNativeChatOrchestrationClient
-    func openApprovals() async
-    func openDesk() async
-    func openChatDraft(_ draft: String) async
-    func openSpokenChat(_ sessionID: String) async
+    @MainActor func openApprovals() async
+    @MainActor func openDesk() async
+    @MainActor func openChatDraft(_ draft: String) async
+    @MainActor func openSpokenChat(_ sessionID: String) async
 }
 
 public enum InboxCardActions {
-    private static let explicitlyHandledInboxActionIDs: Set<String> = [
-        "read", "archive", "dismiss", "act", "approve", "reject",
-    ]
-
     public static func perform(
         _ id: String, action: String, metadata: [String: JSONValue] = [:], quiet: Bool = false,
         dataRootOverride: URL?, effects: any InboxCardActionEffects
     ) async throws {
         let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
         let visibleInboxPath = LiveNotificationInbox.livePath(dataRoot: root)
-        let normalizedAction = action == "deny" ? "reject" : action
+        let normalizedAction = InboxActionVocabulary.normalizedAction(action)
         if id.hasPrefix("interaction:"), !["read", "archive", "dismiss"].contains(normalizedAction) {
             try await effects.interactionAction(id: id, action: normalizedAction, dataRoot: root, quiet: quiet)
             return
@@ -49,8 +40,7 @@ public enum InboxCardActions {
                 userInfo: [NSLocalizedDescriptionKey: "Reply requires text input; use inboxReply(id:text:) instead of inboxAction(id:\"reply\")."]
             )
         }
-        let nativeActions = explicitlyHandledInboxActionIDs.union(effects.heartbeatActionIDs)
-        guard nativeActions.contains(normalizedAction) else {
+        guard InboxActionVocabulary.nativeActionIDs.contains(normalizedAction) else {
             throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
                 NSLocalizedDescriptionKey: "Unknown inbox action: \(normalizedAction)"
             ])
@@ -81,18 +71,12 @@ public enum InboxCardActions {
             }
             return
         }
-        if endpointAction == effects.heartbeatOpenApprovalsActionID {
+        if endpointAction == "open_approvals" {
             if quiet {
                 _ = await updateVisibleStatus(id: id, action: "read", inboxPath: visibleInboxPath)
             } else {
                 await openApprovalsFromInboxAction(id: id, inboxPath: visibleInboxPath, effects: effects)
             }
-            return
-        }
-        if endpointAction == effects.heartbeatRepairActionID {
-            let message = try await effects.repairHeartbeatInboxItem(id: id, dataRoot: root)
-            _ = await updateVisibleStatus(id: id, action: "archive", inboxPath: visibleInboxPath)
-            nativeLog("[inbox] inboxAction(repair) id=\(id): \(message)")
             return
         }
         if endpointAction == "act" {
@@ -104,7 +88,7 @@ public enum InboxCardActions {
                     userInfo: [NSLocalizedDescriptionKey: "Inbox item \(id) not found"]
                 )
             }
-            let resolution = resolvePrimaryAction(for: item, effects: effects)
+            let resolution = resolvePrimaryAction(for: item)
             // Persist engagement before its effect; disposal owns its own write.
             if let statusAction = resolution.inboxStatusAction {
                 guard await updateVisibleStatus(
@@ -185,9 +169,8 @@ public enum InboxCardActions {
         }
     }
 
-    public static func resolvePrimaryAction(for item: InboxItemRecord, effects: any InboxCardActionEffects) -> InboxPrimaryActionResolution {
-        let projection = effects.primaryActionProjection(for: item)
-        if projection.opensApprovals {
+    public static func resolvePrimaryAction(for item: InboxItemRecord) -> InboxPrimaryActionResolution {
+        if item.isApprovalBacklogCard {
             return .openApprovals
         }
         if let executionId = item.relatedWorkshopExecutionId, !executionId.isEmpty {
@@ -196,7 +179,7 @@ public enum InboxCardActions {
         if item.source == "disk_hygiene" {
             return .diskCleanup
         }
-        if projection.isProactive {
+        if item.isProactiveCard {
             return .unresolved(reason: "unmapped proactive card — no approval link")
         }
         let title = item.title.trimmingCharacters(in: .whitespacesAndNewlines)

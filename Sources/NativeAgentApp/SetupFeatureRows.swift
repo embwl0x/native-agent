@@ -1,14 +1,7 @@
 import MemoryV2
 
 // Blueprint: | `SetupFeatureRows.swift` | `SetupFeatureRows`: settings-page controls over existing cognition/context/dream/memory/embedding owners; no new settings store |
-// THE REST OF THE FOUR THINGS, ON THE SETUP PAGE.
-//
-// Every switch here writes exactly the storage its old control wrote — the
-// substrate lanes (Cognition Observatory), Fluid Context (Settings ▸
-// Subconscious), the dream and REM gates (Dreams), the memory policy (Trust ▸
-// Living memory), the embeddings backend and memory mode (Settings ▸ Memory)
-// and the weekly self-improvement key. Nothing here owns a setting of its own,
-// and no row invents a second home for one.
+// Every switch writes through its existing owner; no row owns a setting.
 //
 // The inner-life master's switch is SetupView's (it carries the runtime's
 // status and recovery); this card puts it first, over the lanes it owns.
@@ -38,18 +31,13 @@ struct SetupFeatureRows<InnerLife: View>: View {
     // Pending edits reconcile from their owners after every save.
     @State private var pendingDream: Bool?
     @State private var savingDream = false
-    @State private var remCycleOn = true
-    @State private var savingRem = false
-    @State private var memoryDraft = TrustMemoryPolicy()
-    @State private var savingMemory = false
-    private var embeddingsStatus: EmbeddingsStatus? { appModel.engine.memory.embeddingsStatus }
+    @State private var pendingRem: Bool?
+    private var embeddingSnapshot: EmbeddingRuntimeSnapshot? { appModel.engine.memory.embeddingSnapshot }
     @State private var savingEmbeddings = false
     @State private var pendingEmbeddings: Bool?
     @State private var savingContextFlow = false
 
     var body: some View {
-        // Alive glass (2026-09-23): the section's fourteen rows in two group
-        // cards, the inner life and then memory, where each was its own card.
         VStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
             AdvancedSection(title: "Inner life") {
                 innerLife
@@ -62,31 +50,21 @@ struct SetupFeatureRows<InnerLife: View>: View {
             }
             AdvancedSection(title: "Memory") {
                 meaningMemoryRow
-                knowledgeGraphRow
-                nightlyConsolidationRow
-                adaptivePromotionRow
-                hygieneRow
-                crossSessionRecallRow
+                LivingMemoryPermissionsView()
             }
         }
         .task { await load() }
-        // The policy is one document: a save anywhere in the app re-publishes
-        // it, and these rows follow it rather than keeping their own copy.
-        .onChange(of: appModel.engine.trust.policy) { _, _ in
-            syncFromTrustPolicy()
-            Task { await appModel.engine.cognitionView.refreshDiary() }
-        }
     }
 
     // MARK: - Reflection (cognitiveSubstrateReflectionEnabled)
 
     private var reflectionRow: some View {
-        SetupFeatureSwitchRow(
+        SetupSwitchCard(
             title: "Reflection between conversations",
-            detail: subconsciousEnabled
+            sentence: subconsciousEnabled
                 ? "Between conversations I think back over what happened and keep what matters."
                 : "Turn on an inner life first — reflection runs inside it.",
-            key: "cognitiveSubstrateReflectionEnabled",
+            identifier: "setup.feature.cognitiveSubstrateReflectionEnabled",
             isOn: Binding(
                 get: { reflectionEnabled },
                 set: { value in
@@ -101,12 +79,12 @@ struct SetupFeatureRows<InnerLife: View>: View {
     // MARK: - Organism (organismKernelEnabled)
 
     private var organismRow: some View {
-        SetupFeatureSwitchRow(
+        SetupSwitchCard(
             title: "Moods, energy, and a clock of my own",
-            detail: subconsciousEnabled
+            sentence: subconsciousEnabled
                 ? "I get moods, tiredness, and a clock that keeps running while you are away."
                 : "Turn on an inner life first to enable moods, energy, and a daily rhythm.",
-            key: "organismKernelEnabled",
+            identifier: "setup.feature.organismKernelEnabled",
             isOn: Binding(
                 get: { organismEnabled },
                 set: { value in
@@ -120,10 +98,9 @@ struct SetupFeatureRows<InnerLife: View>: View {
 
     // MARK: - Memory in every reply (contextFlowMode)
 
-    /// A menu, as the original control was: a switch cannot round-trip out
-    /// of Off (the reviewer's catch, 2026-09-04).
+    /// Context flow uses a menu so Off remains reversible.
     private var fluidContextRow: some View {
-        SetupFeatureCard(
+        SetupRow(
             title: "Memory in every reply",
             detail: "What I remember shapes each reply."
         ) {
@@ -161,10 +138,10 @@ struct SetupFeatureRows<InnerLife: View>: View {
     // MARK: - Dreams (personalityPolicy.dream_cycle_enabled + trainingPolicy.dream_scheduler)
 
     private var dreamsRow: some View {
-        SetupFeatureSwitchRow(
+        SetupSwitchCard(
             title: "Dreams at night",
-            detail: "At night I go back over the day and write down what I made of it.",
-            key: "dream_cycle_enabled",
+            sentence: "At night I go back over the day and write down what I made of it.",
+            identifier: "setup.feature.dream_cycle_enabled",
             isOn: Binding(
                 get: { pendingDream ?? (appModel.engine.cognitionView.diaryGate?.dreamEnabled == true) },
                 set: { value in
@@ -196,29 +173,27 @@ struct SetupFeatureRows<InnerLife: View>: View {
     // MARK: - Weekly consolidation (trainingPolicy.rem_cycle_enabled)
 
     private var weeklyConsolidationRow: some View {
-        SetupFeatureSwitchRow(
+        SetupSwitchCard(
             title: "Weekly dream consolidation",
-            detail: "Once a week I gather the week's memories into fewer, stronger ones.",
-            key: "rem_cycle_enabled",
+            sentence: "Once a week I gather the week's memories into fewer, stronger ones.",
+            identifier: "setup.feature.rem_cycle_enabled",
             isOn: Binding(
-                get: { remCycleOn },
+                get: { pendingRem ?? remEnabledInPolicy },
                 set: { value in
-                    guard !savingRem else { return }
-                    remCycleOn = value            // optimistic — no snap-back
-                    savingRem = true
+                    guard pendingRem == nil else { return }
+                    pendingRem = value
                     Task {
                         let ok = await appModel.setRemCycleEnabled(value)
-                        remCycleOn = ok ? remEnabledInPolicy : !value
+                        pendingRem = nil
                         if !ok {
                             appModel.systemToasts.push(
                                 error: appModel.dreamError ?? "The weekly consolidation setting could not be saved."
                             )
                         }
-                        savingRem = false
                     }
                 }
             ),
-            disabled: savingRem
+            disabled: pendingRem != nil
         )
     }
 
@@ -228,23 +203,20 @@ struct SetupFeatureRows<InnerLife: View>: View {
 
     // MARK: - Meaning-based memory (the embeddings backend)
 
-    /// The switch reads what was ASKED for (`requestedEnabled`), which is the
-    /// field the write changes; what is actually running is the detail line.
-    /// Flipping it re-reads every memory to rebuild how they are found, so it
-    /// asks first (the reviewer's catch, 2026-09-04).
+    /// The switch binds the requested backend and confirms before rebuilding memory lookup.
     private var meaningMemoryRow: some View {
-        SetupFeatureSwitchRow(
+        SetupSwitchCard(
             title: "Meaning-based memory",
-            detail: meaningMemoryDetail,
-            key: "embeddings",
+            sentence: meaningMemoryDetail,
+            identifier: "setup.feature.embeddings",
             isOn: Binding(
-                get: { pendingEmbeddings ?? embeddingsStatus?.requestedEnabled ?? false },
+                get: { pendingEmbeddings ?? embeddingSnapshot.map { $0.requestedBackend != ManagedEmbeddingProvider.mockBackend } ?? false },
                 set: { value in
-                    guard !savingEmbeddings, value != embeddingsStatus?.requestedEnabled else { return }
+                    guard !savingEmbeddings, value != embeddingSnapshot.map({ $0.requestedBackend != ManagedEmbeddingProvider.mockBackend }) else { return }
                     pendingEmbeddings = value
                 }
             ),
-            disabled: savingEmbeddings || embeddingsStatus == nil
+            disabled: savingEmbeddings || embeddingSnapshot == nil
         )
         .confirmationDialog(
             pendingEmbeddings == true ? "Turn on meaning-based memory?" : "Turn off meaning-based memory?",
@@ -281,121 +253,29 @@ struct SetupFeatureRows<InnerLife: View>: View {
 
     /// The detail line says what is TRUE right now, not what was asked for.
     private var meaningMemoryDetail: String {
-        guard let status = embeddingsStatus else {
+        guard let status = embeddingSnapshot else {
             return appModel.engine.memory.embeddingsError ?? "Checking how I look things up right now."
         }
         if savingEmbeddings {
             return "Re-indexing every memory. This can take a while."
         }
         switch status.effectiveBackend {
-        case "local":
+        case ManagedEmbeddingProvider.coreMLBackend:
             return "On — I find memories by what they mean, not by the words in them."
-        case "unavailable" where status.requestedEnabled:
+        case ManagedEmbeddingProvider.failClosedBackend where status.requestedBackend != ManagedEmbeddingProvider.mockBackend:
             return "Asked for, but the on-device model could not be loaded; I match on words for now."
         default:
             return "Off — I match memories on their words alone."
         }
     }
 
-    // MARK: - Memory policy (memoryPolicy.*)
-
-    private var hygieneRow: some View {
-        SetupFeatureSwitchRow(
-            title: "Memory hygiene",
-            detail: "I tidy old, noisy, and duplicate memories on a schedule.",
-            key: "hygiene_enabled",
-            isOn: Binding(
-                get: { memoryDraft.hygiene_enabled },
-                set: { value in
-                    var next = memoryDraft
-                    next.hygiene_enabled = value
-                    memoryDraft = next
-                    Task { await patchMemory(hygiene: value) }
-                }
-            ),
-            disabled: savingMemory
-        )
-    }
-
-    private var knowledgeGraphRow: some View {
-        SetupFeatureSwitchRow(
-            title: "Knowledge graph",
-            detail: "I join up the people, places, and things your conversations keep mentioning.",
-            key: "knowledge_graph_enabled",
-            isOn: Binding(
-                get: { memoryDraft.knowledge_graph_enabled },
-                set: { value in
-                    var next = memoryDraft
-                    next.knowledge_graph_enabled = value
-                    memoryDraft = next
-                    Task { await patchMemory(knowledgeGraph: value) }
-                }
-            ),
-            disabled: savingMemory
-        )
-    }
-
-    private var nightlyConsolidationRow: some View {
-        SetupFeatureSwitchRow(
-            title: "Memory consolidation",
-            detail: "Once a week I gather what keeps coming up into fewer, stronger memories and offer them for review.",
-            key: "consolidation_enabled",
-            isOn: Binding(
-                get: { memoryDraft.consolidation_enabled },
-                set: { value in
-                    var next = memoryDraft
-                    next.consolidation_enabled = value
-                    memoryDraft = next
-                    Task { await saveMemory(next, expecting: \.consolidation_enabled) }
-                }
-            ),
-            disabled: savingMemory
-        )
-    }
-
-    private var adaptivePromotionRow: some View {
-        SetupFeatureSwitchRow(
-            title: "Recurring memories are proposed as facts",
-            detail: "When something keeps coming back, I propose it as a durable fact for you to accept.",
-            key: "adaptive_promotion",
-            isOn: Binding(
-                get: { memoryDraft.adaptive_promotion },
-                set: { value in
-                    var next = memoryDraft
-                    next.adaptive_promotion = value
-                    memoryDraft = next
-                    Task { await patchMemory(adaptivePromotion: value) }
-                }
-            ),
-            disabled: savingMemory
-        )
-    }
-
-    private var crossSessionRecallRow: some View {
-        SetupFeatureSwitchRow(
-            title: "Remember across conversations",
-            detail: "I bring in what is relevant from every past conversation, not just this one.",
-            key: "cross_session_recall",
-            isOn: Binding(
-                get: { memoryDraft.cross_session_recall },
-                set: { value in
-                    var next = memoryDraft
-                    next.cross_session_recall = value
-                    memoryDraft = next
-                    Task { await saveMemory(next, expecting: \.cross_session_recall) }
-                }
-            ),
-            disabled: savingMemory
-        )
-    }
-
     // MARK: - Weekly self-improvement (selfImprovementEnabled)
 
     private var selfImprovementRow: some View {
-        SetupFeatureSwitchRow(
+        SetupSwitchCard(
             title: "Weekly self-improvement pass",
-            detail: "Once a week I review how things actually went and propose safe changes.",
-            key: "selfImprovementEnabled",
+            sentence: "Once a week I review how things actually went and propose safe changes.",
+            identifier: "setup.feature.selfImprovementEnabled",
             isOn: $selfImprovementEnabled
         )
     }
@@ -411,93 +291,8 @@ struct SetupFeatureRows<InnerLife: View>: View {
         if appModel.engine.trust.policy == nil {
             _ = try? await appModel.engine.trust.load()
         }
-        syncFromTrustPolicy()
         await appModel.engine.cognitionView.refreshDiary()
         await appModel.engine.memory.loadEmbeddings()
     }
 
-    @MainActor
-    private func syncFromTrustPolicy() {
-        if !savingMemory {
-            memoryDraft = appModel.engine.trust.policy?.memoryPolicy ?? TrustMemoryPolicy()
-        }
-        if !savingRem {
-            remCycleOn = remEnabledInPolicy
-        }
-    }
-
-    /// The two-field memory save. A failure leaves the stored policy alone,
-    /// so re-reading it is the revert; the toast says the write did not land.
-    @MainActor
-    private func saveMemory(
-        _ next: TrustMemoryPolicy,
-        expecting field: KeyPath<TrustMemoryPolicy, Bool>
-    ) async {
-        savingMemory = true
-        await appModel.saveMemoryPolicy(
-            consolidationEnabled: next.consolidation_enabled,
-            crossSessionRecall: next.cross_session_recall
-        )
-        savingMemory = false
-        syncFromTrustPolicy()
-        if memoryDraft[keyPath: field] != next[keyPath: field] {
-            appModel.systemToasts.push(error: "That memory setting could not be saved.")
-        }
-    }
-
-    @MainActor
-    private func patchMemory(
-        knowledgeGraph: Bool? = nil,
-        adaptivePromotion: Bool? = nil,
-        hygiene: Bool? = nil
-    ) async {
-        savingMemory = true
-        let ok = await appModel.patchMemoryPolicy(
-            knowledgeGraphEnabled: knowledgeGraph,
-            adaptivePromotion: adaptivePromotion,
-            hygieneEnabled: hygiene
-        )
-        savingMemory = false
-        syncFromTrustPolicy()
-        if !ok {
-            appModel.systemToasts.push(error: "That memory setting could not be saved.")
-        }
-    }
-}
-
-// MARK: - The one card shape
-
-/// EXACTLY the page's one row shape (`SetupRow`, SetupView): a title, one
-/// secondary sentence in the fixed row box, and one control on the right.
-private struct SetupFeatureCard<Trailing: View>: View {
-    let title: String
-    let detail: String
-    @ViewBuilder var trailing: Trailing
-
-    var body: some View {
-        SetupRow(title: title, detail: detail) { trailing }
-    }
-}
-
-/// One feature, one switch. `key` is the storage the switch actually writes,
-/// so the accessibility identifier names the real thing rather than a label.
-private struct SetupFeatureSwitchRow: View {
-    let title: String
-    let detail: String
-    let key: String
-    @Binding var isOn: Bool
-    var disabled: Bool = false
-
-    var body: some View {
-        SetupFeatureCard(title: title, detail: detail) {
-            Toggle(title, isOn: $isOn)
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .hazeTinted()
-                .disabled(disabled)
-                .accessibilityLabel(title)
-                .accessibilityHint(detail)
-                .accessibilityIdentifier("setup.feature.\(key)")
-        }
-    }
 }

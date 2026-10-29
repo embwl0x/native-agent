@@ -1,29 +1,7 @@
 import Foundation
-// Blueprint: | `ChatRichContentParser.swift` | `ChatRichContentParser` enum; `blocks`, `listRows`; shared fence, list marker and continuation grammar |
+// Blueprint: | `ChatRichContentParser.swift` | `ChatRichContentParser`: shared fence, list and sanitized inline grammar; `ChatContentCache`: bounded content-keyed FIFO storage |
 
-// Shared by the Mac transcript and the iPhone chat (2026-10-04): pure
-// Foundation, no AppKit/UIKit, so both renderers split and sanitize alike.
-
-// 658.13 — assistant rich content that earns its keep.
-//
-// AUDIT FINDING THAT MOTIVATES THIS FILE. The transcript parses message
-// content with `.inlineOnlyPreservingWhitespace`, which is lossless for every
-// block construct EXCEPT the fenced code block. Measured, not assumed:
-//
-//     input:  "Here:\n```swift\nlet x = 1\n```\ndone"
-//     output: "Here:\nswift let x = 1 \ndone"
-//
-// The fence markers are eaten, the language tag is glued onto the first line
-// of code, and the interior newlines COLLAPSE TO SPACES. A multi-line snippet
-// arrives in the transcript as one mangled line. That is data destruction, not
-// missing styling — and it is the only construct where that happens. Lists,
-// headings, blockquotes and tables all survive verbatim as plain text today.
-//
-// Fences are split first so code stays literal. The prose renderer then uses
-// ChatProseListParser for bullet and numbered rows with hanging indents.
-//
-// PURE PROJECTION. Splitting is a total function of the content string. No
-// clock, no network, no side effects, no renderer-local state machine.
+// Split fences before inline parsing so code remains literal on both platforms.
 /// Identity is deliberately NOT derived from the block's contents: a message
 /// can repeat the same prose or the same snippet twice, and content-derived ids
 /// would collide inside one `ForEach`. The list is recomputed atomically from a
@@ -35,6 +13,15 @@ public enum ChatContentBlock: Equatable, Sendable {
 }
 
 public enum ChatRichContentParser {
+    /// Uncached for growing streaming text; settled callers retain by content.
+    public static func inline(_ content: String) -> AttributedString? {
+        guard let raw = try? AttributedString(
+            markdown: content,
+            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        ) else { return nil }
+        return ChatLinkPolicy.sanitized(raw)
+    }
+
     public struct ProseRow: Equatable, Sendable {
         public var marker: String?
         public var indent: Int
@@ -144,10 +131,7 @@ public enum ChatRichContentParser {
 
             if ticks >= 3 {
                 let info = leading.dropFirst(ticks).trimmingCharacters(in: .whitespaces)
-                // 2026-09-06: CommonMark — a backtick fence's info string may
-                // not contain a backtick. Without that rule a one-line
-                // ```inline``` example opened a code block that swallowed the
-                // rest of the reply.
+                // A backtick fence's info string cannot contain a backtick.
                 if !info.contains("`") {
                     flushProse()
                     fence = (ticks: ticks, language: info.isEmpty ? nil : info)
@@ -168,15 +152,7 @@ public enum ChatRichContentParser {
     }
 }
 
-// Assistant output is untrusted data. `AttributedString(markdown:)` will happily
-// build a live `.link` for ANY scheme — measured: `[click](javascript:alert(1))`
-// and `[f](file:///etc/passwd)` both survive into a run attribute, and SwiftUI
-// `Text` hands a clicked link straight to the system opener. Nothing in the
-// transcript validated the scheme before this.
-//
-// Allowlist, not denylist: an unknown scheme loses its link and renders as
-// plain text. The label is never hidden, so the user still sees what was
-// written — the link just stops being a live control.
+// Untrusted links outside the allowlist lose their link attribute, retaining text.
 public enum ChatLinkPolicy {
     public static let allowedSchemes: Set<String> = ["http", "https", "mailto"]
 
@@ -186,15 +162,7 @@ public enum ChatLinkPolicy {
     }
 
     /// Strip the `.link` attribute from every run whose URL is not allowlisted.
-    ///
-    /// Ranges are collected BEFORE any mutation. `runs` is a view computed over
-    /// the string's attribute storage, and clearing an attribute coalesces
-    /// adjacent runs. Measured 2026-08-19: mutating mid-iteration happens to
-    /// produce the right answer on the current toolchain, so this is DEFENSIVE
-    /// — the collect-then-mutate form does not depend on an unspecified
-    /// invalidation rule. `sanitizingManyAdjacentBadLinksIsStable` pins the
-    /// observable contract (12 adjacent doomed runs, text untouched); it does
-    /// NOT fail on the mid-iteration form, and that is expected.
+    /// Collect ranges before mutation, since clearing links coalesces runs.
     public static func sanitized(_ attributed: AttributedString) -> AttributedString {
         let doomed = attributed.runs.compactMap { run -> Range<AttributedString.Index>? in
             guard let url = run.link, !isAllowed(url) else { return nil }
@@ -204,5 +172,38 @@ public enum ChatLinkPolicy {
         var copy = attributed
         for range in doomed { copy[range].link = nil }
         return copy
+    }
+}
+
+/// Process-local FIFO storage; callers own parsing and admission outside the lock.
+public final class ChatContentCache<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cache: [String: Value] = [:]
+    private var order: [String] = []
+    private var totalChars = 0
+    private let capacity = 300
+    private let charBudget = 4_000_000
+
+    public init() {}
+
+    public func lookup(_ content: String) -> Value? {
+        lock.lock()
+        defer { lock.unlock() }
+        return cache[content]
+    }
+
+    public func insertIfAbsent(_ parsed: Value, for content: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        if cache[content] == nil {
+            cache[content] = parsed
+            order.append(content)
+            totalChars += content.count
+            while order.count > capacity || (totalChars > charBudget && order.count > 1) {
+                let evicted = order.removeFirst()
+                totalChars -= evicted.count
+                cache.removeValue(forKey: evicted)
+            }
+        }
     }
 }

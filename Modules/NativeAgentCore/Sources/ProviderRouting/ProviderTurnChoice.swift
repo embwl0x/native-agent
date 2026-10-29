@@ -2,8 +2,8 @@ import Foundation
 import NativeAgentCore
 // Blueprint: | `ProviderTurnChoice.swift` | `ProviderTurnChoice` struct |
 
-/// A turn-local picker tuple. Never writes active.json or another surface's preferences.
-public struct ProviderTurnChoice: Sendable, Equatable {
+/// A selection value; only binding `current` makes it turn-local. Never writes saved preferences.
+public struct ProviderTurnChoice: Sendable, Hashable {
     public let provider: String
     public let model: String
     public let reasoningEffort: String

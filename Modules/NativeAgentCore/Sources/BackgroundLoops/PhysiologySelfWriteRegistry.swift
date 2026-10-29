@@ -2,31 +2,9 @@ import Foundation
 
 // Blueprint: | `PhysiologySelfWriteRegistry.swift` | `PhysiologySelfWriteRegistry`: writer-generation suppression of watcher echoes, without time-window suppression of external writes |
 
-/// C6 (2026-08-28): self-write suppression for event/deadline physiology
-/// watchers, keyed on a WRITER GENERATION — never on a time window.
+/// Suppress watcher echoes whose file identity matches the post-tick snapshot, never by time window.
 ///
-/// The problem: a physiology loop watches the very store its own tick writes.
-/// The tick lands, the file changes, the watcher fires, the loop ticks again.
-/// The github_tracking / desk lanes churned exactly this way. A time window
-/// ("ignore events for 2s after a tick") is the wrong fix twice over: it drops
-/// a genuine FOREIGN write that lands inside the window, and it still admits
-/// the loop's own echo when FSEvents coalesces past the window — file-system
-/// notifications carry no delivery deadline.
-///
-/// The generation is the answer because it is a property of the DATA, not of
-/// the clock: after each tick the registry snapshots the identity of every
-/// watched path (APFS `st_gen` where the volume supplies it, plus size,
-/// nanosecond mtime and inode). A later watcher
-/// event whose observed generation is IDENTICAL to that snapshot carries no new
-/// information — nothing has changed since this loop last looked, so the event
-/// is its own echo and is suppressed. Any differing generation is a real change
-/// and is delivered, no matter how long after the tick it arrives.
-///
-/// Declared limit: a foreign write that lands DURING a tick, after the loop has
-/// already read the file, is folded into that tick's stamp and therefore not
-/// re-delivered. The loop's periodic cadence and its deadline lane still cover
-/// it. Narrowing that would need the write itself to carry the generation,
-/// which the file-system watcher cannot provide.
+/// A foreign write during a tick may fold into its stamp; periodic and deadline wakes still cover it.
 public final class PhysiologySelfWriteRegistry: @unchecked Sendable {
     public static let shared = PhysiologySelfWriteRegistry()
 

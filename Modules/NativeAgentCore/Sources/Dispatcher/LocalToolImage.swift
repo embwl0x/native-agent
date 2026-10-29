@@ -1,10 +1,11 @@
 import Foundation
+import CoreGraphics
 import NativeAgentCore
 import PersistenceCore
 import ImageIO
 import UniformTypeIdentifiers
 
-// Blueprint: | `LocalToolImage.swift` | `LocalToolImage`: turn-local admitted image continuation and bounded thumbnails; pixels never enter durable JSON/transcript receipts |
+// Blueprint: | `LocalToolImage.swift` | `LocalToolImage`: turn-local admitted image continuation and bounded thumbnails, including every chrome.look spelling; pixels never enter durable JSON/transcript receipts |
 
 /// Pixels live only in the admitted tool call's model continuation, never in
 /// JSON tool results, transcript receipts, result paging, or tool notices.
@@ -12,13 +13,7 @@ public enum LocalToolImage {
     @TaskLocal public static var sink: Sink?
     public static let maximumBytes = 8 * 1024 * 1024
 
-    // MARK: - Tools that MAKE a picture show the picture (2026-09-13)
-    //
-    // Agent shipped two images she had never seen: image_generate returned a
-    // path, and seeing it meant a second turn with read_file — which on the
-    // second occasion was not even loaded. The tool that makes the thing shows
-    // the thing, through this same sink: a bounded thumbnail rides back on the
-    // SAME tool result, the full-size file path stays in the JSON.
+    // Image producers deliver bounded thumbnails in the same tool continuation; JSON retains the full-size file path.
 
     /// The images one round may deliver, across all its calls: eight, and
     /// 32 MiB. Pixels the model has not answered are never released, so this
@@ -47,14 +42,9 @@ public enum LocalToolImage {
         "app",
         "image_generate",
         "browser.screenshot",
-        // Both carry a `capture_screenshot` flag through the same capture.
+        "browser.chrome_look",
+        // Carries a `capture_screenshot` flag through the same capture.
         "browser.open_url",
-        "browser.navigate",
-        // The underscore spellings ToolNameAliases canonicalizes: a call
-        // that arrives under an alias is dispatched to the same capture, and a
-        // name missing from this set would silently return no pixels at all.
-        "browser_screenshot", "browser_capture_screenshot", "browser.capture_screenshot",
-        "browser_open_url", "browser_navigate",
     ]
 
     /// What happened when a tool offered the model a file it just produced.
@@ -87,29 +77,38 @@ public enum LocalToolImage {
                 return skipped("Not shown inline: \(label) is \(size / (1024 * 1024)) MB, over the \(producedSourceMaximumBytes / (1024 * 1024)) MB inline cap. Open the path above to see it.")
             }
             let data = try Data(contentsOf: url, options: .mappedIfSafe)
-            guard let thumbnail = jpegThumbnail(data, maxPixelSize: producedThumbnailMaxPixelSize) else {
+            guard let thumbnail = thumbnail(data, maxPixelSize: producedThumbnailMaxPixelSize) else {
+                return skipped("Not shown inline: \(label) could not be decoded as an image.")
+            }
+            let encoded = NSMutableData()
+            guard let destination = CGImageDestinationCreateWithData(
+                encoded, UTType.jpeg.identifier as CFString, 1, nil) else {
+                return skipped("Not shown inline: \(label) could not be decoded as an image.")
+            }
+            CGImageDestinationAddImage(destination, thumbnail.pixels, [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary)
+            guard CGImageDestinationFinalize(destination), encoded.length > 0, encoded.length <= maximumBytes else {
                 return skipped("Not shown inline: \(label) could not be decoded as an image.")
             }
             guard !Task.isCancelled, sink.accept(.image(
-                mediaType: "image/jpeg", base64: thumbnail.data.base64EncodedString(),
-                name: label, byteSize: thumbnail.data.count
+                mediaType: "image/jpeg", base64: (encoded as Data).base64EncodedString(),
+                name: label, byteSize: encoded.length
             )) else {
                 return skipped("Not shown inline: \(roundFull) The file is at the path above.")
             }
             return ProducedImage(
                 shown: true,
                 note: "Shown below this tool result as a JPEG thumbnail, long edge \(producedThumbnailMaxPixelSize)px. The full-size file is at the path above.",
-                width: thumbnail.width, height: thumbnail.height
+                width: thumbnail.pixels.width, height: thumbnail.pixels.height
             )
         } catch {
             return skipped("Not shown inline: \(label) could not be read (\(error.localizedDescription)).")
         }
     }
 
-    /// Downscaled JPEG of the first frame, oriented. Shared by every producer.
-    static func jpegThumbnail(
+    /// Oriented first-frame pixels and original source dimensions.
+    static func thumbnail(
         _ data: Data, maxPixelSize: Int
-    ) -> (data: Data, width: Int, height: Int)? {
+    ) -> (pixels: CGImage, sourceWidth: Int, sourceHeight: Int)? {
         guard let source = CGImageSourceCreateWithData(
                 data as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
               let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
@@ -121,15 +120,7 @@ public enum LocalToolImage {
                 kCGImageSourceCreateThumbnailWithTransform: true,
                 kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
               ] as CFDictionary) else { return nil }
-        let encoded = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(
-            encoded, UTType.jpeg.identifier as CFString, 1, nil) else { return nil }
-        CGImageDestinationAddImage(destination, pixels, [
-            kCGImageDestinationLossyCompressionQuality: 0.8,
-        ] as CFDictionary)
-        guard CGImageDestinationFinalize(destination), encoded.length > 0,
-              encoded.length <= maximumBytes else { return nil }
-        return (encoded as Data, pixels.width, pixels.height)
+        return (pixels, width, height)
     }
 
     /// Bound the entire active conversation, not just one tool iteration.
@@ -164,9 +155,7 @@ public enum LocalToolImage {
                 }
             }
             if changed {
-                messages[index] = LLMMessage(role: message.role, content: content,
-                    turnScopedClearAtNextUserMessage: message.turnScopedClearAtNextUserMessage,
-                    toolChanges: message.toolChanges)
+                messages[index] = LLMMessage(role: message.role, content: content)
             }
         }
     }
@@ -213,9 +202,7 @@ public enum LocalToolImage {
             }
             if changed {
                 let message = messages[index]
-                messages[index] = LLMMessage(role: message.role, content: content,
-                    turnScopedClearAtNextUserMessage: message.turnScopedClearAtNextUserMessage,
-                    toolChanges: message.toolChanges)
+                messages[index] = LLMMessage(role: message.role, content: content)
             }
         }
     }

@@ -1,6 +1,5 @@
 import AgentLinkTransport
 import AgentWorkspace
-import GrokLink
 import Foundation
 import CryptoKit
 import NativeAgentCore
@@ -416,11 +415,9 @@ public enum AgentHostConnection {
                 "remedy": Repair.remedy(owner: checked, nextCall: .object(["tool": .string("app"), "input": .object([
                     "action": .string("agent.connect"), "args": .object(["name": .string(host)])])]), tap: nil)])
         } catch let failure as ToolFailureError where failure.owner != nil {
-            return .object(["status": .string("failed"), "dry_run": .bool(true), "sent": .bool(false), "changed": .bool(false),
-                "detail": .string(failure.localizedDescription),
-                "remedy": failure.personDecides
-                    ? Repair.why(owner: failure.owner!, tap: failure.tap ?? "")
-                    : Repair.remedy(owner: failure.owner!, nextCall: failure.nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }, tap: failure.tap)])
+            return .object(failure.failureEvidence(defaultCode: "agent_verify_failed").merging([
+                "status": .string("failed"), "dry_run": .bool(true), "sent": .bool(false), "changed": .bool(false),
+                "detail": .string(failure.localizedDescription)]) { _, delivery in delivery })
         } catch {
             return .object(["status": .string("failed"), "dry_run": .bool(true), "sent": .bool(false), "changed": .bool(false),
                 "detail": .string("Checked \(checked): \(error.localizedDescription) Read agent.recipe, correct its host fields with agent.recipe_write or the named file, then agent.verify.")])

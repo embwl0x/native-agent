@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 import NativeAgentCore
 import os
+import PersistenceCore
 // Blueprint: | `AgentACPExecutable.swift` | `AgentACPExecutable` struct; `capture`, `verify` |
 
 /// The executable the person saw. Never resolve PATH again when sending.
@@ -84,13 +85,12 @@ public struct AgentACPExecutable: Codable, Sendable, Equatable {
     }
 
     /// Approved program → the file stamp its last full verification passed under.
-    private static let verifiedStamps = OSAllocatedUnfairLock(initialState: [String: String]())
+    private static let verifiedStamps = OSAllocatedUnfairLock(initialState: [String: SnapshotTailOpLog.FileStamp]())
 
-    private static func fileStamp(_ path: String) -> String? {
+    private static func fileStamp(_ path: String) -> SnapshotTailOpLog.FileStamp? {
         var info = stat()
         guard lstat(path, &info) == 0 else { return nil }
-        return "\(info.st_dev) \(info.st_ino) \(info.st_size) \(info.st_mode) "
-            + "\(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec) \(info.st_ctimespec.tv_sec).\(info.st_ctimespec.tv_nsec)"
+        return SnapshotTailOpLog.FileStamp(info)
     }
 
     /// A bounded probe, without a shell or inherited app credentials: its

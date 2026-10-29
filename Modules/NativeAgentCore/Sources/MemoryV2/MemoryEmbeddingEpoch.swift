@@ -1,7 +1,8 @@
 import CryptoKit
 import Foundation
 import NativeAgentCore
-// Blueprint: | `MemoryEmbeddingEpoch.swift` | `MemoryEmbeddingEpoch`, `MemoryEmbeddingBatch`; engine-stopped launch epoch reconciliation on the canonical memory owner; admission retained through actual flight exit |
+import NativeAgentShared
+// Blueprint: | `MemoryEmbeddingEpoch.swift` | `MemoryEmbeddingEpoch`, `MemoryEmbeddingBatch`; engine-stopped epoch reconciliation on the canonical memory owner, including same-epoch vector-pending tombstones before active memory admission; admission retained through actual flight exit |
 
 /// Immutable identity of one vector space. Dimensions alone are deliberately
 /// insufficient: backend, model/tokenizer artifacts, preprocessing, pooling,
@@ -73,12 +74,7 @@ public struct MemoryEmbeddingEpoch: RawRepresentable, Sendable, Codable, Equatab
             let relative = file.path.replacingOccurrences(of: url.path + "/", with: "")
             let path = Data(relative.utf8)
             let contents = try Data(contentsOf: file, options: [.mappedIfSafe])
-            // 2026-09-06: length-prefixed framing. NUL separators alone did not
-            // separate: {a=X, b=Y} and the single file a="X\0b\0Y" serialised
-            // to the same bytes, so two different model directories could share
-            // one epoch — and a store embedded by one would silently be treated
-            // as current under the other. Every install's fingerprint changes
-            // with this, so each re-embeds once at the next launch.
+            // Length-prefixed framing keeps distinct model directories distinct even when file contents contain NULs.
             hasher.update(data: byteLength(path.count))
             hasher.update(data: path)
             hasher.update(data: byteLength(contents.count))
@@ -127,8 +123,7 @@ extension SwiftNativeMemoryV2 {
     /// Rows written while the model was cold get their vectors here, each
     /// through the checks a warm write passes (`landOwedVector`).
     private func fillOwedMemoryVectors() async throws {
-        guard let embedder, let bridge = storage else { throw MemoryV2Error.storageUnavailable }
-        let disk = await bridge.underlyingStorage()
+        guard let embedder, let disk = storage else { throw MemoryV2Error.storageUnavailable }
         try checkEmbeddingConvergence()
         while true {
             let owed = try await disk.memoriesOwingVectors(limit: 32)
@@ -152,6 +147,26 @@ extension SwiftNativeMemoryV2 {
         }
     }
 
+    /// Forget can win before an active row's vector lands. Tombstones are
+    /// canonical claims too, filled in the same epoch without reindexing.
+    private func fillOwedTombstoneVectors() async throws {
+        guard let embedder, let disk = storage else { throw MemoryV2Error.storageUnavailable }
+        while true {
+            try checkEmbeddingConvergence()
+            let owed = try await disk.tombstonesOwingVectors(limit: 32)
+            guard !owed.isEmpty else { return }
+            let batch = try await embedder.embedWithEpoch(owed.map(\.content))
+            try checkEmbeddingConvergence()
+            guard batch.vectors.count == owed.count, batch.vectors.allSatisfy({ !$0.isEmpty }) else {
+                throw MemoryV2Error.underlying("embedder did not return every owed tombstone vector")
+            }
+            for (row, vector) in zip(owed, batch.vectors) {
+                _ = try await disk.landOwedTombstoneVector(hash: row.hash, content: row.content, vector: vector, epoch: batch.epoch)
+                try checkEmbeddingConvergence()
+            }
+        }
+    }
+
     private func convergeEmbeddingEpoch() async -> Bool {
         do {
             try checkEmbeddingConvergence()
@@ -167,6 +182,7 @@ extension SwiftNativeMemoryV2 {
                 try checkEmbeddingConvergence()
                 nativeLog("[memory-epoch] activated %@ across %d canonical rows", report.epoch, report.total)
             }
+            try await fillOwedTombstoneVectors()
             try await fillOwedMemoryVectors()
             try checkEmbeddingConvergence()
             return true

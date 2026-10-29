@@ -1,10 +1,10 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `CognitiveSubstrate+CaresNight.swift` | `CognitiveSubstrate` cares at night: the dream's material (moved today, still open), its settle and let-go lines, fade past the depth's horizon, deepen by distinct days moved, the cares ready for the life card and its approval, their story lines |
 
-// CARES AT NIGHT (personality lane 3, 2026-10-25). Law 4: the night deepens
-// what keeps moving her and lets go of what never does. One CPU pass after the
+// The night deepens what keeps moving her and lets go of what never does after the
 // dream commits. The only model in it is the dream she already has, which is
 // shown what moved her today and what has stayed open, and may answer that an
 // open care is settled or that she lets it go.
@@ -13,12 +13,13 @@ import PersistenceCore
 /// once the dream committed, the lines it answered.
 public struct CognitiveCareNight: Sendable, Equatable {
     public var block: String
-    public var keys: [String: UUID]
+    /// The exact care revision shown at each key, including its open gap.
+    public var keys: [String: CognitiveCare]
     public var answers: [String]
     /// `dream_diary/<date>.md`: the entry the pass follows, the source of its moments.
     public var source: String
 
-    public init(block: String, keys: [String: UUID], answers: [String] = [], source: String = "") {
+    public init(block: String, keys: [String: CognitiveCare], answers: [String] = [], source: String = "") {
         self.block = block
         self.keys = keys
         self.answers = answers
@@ -54,29 +55,31 @@ extension CognitiveSubstrate {
         guard configuration.enabled else { return nil }
         let now = dependencies.now()
         let live = cares.values.filter { $0.fadedAt == nil }
-        let moved = live.compactMap { care -> (care: CognitiveCare, today: [CognitiveCare.Moment])? in
+        let moved = live.compactMap { care -> (care: CognitiveCare, today: [CognitiveCare.Moment], magnitude: Double)? in
             let today = care.story.filter { $0.moved != 0 && now.timeIntervalSince($0.at) < 86_400 }
-            return today.isEmpty ? nil : (care, today)
+            return today.isEmpty ? nil : (care, today, today.reduce(0) { $0 + abs($1.moved) })
         }
-        .sorted { $0.today.reduce(0) { $0 + abs($1.moved) } > $1.today.reduce(0) { $0 + abs($1.moved) } }
+        .sorted { $0.magnitude > $1.magnitude }
         .prefix(Self.dreamMovedCares)
         let movedIDs = Set(moved.map(\.care.id))
-        let stuck = live.filter {
-            $0.open != nil && $0.depth != .now && !movedIDs.contains($0.id)
-                && now.timeIntervalSince(Self.careLastMoved($0)) >= Self.careStuckAfter
+        let stuck = live.compactMap { care -> (care: CognitiveCare, lastMoved: Date)? in
+            guard care.open != nil, care.depth != .now, !movedIDs.contains(care.id) else { return nil }
+            let lastMoved = Self.careLastMoved(care)
+            return now.timeIntervalSince(lastMoved) >= Self.careStuckAfter ? (care, lastMoved) : nil
         }
-        .sorted { Self.careLastMoved($0) < Self.careLastMoved($1) }
+        .sorted { $0.lastMoved < $1.lastMoved }
         .prefix(Self.dreamOpenCares)
-        var keys: [String: UUID] = [:]
+        .map(\.care)
+        var keys: [String: CognitiveCare] = [:]
         func key(_ care: CognitiveCare) -> String {
             let key = "c\(keys.count + 1)"
-            keys[key] = care.id
+            keys[key] = care
             return key
         }
         var lines: [String] = []
         if !moved.isEmpty {
             lines.append("--- WHAT MOVED YOU TODAY (your cares; dream about what actually mattered) ---")
-            for (care, today) in moved {
+            for (care, today, _) in moved {
                 let felt = today.suffix(Self.dreamMomentsPerCare).map { "\($0.felt) (\($0.note))" }
                 lines.append("\(key(care)). \(care.about): " + felt.joined(separator: "; ")
                     + (care.open.map { " | open: \($0)" } ?? ""))
@@ -109,18 +112,25 @@ extension CognitiveSubstrate {
         var changed: [UUID] = []
         var settled = 0, letGo = 0, faded = 0, deepened = 0
         for line in night.answers {
-            guard let answer = Self.careNightAnswer(line), let id = night.keys[answer.key],
-                  var care = cares[id], care.fadedAt == nil, let open = care.open else { continue }
-            care.open = nil
+            guard let answer = Self.careNightAnswer(line), let shown = night.keys[answer.key],
+                  let open = shown.open, var care = cares[shown.id], care.fadedAt == nil else { continue }
+            // A revision is the captured value, not just a timestamp: two
+            // changes can share a clock instant. A changed care keeps the
+            // dream as history without closing a question it never saw.
+            let current = care == shown
+            if current { care.open = nil }
             care.record(CognitiveCare.Moment(
-                at: now, moved: 0, by: .her, felt: answer.how == nil ? "let it go" : "settled",
-                note: answer.how ?? "let go: \(open)", source: night.source))
-            cares[id] = care
-            changed.append(id)
-            if answer.how == nil { letGo += 1 } else { settled += 1 }
+                at: now, moved: 0, by: .her, felt: current ? (answer.how == nil ? "let it go" : "settled") : "dreamed",
+                note: current ? (answer.how ?? "let go: \(open)")
+                    : "dream about \(open): \(answer.how ?? "let go")", source: night.source))
+            cares[care.id] = care
+            changed.append(care.id)
+            if current {
+                if answer.how == nil { letGo += 1 } else { settled += 1 }
+            }
         }
         var ready: [CognitiveCare] = []
-        for var care in cares.values where care.fadedAt == nil && care.depth != .life && care.origin != .seed {
+        for var care in Array(cares.values) where care.fadedAt == nil && care.depth != .life && care.origin != .seed {
             if let horizon = Self.careFadeHorizon(care.depth), now.timeIntervalSince(Self.careLastMoved(care)) > horizon {
                 care.fadedAt = now
                 cares[care.id] = care
@@ -129,7 +139,11 @@ extension CognitiveSubstrate {
                 continue
             }
             var deeper = false
-            while let next = Self.careEarnedDepth(care, calendar: calendar) {
+            // Depth notes leave these local-day witnesses unchanged for every threshold.
+            let dates = (care.folded?.movedDays ?? []) + care.story.filter { $0.moved != 0 }.map(\.at)
+            let moved = Set(dates.map { calendar.startOfDay(for: $0) }).sorted()
+            let span = calendar.dateComponents([.day], from: moved.first ?? now, to: moved.last ?? now).day ?? 0
+            while let next = Self.careEarnedDepth(care.depth, days: moved.count, span: span) {
                 care.record(CognitiveCare.Moment(
                     at: now, moved: 0, by: .her, felt: "deepened", note: "now part of my \(next.rawValue)",
                     source: night.source, depthChange: .init(from: care.depth, to: next)))
@@ -141,13 +155,13 @@ extension CognitiveSubstrate {
                 cares[care.id] = care
                 changed.append(care.id)
             }
-            if care.depth == .season, Self.careMovedSpan(care, calendar: calendar, days: 8, span: 60) {
+            if care.depth == .season, moved.count >= 8, span >= 60 {
                 ready.append(care)
             }
         }
         if !changed.isEmpty {
             markDirty(at: now)
-            for id in Set(changed) { await persistCare(id, at: now) }
+            _ = await saveCares(Array(Set(changed)), at: now)
         }
         await recordReceipt(kind: "cares.night", payload: .object([
             "source": .string(night.source),
@@ -159,12 +173,14 @@ extension CognitiveSubstrate {
     }
 
     /// The life card was approved: the care becomes part of who she is. True
-    /// when it is at life depth now; false when no such care is left.
+    /// when life depth is saved, including on a retry; false when absent or unsaved.
     public func deepenCareToLife(_ id: UUID, source: String) async -> Bool {
         await waitForMaintenanceTransition()
         guard configuration.enabled, var care = cares[id] else { return false }
-        guard care.depth != .life else { return true }
         let now = dependencies.now()
+        if care.depth == .life {
+            return (try? await saveCares([id], at: now).get()) != nil
+        }
         care.record(CognitiveCare.Moment(
             at: now, moved: 0, by: .her, felt: "deepened", note: "now part of my life",
             source: source, depthChange: .init(from: care.depth, to: .life)))
@@ -172,21 +188,17 @@ extension CognitiveSubstrate {
         care.fadedAt = nil
         cares[id] = care
         markDirty(at: now)
-        await persistCare(id, at: now)
-        return true
+        return (try? await saveCares([id], at: now).get()) != nil
     }
 
     // MARK: - Her story
 
     /// Her depth changes and what her nights settled or let go, newest first.
     func careStoryLines() -> [String] {
-        let day = DateFormatter()
-        day.locale = Locale(identifier: "en_US_POSIX")
-        day.dateFormat = "yyyy-MM-dd"
         var lines: [(at: Date, text: String)] = []
         for care in cares.values {
             for moment in care.story where moment.by == .her {
-                let date = day.string(from: moment.at)
+                let date = NativeTimestampFormat.calendarDay(moment.at)
                 if let change = moment.depthChange {
                     lines.append((moment.at, "\(date): \(care.about) became part of my \(change.to.rawValue)"))
                 } else if moment.source.hasPrefix("dream_diary/"), moment.felt == "settled" {
@@ -202,21 +214,15 @@ extension CognitiveSubstrate {
     // MARK: - Reading a story
 
     static func careLastMoved(_ care: CognitiveCare) -> Date {
-        care.story.last(where: { $0.moved != 0 })?.at ?? care.createdAt
-    }
-
-    /// Moved on at least `days` distinct local days, spanning at least `span` days.
-    static func careMovedSpan(_ care: CognitiveCare, calendar: Calendar, days: Int, span: Int) -> Bool {
-        let moved = Set(care.story.filter { $0.moved != 0 }.map { calendar.startOfDay(for: $0.at) }).sorted()
-        guard moved.count >= days, let first = moved.first, let last = moved.last else { return false }
-        return (calendar.dateComponents([.day], from: first, to: last).day ?? 0) >= span
+        max(care.story.last(where: { $0.moved != 0 })?.at ?? care.createdAt,
+            care.folded?.movedDays?.last ?? care.createdAt)
     }
 
     /// The next depth its story has earned. Life is never earned here.
-    static func careEarnedDepth(_ care: CognitiveCare, calendar: Calendar) -> CognitiveCare.Depth? {
-        switch care.depth {
-        case .now where careMovedSpan(care, calendar: calendar, days: 2, span: 0): return .lately
-        case .lately where careMovedSpan(care, calendar: calendar, days: 4, span: 14): return .season
+    static func careEarnedDepth(_ depth: CognitiveCare.Depth, days: Int, span: Int) -> CognitiveCare.Depth? {
+        switch depth {
+        case .now where days >= 2 && span >= 0: return .lately
+        case .lately where days >= 4 && span >= 14: return .season
         default: return nil
         }
     }
@@ -240,14 +246,4 @@ extension CognitiveSubstrate {
         return key.isEmpty || how.isEmpty ? nil : (key, how)
     }
 
-    func persistCare(_ id: UUID, at now: Date) async {
-        guard let care = cares[id] else { return }
-        do {
-            await persistArtifact(kind: "care", id: id, status: care.fadedAt == nil ? "live" : "faded",
-                                  score: min(1, abs(care.charge(at: now))), payload: try Self.careJSON(care))
-        } catch {
-            nativeLog("cares: care %@ was not saved, it could not be encoded: %@", id.uuidString,
-                      String(describing: error))
-        }
-    }
 }

@@ -1,13 +1,25 @@
 import CryptoKit
 import Foundation
+import UserNotifications
 
-// Blueprint: | `DeviceEventIdentity.swift` | `NativeAgentDeviceEventIdentity`: payload-free stable cross-device notification/collapse identity independent of changing prose |
+// Blueprint: | `DeviceEventIdentity.swift` | Stable cross-device notification/collapse identity and shared authenticated notification category construction |
 
-/// Stable, payload-free identity for one user-visible cross-device event.
-///
-/// The same semantic key produces the same 64-byte-safe APNS collapse id,
-/// iCloud notification id, and local snapshot notification id. Content is not
-/// part of identity: changing prose cannot create another alert for one event.
+public func nativeAgentNotificationCategories(approvalCategory: String, messageCategory: String,
+    approve: String, deny: String, reply: String, replyPlaceholder: String) -> Set<UNNotificationCategory> {
+    let authenticated: UNNotificationActionOptions = [.foreground, .authenticationRequired]
+    let replyAction = UNTextInputNotificationAction(identifier: reply, title: "Reply", options: authenticated,
+        textInputButtonTitle: "Send", textInputPlaceholder: replyPlaceholder)
+    return [
+        UNNotificationCategory(identifier: approvalCategory, actions: [
+            UNNotificationAction(identifier: approve, title: "Approve", options: authenticated),
+            UNNotificationAction(identifier: deny, title: "Deny", options: authenticated.union(.destructive)),
+        ], intentIdentifiers: [], options: []),
+        UNNotificationCategory(identifier: messageCategory, actions: [replyAction], intentIdentifiers: [], options: []),
+    ]
+}
+
+/// A semantic key owns one payload-free, 64-byte-safe ID across APNS, iCloud and
+/// local snapshots. Changing prose cannot create another alert for that event.
 public enum NativeAgentDeviceEventIdentity {
     private static let canonicalHexCount = 64
 

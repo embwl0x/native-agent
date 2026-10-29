@@ -1,30 +1,29 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `LLMClient+XAIOAuthDirectAdapter.swift` | `XAIOAuthDirectAdapter`: app-owned OAuth token lifecycle and Grok completion/stream transport with shared refresh serialization |
+// Blueprint: | `LLMClient+XAIOAuthDirectAdapter.swift` | `XAIOAuthTransport`: app-owned OAuth token lifecycle and Grok completion/stream transport with shared refresh serialization |
 
 public let XAIOAuthDirectExhaustedMarker = "xai_oauth_direct_exhausted: re-sign-in required"
 
 /// xAI Grok OAuth provider for NativeAgent-owned credentials.
 ///
 /// It authenticates against xAI and calls Grok models at https://api.x.ai/v1.
-public final class XAIOAuthDirectAdapter: LLMAdapter {
+public final class XAIOAuthTransport: LLMTransport {
     public static let toolWire = ProviderToolWire.native
     public let providerId: String = "xai_oauth_direct"
 
     public static let defaultEndpoint = URL(string: "https://api.x.ai/v1/chat/completions")!
     public static let defaultRefreshEndpoint = URL(string: ProviderOAuthConfig.xaiTokenEndpoint)!
     public static let clientID = ProviderOAuthConfig.xaiClientID
-    /// The first row of this provider's own catalog (2026-09-13): computed, not
-    /// a model id chosen in code — same rule as the Moonshot adapter.
+    /// The default is the provider catalog's first row.
     public static var defaultModel: String {
         FirstPartyModelCatalog.models(forProviderID: "xai_oauth_direct").first?.id ?? ""
     }
 
     private let session: URLSession
     private let endpoint: URL
-    private let refreshEndpoint: URL
     private let tokenPathOverride: URL?
     private let telemetry: LLMCallTraceRecorder
 
@@ -32,14 +31,12 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
 
     public init(
         session: URLSession = .shared,
-        endpoint: URL = XAIOAuthDirectAdapter.defaultEndpoint,
-        refreshEndpoint: URL = XAIOAuthDirectAdapter.defaultRefreshEndpoint,
+        endpoint: URL = XAIOAuthTransport.defaultEndpoint,
         tokenPathOverride: URL? = nil,
         telemetryDataRootOverride: URL? = nil
     ) {
         self.session = session
         self.endpoint = endpoint
-        self.refreshEndpoint = refreshEndpoint
         self.tokenPathOverride = tokenPathOverride
         self.telemetry = LLMCallTraceRecorder(dataRootOverride: telemetryDataRootOverride)
     }
@@ -48,11 +45,6 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         dataRoot
             .appendingPathComponent("providers", isDirectory: true)
             .appendingPathComponent("xai_oauth_direct.json")
-    }
-
-    public func complete(prompt: String, system: String?, model: String) async throws -> String {
-        let messages = [LLMMessage.user(prompt)]
-        return try await completeMessages(messages: messages, system: system, model: model, tools: nil)
     }
 
     public func complete(
@@ -71,84 +63,12 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         model: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
-        let effectiveModel = Self.normalizeModel(model)
-        // User, 2026-09-06: the token the last attempt actually sent, handed to the
-        // forced refresh so a rotation another caller already performed is taken
-        // instead of burning a second single-use refresh_token — N simultaneous 401s
-        // otherwise rotated N times and signed the user out.
-        let requestAccount = OAuthRequestAccount()
-        var lastSentAccessToken: String?
-        for attempt in 0...1 {
-            let access = try await ensureFreshAccessToken(
-                forceRefresh: attempt == 1, staleToken: lastSentAccessToken, requestAccount: requestAccount)
-            lastSentAccessToken = access
-            var req = URLRequest(url: endpoint)
-            req.httpMethod = "POST"
-            req.timeoutInterval = ProviderStreamContext.stallOnly ? .infinity : 240
-            req.setValue("Bearer \(access)", forHTTPHeaderField: "Authorization")
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.setValue("application/json", forHTTPHeaderField: "Accept")
-            req.setValue("NativeAgent (Darwin)", forHTTPHeaderField: "User-Agent")
-
-            let body = try Self.buildChatCompletionsBody(
-                model: effectiveModel,
-                messages: messages,
-                system: system,
-                tools: tools,
-                stream: false
-            )
-            req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
-
-            let requestStartNs = DispatchTime.now().uptimeNanoseconds
-            let data: Data
-            let response: URLResponse
-            do {
-                (data, response) = try await session.data(for: req)
-            } catch {
-                throw mapTransportError(error, fallback: transientNetworkError(error, operation: "completeMessages"))
-            }
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            if status == 401 {
-                if attempt == 0 { continue }
-                throw LLMError.authRejected(
-                    provider: "xai_oauth_direct",
-                    detail: XAIOAuthDirectExhaustedMarker
-                )
-            }
-            try throwIfChatCompletionsError(status: status, data: data, response: response)
-            guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                throw LLMError.invalidResponse(status: status)
-            }
-            let terminal = Result { try Self.parseChatCompletion(obj: obj, status: status) }
-            let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-            await telemetry.record(
-                requestBody: req.httpBody,
-                provider: providerId,
-                model: effectiveModel,
-                streaming: false,
-                usage: LLMUsage.fromOpenAIChatCompletions(obj["usage"] as? [String: Any]),
-                ttftMs: nil,
-                durationMs: durationMs,
-                status: try terminal.chatCompletionsTerminalStatus()
-            )
-            return try terminal.get().text
-        }
-        throw LLMError.authRejected(
-                    provider: "xai_oauth_direct",
-                    detail: XAIOAuthDirectExhaustedMarker
-                )
+        // The stream owns the account-bound refresh and the one 401 retry, as a turn's does.
+        try await LLMMessageStreamEvent.reply(collecting:
+            streamMessages(messages: messages, system: system, model: model, tools: tools))
     }
 
-    public func stream(
-        prompt: String,
-        system: String?,
-        model: String
-    ) -> AsyncThrowingStream<String, Error> {
-        streamMessages(messages: [.user(prompt)], system: system, model: model, tools: nil)
-            .textDeltas(omittingEmpty: true)
-    }
 
-    public func messagesStreamKind(tools: [LLMToolSchema]?) -> LLMMessagesStreamKind { .incremental }
 
     public func streamMessages(
         messages: [LLMMessage],
@@ -164,9 +84,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    // User, 2026-09-06: see the sibling note in
-                    // completeMessages — the stale token keeps N simultaneous
-                    // 401s from rotating the single-use refresh_token N times.
+                    // Forced refresh reuses a concurrent rotation instead of spending the refresh token twice.
                     let requestAccount = OAuthRequestAccount()
                     var lastSentAccessToken: String?
                     for attempt in 0...1 {
@@ -197,79 +115,16 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
                         defer { bytes.task.cancel() }
                         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                         if status == 401, attempt == 0 { continue }
-                        if status == 401 { throw LLMError.authRejected(
-                    provider: "xai_oauth_direct",
-                    detail: XAIOAuthDirectExhaustedMarker
-                ) }
-                        if status == 429 { throw LLMError.rateLimited(message: "", retryAfterSeconds: parseRetryAfterSeconds(from: response)) }
-                        if !(200..<300).contains(status) {
-                            let errData = try await ProviderErrorBodyDrain.read(
-                                bytes, maxBytes: 4096, timeout: 2.0
-                            )
-                            try throwIfChatCompletionsError(status: status, data: errData, response: response)
+                        if status == 401 {
+                            throw LLMError.authRejected(provider: "xai_oauth_direct", detail: XAIOAuthDirectExhaustedMarker)
                         }
-
-                        var ttftMs: Int?
-                        // C1: shared decoder owns framing — [DONE] tracking,
-                        // root error frames (now surfaced as providerError
-                        // instead of a masking streamTruncated), usage capture,
-                        // and tool_call accumulation. This loop keeps only
-                        // xAI's yield policy: ttft stamping and a keepAlive on a
-                        // terminal finish_reason.
+                        try await ProviderWire.validateChatCompletions(bytes, response)
                         var decoder = ChatCompletionsStreamDecoder(providerLabel: "xAI")
-                        var sawContent = false
-                        try await decoder.consume(SSEEventStream(bytes)) { frame in
-                            if ttftMs == nil, frame.content != nil || frame.toolCallDeltaCount > 0 {
-                                ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                            }
-                            // User, 2026-09-06: reasoning frames and tool-argument
-                            // fragments are model output that yields no text, and
-                            // this loop signalled liveness only on content and a
-                            // terminal finish_reason — so ProviderStreamGuard's
-                            // idle clock saw nothing and cut a stream that was
-                            // thinking or assembling arguments. Parity with the
-                            // Moonshot and OpenRouter loops on the same decoder.
-                            if frame.reasoning != nil { continuation.yield(.keepAlive) }
-                            for _ in 0..<frame.toolCallDeltaCount { continuation.yield(.keepAlive) }
-                            if let content = frame.content {
-                                sawContent = true
-                                continuation.yield(.textDelta(content))
-                            }
-                            if let finish = frame.finishReason,
-                               finish == "tool_calls" || finish == "stop" {
-                                continuation.yield(.keepAlive)
-                            }
-                        }
-                        // User, 2026-09-06: `[DONE]` with no content and no tool
-                        // calls was accepted as success — the same empty-and-
-                        // silent turn OpenAI and OpenRouter reject.
-                        let terminal = Result {
-                            try decoder.finalizedToolCalls(
-                                idPrefix: "xai_tool", providerID: "xai_oauth_direct", sawContent: sawContent
-                            )
-                        }
-                        let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                        await telemetry.record(
-                            requestBody: req.httpBody,
-                            provider: providerId,
-                            model: effectiveModel,
-                            streaming: true,
-                            usage: decoder.usage,
-                            ttftMs: ttftMs,
-                            durationMs: durationMs,
-                            status: decoder.toolBoundaryReason != nil ? "incomplete" : (try terminal.chatCompletionsTerminalStatus()),
-                            stopReason: decoder.toolBoundaryReason?.rawValue,
-                            errorDetail: decoder.errorDetail
+                        try await decoder.consume(
+                            SSEEventStream(bytes), continuation: continuation,
+                            request: req, providerID: providerId, model: effectiveModel, idPrefix: "xai_tool",
+                            started: requestStartNs, telemetry: telemetry
                         )
-                        let completedCalls = try terminal.get()
-                        for call in completedCalls {
-                            continuation.yield(.toolCall(LLMStreamToolCall(
-                                id: call.id,
-                                name: call.name,
-                                inputJSON: Data(call.arguments.utf8)
-                            )))
-                        }
-                        if let reason = decoder.toolBoundaryReason { continuation.yield(.toolBoundary(reason)) }
                         continuation.finish()
                         return
                     }
@@ -294,48 +149,18 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         tools: [LLMToolSchema]?,
         stream: Bool
     ) throws -> [String: Any] {
-        var apiMessages: [[String: Any]] = []
-        if let system, !system.isEmpty {
-            apiMessages.append(["role": "system", "content": system])
-        }
-        for message in messages {
-            apiMessages.append(contentsOf: chatCompletionsMessages(from: message))
-        }
         var body: [String: Any] = [
             "model": model,
-            "messages": apiMessages,
+            "messages": OpenAITransport.chatMessages(messages: messages, system: system),
             "stream": stream,
         ]
-        // R-L1: request usage on the final SSE frame so streaming telemetry
-        // carries token counts (mirrors OpenAI/Moonshot). The stream loop
-        // already records decoder.usage; without this the body never asked for
-        // it, so xAI streaming token telemetry was always nil.
+        // Streaming requests ask for token usage on the final SSE frame.
         if stream { body["stream_options"] = ["include_usage": true] }
-        try OpenAIAdapter.applyTools(to: &body, tools: tools)
+        try OpenAITransport.applyTools(to: &body, tools: tools)
         FirstPartyExecutionControls.applyXAIControls(to: &body, model: model)
         return body
     }
 
-
-    private static func parseChatCompletion(obj: [String: Any], status: Int) throws -> (text: String, usage: [String: Any]?) {
-        let message = try chatCompletionsMessage(obj, status: status)
-        // User, 2026-09-06: all-or-nothing on the tool set, same as the streams
-        // — the loop used to `continue` past an entry it could not execute and
-        // emit its siblings, which is half a plan the model wrote as one
-        // decision.
-        let toolSet = finalizeChatCompletionsToolCalls(
-            message["tool_calls"] as? [[String: Any]] ?? [],
-            idPrefix: "xai_tool"
-        )
-        // User, 2026-09-06: an empty reply used to come back as "" and reach the
-        // chat as a blank turn. The streaming lanes call that
-        // `.streamTruncated`; this one does now too, and the ladder can retry.
-        let reply = try chatCompletionsReply(
-            content: (message["content"] as? String) ?? "",
-            toolCalls: toolSet.calls, incompleteNote: toolSet.incompleteNote, provider: "xai_oauth_direct"
-        )
-        return (reply, obj["usage"] as? [String: Any])
-    }
 
     // MARK: - Credentials
 
@@ -360,16 +185,11 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         return try await refreshSerial.run { [self] in
             let state = try Self.loadTokenState(path: self.tokenPath, requestAccount: requestAccount)
             let access = state.accessToken
-            // User, 2026-09-06: a forced refresh used to rotate unconditionally,
-            // so N simultaneous 401s each rotated in turn and every rotation
-            // invalidated the single-use refresh_token the next waiter was
-            // about to spend — a burst of parallel requests signed the user
-            // out. A forced refresh whose on-disk token has already moved past
-            // the one the failing request sent takes the new token instead.
+            // A forced refresh reuses the on-disk token when another waiter has already rotated it.
             if forceRefresh, let staleToken, !staleToken.isEmpty, access != staleToken {
                 return access
             }
-            let shouldRefresh = forceRefresh || Self.accessTokenIsExpiring(state, skew: NativeOAuthSupport.renewalMargin)
+            let shouldRefresh = forceRefresh || Self.accessTokenIsExpiring(state, skew: OAuthGrantOperations.renewalMargin)
             guard shouldRefresh else { return access }
             let refreshed = try await self.refreshTokens(state: state, requestAccount: requestAccount)
             return refreshed.accessToken
@@ -381,10 +201,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         var accessToken: String
         var refreshToken: String
         var tokenEndpoint: URL
-        /// User, 2026-09-06: the hydrated credential bytes. Only their
-        /// token-key digest (`CredentialFileLock.credentialGeneration`) is the
-        /// generation the refresh write is allowed to replace — the rest of
-        /// the file is provider settings that other writers own.
+        /// Hydrated credential bytes whose token-key digest gates refresh writes.
         var bytes: Data
     }
 
@@ -428,26 +245,22 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await NativeOAuthSupport.post(state.tokenEndpoint, body, session: session)
+            (data, response) = try await OAuthGrantOperations.post(state.tokenEndpoint, body, session: session)
         } catch {
             if error is CancellationError { throw CancellationError() }
-            throw transientNetworkError(error, operation: "refresh")
+            throw mapTransportError(error, fallback: transientNetworkError(error, operation: "refresh"))
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if status == 403 {
             throw LLMError.failure(.http(status: status, detail: ProviderFailure.wireDetail(data)))
         }
-        // A3.5: classify refresh failures instead of blanket "revoked". A 401
-        // means the refresh token itself was rejected → genuinely revoked
-        // (reconnect). A 429/5xx is a provider-side hiccup → transient: keep the
-        // session so a stranger isn't told to reconnect over a temporary blip.
+        // Only token rejection requires reconnecting; temporary refresh failures preserve the session.
         let refreshError = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         if status == 401 || (status == 400 && refreshError?["error"] as? String == "invalid_grant") {
             throw LLMError.authRejected(
                 provider: "xai_oauth_direct", detail: Self.boundedBodyString(data))
         }
-        // User, 2026-09-06: preserve `Retry-After` on a refresh 429 the way the
-        // chat call path does — see the Anthropic sibling.
+        // Refresh 429 preserves Retry-After.
         if status == 429 {
             throw LLMError.rateLimited(
                 message: "xai_oauth_direct refresh HTTP 429 (temporary): \(Self.boundedBodyString(data))",
@@ -471,7 +284,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
             "access_token": access,
             "refresh_token": (payload["refresh_token"] as? String) ?? state.refreshToken,
             "token_type": (payload["token_type"] as? String) ?? "Bearer",
-            "last_refresh": isoNow(),
+            "last_refresh": NativeTimestampFormat.plainZulu(Date()),
             "discovery": ["token_endpoint": state.tokenEndpoint.absoluteString],
         ]
         try OAuthRefreshBinding.requireSameAccount(payload, original: state.object, provider: "xai_oauth_direct")
@@ -480,28 +293,13 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
         }
         if let expiresIn = payload["expires_in"] as? Int {
             updates["expires_in"] = expiresIn
-            updates["expires_at"] = isoBasic(Date().addingTimeInterval(TimeInterval(expiresIn)))
+            updates["expires_at"] = NativeTimestampFormat.basicZulu(Date().addingTimeInterval(TimeInterval(expiresIn)))
         } else if let expiresInDouble = payload["expires_in"] as? Double {
             updates["expires_in"] = expiresInDouble
-            updates["expires_at"] = isoBasic(Date().addingTimeInterval(expiresInDouble))
+            updates["expires_at"] = NativeTimestampFormat.basicZulu(Date().addingTimeInterval(expiresInDouble))
         }
-        // User, 2026-09-06: sign-out (which deletes this file) and a fresh
-        // sign-in (which replaces it) do not go through the adapter's refresh
-        // queue, so writing unconditionally resurrected a removed credential
-        // or clobbered a newer one. The bytes read before the network call are
-        // the generation; a refresh whose generation moved skips its write and
-        // hands back the current credential only for the request's account.
-        // User, 2026-09-06: the comparison and the write it guards now sit in
-        // ONE critical section on the credential path's shared lock, which the
-        // app's sign-in and sign-out take too — a compare followed by an
-        // unguarded write still lost every sign-out that landed between them.
-        // User, 2026-09-06: the generation is a digest of the TOKEN keys, not
-        // the file's bytes. `configureProvider` writes `default_model` into
-        // this same file, so saving provider settings during a refresh moved
-        // the bytes and made the refresh discard the token it had just
-        // rotated — burning the single-use refresh_token on disk. For the same
-        // reason the refreshed fields are merged onto what is on disk NOW, so
-        // a concurrent settings save survives the refresh's write.
+        // Under the shared path lock, compare token-key generations and merge onto current settings.
+        // Superseded refreshes skip the write and return a current credential only for the same account.
         let generation = CredentialFileLock.credentialGeneration(ofFileContents: state.bytes)
         return try CredentialFileLock.withLock(tokenPath) {
             let current = try XAIOAuthCredentialStore.read(at: tokenPath)
@@ -528,30 +326,10 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
     }
 
     private func transientNetworkError(_ error: Error, operation: String) -> LLMError {
-        let host = endpoint.host ?? "api.x.ai"
-        let nsError = error as NSError
-        if nsError.domain == NSURLErrorDomain {
-            switch URLError.Code(rawValue: nsError.code) {
-            case .timedOut:
-                return .transient(message: "xai_oauth_direct \(operation) timed out: \(host)")
-            case .notConnectedToInternet:
-                return .transient(message: "xai_oauth_direct \(operation) not connected to internet")
-            case .cannotConnectToHost, .networkConnectionLost, .cannotFindHost, .dnsLookupFailed:
-                return .transient(message: "xai_oauth_direct \(operation) network error for \(host): \(nsError.code)")
-            default:
-                break
-            }
-        }
-        return .transient(message: "xai_oauth_direct \(operation) network error for \(host): \(error)")
+        .transient(message: "\(providerId) \(operation) failed for \(endpoint.host ?? "api.x.ai"): \(String(ProviderFailure.diagnosticDescription(error).prefix(400)))")
     }
 
-    /// User, 2026-09-06: consult the PERSISTED `expires_at` as well as the JWT
-    /// `exp`. xAI also issues opaque access tokens, and for those `jwtExpiry`
-    /// returns nil — the token was then treated as never expiring, so the
-    /// adapter never refreshed proactively and every turn paid a 401 round
-    /// trip (and a turn that had already spent its one retry just failed).
-    /// The earlier of the two wins when both are present, so an out-of-band
-    /// rotation cannot leave a token being served past its real expiry.
+    /// Expiry is the earlier of persisted expires_at and JWT exp, including opaque-token support.
     private static func accessTokenIsExpiring(_ state: TokenState, skew: TimeInterval) -> Bool {
         guard let effective = effectiveExpiry(state.accessToken, object: state.object) else { return false }
         return effective.timeIntervalSinceNow <= skew
@@ -570,11 +348,15 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
     public static func credentialStatus(_ auth: [String: Any]?) -> (usable: Bool, detail: String, health: OAuthCredentialHealth) {
         let object = auth ?? [:]
         let tokens = OAuthRefreshBinding.tokenSet(object, provider: "xai_oauth_direct")
+        if OAuthRefreshBinding.hasInvalidExpiry(object, provider: "xai_oauth_direct") {
+            return (false, "Saved expires_at is invalid — repair the credential or sign in again",
+                OAuthCredentialHealth(configured: false, expiresAt: nil, canRefresh: false))
+        }
         let access = OAuthRefreshBinding.string(tokens["access_token"])
         let refresh = OAuthRefreshBinding.string(tokens["refresh_token"])
         let expiry = effectiveExpiry(access ?? "", object: object)
         let canRefresh = refresh != nil && OAuthRefreshBinding.permitsRefresh(object, provider: "xai_oauth_direct")
-        let needsRefresh = expiry.map { $0.timeIntervalSinceNow <= NativeOAuthSupport.renewalMargin } ?? false
+        let needsRefresh = expiry.map { $0.timeIntervalSinceNow <= OAuthGrantOperations.renewalMargin } ?? false
         let usable = access != nil && refresh != nil && (!needsRefresh || canRefresh)
             && tokenEndpoint(in: object) != nil
         let detail = usable ? (needsRefresh ? "Signed in. Your session will renew on your next chat." : "Signed in")
@@ -597,7 +379,7 @@ public final class XAIOAuthDirectAdapter: LLMAdapter {
     }
 
     private static func redactedErrorBody(_ raw: String) -> String {
-        var out = NativeOAuthSupport.redact(raw, bearerReplacement: "Bearer ***")
+        var out = OAuthGrantOperations.redact(raw, bearerReplacement: "Bearer ***")
         if let re = try? NSRegularExpression(
             pattern: #"(?i)"(access_token|refresh_token|id_token|authorization|api_key|token)"\s*:\s*"[^"]+""#
         ) {
@@ -633,19 +415,4 @@ private func persistedExpiry(_ obj: [String: Any]) -> Date? {
         ?? (obj["tokens"] as? [String: Any])?["expires_at"]
     guard let raw else { return nil }
     return parseExpiresAt(raw)
-}
-
-private func isoNow() -> String {
-    let formatter = ISO8601DateFormatter()
-    formatter.formatOptions = [.withInternetDateTime]
-    return formatter.string(from: Date())
-}
-
-private func isoBasic(_ date: Date) -> String {
-    let formatter = DateFormatter()
-    formatter.calendar = Calendar(identifier: .iso8601)
-    formatter.locale = Locale(identifier: "en_US_POSIX")
-    formatter.timeZone = TimeZone(secondsFromGMT: 0)
-    formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'"
-    return formatter.string(from: date)
 }

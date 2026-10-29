@@ -15,14 +15,14 @@ public enum NativeActionRoutes {
     ) async throws -> NativeActionReceipt {
         let actionId = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !actionId.isEmpty else {
-            throw NativeActionRouteSupport.notImplemented(
+            throw NativeActionWire.notImplemented(
                 method: "runNativeAction",
                 reason: "native action id is required",
                 followup: "vault://nativeagent/zombie_stub_audit#runNativeAction"
             )
         }
         guard let action = Self.swiftRunnableNativeAction(id: actionId) else {
-            throw NativeActionRouteSupport.notImplemented(
+            throw NativeActionWire.notImplemented(
                 method: "runNativeAction",
                 reason: "Swift native action '\(actionId)' is not registered",
                 followup: "vault://nativeagent/zombie_stub_audit#runNativeAction"
@@ -36,7 +36,7 @@ public enum NativeActionRoutes {
         }
         let result = try await NativeActionDispatch.dispatchNativeAction(
             tool: actionId,
-            input: NativeActionRouteSupport.jsonValueBody(input),
+            input: NativeActionWire.jsonValueBody(input),
             dryRun: dryRun,
             dataRoot: dataRoot
         )
@@ -180,8 +180,7 @@ public enum NativeActionRoutes {
         }
         let recordValue = JSONValue.object(record)
         let path = SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot).nativeActionsReceiptsPath
-        let persistence = SwiftNativePersistenceCore()
-        try await appendPathOwnedJSONL(recordValue, to: path, using: persistence, logLabel: "NativeActions.receipts")
+        try await appendPathOwnedJSONL(recordValue, to: path, logLabel: "NativeActions.receipts")
         let data = try recordValue.serializedData(pretty: false)
         return try JSONDecoder.nativeAgent.decode(NativeActionReceipt.self, from: data)
     }
@@ -218,10 +217,10 @@ public enum NativeActionRoutes {
             "effectiveAutonomy": .string(result.effectiveAutonomy),
             "autonomySource": .string(result.autonomySource),
             "providerMatch": .bool(result.providerMatch),
-            "traceEventId": .string(result.traceEventId),
+            "traceEventId": .string(""),
             "runId": .string(result.runId),
             "startedAt": .string(result.startedAt),
-            "output": result.output?.value ?? .null,
+            "output": result.output ?? .null,
             "verifyPassed": result.verifyPassed.map { .bool($0) } ?? .null,
         ]
         if let err = result.error {

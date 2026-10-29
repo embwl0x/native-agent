@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import ChatTurnRuntime
 import ChatTurnContracts
 import PersonaEngine
@@ -9,7 +10,6 @@ import StandingBots
 import ProviderRouting
 import PersistenceCore
 import NativeAgentCore
-import ChatTurnContracts
 // Blueprint: | `AgentContacts.swift` | Root-retained contact clients, tasks, reply handovers and desktop routes; helpers of this install reach the resident through the same contact runtime with their own sender and thread |
 
 /// The chat and tool clients an engine root builds for its agent contacts.
@@ -65,7 +65,7 @@ public final class AgentContacts: Sendable {
     }
     public let tasks: AgentContactTasks
     public let desktop: DesktopAgentConversationRoute
-    public let humanReplies: HumanConversationReplyService
+    public let humanReplies: HumanConversationReplies
     public let grok: GrokInboundReply
     public let continuation: AgentConversationContinuation
     private let dot: ChatGPTDotConversation
@@ -115,21 +115,19 @@ public final class AgentContacts: Sendable {
                     sessionID: ContactThread.session(owner: owner), surface: AgentBridgeSurface.id,
                     envelope: TurnEnvelope(surface: AgentBridgeSurface.id, agent: "peer", verifiedUserId: String(from.dropFirst(5)),
                                            commandSignatureVerified: true, declaredRemote: true),
-                    origin: origin)
-                let iso = ISO8601DateFormatter()
-                iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                _ = try await ChatPersistenceContext.$importedMessageCreatedAt.withValue(iso.string(from: at)) {
+                    origin: origin, threadKind: .agent)
+                _ = try await ChatPersistenceContext.$importedMessageCreatedAt.withValue(NativeTimestampFormat.fractionalZulu(at)) {
                     try await request.enqueue(on: clients.bridgeChatClient(), awaitingConsumption: false)
                 }
             }
         }
-        // The writer is back: let-go sends' states waiting on it go onto their rows.
-        AgentConversationStore.releasePending(dataRoot: dataRoot)
+        // Restore projections once; let-go sends' states can reach their rows again.
+        AgentConversationStore.restoreProjections(dataRoot: dataRoot)
         tasks = AgentContactTasks(dataRoot: dataRoot) { turn, emit in
             try await AgentContactRuntime.run(turn, client: clients.bridgeChatClient(), dataRoot: dataRoot, emit: emit)
         }
         desktop = DesktopAgentConversationRoute(clients: clients, dataRoot: dataRoot)
-        humanReplies = HumanConversationReplyService(dataRoot: dataRoot, sender: completionSender) { id, expected, text, run in
+        humanReplies = HumanConversationReplies(dataRoot: dataRoot, sender: completionSender) { id, expected, text, run in
             let client = clients.backgroundChatClient()
             try await client.appendHumanConversationReply(sessionID: id, expectedLastMessageID: expected,
                                                           text: text, runID: run)

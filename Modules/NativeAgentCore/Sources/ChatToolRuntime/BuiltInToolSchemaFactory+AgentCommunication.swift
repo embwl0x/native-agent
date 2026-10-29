@@ -1,16 +1,27 @@
 import Foundation
+import AgentConversations
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `BuiltInToolSchemaFactory+AgentCommunication.swift` | `BuiltInToolSchemaFactory`: `agentCommunicationSchemas` |
+// Blueprint: | `BuiltInToolSchemaFactory+AgentCommunication.swift` | `BuiltInToolSchemaFactory`: `agentCommunicationSchemas`, `inboxOptionsSchema` |
 
 extension BuiltInToolSchemaFactory {
+    func inboxOptionsSchema() -> JSONValue {
+        return ToolSchema.obj([("type", .string("object")), ("additionalProperties", .bool(false)), ("properties", .object(
+            Dictionary(uniqueKeysWithValues: AgentConversationDelivery.inboxOptionKeys.map { key in
+                let property = ["fast", "pair_reviewer"].contains(key) ? ToolSchema.boolSchema()
+                    : key == "timeout_seconds" ? ToolSchema.intSchema("Door's run limit, 60–3600 seconds.", minimum: 60, maximum: 3600)
+                    : ToolSchema.strSchema("Declared by the contact's inbox door.")
+                return (key, property)
+            })))])
+    }
+
     func agentCommunicationSchemas() -> [LLMToolSchema?] {
         let names: Set<String> = ["agent_contacts", "agent_connect", "agent_message", "agent_read", "agent_cancel"]
         guard requestedNames == nil || !names.isDisjoint(with: requestedNames!) else { return [] }
         let agent = ToolSchema.strSchema("A unique saved participant name or handle, bot:<UUID>, or peer:<UUID> from agent.contacts. Ambiguous names need an exact reference; never guess.")
         let conversation = ToolSchema.strSchema("Optional human conversation label, such as browser work, for adapters supporting separate conversations. Omit to use this participant's current conversation. Home message shortcuts also take args {text, conversation}. Bots have one continuous conversation: omit this field for bots. Opening a bot by name shows its latest full saved reply. On supported routes, an unused label starts a separate conversation; on a read it selects an existing one. The app retains the underlying identities.")
         return [
-            requestedSchema(name: "agent_contacts", toolClass: .read, description: "Find a participant by name: saved connections, coding helpers and bots, with availability and status. Includes local agents, remote peers and agent hosts available to connect by name. Set discover true only when the person asks about agents or asks to find agents; ordinary calls reuse observations without discovery.", parametersJSON: agentCommunicationParams(properties: [("discover", ToolSchema.obj([("anyOf", .array([ToolSchema.obj([("type", .string("boolean"))]), ToolSchema.obj([("type", .string("string"))]), ToolSchema.obj([("type", .string("null"))])])), ("description", .string("true, or a name to find."))]))], required: [])),
+            requestedSchema(name: "agent_contacts", toolClass: .read, description: "One short row per contact: name, state and last answered from its thread. details:true includes doors and connection evidence. Set discover true only when the person asks about agents or asks to find agents; ordinary calls reuse observations without discovery.", parametersJSON: agentCommunicationParams(properties: [("details", ToolSchema.boolSchema()), ("discover", ToolSchema.obj([("anyOf", .array([ToolSchema.obj([("type", .string("boolean"))]), ToolSchema.obj([("type", .string("string"))]), ToolSchema.obj([("type", .string("null"))])])), ("description", .string("true, or a name to find."))]))], required: [])),
             requestedSchema(name: "agent_connect", toolClass: .write, capabilities: ["app_data_write", "credential_write", "other_app_settings_write", "tool_call"], effectInputPolicy: .agentConnection, description: "Connect a participant by name, URL or desktop app. First resolve it with agent.contacts; Codex/Claude may also name providers. Call directly: Trust supplies any required approval card with the exact change. Name alone finds a supported installed host and adds one MCP entry for nativeagent-link with a connection-specific key. Preserves other settings; keeps only the newest NativeAgent backup beside them and removes it on disconnect. Unknown/uninstalled hosts leave settings unchanged; no app is restarted or interrupted. Setup may run one fixed CLI verification probe asking the participant to answer through the entry; this is a message, not task work or an authority grant. Connected requires an authenticated inbound request, not a successful CLI exit. Otherwise stays configured with the cause; without a probe route, the result names any restart needed and waits for first inbound proof without reading the window. Disconnect: disconnect:true, name:peer:<exact id from agent.contacts>; removes that entry and revokes its key. With endpoint, omitted/auto transport discovers supported A2A/NativeAgent cards through bounded same-origin GETs; explicit a2a/nativeAgent saves without probing. Desktop: transport:desktop, app_bundle_id, optional conversation_label; send-only, using existing Mac permissions to type into its chat. Replies require that app’s nativeagent-link mcp entry and its agent_message tool. Reuses exact discovered/desktop routes.", parametersJSON: agentCommunicationParams(properties: [
                 ("name", ToolSchema.strSchema("The participant's name, at most 120 characters. On its own — with no endpoint and no transport — it is looked up among the known agent hosts on this Mac, matched case-insensitively including common aliases. With an endpoint it is the display name for that contact.")),
                 ("endpoint", ToolSchema.strSchema("Required for a2a/nativeAgent: HTTPS URL, or explicit loopback HTTP. No embedded credentials, query, or fragment. Omit for desktop, and omit to connect by name.")),
@@ -25,11 +36,12 @@ extension BuiltInToolSchemaFactory {
                 ("ability", ToolSchema.obj([("anyOf", .array([ToolSchema.obj([("type", .string("string"))]), ToolSchema.obj([("type", .string("boolean"))]), ToolSchema.obj([("type", .string("null"))])])),
                     ("description", .string("A saved contact can be reached through one of your abilities: its id here, with the contact's name, moves the contact there (agent.message runs it, and it answers with agent.reply), and false moves it back to its built-in route."))]))
             ], required: ["name"])),
-            requestedSchema(name: "agent_message", toolClass: .send, capabilities: ["app_data_write", "external_send", "network_read", "network_write", "process_spawn", "shell", "tool_call"], effectInputPolicy: .agentMessage, description: "Sends a message now to an agent by name; a known agent not yet connected is connected first in the same call. Continues your current thread; conversation names a separate one, new_conversation:true starts fresh. While its reply is still coming, a new message queues behind it and goes by itself when that reply settles. Queued or delivered is not done; never auto-resend.", parametersJSON: agentCommunicationParams(properties: [
+            requestedSchema(name: "agent_message", toolClass: .send, capabilities: ["app_data_write", "external_send", "network_read", "network_write", "process_spawn", "shell", "tool_call"], effectInputPolicy: .agentMessage, description: "Send a message to an agent and wait up to wait_seconds (default 20, max 120) for a live lane's answer inline; 0 sends and continues. An answered receipt has reply, replied_at and delivery:answered. Timeout preserves queued delivery and the later reply; async lanes return immediately with wait_ignored:lane_is_async. A known agent not yet connected is connected first through its setup gates. Continues your current thread; conversation names a separate one, new_conversation:true starts fresh. While its reply is still coming, a new message queues behind it and goes by itself when that reply settles. Queued or delivered is not done; never auto-resend.", parametersJSON: agentCommunicationParams(properties: [
                 ("agent", agent), ("text", ToolSchema.strSchema("The message to send.")),
                 ("conversation", conversation),
                 ("new_conversation", ToolSchema.boolSchema()),
                 ("expects_reply", ToolSchema.boolSchema("false for a message needing no answer. Acceptance is still owed until the recipient receives it. Omit for questions and work.")),
+                ("wait_seconds", ToolSchema.intSchema("Wait for a live lane's reply inline: default 20, maximum 120; 0 sends and continues. Async lanes ignore the wait and say wait_ignored:lane_is_async. Timeout keeps the queued receipt; the later answer still arrives once.", minimum: 0, maximum: 120)),
                 ("conversation_id", ToolSchema.strSchema("Advanced override: exact existing remote conversation identity. Normally omit; the app remembers it. A failed resume never falls back to a fresh conversation. Bots retain their own conversation.")),
                 ("message_id", ToolSchema.strSchema("Optional caller message identity for coding agents or A2A; NativeAgent accepts a UUID for receipt correlation, not deduplication. Not supported for bot sends. Use returned request identity for recovery.")),
                 ("task_id", ToolSchema.strSchema("A2A only: exact task to continue, especially when it needs input.")),
@@ -83,11 +95,7 @@ extension BuiltInToolSchemaFactory {
                 object["required"] = .array(needed.sorted().map(JSONValue.string))
                 object["additionalProperties"] = .bool(false)
             }
-            if optional, case .string(let type)? = object["type"] {
-                object["type"] = .array([.string(type), .string("null")])
-                if case .array(var values)? = object["enum"] { values.append(.null); object["enum"] = .array(values) }
-            }
-            return .object(object)
+            return optional ? ToolSchema.nullable(.object(object)) : .object(object)
         }
         let value = ToolSchema.obj([("type", .string("object")), ("properties", ToolSchema.obj(properties)),
                          ("required", .array(required.map(JSONValue.string))), ("additionalProperties", .bool(false))])

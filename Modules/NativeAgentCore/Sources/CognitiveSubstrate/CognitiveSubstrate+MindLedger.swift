@@ -1,22 +1,13 @@
 // CognitiveSubstrate+MindLedger.swift
-// Phase 5 B0 (2026-10-03) — her two corrective verbs over her own mind.
-//
-// Agent: "reject a bad association, and reverse an update without rewriting my
-// whole history." Two bounded lists in ONE artifact row (`mind_ledger`):
-//   * suppressions — (source, context signature): this memory or care
-//     must not surface for this kind of thing. Every selector that can surface
-//     the source honors it (the felt cue, the unbidden recall, the memory lane).
-//   * undo — the PREVIOUS value of each item her own update changed, just the
-//     previous, keyed by item. Undo restores that one item only, and only while
-//     the item still holds the value that update left; anything newer is a
-//     conflict and is refused with the current value.
+// The `mind_ledger` artifact holds bounded suppressions and one disposition undo.
+// Every selector honors source/context suppressions; undo refuses changes newer than the update it reverses.
 
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Studio
 
-// Blueprint: | `CognitiveSubstrate+MindLedger.swift` | `CognitiveSubstrate` mind ledger: bounded association suppressions and undo entries, persistence and restoration |
+// Blueprint: | `CognitiveSubstrate+MindLedger.swift` | `CognitiveSubstrate` mind ledger: bounded association suppressions and one disposition undo, persistence and restoration |
 
 public struct CognitiveAssociationSuppression: Sendable, Equatable {
     /// `memory:<record id>`, `care:<uuid>` or `dream:<date>#<n>`;
@@ -55,7 +46,6 @@ extension CognitiveSubstrate {
     }
 
     static let maximumAssociationSuppressions = 48
-    static let maximumUndoEntries = 24
     static let associationSignatureTermCap = 8
 
     // MARK: - Association signature
@@ -128,19 +118,15 @@ extension CognitiveSubstrate {
         "\(disposition.valence)|\(disposition.updatedAt.timeIntervalSince1970)"
     }
 
-    /// One entry per item, newest last; the oldest drops past the cap.
-    func recordUndo(key: String, what: String, previous: JSONValue, stamp: String) async {
-        undoLedger.removeAll { $0.key == key }
-        undoLedger.append(.init(
-            key: key, what: bounded(what, maxCharacters: 160), previous: previous,
-            stamp: stamp, at: dependencies.now()))
-        if undoLedger.count > Self.maximumUndoEntries {
-            undoLedger.removeFirst(undoLedger.count - Self.maximumUndoEntries)
-        }
+    /// The newest undertone update replaces the previous undo.
+    func recordDispositionUndo(what: String, previous: JSONValue, stamp: String) async {
+        dispositionUndo = .init(
+            key: "disposition", what: bounded(what, maxCharacters: 160), previous: previous,
+            stamp: stamp, at: dependencies.now())
         await notingPersistence("mind_ledger") { try await persistMindLedger() }
     }
 
-    public func undoSnapshot() -> [CognitiveUndoEntry] { undoLedger }
+    public func undoSnapshot() -> [CognitiveUndoEntry] { dispositionUndo.map { [$0] } ?? [] }
 
     /// Reverse ONE update of hers. Compare-and-set: the item must still hold
     /// the value that update left, else the call is refused with what it holds
@@ -150,65 +136,55 @@ extension CognitiveSubstrate {
             return .refused(reason: "an undo is made from inside your own turn", current: .null)
         }
         await waitForMaintenanceTransition()
-        guard let entry = undoLedger.last(where: { $0.key == key }) else {
+        guard key == "disposition", let entry = dispositionUndo else {
             return .refused(reason: "nothing of yours to undo for \(key)", current: .null)
         }
         beginMaintenanceTransition()
         defer { endMaintenanceTransition() }
         let now = dependencies.now()
-        var artifacts: [CognitiveArtifactWrite] = []
-        let rollback: () -> Void
-        let previousValue: JSONValue
-        if key == "disposition" {
-            let current = disposition
-            guard Self.undoStamp(current) == entry.stamp else {
-                return .refused(reason: "your undertone moved again since that update",
-                                current: .object(["valence": .double(current.valence)]))
-            }
-            guard case .object(let prior) = entry.previous,
-                  let valence = doubleValue(prior["valence"]),
-                  let updatedAt = dateValue(prior["updatedAt"]) else {
-                return .refused(reason: "no previous undertone kept", current: .null)
-            }
-            let previousTransitions = dispositionTransitions
-            let restored = CognitiveDisposition(valence: valence, updatedAt: updatedAt)
-            disposition = restored
-            dispositionTransitions.append(CognitiveDispositionTransition(
-                before: current.valence, afterDecay: current.valence, afterContribution: valence,
-                at: now, source: bounded("undo: \(entry.what)", maxCharacters: 60)))
-            if dispositionTransitions.count > Self.maximumDispositionTransitions {
-                dispositionTransitions.removeFirst(dispositionTransitions.count - Self.maximumDispositionTransitions)
-            }
-            dirtyRevision &+= 1
-            artifacts.append(CognitiveArtifactWrite(
-                kind: "disposition", id: stableArtifactID("disposition"), status: "current",
-                score: (valence + 1) / 2, payload: dispositionArtifactPayload(at: updatedAt)))
-            let writtenTransitions = dispositionTransitions
-            previousValue = .object(["valence": .double(current.valence)])
-            rollback = {
-                if self.disposition == restored { self.disposition = current }
-                if self.dispositionTransitions == writtenTransitions {
-                    self.dispositionTransitions = previousTransitions
-                }
-            }
-        } else {
-            return .refused(reason: "unknown item \(key)", current: .null)
+        let current = disposition
+        guard Self.undoStamp(current) == entry.stamp else {
+            return .refused(reason: "your undertone moved again since that update",
+                            current: .object(["valence": .double(current.valence)]))
         }
+        guard case .object(let prior) = entry.previous,
+              let valence = prior["valence"]?.numberValue(coercingStrings: false, finiteOnly: false),
+              let updatedAt = dateValue(prior["updatedAt"]) else {
+            return .refused(reason: "no previous undertone kept", current: .null)
+        }
+        let previousTransitions = dispositionTransitions
+        let restored = CognitiveDisposition(valence: valence, updatedAt: updatedAt)
+        disposition = restored
+        dispositionTransitions.append(CognitiveDispositionTransition(
+            before: current.valence, afterDecay: current.valence, afterContribution: valence,
+            at: now, source: bounded("undo: \(entry.what)", maxCharacters: 60)))
+        if dispositionTransitions.count > Self.maximumDispositionTransitions {
+            dispositionTransitions.removeFirst(dispositionTransitions.count - Self.maximumDispositionTransitions)
+        }
+        dirtyRevision &+= 1
+        let writtenTransitions = dispositionTransitions
         // The item and consumption of its retry entry are one durable change.
-        artifacts.append(CognitiveArtifactWrite(
-            kind: "mind_ledger", id: stableArtifactID("mind_ledger"), status: "current", score: 0,
-            payload: mindLedgerArtifactPayload(at: now, undoEntries: undoLedger.filter { $0 != entry })))
+        let artifacts = [
+            CognitiveArtifactWrite(
+                kind: "disposition", id: stableArtifactID("disposition"), status: "current",
+                score: (valence + 1) / 2, payload: dispositionArtifactPayload(at: updatedAt)),
+            CognitiveArtifactWrite(
+                kind: "mind_ledger", id: stableArtifactID("mind_ledger"), status: "current", score: 0,
+                payload: mindLedgerArtifactPayload(at: now, undoEntry: nil)),
+        ]
         do {
             try await persistArtifactTransition(artifacts: artifacts, deletedArtifactIDs: [], at: now)
         } catch {
-            rollback()
+            if disposition == restored { disposition = current }
+            if dispositionTransitions == writtenTransitions { dispositionTransitions = previousTransitions }
             markDirty(at: dependencies.now())
             publishAttentionProjection(at: dependencies.now())
-            return .refused(reason: "the undo was not saved; you can retry: \(error)", current: previousValue)
+            return .refused(reason: "the undo was not saved; you can retry: \(error)",
+                            current: .object(["valence": .double(current.valence)]))
         }
         // Only the entry this call undid: a newer update of the same item may
         // have recorded its own while the write above was suspended.
-        undoLedger.removeAll { $0 == entry }
+        if dispositionUndo == entry { dispositionUndo = nil }
         await recordReceipt(kind: "mind.undo", payload: .object([
             "item": .string(key), "what": .string(entry.what),
         ]))
@@ -216,15 +192,15 @@ extension CognitiveSubstrate {
         return .undone(what: entry.what)
     }
 
-    // MARK: - Persistence (one row, both lists capped)
+    // MARK: - Persistence (one row)
 
     func persistMindLedger() async throws {
         try await persistArtifactChecked(
             kind: "mind_ledger", id: stableArtifactID("mind_ledger"), status: "current", score: 0,
-            payload: mindLedgerArtifactPayload(at: dependencies.now()))
+            payload: mindLedgerArtifactPayload(at: dependencies.now(), undoEntry: dispositionUndo))
     }
 
-    func mindLedgerArtifactPayload(at now: Date, undoEntries: [CognitiveUndoEntry]? = nil) -> JSONValue {
+    func mindLedgerArtifactPayload(at now: Date, undoEntry: CognitiveUndoEntry?) -> JSONValue {
         let suppressions: [JSONValue] = associationSuppressions.map {
             .object([
                 "source": .string($0.source),
@@ -232,7 +208,7 @@ extension CognitiveSubstrate {
                 "at": .double($0.at.timeIntervalSince1970),
             ])
         }
-        let undo: [JSONValue] = (undoEntries ?? undoLedger).map {
+        let undo: [JSONValue] = (undoEntry.map { [$0] } ?? []).map {
             .object([
                 "key": .string($0.key),
                 "what": .string($0.what),
@@ -250,28 +226,27 @@ extension CognitiveSubstrate {
 
     func restoreMindLedger(from payloads: [JSONValue]) {
         associationSuppressions = []
-        undoLedger = []
+        dispositionUndo = nil
         guard case .object(let object)? = payloads.first else { return }
         if case .array(let rows)? = object["suppressions"] {
             for case .object(let row) in rows {
-                guard let source = stringValue(row["source"]),
+                guard let source = row["source"]?.stringValue,
                       ["memory:", "care:", "dream:", "desk:", "ship:"].contains(where: source.hasPrefix),
                       let at = dateValue(row["at"]) else { continue }
                 var terms: [String] = []
-                if case .array(let values)? = row["terms"] { terms = values.compactMap { stringValue($0) } }
+                if case .array(let values)? = row["terms"] { terms = values.compactMap { $0.stringValue } }
                 associationSuppressions.append(.init(source: source, terms: terms, at: at))
             }
             associationSuppressions = Array(associationSuppressions.suffix(Self.maximumAssociationSuppressions))
         }
         if case .array(let rows)? = object["undo"] {
             for case .object(let row) in rows {
-                guard let key = stringValue(row["key"]), key == "disposition", let stamp = stringValue(row["stamp"]),
+                guard let key = row["key"]?.stringValue, key == "disposition", let stamp = row["stamp"]?.stringValue,
                       let at = dateValue(row["at"]) else { continue }
-                undoLedger.append(.init(
-                    key: key, what: stringValue(row["what"]) ?? key, previous: row["previous"] ?? .null,
-                    stamp: stamp, at: at))
+                dispositionUndo = .init(
+                    key: key, what: row["what"]?.stringValue ?? key, previous: row["previous"] ?? .null,
+                    stamp: stamp, at: at)
             }
-            undoLedger = Array(undoLedger.suffix(Self.maximumUndoEntries))
         }
     }
 }

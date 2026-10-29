@@ -12,22 +12,19 @@ import TrustCenter
 /// Typed failures retain diagnostic details while `LocalizedError` supplies
 /// plain messages for the read-aloud UI.
 public enum MultimodalTTSError: Error, Equatable, Sendable, LocalizedError {
-    /// Trust Center denies `multimodalPolicy.tts_openai` (default OFF). Mirrors
-    /// the daemon's `_multimodal_policy_check("tts_openai")` "[trust_denied]" path.
+    /// Saved policy denies OpenAI speech (default off).
     case trustDenied
     /// The configured OpenAI platform key could not be resolved.
     case notConfigured
-    /// HTTP 401 — token rejected. Mirrors "[tts_auth_error] HTTP 401".
+    /// HTTP 401: the key was rejected.
     case authRejected
-    /// Any other non-2xx HTTP status. Mirrors "[tts_api_error] HTTP <code>".
+    /// A non-2xx HTTP status other than 401.
     case apiError(status: Int)
-    /// Transport/other failure. Mirrors "[tts_error] <exc>".
+    /// Transport failed or returned a non-HTTP response.
     case transport(message: String)
-    /// Input text was empty (daemon returns {"ok": false, "error": "text is required"}).
+    /// No text was supplied.
     case emptyText
-    /// The route this surface runs on declares no speech model, so there is no
-    /// cloud voice to call. The client never picks another provider's
-    /// (2026-09-13 rulings); the caller says so and reads nothing.
+    /// A route without a speech model refuses read-aloud without borrowing another provider's voice.
     case routeHasNoSpeech(route: String)
 
     public var errorDescription: String? {
@@ -55,18 +52,11 @@ public enum MultimodalTTSError: Error, Equatable, Sendable, LocalizedError {
 /// SwiftNative OpenAI TTS client. Calls https://api.openai.com/v1/audio/speech
 /// directly via URLSession, using the caller's model and the shared credential resolver.
 public final class SwiftOpenAITTSClient: Sendable {
-    /// Matches the retired daemon `OPENAI_TTS_URL`.
     public static let ttsURL = URL(string: "https://api.openai.com/v1/audio/speech")!
-    /// The speech model this client sends. Supplied by the caller from the
-    /// route's catalog entry (`FirstPartyModelCatalog.speechModel`), never
-    /// chosen here: a model literal in a client is a model the person never
-    /// picked (2026-09-13 rulings).
+    /// The caller supplies the speech model from its route's catalog entry.
     public let model: String
-    /// Matches the daemon's User-Agent.
     public static let userAgent = "NativeAgent/0.2.0"
-    /// Matches the daemon's 4096-char input cap.
     public static let maxInputChars = 4096
-    /// Matches the daemon's 60s urlopen timeout.
     public static let timeoutSeconds: TimeInterval = 60
 
     private let dataRoot: URL
@@ -85,12 +75,9 @@ public final class SwiftOpenAITTSClient: Sendable {
 
     /// The audio, and how many scalars past the provider's per-request cap it does not read.
     public func synthesize(text: String, voice: String, format: String) async throws -> (audio: Data, unread: Int) {
-        // Daemon runs _multimodal_policy_check("tts_openai") FIRST
-        // — before empty-text/key/network. Default OFF.
+        // Deny before input validation, credential resolution or network work.
         guard ttsOpenAIAllowed() else { throw MultimodalTTSError.trustDenied }
 
-        // Daemon: handler returns {"ok": false, "error": "text is required"} for
-        // empty text BEFORE calling _vision_client.tts.
         if text.isEmpty { throw MultimodalTTSError.emptyText }
 
         // Resolve the platform key through the shared owner at this data root.
@@ -101,9 +88,7 @@ public final class SwiftOpenAITTSClient: Sendable {
             throw MultimodalTTSError.notConfigured
         }
 
-        // The endpoint reads at most 4096 code points per request (sliced by
-        // scalar, as the daemon's text[:4096] did); what lies past it is
-        // returned as unread, never dropped in silence.
+        // Truncate by Unicode scalar and report the remainder as unread.
         let truncated = String(String.UnicodeScalarView(text.unicodeScalars.prefix(SwiftOpenAITTSClient.maxInputChars)))
         let unread = max(0, text.unicodeScalars.count - SwiftOpenAITTSClient.maxInputChars)
 

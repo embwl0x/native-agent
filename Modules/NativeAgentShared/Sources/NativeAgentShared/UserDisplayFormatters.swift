@@ -1,18 +1,14 @@
 import Foundation
-// Blueprint: | `UserDisplayFormatters.swift` | `UserDisplayFormatters` timestamp parsing, cache and presentation shared by Mac and iPhone; compact duration presentation delegates to `CompactDurationFormatter` |
+// Blueprint: | `UserDisplayFormatters.swift` | Shared timestamp parsing/cache, lexical home-relative path display and compact duration presentation through `CompactDurationFormatter` |
 
 public enum UserDisplayFormatters {
-    // MARK: - Timestamps
-
-    /// Fractional-first Foundation formatter semantics for stored timestamps.
-    /// Callers retain their own whitespace and empty-input rules. Keep these
-    /// formatters local: they are not Sendable, and the cached display parser
-    /// below uses distinct value-typed parsing strategies.
-    public static func parseFoundationISOTimestamp(_ raw: String) -> Date? {
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return fractional.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
+    /// Shorten the home component without symlink or existence checks.
+    public static func tildifyPath(_ path: String) -> String {
+        let home = NSHomeDirectory()
+        return path == home || path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : path
     }
+
+    // MARK: - Timestamps
 
     // Value-typed, immutable parse strategies are safe to share and avoid
     // constructing two Foundation formatter objects for every timestamp in a
@@ -81,18 +77,6 @@ public enum UserDisplayFormatters {
         guard let date = parseISOTimestamp(iso) else { return iso }
         let out = DateFormatter()
         out.dateStyle = .none
-        out.timeStyle = .short
-        return out.string(from: date)
-    }
-
-    /// Medium date + short time, localized ("May 26, 2026 at 6:02 PM"). On
-    /// parse failure returns the raw input. Uses the current locale/timezone.
-    public static func mediumDateTime(_ iso: String) -> String {
-        guard let date = parseISOTimestamp(iso) else { return iso }
-        let out = DateFormatter()
-        out.locale = .current
-        out.timeZone = .current
-        out.dateStyle = .medium
         out.timeStyle = .short
         return out.string(from: date)
     }

@@ -2,10 +2,11 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Experiences
-// Blueprint: | `DoctorStatusProjection.swift` | `DoctorStatusProjection` enum; `makeHealthCard`, `persistDoctorSnapshot`, `recordReadings`, `repairProjection`; Experiences owns repair obligations and settlement, while Doctor owns the measured postcondition and executable repair call; historical calls are never reanimated; DoctorPlainCopy owns severity classification for Doctor/Support aggregation and adverse admission |
+import NativeAgentShared
+// Blueprint: | `DoctorStatusProjection.swift` | `DoctorReadout` enum; `healthReadings`, `persistDoctorSnapshot`, `recordReadings`, `repairProjection`; Experiences owns repair obligations and settlement, while Doctor owns the measured postcondition and executable repair call; historical calls are never reanimated; DoctorPlainCopy owns severity classification for Doctor/Support aggregation and adverse admission |
 
 /// Cached health projection; host probes and display redaction arrive from the caller.
-public enum DoctorStatusProjection {
+public enum DoctorReadout {
     /// A snapshot from another process launch cannot describe this launch's window.
     private static let launchID = UUID().uuidString
 
@@ -70,57 +71,33 @@ public enum DoctorStatusProjection {
                 }.value
             } else if ["ok", "off", "not needed"].contains(row.status) {
                 // Off by config or not needed owes nothing: the reading settles
-                // a debt met while the part was meant to run, so no later run
-                // renders it (0.6.9: Slack, never connected, stayed "fail").
+                // a debt met while the part was meant to run, so no later run renders it.
                 await RepairOwed.settle(dataRoot, operation: operation, evidence: evidence).value
             }
         }
     }
 
-    public static func makeHealthCard(
+    public static func healthReadings(
         now: String,
         cachePath: URL,
         liveChecks: [CheckResult],
-        safeDetail: (String) -> String,
-        runCoreChecks: () async throws -> [CheckResult]
-    ) async -> HealthCard {
-        if let cached = readCachedHealthCard(at: cachePath, now: now) {
-            return mergeHealthCard(cached: cached, liveChecks: liveChecks, now: now)
+        runCoreChecks: () async -> [CheckResult]
+    ) async -> (checks: [CheckResult], measuredAt: String) {
+        if let cached = readCachedReadings(at: cachePath) {
+            let liveIDs = Set(liveChecks.map(\.id))
+            return (cached.checks.filter { !liveIDs.contains($0.id) } + liveChecks, cached.measuredAt)
         }
+        let measuredAt = ISO8601DateFormatter().string(from: Date())
+        let raw = await runCoreChecks()
+        let executable = DoctorSafeRepairPolicy.executableCoreIDs(for: raw)
+        let core = raw.map { $0.settled(liveAvailable: false, coreAvailable: executable.contains($0.id)) }
+        await recordReadings(core, dataRoot: cachePath.deletingLastPathComponent().deletingLastPathComponent())
         do {
-            let measuredAt = ISO8601DateFormatter().string(from: Date())
-            let raw = try await runCoreChecks()
-            let executable = DoctorSafeRepairPolicy.executableCoreIDs(for: raw)
-            let core = raw.map { $0.settled(liveAvailable: false, coreAvailable: executable.contains($0.id)) }
-            await recordReadings(core, dataRoot: cachePath.deletingLastPathComponent().deletingLastPathComponent())
-            do {
-                try await persistDoctorSnapshot(core, to: cachePath, runAt: now, measuredAt: measuredAt, inPlace: true)
-            } catch {
-                nativeLog("health_card: doctor snapshot cache write failed: \(error.localizedDescription)")
-            }
-            let subs: [HealthCardSubsystem] = (core + liveChecks).map { c in
-                HealthCardSubsystem(
-                    id: c.id,
-                    label: c.title,
-                    status: c.status,
-                    detail: c.repairFace,
-                    fixAction: c.repairCall ?? c.repairTap
-                )
-            }
-            return HealthCard(overall: doctorRollup(subs.map(\.status)), subsystems: subs, createdAt: measuredAt)
+            try await persistDoctorSnapshot(core, to: cachePath, runAt: now, measuredAt: measuredAt, inPlace: true)
         } catch {
-            await recordReadings([CheckResult(source: "Doctor run", id: "doctor", title: "Doctor", status: "unmeasured",
-                detail: "Doctor run failed: \(safeDetail(error.localizedDescription))")],
-                dataRoot: cachePath.deletingLastPathComponent().deletingLastPathComponent())
-            let err = HealthCardSubsystem(
-                id: "doctor",
-                label: "Doctor",
-                status: "error",
-                detail: "Doctor run failed: \(safeDetail(error.localizedDescription))",
-                fixAction: nil
-            )
-            return HealthCard(overall: "error", subsystems: [err], createdAt: now)
+            nativeLog("health_card: doctor snapshot cache write failed: \(error.localizedDescription)")
         }
+        return (core + liveChecks, measuredAt)
     }
 
     /// The one writer of `doctor/latest.json`: checks, runAt, measuredAt and launchID,
@@ -132,8 +109,7 @@ public enum DoctorStatusProjection {
     public static func persistDoctorSnapshot(
         _ results: [CheckResult], to path: URL, runAt: String, measuredAt: String, inPlace: Bool = false
     ) async throws {
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
+        try await SwiftNativePersistenceCore.withFileLock(path) {
             var rows = results
             var measured = measuredAt
             if inPlace, FileManager.default.fileExists(atPath: path.path) {
@@ -149,14 +125,14 @@ public enum DoctorStatusProjection {
             }
             let enc = JSONEncoder()
             enc.outputFormatting = [.sortedKeys]
-            try await persistence.writeJSON(.object([
+            try await SwiftNativePersistenceCore.writeJSON(.object([
                 "checks": try JSONValue.parse(try enc.encode(rows)), "runAt": .string(runAt), "measuredAt": .string(measured),
                 "launchID": .string(launchID),
             ]), to: path)
         }
     }
 
-    public static func readCachedHealthCard(at path: URL, now: String) -> HealthCard? {
+    private static func readCachedReadings(at path: URL) -> (checks: [CheckResult], measuredAt: String)? {
         guard let data = try? Data(contentsOf: path),
               let payload = try? JSONDecoder().decode(CachedDoctorPayload.self, from: data),
               payload.launchID == launchID,
@@ -166,33 +142,7 @@ public enum DoctorStatusProjection {
               Date().timeIntervalSince(runAt) < 60,
               let measuredAt = payload.measuredAt
         else { return nil }
-        let subs = payload.checks.map {
-            HealthCardSubsystem(
-                id: $0.id,
-                label: $0.title,
-                status: $0.status,
-                detail: $0.repairFace,
-                fixAction: $0.repairCall ?? $0.repairTap
-            )
-        }
-        let rollup = Self.doctorRollup(subs.map(\.status))
-        return HealthCard(overall: rollup, subsystems: subs, createdAt: measuredAt)
-    }
-
-    public static func mergeHealthCard(cached: HealthCard, liveChecks: [CheckResult], now: String) -> HealthCard {
-        let live = liveChecks.map { check in
-            HealthCardSubsystem(
-                id: check.id,
-                label: check.title,
-                status: check.status,
-                detail: check.repairFace,
-                fixAction: check.repairCall ?? check.repairTap
-            )
-        }
-        let liveIDs = Set(live.map(\.id))
-        let subsystems = cached.subsystems.filter { !liveIDs.contains($0.id) } + live
-        let overall = doctorRollup(subsystems.map(\.status))
-        return HealthCard(overall: overall, subsystems: subsystems, createdAt: cached.createdAt)
+        return (payload.checks, measuredAt)
     }
 
     private struct CachedDoctorPayload: Decodable {
@@ -218,7 +168,7 @@ public enum DoctorStatusProjection {
     }
 }
 
-extension DoctorStatusProjection {
+extension DoctorReadout {
     public static func categoryID(for id: String) -> String {
         switch id {
         case "codex_login", "llm", "codex_login_helper", "live.providers": "Provider"

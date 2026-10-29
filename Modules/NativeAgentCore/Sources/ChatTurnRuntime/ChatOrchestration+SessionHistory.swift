@@ -6,11 +6,22 @@ import NativeAgentCore
 import os
 import PersistenceCore
 import TurnTrace
-// v2Prefix delivery ladder: supportsMidConversationSystem / …ClearAt.
+import ChatSessionWork
+import ChatTurnContracts
 import ProviderRouting
-// Blueprint: | `ChatOrchestration+SessionHistory.swift` | `SwiftNativeTurnEngine`: `buildTurnContextWithHistory` (history and digest gathered for their turn part), `fireAssemblyStageEvent`, `injectingSessionDigest` |
+// Blueprint: | `ChatOrchestration+SessionHistory.swift` | `SwiftNativeTurnEngine`: `buildTurnContextWithHistory` pins selection to the persisted window before row/character advancement; exact sent user context and keyframe/window metadata replayed from the row; history and digest gathered for their turn part; `fireAssemblyStageEvent`, `injectingSessionDigest` |
 
 // MARK: - SwiftNativeTurnEngine + history threading
+
+public enum TurnHistoryError: Error, LocalizedError {
+    case unsupportedLimit(Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unsupportedLimit(let limit): return "History limit \(limit) exceeds the supported row budget."
+        }
+    }
+}
 
 extension SwiftNativeTurnEngine {
     /// Same as `buildTurnContextWithHistory(...)` but with a Mac UI
@@ -40,83 +51,88 @@ extension SwiftNativeTurnEngine {
         // its lock; nil reads the file once here.
         transcript: Data? = nil
     ) async throws -> TurnContext {
-        // Non-nil queryUserMessage is authoritative EVEN WHEN BLANK — an
-        // attachment-only text-compat turn must not fall back to the hinted
-        // wire message (gpt-5.5 review 2026-08-13, NEEDS-FIX #1).
+        // Admit the row budget before any context reads or multiplication.
+        // Nonpositive limits disable history, including Int.min.
+        let prefixRows = max(0, historyLimit).multipliedReportingOverflow(by: 2)
+        let tailRows = prefixRows.partialValue.multipliedReportingOverflow(by: 2)
+        guard !prefixRows.overflow, !tailRows.overflow else {
+            throw TurnHistoryError.unsupportedLimit(historyLimit)
+        }
+        // A non-nil queryUserMessage is authoritative even when blank, including attachment-only turns.
         let queryMessage = queryUserMessage ?? userMessage
+        func beforeReplacedQuestion(_ messages: [ChatMessage]) -> [ChatMessage] {
+            guard let id = ChatPersistenceContext.replacementUserMessageID,
+                  let index = messages.firstIndex(where: {
+                      if case .object(let row)? = $0.extras { return row["id"] == .string(id) }
+                      return false
+                  }) else { return messages }
+            return Array(messages[..<index])
+        }
         var trace = ContextStageTrace()
-        // Capture once at the outer turn boundary. The base builder owns the
-        // receipt flag and this history wrapper owns final clock rendering;
-        // both must observe the same preference bytes without a second read.
+        // One instant and preference snapshot feed facts, base receipts and composition.
+        let currentTurnClock = clockNowOverride ?? clock()
         let quietHoursWindow = readTurnQuietHours()
         // The read-only facts of this moment read nothing the history and base
         // context assemble, so they gather beside that work from the start.
         // The composition below reads the facts that consume state, and the
         // peer-sensitive elsewhere line after this history latched its evidence.
         async let currentFacts = currentTurnFacts(
-            clockNowOverride: clockNowOverride,
+            clockNow: currentTurnClock,
             quietHours: quietHoursWindow,
             sessionID: sessionId,
             queryUserMessage: queryMessage
         )
         // v2 replays history as REAL messages behind a cache breakpoint, so
         // carrying more of it is nearly free and continuity is the whole point
-        // — a broad replay window. The cursor fires at `* 1.15` (92) and
-        // trims to `* 0.70` (56), so the live window sits between those.
-        let prefixRowCap = max(1, historyLimit * 2)
+        // — a broad replay window. Both row and character pressure use the
+        // cursor's 1.15 trigger and 0.70 target.
+        let prefixRowCap = max(1, prefixRows.partialValue)
+        let cursorStore = HistoryWindowCursorStore(dataRoot: historyReader.dataRoot)
+        let windowCursor = historyLimit > 0
+            ? try await cursorStore.current(sessionId: sessionId) : HistoryWindowCursor(sessionId: sessionId)
         let prior: [ChatMessage]
         let middleCandidates: [ChatMessage]
         let priorStats: SessionHistoryReadStats
         let middleStats: SessionHistoryReadStats?
         var unreadHistory: Error?
-        var unreadArchive: Error?
         if historyLimit > 0 {
             // One transcript read per turn: the bytes this turn's compaction
             // pass already read under its lock, else the file once, here.
             // Every selection below (prompt head and tail, middle candidates)
             // runs over those bytes.
-            let selected: (Data?, SessionHistoryReadResult)?
-            do { selected = try await trace.measure(.promptRead) {
+            let selected: (prompt: SessionHistoryReadResult, relevance: SessionHistoryReadResult?)?
+            // Measured inline: the read's closure holds actor state and cannot be sent to the trace.
+            let promptReadStart = DispatchTime.now().uptimeNanoseconds
+            do {
                 let bytes: Data?
                 if let transcript { bytes = transcript } else {
                     bytes = try await historyReader.transcriptBytes(forSessionId: sessionId)
                 }
-                return (bytes, historyReader.promptMessagesWithStats(
+                selected = historyReader.promptMessagesWithStats(
                     transcript: bytes,
                     anchorLimit: 3,
-                    // v2: the reader must NOT be the head. Its tail limit
-                    // slides by a few rows every turn as the transcript grows,
-                    // and on v2 the projection admits everything it returns —
-                    // so the replayed prefix started at a different row every
-                    // turn and the message history never cached (live
-                    // CD041E66). The window cursor owns the head now; this
-                    // number only has to be wide enough that the cursor's
-                    // boundary is always INSIDE it. The cursor trims to
-                    // `historyLimit * 0.70` rows and fires at `* 1.15`, so a
-                    // 2x read leaves the boundary with most of the window
-                    // beneath it — it can never slide out from under.
-                    tailLimit: max(96, prefixRowCap * 2),
-                    excludingRunId: excludeHistoryRunId
-                ))
-            } } catch {
+                    // 2C > 1.15C + the boundary row; selection also retains
+                    // the exact boundary if raw/filtered rows exceed that slack.
+                    tailLimit: max(96, tailRows.partialValue),
+                    windowCursor: windowCursor,
+                    excludingRunId: excludeHistoryRunId,
+                    relevanceWhen: { beforeReplacedQuestion($0.messages).count > historyLimit || $0.stats.truncated }
+                )
+                trace.record(.promptRead, since: promptReadStart)
+            } catch {
+                trace.record(.promptRead, since: promptReadStart)
                 if error is CancellationError { throw error }
                 selected = nil
                 unreadHistory = error
             }
-            let priorResult = selected?.1 ?? SessionHistoryReadResult(
+            let priorResult = selected?.prompt ?? SessionHistoryReadResult(
                 messages: [],
                 stats: SessionHistoryReadStats(mode: "prompt_read_failed")
             )
-            prior = priorResult.messages
+            prior = beforeReplacedQuestion(priorResult.messages)
             priorStats = priorResult.stats
-            if prior.count > historyLimit || priorStats.sourceBytes > priorStats.bytesRead {
-                let middleResult = await trace.measure(.middleSample) {
-                    historyReader.relevanceMessagesWithStats(
-                        transcript: selected?.0,
-                        excludingRunId: excludeHistoryRunId
-                    )
-                }
-                middleCandidates = middleResult.messages
+            if let middleResult = selected?.relevance {
+                middleCandidates = beforeReplacedQuestion(middleResult.messages)
                 middleStats = middleResult.stats
             } else {
                 middleCandidates = prior
@@ -142,9 +158,10 @@ extension SwiftNativeTurnEngine {
                 recallQueryOverride: nil,
                 includeClockContext: false,
                 sessionID: sessionId,
-                recentTurns: prior.filter { $0.role == "user" || $0.role == "assistant" }.suffix(4).map(\.content),
+                recentTurns: prior.filter { $0.role == "user" || $0.role == "assistant" }.suffix(4)
+                    .map { $0.content },
                 queryUserMessage: queryMessage,
-                clockNowOverride: clockNowOverride,
+                clockNowOverride: currentTurnClock,
                 quietHoursSnapshot: quietHoursWindow,
                 offeredToolNames: SwiftToolDispatcher.normalModelToolNames(activeTools: LLMCallContext.turnActiveTools ?? []),
                 recallHistory: preparedHistory
@@ -154,7 +171,7 @@ extension SwiftNativeTurnEngine {
             trace.record(.contextBase, since: baseStartNs)
             throw error
         }
-        let base = try await trace.measure(.digest) {
+        let (base, admittedPriorSessionId) = try await trace.measure(.digest) {
             try await Self.injectingSessionDigest(
                 into: rawBase,
                 sessionId: sessionId,
@@ -162,13 +179,7 @@ extension SwiftNativeTurnEngine {
                 provider: sessionDigest
             )
         }
-        // Sweep R4 W3: the ONLY production caller of the history renderer, and
-        // the first place in prompt assembly where the admitted model for this
-        // turn is known (`buildTurnContext` resolved it above). That makes this
-        // the interception point for window-aware budgets — everything the
-        // renderer sizes flows from `ContextBudgetPolicy.resolve`. An unknown
-        // or unresolvable model yields nil and the floor regime, i.e. exactly
-        // the pre-policy budgets.
+        // The admitted model determines every history budget through ContextBudgetPolicy.resolve.
         let historyWindowTokens = ContextBudgetPolicy.windowTokens(
             forModel: base.modelId,
             providerID: LLMCallContext.providerId,
@@ -179,94 +190,46 @@ extension SwiftNativeTurnEngine {
         )
         let preparedMiddle = middleStats == nil
             ? preparedHistory : middleCandidates.compactMap(SessionHistoryPromptRenderer.renderable)
-        let renderedHistory = await trace.measure(.render) {
-            SessionHistoryPromptRenderer.renderDetailed(
-                renderables: preparedHistory,
-                middleCandidates: preparedMiddle,
-                userMessage: queryMessage,
-                historyLimit: historyLimit,
-                windowTokens: historyWindowTokens
-            )
-        }
+        var deliveredHistoryIdentities = Set<String>()
         var historyMessages: [LLMMessage] = []
         var historyMessageChars = 0
         var historyWindowReceipt: HistoryWindowReceipt?
         var replayedRunIds = Set<String>()
-        // CROSS-SESSION CONTINUITY. A session with no recollection of its own
-        // borrows the conversation anchor's, read-only, at the head of the
-        // replayed prefix — see `CarriedAnchorRecollection`. Seeded HERE and
-        // nowhere else: `prior` itself is untouched, so nothing that persists,
-        // ages, recalls or summarises this session ever sees the borrowed row.
-        // Borrowing another conversation's recollection IS remembering across
-        // conversations, so the same switch gates it (Codex review 2026-09-05).
+        var replayedContexts: [SentTurnContext] = []
+        var contextWindow = "0:"
+        // With cross-session recall enabled, absent recollection borrows the anchor only in the replay prefix; prior stays untouched.
         let priorForPrefix = MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: historyReader.dataRoot)
             ? CarriedAnchorRecollection.seeded(
-                prior, sessionId: sessionId, dataRoot: historyReader.dataRoot
+                prior, sessionId: sessionId, dataRoot: historyReader.dataRoot,
+                admittedPriorSessionId: sessionDigest?.dataRoot == historyReader.dataRoot ? admittedPriorSessionId : nil
             )
             : prior
         trace.setFlag("prefix.carriedRecollection", priorForPrefix.count != prior.count)
-        if let admission = SessionHistoryMessageProjection.admission(
+        if let admission = SessionHistoryMessages.admission(
             renderables: priorForPrefix.prefix(priorForPrefix.count - prior.count)
                 .compactMap(SessionHistoryPromptRenderer.renderable) + preparedHistory,
             historyLimit: historyLimit,
             windowTokens: historyWindowTokens
            ) {
             // The window head moves at most once per turn, oldest-first, and
-            // never in a turn compaction already rewrote (see
+            // after compaction only if its result still exceeds a budget (see
             // HistoryWindowCursor). The turn-id guard inside the store makes a
             // tool loop's later iterations no-ops by construction, so a lane
             // that rebuilds context per iteration cannot slide the prefix
             // mid-turn.
-            let cursorStore = HistoryWindowCursorStore(dataRoot: historyReader.dataRoot)
             let advance = try await cursorStore.advanceIfNeeded(
                 sessionId: sessionId,
                 admitted: admission.rows,
                 budgetChars: historyBudget.historyChars,
-                // The bound that actually bites: char pressure never fires
-                // because the reader hands us a pre-trimmed slice. Enforced
-                // ONCE per several turns instead of every turn.
+                // The same row budget whose 2x tail is read above.
                 rowCap: prefixRowCap,
                 turnId: TurnTraceContext.turnId,
                 compactionRanThisTurn: HistoryWindowTurnFacts.compactionRanThisTurn
             )
-            // Replay earlier turns' turn-scoped system messages ONLY where the
-            // provider actually supports clear_at. Everywhere else the block was
-            // never sent as a system message in the first place, so there is
-            // nothing to keep byte-stable and replaying one would ADD a message
-            // the previous request did not have — the same divergence, mirrored.
-            // Replay is per-CAPABILITY, not per-lane: a turn-scoped block is
-            // only replayable where clear_at is supported. An archived
-            // tool-change message is never replayed: `app` is the whole tools
-            // array, so the names it adds or removes are declared nowhere.
-            let replaysClearAt = supportsMidConversationSystemClearAt(forModel: base.modelId)
-            var observedArchive: [String: [ArchivedVolatileBlock]] = [:]
-            var archivedTurnMessages: [String: [LLMMessage]] = [:]
-            let archive = await TurnVolatileArchiveRegistry.shared
-                .archive(dataRoot: historyReader.dataRoot)
-            if replaysClearAt {
-                do {
-                    observedArchive = try await archive.load(sessionId: sessionId)
-                    archivedTurnMessages = observedArchive
-                        .mapValues { entries in
-                            entries.filter { $0.toolChanges.isEmpty }.map(\.message)
-                        }
-                        .filter { !$0.value.isEmpty }
-                } catch { unreadArchive = error }
-            }
-            let projected = SessionHistoryMessageProjection.project(
-                admission,
-                cursor: advance.cursor,
-                archivedTurnMessages: archivedTurnMessages
-            )
-            // Bound the sidecar to the window the prefix actually replays: when
-            // the cursor drops a turn, its archived messages go with it. That is
-            // the archive's own chore; the turn does not wait for it, and it
-            // keeps this turn's own block and any unseen or re-recorded runs.
-            if !archivedTurnMessages.isEmpty {
-                let keeping = projected.replayedRunIds.union([excludeHistoryRunId].compactMap { $0 })
-                let removing = observedArchive.filter { !keeping.contains($0.key) }
-                Task { await archive.prune(sessionId: sessionId, removing: removing) }
-            }
+            let projected = SessionHistoryMessages.project(admission, cursor: advance.cursor)
+            deliveredHistoryIdentities = projected.historyIdentities
+            replayedContexts = projected.replayedContexts
+            contextWindow = projected.contextWindow
             replayedRunIds = projected.replayedRunIds
             historyMessages = projected.messages
             historyMessageChars = projected.messages.reduce(0) { total, message in
@@ -297,8 +260,19 @@ extension SwiftNativeTurnEngine {
         // labelled untrusted for the model, and never steer the person's new turn.
         // A steer lives for exactly the turn that read the words; a resumed turn
         // restores its own (`ChatOrchestration+Continuation`).
-        let receiptStrip = SessionHistoryPromptRenderer.recentReceiptStrip(from: prior)
-        let historyParts = [renderedHistory, SessionHistoryPromptRenderer.worldRecord(from: prior), receiptStrip].compactMap { $0 }
+        let receiptStrip = ChatTranscriptEvidenceRendering.recentReceiptStrip(from: prior)
+        deliveredHistoryIdentities.formUnion(receiptStrip?.historyIdentities ?? [])
+        let renderedHistory = await trace.measure(.render) {
+            SessionHistoryPromptRenderer.renderDetailed(
+                renderables: preparedHistory,
+                middleCandidates: preparedMiddle,
+                deliveredHistoryIdentities: deliveredHistoryIdentities,
+                userMessage: queryMessage,
+                historyLimit: historyLimit,
+                windowTokens: historyWindowTokens
+            )
+        }
+        let historyParts = [renderedHistory, SessionHistoryPromptRenderer.worldRecord(from: prior), receiptStrip?.text].compactMap { $0 }
         let historyBlock = historyParts.isEmpty ? nil : historyParts.joined(separator: "\n\n")
         trace.setCount("history.prompt.sourceBytes", priorStats.sourceBytes)
         trace.setCount("history.prompt.bytesRead", priorStats.bytesRead)
@@ -329,23 +303,21 @@ extension SwiftNativeTurnEngine {
         var contextWithHistory = base
         if let historyBlock {
             contextWithHistory.turnReach.history = historyBlock
-            contextWithHistory.historyMessages = historyMessages
-            contextWithHistory.historyWindowReceipt = historyWindowReceipt
         }
+        contextWithHistory.historyMessages = historyMessages
+        contextWithHistory.historyWindowReceipt = historyWindowReceipt
+        contextWithHistory.replayedTurnContexts = replayedContexts
+        contextWithHistory.historyContextWindow = contextWindow
         let runtimeStartNs = DispatchTime.now().uptimeNanoseconds
         let clocked = await contextByAppendingCurrentTurnFacts(
-            contextWithHistory, facts: currentFacts, sessionID: sessionId, clockNowOverride: clockNowOverride)
+            contextWithHistory, facts: currentFacts, sessionID: sessionId, clockNowOverride: currentTurnClock)
         var finalContext = clocked
         // An unread history is a fact of this turn, never a quiet empty one.
         if let unreadHistory {
             finalContext = Self.contextByAppendingRuntimeContext(finalContext, runtimeContext:
                 "This conversation's history could not be read for this turn (\(unreadHistory.localizedDescription)); nothing before this message is in front of you.")
         }
-        if let unreadArchive {
-            finalContext = Self.contextByAppendingRuntimeContext(finalContext, runtimeContext:
-                "Earlier turns' turn-scoped messages could not be read for this turn (\(unreadArchive.localizedDescription)); those turns are in front of you without them.")
-        }
-        trace.record(ContextHistoryStageName.contextClockRuntime, since: runtimeStartNs)
+        trace.record(ContextStageName.contextClockRuntime, since: runtimeStartNs)
         trace.setCount("userMessageChars", finalContext.userMessage.count)
         trace.setCount("toolSchemaCount", finalContext.toolSchemas.count)
         finalContext.preparationMs = trace.emit(kind: "context.history.summary", surface: surface)
@@ -424,11 +396,11 @@ extension SwiftNativeTurnEngine {
         sessionId: String,
         hasPriorHistory: Bool,
         provider: SessionDigestProvider?
-    ) async throws -> TurnContext {
+    ) async throws -> (context: TurnContext, priorSessionId: String?) {
         // Guard before provider/cache access: a surface that did not ask for
         // the carry-over never reads or writes anchor bytes.
-        guard let provider else { return base }
-        guard MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: provider.dataRoot) else { return base }
+        guard let provider else { return (base, nil) }
+        guard MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: provider.dataRoot) else { return (base, nil) }
         // FIRST TURN ONLY. The anchor exists to hand a BRAND-NEW session the
         // thread it was cut from. From turn 2 the session's own history block
         // carries that thread, and re-injecting two lines that point at a
@@ -436,21 +408,21 @@ extension SwiftNativeTurnEngine {
         // every turn. `prior` rows are the same signal the history guard below
         // uses — non-empty prior ⇒ a history block renders — and the current
         // turn's own user row is excluded by runId, so turn 1 is empty here.
-        guard !hasPriorHistory else { return base }
+        guard !hasPriorHistory else { return (base, nil) }
         // The handoff is housekeeping: the turn takes what is published. When
         // none is, its builder runs on its own and the turn says what is missing.
         let unavailable: String
         do {
             if let digest = try await provider.published(forSessionId: sessionId) {
-                guard !digest.isEmpty else { return base }
+                guard !digest.text.isEmpty else { return (base, digest.priorSessionId) }
                 var copy = base
-                copy.turnReach.digest = digest
-                return copy
+                copy.turnReach.digest = digest.text
+                return (copy, digest.priorSessionId)
             }
-            guard let prior = try PriorChatSession.latest(excluding: sessionId, dataRoot: provider.dataRoot) else { return base }
+            guard let prior = try PriorChatSession.latest(excluding: sessionId, dataRoot: provider.dataRoot) else { return (base, nil) }
             let (model, surface, message) = (base.modelId, base.surface, base.userMessage)
             Task {
-                do { _ = try await provider.digest(forSessionId: sessionId, model: model, surface: surface, userMessage: message) }
+                do { _ = try await provider.digest(forSessionId: sessionId, prior: prior, model: model, surface: surface, userMessage: message) }
                 catch {
                     TurnTraceBus.fireFromContext(kind: "context.digest.failed", sessionId: sessionId, surface: surface,
                         payload: .object(["reason": .string(String(describing: error))]))
@@ -467,6 +439,6 @@ extension SwiftNativeTurnEngine {
             )
             unavailable = "The handoff from your previous conversation with this participant could not be read (\(error.localizedDescription))."
         }
-        return contextByAppendingRuntimeContext(base, runtimeContext: unavailable)
+        return (contextByAppendingRuntimeContext(base, runtimeContext: unavailable), nil)
     }
 }

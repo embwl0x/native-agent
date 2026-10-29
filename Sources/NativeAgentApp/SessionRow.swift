@@ -1,20 +1,7 @@
 import SwiftUI
 import AppKit
-import CoreGraphics
-import ScreenCaptureKit
-import ScreenVision
-import Speech
-import AVFoundation
-import UniformTypeIdentifiers
 import NativeAgentShared
-import MemoryV2
 import PersistenceCore
-#if canImport(CoreSpotlight)
-import CoreSpotlight
-#endif
-#if canImport(CloudKit)
-import CloudKit
-#endif
 
 // Blueprint: | `SessionRow.swift` | `SessionRow` and `ChatRenameStateMachine`: session pin/source presentation and one terminal rename result across submit/cancel/focus loss |
 
@@ -61,31 +48,6 @@ struct ChatRenameStateMachine: Equatable {
     }
 }
 
-/// One source of truth for the sidebar row's two rename entry points. The
-/// pencil is intentionally hover-only, while the context-menu action remains
-/// available whenever a caller supplies a rename handler so keyboard and
-/// assistive-technology users never depend on pointer hover.
-struct SessionRowRenamePencilPresentation: Equatable {
-    let opacity: Double
-    let allowsHitTesting: Bool
-    let accessibilityHidden: Bool
-    let contextMenuRenameAvailable: Bool
-
-    static func make(
-        renameAvailable: Bool,
-        hovering: Bool,
-        renaming: Bool
-    ) -> Self {
-        let pencilVisible = renameAvailable && hovering && !renaming
-        return Self(
-            opacity: pencilVisible ? 1 : 0,
-            allowsHitTesting: pencilVisible,
-            accessibilityHidden: !pencilVisible,
-            contextMenuRenameAvailable: renameAvailable
-        )
-    }
-}
-
 /// Session-level origin is a trust boundary. Unlike a message's origin, this
 /// follows the whole conversation in the sidebar, so never interpolate a raw
 /// stored value or silently hide a missing one.
@@ -123,12 +85,7 @@ struct ChatSidebarSessionSourceBadge: Equatable {
     }
 }
 
-// sidebar-density 2026-08-10 (User): one line per session so the list shows
-// more. The preview text is gone from the ROW but stays in the search filter —
-// finding a session by remembered content still works. Rename mirrors
-// PinnedSessionTab's contract exactly (pencil/menu begins, Enter
-// commits, Esc cancels, focus-loss commits, empty reverts) so the two
-// surfaces never teach conflicting muscle memory.
+// Rows omit previews but search includes them; rename matches PinnedSessionTab's commit/cancel behavior.
 struct SessionRow: View {
     enum PinState {
         case unpinned
@@ -165,14 +122,6 @@ struct SessionRow: View {
     // commit. (PinnedSessionTab gets this for free from its local isRenaming;
     // this row's rename state lives in the parent, so the sync guard is local.)
 
-    private var renamePencil: SessionRowRenamePencilPresentation {
-        SessionRowRenamePencilPresentation.make(
-            renameAvailable: onRenameBegin != nil,
-            hovering: hovering,
-            renaming: renaming
-        )
-    }
-
     var body: some View {
         HStack(spacing: 6) {
             if pinState.isPinned {
@@ -187,14 +136,9 @@ struct SessionRow: View {
             }
             titleView
             Spacer(minLength: 4)
-            // Rename affordance is a hover pencil, deliberately NOT a
-            // double-click: a count-2 gesture sharing the row with the
-            // single-tap select is racy (the select's state rebuild resets
-            // the recognizer — live-verified 2026-08-10), and prioritizing
-            // it would lag every selection by the double-click window.
-            // The slot is always reserved and only fades in, so hovering
-            // never reflows or re-truncates the title.
+            // The hover pencil reserves its slot and avoids delaying selection with double-click detection.
             if onRenameBegin != nil {
+                let pencilVisible = hovering && !renaming
                 Button {
                     onRenameBegin?()
                 } label: {
@@ -204,12 +148,12 @@ struct SessionRow: View {
                 }
                 .buttonStyle(.plain)
                 .frame(width: 14)
-                .opacity(renamePencil.opacity)
-                .allowsHitTesting(renamePencil.allowsHitTesting)
+                .opacity(pencilVisible ? 1 : 0)
+                .allowsHitTesting(pencilVisible)
                 .help("Rename session")
                 .accessibilityLabel("Rename session")
                 .accessibilityIdentifier("chat.sidebar.session.rename-pencil.\(session.id)")
-                .accessibilityHidden(renamePencil.accessibilityHidden)
+                .accessibilityHidden(!pencilVisible)
             }
             if let sourceBadge = ChatSidebarSessionSourceBadge.make(source: session.source) {
                 Label(sourceBadge.label, systemImage: sourceBadge.symbol)
@@ -227,8 +171,7 @@ struct SessionRow: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .background {
-            // Liquid Feel W1: the row answers the cursor — hover fill on
-            // unselected rows, spring-animated (reduce-motion aware).
+            // Hover fills unselected rows with Reduce Motion-aware animation.
             RoundedRectangle(cornerRadius: 8)
                 .fill(selected
                     ? AnyShapeStyle(Color.accentColor.opacity(0.16))
@@ -253,15 +196,8 @@ struct SessionRow: View {
                 .lineLimit(1)
                 .focused($titleFocused)
                 .onSubmit { endRename(renameState.submit(currentTitle: session.displayTitle)) }
-                // COMMIT only on deliberate signals: Enter, or genuine focus
-                // loss (clicking the search field / composer — real focus
-                // targets). Everything structural CANCELS: Esc, clicking
-                // another row (parent clears renamingSessionId), the row
-                // scrolling out of the LazyVStack, or a search filter
-                // removing it — a disappearance can't tell click-away from
-                // recycling, and committing a half-typed title on a scroll
-                // is worse than dropping an edit (review round 3).
-                // The shared state machine keeps every end path single-fire.
+                // Submit or genuine focus loss commits; Escape, selection changes
+                // and structural disappearance cancel through the single-fire state machine.
                 .onKeyPress(.escape) {
                     endRename(renameState.cancel())
                     return .handled

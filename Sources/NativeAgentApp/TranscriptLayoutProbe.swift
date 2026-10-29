@@ -4,22 +4,7 @@ import os
 
 // Blueprint: | `TranscriptLayoutProbe.swift` | `TranscriptLayoutProbe`: opt-in per-row layout measurement and bounded diagnostic ledger, without changing transcript content |
 
-/// Per-row layout cost for the chat transcript.
-///
-/// The 04:05 pin (2026-09-04) had no app code in it: `NSHostingView`
-/// `beginTransaction` → `updateGraph` → nested `StackLayout` →
-/// `StyledTextLayoutEngine`, 3,393 `sizeThatFits` frames in one sample. A
-/// stack trace names the engine but not the ROW, so it cannot say whether the
-/// cost is one 12-KB markdown reply re-measured eighty times or eighty rows
-/// measured once. This probe answers exactly that: it counts `sizeThatFits`
-/// calls and sums their wall time per row, so a soak on the real pinned thread
-/// produces a ranked ledger instead of another anonymous engine frame.
-///
-/// OFF BY DEFAULT AND INERT WHEN OFF. Enabled only by
-/// `NATIVEAGENT_TRANSCRIPT_LAYOUT_PROBE=1` in the environment, read once at
-/// launch. When disabled the modifier returns `content` untouched, so the
-/// shipped view tree is byte-for-byte what it is today — no extra `Layout`
-/// node, no timing, no allocation. This is a measuring instrument, not a fix.
+/// Measures per-row layout calls and wall time only with `NATIVEAGENT_TRANSCRIPT_LAYOUT_PROBE=1`; otherwise leaves content untouched.
 enum TranscriptLayoutProbe {
     /// Read once: a per-measure `ProcessInfo` lookup would itself be a cost in
     /// the hot path the probe is trying to measure.

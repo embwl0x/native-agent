@@ -14,7 +14,7 @@ struct TelegramQueuedTurnControlCallback: Sendable, Equatable {
     let action: TelegramQueuedTurnControlAction
     let updateId: Int
     let chatId: Int
-    /// 2026-09-06: the forum topic the control button lives in.
+    /// The forum topic containing the control button.
     let threadId: Int?
     let messageId: Int
     let fromUserId: Int?

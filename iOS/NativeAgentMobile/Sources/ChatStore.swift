@@ -3,12 +3,6 @@ import Observation
 import UIKit
 import NativeAgentShared
 
-enum ChatSendDisposition: Equatable {
-    case started
-    case queued(UUID)
-    case rejected
-}
-
 /// Local payloads share one serial IO owner; callers retain their existing keys.
 final class MobileLocalStorage: @unchecked Sendable {
     static func recordingURL(id: String) throws -> URL {
@@ -117,6 +111,9 @@ struct QueuedChatSend: Identifiable, Codable, Sendable {
     var preparedMessage: BridgeMessage? = nil
     var placeholderID: UUID? = nil
     var userMessageID: UUID? = nil
+    /// Captured at acceptance. Missing legacy identities stay held for an
+    /// explicit new submission; restoration never adopts the current peer.
+    var pairingFingerprint: String? = nil
 
     var preview: String {
         let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -169,10 +166,7 @@ final class ChatStore {
         errorBanner = nil
     }
     var streamingHintsByMessageId: [UUID: String] = [:]
-    /// 2026-09-13: unfinished exchanges, by correlation. Durable so closing the
-    /// app (or opening another conversation) does not erase the fact that a
-    /// request is still outstanding. Observation state only — never a resend
-    /// queue; see ChatStore+PendingExchanges.swift.
+    /// ChatPendingExchange durably retains observation across launches and session switches, without resending.
     var pendingExchanges: [String: ChatPendingExchange] = [:] {
         didSet { persistPendingExchanges() }
     }
@@ -217,9 +211,7 @@ final class ChatStore {
     }
     /// Transport failures wait for recovery; user pauses survive it and launch.
     var transportPausedQueueSessionKeys: Set<String> = []
-    /// 2026-09-06: the pause set was in-memory while the queue it pauses is
-    /// persisted, so a relaunch drained (and sent) messages the user had
-    /// explicitly stopped. Persist it alongside the queue.
+    /// User pauses persist alongside the queue and survive relaunch.
     private let pausedQueueSessionKeysKey = "NativeAgentMobile.chatPausedQueueSessions.v1"
 
     private func persistPausedQueueSessionKeys() {
@@ -229,18 +221,7 @@ final class ChatStore {
         }
         defaults.set(Array(pausedQueueSessionKeys), forKey: pausedQueueSessionKeysKey)
     }
-    // PATCH-2026-05-30: incremental text streaming over iCloud.
-    // The Mac side writes batched text_delta BridgeMessages every ~1s during
-    // a chat turn so iOS users see Agent "typing" in real time instead of a
-    // 20-second wall of silence followed by the whole answer dropping in.
-    //
-    // Each delta carries the FULL accumulated text-so-far (not incremental
-    // characters) plus a monotonic `seq` per correlation, so out-of-order
-    // delivery from iCloud Drive is recoverable — we just keep the highest
-    // seq we've seen and ignore stragglers. The final reply (no `kind` set
-    // or `kind:"final"`) supersedes all deltas via the existing finalize
-    // path; once a correlation is in resolvedICloudReplyIds, late deltas
-    // are dropped on the dispatcher.
+    // setStreamingText admits newer full-text sequences per correlation; receiveICloudReply drops resolved deltas.
     var maxDeltaSeqByCorrelation: [String: Int] = [:]
     private(set) var selectedSessionID: String?
     var mainSessionID: String? { iCloudSyncEngine.shared.chatAnchor?.cleanSessionId }
@@ -250,9 +231,6 @@ final class ChatStore {
     /// back to the previous main chat and stamp the send with the wrong id.
     private(set) var locallyCreatedSessionID: String?
 
-    // PATCH-2026-05-11: unified-session-v1 — drop stale iOS-only session ID on first launch
-    // so the Mac app resolves to the shared mobile session via sourceKey.
-    private static let selectedSessionIDKey = "NativeAgentMobile.chatSessionID"
     private static let locallyCreatedSessionIDKey = "NativeAgentMobile.locallyCreatedChatSessionID"
     /// One session switch owns the composer lock. The generation prevents a
     /// cancelled/late history read from releasing a newer switch.
@@ -260,25 +238,15 @@ final class ChatStore {
     var sessionSwitchTask: Task<Void, Never>?
     @ObservationIgnored var restorationTask: Task<Void, Never>?
 
-    init(
-        defaults: UserDefaults = .standard,
-        restoreQueuedSends: Bool = true,
-        iCloudReplyTimeoutSeconds: UInt64 = 180
-    ) {
+    init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         storage = MobileLocalStorage(defaults: defaults)
-        self.iCloudReplyTimeoutSeconds = iCloudReplyTimeoutSeconds
-        if !defaults.bool(forKey: "NativeAgent.unifiedSession.v1") {
-            defaults.removeObject(forKey: Self.selectedSessionIDKey)
-            defaults.set(true, forKey: "NativeAgent.unifiedSession.v1")
-        }
         // A launch opens main. History is only selected by an explicit action
         // in this launch, never by restoring yesterday's open history thread.
-        let savedSelected: String? = nil
         let savedLocal = Self.cleanSessionID(defaults.string(forKey: Self.locallyCreatedSessionIDKey))
-        selectedSessionID = savedSelected
+        selectedSessionID = nil
         locallyCreatedSessionID = savedLocal
-        if restoreQueuedSends, let restoredPaused = defaults.array(forKey: pausedQueueSessionKeysKey) as? [String] {
+        if let restoredPaused = defaults.array(forKey: pausedQueueSessionKeysKey) as? [String] {
             pausedQueueSessionKeys = Set(restoredPaused)
         }
         isSwitchingSession = true
@@ -290,16 +258,14 @@ final class ChatStore {
                 scheduleQueuedSendDrain()
             }
             var failures: [String] = []
-            if restoreQueuedSends {
-                do { queuedSends = try await storage.read([QueuedChatSend].self, key: queuedSendsKey) ?? [] }
-                catch { failures.append(error.localizedDescription) }
-                do {
-                    let exchanges = try await storage.read([ChatPendingExchange].self, key: Self.pendingExchangesKey) ?? []
-                    pendingExchanges = Dictionary(exchanges.map { ($0.correlationID, $0) }, uniquingKeysWith: { _, newer in newer })
-                } catch { failures.append(error.localizedDescription) }
-            }
+            do { queuedSends = try await storage.read([QueuedChatSend].self, key: queuedSendsKey) ?? [] }
+            catch { failures.append(error.localizedDescription) }
+            do {
+                let exchanges = try await storage.read([ChatPendingExchange].self, key: Self.pendingExchangesKey) ?? []
+                pendingExchanges = Dictionary(exchanges.map { ($0.correlationID, $0) }, uniquingKeysWith: { _, newer in newer })
+            } catch { failures.append(error.localizedDescription) }
             guard sessionSwitchGeneration == 0 else { return }
-            restorePendingExchanges(for: savedSelected)
+            restorePendingExchanges(for: nil)
             if !failures.isEmpty { errorBanner = "Chat could not be restored: " + failures.joined(separator: "\n") }
         }
     }
@@ -313,11 +279,6 @@ final class ChatStore {
         let clean = Self.cleanSessionID(value)
         if clean != selectedSessionID { historyExhaustedSessionIDs.removeAll() }
         selectedSessionID = clean
-        if let clean {
-            defaults.set(clean, forKey: Self.selectedSessionIDKey)
-        } else {
-            defaults.removeObject(forKey: Self.selectedSessionIDKey)
-        }
     }
 
     func markLocallyCreatedSession(_ value: String) {
@@ -341,81 +302,32 @@ final class ChatStore {
     /// VoiceOutputController can speak it without the store importing AVFoundation.
     var onReply: ((String) -> Void)?
 
-    /// 2026-09-06: fired once per real session change, from the store's own
-    /// switch path. Dictation belongs to the conversation it was started in, and
-    /// ending it at each switch call site kept missing one — New Chat, a
-    /// removed pin, the conversation anchor. The surface that owns the
-    /// microphone subscribes; the store stays free of AVFoundation.
+    /// The store calls once per session change; the microphone-owning surface ends dictation.
     var onSessionChange: (() -> Void)?
 
-    // N5 fix (R18): track placeholder indices by pending message ID so iCloud
-    // replies can update the correct bubble when they arrive asynchronously.
-    // MacBridgeClient is iCloud-only: sendMessage returns the sent message's ID; the reply arrives
-    // via observeICloudReplies, which looks up and updates the placeholder here.
+    // receiveICloudReply uses the pending correlation to update the existing placeholder.
     var pendingICloudPlaceholders: [String: UUID] = [:]
-    /// 2026-09-06: the correlation ids of sends that have left the composer but
-    /// whose transport call has not returned yet. The phone mints the id before
-    /// the await, so a Stop pressed during the initial handoff can name the run
-    /// it is stopping instead of arriving unscoped — an unscoped Stop makes the
-    /// Mac cancel whatever holds the session, which may be somebody else's turn.
+    /// Locally minted send IDs keep Stop scoped while transport is awaiting acceptance.
     var inFlightSendIDs: Set<String> = []
-    // Phase 14e-iCloud: per-message timeout tasks. Each entry maps a pending
-    // message ID to the cancellable Task that will fire if no reply arrives.
+    // armTimeout owns a cancellable silence watchdog for each pending correlation.
     var pendingTimeouts: [String: Task<Void, Never>] = [:]
-    var pendingPolls: [String: Task<Void, Never>] = [:]
+    var replyCatchUpTask: Task<Void, Never>?
     var sendTask: Task<Void, Never>?
-    // Phase 14e-iCloud HMAC self-heal: remember the args of every iCloud-queued
-    // send so we can replay ONCE after a signature_invalid_resync. Cleared on
-    // successful final/cancel/timeout paths.
-    struct PendingSendArgs: Sendable {
-        let text: String
-        let sessionID: String?
-        let controls: ChatRuntimeControls
-        let attachments: [MultimodalAttachment]
-        let appendedUserId: UUID?
-    }
-    var pendingSendArgs: [String: PendingSendArgs] = [:]
-    var retriedSignatureCorrelations: Set<String> = []
     var timedOutPendingIds: [String: UUID] = [:]
     /// Queued messages the Mac's working turn has been offered (Steer): the
     /// queue holds them until the Mac says the turn read them or gave them back.
     var steeringQueuedIDs: Set<UUID> = []
-    /// Requests the Mac signed a refusal for because they aged out unread:
-    /// proven never started, so their retained text may be sent again — and
-    /// only ever by the person, through `sendNow` (2026-09-13).
-    var expiredPendingIds: [String: UUID] = [:]
     var resolvedICloudReplyIds: Set<String> = []
-    var macPublishedMessageIDs: Set<UUID> {
-        Set(iCloudSyncEngine.shared.chatTranscripts[transcriptSessionKey]?.records.compactMap { UUID(uuidString: $0.id) } ?? [])
-    }
-    /// 2026-09-06: assistant ids removed locally for a regenerate. They are
-    /// deliberately absent until the Mac's replacement lands, which is exactly
-    /// the shape snapshot reply selection reads as "the awaited
-    /// reply" — a stale snapshot would otherwise complete the regeneration
-    /// with the answer being replaced.
-    var regeneratedAwayAssistantIDs: Set<UUID> {
-        get { iCloudSyncEngine.shared.chatTranscripts[transcriptSessionKey]?.regeneratedAwayIDs ?? [] }
-        set {
-            guard var transcript = iCloudSyncEngine.shared.chatTranscripts[transcriptSessionKey] else { return }
-            transcript.regeneratedAwayIDs = newValue
-            iCloudSyncEngine.shared.chatTranscripts[transcriptSessionKey] = transcript
-        }
-    }
+    var macPublishedMessageIDs: Set<UUID> { iCloudSyncEngine.shared.chatTranscripts[transcriptSessionKey]?.publishedIDs ?? [] }
     /// Turns another door started in this conversation, by run id, and the
     /// bubble each one streams into (`receiveLiveTurn`).
     var liveTurnBubbles: [String: UUID] = [:]
-    /// Mac history rows retained in the shared transcript beyond its snapshot window.
-    var pagedHistoryIDs: Set<UUID> {
-        iCloudSyncEngine.shared.chatTranscripts[transcriptSessionKey]?.historyIDs ?? []
-    }
     var isLoadingHistory = false
     var historyExhaustedSessionIDs: Set<String> = []
     /// Sessions opened from a Mac page (no published transcript) whose page
     /// said there is more before it.
     var pagedSessionsWithOlder: Set<String> = []
-    /// 2026-09-06: the store the visible chat is bound to, so the notification
-    /// delegate can tell a reply the user is already reading from one worth
-    /// alerting about. Nil whenever no chat surface is on screen.
+    /// ChatView registers its visible store for notification suppression and clears it on disappearance.
     static weak var visibleStore: ChatStore?
 
     static let snapshotTruncationMarker = "[truncated for iPhone snapshot]"
@@ -427,23 +339,13 @@ final class ChatStore {
     /// Throttle interval (seconds). Refreshes closer together than this are skipped.
     let refreshThrottleSeconds: TimeInterval = 2.0
 
-    /// Held weakly so receiveICloudRejection can replay a send without the
-    /// caller threading the client through the rejection observer.
-    ///
-    /// It is also the last precondition `scheduleQueuedSendDrain` waits on, and
-    /// it only arrives from `ChatView.onAppear` — which does not run on a
-    /// launch that lands on another tab. A resume that happened first (network
-    /// restore, rejection replay) would otherwise schedule nothing and be lost,
-    /// so installing the client picks up whatever the queue is already owed.
+    /// Weak client for queued sends; installing it schedules any drain already owed.
     weak var pendingRetryClient: MacBridgeClient? {
         didSet {
             guard pendingRetryClient !== oldValue, pendingRetryClient != nil else { return }
             scheduleQueuedSendDrain()
         }
     }
-    /// Held weakly so the rejection-retry path can call refreshFromKVS() without
-    /// the caller threading PairingStore through every observer signature.
-    weak var pairingStoreRef: PairingStore?
 
     var hasPendingICloudReplies: Bool {
         !pendingICloudPlaceholders.isEmpty
@@ -458,8 +360,14 @@ final class ChatStore {
     var queuedSendsForSelectedSession: [QueuedChatSend] {
         let key = queueSessionKey(selectedSessionID)
         return queuedSends.filter {
-            queueSessionKey($0.sessionID) == key && !inFlightSendIDs.contains($0.id.uuidString)
+            (queueSessionKey($0.sessionID) == key || !canDeliverQueuedSend($0))
+                && !inFlightSendIDs.contains($0.id.uuidString)
         }
+    }
+
+    func canDeliverQueuedSend(_ queued: QueuedChatSend) -> Bool {
+        guard let pairing = queued.pairingFingerprint else { return false }
+        return pairing == AgentNameCache.fingerprint(pendingRetryClient?.pairingStore?.iCloudPairingSecret)
     }
 
     var isSelectedQueuePaused: Bool {
@@ -467,38 +375,18 @@ final class ChatStore {
         return pausedQueueSessionKeys.contains(key) || transportPausedQueueSessionKeys.contains(key)
     }
 
-    // 2026-09-06: Mac snapshots cannot retire an unaccepted local handoff.
-    var retainedSendMessageIDs: Set<UUID> {
-        let key = queueSessionKey(selectedSessionID)
-        return Set(queuedSends.filter { queueSessionKey($0.sessionID) == key }
-            .flatMap { [$0.id, $0.placeholderID, $0.userMessageID].compactMap { $0 } })
-    }
-
-    /// B2: bumped when a straggler reply lands after its bubble already timed
-    /// out, so ChatView force-scrolls to it even if the user had scrolled away.
+    /// Late replies signal ChatView to scroll into view even when the person had scrolled away.
     var scrollToBottomTick = 0
     func requestScrollToBottom() { scrollToBottomTick &+= 1 }
 
-    /// True for an assistant bubble that was retired locally and can resume
-    /// observing the original signed event. Since 2026-09-13 a local timeout no
-    /// longer produces one of these — waiting simply continues — so this only
-    /// names bubbles retired by other paths. It never queues a second turn.
-    /// A bubble whose request the Mac refused as expired: it shows "Send now"
-    /// instead of a retry that would only resume observing nothing.
+    /// A signed expiry keeps the request available for "Send now".
     func isExpiredRequest(_ message: ChatMessage) -> Bool {
         message.role == .assistant
             && !message.isStreaming
-            && expiredPendingIds.values.contains(message.id)
+            && expiredExchange(for: message.id) != nil
     }
 
-    func isTimedOut(_ message: ChatMessage) -> Bool {
-        message.role == .assistant
-            && !message.isStreaming
-            && timedOutPendingIds.values.contains(message.id)
-    }
 
-    /// How long to wait for an iCloud reply before surfacing an error.
-    /// 30s covers typical iCloud sync latency (1–10s) with comfortable margin.
-    /// Tunable via DEBUG override in Settings if needed.
-    let iCloudReplyTimeoutSeconds: UInt64
+    /// Silence releases the composer while observation of the same request continues.
+    let iCloudReplyTimeoutSeconds: UInt64 = 180
 }

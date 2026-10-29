@@ -1,13 +1,13 @@
 import Foundation
-// Blueprint: | `ContextMemoryLead.swift` | `ContextMemoryLead`: memory age, provenance and stored untrusted-source extraction |
+import NativeAgentCore
+// Blueprint: | `ContextMemoryLead.swift` | `ContextMemoryLead`: memory age, provenance and stored-source extraction; packet lines retain the shared author suffix |
 
 /// How a memory record came to be known, as the agent should read it back.
 ///
 /// `verified` — she checked it herself. `told` — someone told her (`by`).
-/// `inferred` — she worked it out. Rows written before provenance existed carry
-/// none, and render nothing: an absent tag is honest, an invented one is not.
+/// `inferred` — she worked it out. Unstamped rows render nothing.
 public struct ContextMemoryProvenance: Codable, Equatable, Sendable {
-    public enum Kind: String, Codable, Sendable {
+    public enum Kind: String, Codable, Sendable, CaseIterable {
         case verified
         case told
         case inferred
@@ -22,11 +22,13 @@ public struct ContextMemoryProvenance: Codable, Equatable, Sendable {
         self.by = (trimmed?.isEmpty == false) ? trimmed : nil
     }
 
-    /// `[verified]` / `[told by Claude]` / `[inferred]`.
-    public var tag: String {
-        if kind == .told, let by { return "[told by \(by)]" }
-        return "[\(kind.rawValue)]"
+    public var text: String {
+        if kind == .told, let by { return "told by \(by)" }
+        return kind.rawValue
     }
+
+    /// Context brackets the same wording recall returns as plain text.
+    public var tag: String { "[\(text)]" }
 }
 
 /// The ONE time a packet render is allowed to know about.
@@ -233,12 +235,12 @@ public enum ContextMemoryLead {
         item: ContextPacketItem,
         clock: ContextRenderClock
     ) -> String {
-        decorate(
+        MemoryDisplayText.attributed(decorate(
             text,
             recordedAt: item.recordedAt,
             provenance: item.provenance,
             clock: clock
-        )
+        ), sources: item.untrustedSources ?? [])
     }
 
     // MARK: Parsing helpers

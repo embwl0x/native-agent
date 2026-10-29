@@ -109,6 +109,21 @@ public struct NAProviderSurfaceSelection: Codable, Equatable, Sendable {
     }
 }
 
+extension NAProviderSurfaceSelection {
+    private enum CodingKeys: String, CodingKey { case providerID, model, reasoningEffort, serviceTier }
+    private enum SnapshotKeys: String, CodingKey { case providerId }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let snapshot = try decoder.container(keyedBy: SnapshotKeys.self)
+        providerID = try c.decodeIfPresent(String.self, forKey: .providerID)
+            ?? snapshot.decodeIfPresent(String.self, forKey: .providerId)
+        model = try c.decode(String.self, forKey: .model)
+        reasoningEffort = try c.decodeIfPresent(String.self, forKey: .reasoningEffort)
+        serviceTier = try c.decodeIfPresent(String.self, forKey: .serviceTier)
+    }
+}
+
 public enum NAProviderCatalogStatusCodec {
     public static let statusKey = "provider_catalog_v1"
     public static let maximumBytes = 256 * 1024

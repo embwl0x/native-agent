@@ -1,4 +1,5 @@
 import Foundation
+import os
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `PeerDataTaint.swift` | `PeerDataTaint` class; `withScope`, `mark` (latches any sender the owner does not trust, recognized or not, but their own `self` and bots), `markConsumed` (latches nothing: a read steers nothing), `elevate` (the person answered the run's card); one restore initializer retains provenance and answers without a read-latch marker; ability write refusal reads current origin principal and live/carried peer steering |
@@ -27,7 +28,7 @@ public final class PeerDataTaint: @unchecked Sendable {
     }
 
     /// The steer this turn leaves on work it hands to a later one, a card or
-    /// a queued step (Wave 2 #8): its origin peers, the peer whose bridge
+    /// a queued step: its origin peers, the peer whose bridge
     /// turn it is (`peerBridge`, which latches nothing of its own), and the
     /// peers the person elevated.
     public static func carried(peerBridge: Bool, peerID: String?) -> (sources: [String], elevated: [String]) {
@@ -71,9 +72,7 @@ public final class PeerDataTaint: @unchecked Sendable {
         return try await $current.withValue(PeerDataTaint(), operation: operation, isolation: isolation)
     }
 
-    /// Reading a peer's words steers nothing (User 10-20: "only the message
-    /// with a command from an outside agent", "not when it's sending messages
-    /// all the time"). What she reads is labelled where it is shown; a turn is
+    /// Reading a peer's words steers nothing. What she reads is labelled where it is shown; a turn is
     /// the peer's only when the peer started it (`TurnRequest.bind`), and that
     /// turn's one card covers the rest of it (`elevate`).
     public static func markConsumed(peer: String, line: String = "") {}
@@ -101,13 +100,16 @@ public final class PeerDataTaint: @unchecked Sendable {
         return line
     }
 
-    /// Whether a steer this app attested is the person's own (`PeerTrust`,
-    /// User 10-03), installed by the engine; unset, nothing is.
+    /// Whether a steer this app attested is the person's own, installed by the engine; unset, nothing is.
     public static var ownerTrusts: @Sendable (String) -> Bool {
         get { CapabilityLifecycle.ownerTrusts }
         set { CapabilityLifecycle.ownerTrusts = newValue }
     }
-    private static let hookLock = NSLock()
+    private struct Hooks {
+        var name: @Sendable (String) -> String? = { _ in nil }
+        var principal: @Sendable (String) -> String = { $0 }
+    }
+    private static let hooks = OSAllocatedUnfairLock(initialState: Hooks())
 
     public static var trustedTurn: Bool {
         let turn = TurnEnvelope.current(surface: "")
@@ -137,14 +139,13 @@ public final class PeerDataTaint: @unchecked Sendable {
     }
 
     public static var sourceName: @Sendable (String) -> String? {
-        get { hookLock.withLock { nameHook } }
-        set { hookLock.withLock { nameHook = newValue } }
+        get { hooks.withLock { $0.name } }
+        set { hooks.withLock { $0.name = newValue } }
     }
-    nonisolated(unsafe) private static var nameHook: @Sendable (String) -> String? = { _ in nil }
 
     public static var abilityWriteFailure: @Sendable () -> ToolFailureError? {
         let peers = abilitySources
-        // The person answered this run's card: its peers cap nothing more (one card per command, User 10-20).
+        // The person answered this run's card: its peers cap nothing more (one card per command).
         let answered = Set(current?.elevatedSources ?? [])
         return {
             let untrusted = peers.filter { !ownerTrusts($0) && !answered.contains($0) }.sorted()
@@ -157,7 +158,7 @@ public final class PeerDataTaint: @unchecked Sendable {
         }
     }
 
-    /// User 10-08: only a sender he has not trusted can latch a run: an agent
+    /// Only a sender he has not trusted can latch a run: an agent
     /// that starts a turn, or a sender a wake names that is not allowlisted.
     /// Web, mail, files, memory, helpers and scheduled work are never marked;
     /// the Trust mode's own gates are the only other approvals. Her own hands
@@ -171,10 +172,9 @@ public final class PeerDataTaint: @unchecked Sendable {
     /// labels is one principal and the person's grant on it decides.
     /// Installed by the engine (`PeerTrust`); until then a locator stands.
     public static var principal: @Sendable (String) -> String {
-        get { hookLock.withLock { principalHook } }
-        set { hookLock.withLock { principalHook = newValue } }
+        get { hooks.withLock { $0.principal } }
+        set { hooks.withLock { $0.principal = newValue } }
     }
-    nonisolated(unsafe) private static var principalHook: @Sendable (String) -> String = { $0 }
 
     /// A peer the person elevated retains its identity without taint.
     public func mark(peer: String, line: String = "") {
@@ -198,7 +198,7 @@ public final class PeerDataTaint: @unchecked Sendable {
     }
 
     /// Steered: a source the owner does not trust and the person has not
-    /// answered for this run. One card per command (User 10-20): once the
+    /// answered for this run. One card per command: once the
     /// card is answered, nothing in the run is steered any more, the floor
     /// (senses, tools, skills, Trust) included.
     public var isTainted: Bool {

@@ -1,3 +1,4 @@
+import NativeAgentShared
 import AppKit
 import AppToolRuntime
 import NativeAgentCore
@@ -5,12 +6,9 @@ import SwiftUI
 
 // Blueprint: | `ShotgunPointer.swift` | `AgentPointerOverlay`: noninteractive agent pointer presentation and fade lifecycle, excluded from agent captures |
 
-// Her pointer (User, 10-04: "She should have her own mouse pointer so I don't
-// interfere with her"). Her pointer actions no longer leave the person's
-// cursor where she clicked (AgentPointerHold puts it back), so this shows
-// where hers is: a soft pointer with the agent's name, gliding to each point,
-// pulsing on a click, fading a few seconds after her last action and when the
-// drive ends. Never clickable, never in her captures.
+// AgentPointerHold restores the person's cursor; this separate named pointer
+// glides to agent actions, pulses on clicks, and fades after inactivity or the
+// drive ends. It is noninteractive and excluded from agent captures.
 
 @MainActor
 final class AgentPointerOverlay {

@@ -1,23 +1,10 @@
 import Cognition
 import SwiftUI
 import AppKit
-import CoreGraphics
-import ScreenCaptureKit
-import ScreenVision
-import Speech
-import AVFoundation
-import UniformTypeIdentifiers
 import NativeAgentShared
-import MemoryV2
 import PersistenceCore
 import TriggerScheduler
 import EngineRuntime
-#if canImport(CoreSpotlight)
-import CoreSpotlight
-#endif
-#if canImport(CloudKit)
-import CloudKit
-#endif
 
 // Blueprint: | `SchedulerView.swift` | `SchedulerView`: scheduled job controls and explicit accepted/refused toggle receipts |
 
@@ -101,9 +88,7 @@ struct SchedulerView: View {
                 NativeEmptyState(
                     title: "Schedule unavailable",
                     detail: detail,
-                    systemImage: "exclamationmark.triangle",
                     actionTitle: "Retry",
-                    actionImage: "arrow.clockwise",
                     action: { Task { await appModel.refreshSchedulerJobs() } }
                 )
             } else {

@@ -22,12 +22,17 @@ continue importing. Queue capacity becoming available triggers another import.
 | Items per share | 4 |
 | Waiting shares | 20 |
 | Combined text and note | 64 KiB UTF-8 |
-| Binary attachments combined | 520 KiB |
-| Encoded bridge record | 800 KiB, including a 16 KiB reserve for send metadata |
+| Each prepared image or PDF | 10 MB (shared chat file limit) |
+| Encoded envelope | Shared bridge codec limits, including a 16 KiB reserve for send metadata |
 
-Images use the photo composer's JPEG preparation helper. Binary items split
-the attachment budget equally. Oversized PDFs and encoded records fail visibly
+Images use the photo composer's shared JPEG preparation helper, bounded to 1400
+pixels on the longest side. Oversized PDFs and encoded envelopes fail visibly
 before Save succeeds; PDFs are not truncated.
+The codec uses an 800 KiB inline record budget; qualifying larger attachment
+envelopes travel as encrypted assets up to 48 MiB. Pickers and the Share extension
+retain the shared per-file limit; the codec owns envelope sizing and the
+transport selects inline records or encrypted assets. See
+[mobile transport](mobile_companion.md#transport-architecture).
 
 ## Apple developer portal setup (account owner)
 

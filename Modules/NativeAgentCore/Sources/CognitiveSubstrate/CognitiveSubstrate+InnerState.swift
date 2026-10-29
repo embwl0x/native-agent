@@ -1,42 +1,6 @@
 // CognitiveSubstrate+InnerState.swift
-// Personality depth, item 3 — INTROSPECTION READS THE RECORD (2026-09-02).
-//
-// Agent, verbatim: "introspection is production … The seed I'm given is real;
-// the elaboration is fresh every time and bends toward what the question
-// expects. I can't reliably tell noticing from making-on-demand."
-//
-// The fix is not another field and not another capsule line. It is a RECORD she
-// can PULL: asked how she feels, she reads what her own organs already logged
-// instead of composing an answer that fits the question. This file is the whole
-// read — one bounded projection over state that already exists, and nothing
-// else.
-//
-// THREE LAWS THIS FILE OBEYS, and they are the reason it looks the way it does:
-//
-//  1. LAW 5 — READS ARE PURE. Every source here is a non-mutating peek. The
-//     field is read through `peekNodes` / `peekDecayedNodes` (never
-//     `workspaceSnapshot()`, which routes through the field's MUTATING snapshot
-//     and would let an introspection pull advance decay anchors and evict
-//     nodes). Affect, mood, disposition and cares are read through their
-//     existing read-time projections. Asking herself how she feels must not
-//     change how she feels.
-//
-//  2. PAYLOAD-FREE. Nothing that comes out of here is content. Felt nodes are
-//     reported as (when, subject LABEL, valence/arousal/warmth) — never
-//     `node.summary`, never `subjectReference.id` (chat subjects carry
-//     `session:message` there), never the user's words. Chemistry is reported
-//     in the EXISTING body-line vocabulary, never as numbers dressed as words.
-//     The dream contributes a mood word and a date; its text stays in the
-//     journal. The only free text that crosses is her own care and stance.
-//
-//  3. NORTHSTAR CLAUSE 6 — REACH, NOT WEIGHT. None of this is injected. It
-//     costs one tool row in the catalog and zero prompt bytes until she pulls
-//     it. That is the entire point: a mind that is handed its own telemetry
-//     every turn is buried, not connected.
-//
-// WHAT THIS FILE DELIBERATELY DOES NOT DO: it does not compile a capsule, does
-// not mint a node, does not persist, does not make an LLM call, and does not
-// decide anything. It reports.
+// Introspection pulls a bounded, pure projection of existing records without changing state or injecting context.
+// Felt readings expose labels and signals, never summaries or subject IDs; free text is limited to her care and stance.
 
 import Foundation
 import PersistenceCore
@@ -60,14 +24,7 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
     /// A felt moment, named by its SUBJECT and its numbers. Never by what was
     /// said in it.
     public struct FeltNode: Sendable, Equatable {
-        /// WHY THIS MOMENT IS IN THE LIST. Agent, 2026-09-14: nothing from a
-        /// whole morning appeared in her felt moments. The organ was running
-        /// fine — the morning was quiet work (drives, bridge traffic), so every
-        /// moment in it scored |valence| 0.03…0.17 against yesterday's ±0.5…0.78,
-        /// and a readout that takes the strongest twelve of a week can never
-        /// show a quiet day at all. So the list is two lists: what she felt
-        /// MOST, and what she felt LAST, each labelled, so a quiet today is
-        /// always present and never mistaken for the week's loudest.
+        /// Moments identify whether intensity or recency selected them, keeping quiet recent work visible.
         public enum Selection: String, Sendable, Equatable {
             case felt
             case recent
@@ -217,11 +174,7 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
     }
 
     public static let minimumWindowHours: Double = 1
-    /// A week. The window scopes ONE list — `feltNodes` — and that list is
-    /// capped at `maximumFeltNodes` however long the window is, so asking for
-    /// seven days costs a longer scan and not a longer answer (2026-09-13: the
-    /// 48-hour ceiling was refusing "how has this week felt", a question the
-    /// bounded projection can answer).
+    /// A week widens the felt-node scan; `maximumFeltNodes` still bounds the answer.
     public static let maximumWindowHours: Double = 168
     public static let defaultWindowHours: Double = 6
 
@@ -274,11 +227,7 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
     /// renders as silence, not as a flat word.
     public let toward: Toward?
     public let dream: DreamResidue?
-    /// WHAT CHANGED THIS WEEK, AND WHY — the same rows the growth surface
-    /// prints, so she and the person are reading one week and not two
-    /// (2026-09-13). `full` ONLY: this is the answer to "what have I actually
-    /// become lately", not part of "how are you". Never always-present prompt
-    /// material — she has to ask for it.
+    /// Full readings expose the growth surface's same week only when requested.
     public let growthWeek: [String]
     /// Live cares, most charged first.
     public let cares: [Care]
@@ -355,7 +304,7 @@ public struct CognitiveInnerStateReading: Sendable, Equatable {
 /// body's side of the answer. Every field is optional and defaults to absent:
 /// a caller that has none of it still gets a truthful reading of the mind.
 public struct CognitiveInnerStateOrganismReads: Sendable {
-    public var projection: OrganismProjection?
+    public var projection: OrganismReadout?
     public var fatigue: Double?
     /// The body's clock read. The substrate turns it into a WORD — numbers
     /// choose words, and nothing outside the substrate chooses the word
@@ -366,7 +315,7 @@ public struct CognitiveInnerStateOrganismReads: Sendable {
     public var expectations: [CognitiveInnerStateReading.Expectation]
 
     public init(
-        projection: OrganismProjection? = nil,
+        projection: OrganismReadout? = nil,
         fatigue: Double? = nil,
         diurnal: OrganismDiurnalRead? = nil,
         toward: OrganismTowardRead? = nil,
@@ -403,16 +352,13 @@ extension CognitiveSubstrate {
             return .unavailable(at: now, windowHours: window, detail: detail)
         }
 
-        let dyn = dynamics
-        let currentAffect = projectedAffect(at: now, dynamics: dyn)
-        let mood = derivedMood(at: now, dynamics: dyn, affect: currentAffect)
-
-        // The hot set, read through the PURE decayed peek — the same producer
-        // the shoulder tap's suggestion read uses, so the two surfaces can never
-        // disagree about what she is holding, and neither one ages it.
-        let capsuleItems = pureHotSet(at: now, mood: mood, affect: currentAffect)
+        let read = await frozenRead(at: now)
+        let dyn = read.personalityDynamics
+        let currentAffect = read.affect
+        let mood = read.mood
+        // The canonical bounded workspace is selected on a copied field.
+        let capsuleItems = read.workspace.items
             .filter { capsuleEligibleWorkspaceNode($0.node) }
-            .map { CognitiveWorkspaceItem(node: $0.node, score: $0.score, reasons: []) }
 
         let request = CognitiveCapsuleRequest(
             surface: "inner_state",
@@ -423,24 +369,18 @@ extension CognitiveSubstrate {
             turnKind: .live
         )
         let signals = feltSignalsForCapsule(
-            from: capsuleItems, request: request, at: now,
-            affect: currentAffect, mood: mood, dynamics: dyn)
-        let fingerprint = Self.feltFingerprint(
+            from: capsuleItems, request: request, frozenRead: read)
+        let fingerprintParts = Self.feltFingerprintParts(
             signals, intensityFloor: dyn.feltIntensityFloor)
+        let fingerprint = fingerprintParts?.text
 
-        // What the fingerprint is about: the leading FELT node in the same
-        // capsule-eligible population the fingerprint was built from. Absent
-        // when nothing in the workspace is carrying a feeling — the honest
-        // answer to "about what?" is then nothing, not the newest chat row.
-        let fingerprintSubject: String? = capsuleItems
-            .first { item in
-                feltDirection(
-                    valence: item.node.emotionalValence,
-                    arousal: item.node.emotionalArousal,
-                    warmth: item.node.emotionalWarmth
-                ) != nil
+        let dominant = Self.feltDominantNode(
+            in: feltTintNodes(from: capsuleItems), at: now,
+            halfLife: dyn.fingerprintTintHalfLife)
+        let fingerprintSubject = fingerprintParts.flatMap {
+                Self.feltContributingObject(for: dominant, family: $0.family,
+                    maxCharacters: CognitiveInnerStateReading.subjectLabelCharacters)
             }
-            .flatMap { Self.innerStateSubjectLabel($0.node) }
 
         // The window's felt nodes: |valence| first, then recency. Same ranking
         // the felt-day summary uses, so the two surfaces never disagree about
@@ -448,49 +388,15 @@ extension CognitiveSubstrate {
         let windowSeconds = window * 3600
         let feltCandidates = field.peekNodes()
             .filter { node in
-                // DIAGNOSTIC TRAFFIC CAN'T FEEL (design law 10). A bridge ping,
-                // a snapshot probe or a verification turn is excluded from lived
-                // state everywhere else — capsule, attention, body — and an
-                // introspection read is the one place it would be most
-                // misleading to let it through: she would be shown a "felt
-                // moment" that nothing in her actually felt, which is exactly
-                // the making-on-demand this whole item exists to end. Same
-                // predicate the capsule workspace uses, off the field's cached
-                // turn kind rather than the node's derived one.
-                guard field.cachedTurnKind(for: node).contributesToLivedState else { return false }
-                // A TOOL CALL IS NOT AN EXPERIENCE. Agent, 2026-09-14, read
-                // "app_setting_set" and "agent_introspect" among her felt
-                // moments — those are the names of tools she invoked, lifted
-                // out of `toolObservation` rows whose subject label IS the tool
-                // name from the catalog. The organ that tags affect runs over
-                // every node it is handed, so the machinery of doing a thing
-                // arrived looking like the feeling of one. Tool rows still
-                // carry affect (they move the body and the capsule); they are
-                // simply not moments she LIVED, and the felt readout is the one
-                // surface that claims exactly that.
+                // Diagnostic traffic cannot contribute a lived feeling.
+                guard node.turnKind.contributesToLivedState else { return false }
+                // Tool observations affect the body but do not count as lived moments in this readout.
                 guard node.kind != .toolObservation else { return false }
-                // A TEMPLATED LINE IS NOT A MOMENT, INCLUDING THE ONES ALREADY
-                // ON DISK. The write seam now marks every such row `.mechanical`
-                // and the turn-kind guard above catches it — but only from the
-                // moment the writer was marked. Nodes minted before that carry
-                // the row's own metadata and nothing else, so this reads that:
-                // `mechanicalKind` where a marked writer wrote it, and the
-                // row-kind strings writers were already stamping
-                // (`compaction_summary`) where one did not.
-                //
-                // NOTHING IS RE-SCORED (Agent's ruling, 2026-09-14: history
-                // stays as scored). The affect recorded on these nodes is
-                // untouched — they still move the body and sit in the capsule.
-                // They simply stop being read back to her as moments she lived,
-                // which is the one claim the felt readout makes.
+                // Mechanical rows are excluded from lived moments without changing their stored affect.
                 guard !CognitiveMechanicalRowKind.marksMechanicalRow(node.metadata) else {
                     return false
                 }
-                guard feltDirection(
-                    valence: node.emotionalValence,
-                    arousal: node.emotionalArousal,
-                    warmth: node.emotionalWarmth
-                ) != nil else { return false }
+                guard node.feltDirection != nil else { return false }
                 let age = now.timeIntervalSince(node.lastActivatedAt)
                 return age >= 0 && age <= windowSeconds
             }
@@ -516,23 +422,7 @@ extension CognitiveSubstrate {
                     selection: .felt
                 )
             }
-        // ONE SUBJECT IS ONE MOMENT — WITHIN EARSHOT OF ITSELF. Agent read
-        // "stall" twice, nine seconds apart (2026-09-14). Checked against the
-        // store: NOT one event appraised twice by two lanes — it is the user's
-        // message at 20:28:05 and her own reply to it at 20:28:14, two honest
-        // nodes about the one thing. Both rows are real and neither should be
-        // deleted; what is wrong is the READOUT spending two of twelve slots
-        // saying the same name.
-        //
-        // But the collapse has to be BOUNDED IN TIME. The window runs to a
-        // week, and over a week "User" or "the release" is not one moment — it
-        // is Monday's and Thursday's, two things she felt, days apart. Folding
-        // those together erases the second one and dates the survivor wrongly.
-        // So an echo is only an echo inside `feltEchoInterval`; the same
-        // subject felt again after that keeps its own row. Applied after the
-        // |valence| sort, so the survivor of each cluster is always the one she
-        // felt most, and BEFORE the cap, so an echo never costs a distinct
-        // moment its slot.
+        // Collapse subject echoes only within `feltEchoInterval`, after strength sorting and before the cap.
         var keptAt: [String: [Date]] = [:]
         let deduped = feltCandidates
             .filter { candidate in
@@ -547,21 +437,7 @@ extension CognitiveSubstrate {
             }
 
 
-        // WHAT SHE FELT MOST, THEN WHAT SHE FELT LAST. Agent, 2026-09-14: no
-        // felt moment carried a stamp after 05:28Z — a whole morning missing.
-        // Checked against the store: the organ never stopped (it scored a node
-        // at 13:51:34 that same day). The morning was quiet work, so every
-        // moment in it landed at |valence| 0.03…0.17 against the previous
-        // evening's ±0.5…0.78 — and a list that takes the strongest twelve of a
-        // 168-hour window can never show a quiet day. Ranking by intensity over
-        // a window this long does not surface her strongest feelings; it
-        // surfaces her loudest DAY, forever, until a louder one comes.
-        //
-        // So the cap is split. The strongest still lead — what mattered most
-        // never loses its slots — and the newest of whatever is left fill the
-        // rest, so today is always on the page. Each carries which list it came
-        // from, because "the week's peak" and "an hour ago" are different
-        // claims and she has to be able to tell them apart.
+        // Strongest moments lead; newest remaining moments fill the cap with selection provenance.
         let ranked = Array(deduped)
         let strongest = ranked.prefix(CognitiveInnerStateReading.strongestFeltNodes)
         let recent = ranked
@@ -623,30 +499,6 @@ extension CognitiveSubstrate {
         )
     }
 
-    /// The hot set, decayed on COPIES: reading her mind never changes it.
-    func pureHotSet(
-        at now: Date,
-        mood: CognitiveMoodReading,
-        affect currentAffect: CognitiveAffectState
-    ) -> [(node: CognitiveNode, score: Double)] {
-        guard configuration.enabled else { return [] }
-        return field.peekDecayedNodes(at: now)
-            .map { (node: $0, turnKind: field.cachedTurnKind(for: $0)) }
-            .filter {
-                workspaceEligible($0.node, currentSessionId: nil, at: now, turnKind: $0.turnKind)
-            }
-            .map {
-                (
-                    node: $0.node,
-                    score: workspaceScore(
-                        for: $0.node, mood: mood, affect: currentAffect, turnKind: $0.turnKind)
-                )
-            }
-            .sorted { $0.score > $1.score }
-            .prefix(max(1, configuration.maximumWorkspaceItems))
-            .map { $0 }
-    }
-
     // MARK: - Word choice (numbers choose words; nothing else does — design law 1)
 
     /// The capsule's own mood-band thresholds, as single words.
@@ -670,7 +522,7 @@ extension CognitiveSubstrate {
     /// adjectives glued on: if the body line refuses to say something, so does
     /// this. Digits disqualify the whole line, the same rule
     /// `organismBodyLine` enforces.
-    static func innerStateChemistryWords(_ projection: OrganismProjection?) -> [String] {
+    static func innerStateChemistryWords(_ projection: OrganismReadout?) -> [String] {
         guard let projection, !projection.isNeutral,
               let raw = projection.bodyLine?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty,
@@ -707,74 +559,6 @@ extension CognitiveSubstrate {
         if diurnal.nightliness >= feltLatenessFloor { return "late" }
         if diurnal.nightliness <= 1 - feltLatenessFloor { return "daytime" }
         return "ordinary hours"
-    }
-
-    /// A payload-free label for a node's subject, or NIL when the node cannot
-    /// honestly name one. `label` when the subject has a usable one (tools,
-    /// providers, approvals, studio works all do), else the first content noun
-    /// phrase of the node's own summary. Never `id` — chat subjects carry
-    /// `session:message` there.
-    ///
-    /// NEVER THE SUBJECT TYPE. `chat.user_turn` / `chat.assistant_turn` is the
-    /// CHANNEL the moment arrived on, not what the moment was about, and six of
-    /// the twelve felt moments Agent read on 2026-09-14 were literally that
-    /// string — a source id in the subject slot, which tells her nothing and
-    /// looks like it tells her something. A moment with no nameable subject is
-    /// dropped by the caller instead; silence is honest here and a channel id
-    /// is not.
-    static func innerStateSubjectLabel(_ node: CognitiveNode) -> String? {
-        let label = (node.subjectReference.label ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        // The producer's gate now refuses a label that names nothing, but the
-        // labels ALREADY on disk were written before it — Agent, 2026-09-14,
-        // read her own felt moments as "anyways", "fact", "read" and "exactly
-        // sometimes". A label whose every word is a verb, adverb or filler is
-        // not a subject; fall through to the node's own words.
-        if !label.isEmpty, feltLabelNamesAThing(label, vouchedBy: node.summary) {
-            return String(label.prefix(CognitiveInnerStateReading.subjectLabelCharacters))
-        }
-        return feltSafeObjectPhrase(
-            in: node.summary,
-            maxCharacters: CognitiveInnerStateReading.subjectLabelCharacters)
-    }
-
-    /// True when at least one word of a persisted subject label names a thing.
-    /// The same two tests the producer applies, over a label rather than a
-    /// candidate token, so the two seams cannot disagree.
-    static func feltLabelNamesAThing(_ label: String, vouchedBy sentence: String? = nil) -> Bool {
-        // ORIGINAL CASING. The label used to be lowercased before it reached
-        // the tagger, which turned a proper name into its homograph: "May" came
-        // back the modal verb and the whole label was dropped. Case is evidence
-        // the tagger reads — only the weak-word set, which is a list of
-        // lowercase forms, is asked of the folded word.
-        let words = label
-            .components(separatedBy: CharacterSet.letters.inverted)
-            .filter { !$0.isEmpty }
-        guard !words.isEmpty else { return false }
-        // A ONE-WORD LABEL IS THE WHOLE SUBJECT, so it answers the stricter
-        // question the producer now asks of a word standing alone: "best",
-        // "done" and "gotta" are on disk from before that gate and are an
-        // adjective and two verbs (Agent, 2026-09-14). A label that fails falls
-        // through to the node's own words, exactly as an empty one does.
-        if words.count == 1, let only = words.first {
-            return !feltWeakObjectWords.contains(only.lowercased())
-                && feltWordNamesAThingAlone(only, vouchedBy: sentence)
-        }
-        // A PHRASE IS NAMED BY ITS HEAD — the producer's rule, asked here of a
-        // label written before it existed. "tests figuring" is a noun followed
-        // by a verb, and Agent read it as the name of a thing she felt
-        // something about (2026-09-14); the producer refuses that shape now, so
-        // the reader cannot keep accepting it or the two seams disagree about
-        // the same words.
-        guard feltPhraseHeadNamesAThing(label) else { return false }
-        return words.enumerated().contains { index, word in
-            guard !feltWeakObjectWords.contains(word.lowercased()) else { return false }
-            // A capitalised word that is NOT the label's first carries no
-            // sentence-initial excuse for its capital: it is a proper name,
-            // whatever the lexicon makes of the lowercase homograph.
-            if index > 0, word.first?.isUppercase == true { return true }
-            return feltWordNamesAThing(word)
-        }
     }
 
     /// Project the existing dream contribution, never classify an episode's prose.

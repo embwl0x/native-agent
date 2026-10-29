@@ -1,10 +1,12 @@
 import Foundation
+import CoreGraphics
+import AgentWorkspace
 import Observation
 import NativeAgentShared
 import NativeAgentCore
 import Transcripts
 import PersistenceCore
-// Blueprint: | `MacChatTurnRuntime.swift` | Canonical Mac admission/lifecycle and Send-next projection; queue writes use MacChatTurnLifecycleStore; cross-life requests stay stopped until the person's Resume or Send now creates fresh requests without old steering or continuations |
+// Blueprint: | `MacChatTurnRuntime.swift` | Canonical Mac admission/lifecycle, replying/preview state and Send-next projection; queue writes use MacChatTurnLifecycleStore; cross-life requests stay stopped until the person's Resume or Send now creates fresh requests without old steering or continuations |
 
 /// Admission, durable queue and lifecycle authority for Mac chat. Presentation
 /// facades observe this same state; no second queue or lifecycle is retained.
@@ -52,7 +54,21 @@ public final class MacChatTurnRuntime {
         busySessions.insert(sessionId)
         return nextTaskGeneration
     }
-    public var lifecycleBySession: [String: MacChatTurnLifecycleState] = [:]
+    public var replyingSessions: Set<String> = [] {
+        didSet { if replyingSessions != oldValue { activityDidChange?() } }
+    }
+    public var screenPreviewBySession: [String: MacChatScreenPreview] = [:]
+    public var lifecycleBySession: [String: MacChatTurnLifecycleState] = [:] {
+        didSet {
+            let settled = Set(lifecycleBySession.compactMap { $0.value.replyTextSettled ? $0.key : nil })
+            if settled != replyTextSettledSessions { replyTextSettledSessions = settled }
+        }
+    }
+    /// Sessions whose reply text has settled, written only when that changes:
+    /// views asking "is she still replying?" observe this, not the lifecycle's
+    /// once-a-second progress writes, so the transcript does not re-render
+    /// every second of a stream.
+    public private(set) var replyTextSettledSessions: Set<String> = []
     @ObservationIgnored public var activeTurnIDsBySession: [String: String] = [:]
     @ObservationIgnored public var streamProgressAppliedAt: [String: (turnId: String, at: Date)] = [:]
     @ObservationIgnored public var lifecycleStore: MacChatTurnLifecycleStore
@@ -100,7 +116,7 @@ public final class MacChatTurnRuntime {
     /// The newest phone handoff's own send time. Later-arriving phone inputs
     /// are ordered against it on the phone's clock, never the Mac's.
     @ObservationIgnored public var phoneControlHandoffSentAt: [String: Date] = [:]
-    @ObservationIgnored public var chatTurnTranscriptProofReader: any MacChatTurnTranscriptProofReading = MacChatTurnTranscriptProofReader()
+    @ObservationIgnored public let chatTurnTranscriptProofReader: MacChatTurnTranscriptProofReader
     @ObservationIgnored public var chatTurnLifecycleRepairCompleted = false
     @ObservationIgnored public var residentRefreshPendingAfterActiveTurns = false
 
@@ -156,7 +172,7 @@ public final class MacChatTurnRuntime {
                             if !wasSteering { continue }
                             turn.startedTurnID = nil
                         case .unavailable: throw MacChatTurnLifecycleStoreError.invalidRecord
-                        case .absent: turn.startedTurnID = nil
+                        case .absent, .incomplete: turn.startedTurnID = nil
                         }
                         pausedQueueSessions.insert(session)
                         queuePauseReasons[session] = "A queued turn was interrupted. Check its conversation before resuming it."
@@ -275,13 +291,50 @@ public final class MacChatTurnRuntime {
         }
         let namedRuns = runIDs + (runId.map { [$0] } ?? [])
         let flagPath = ChatCancelFlag.path(dataRoot: dataRoot, sessionId: safeSessionId)
-        try await SwiftNativePersistenceCore().withFileLock(flagPath) {
-            let parent = flagPath.deletingLastPathComponent()
-            try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        try await SwiftNativePersistenceCore.withFileLock(flagPath) {
             let content = namedRuns.isEmpty ? ChatCancelFlag.stopContent(forFlagAt: flagPath)
                 : ((try? String(contentsOf: flagPath, encoding: .utf8)).map { $0 + "\n" } ?? "")
                     + namedRuns.joined(separator: "\n")
-            try Data(content.utf8).write(to: flagPath, options: .atomic)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(content.utf8), to: flagPath)
         }
+    }
+}
+
+/// What the agent is looking at, as the chat's working card shows it.
+///
+/// Display-only and transient, like the card it lives in. Nothing here is
+/// persisted, nothing here becomes memory, and the per-verb receipts remain the
+/// record of what actually happened — this is the live view while it happens.
+///
+/// The frame arrives already downscaled and secret-masked by
+/// ``MacScreenPreviewFrame`` on the capture side. The app neither crops nor
+/// re-derives what may be shown.
+public struct MacChatScreenPreview: @unchecked Sendable {
+    /// The masked, downscaled frame the last Mac verb captured. Optional
+    /// because a verb can move the caption without producing a picture (no
+    /// Screen Recording permission, a locked screen, a refused capture).
+    public let image: CGImage?
+    /// One line of plain words for the verb in flight.
+    public let caption: String
+    public let updatedAt: Date
+
+    /// Only worth a pane when there is something to show. A caption with no
+    /// frame and no frame with no caption are both nothing to look at.
+    public var isShowable: Bool {
+        image != nil && !caption.isEmpty
+    }
+
+    /// Folds one update into what the card is already showing. A `nil` field in
+    /// the update means UNCHANGED: the verb that clicks a button publishes new
+    /// words over the last frame, which is exactly the behaviour wanted —
+    /// "Clicking Save" over the picture of the window Save is in.
+    public static func merged(
+        _ previous: MacChatScreenPreview?,
+        update: MacScreenPreviewUpdate
+    ) -> MacChatScreenPreview? {
+        let image = update.image ?? previous?.image
+        let caption = update.caption ?? previous?.caption ?? ""
+        guard image != nil || !caption.isEmpty else { return nil }
+        return MacChatScreenPreview(image: image, caption: caption, updatedAt: update.at)
     }
 }

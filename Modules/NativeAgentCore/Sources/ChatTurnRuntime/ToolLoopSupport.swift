@@ -4,47 +4,30 @@ import PersistenceCore
 import TurnTrace
 import ProviderRouting
 import ToolRegistry
+import Synchronization
 // Blueprint: | `ToolLoopSupport.swift` | `ToolLoopTraceObservation` retains prose and dispatch evidence across every loop throw and owns failed-attempt classification; legacy failed-slot counting stays separate; `ToolDispatchDeadline` |
 
 /// Retains loop evidence across a throw without changing the public error carriers.
-final class ToolLoopTraceObservation: @unchecked Sendable {
+final class ToolLoopTraceObservation: Sendable {
     @TaskLocal static var current: ToolLoopTraceObservation?
-    private let lock = NSLock()
-    private var payload: [String: JSONValue] = [:]
-    private var dispatches: [TurnEngineResult.ToolDispatchRecord] = []
-    private var prose = ""
+    private let state = Mutex<(payload: [String: JSONValue], dispatches: [TurnEngineResult.ToolDispatchRecord], prose: String)>(([:], [], ""))
 
     func record(_ counters: TurnEngineResult.LoopCounters, dispatches: [TurnEngineResult.ToolDispatchRecord], reply: String) {
-        lock.lock()
-        defer { lock.unlock() }
-        payload = counters.tracePayload
-        payload.merge(Self.toolCounts(dispatches), uniquingKeysWith: { _, new in new })
-        self.dispatches = dispatches
-        prose = reply
+        state.withLock {
+            $0.payload = counters.tracePayload
+            $0.payload.merge(Self.toolCounts(dispatches), uniquingKeysWith: { _, new in new })
+            $0.dispatches = dispatches
+            $0.prose = reply
+        }
     }
 
-    var partialReply: String {
-        lock.lock()
-        defer { lock.unlock() }
-        return prose
-    }
-
-    var toolDispatches: [TurnEngineResult.ToolDispatchRecord] {
-        lock.lock()
-        defer { lock.unlock() }
-        return dispatches
-    }
-
-    var tracePayload: [String: JSONValue] {
-        lock.lock()
-        defer { lock.unlock() }
-        return payload
-    }
+    var partialReply: String { state.withLock { $0.prose } }
+    var toolDispatches: [TurnEngineResult.ToolDispatchRecord] { state.withLock { $0.dispatches } }
+    var tracePayload: [String: JSONValue] { state.withLock { $0.payload } }
 
     static func toolCounts(_ dispatches: [TurnEngineResult.ToolDispatchRecord]) -> [String: JSONValue] {
         let attempts = dispatches.filter {
             !ChatToolOutcome.neverRan($0.result)
-                && (!wasStopped($0.result) || ChatToolOutcome.effectsUnknown($0.result))
                 && !ChatToolOutcome.isWaitingOnPerson($0.result)
         }
         return [
@@ -52,21 +35,13 @@ final class ToolLoopTraceObservation: @unchecked Sendable {
             "failedToolAttemptCount": .int(Int64(dispatches.filter { isFailedAttempt($0.result) }.count)),
             "skippedToolSlotCount": .int(Int64(dispatches.filter {
                 ChatToolOutcome.neverRan($0.result)
-                    || (wasStopped($0.result) && !ChatToolOutcome.effectsUnknown($0.result))
             }.count)),
         ]
     }
 
     static func isFailedAttempt(_ output: JSONValue) -> Bool {
-        !ChatToolOutcome.neverRan(output) && !ChatToolOutcome.outputLooksSuccessful(output)
-            && !wasStopped(output) && !ChatToolOutcome.wasCancelled(output)
+        !ChatToolOutcome.neverRan(output) && [.failed, .refused, .timeout].contains(ChatToolOutcome.exactResultClass(output))
             && !ChatToolOutcome.isWaitingOnPerson(output)
-    }
-
-    /// The loop's Stop envelopes include an error sentence, which outranks status in the shared classifier.
-    static func wasStopped(_ output: JSONValue) -> Bool {
-        guard case .object(let object) = output else { return false }
-        return object["cancelled"] == .bool(true) && object["status"] == .string("cancelled")
     }
 }
 
@@ -85,42 +60,11 @@ extension TurnEngineResult.LoopCounters {
     }
 }
 
-// MARK: - Per-tool-dispatch deadline (Trust loop #3, 2026-06-15)
+// MARK: - Per-tool-dispatch deadline
 //
-// The chat tool loop's only existing brake on a single tool call is the
-// dispatch boundary. The LLM *stream* is guarded by ProviderStreamGuard
-// (idle 90s / wall 600s) but a single `tools.dispatch(...)` has NO timeout —
-// so a wedged tool (dead network, an MCP server that never answers, a stuck
-// subprocess) freezes that one dispatch forever. On any surface the whole
-// turn then hangs until the app restarts. This is
-// the same freeze class loop #1 fixed for the execution *step* path, on the
-// OTHER execution path: the chat tool loop driving an autonomous turn.
-//
-// runSingleDispatch races each dispatch against a
-// hard deadline; on expiry the deadline task throws ToolDispatchTimedOut,
-// which runSingleDispatch's existing catch turns into the slot's
-// {"error": ...} result — so the loop continues exactly as it does for any
-// tool error, and the model sees the timeout as recoverable feedback.
-//
-// INTERACTIVE surfaces (chat / telegram / ios / mobile / …) use a generous
-// finite backstop too. A human being present does not make a frozen turn
-// recoverable. Explicit timeout_seconds requests retain their requested window
-// plus cleanup margin, so the watchdog prevents unbounded wedges without
-// shortening intentionally long work.
-//
-// The unattended default (3900s) sits ABOVE the longest self-bounding tool
-// (an explicit timeout_seconds clamps to <=3600s),
-// so it NEVER clips a legitimately long tool — it only ever fires for a
-// genuinely UNBOUNDED wedge (shell / network / MCP with no internal timeout,
-// all of which complete in seconds-to-minutes normally). It is a backstop
-// against "hangs forever," not a tight per-tool SLA.
-//
-// RESIDUAL (identical to the execution step deadline, gpt-5.5-concurred): a
-// NON-cooperative sync wedge that never suspends / swallows CancellationError
-// can't be preempted — structured concurrency awaits the child at scope exit,
-// so the group can't return until that child does. Every realistic I/O hang
-// (async network / subprocess) IS cooperative and IS bounded here; a
-// guaranteed kill of a sync wedge needs a process/tool-layer boundary.
+// runSingleDispatch races each call against a deadline and returns ToolDispatchTimedOut as that slot's error.
+// Interactive and unattended calls have backstops; explicit timeout_seconds retains its window plus cleanup margin.
+// Structured concurrency cannot preempt a non-cooperative synchronous child and awaits it at scope exit.
 public enum ToolDispatchDeadline {
     /// Env override for the universal backstop, in seconds. <=0 / non-finite
     /// disables it on every surface.
@@ -141,8 +85,6 @@ public enum ToolDispatchDeadline {
     /// machine-driven surfaces, including training.
     static func isUnattended(surface: String) -> Bool {
         switch surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        // Wave 5b: Workshop spellings via `WorkshopSurfaceVocabulary`
-        // (same three strings as the open-coded list this replaces).
         case "autonomy", "background",
              "swarm", "swarms", "worker", "workers", "training":
             return true
@@ -204,19 +146,13 @@ public enum ToolDispatchDeadline {
     }
 }
 
-// MARK: - Tool-result stub (U1 step 5, 2026-06-10)
+// MARK: - Tool-result stub
 //
 // The stub `IntraTurnContextCompaction` puts in place of an older tool-result
-// body under window pressure: a 180-char head plus a marker telling the model
-// to recover the existing output without repeating effects. Disk persistence,
-// transcripts and traces keep full bodies — session history is written from
-// TurnEngineResult.toolDispatches + progress events, never from the in-flight
-// conversation.
+// body under window pressure. Historical tool receipts are bounded; a temporary
+// output handle belongs to its turn and never promises full source retention.
 enum IntraTurnToolResultClearing {
-    /// Head of the original body preserved in the stub. Sized in the same
-    /// ballpark as the cross-turn projection in SessionHistory
-    /// (`toolResultProjection`, which since sweep R4 keeps head+tail rather
-    /// than a 180-char head); the two budgets are independent.
+    /// Preserved head length; independent of SessionHistory's cross-turn head-and-tail projection budget.
     static let headLength = 180
 
     /// Prefix of OUR stub's terminal marker line.
@@ -225,11 +161,7 @@ enum IntraTurnToolResultClearing {
     /// Suffix of OUR stub's terminal marker line.
     static let clearedMarkerSuffix = " chars; recover the existing output from its receipt or saved result; do not repeat mutations or external sends merely to recover output]"
 
-    /// Idempotence sentinel (tightened 2026-06-10 review fix): a body counts
-    /// as already-stubbed only when it ENDS with our exact terminal marker
-    /// line — prefix + decimal char count + suffix. The old
-    /// substring-anywhere check permanently exempted any ORIGINAL tool
-    /// result that merely mentioned the marker phrase from clearing.
+    /// A body is already stubbed only if its final line is exactly the marker prefix, decimal character count and suffix.
     static func isAlreadyStubbed(_ content: String) -> Bool {
         guard content.hasSuffix(clearedMarkerSuffix) else { return false }
         let lastLine = content.split(separator: "\n", omittingEmptySubsequences: false).last
@@ -261,7 +193,7 @@ enum IntraTurnToolResultClearing {
 /// bounded projections; only the live provider block is replaced with a
 /// valid JSON page containing whole sections. Recover the existing
 /// output before deciding whether another operation is needed.
-enum ProviderToolResultProjection {
+enum ProviderToolResultPage {
     static let defaultMaxUTF8Bytes = 48_000
     static let compactMaxUTF8Bytes = 12_000
 
@@ -283,17 +215,18 @@ enum ProviderToolResultProjection {
         let limit = maxUTF8Bytes(for: toolName)
         guard content.utf8.count > limit else { return content }
 
+        let parsed = try? JSONValue.parse(Data(content.utf8))
+        let originalResultClass = originalResultClass ?? (content.utf8.count <= ProviderToolResultRecoveryStore.maxEntryBytes
+            ? parsed.map(ChatToolOutcome.exactResultClass) ?? .unknown : .unknown)
         let recovery = await ProviderToolResultRecoveryStore.shared.store(
             content: content,
+            parsed: parsed,
             toolName: toolName,
             sessionId: sessionId,
             turnId: turnId,
             originalResultClass: originalResultClass,
             sectionBudget: min(ToolResultSections.pageBudget, limit - 3_000)
         )
-        let originalResultClass = recovery?.resultClass
-            ?? originalResultClass ?? ProviderToolResultRecoveryStore.resultClass(content: content)
-
         let budget = min(ToolResultSections.pageBudget, limit - 3_000)
         var fields: [String: JSONValue]
         if let recovery, case .object(let page) = await ProviderToolResultRecoveryStore.shared.page(
@@ -308,7 +241,7 @@ enum ProviderToolResultProjection {
             }
             fields["retained_bytes"] = .int(Int64(recovery.bytes))
         } else {
-            fields = ["sections": .array(ToolResultSections.pages(content: content, budget: budget)[0]),
+            fields = ["sections": .array(ToolResultSections.pages(sections: ToolResultSections.projection(content: content, value: parsed, budget: budget), query: "", budget: budget)[0]),
                 "detail": .string("Only the displayed whole sections are included. The original could not be retained. Inspect an existing saved result; missing output does not establish failure.")]
         }
         fields["provider_projection"] = .string("bounded_tool_result")
@@ -322,9 +255,7 @@ enum ProviderToolResultProjection {
         // Home's controls must remain usable even when a page's reading
         // evidence is paged. Preserve the exact live controls, never reconstruct
         // or replay them from retained content. The full result remains paged.
-        if toolName == "app", let data = content.data(using: .utf8),
-           let value = try? JSONDecoder().decode(JSONValue.self, from: data),
-           case .object(var frame) = value {
+        if toolName == "app", case .object(var frame)? = parsed {
             fields["version"] = frame["version"]
             // A home-item send puts its receipt on top and the room under view.
             if case .object(let view)? = frame["view"] { frame.merge(view) { top, _ in top } }

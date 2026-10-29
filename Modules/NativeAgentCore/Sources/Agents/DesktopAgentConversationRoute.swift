@@ -1,6 +1,5 @@
 import AppKit
 import Foundation
-import GrokLink
 import ChatTurnRuntime
 import ChatTurnContracts
 import AgentConversations
@@ -41,16 +40,16 @@ public actor DesktopAgentConversationRoute {
         let procedure: String
     }
 
-    public func run(plan: [String: JSONValue], inner: any ToolDispatchClient, surface: String, appendReplyInstruction: Bool = true) async -> JSONValue {
+    public func run(plan: [String: JSONValue], inner: any ToolDispatchClient, surface: String) async -> JSONValue {
         let agent = string(plan["agent"]) ?? "unknown"
         guard !busy else { return result(agent, "busy", "The desktop is handling another conversation. Send again when it finishes.") }
         busy = true
-        let output = await operate(plan: plan, inner: inner, surface: surface, appendReplyInstruction: appendReplyInstruction)
+        let output = await operate(plan: plan, inner: inner, surface: surface)
         return await settle { await self.release(output) }
     }
     private func release(_ output: JSONValue) -> JSONValue { busy = false; return output }
 
-    private func operate(plan: [String: JSONValue], inner: any ToolDispatchClient, surface: String, appendReplyInstruction: Bool) async -> JSONValue {
+    private func operate(plan: [String: JSONValue], inner: any ToolDispatchClient, surface: String) async -> JSONValue {
         let agent = string(plan["agent"]) ?? "unknown"
         guard case .object(let target)? = plan["target"], let bundle = string(target["app_bundle_id"]),
               let label = string(target["conversation_label"]), !label.isEmpty else {
@@ -62,15 +61,12 @@ public actor DesktopAgentConversationRoute {
         // Grok's answer is read from its own chat, so it is not asked to answer
         // through an agent door as well: an inbound message there carries
         // nothing that ties it to this send, and two answers would be recorded.
-        // The screensaver hides every window and refuses activation (walk 2:
-        // "Grok Bot never came to the front"); wake it before touching the app.
+        // Wake a covered screen before activating the target app.
         do { try await MacScreenLock.wakeIfCovered() } catch {
             return Self.stopped(agent, app: "the app", stage: "waking the screen", typed: false, submitted: false,
                                 why: (error as? MacScreenLock.Covered)?.detail ?? "\(error)")
         }
-        // Grok Bot has a proven native send (select chat, empty box, paste,
-        // Return, see it in the chat) that knows exactly how far it got; a
-        // model driving the screen could not find its composer (walk 09-25).
+        // Grok's native sender owns submission evidence and reply watching.
         if bundle == GrokBotRoute.bundleID {
             do {
                 try await GrokRoutineAccessibility.send(requested, bot: label, watchReply: true)
@@ -103,7 +99,7 @@ public actor DesktopAgentConversationRoute {
             return Self.stopped(agent, app: "the app", stage: "preparing the courier instructions",
                 typed: false, submitted: false, why: error.localizedDescription)
         }
-        let message = requested + (appendReplyInstruction ? "\n\n" + instructions.replyInstruction : "")
+        let message = requested + "\n\n" + instructions.replyInstruction
         let operatorTools = DesktopConversationTools(inner: inner, bundle: bundle, label: label, message: message)
         let client = clients.chatClient(tools: operatorTools)
         let task: JSONValue = .object([
@@ -174,12 +170,10 @@ package actor DesktopConversationTools: ToolDispatchClient {
     private var calls = 0
     private var typed = false
     private var submitted = false
-    /// The submit action itself reported success (an attempt alone is `submitted`).
-    private var submitConfirmed = false
     private var selectionSucceeded = false
-    /// Times the message was already visible before it was typed; delivery
-    /// needs a post-submission read showing it more often than that.
-    private var baseline = 0
+    /// Exact outgoing transcript occurrences before submission, when the app
+    /// has a native reader. Missing evidence permits sending, never confirmation.
+    private var baseline: Int?
     private var observed = ""
     private var goReport = ""
     /// Where the route is and the last thing that went wrong, for a stop to name.
@@ -200,7 +194,6 @@ package actor DesktopConversationTools: ToolDispatchClient {
         try await inner.listAvailableToolSchemas()
     }
     package func dispatch(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        if bundle == GrokBotRoute.bundleID { try await GrokRoutineAccessibility.requireChatOnly() }
         calls += 1
         guard calls <= 24 else { throw refusal("Desktop conversation tool budget exceeded.") }
         var args = input.filter { $0.value != .null }
@@ -262,12 +255,12 @@ package actor DesktopConversationTools: ToolDispatchClient {
                     args["target"] = .string(composer)
                     typed = true // before dispatch: uncertain attempts are never replayed
                     stage = "typing the message"; typing = true
-                    baseline = occurrences(observed)
                 case "key":
                     guard typed, ["return", "enter"].contains(target.lowercased()) else { throw refusal("Only one message submission key is permitted.") }
                     guard try await Self.verifiedComposerTarget(bundle: bundle, label: label, content: message) != nil else {
                         throw refusal("The conversation or composed message changed. Submission stopped.")
                     }
+                    baseline = try await DesktopChatRoute.outgoingOccurrences(message, bundle: bundle, label: label)
                     submitted = true; stage = "verifying the sent message"; submitting = true
                 case "click":
                     if typed {
@@ -275,6 +268,7 @@ package actor DesktopConversationTools: ToolDispatchClient {
                         guard try await Self.verifiedComposerTarget(bundle: bundle, label: label, content: message) != nil else {
                             throw refusal("The conversation or composed message changed. Submission stopped.")
                         }
+                        baseline = try await DesktopChatRoute.outgoingOccurrences(message, bundle: bundle, label: label)
                         submitted = true; stage = "verifying the sent message"; submitting = true
                     } else {
                         let decorated = target.hasPrefix(label + ", ") && observed.contains(target)
@@ -296,7 +290,6 @@ package actor DesktopConversationTools: ToolDispatchClient {
         if ["screen", "read", "tool_result_page"].contains(tool) {
             observed = String(flatten(response).prefix(120_000))
         }
-        if submitting, case .object(let reply) = response, reply["ok"] == .bool(true) { submitConfirmed = true }
         if selecting, case .object(let reply) = response, reply["ok"] == .bool(true) {
             selectionSucceeded = true
         }
@@ -341,26 +334,30 @@ package actor DesktopConversationTools: ToolDispatchClient {
               value.trimmingCharacters(in: .whitespacesAndNewlines) == content.trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
         return MacAXAttributeRead.text(boxes[0], kAXRoleAttribute) == kAXTextAreaRole ? "text area" : "text"
     }
-    /// Send-only: the answer is delivery evidence for the outgoing message.
+    /// Send-only: native transcript reads establish outgoing delivery.
     /// No reply is looked for here — the recipient answers through the app's
     /// own inbound agent door, which arrives as an ordinary inbound message.
-    func project(answer: [String: JSONValue], agent: String) -> JSONValue {
-        let state = string(answer["state"])
-        if submitConfirmed && state == "sent" && occurrences(observed) > baseline {
-            return DesktopAgentConversationRoute.delivered(agent)
+    func project(answer: [String: JSONValue], agent: String) async -> JSONValue {
+        if submitted, let baseline {
+            do {
+                if let count = try await DesktopChatRoute.outgoingOccurrences(message, bundle: bundle, label: label), count > baseline {
+                    return DesktopAgentConversationRoute.delivered(agent)
+                }
+            } catch { problem = "Outgoing transcript read failed: \(error.localizedDescription)" }
+        } else if submitted {
+            problem = "No native outgoing-transcript baseline was available; delivery is unconfirmed."
         }
         // The operator's note is model-written: it rides inside the fixed
         // frame of what this fence itself saw happen.
         let note = String(string(answer["detail"]).prefix(300))
-        return stopped(agent, why: note.isEmpty ? problem : "operator: " + note)
+        let why = [problem, note.isEmpty ? "" : "operator: " + note].filter { !$0.isEmpty }.joined(separator: " ")
+        return stopped(agent, why: why)
     }
     func stopped(_ agent: String, why: String) -> JSONValue {
         DesktopAgentConversationRoute.stopped(agent, app: "the app", stage: stage, typed: typed, submitted: submitted,
                                               why: why.isEmpty ? problem : why)
     }
     private func string(_ value: JSONValue?) -> String { if case .string(let s)? = value { return s }; return "" }
-    private func normalize(_ value: String) -> String { value.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
-    private func occurrences(_ text: String) -> Int { normalize(text).components(separatedBy: normalize(message)).count - 1 }
     private func flatten(_ value: JSONValue) -> String {
         switch value {
         case .string(let text): text
@@ -373,21 +370,4 @@ package actor DesktopConversationTools: ToolDispatchClient {
         problem = reason
         return NSError(domain: "DesktopConversation", code: 403, userInfo: [NSLocalizedDescriptionKey: reason])
     }
-}
-
-extension DesktopAgentConversationRoute: GrokBotConnectionPort {
-    public nonisolated func ensureRunning() async throws {
-        try await GrokRoutineAccessibility.ensureRunning()
-    }
-
-    public nonisolated func send(peer: AgentPeerContact, text: String, conversation: String, route: AgentBridgeCompletionRoute,
-              messageID: String, dataRoot: URL, quiet: Bool) async throws -> JSONValue {
-        if peer.grokSetup != "set up" { return GrokBotRoute.setupRequired(peer) }
-        return try await GrokBotRoute.send(
-            peer: peer, text: text, conversation: conversation, route: route,
-            messageID: messageID, dataRoot: dataRoot,
-            credential: GrokLinkCredential.read(peer: peer.id), quiet: quiet
-        )
-    }
-
 }

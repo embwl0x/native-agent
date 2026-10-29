@@ -4,7 +4,7 @@ import PersistenceCore
 import TrustCenter
 // Blueprint: | `QuietTrustPolicyPreset+Action.swift` | trust preset action receipts |
 
-extension TrustPolicyPreset {
+extension MobileTrustAction.Preset {
     public enum Outcome: Sendable {
         case confirmationRequired(TrustPolicyPresetPlan)
         case applied(TrustPolicy)

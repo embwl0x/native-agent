@@ -4,20 +4,12 @@ import NativeAgentShared
 
 extension ChatStore {
     func pendingUserMessage(for pendingId: String) -> ChatMessage? {
-        guard let args = pendingSendArgs[pendingId],
+        guard let args = pendingExchanges[pendingId]?.request,
               let appendedUserId = args.appendedUserId else {
             return nil
         }
         let summaries = args.attachments.map {
-            ChatAttachmentSummary(
-                id: $0.id,
-                name: $0.name ?? ($0.type == "image" ? "Photo" : "Attachment"),
-                type: $0.type,
-                mime: $0.mime,
-                base64: $0.base64,
-                byteSize: $0.byteSize,
-                utterance: $0.utterance
-            )
+            ChatAttachmentSummary($0, fallbackName: $0.type == "image" ? "Photo" : "Attachment")
         }
         return ChatMessage(
             id: appendedUserId,
@@ -41,35 +33,19 @@ extension ChatStore {
         }
     }
 
-    private func macAssistantReply(for pendingId: String, in macMessages: [ChatMessage]) -> ChatMessage? {
-        macMessages.last {
-            $0.runId == pendingId && $0.isTerminalReply && macPublishedMessageIDs.contains($0.id)
-                && !regeneratedAwayAssistantIDs.contains($0.id)
-        }
-    }
-
-    func resolvePendingReplyFromMac(_ macMessages: [ChatMessage]) -> Bool {
-        let matches = Set(pendingICloudPlaceholders.keys).union(timedOutPendingIds.keys).sorted().compactMap { pendingId -> (String, UUID, ChatMessage)? in
-            guard let placeholderId = pendingICloudPlaceholders[pendingId] ?? timedOutPendingIds[pendingId],
-                  let reply = macAssistantReply(for: pendingId, in: macMessages) else { return nil }
-            return (pendingId, placeholderId, reply)
-        }
-        guard !matches.isEmpty else { return false }
-        // Retire only matched exchanges. Every other bubble
-        // remains owned by its pending record, even if this snapshot has replies.
+    func resolvePendingReplyFromMac(_ repliesByRun: [String: ChatMessage]) {
+        let matches = pendingICloudPlaceholders.merging(timedOutPendingIds) { current, _ in current }
+            .sorted { $0.key < $1.key }.compactMap { pendingId, placeholderId in
+                repliesByRun[pendingId].map { (pendingId, placeholderId, $0) }
+            }
+        guard !matches.isEmpty else { return }
         for (pendingId, placeholderId, _) in matches {
-            markICloudReplyResolved(pendingId)
-            pendingICloudPlaceholders.removeValue(forKey: pendingId)
-            timedOutPendingIds.removeValue(forKey: pendingId)
-            cancelReplyWaits(for: pendingId)
-            streamingHintsByMessageId.removeValue(forKey: placeholderId)
-            messages.removeAll { $0.id == placeholderId }
+            settlePendingReply(pendingId, placeholderId: placeholderId)
         }
-        for (_, placeholderId, reply) in matches {
-            releaseLoading(for: placeholderId)
+        let placeholders = Set(matches.map { $0.1 })
+        messages.removeAll { placeholders.contains($0.id) }
+        for (_, _, reply) in matches {
             onReply?(reply.text)
         }
-        isPollingFallback = false
-        return true
     }
 }

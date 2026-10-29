@@ -1,5 +1,6 @@
 import AgentWorkspace
 import Foundation
+import NativeAgentShared
 import Darwin
 import CryptoKit
 import NativeAgentCore
@@ -11,14 +12,11 @@ import ProviderRouting
 import TrustCenter
 import Dispatcher
 import MacControl
-import SwarmRuns
 import MacIntegration
 import ToolRegistry
-// Blueprint: | `SwiftToolDispatcher+AgentBridgeTools.swift` | `SwiftToolDispatcher`: `drivenAgentLaunch`, `drivenAgentContact`, `stampDelegationProducer` |
+// Blueprint: | `SwiftToolDispatcher+AgentBridgeTools.swift` | `SwiftToolDispatcher`: driven-agent launch admission, executable rebinding, cwd authority and wake-helper execution |
 
-/// One finished launch of an agent NativeAgent drives: SecurityCenter's
-/// decision for this turn's real origin and the exact program
-/// approved for that agent, its receipt re-verified just now.
+/// SecurityCenter's launch decision for the real origin and re-verified approved program.
 struct DrivenAgentLaunch: Sendable {
     var permission: DrivenAgentLaunchPermission
     /// The verified file to run; absent only when the launch is refused.
@@ -52,12 +50,12 @@ extension SwiftToolDispatcher {
 
     /// `contact` carries the approved program's receipt: the contact itself
     /// for agent_message, otherwise the connected contact for that agent.
-    static func drivenAgentLaunch(tool: String, surface: String, contact: AgentPeerContact?,
+    static func drivenAgentLaunch(surface: String, contact: AgentPeerContact?,
                                   name: String, dataRoot: URL) async -> DrivenAgentLaunch {
         let origin = SecurityOriginContext.currentTurn(
             verifiedSessionId: ChatToolSessionContext.verifiedSessionId, surface: surface)
         let permission = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
-            .drivenAgentLaunchPermission(tool: tool, origin: origin)
+            .drivenAgentLaunchPermission(origin: origin)
         if case .denied = permission { return DrivenAgentLaunch(permission: permission) }
         // Rebinding follows the installation without changing the launch's authority.
         let store = AgentPeerStore(dataRoot: dataRoot)
@@ -92,13 +90,10 @@ extension SwiftToolDispatcher {
         }
     }
 
-    /// Stamp every delegated wake with the runtime contract that produced it.
-    /// Older job records deliberately remain unstamped: readers can then keep
-    /// historical uncertainty separate from evidence produced by this build.
+    /// Stamp delegated wakes with producer evidence; unstamped records remain uncertain.
     static func stampDelegationProducer(on payload: inout [String: JSONValue]) {
         payload["producerSchemaVersion"] = .int(1)
-        // A turn an untrusted agent started delegates under that steer: the
-        // woken agent is told the ask is not the person's.
+        // Delegated wakes retain the untrusted origin of the turn.
         if let taint = PeerDataTaint.current, taint.isTainted { payload["peerTainted"] = .string(taint.sourceDescription) }
         guard let raw = Bundle.main.object(forInfoDictionaryKey: "NativeAgentSourceRevision") as? String else {
             return
@@ -108,53 +103,29 @@ extension SwiftToolDispatcher {
         payload["producerSourceRevision"] = .string(revision)
     }
 
-    /// Optional exact Desk binding for delegated work. The visible alias is
-    /// accepted at the tool edge, but only the stable live handle crosses into
-    /// bridge job evidence. No fuzzy title/topic inference is allowed.
-    func delegationDeskHandle(_ input: [String: JSONValue]) async throws -> String? {
-        guard let raw = input["desk_item"], raw != .null else { return nil }
+    /// Resolve an exact Desk handle or alias to the stable live handle, without inference.
+    /// Drop stale references and return them unchanged for the receipt.
+    func delegationDeskHandleDroppingStale(
+        _ input: [String: JSONValue]
+    ) async throws -> (handle: String?, dropped: String?) {
+        guard let raw = input["desk_item"], raw != .null else { return (nil, nil) }
         guard case .string(let value) = raw else {
             throw AutonomyGateError.toolDenied(reason: "delegation: desk_item must be a string")
         }
         let reference = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        // 2026-09-07: models spell "no desk item" as a sentinel string; the
-        // agent looped 78 times on desk_item "none" being "not a live Desk
-        // item". An empty or sentinel value means no desk binding, like omission.
+        // Empty and sentinel values omit the Desk binding.
         let noItem: Set<String> = ["", "none", "null", "nil", "no", "n/a", "na", "-"]
-        if noItem.contains(reference.lowercased()) { return nil }
+        if noItem.contains(reference.lowercased()) { return (nil, nil) }
         let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
         guard let item = state.items.first(where: {
             $0.handle == reference || $0.alias == reference
         }) else {
-            throw AutonomyGateError.toolDenied(
-                reason: "delegation: desk_item '\(reference)' is not a live Desk item"
-            )
+            return (nil, value)
         }
-        return item.handle
+        return (item.handle, nil)
     }
-
-    /// Same resolution, but a desk_item that is not a live item is dropped
-    /// rather than denying the whole send. 2026-09-11: across ten days
-    /// `claude_message`/`codex_message` lost 151 dispatches to
-    /// `delegation: desk_item '<x>' is not a live Desk item` — the model
-    /// invented `none`, `27`, `123`, a slug, once a stray CJK character. A
-    /// message is worth more than its Desk link, so the link is what gives way;
-    /// the returned `dropped` id lets the caller say so in its receipt.
-    func delegationDeskHandleDroppingStale(
-        _ input: [String: JSONValue]
-    ) async throws -> (handle: String?, dropped: String?) {
-        do {
-            return (try await delegationDeskHandle(input), nil)
-        } catch AutonomyGateError.toolDenied(let reason, _) where reason.contains("is not a live Desk item") {
-            guard case .string(let raw)? = input["desk_item"] else { return (nil, nil) }
-            return (nil, raw)
-        }
-    }
-    /// Delegated bridge transcripts contain prompts and replies, so retain a
-    /// bounded recent audit window rather than letting an unobserved side feed
-    /// grow forever. Session pointers are not audits; a last-message sidecar
-    /// is removed only with the matching evicted audit, never by itself while
-    /// an active Codex process may still be writing it.
+    /// Bound recent prompt/reply audits; session pointers are not audits.
+    /// Remove a last-message sidecar only with its matching evicted audit.
     static let agentBridgeAuditRetention = 100
     private static let agentBridgeAuditLock = NSLock()
 
@@ -183,97 +154,6 @@ extension SwiftToolDispatcher {
             try? fm.removeItem(at: lastMessage)
         }
     }
-    /// A wire handle over the builder CLIs' existing conversation state.
-    /// NativeAgent does not copy transcripts or create a second session store:
-    /// Codex owns its thread id, while Claude and OMP own per-topic pointers.
-    enum BuilderConversationAgent: String {
-        case codex
-        case claude
-        case omp
-    }
-
-    struct BuilderConversationSelection {
-        let conversationId: String?
-        let resumeId: String?
-        let topic: String?
-    }
-
-    enum BuilderConversationMode: String, Equatable {
-        case new
-        case resume
-    }
-
-    enum BuilderConversationReferenceError: Error {
-        case malformed(expectedAgent: BuilderConversationAgent)
-        case invalidMode
-        case modeConflict(mode: BuilderConversationMode)
-        case agentMismatch(expected: BuilderConversationAgent, actual: String)
-        case topicMismatch(conversationId: String, topic: String)
-
-        var envelope: JSONValue {
-            switch self {
-            case .malformed(let expectedAgent):
-                return .object([
-                    "status": .string("failed"), "effects": .string("none"),
-                    "reason": .string("invalid_conversation_id"),
-                    "fix": .string("Pass the exact \(expectedAgent.rawValue):… conversationId returned by the first builder message."),
-                ])
-            case .invalidMode:
-                return .object([
-                    "status": .string("failed"), "effects": .string("none"),
-                    "reason": .string("invalid_conversation_mode"),
-                    "fix": .string("Use conversation_mode='new' with no conversation_id, or conversation_mode='resume' with the exact returned conversationId."),
-                ])
-            case .modeConflict(let mode):
-                return .object([
-                    "status": .string("failed"), "effects": .string("none"),
-                    "reason": .string("conversation_mode_conflict"),
-                    "conversationMode": .string(mode.rawValue),
-                    "fix": .string(mode == .new
-                        ? "Remove conversation_id when starting new work."
-                        : "Pass the exact conversationId returned by the earlier builder message when resuming."),
-                ])
-            case .agentMismatch(let expected, let actual):
-                return .object([
-                    "status": .string("failed"), "effects": .string("none"),
-                    "reason": .string("conversation_agent_mismatch"),
-                    "expectedAgent": .string(expected.rawValue),
-                    "actualAgent": .string(actual),
-                    "fix": .string("Reply with the same builder tool that created this conversation."),
-                ])
-            case .topicMismatch(let conversationId, let topic):
-                return .object([
-                    "status": .string("failed"), "effects": .string("none"),
-                    "reason": .string("conversation_topic_mismatch"),
-                    "conversationId": .string(conversationId),
-                    "topic": .string(topic),
-                    "fix": .string("topic must match conversation_id; pass topic: \"\(conversationId.split(separator: ":", maxSplits: 1).last ?? "")\" or omit topic."),
-                ])
-            }
-        }
-    }
-
-    /// The ONE answer to "did the caller actually reference a conversation?".
-    /// `builderConversationSelection` treats an empty `conversation_id` as
-    /// absent; the worktree allocator's `isFollowUp` has to agree or empty is
-    /// only half-absent — it would take the follow-up branch and reject a
-    /// caller-supplied working_directory as a `follow_up_directory_conflict`
-    /// on what is, by the same rule, brand new work.
-    static func builderConversationReferenceSupplied(in input: [String: JSONValue]) -> Bool {
-        guard case .string(let raw)? = input["conversation_id"] else {
-            // A non-null, non-string value is malformed, not absent —
-            // builderConversationSelection rejects it before this is read.
-            return input["conversation_id"] != nil && input["conversation_id"] != .null
-        }
-        return !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    static func builderMessageId(input: [String: JSONValue]) -> String {
-        guard case .string(let raw)? = input["message_id"] else { return UUID().uuidString }
-        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        return value.isEmpty ? UUID().uuidString : String(value.prefix(160))
-    }
-
     /// A relative folder belongs to the contact's workspace, never the app's process cwd.
     static func builderInvokeWorkingDirectory(input: [String: JSONValue], dataRoot: URL) throws -> String {
         let contact = try AgentPeerStore(dataRoot: dataRoot).list().first {
@@ -286,7 +166,7 @@ extension SwiftToolDispatcher {
             guard case .string(let value) = value else {
                 throw ToolRegistryError.invalidRequest("Pass cwd as an existing folder. Codex's workspace root is \(root.path).")
             }
-            raw = NSString(string: value.trimmingCharacters(in: .whitespacesAndNewlines)).expandingTildeInPath
+            raw = NativeAgentWorkspaceRoot.fileSpelling(value.trimmingCharacters(in: .whitespacesAndNewlines))
         } else { raw = "" }
         let folder = (raw.isEmpty ? root : raw.hasPrefix("/") ? URL(fileURLWithPath: raw) : root.appendingPathComponent(raw))
             .standardizedFileURL.resolvingSymlinksInPath()
@@ -295,128 +175,6 @@ extension SwiftToolDispatcher {
             throw ToolRegistryError.invalidRequest("Codex's working folder does not exist: \(folder.path). Use its workspace root \(root.path) or an existing folder inside it.")
         }
         return folder.path
-    }
-
-    static func builderConversationSelection(
-        input: [String: JSONValue],
-        agent: BuilderConversationAgent,
-        topic: String?,
-        messageId: String
-    ) -> Result<BuilderConversationSelection, BuilderConversationReferenceError> {
-        let requestedMode: BuilderConversationMode?
-        if let rawMode = input["conversation_mode"], rawMode != .null {
-            guard case .string(let raw) = rawMode else {
-                return .failure(.invalidMode)
-            }
-            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if normalized.isEmpty {
-                requestedMode = nil
-            } else {
-                guard let mode = BuilderConversationMode(rawValue: normalized) else {
-                    return .failure(.invalidMode)
-                }
-                requestedMode = mode
-            }
-        } else {
-            requestedMode = nil
-        }
-
-        let suppliedReference: String?
-        if let rawReference = input["conversation_id"], rawReference != .null {
-            guard case .string(let raw) = rawReference else {
-                return .failure(.malformed(expectedAgent: agent))
-            }
-            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            // 2026-08-28 (upgrade-sweep C9-1): an EMPTY conversation_id means
-            // "no conversation", which is exactly what omitting the key means —
-            // the tool description already says "omit it for new work". Many
-            // tool-calling models cannot emit an absent optional and send "".
-            // Rejecting that as `invalid_conversation_id` cost 75 of the 101
-            // live claude_message failures in traces/events.jsonl (turn_traces
-            // 2026-08-*, all with `"conversation_id": ""`). Empty is absent.
-            suppliedReference = value.isEmpty ? nil : value
-        } else {
-            suppliedReference = nil
-        }
-
-        if requestedMode == .new, suppliedReference != nil {
-            // Never discard a non-empty stale handle and silently start a
-            // different job. The caller must make the new-work intent exact.
-            return .failure(.modeConflict(mode: .new))
-        }
-        if requestedMode == .resume, suppliedReference == nil {
-            return .failure(.modeConflict(mode: .resume))
-        }
-
-        guard let suppliedReference else {
-            if agent == .codex {
-                return .success(.init(conversationId: nil, resumeId: nil, topic: topic))
-            }
-            let stableTopic = topic ?? "conversation-\(shortStableBuilderMessageId(messageId))"
-            let slug = builderTopicSlug(stableTopic)
-            return .success(.init(
-                conversationId: "\(agent.rawValue):\(slug)",
-                resumeId: slug,
-                topic: slug
-            ))
-        }
-
-        let pieces = suppliedReference.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
-        guard pieces.count == 2 else { return .failure(.malformed(expectedAgent: agent)) }
-        let actualAgent = String(pieces[0])
-        guard actualAgent == agent.rawValue else {
-            return .failure(.agentMismatch(expected: agent, actual: actualAgent))
-        }
-        let resumeId = String(pieces[1])
-        guard !resumeId.isEmpty, resumeId.count <= 160,
-              resumeId.unicodeScalars.allSatisfy({ scalar in
-                  let value = scalar.value
-                  return (48...57).contains(value)
-                      || (65...90).contains(value)
-                      || (97...122).contains(value)
-                      || scalar == "-" || scalar == "_" || scalar == "."
-              }) else {
-            return .failure(.malformed(expectedAgent: agent))
-        }
-
-        if agent != .codex {
-            guard builderTopicSlug(resumeId) == resumeId else {
-                return .failure(.malformed(expectedAgent: agent))
-            }
-            if let topic, builderTopicSlug(topic) != resumeId {
-                return .failure(.topicMismatch(conversationId: suppliedReference, topic: topic))
-            }
-        }
-        return .success(.init(
-            conversationId: suppliedReference,
-            resumeId: resumeId,
-            topic: agent == .codex ? topic : resumeId
-        ))
-    }
-
-    /// Matches `topicSlug` in both builder wake helpers: ASCII lowercase
-    /// alphanumerics, collapsed dash separators, 64-character ceiling.
-    static func builderTopicSlug(_ raw: String) -> String {
-        var output = ""
-        var pendingSeparator = false
-        for scalar in raw.lowercased().unicodeScalars {
-            let value = scalar.value
-            let isASCIIAlphaNumeric = (48...57).contains(value) || (97...122).contains(value)
-            if isASCIIAlphaNumeric {
-                if pendingSeparator, !output.isEmpty { output.append("-") }
-                pendingSeparator = false
-                output.unicodeScalars.append(scalar)
-            } else if !output.isEmpty {
-                pendingSeparator = true
-            }
-        }
-        let canonical = String(output.prefix(64))
-            .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
-        return canonical.isEmpty ? "general" : canonical
-    }
-
-    private static func shortStableBuilderMessageId(_ messageId: String) -> String {
-        SHA256.hash(data: Data(messageId.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
     }
 
     static func stringField(_ name: String, in value: JSONValue) -> String? {
@@ -443,187 +201,7 @@ extension SwiftToolDispatcher {
         return .success(requested)
     }
 
-    /// Keep deduplication and the capped append under the same inbox lock.
-    /// Claude includes reviewer pairing in operation identity; OMP does not.
-    /// `durable`: the row is flushed and closed before this returns, and a
-    /// failed flush or close throws (Claude: the row is the whole delivery).
-    static func appendBuilderInboxMessage(
-        _ messageId: String,
-        entry: [String: JSONValue],
-        to inboxURL: URL,
-        queuedAt: String,
-        comparePairReviewer: Bool,
-        maxLines: Int,
-        logLabel: String,
-        persistence: SwiftNativePersistenceCore,
-        quarantine: BuilderInboxQuarantineNote,
-        durable: Bool = false
-    ) async throws -> (status: String, retryWake: Bool, queuedAt: String) {
-        try await persistence.withFileLock(inboxURL) {
-            let existing = try await checkedBuilderInboxMessage(
-                messageId, inboxURL: inboxURL, persistence: persistence, quarantine: quarantine
-            )
-            if case .object(let object)? = existing {
-                let operationFields = ["text", "topic", "conversationId", "workingDirectory", "deskHandle", "origin"]
-                guard operationFields.allSatisfy({ object[$0] == entry[$0] }),
-                      (object["requireExistingConversation"] == .bool(true)) == (entry["requireExistingConversation"] == .bool(true)),
-                      !comparePairReviewer || object["pairReviewer"] == entry["pairReviewer"] else {
-                    return ("conflict", false, queuedAt)
-                }
-                if let session = stringField("sessionId", in: .object(object)), !session.isEmpty {
-                    guard object["sessionId"] == entry["sessionId"],
-                          object["priority"] == entry["priority"],
-                          object["timeoutSeconds"] == entry["timeoutSeconds"] else {
-                        return ("conflict", false, queuedAt)
-                    }
-                }
-                // A durable retry proves the row is on disk before it says so:
-                // an earlier attempt may have written it but failed to flush.
-                if durable {
-                    let handle = try FileHandle(forWritingTo: inboxURL)
-                    defer { try? handle.close() }
-                    try handle.synchronize()
-                }
-                return ("duplicate", builderInboxAllowsExplicitWakeRetry(object),
-                        stringField("createdAt", in: .object(object)) ?? queuedAt)
-            }
-            try await appendJSONLCapped(
-                .object(entry), to: inboxURL, using: persistence,
-                maxLines: maxLines, logLabel: logLabel, takeLock: false,
-                // 2026-09-22: without a trigger the line cap re-read the whole
-                // inbox on every append.
-                trimWhenBytesExceed: 4 << 20,
-                durable: durable
-            )
-            return ("appended", false, queuedAt)
-        }
-    }
-
-    /// Carries a quarantine out of the flock'd read-dedup-append closure, which
-    /// is `@Sendable` and so cannot write to a captured local. Only the send
-    /// that actually quarantined stamps it, so the receipt names THIS call's
-    /// damage — never an older `.quarantined-<ts>` sibling still on disk.
-    final class BuilderInboxQuarantineNote: @unchecked Sendable {
-        private let lock = NSLock()
-        private var quarantinedPath: String?
-        var path: String? { lock.withLock { quarantinedPath } }
-        func record(_ path: String) { lock.withLock { quarantinedPath = path } }
-    }
-
-    static func checkedBuilderInboxMessage(
-        _ messageId: String,
-        inboxURL: URL,
-        persistence: SwiftNativePersistenceCore,
-        quarantine: BuilderInboxQuarantineNote
-    ) async throws -> JSONValue? {
-        let scan = try await persistence.readJSONLReporting(inboxURL)
-        if !scan.report.isClean
-            || !scan.rows.allSatisfy({ if case .object = $0 { return true }; return false }) {
-            // Preserve the original bytes before rebuilding the active queue
-            // from its valid rows. Those rows still own delivery and deduplication.
-            let aside = try await quarantineBuilderInbox(
-                inboxURL,
-                report: scan.report,
-                parsedRowCount: scan.rows.count,
-                persistence: persistence
-            )
-            quarantine.record(aside.path)
-        }
-        let matching = scan.rows.filter { row in
-            guard case .object(let object) = row else { return false }
-            return object["messageId"] == .string(messageId) || object["id"] == .string(messageId)
-        }
-        guard matching.count <= 1 else {
-            throw PersistenceCoreError.ioFailure("builder inbox message identity is ambiguous; original bytes preserved")
-        }
-        if case .object(let row)? = matching.first,
-           let id = row["id"], let canonicalId = row["messageId"], id != canonicalId {
-            throw PersistenceCoreError.ioFailure("builder inbox message identity conflicts; original bytes preserved")
-        }
-        return matching.first
-    }
-
-    /// Damage may conceal an earlier admission; report the preserved bytes
-    /// while valid rows keep their deduplication identities.
-    static func stampBuilderInboxQuarantine(
-        _ note: BuilderInboxQuarantineNote,
-        on response: inout [String: JSONValue]
-    ) {
-        guard let aside = note.path else { return }
-        response["inboxQuarantined"] = .object([
-            "quarantinedPath": .string(aside),
-            "note": .string("The inbox contained malformed rows. Its original bytes were preserved separately; valid rows remain queued and retain their message identities. An earlier admission may be in a damaged row; reconcile against the preserved file before assuming this was the first."),
-        ])
-    }
-
-    /// Preserve the original bytes, then atomically retain valid object rows
-    /// in the active inbox. Failure leaves the original queue available.
-    private static func quarantineBuilderInbox(
-        _ inboxURL: URL,
-        report: JSONLReadReport,
-        parsedRowCount: Int,
-        persistence: SwiftNativePersistenceCore
-    ) async throws -> URL {
-        let fileManager = FileManager.default
-        let stamp = String(Int(Date().timeIntervalSince1970))
-        var aside = inboxURL.appendingPathExtension("quarantined-\(stamp)")
-        var collision = 1
-        while fileManager.fileExists(atPath: aside.path) {
-            aside = inboxURL.appendingPathExtension("quarantined-\(stamp)-\(collision)")
-            collision += 1
-        }
-        try fileManager.copyItem(at: inboxURL, to: aside)
-        let original = try Data(contentsOf: aside)
-        var retained = Data()
-        for line in original.split(separator: 0x0A, omittingEmptySubsequences: false) {
-            guard String(data: Data(line), encoding: .utf8) != nil,
-                  let parsed = try? JSONValue.parse(Data(line)), case .object = parsed else { continue }
-            retained.append(contentsOf: line)
-            retained.append(0x0A)
-        }
-        try retained.write(to: inboxURL, options: .atomic)
-        let receipt: [String: JSONValue] = [
-            "event": .string("builder_inbox_quarantined"),
-            "quarantinedAt": .string(ISO8601DateFormatter().string(from: Date())),
-            "inboxPath": .string(inboxURL.path),
-            "quarantinedPath": .string(aside.path),
-            "reason": .string("builder inbox is malformed; original bytes preserved"),
-            "malformedLineCount": .int(Int64(report.malformedLineCount)),
-            "trailingPartialLine": .bool(report.trailingPartialLine),
-            "physicalLineCount": .int(Int64(report.physicalLineCount)),
-            "parsedRowCount": .int(Int64(parsedRowCount)),
-        ]
-        // Best effort: the bytes are already safe, and a receipt write failure
-        // must not turn a recovered send back into a dark bridge.
-        try? await persistence.appendJSONLDurable(
-            .object(receipt),
-            to: inboxURL.deletingLastPathComponent()
-                .appendingPathComponent("bridge-inbox-quarantine.jsonl")
-        )
-        return aside
-    }
-
-    static func builderInboxAllowsExplicitWakeRetry(
-        _ row: [String: JSONValue],
-        requiresSession: Bool = true
-    ) -> Bool {
-        guard row["read"] == .bool(false),
-              let createdAt = stringField("createdAt", in: .object(row)),
-              !createdAt.isEmpty else { return false }
-        if requiresSession {
-            guard let session = stringField("sessionId", in: .object(row)),
-                  !session.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
-        }
-        switch row["consumedAt"] {
-        case nil, .null: return true
-        case .string(let value): return value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        default: return false
-        }
-    }
-
-    /// Accepts only a bare `owner/name` GitHub slug. Rejects anything that
-    /// could be read as a filesystem path or a traversal attempt, so the
-    /// resolver is never handed model-authored path syntax.
+    /// Admit only bare owner/name GitHub slugs, never filesystem or traversal syntax.
     static func isWellFormedRepositorySlug(_ value: String) -> Bool {
         guard !value.isEmpty, value.count <= 140 else { return false }
         guard !value.hasPrefix("/"), !value.hasPrefix("~"), !value.contains("..") else { return false }
@@ -639,25 +217,11 @@ extension SwiftToolDispatcher {
         return true
     }
 
-    /// Repository slugs a codex_message request mentions, most-confident first.
-    ///
-    /// This exists because forgetting the `repository` parameter silently costs
-    /// the caller the whole `github-command-repository-network-v1` execution
-    /// profile: no network, no writable checkout, so Codex has zero GitHub paths
-    /// and grinds until the harness kills the turn (2026-08-05 incident, turn
-    /// 019fd2e5-0b16-7b31-bf28-1df55570c4bd). Omission must be impossible, not
-    /// merely rare.
-    ///
-    /// This widens only WHERE the slug is read from, never the trust boundary:
-    /// every candidate still goes through `GitHubCommandCheckoutResolver`, whose
-    /// anchor is the checkout's own git remote. The explicit `repository`
-    /// parameter already accepts any model-authored slug, so reading one out of
-    /// the request text grants no authority the caller did not already have.
+    /// Request slugs retain confidence order and require checkout-remote validation.
     static func repositorySlugCandidates(inRequestText text: String) -> [String] {
         var urlSlugs: [String] = []
         var bareSlugs: [String] = []
-        // github.com/<owner>/<name> is unambiguous; a bare owner/name token is a
-        // weaker signal and is only consulted when no URL names a repository.
+        // Prefer GitHub URLs; consult bare owner/name tokens only without a URL.
         for rawToken in text.split(whereSeparator: { $0.isWhitespace }) {
             var token = String(rawToken).trimmingCharacters(
                 in: CharacterSet(charactersIn: "`\"'<>(),;:[]{}!?*")
@@ -679,9 +243,7 @@ extension SwiftToolDispatcher {
                 }
                 continue
             }
-            // A bare token must be exactly owner/name -- never a path fragment
-            // ("docs/build_plans" resolves to nothing, but rejecting the shape
-            // early keeps the resolver off obviously-wrong candidates).
+            // A bare token must be exactly owner/name, never a path fragment.
             if token.hasPrefix("/") || token.hasSuffix("/") { continue }
             if token.hasSuffix(".git") { token = String(token.dropLast(4)) }
             guard isWellFormedRepositorySlug(token) else { continue }
@@ -689,25 +251,18 @@ extension SwiftToolDispatcher {
             guard parts.count == 2, parts[0].count >= 2, parts[1].count >= 2 else { continue }
             if !bareSlugs.contains(token) { bareSlugs.append(token) }
         }
-        // Cap the resolver's work: each candidate walks directories and shells
-        // out to git. A request naming a dozen slugs is not a repo request.
+        // Bound directory walks and git invocations to eight candidates.
         return Array((urlSlugs.isEmpty ? bareSlugs : urlSlugs).prefix(8))
     }
 
-    /// Resolve at most ONE checkout from the request text. Ambiguity -- two
-    /// different repositories that both resolve -- yields nil and the send
-    /// proceeds with today's no-profile behavior, because guessing which
-    /// repository the caller meant would hand Codex a network-enabled writable
-    /// checkout of the wrong tree.
+    /// Working-directory admission supplies an optional path or an explicit refusal.
     enum AgentBridgeWorkingDirectoryResolution {
         case success(String?)
         case failure(JSONValue)
     }
 
-    /// Resolve an explicit bridge cwd at the same effect-time TrustCenter
-    /// boundary as native shell tools. Canonical workspace/source roots remain
-    /// valid in ordinary modes. An external directory requires active Full Mac
-    /// file authority plus the explicit outside-workspace allow posture.
+    /// Admit canonical workspace/source roots at the shell tools' effect-time Trust boundary.
+    /// External directories require Full Mac file authority and explicit outside-workspace allow.
     func resolveAgentBridgeWorkingDirectory(
         input: [String: JSONValue],
         surface: String
@@ -716,57 +271,22 @@ extension SwiftToolDispatcher {
             return .success(nil)
         }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        // Optional string fields are sometimes serialized as "" by tool-calling
-        // models. Match conversation_id's omission semantics: an empty cwd does
-        // not request a path, while a non-empty invalid path still fails closed.
+        // An empty cwd requests no path; a non-empty invalid path still fails closed.
         guard !trimmed.isEmpty else { return .success(nil) }
-        let expanded = NSString(string: trimmed).expandingTildeInPath
-        let url = URL(fileURLWithPath: expanded)
-            .standardizedFileURL
-            .resolvingSymlinksInPath()
-        var isDirectory: ObjCBool = false
-        guard url.path.hasPrefix("/"),
-              FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
-              isDirectory.boolValue else {
-            return .failure(.object([
-                "status": .string("failed"),
-                "reason": .string("working_directory_invalid"),
-                "workingDirectory": .string(url.path),
-                "detail": .string("working_directory must resolve to an existing absolute directory."),
-            ]))
+        let directory = Self.builderNormalizeCwd(trimmed, dataRoot: dataRoot)
+        guard let rejection = directory.rejection else { return .success(directory.path) }
+        var fields: [String: JSONValue] = [
+            "status": .string("failed"), "reason": .string(rejection),
+            "workingDirectory": .string(directory.path), "detail": .string(directory.detail!),
+        ]
+        if rejection == "working_directory_outside_workspace_denied" {
+            let access = await fullMacToolAccess(surface: surface)
+            if access.fullMacActive, access.fileOpsAllowed,
+               Self.builderYoloPermissionLevels.contains(access.permissionLevel),
+               access.outsideWorkspaceDefault == "allow" { return .success(directory.path) }
+            fields["workspaceRoot"] = .string(Self.builderWorkspaceRoot(dataRoot: dataRoot).path)
         }
-
-        if Self.builderAllowedRoots(dataRoot: dataRoot).contains(where: { root in
-            let rootPath = root.path
-            return url.path == rootPath || url.path.hasPrefix(rootPath + "/")
-        }) {
-            return .success(url.path)
-        }
-
-        if let reason = MacControlSensitivePathFence.reason(forPath: url.path)
-            ?? MacControlSensitivePathFence.protectedSystemMutationReason(forPath: url.path) {
-            return .failure(.object([
-                "status": .string("failed"),
-                "reason": .string("working_directory_sensitive_path_denied"),
-                "workingDirectory": .string(url.path),
-                "detail": .string(reason),
-            ]))
-        }
-
-        let access = await fullMacToolAccess(surface: surface)
-        guard access.fullMacActive,
-              access.fileOpsAllowed,
-              Self.builderYoloPermissionLevels.contains(access.permissionLevel),
-              access.outsideWorkspaceDefault == "allow" else {
-            return .failure(.object([
-                "status": .string("failed"),
-                "reason": .string("working_directory_outside_workspace_denied"),
-                "workingDirectory": .string(url.path),
-                "workspaceRoot": .string(Self.builderWorkspaceRoot(dataRoot: dataRoot).path),
-                "detail": .string("An external coding directory requires active Full Mac YOLO with outside-workspace access set to allow."),
-            ]))
-        }
-        return .success(url.path)
+        return .failure(.object(fields))
     }
 
     var builderWorktreeConfigRoot: URL {
@@ -804,14 +324,52 @@ extension SwiftToolDispatcher {
         ])
     }
 
-    /// One lifecycle owner for the Codex, Claude, and OMP wake helpers. The
-    /// shared adapter drains both pipes while the child runs, feeds stdin off
-    /// the waiting path, bounds captured output, and owns cancellation plus
-    /// process-tree timeout escalation. Builder-specific wrappers only supply
-    /// environment and deadline policy.
-    /// `launch`: the finished decision for an agent NativeAgent drives. A
-    /// Full Mac launch runs only its approved file; the helper receives the
-    /// finished values (`launchArguments`, `launchEnvironment`) and nothing else.
+    func postBuilderThreadWakeup(name: String, surface: String, payload: [String: JSONValue]) async -> JSONValue {
+        let cli = name.lowercased()
+        let disabledVariable = "NATIVE_AGENT_\(cli.uppercased())_WAKEUP_DISABLED"
+        let disabled = ProcessInfo.processInfo.environment[disabledVariable]?.lowercased()
+        if ["1", "true", "yes"].contains(disabled ?? "") {
+            return .object([
+                "status": .string("skipped"), "reason": .string("disabled_by_environment"),
+                "env": .string(disabledVariable),
+            ])
+        }
+        let helperName = "\(cli)_thread_wakeup.js"
+        guard let helper = AgentBridgeRuntime.helperURL(named: helperName, dataRoot: dataRoot) else {
+            return .object([
+                "status": .string("skipped"), "reason": .string("helper_not_found"),
+                "expected": .string(AgentBridgeRuntime.expectedHelperPath(named: helperName, dataRoot: dataRoot).path),
+                "remedy": Self.builderFailureRemedy(owner: "NativeAgent app bundle / \(helperName)",
+                    instruction: "The bundled \(name) wake helper is missing."),
+            ])
+        }
+        let inputData: Data
+        do {
+            inputData = try JSONValue.object(payload).serializedData(pretty: false)
+        } catch {
+            return .object(Self.builderFailureFields(error,
+                tool: "\(cli)_message", reason: "wakeup_payload_encode_failed", effects: .none,
+                owner: "\(name) wake payload encoding",
+                instruction: "Repair the reported payload encoding error. The inbox message is saved; this wake did not launch."))
+        }
+        var launch: DrivenAgentLaunch?
+        var arguments: [String] = []
+        if cli == "codex" {
+            let decision = await Self.drivenAgentLaunch(surface: surface,
+                contact: Self.drivenAgentContact(host: "codex", dataRoot: dataRoot), name: "Codex", dataRoot: dataRoot)
+            if let denied = decision.deniedResult { return denied }
+            launch = decision
+            arguments = ["--sandbox", decision.permission.codexSandbox, "--approval-policy", decision.permission.codexApprovalPolicy]
+        }
+        let cwd = Self.builderSourceRepoRoot(dataRoot: dataRoot) ?? NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
+        return await runAgentWakeupHelper(helper: helper, inputData: inputData, cwd: cwd,
+            cli: cli, variable: cli == "codex" ? "CODEX_BIN" : "NATIVE_AGENT_OMP_WAKE_BIN",
+            timeout: cli == "codex" ? Self.codexWakeupHelperTimeoutSeconds() : 30,
+            launch: launch, launchArguments: arguments)
+    }
+
+    /// One wake-helper lifecycle: concurrent pipe drain, off-path stdin, bounded output and tree cancellation/timeout.
+    /// Callers supply deadlines and finished launch arguments/environment; Full Mac runs only the approved file.
     func runAgentWakeupHelper(helper: URL, inputData: Data, cwd: URL,
                               cli: String, variable: String, timeout: TimeInterval,
                               launch: DrivenAgentLaunch? = nil, launchArguments: [String] = [],
@@ -841,383 +399,4 @@ extension SwiftToolDispatcher {
         return receipt
     }
 
-    // MARK: - Runs-ledger append for sub-agent spawns
-    //
-    // Shared tail for invoke_claude / invoke_codex: translate the tool-result
-    // envelope into one RunRecord row in <dataRoot>/runs/runs.json. The
-    // envelope's "completed" maps to the ledger's "succeeded" (the status
-    // string the Runs UI colors green); a watchdog kill maps to "timeout".
-    static func appendSpawnRunToLedger(
-        kind: String,
-        result: JSONValue,
-        model: String?,
-        prompt: String,
-        startedAt: Date,
-        dataRoot: URL
-    ) async {
-        guard case .object(let obj) = result else { return }
-        let rawStatus: String = {
-            if case .string(let s)? = obj["status"] { return s }
-            return "unknown"
-        }()
-        let timedOut: Bool = {
-            if case .bool(let b)? = obj["timedOut"] { return b }
-            if case .string(let reason)? = obj["reason"], reason.hasPrefix("timeout_after_") { return true }
-            return false
-        }()
-        let status = rawStatus == "completed" ? "succeeded" : (timedOut ? "timeout" : rawStatus)
-        let runId: String = {
-            if case .string(let r)? = obj["runId"], !r.isEmpty { return r }
-            return UUID().uuidString
-        }()
-        let reply: String? = {
-            if case .string(let r)? = obj["reply"], !r.isEmpty { return r }
-            return nil
-        }()
-        var errorParts: [String] = []
-        if status != "succeeded" {
-            if case .string(let reason)? = obj["reason"] { errorParts.append(reason) }
-            if case .string(let detail)? = obj["detail"], !detail.isEmpty { errorParts.append(detail) }
-            if case .string(let stderrText)? = obj["stderr"], !stderrText.isEmpty { errorParts.append(stderrText) }
-        }
-        await RunLedger.append(
-            id: runId,
-            kind: kind,
-            status: status,
-            model: model,
-            prompt: prompt,
-            output: reply,
-            error: errorParts.isEmpty ? nil : errorParts.joined(separator: "\n"),
-            createdAt: startedAt,
-            durationSeconds: Date().timeIntervalSince(startedAt),
-            dataRoot: dataRoot
-        )
-    }
-
-}
-
-// MARK: - Stale-wakeup replay guard (W2b, upgrade campaign 2026-08 Track A)
-//
-// L1#14, in User's words: "the bridge is still replaying old wakeups as if they
-// are new." The shape of that failure is narrow and identifiable — the SAME
-// message text, on the SAME topic, fired again at a runner that already ran it
-// to completion and already handed the answer back. Each replay costs a real
-// spawned session, real tokens, and produces a second copy of an answer nobody
-// asked for twice.
-//
-// This guard reads the target store BEFORE the wakeup spawn and returns a
-// receipt instead of enqueuing, when and only when all four hold:
-//
-//   1. Same topic slug (slugged through the dispatcher's own
-//      `builderTopicSlug`, never a second implementation).
-//   2. Byte-identical payload text. Same topic with DIFFERENT text is normal
-//      follow-up work and must always go through — this is the single most
-//      important non-suppression, because getting it wrong silently strands
-//      real work.
-//   3. The prior job is TERMINAL: it carries a completion stamp or a terminal
-//      status word. An in-flight job is not a replay; the bridges already
-//      serialize per topic and have their own in-flight handling.
-//   4. The prior job's answer was CONFIRMED DELIVERED. A job whose delivery was
-//      lost or unconfirmed is deliberately NOT suppressed — re-asking after an
-//      answer went missing is the correct human action, and blocking it would
-//      strand the work permanently. This is why the guard cannot be "is there a
-//      terminal job with this topic".
-//
-// Plus a recency window (default 24h): an identical request made weeks later is
-// a deliberate re-run, not a replay.
-//
-// WIRE FENCE: nothing here writes, and no script/*.js is touched. The store
-// paths mirror the JS writers' own resolution order (env override, then
-// ~/.config) so the guard can never read a different directory than the writer.
-enum WakeupReplayGuard {
-
-    enum Store {
-        case omp
-        case codex
-    }
-
-    /// Everything the receipt needs to say WHICH prior job matched. Every field
-    /// is read off the record — nothing is inferred.
-    struct Match: Equatable {
-        let jobId: String
-        let topicSlug: String
-        let completedAt: String?
-        let statusWord: String?
-        let storeLabel: String
-        /// The prior run's answer, when its record still holds it.
-        var reply: String? = nil
-        var deliveryConfirmed: Bool = true
-    }
-
-    /// How long an identical completed request keeps suppressing a re-fire.
-    static let defaultWindow: TimeInterval = 24 * 60 * 60
-
-    /// Escape hatch. Set to 1/true/yes to force every wakeup through, e.g. when
-    /// deliberately re-running an identical delegated job.
-    static let disableEnvironmentKey = "NATIVE_AGENT_WAKEUP_REPLAY_GUARD_DISABLED"
-
-    static func isDisabled(
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> Bool {
-        let raw = environment[disableEnvironmentKey]?.lowercased() ?? ""
-        return ["1", "true", "yes"].contains(raw)
-    }
-
-    /// Resolve the jobs directory for a store, mirroring the JS writer's own
-    /// order: an explicit override (tests / `agentBridgeConfigRoot`) wins, then
-    /// the writer's env var, then `~/.config`.
-    static func jobsDirectory(
-        for store: Store,
-        configRoot: URL?,
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> URL {
-        func home(_ bridge: String) -> URL {
-            InstallPaths.current.bridgeConfigRoot
-                .appendingPathComponent(bridge, isDirectory: true)
-        }
-        switch store {
-        case .omp:
-            let base = configRoot?.appendingPathComponent("omp-bridge", isDirectory: true)
-                ?? environment["NATIVE_AGENT_OMP_BRIDGE_DIR"].map { URL(fileURLWithPath: $0) }
-                ?? home("omp-bridge")
-            return base.appendingPathComponent("wake-jobs", isDirectory: true)
-        case .codex:
-            if let configRoot {
-                return configRoot
-                    .appendingPathComponent("codex-nativeagent-bridge", isDirectory: true)
-                    .appendingPathComponent("reply-jobs", isDirectory: true)
-            }
-            if let override = environment["NATIVE_AGENT_CODEX_REPLY_JOBS_DIR"] {
-                return URL(fileURLWithPath: override)
-            }
-            return home("codex-nativeagent-bridge")
-                .appendingPathComponent("reply-jobs", isDirectory: true)
-        }
-    }
-
-    /// The prior terminal, delivered, identical job — or nil, meaning "post the
-    /// wakeup". Every failure to read is nil: the guard NEVER blocks work
-    /// because a directory was unreadable.
-    static func terminalDuplicate(
-        store: Store,
-        jobsDirectory: URL,
-        dataRoot: URL,
-        topic: String?,
-        text: String,
-        conversationId: String? = nil,
-        now: Date,
-        window: TimeInterval = defaultWindow
-    ) -> Match? {
-        let wanted = SwiftToolDispatcher.builderTopicSlug(topic ?? "")
-        guard !text.isEmpty else { return nil }
-        let names = (try? FileManager.default.contentsOfDirectory(atPath: jobsDirectory.path)) ?? []
-        var records: [[String: JSONValue]] = []
-        var best: (match: Match, completed: Date, thread: String?)?
-        for name in names.sorted() where name.hasSuffix(".json") && !name.hasPrefix(".") {
-            let url = jobsDirectory.appendingPathComponent(name)
-            guard let data = try? Data(contentsOf: url),
-                  let parsed = try? JSONValue.parse(data),
-                  case .object(let record) = parsed,
-                  (try? DataRootLife.isCurrent(string(record, "lifeID"), in: dataRoot)) == true else { continue }
-            records.append(record)
-            guard let candidate = match(
-                store: store, record: record, url: url,
-                wantedSlug: wanted, text: text, conversationId: conversationId, now: now, window: window
-            ) else { continue }
-            // Newest match wins, so the receipt names the most recent run.
-            let stamp = parseISO(candidate.completedAt) ?? .distantPast
-            if best == nil || stamp > best!.completed { best = (candidate, stamp, string(record, "threadId")) }
-        }
-        guard let best else { return nil }
-        // A different message entered this conversation after that run
-        // completed: asking the same thing again is a new turn, not a replay
-        // (walk 2, 09-25: OMP's second fruit pick was skipped and never ran).
-        // Codex is scoped by its thread; the wake stores by topic.
-        let movedOn = records.contains { record in
-            guard let created = parseISO(string(record, "createdAt")), created > best.completed else { return false }
-            if store == .codex, let thread = best.thread, string(record, "threadId") != thread { return false }
-            return turns(store: store, record: record).contains { turn in
-                turn.text != text && (store == .codex && best.thread != nil || turn.slug == wanted)
-            }
-        }
-        return movedOn ? nil : best.match
-    }
-
-    /// Every (text, topic slug) a job record carries: one payload for the
-    /// wake stores, each batched entry for Codex.
-    private static func turns(store: Store, record: [String: JSONValue]) -> [(text: String, slug: String)] {
-        let payloads: [[String: JSONValue]]
-        switch store {
-        case .omp:
-            guard case .object(let payload)? = record["payload"] else { return [] }
-            payloads = [payload]
-        case .codex:
-            guard case .array(let entries)? = record["entries"] else { return [] }
-            payloads = entries.compactMap { if case .object(let e) = $0, case .object(let p)? = e["payload"] { p } else { nil } }
-        }
-        return payloads.compactMap { payload in
-            guard let text = string(payload, "text") else { return nil }
-            let slug = (store == .codex ? nil : string(record, "topicSlug"))
-                ?? SwiftToolDispatcher.builderTopicSlug(string(payload, "topic") ?? "")
-            return (text, slug)
-        }
-    }
-
-    private static func match(
-        store: Store,
-        record: [String: JSONValue],
-        url: URL,
-        wantedSlug: String,
-        text: String,
-        conversationId: String?,
-        now: Date,
-        window: TimeInterval
-    ) -> Match? {
-        switch store {
-        case .omp:
-            // The wake-job writer persists the whole request under `payload`.
-            guard case .object(let payload)? = record["payload"],
-                  string(payload, "text") == text else { return nil }
-            let slug = string(record, "topicSlug")
-                ?? SwiftToolDispatcher.builderTopicSlug(string(payload, "topic") ?? "")
-            guard slug == wantedSlug else { return nil }
-            let completedAt = string(record, "completedAt")
-            let statusWord = (string(record, "runStatus") ?? string(record, "status"))?.lowercased()
-            guard isTerminal(completedAt: completedAt, statusWord: statusWord) else { return nil }
-            guard succeeded(statusWord: statusWord) else { return nil }
-            guard deliveryConfirmed(record) else { return nil }
-            guard withinWindow(completedAt, now: now, window: window) else { return nil }
-            return Match(
-                jobId: string(record, "messageId") ?? url.deletingPathExtension().lastPathComponent,
-                topicSlug: slug,
-                completedAt: completedAt,
-                statusWord: statusWord,
-                storeLabel: "omp",
-                reply: string(record, "reply")
-            )
-
-        case .codex:
-            // A DELIVERED codex reply-job is unlinked by the bridge, so a
-            // terminal record still sitting in reply-jobs/ is one whose handoff
-            // is pending recovery — the WORK is done, and re-firing duplicates
-            // it. Records preserved under `undelivered/` are never scanned (the
-            // caller does not descend into it), which is the point: an
-            // undeliverable job must stay re-askable.
-            guard let conversationId, string(record, "threadId") == conversationId,
-                  case .array(let entries)? = record["entries"] else { return nil }
-            var matched = false
-            for entry in entries {
-                guard case .object(let e) = entry,
-                      case .object(let payload)? = e["payload"],
-                      string(payload, "text") == text else { continue }
-                let slug = SwiftToolDispatcher.builderTopicSlug(
-                    string(payload, "topic") ?? "")
-                if slug == wantedSlug { matched = true; break }
-            }
-            guard matched else { return nil }
-            guard case .object(let execution)? = record["completedExecution"],
-                  case .object(let turnResult)? = execution["turnResult"] else { return nil }
-            let completedAt = string(turnResult, "completedAt")
-            let statusWord = string(turnResult, "status")?.lowercased()
-            guard isTerminal(completedAt: completedAt, statusWord: statusWord) else { return nil }
-            guard succeeded(statusWord: statusWord) else { return nil }
-            guard withinWindow(completedAt, now: now, window: window) else { return nil }
-            return Match(
-                jobId: string(record, "id") ?? url.deletingPathExtension().lastPathComponent,
-                topicSlug: wantedSlug,
-                completedAt: completedAt,
-                statusWord: statusWord,
-                storeLabel: "codex",
-                reply: string(turnResult, "message"),
-                deliveryConfirmed: false
-            )
-        }
-    }
-
-    static let terminalStatusWords: Set<String> = [
-        "completed", "complete", "succeeded", "success",
-        "failed", "failure", "error", "errored",
-        "timeout", "timed_out", "cancelled", "canceled", "aborted", "spawn_failed",
-    ]
-
-    static let successStatusWords: Set<String> = [
-        "completed", "complete", "succeeded", "success",
-    ]
-
-    static func isTerminal(completedAt: String?, statusWord: String?) -> Bool {
-        if completedAt != nil { return true }
-        if let statusWord, terminalStatusWords.contains(statusWord) { return true }
-        return false
-    }
-
-    /// A FAILED prior run is not a replay to suppress — retrying failed work is
-    /// exactly what a re-send is for.
-    static func succeeded(statusWord: String?) -> Bool {
-        guard let statusWord else { return false }
-        return successStatusWords.contains(statusWord)
-    }
-
-    /// Claude writes `bridgeStatus`; OMP writes a `bridge` object with a
-    /// `status`. Only an explicit "delivered" counts — `deliveryLost` true, an
-    /// unknown bridge status, or no bridge record at all all mean the answer is
-    /// not known to have arrived, so the re-send goes through.
-    static func deliveryConfirmed(_ record: [String: JSONValue]) -> Bool {
-        if case .bool(true)? = record["deliveryLost"] { return false }
-        if let status = string(record, "bridgeStatus") { return status == "delivered" }
-        if case .object(let bridge)? = record["bridge"] {
-            return string(bridge, "status") == "delivered"
-        }
-        return false
-    }
-
-    static func withinWindow(_ completedAt: String?, now: Date, window: TimeInterval) -> Bool {
-        // No completion stamp means we cannot prove recency. Terminal-by-status
-        // with no timestamp is a legacy/hand-edited shape; treat it as OUT of
-        // the window so the wakeup proceeds rather than being blocked by a
-        // record we cannot date.
-        guard let date = parseISO(completedAt) else { return false }
-        return now.timeIntervalSince(date) <= window && date <= now.addingTimeInterval(window)
-    }
-
-    /// The receipt that replaces the wakeup envelope. `status: "skipped"` keeps
-    /// it in the same vocabulary the other non-spawn outcomes already use
-    /// (`disabled_by_environment`, `helper_not_found`, `deduplicated`), so no
-    /// caller needs a new branch to understand it.
-    static func receipt(_ match: Match) -> JSONValue {
-        var obj: [String: JSONValue] = [
-            "status": .string("skipped"),
-            "reason": .string("already_completed"),
-            "jobId": .string(match.jobId),
-            "topicSlug": .string(match.topicSlug),
-            "store": .string(match.storeLabel),
-            "delivery": .string(match.deliveryConfirmed ? "delivered" : "pending"),
-            "detail": .string("This exact request already ran to completion on this topic and "
-                + (match.deliveryConfirmed ? "its answer was delivered. " : "its answer is awaiting delivery. ")
-                + "The durable inbox row was still written; only the "
-                + "duplicate wake was skipped."),
-            "fix": .string("Change the message text to send new work on this topic, or set "
-                + "\(disableEnvironmentKey)=1 to force an identical re-run."),
-        ]
-        if let completedAt = match.completedAt { obj["completedAt"] = .string(completedAt) }
-        if let statusWord = match.statusWord { obj["priorRunStatus"] = .string(statusWord) }
-        if let reply = match.reply { obj["reply"] = .string(reply) }
-        return .object(obj)
-    }
-
-    // MARK: - Local readers (deliberately not shared with the projector: this
-    // guard must keep working if that file changes shape, and the two answer
-    // different questions).
-
-    private static func string(_ obj: [String: JSONValue], _ key: String) -> String? {
-        if case .string(let s)? = obj[key] { return s.isEmpty ? nil : s }
-        return nil
-    }
-
-    static func parseISO(_ iso: String?) -> Date? {
-        guard let iso, !iso.isEmpty else { return nil }
-        let withFraction = ISO8601DateFormatter()
-        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = withFraction.date(from: iso) { return d }
-        return ISO8601DateFormatter().date(from: iso)
-    }
 }

@@ -1,11 +1,16 @@
 import ChatTurnContracts
 import Foundation
+import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MemoryDataProvenance.swift` | `MemoryDataProvenance`: stamp, retain and consume untrusted memory sources across writes and readbacks |
+// Blueprint: | `MemoryDataProvenance.swift` | `MemoryDataProvenance`: stamp, retain and display memory sources across writes, readbacks and prompt projections |
 
 /// Stored untrusted content keeps its steer through duplicate saves and edits.
 /// Reading remains allowed; only subsequent effects use the turn's usual gates.
 public enum MemoryDataProvenance {
+    public static func presentation(_ text: String, metadata: JSONValue?, dataRoot: URL = PersistenceCore.defaultDataRoot()) -> String {
+        MemoryDisplayText.attributed(text, sources: sources(in: metadata, dataRoot: dataRoot))
+    }
+
     public static func sources(in metadata: JSONValue?, dataRoot: URL = PersistenceCore.defaultDataRoot()) -> [String] {
         guard case .object(let fields)? = metadata else { return [] }
         var sources: [String] = []
@@ -75,8 +80,5 @@ public enum MemoryDataProvenance {
         return .object(fields)
     }
 
-    // A memory she kept is hers (User, 2026-10-16: "it should know if it's me or
-    // you or whoever, whenever"): recalling it shows who first said it
-    // (`fields(in:)`) and steers nothing. A steer is a peer's words in the
-    // turn's own input: a bridge turn, a reply read now, a room, an arrival.
+    // Kept memories disclose their speaker through `fields(in:)`; only peer words in the turn's input steer it.
 }

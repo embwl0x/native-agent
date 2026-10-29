@@ -1,32 +1,21 @@
 import Foundation
 
-// Blueprint: | `LLMClient.swift` | `LLMClient` and shared message/tool/stream contracts: task-local call context, lifecycle evidence, deadlines and failure/effect vocabulary |
+// Blueprint: | `LLMClient.swift` | `LLMClient` named completion and structured streaming; request context, prompt layout, offered schemas and message/stream contracts |
 
-// MARK: - LLMCallContext (request-scoped, additive)
+// MARK: - LLMCallContext (request scope)
 //
-// U1 step-1/4 (2026-06-10): task-local request context threaded DOWN to the
-// provider adapters without changing any public signatures. Two consumers:
-//   - `surface`  — bound by SwiftNativeLLMClient around every adapter call so
-//     the per-call `llm.call` telemetry row can carry the calling surface
-//     (chat / telegram / executions / dream...). Adapters read it at
-//     record time; unbound → "unknown".
-//   - `sessionId` — bound by the ChatOrchestration tool loop around its
-//     llm.completeMessages / llm.streamMessages calls so the OpenAI
-//     Responses adapter can derive a STABLE per-session `prompt_cache_key`
-//     (server-side prompt-cache routing). Unbound → no prompt_cache_key
-//     field is added (byte-identical request body to pre-U1 behavior).
-//
-// TaskLocal values propagate into unstructured `Task {}` created inside the
-// binding scope, which is how they survive the AsyncThrowingStream-wrapped
-// adapter streaming paths: the binding wraps the SYNCHRONOUS stream
-// construction, and the inner Task inherits the values at creation.
+// Task-local context carries the calling surface for telemetry and session
+// identity for prompt-cache routing. Unbound surfaces are "unknown"; sessionless
+// Workshop calls use a stable scope, other sessionless calls use their turn id,
+// and calls without any scope omit the cache hint.
+// Bindings wrap synchronous stream construction so inner Tasks inherit them.
 public enum LLMCallContext {
+    /// The shared router owns the admitted call's wall and cancels its process.
+    @TaskLocal public static var wallOwned = false
     /// The admitted turn's client, for thoughts made by its owned code.
     @TaskLocal public static var client: (any LLMClient)?
     @TaskLocal public static var toolCapabilityNote: (@Sendable (String) -> Void)?
     @TaskLocal public static var turnTokenBudget: TurnTokenBudget?
-    /// Remaining output ceiling for the current provider request.
-    @TaskLocal public static var botOutputTokenLimit: Int?
     @TaskLocal public static var surface: String?
     @TaskLocal public static var purpose: String = "other"
     @TaskLocal public static var sessionId: String?
@@ -47,229 +36,62 @@ public enum LLMCallContext {
     /// distinct from the provider family so `openai` (API key),
     /// `openai_oauth_direct`, and `codex` cannot silently swap accounts.
     @TaskLocal public static var providerId: String?
-    /// U1 step 2b/3b (2026-06-10) — stable/dynamic split of the system
-    /// prompt, bound by the ChatOrchestration tool/streaming loops alongside
-    /// `sessionId`. The Anthropic adapters read it to place a cache_control
-    /// breakpoint at the END of the stable segment (persona+pins) instead of
-    /// the end of the whole churning sys string, so the persona mass gets
-    /// cache READS instead of paying the 1.25x write premium every turn.
-    /// Unbound → adapters emit the pre-2b/3b combined-block request shape,
-    /// byte-identical to before.
+    /// Anthropic caches the stable segment; unbound calls use one combined block.
     @TaskLocal public static var systemSegments: SystemPromptSegments?
-    /// Test-hermeticity seam (2026-06-11). The vision `attachment_unsupported`
-    /// tripwire is emitted from a STATIC method on Codex's text-only
-    /// `completeMessages` flatten, and Codex does NOT carry an instance-level
-    /// `telemetryDataRootOverride`. So
-    /// the tripwire's destination is threaded the same way the rest of the
-    /// per-call context is: a task-local override that propagates into the
-    /// inner stream `Task {}`. Unbound (nil) → the trace resolves through
-    /// `PersistenceCore.defaultDataRoot()` exactly as in production. Bound by a
-    /// test around the call → the row lands under the test's tmp root and the
-    /// LIVE default `traces/events.jsonl` is never touched.
+    /// Per-call trace root; nil resolves through `PersistenceCore.defaultDataRoot()`.
     @TaskLocal public static var traceDataRootOverride: URL?
     /// The tools this turn offers by name: `app` on her chat, a lane's own
     /// declared list on an ephemeral turn.
     @TaskLocal public static var turnActiveTools: Set<String>?
 }
 
-// MARK: - Provider lifecycle evidence
-
-/// Payload-free evidence emitted by the shared provider router around one real
-/// adapter invocation. The call id is minted before the adapter starts and is
-/// reused for its terminal phase, so the organism can predict an outcome before
-/// observing it instead of inferring provider health after the fact.
-public enum LLMCallLifecyclePhase: String, Sendable, Equatable {
-    case started
-    case succeeded
-    case failed
-    case cancelled
-}
-
-public struct LLMCallLifecycleEvent: Sendable, Equatable, Identifiable {
-    public let id: String
-    public let phase: LLMCallLifecyclePhase
-    public let providerId: String
-    public let model: String
-    public let surface: String
-    public let sessionId: String?
-    public let turnId: String?
-    /// Exact request-scoped reasoning effort presented to the shared provider
-    /// router. This is payload-free lifecycle evidence, not a quality claim.
-    public let reasoningEffort: String?
-    public let streaming: Bool
-    public let occurredAt: Date
-    /// A terminal call's first text or tool output in milliseconds from its
-    /// request, as the adapter stamped it on the call's `llm.call` row.
-    public let firstOutputMs: Int?
-    /// A terminal streamed call's `LLMMessagesStreamKind` raw value; nil when
-    /// it did not come through `streamMessages`.
-    public let streamKind: String?
-    /// The stream guard cut this call (`ProviderFailure.noReply`).
-    public let noReply: Bool
-    /// What the request asked the provider to read (`LLMMessage.inputBytes`).
-    public let requestBytes: Int?
-
-    public init(
-        id: String,
-        phase: LLMCallLifecyclePhase,
-        providerId: String,
-        model: String,
-        surface: String,
-        sessionId: String?,
-        turnId: String?,
-        reasoningEffort: String? = nil,
-        streaming: Bool,
-        occurredAt: Date = Date(),
-        firstOutputMs: Int? = nil,
-        streamKind: String? = nil,
-        noReply: Bool = false,
-        requestBytes: Int? = nil
-    ) {
-        self.requestBytes = requestBytes
-        self.id = String(id.trimmingCharacters(in: .whitespacesAndNewlines).prefix(120))
-        self.phase = phase
-        self.providerId = String(providerId.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80))
-        self.model = String(model.trimmingCharacters(in: .whitespacesAndNewlines).prefix(160))
-        self.surface = String(surface.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80))
-        self.sessionId = sessionId.map { String($0.prefix(160)) }
-        self.turnId = turnId.map { String($0.prefix(120)) }
-        self.reasoningEffort = reasoningEffort.map {
-            String($0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().prefix(32))
-        }.flatMap { $0.isEmpty ? nil : $0 }
-        self.streaming = streaming
-        self.occurredAt = occurredAt
-        self.firstOutputMs = firstOutputMs
-        self.streamKind = streamKind
-        self.noReply = noReply
-    }
-
-    public func terminal(_ phase: LLMCallLifecyclePhase, at date: Date = Date(), firstOutputMs: Int? = nil,
-                         streamKind: String? = nil, noReply: Bool = false, requestBytes: Int? = nil) -> Self {
-        precondition(phase != .started)
-        return Self(
-            id: id,
-            phase: phase,
-            providerId: providerId,
-            model: model,
-            surface: surface,
-            sessionId: sessionId,
-            turnId: turnId,
-            reasoningEffort: reasoningEffort,
-            streaming: streaming,
-            occurredAt: date,
-            firstOutputMs: firstOutputMs,
-            streamKind: streamKind,
-            noReply: noReply,
-            requestBytes: requestBytes
-        )
-    }
-}
-
-public protocol LLMCallLifecycleObserving: Sendable {
-    func observeProviderCall(_ event: LLMCallLifecycleEvent) async
-    /// Asked once as a stream starts: how long this provider has taken to its
-    /// first output on this model and stream kind, for a request this size.
-    func firstOutputDeadline(provider: String, model: String, streamKind: String?, requestBytes: Int) async -> FirstOutputDeadline
-}
-
-/// A provider's slowest first output (text, thinking or tool, the adapter's `ttftMs`)
-/// over its retained streamed calls. Below `callsNeeded` calls the slowest is
-/// not yet evidence and the deadline is unmeasured.
-public struct FirstOutputDeadline: Sendable, Equatable {
-    public static let callsNeeded = 100
-    public let calls: Int
-    public let slowest: TimeInterval?
-    /// The slowest first output per input byte among those calls: what reading
-    /// (upload and prefill) has cost this provider at its worst.
-    public let slowestPerByte: Double?
-    /// This request's input bytes.
-    public let requestBytes: Int
-
-    public init(calls: Int, slowest: TimeInterval?, slowestPerByte: Double? = nil, requestBytes: Int = 0) {
-        self.calls = calls
-        self.slowest = slowest
-        self.slowestPerByte = slowestPerByte
-        self.requestBytes = requestBytes
-    }
-
-    /// The slowest, deliberately not a p99: cutting a real slow start wastes
-    /// the request while waiting longer costs seconds. On her
-    /// trace 10-10 a p99 deadline would have cut 13 real replies in 37 h
-    /// (12 gpt-6-luna, 1 claude-opus-5-5); the slowest cut none. A request
-    /// bigger than those calls gets each of them scaled to its size:
-    /// max over calls of seconds × max(1, bytes / their bytes), which is
-    /// max(slowest, slowestPerByte × bytes). A big prefill is never a dead wire.
-    public var seconds: TimeInterval? {
-        guard calls >= Self.callsNeeded, let slowest else { return nil }
-        return max(slowest, (slowestPerByte ?? 0) * Double(requestBytes))
-    }
-}
-
-extension LLMMessage {
-    /// What a request asks the provider to read, in bytes as sent: the system
-    /// prompt, every block (an image as its base64) and the tool schemas.
-    public static func inputBytes(_ messages: [LLMMessage], system: String?, tools: [LLMToolSchema] = []) -> Int {
-        (system?.utf8.count ?? 0) + tools.reduce(0) { $0 + $1.name.utf8.count + $1.description.utf8.count + $1.parametersJSON.count }
-            + messages.reduce(0) { total, message in
-                message.content.reduce(total) { total, block in
-                    switch block {
-                    case .text(let text): total + text.utf8.count
-                    case .toolUse(let id, let name, let input): total + id.utf8.count + name.utf8.count + input.count
-                    case .toolResult(let id, let content, _): total + id.utf8.count + content.utf8.count
-                    case .image(_, let base64, _, _): total + base64.utf8.count
-                    }
-                }
-            }
-    }
-}
-
-/// Stable/dynamic split of an assembled system prompt (U1 step 2b/3b).
+/// Stable/dynamic split of an assembled system prompt.
 ///
 /// INVARIANT: the combined system string handed to the LLM client MUST equal
-/// `combined` (the non-empty segments joined by `"\n\n"` in stable →
-/// stableSuffix → dynamic order) — the segments are a CACHING-layout hint
+/// `combined` (the non-empty segments joined by `"\n\n"` in stable → dynamic
+/// order) — the segments are a CACHING-layout hint
 /// only, never a content change. Adapters verify this via `reassembles(into:)` before
 /// splitting and fall back to the single combined block on any mismatch.
 ///
 /// - `stable`: rarely changes turn-to-turn within a session — persona packet,
 ///   REM pins, and a session's current lazy tool contract/catalog. Safe to
 ///   cache_control; loading a different tool set intentionally rewrites it.
-/// - `stableSuffix`: appended AFTER `stable` and before `dynamic`. Text that
-///   is stable for the REST OF THE SESSION but was not known when `stable`
-///   was assembled (e.g. a session-scoped contract that a later turn adds).
-///   It rides INSIDE the cached prefix: the breakpoint moves to the end of
-///   the suffix, so `stable` stays a strict prefix of the cached mass and one
-///   breakpoint covers both. Empty by default → byte-identical to the
-///   two-segment shape.
 /// - `dynamic`: churns every turn — memory recall (keyed per user message)
 ///   + rendered session history and other per-turn extras. Must NOT carry a
 ///   cache breakpoint.
 public struct SystemPromptSegments: Sendable, Equatable {
     public let stable: String
-    public let stableSuffix: String
     public let dynamic: String
 
-    public init(stable: String, stableSuffix: String = "", dynamic: String) {
+    public init(stable: String, dynamic: String) {
         self.stable = stable
-        self.stableSuffix = stableSuffix
         self.dynamic = dynamic
     }
 
     /// The canonical recombination: the non-empty segments joined by
-    /// `"\n\n"` in `stable` → `stableSuffix` → `dynamic` order, empty
+    /// `"\n\n"` in `stable` → `dynamic` order, empty
     /// segments collapsing their separator. This is the exact byte sequence
-    /// the legacy combined `systemPrompt` must carry.
+    /// the combined `systemPrompt` must carry.
     public var combined: String {
-        [stable, stableSuffix, dynamic]
+        [stable, dynamic]
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
+    }
+
+    /// Block texts concatenate to the combined prompt; separators belong to the preceding block.
+    public var textBlockLayout: (texts: [String], lastStableIndex: Int) {
+        var texts = [stable].filter { !$0.isEmpty }
+        let lastStableIndex = texts.count - 1
+        if !dynamic.isEmpty { texts.append(dynamic) }
+        for index in texts.indices.dropLast() { texts[index] += "\n\n" }
+        return (texts, lastStableIndex)
     }
 
     /// True when these segments reassemble byte-for-byte into `system`.
     /// Adapters gate the block split on this so a stale or mismatched
     /// binding can never change model-visible content.
     public func reassembles(into system: String) -> Bool {
-        combined == system
+        combined.utf8.elementsEqual(system.utf8)
     }
 }
 
@@ -281,16 +103,11 @@ public struct SystemPromptSegments: Sendable, Equatable {
 /// the read the next turn is built on.
 ///
 /// The seeding layer already computes this exactly (`Seed.currentUserIndex`).
-/// The adapter cannot re-derive it reliably: replayed history carries archived
-/// `system` blocks of its own, so "the last system message" is NOT a
-/// dependable marker for where the current turn starts — and when the turn's
-/// volatile block is empty, or the model has no mid-conversation system
-/// support, the seed emits no trailing system message at all. Binding this is
-/// how the adapter stops guessing.
+/// The adapter cannot re-derive it from roles: tool results within a turn are
+/// user messages too. Context leads its own user turn on every provider, so
+/// there is no separate system message to mark the boundary.
 ///
-/// Unbound → the adapter falls back to a conservative trailing-system-run
-/// scan and, when even that is ambiguous, places NO cross-turn marker rather
-/// than a wrong one.
+/// Unbound calls have no seeded cross-turn boundary and receive no such marker.
 public enum ConversationPrefixBoundary {
     @TaskLocal public static var currentUserIndex: Int?
 }
@@ -299,43 +116,20 @@ public enum ConversationPrefixBoundary {
 // ProviderRouting. Lives in NativeAgentCore so every subsystem that depends on
 // NativeAgentCore can see it without taking a transitive dep on DreamREMCycle.
 public protocol LLMClient: Sendable {
-    func complete(prompt: String, system: String?, model: String?) async throws -> String
+    /// Named completion retains the calling route, purpose and optional tool offer.
+    /// Nil or empty tools preserve the existing no-tools wire request.
     func complete(
         prompt: String,
-        system: String?,
-        model: String?,
-        surface: String
-    ) async throws -> String
-    /// Tool-aware variant. When `tools` is nil or empty, callers MUST observe
-    /// byte-identical request bodies on the wire as the no-tools overload —
-    /// the back-compat path is sacred. Default implementation forwards to the
-    /// no-tools overload; concrete clients (SwiftNativeLLMClient) override.
-    func complete(
-        prompt: String,
-        system: String?,
-        model: String?,
-        tools: [LLMToolSchema]?
-    ) async throws -> String
-    /// Structured multi-turn variant for proper tool_use/tool_result loops.
-    /// Default implementation below flattens for adapters that only implement
-    /// the prompt API; SwiftNativeLLMClient overrides and routes to provider
-    /// adapters that can emit canonical structured messages. `surface` pins
-    /// provider/model selection to the calling surface's active.json
-    /// preference (chat / executions / dream / telegram...); the prior
-    /// non-surface entry point was collapsed into this one (tightness sweep
-    /// 2026-07-17 — it had no production callers, only forwarders/defaults).
-    func completeMessages(
-        messages: [LLMMessage],
         system: String?,
         model: String?,
         surface: String,
+        purpose: String,
         tools: [LLMToolSchema]?
     ) async throws -> String
-
     /// Structured streaming variant for tool-capable chat surfaces. Providers
     /// with native structured SSE support yield text deltas and tool-call
-    /// events as they arrive; providers without it fall back to
-    /// `completeMessages` and emit the completed text as one delta.
+    /// events as they arrive; complete-only clients flatten messages into
+    /// the named completion and emit the completed text as one delta.
     func streamMessages(
         messages: [LLMMessage],
         system: String?,
@@ -354,117 +148,11 @@ public protocol LLMClient: Sendable {
 }
 
 extension LLMClient {
-    public func complete(prompt: String, system: String?, model: String?,
-                         surface: String, purpose: String) async throws -> String {
-        try await LLMCallContext.$purpose.withValue(purpose) {
-            try await complete(prompt: prompt, system: system, model: model, surface: surface)
-        }
-    }
-
     /// Clients that do not route to provider adapters serve no provider.
     public func servingProviderID(model: String?, surface: String) async -> String? {
         nil
     }
-
-    /// Surface-aware variant. Non-chat callers (executions, dream, REM,
-    /// telegram) pass their own surface so the dispatch layer's active.json
-    /// provider selection honors the right surface. Default implementation
-    /// delegates for clients that are not surface-aware.
-    public func complete(
-        prompt: String,
-        system: String?,
-        model: String?,
-        surface: String
-    ) async throws -> String {
-        try await complete(prompt: prompt, system: system, model: model)
-    }
-
-    /// Default implementation forwards to the no-tools overload so existing
-    /// adapters keep compiling. Concrete clients with tool routing override.
-    public func complete(
-        prompt: String,
-        system: String?,
-        model: String?,
-        tools: [LLMToolSchema]?
-    ) async throws -> String {
-        try await complete(prompt: prompt, system: system, model: model)
-    }
 }
-
-/// Failure evidence supplied by the owner, never inferred from an error message.
-public struct ToolFailureError: Error, LocalizedError, Sendable {
-    public enum Status: String, Sendable { case failed, refused, timeout, cancelled }
-    public enum Effects: String, Sendable { case none, occurred, partial, unknown }
-    public enum Recovery: String, Sendable {
-        case correctArguments = "correct_arguments"
-        case repair, reconcile, inspect, terminal
-    }
-    /// The owner's stable cause, not a dispatch or presentation code.
-    public let code: String?
-    public let status: Status
-    public let message: String
-    public let argumentPath: String?
-    public let accepted: String?
-    public let effects: Effects
-    /// What decided this no, when it is not the call's own input: the file and
-    /// field, setting, recipe, part, peer or provider (User 10-18: "never can the
-    /// agent say I can't fix it"). Always given with a lever.
-    public let owner: String?
-    /// Her lever: the call that changes the owner, as `{"tool":…,"input":{…}}`
-    /// (`ToolFailureError.call` builds it).
-    public let nextCall: String?
-    /// The person's lever, only where the law gives him the decision (Trust
-    /// posture, a peer's elevation, a macOS grant, his sign-in): the exact
-    /// place, screen › section › control.
-    public let tap: String?
-    /// A lawful person-only decision (a Trust posture or block, a consent):
-    /// it names its owner and his control and owes nothing.
-    public let personDecides: Bool
-    /// The plain fix, separate from the explanation of what happened.
-    public let instruction: String?
-    /// The owner's recovery meaning; a terminal instruction explains why
-    /// there is no next call. Existing owners may keep their current fields.
-    public let recovery: Recovery?
-
-    public init(_ message: String, argumentPath: String? = nil, accepted: String? = nil, effects: Effects,
-                owner: String? = nil, nextCall: String? = nil, tap: String? = nil, personDecides: Bool = false,
-                code: String? = nil, status: Status = .failed, instruction: String? = nil, recovery: Recovery? = nil) {
-        self.code = code
-        self.status = status
-        self.message = message
-        self.argumentPath = argumentPath
-        self.accepted = accepted
-        self.effects = effects
-        self.owner = owner
-        self.nextCall = nextCall
-        self.tap = tap
-        self.personDecides = personDecides
-        self.instruction = instruction
-        self.recovery = recovery
-    }
-
-    public var errorDescription: String? { message }
-}
-
-/// What a call IS to the permission law: a read, a write, a send that reaches
-/// another person or service, or a destructive act with no way back (deleted
-/// for good, emptied, an ability's history dropped). Declared once where the
-/// tool is declared; Trust derives every decision from it, the posture, the
-/// integration switch and who steered the turn.
-public enum ToolClass: Int, Sendable, Comparable {
-    case read, write, send, destructive
-
-    /// What a tool of this class carries unless it says otherwise: every tool is a tool_call; a read is a safe read.
-    public var baseCapabilities: Set<String> { self == .read ? ["safe_read", "tool_call"] : ["tool_call"] }
-
-    public static func < (lhs: ToolClass, rhs: ToolClass) -> Bool { lhs.rawValue < rhs.rawValue }
-}
-
-/// Which side a tool's fixed effects reach; path policy still resolves named paths.
-public enum ToolReach: String, Sendable { case hers, his }
-
-/// Argument-dependent effects, declared by their owning tool.
-public enum ToolEffectInputPolicy: Sendable { case fixed, agentConnection, agentMessage }
 
 /// Offered JSON schema and its local effect declaration. Policy fields never
 /// enter CodingKeys; adapters retain the same provider-visible contract.
@@ -475,18 +163,6 @@ public struct LLMToolSchema: Sendable, Codable, Equatable {
     /// arguments. Build with
     /// `try JSONSerialization.data(withJSONObject: schemaDict)`.
     public let parametersJSON: Data
-    /// Anthropic `defer_loading` (beta `mid-conversation-tool-changes-2026-07-01`).
-    ///
-    /// A tool declared with `defer_loading: true` is DECLARED in the request's
-    /// `tools` array — so it is part of the cached prefix and can be referenced
-    /// by name — but is NOT offered to the model until a `tool_addition` block
-    /// surfaces it. That is the whole point of the mid-conversation tool-change
-    /// lane: the array stays byte-identical turn to turn while the offered set
-    /// changes in the message body, behind the cache breakpoint.
-    ///
-    /// FALSE for every other lane and every other provider, so a request that
-    /// never sets it is byte-identical to the pre-2026-09 wire.
-    public let deferLoading: Bool
     /// The class its declaration gives it; nil on a decoded wire copy.
     public let toolClass: ToolClass?
     public let reach: ToolReach
@@ -500,13 +176,11 @@ public struct LLMToolSchema: Sendable, Codable, Equatable {
         capabilities: Set<String>? = nil,
         effectInputPolicy: ToolEffectInputPolicy = .fixed,
         description: String,
-        parametersJSON: Data,
-        deferLoading: Bool = false
+        parametersJSON: Data
     ) {
         self.name = name
         self.description = description
         self.parametersJSON = parametersJSON
-        self.deferLoading = deferLoading
         self.toolClass = toolClass
         self.reach = reach
         self.capabilities = capabilities ?? toolClass?.baseCapabilities ?? []
@@ -514,24 +188,20 @@ public struct LLMToolSchema: Sendable, Codable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case name, description, parametersJSON, deferLoading
+        case name, description, parametersJSON
     }
 
     /// The offered contract; the class is policy, not part of it.
     public static func == (lhs: LLMToolSchema, rhs: LLMToolSchema) -> Bool {
         lhs.name == rhs.name && lhs.description == rhs.description
-            && lhs.parametersJSON == rhs.parametersJSON && lhs.deferLoading == rhs.deferLoading
+            && lhs.parametersJSON == rhs.parametersJSON
     }
 
-    /// Hand-rolled so a persisted schema written before `deferLoading` existed
-    /// still decodes (absent → false) and a schema that does not defer encodes
-    /// byte-identically to the pre-flag shape.
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.name = try container.decode(String.self, forKey: .name)
         self.description = try container.decode(String.self, forKey: .description)
         self.parametersJSON = try container.decode(Data.self, forKey: .parametersJSON)
-        self.deferLoading = try container.decodeIfPresent(Bool.self, forKey: .deferLoading) ?? false
         self.toolClass = nil
         self.reach = .his
         self.capabilities = []
@@ -543,45 +213,6 @@ public struct LLMToolSchema: Sendable, Codable, Equatable {
         try container.encode(name, forKey: .name)
         try container.encode(description, forKey: .description)
         try container.encode(parametersJSON, forKey: .parametersJSON)
-        if deferLoading { try container.encode(true, forKey: .deferLoading) }
-    }
-}
-
-/// One Anthropic mid-conversation tool change (beta
-/// `mid-conversation-tool-changes-2026-07-01`).
-///
-/// A MESSAGE-LEVEL field rather than an `LLMContentBlock` case on purpose:
-/// every adapter in this repo switches exhaustively over `LLMContentBlock`, so
-/// a new case there would be a twelve-file edit across providers that can
-/// never carry one of these. Carried on `LLMMessage.toolChanges`, it is
-/// invisible to every encoder that does not opt in, and the ONE lane that
-/// emits it (the Anthropic api-key structured lane) reads it explicitly.
-///
-/// `name` is the PROVIDER-visible tool name — the name as it appears in the
-/// request's `tools` array. Referencing a name that is not declared there is a
-/// 400, so the producer validates against the array before building these.
-public struct LLMToolChange: Sendable, Equatable {
-    public enum Kind: String, Sendable, Equatable {
-        /// `{"type":"tool_addition","tool":{"type":"tool_reference","name":…}}`
-        case addition
-        /// `{"type":"tool_removal","tool":{"type":"tool_reference","name":…}}`
-        case removal
-    }
-
-    public let kind: Kind
-    public let name: String
-
-    public init(kind: Kind, name: String) {
-        self.kind = kind
-        self.name = name
-    }
-
-    public static func addition(_ name: String) -> LLMToolChange {
-        LLMToolChange(kind: .addition, name: name)
-    }
-
-    public static func removal(_ name: String) -> LLMToolChange {
-        LLMToolChange(kind: .removal, name: name)
     }
 }
 
@@ -625,33 +256,13 @@ public enum LLMMessageStreamEvent: Sendable, Equatable {
     case toolBoundary(LLMToolBoundaryReason)
     /// Presentation only: the message ended, but the response remains open.
     case replyTextSettled(Bool)
-    /// Liveness signal: the provider is producing NON-user-visible output (an
-    /// extended-thinking phase, or tool-argument accumulation) — real activity,
-    /// but not reply content. `ProviderStreamGuard` counts it as a yield so its
-    /// idle clock doesn't kill a healthy long-reasoning turn (audit #4,
-    /// 2026-06-14), while consumers IGNORE it so no empty/placeholder content
-    /// leaks into the assistant reply. Replaces the prior `.textDelta("")`
-    /// keepalive, which leaked empty deltas into every consumer (a footgun: any
-    /// consumer that treats "a delta arrived" as a token-event would mis-fire).
+    /// Provider activity advances liveness without adding user-visible reply content.
     case keepAlive
 }
 
 // MARK: - Multi-turn message structure (proper tool_use / tool_result blocks)
 //
-// HOTFIX 2026-06-03 conversation-shape: the single-prompt API
-// (`complete(prompt:String, ...)`) can't represent a tool-use loop properly.
-// When the model emits a tool call and we want to feed the result back, both
-// the Anthropic Messages API and the OpenAI Responses API require STRUCTURED
-// content blocks (`tool_use` + `tool_result` for Anthropic, `function_call` +
-// `function_call_output` items for OpenAI). Appending "Tool X returned: ..."
-// as plain text to a growing single prompt doesn't satisfy either contract —
-// the model keeps re-emitting tool calls every iteration because it never sees
-// the structured result.
-//
-// `LLMMessage` carries an ordered sequence of structured content blocks per
-// role. Adapters that implement `completeMessages(messages:...)` translate
-// these into their provider's specific wire shape; the default `complete`
-// path stays untouched for non-tool-loop callers.
+// Tool loops carry structured calls and results; adapters encode the provider wire shape.
 
 /// One block of structured content inside an `LLMMessage`. Mirrors the union
 /// of Anthropic's content-block types and OpenAI Responses' item types,
@@ -681,66 +292,29 @@ public enum LLMContentBlock: Sendable, Equatable {
 /// One conversation message. The TURN-LEVEL system prompt is still passed
 /// separately via the `system:` arg (both providers' canonical request
 /// shape). `.system` here is the MID-CONVERSATION variant: a system message
-/// positioned inside the message array, so per-turn volatile context can sit
-/// AFTER the cached transcript prefix instead of churning the front of it.
+/// positioned inside the message array. Per-turn context does not use this
+/// role: it is sent and replayed as leading text of its user turn.
 public struct LLMMessage: Sendable, Equatable {
     public enum Role: String, Sendable, Equatable { case user, assistant, system }
     public let role: Role
     public let content: [LLMContentBlock]
-    /// Anthropic `clear_at: "next_user_message"` — the provider drops this
-    /// message from the conversation once the next user message arrives, so a
-    /// turn-scoped instruction never becomes permanent transcript. VALID ONLY
-    /// ON `.system`: the initializer forces it to false for every other role,
-    /// so no encoder has to re-check the invariant. Requires the
-    /// `mid-conversation-system-clear-at-2026-08-21` beta, which the adapter
-    /// adds per-request exactly when a flagged message is present, and a model
-    /// whose catalog row says `supportsMidConversationSystemClearAt`.
-    public let turnScopedClearAtNextUserMessage: Bool
-    /// Anthropic `tool_addition` / `tool_removal` content blocks, carried as a
-    /// message-level field (see `LLMToolChange`). VALID ONLY ON `.system` AND
-    /// ONLY WHEN NOT TURN-SCOPED: a `clear_at` message is text-only and returns
-    /// a 400 if it carries a tool-change block, so the initializer clears the
-    /// list for every other shape and no encoder has to re-check the invariant.
-    /// Requires the `mid-conversation-tool-changes-2026-07-01` beta, which the
-    /// Anthropic adapters add per-request exactly when a message carries one,
-    /// and a model whose catalog row says `supportsMidConversationToolChanges`.
-    public let toolChanges: [LLMToolChange]
 
     public init(
         role: Role,
-        content: [LLMContentBlock],
-        turnScopedClearAtNextUserMessage: Bool = false,
-        toolChanges: [LLMToolChange] = []
+        content: [LLMContentBlock]
     ) {
         self.role = role
         self.content = content
-        self.turnScopedClearAtNextUserMessage =
-            role == .system ? turnScopedClearAtNextUserMessage : false
-        self.toolChanges =
-            (role == .system && !self.turnScopedClearAtNextUserMessage) ? toolChanges : []
-    }
-
-    /// A mid-conversation system message that carries ONLY tool-change blocks.
-    /// Never turn-scoped (the API rejects that pairing).
-    public static func toolChanges(_ changes: [LLMToolChange]) -> LLMMessage {
-        LLMMessage(role: .system, content: [], toolChanges: changes)
     }
 
     /// Convenience: build a pure-text user message.
     public static func user(_ text: String) -> LLMMessage {
         LLMMessage(role: .user, content: [.text(text)])
     }
-    /// Convenience: build a pure-text MID-CONVERSATION system message.
-    /// `clearAtNextUserMessage` marks it turn-scoped (see the flag's doc).
-    public static func system(
-        _ text: String,
-        clearAtNextUserMessage: Bool = false
-    ) -> LLMMessage {
-        LLMMessage(
-            role: .system,
-            content: [.text(text)],
-            turnScopedClearAtNextUserMessage: clearAtNextUserMessage
-        )
+    /// Convenience for callers supplying a conversation-level system role.
+    /// Turn context always rides the current user message.
+    public static func system(_ text: String) -> LLMMessage {
+        LLMMessage(role: .system, content: [.text(text)])
     }
     /// Convenience: build a pure-text assistant message.
     public static func assistantText(_ text: String) -> LLMMessage {
@@ -759,42 +333,7 @@ public struct LLMMessage: Sendable, Equatable {
 }
 
 extension LLMClient {
-    /// Structured multi-turn variant. Default implementation FLATTENS messages
-    /// to a single prompt string and delegates to the existing
-    /// `complete(...tools:)` overload — back-compat for adapters that haven't
-    /// been updated to the structured shape (api-key, OpenRouter, Codex).
-    /// SwiftNativeLLMClient + the two OAuth-direct adapters override. `surface`
-    /// is accepted for routing parity; the flatten fallback does not itself
-    /// vary by surface (the concrete client threads it into provider routing).
-    public func completeMessages(
-        messages: [LLMMessage],
-        system: String?,
-        model: String?,
-        surface: String,
-        tools: [LLMToolSchema]?
-    ) async throws -> String {
-        // Conservative flatten: just concatenate text blocks per role with
-        // role-prefix lines. Tool blocks become inline annotations so a
-        // non-tool-aware adapter doesn't drop them silently.
-        let flattened = llmCompatibilityPrompt(messages: messages) { role in
-            switch role {
-            case .user: "USER:"
-            case .assistant: "ASSISTANT:"
-            case .system: "SYSTEM:"
-            }
-        }
-        var combined = flattened.text
-        let imageCount = flattened.imageCount
-        if imageCount > 0 {
-            let note = "[NOTE TO ASSISTANT: \(imageCount) image(s) reached this turn — attached by the user, or produced by a tool you just ran — but the active provider/model cannot see images. Tell the user honestly that you could not view the attached image(s) or the image(s) a tool produced — do NOT guess or pretend to describe them.]"
-            combined = combined.isEmpty ? note : note + "\n" + combined
-        }
-        return try await complete(prompt: combined, system: system, model: model, tools: tools)
-    }
-
-    /// Default streaming: run the (possibly flattened) `completeMessages`
-    /// surface variant and emit its completed text as one delta. Providers
-    /// with native structured SSE override this.
+    /// Clients without structured transport flatten messages into the named completion.
     public func streamMessages(
         messages: [LLMMessage],
         system: String?,
@@ -805,13 +344,15 @@ extension LLMClient {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let reply = try await completeMessages(
-                        messages: messages,
-                        system: system,
-                        model: model,
-                        surface: surface,
-                        tools: tools
-                    )
+                    let flattened = try llmCompatibilityPrompt(messages: messages) { role in
+                        switch role {
+                        case .user: "USER:"
+                        case .assistant: "ASSISTANT:"
+                        case .system: "SYSTEM:"
+                        }
+                    }
+                    let reply = try await complete(prompt: flattened.text, system: system, model: model,
+                        surface: surface, purpose: LLMCallContext.purpose, tools: tools)
                     if !reply.isEmpty {
                         continuation.yield(.textDelta(reply))
                     }

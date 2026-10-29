@@ -260,7 +260,7 @@ public struct AgentConversationLiveStore: Sendable {
                 }
                 rows[live.key] = live
             }
-            for (key, var live) in rows {
+            for (key, var live) in Array(rows) {
                 let row: AgentConversationRecord?
                 if let id = live.recordID {
                     row = records.first { $0.id == id }
@@ -284,7 +284,7 @@ public struct AgentConversationLiveStore: Sendable {
             if rows != before {
                 let encoder = JSONEncoder()
                 encoder.dateEncodingStrategy = .iso8601
-                try encoder.encode(rows).write(to: fileURL, options: [.atomic])
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(rows), to: fileURL)
             }
             return rows
         }

@@ -31,24 +31,24 @@ struct ResidentAgentQuery: EntityStringQuery {
     static var allowedExecutionTargets: IntentExecutionTargets { .main }
 
     func entities(for identifiers: [String]) async throws -> [ResidentAgentEntity] {
-        try await NativeAgentAppCoordinator.shared.prepare()
+        try await ApplicationLifetime.shared.prepare()
         let agent = try await ResidentAgentEntity.current()
         return identifiers.contains(agent.id) ? [agent] : []
     }
 
     func entities(matching string: String) async throws -> [ResidentAgentEntity] {
-        try await NativeAgentAppCoordinator.shared.prepare()
+        try await ApplicationLifetime.shared.prepare()
         let agent = try await ResidentAgentEntity.current()
         return agent.name.localizedCaseInsensitiveContains(string) ? [agent] : []
     }
 
     func suggestedEntities() async throws -> [ResidentAgentEntity] {
-        try await NativeAgentAppCoordinator.shared.prepare()
+        try await ApplicationLifetime.shared.prepare()
         return [try await ResidentAgentEntity.current()]
     }
 
     func defaultResult() async -> ResidentAgentEntity? {
-        do { try await NativeAgentAppCoordinator.shared.prepare(); return try await ResidentAgentEntity.current() }
+        do { try await ApplicationLifetime.shared.prepare(); return try await ResidentAgentEntity.current() }
         catch { return nil }
     }
 }
@@ -75,7 +75,7 @@ struct AskResidentAgentIntent: AppIntent {
     }
 
     func perform() async throws -> some IntentResult & ReturnsValue<String> & ProvidesDialog {
-        try await NativeAgentAppCoordinator.shared.prepare()
+        try await ApplicationLifetime.shared.prepare()
         guard agent.id == (try await ResidentAgentEntity.current()).id else {
             throw $agent.needsValueError("Choose the resident agent.")
         }
@@ -100,7 +100,7 @@ struct NativeAgentStatusIntent: AppIntent {
     static let openAppWhenRun = false
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        try await NativeAgentAppCoordinator.shared.prepare()
+        try await ApplicationLifetime.shared.prepare()
         let health = NativeAgentEngine.live.doctor.readHealth()
         let state = health.ok ? "online" : "unavailable"
         if #available(macOS 27, *), systemContext.isVoiceOnly {
@@ -138,7 +138,7 @@ struct NativeAgentChatIntent: AppIntent {
     }
 
     static func reply(to message: String) async throws -> String {
-        try await NativeAgentAppCoordinator.shared.prepare()
+        try await ApplicationLifetime.shared.prepare()
         return try await NativeAgentEngine.live.replyToIntent(message)
     }
 }
@@ -158,7 +158,7 @@ struct NativeAgentDoctorIntent: AppIntent {
     static let openAppWhenRun = true
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        try await NativeAgentAppCoordinator.shared.prepare()
+        try await ApplicationLifetime.shared.prepare()
         let report = try await AppDoctorPort(dataRoot: PersistenceCore.defaultDataRoot()).runtime.runDoctor()
         return .result(dialog: "Doctor finished with status \(report.status). \(report.checks.count) checks ran.")
     }
@@ -183,15 +183,11 @@ struct NativeAgentWorkshopTaskIntent: AppIntent {
     }
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        try await NativeAgentAppCoordinator.shared.prepare()
+        try await ApplicationLifetime.shared.prepare()
         let task = try await NativeAgentEngine.submitDeskTask(title: title, objective: objective).execution
         return .result(dialog: "Desk task created: \(task.title).")
     }
 }
-
-// 2026-09-01: `NativeAgentWorkflowIntent` ("Launch NativeAgent Workflow") was
-// retired with the workflow run engine (User authorized). It was never in
-// `appShortcuts`, and the native action it invoked no longer exists.
 
 struct NativeAgentApprovalsIntent: AppIntent {
     @available(macOS 27, *)
@@ -202,7 +198,7 @@ struct NativeAgentApprovalsIntent: AppIntent {
     static let openAppWhenRun = true
 
     func perform() async throws -> some IntentResult & ProvidesDialog {
-        try await NativeAgentAppCoordinator.shared.prepare()
+        try await ApplicationLifetime.shared.prepare()
         let approvals = try await NativeAgentEngine.live.approvals.list()
         let pending = WorkOverviewRead.waitingApprovals(approvals).count
         return .result(dialog: "\(pending) NativeAgent approval\(pending == 1 ? "" : "s") pending.")

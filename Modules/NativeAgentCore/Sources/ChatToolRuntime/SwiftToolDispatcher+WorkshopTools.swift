@@ -13,25 +13,17 @@ import MacControl
 import Context
 import SwarmRuns
 import WorkshopExecution
-// Blueprint: | `SwiftToolDispatcher+WorkshopTools.swift` | `SwiftToolDispatcher`: `impl_workshop_submit`, `impl_workshop_status`, `impl_task_ledger_post` |
+// Blueprint: | `SwiftToolDispatcher+WorkshopTools.swift` | `SwiftToolDispatcher`: Workshop submission/status and the separately labeled, paged shared task ledger; explicit compiled requests retain their declared route and report activation/preflight failures without model planning |
 
 // MARK: - Workshop and task ledger tools
 
 extension SwiftToolDispatcher {
     // MARK: - Workshop chat lane
 
-    /// Build a Workshop runner pointed at THIS dispatcher's data root, wiring the
-    /// production planner (`SwiftNativeWorkshopPlannerLLM`) so a chat-submitted
-    /// task is planned exactly like one the background executor drains. The
-    /// runner is stateless w.r.t. the executor — they share the on-disk queue
-    /// under `<dataRoot>/workshop/executions/`, not in-memory state. `executorAvailable`
-    /// defaults TRUE (the executor port landed 2026-06-10); the runner's OWN
-    /// missionPolicy gate + slot cap + per-step approval staging apply
-    /// downstream, so this tool adds no new policy.
+    /// Chat and background execution share the data-root Workshop queue and production planner.
+    /// The runner owns policy admission, slot capacity and per-step approvals.
     private func workshopRunner() -> SwiftNativeWorkshopRunner {
-        // TOOL-AWARE planner: inject THIS dispatcher's own tool catalog so a
-        // chat-submitted execution plans against the same tools the chat loop
-        // sees, including their argument schemas for binding the task folder.
+        // Plan against this dispatcher's tool catalog and argument schemas.
         SwiftNativeWorkshopRunner(
             root: dataRoot,
             planner: SwiftNativeWorkshopPlannerLLM(
@@ -61,8 +53,7 @@ extension SwiftToolDispatcher {
     /// surface the runner's honest typed error as a `failed` envelope the tool
     /// loop classifies as failed (not a crash), mirroring impl_commit_memory.
     func impl_workshop_submit(input: [String: JSONValue]) async throws -> JSONValue {
-        // 2026-09-24: an exact copy says what it is by source and destination;
-        // blank text used to come back as "an access rule blocks it".
+        // Source and destination suffice to name an exact copy task.
         var text = (optionalString(input, "text") ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if text.isEmpty, let source = optionalString(input, "source"), !source.isEmpty,
            let destination = optionalString(input, "destination"), !destination.isEmpty {
@@ -129,11 +120,7 @@ extension SwiftToolDispatcher {
             ])
         }
 
-        var procedureFallbackReason: String?
-        // GPT-family structured decoders can redundantly populate both known
-        // enum fields when the user names the old procedure. The sole exact
-        // equivalent pair is canonicalized to the stable operation; every
-        // conflicting future pair still fails before admission.
+        // The equivalent procedure/operation pair selects the stable operation; conflicting pairs fail admission.
         let explicitProcedure = requestedProcedure == "local_file_copy_v1"
             && !redundantExactPair
         let exactTypedOperation = requestedOperation == "copy_workspace_file"
@@ -165,15 +152,16 @@ extension SwiftToolDispatcher {
                         domain: "workshop_execution"
                     ).filter(WorkshopCompiledLocalFileCopyPlanner.isEligibleArtifact)
                     artifact = artifacts.count == 1 ? artifacts.first : nil
-                    if artifacts.count > 1 {
-                        procedureFallbackReason = "approved_artifact_ambiguous"
+                    guard artifacts.count <= 1 else {
+                        return .object(["status": .string("failed"), "reason": .string("approved_artifact_ambiguous"),
+                            "procedure_used": .bool(false), "ordinary_fallback_submitted": .bool(false)])
                     }
                 }
                 if let artifact {
                     let invocationKey = TurnTraceContext.turnId
                         ?? CausalTransitionEvidence.opaqueIdentity([
                             "direct-workshop-procedure",
-                            Self.stringValue(input["__session_id"]) ?? "unbound",
+                            input["__session_id"]?.stringValue ?? "unbound",
                             source,
                             destination,
                         ].joined(separator: "|"))
@@ -189,24 +177,12 @@ extension SwiftToolDispatcher {
                             store: store
                         )
                     } catch {
-                        if exactTypedOperation,
-                           error is WorkshopCompiledProcedurePlanError {
-                            return .object([
-                                "status": .string("failed"),
-                                "reason": .string(error.localizedDescription),
-                                "procedure": .string("local_file_copy_v1"),
-                                "procedure_used": .bool(false),
-                                "ordinary_fallback_submitted": .bool(false),
-                            ])
-                        }
-                        procedureFallbackReason = "compiled_preflight_refused"
-                        return try await ordinaryWorkshopSubmission(
-                            title: title,
-                            text: text,
-                            deskHandle: optionalString(input, "desk_handle")?
-                                .trimmingCharacters(in: .whitespacesAndNewlines),
-                            procedureFallbackReason: procedureFallbackReason
-                        )
+                        return .object([
+                            "status": .string("failed"), "reason": .string("compiled_preflight_refused"),
+                            "error": .string(error.localizedDescription),
+                            "procedure": .string("local_file_copy_v1"), "procedure_used": .bool(false),
+                            "ordinary_fallback_submitted": .bool(false),
+                        ])
                     }
                     do {
                         let policy: WorkshopCompiledLocalFileCopyInvocation.PolicyAllowed = {
@@ -266,15 +242,15 @@ extension SwiftToolDispatcher {
                         return .object(failure)
                     }
                 }
-                if procedureFallbackReason == nil {
-                    procedureFallbackReason = exactTypedOperation
-                        ? "exact_activation_unavailable"
-                        : "approved_artifact_unavailable"
-                }
+                return .object(["status": .string("failed"), "reason": .string("approved_artifact_unavailable"),
+                    "procedure_used": .bool(false), "ordinary_fallback_submitted": .bool(false)])
             } catch {
-                procedureFallbackReason = exactTypedOperation
-                    ? "exact_activation_unavailable"
-                    : "approved_artifact_unavailable"
+                return .object([
+                    "status": .string("failed"),
+                    "reason": .string((error as? ProcedureExactActivationError)?.rawValue ?? "compiled_artifact_read_failed"),
+                    "error": .string(error.localizedDescription),
+                    "procedure_used": .bool(false), "ordinary_fallback_submitted": .bool(false),
+                ])
             }
         }
 
@@ -283,8 +259,7 @@ extension SwiftToolDispatcher {
             text: text,
             expectedOutputs: expectedOutputs,
             deskHandle: optionalString(input, "desk_handle")?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-            procedureFallbackReason: procedureFallbackReason
+                .trimmingCharacters(in: .whitespacesAndNewlines)
         )
     }
 
@@ -292,8 +267,7 @@ extension SwiftToolDispatcher {
         title: String,
         text: String,
         expectedOutputs: [String] = [],
-        deskHandle: String? = nil,
-        procedureFallbackReason: String?
+        deskHandle: String? = nil
     ) async throws -> JSONValue {
         // "agent", not the person's "manual": workshop_reject may stop only
         // work she started, never his.
@@ -321,7 +295,7 @@ extension SwiftToolDispatcher {
             }
             return .object(envelope)
         }
-        var envelope: [String: JSONValue] = [
+        let envelope: [String: JSONValue] = [
             "status": .string(result.execution.status),
             "id": .string(result.executionId),
             "desk_handle": .string(result.deskItem.handle),
@@ -333,19 +307,11 @@ extension SwiftToolDispatcher {
             // project" when a second project was in fact created.
             "desk_item_reused": .bool(deskHandle?.isEmpty == false),
         ]
-        if let procedureFallbackReason {
-            envelope["procedure_fallback"] = .string(procedureFallbackReason)
-        }
         return .object(envelope)
     }
 
     private static func procedureRelativePath(_ raw: String) -> String {
         raw.hasPrefix("workspace/") ? String(raw.dropFirst("workspace/".count)) : raw
-    }
-
-    private static func stringValue(_ value: JSONValue?) -> String? {
-        guard case .string(let string)? = value else { return nil }
-        return string
     }
 
     private static func compiledWorkshopPolicyAllows(dataRoot: URL) async -> Bool {
@@ -479,15 +445,8 @@ extension SwiftToolDispatcher {
         ])
     }
 
-    /// task_ledger_post — append one event to the cross-agent task ledger
-    /// (`<dataRoot>/orchestration/task_ledger.jsonl`) under the shared flock,
-    /// cap to newest-5000, and recompact the derived state in the same lock.
-    /// This is Agent's WRITE surface into the same feed Claude/Codex append to
-    /// via script/task_ledger.sh -> Swift task-ledger. The actor is pinned to `agent` — the in-app
-    /// chat tool can only ever post AS Agent (an unattended caller cannot
-    /// impersonate Claude/Codex/the user through chat). Medium-write; available on
-    /// the claude/codex bridge as of the user's 2026-06-13 "open the bridges" call
-    /// (the actor pin to `agent` is the integrity boundary, not a bridge deny).
+    /// Append to `<dataRoot>/orchestration/task_ledger.jsonl`; shared flock covers the newest-5000 cap and compaction.
+    /// The actor is pinned to `agent` on every dispatch surface, preventing impersonation.
     func impl_task_ledger_post(input: [String: JSONValue]) async throws -> JSONValue {
         let kindRaw = try requireString(input, "kind")
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -560,6 +519,15 @@ extension SwiftToolDispatcher {
     /// folds terminal tasks back in. Pure read; bridge-ALLOWED.
     func impl_task_ledger_list(input: [String: JSONValue]) async throws -> JSONValue {
         let ledger = SwiftNativeTaskLedger(dataRoot: dataRoot)
+        for key in ["limit", "offset"] where input[key] != nil {
+            guard let value = Self.jsonInt(input[key]), value >= (key == "limit" ? 1 : 0), value <= (key == "limit" ? 100 : 1_000_000) else {
+                throw ToolFailureError("\(key) is outside its allowed range.", argumentPath: "$.\(key)", effects: .none, code: "invalid_input")
+            }
+        }
+        let limit = Self.jsonInt(input["limit"]) ?? 25
+        let offset = Self.jsonInt(input["offset"]) ?? 0
+        // Input bounds above keep this sum at or below 1_000_100.
+        let nextOffset = offset + limit
         let id = optionalString(input, "task_id")?.trimmingCharacters(in: .whitespacesAndNewlines)
 
         // Detail branch: authoritative base + tail state, with retained events.
@@ -576,24 +544,27 @@ extension SwiftToolDispatcher {
             return .object([
                 "status": .string("ok"),
                 "task": state.toJSON(),
-                "events": .array(forTask.map { $0.toJSON() }),
+                "events": .array(forTask.dropFirst(offset).prefix(limit).map { $0.toJSON() }),
+                "total": .int(Int64(forTask.count)), "limit": .int(Int64(limit)), "offset": .int(Int64(offset)),
+                "has_more": .bool(nextOffset < forTask.count),
+                "next_offset": nextOffset < forTask.count ? .int(Int64(nextOffset)) : .null,
+                "source": .string("shared_task_ledger"),
             ])
         }
 
         // List branch: compacted per-task summary.
-        let includeDone: Bool
-        switch input["include_done"] {
-        case .some(.bool(let b)): includeDone = b
-        case .some(.string(let s)): includeDone = ["true", "1", "yes", "y", "on"].contains(s.lowercased())
-        default: includeDone = false
-        }
+        let includeDone = flag(input, "include_done")
         let tasks = try await ledger.listTasks(includeTerminal: includeDone)
         return .object([
             "status": .string("ok"),
-            "tasks": .array(tasks.map { $0.toJSON() }),
+            "tasks": .array(tasks.dropFirst(offset).prefix(limit).map { $0.toJSON() }),
+            "source": .string("shared_task_ledger"),
+            "total": .int(Int64(tasks.count)), "limit": .int(Int64(limit)), "offset": .int(Int64(offset)),
+            "has_more": .bool(nextOffset < tasks.count),
+            "next_offset": nextOffset < tasks.count ? .int(Int64(nextOffset)) : .null,
             "include_done": .bool(includeDone),
-            "note": .string(includeDone ? "Includes open and finished tasks."
-                : "Only open tasks are shown. app {action:\"ledger.list\",args:{include_done:true}} also shows finished tasks."),
+            "note": .string("This is the shared task ledger; desk.read reads your Desk. " + (includeDone ? "Includes open and finished ledger tasks."
+                : "Only open ledger tasks are shown; include_done:true also shows finished tasks.")),
         ])
     }
 

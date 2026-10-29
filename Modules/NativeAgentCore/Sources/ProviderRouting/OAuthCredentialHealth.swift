@@ -9,6 +9,9 @@ public struct OAuthCredentialHealth: Sendable {
     public let expiresAt: Date?
     public let canRefresh: Bool
     public let requiresRefresh: Bool
+    public var detail = ""
+    public var authPath: URL? = nil
+    public var accountEmail: String? = nil
 
     public init(configured: Bool, expiresAt: Date?, canRefresh: Bool, requiresRefresh: Bool = false) {
         self.configured = configured
@@ -31,19 +34,22 @@ public enum ProviderOAuthCredentialMaintenance {
             }
             object = parsed
         }
+        let verdict: (usable: Bool, detail: String, health: OAuthCredentialHealth)
         switch provider {
-        case "anthropic_oauth_direct":
-            return AnthropicOAuthDirectAdapter.credentialStatus(object).health
-        case "xai_oauth_direct":
-            return XAIOAuthDirectAdapter.credentialStatus(object).health
-        default:
-            return OpenAIOAuthDirectAdapter.credentialStatus(object, path: path).health
+        case "anthropic_oauth_direct": verdict = AnthropicOAuthTransport.credentialStatus(object)
+        case "xai_oauth_direct": verdict = XAIOAuthTransport.credentialStatus(object)
+        default: verdict = ChatGPTTransport.credentialStatus(object, path: path)
         }
+        var health = verdict.health
+        health.detail = verdict.detail
+        health.authPath = path
+        if provider == "openai_oauth_direct" { health.accountEmail = NativeOAuthFlow.openAIAccountEmail(in: object) }
+        return health
     }
 
     public static func credentialPath(provider: String, root: URL) -> URL {
         if provider == "openai_oauth_direct" {
-            return OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: root)
+            return ChatGPTTransport.preferredAuthPath(dataRoot: root)
         }
         return root.appendingPathComponent("providers/\(provider).json")
     }
@@ -52,13 +58,13 @@ public enum ProviderOAuthCredentialMaintenance {
         let path = credentialPath(provider: provider, root: root)
         switch provider {
         case "xai_oauth_direct":
-            _ = try await XAIOAuthDirectAdapter(tokenPathOverride: path, telemetryDataRootOverride: root)
+            _ = try await XAIOAuthTransport(tokenPathOverride: path, telemetryDataRootOverride: root)
                 .ensureFreshAccessToken(forceRefresh: false)
         case "anthropic_oauth_direct":
-            _ = try await AnthropicOAuthDirectAdapter(authPathOverride: path, telemetryDataRootOverride: root)
+            _ = try await AnthropicOAuthTransport(authPathOverride: path, telemetryDataRootOverride: root)
                 .ensureFreshAccessToken()
         case "openai_oauth_direct":
-            _ = try await OpenAIOAuthDirectAdapter(authPathOverride: path, telemetryDataRootOverride: root)
+            _ = try await ChatGPTTransport(authPathOverride: path, telemetryDataRootOverride: root)
                 .ensureFreshAccessToken()
         default:
             throw LLMError.notConfigured(provider: provider)

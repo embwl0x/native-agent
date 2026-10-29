@@ -7,7 +7,7 @@ import Senses
 extension SwiftToolDispatcher {
     func senseAppCorner(_ input: [String: JSONValue]) -> SenseCorner? {
         let source = defaultMacAXElementSource()
-        let requested = jsonString(input["app"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let requested = input["app"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let target: MacAXAppInfo?
         if requested.isEmpty { target = source.frontmostApp() }
         else if case .matched(let app) = MacBackgroundSight.resolve(requested, among: source.runningApps()) { target = app }

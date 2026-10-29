@@ -78,17 +78,11 @@ extension SwiftToolDispatcher {
         guard kind != .unknown else {
             return failed("unknown_kind", "There is no \(rawKind) request in this app.")
         }
-        // 2026-09-24 trace: she sent {"connector": "github", "message": ...}
-        // and burned two calls on missing_why / missing_target.
         guard let why = text("why", "reason", "message") else {
             return failed("missing_why", "Say in one sentence why this is needed.")
         }
-        // She names it by its kind as often as by `target` (09-24:
-        // connector:"github" came back missing_target).
-        let target = text("target", rawKind) ?? (kind == .permission ? text("capability").map { SystemAppleScriptAdapter.automationTarget($0) == nil ? "privacy:" + $0 : $0 } : nil) ?? ""
-        // Her own words for what a decline costs, when she has them; the
-        // registry's default otherwise. Never empty — Agent's rule is that
-        // every decline says what happens next.
+        let target = text("target", rawKind) ?? (kind == .permission ? text("capability").map { AppleScriptExecution.automationTarget($0) == nil ? "privacy:" + $0 : $0 } : nil) ?? ""
+        // Every decline states its consequence, using the caller's words or the registry's default.
         let declineConsequence = text("decline_consequence", "consequence")
 
         let options: [InlineInteraction.Option] = {
@@ -165,8 +159,8 @@ extension SwiftToolDispatcher {
                 }
             }
             for capability in capabilities {
-                guard let bundleID = SystemAppleScriptAdapter.automationTarget(capability) else { continue }
-                let permission = await SystemAppleScriptAdapter.automationPermission(bundleID: bundleID)
+                guard let bundleID = AppleScriptExecution.automationTarget(capability) else { continue }
+                let permission = await AppleScriptExecution.automationPermission(bundleID: bundleID)
                 guard case .object(let fields) = permission, fields["app_path"] != nil else {
                     return failed("app_not_installed", "No installed app resolves \(bundleID); install that app before requesting Automation consent.")
                 }

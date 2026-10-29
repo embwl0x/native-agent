@@ -3,19 +3,73 @@ import Foundation
 import Darwin
 
 // Only marked table bodies are generated. Headings, prose and policy stay put.
-let arguments = Array(CommandLine.arguments.dropFirst())
-let check = arguments.contains("--check")
-let repoIndex = arguments.firstIndex(of: "--repo")
+var arguments = Array(CommandLine.arguments.dropFirst())
+var check = false
+var given = FileManager.default.currentDirectoryPath
+while !arguments.isEmpty {
+    switch arguments.removeFirst() {
+    case "--check": check = true
+    case "--repo":
+        guard !arguments.isEmpty else { fatalError("--repo requires a path") }
+        given = arguments.removeFirst()
+    case "--help", "-h":
+        print("Usage: swift script/generate_architecture_blueprint.swift [--check] [--repo PATH]\nGenerate source-owned tables, or check equality, coverage and architecture policy.")
+        exit(0)
+    case let argument: fatalError("unknown argument: \(argument)")
+    }
+}
 // realpath, not resolvingSymlinksInPath: Foundation maps /private/tmp back to
 // /tmp, while the enumerator hands back /private/tmp paths.
-let given = repoIndex.map { arguments[$0 + 1] } ?? FileManager.default.currentDirectoryPath
 let repo = URL(fileURLWithPath: realpath(given, nil).map { defer { free($0) }; return String(cString: $0) } ?? given)
 let document = repo.appendingPathComponent("docs/ARCHITECTURE_BLUEPRINT.md")
 let original = try String(contentsOf: document, encoding: .utf8)
-struct Scope: Decodable { let blueprintRoots: [String] }
+struct Policy: Decodable {
+    let blueprintRoots: [String]
+    let forbiddenFiles: [String]
+    let rules: [Rule]
+}
+struct Rule: Decodable {
+    let id: String
+    let files: [String]?
+    let optionalFiles: [String]?
+    let roots: [String]?
+    let required: [String]?
+    let forbidden: [String]?
+    let forbiddenPatterns: [String]?
+    let caseInsensitive: Bool?
+    let requiredAnyImports: [String]?
+    let forbiddenImports: [String]?
+    let allowlist: [String: String]?
+    let message: String?
+}
 let policy = original.components(separatedBy: "```json architecture-policy\n")
-guard policy.count == 2 else { fatalError("expected one architecture-policy block") }
-let scope = try JSONDecoder().decode(Scope.self, from: Data(policy[1].components(separatedBy: "\n```")[0].utf8))
+guard policy.count == 2, policy[1].contains("\n```") else {
+    fatalError("blueprint must contain exactly one closed architecture-policy JSON block")
+}
+let scope = try JSONDecoder().decode(Policy.self, from: Data(policy[1].components(separatedBy: "\n```")[0].utf8))
+var sources = ["docs/ARCHITECTURE_BLUEPRINT.md": original]
+let roots = Set(scope.blueprintRoots + (check ? scope.rules.flatMap { $0.roots ?? [] } : []))
+for root in roots.sorted() {
+    let url = repo.appendingPathComponent(root)
+    var enumerationError: Error?
+    guard FileManager.default.fileExists(atPath: url.path) else {
+        fatalError("cannot enumerate source root: \(url.path)")
+    }
+    if roots.contains(where: { root.hasPrefix($0 + "/") }) { continue }
+    guard let files = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.isRegularFileKey],
+        errorHandler: { _, error in enumerationError = error; return false }) else {
+        fatalError("cannot enumerate source root: \(url.path)")
+    }
+    for case let file as URL in files {
+        if [".build", "Tests", "tests"].contains(file.lastPathComponent) { files.skipDescendants(); continue }
+        let path = String(file.path.dropFirst(repo.path.count + 1))
+        guard file.pathExtension == "swift" || (scope.blueprintRoots.contains { path.hasPrefix($0 + "/") }
+            && ["js", "sh", "rb", "py", "yml", "yaml"].contains(file.pathExtension)) else { continue }
+        sources[path] = try String(contentsOf: file, encoding: .utf8)
+    }
+    if let enumerationError { throw enumerationError }
+}
+let sourcePaths = Set(sources.keys)
 var rows: [String: String] = [:]
 var missing: [String] = []
 // Her parts are hers byte for byte (a changed turn.js stops matching its shipped
@@ -38,32 +92,27 @@ func partRow(_ file: URL, _ text: String) -> String? {
     }
     return "| `\(file.lastPathComponent)` | \(json["kind"] as? String ?? "part") `\(id)`: \(words.replacingOccurrences(of: "|", with: "/")) |"
 }
-for root in scope.blueprintRoots {
-    let files = FileManager.default.enumerator(at: repo.appendingPathComponent(root), includingPropertiesForKeys: nil)!
-    for case let file as URL in files {
-        if [".build", "Tests", "tests"].contains(file.lastPathComponent) { files.skipDescendants(); continue }
-        guard ["swift", "js", "sh", "rb", "py", "yml", "yaml"].contains(file.pathExtension) else { continue }
-        let path = String(file.path.dropFirst(repo.path.count + 1))
-        let prefix = ["sh", "rb", "py", "yml", "yaml"].contains(file.pathExtension) ? "# Blueprint: " : "// Blueprint: "
-        if file.pathExtension == "js", root == "Resources/abilities" {
-            let text = try String(contentsOf: file, encoding: .utf8)
-            guard !text.contains("// Blueprint: ") else { fatalError("parts carry no Blueprint line: \(path)") }
-            if let row = partRow(file, text) { rows[path] = row } else { missing.append(path) }
-            continue
+for path in sources.keys.sorted() {
+    guard let root = scope.blueprintRoots.first(where: { path.hasPrefix($0 + "/") }) else { continue }
+    let file = repo.appendingPathComponent(path)
+    let text = sources[path]!
+    let prefix = ["sh", "rb", "py", "yml", "yaml"].contains(file.pathExtension) ? "# Blueprint: " : "// Blueprint: "
+    if file.pathExtension == "js", root == "Resources/abilities" {
+        guard !text.contains("// Blueprint: ") else { fatalError("parts carry no Blueprint line: \(path)") }
+        if let row = partRow(file, text) { rows[path] = row } else { missing.append(path) }
+        continue
+    }
+    let lines = text.components(separatedBy: "\n")
+    let headers = lines.filter { $0.hasPrefix(prefix) }
+    guard headers.count <= 1 else { fatalError("multiple Blueprint lines: \(file.path)") }
+    if let header = headers.first {
+        let row = String(header.dropFirst(prefix.count))
+        guard row.hasPrefix("| `\(file.lastPathComponent)` | ") || row.hasPrefix("| `\(path)` | "), row.hasSuffix(" |") else {
+            fatalError("Blueprint row must name its own file: \(path)")
         }
-        let lines = try String(contentsOf: file, encoding: .utf8).components(separatedBy: "\n")
-        let headers = lines.filter { $0.hasPrefix(prefix) }
-        guard headers.count <= 1 else { fatalError("multiple Blueprint lines: \(file.path)") }
-        if let header = headers.first {
-            let row = String(header.dropFirst(prefix.count))
-            guard row.hasPrefix("| `\(file.lastPathComponent)` | ") || row.hasPrefix("| `\(path)` | "), row.hasSuffix(" |") else {
-                fatalError("Blueprint row must name its own file: \(path)")
-            }
-            rows[path] = row
-        } else if (file.pathExtension == "swift" && (path.hasPrefix("Modules/") || path.hasPrefix("Sources/")))
-                    || (file.pathExtension == "js" && root == "Resources/abilities") {
-            missing.append(path)
-        }
+        rows[path] = row
+    } else if file.pathExtension == "swift" && (path.hasPrefix("Modules/") || path.hasPrefix("Sources/")) {
+        missing.append(path)
     }
 }
 if !missing.isEmpty {
@@ -126,7 +175,83 @@ if check {
         fputs("[blueprint] generated tables differ; run swift script/generate_architecture_blueprint.swift\n", stderr)
         exit(1)
     }
+    var errors: [String] = []
+    for path in scope.forbiddenFiles where FileManager.default.fileExists(atPath: repo.appendingPathComponent(path).path) {
+        errors.append("forbidden architecture file exists: \(path)")
+    }
+    for rule in scope.rules { try checkPolicy(rule, errors: &errors) }
+    if !errors.isEmpty {
+        fputs("[blueprint] ERROR: architecture blueprint or active-instruction drift detected\n", stderr)
+        for error in errors.sorted() { fputs("  - \(error)\n", stderr) }
+        exit(1)
+    }
+    print("[blueprint] complete source-owned tables and \(scope.rules.count) policy rules checked; behavioral prose is not type-checked")
 } else if generated != original {
     try generated.write(to: document, atomically: true, encoding: .utf8)
 }
 print("[blueprint] \(check ? "checked" : "generated") \(selected.count) source-owned rows")
+
+func matches(_ regex: NSRegularExpression, in text: String) -> Bool {
+    regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
+}
+
+func imports(_ module: String) throws -> NSRegularExpression {
+    try NSRegularExpression(
+        pattern: #"^\h*(?:@\w+\h+)*(?:(?:public|internal|private|package)\h+)?import\h+(?:(?:typealias|struct|class|enum|protocol|let|var|func)\h+)?"#
+            + NSRegularExpression.escapedPattern(for: module) + #"\b"#,
+        options: [.anchorsMatchLines]
+    )
+}
+
+func checkPolicy(_ rule: Rule, errors: inout [String]) throws {
+    let fm = FileManager.default
+    var paths = Set(rule.files ?? [])
+    paths.formUnion((rule.optionalFiles ?? []).filter { fm.fileExists(atPath: repo.appendingPathComponent($0).path) })
+    for root in rule.roots ?? [] {
+        paths.formUnion(sourcePaths.filter { $0.hasPrefix(root + "/") && $0.hasSuffix(".swift") })
+    }
+    for (path, owner) in rule.allowlist ?? [:] {
+        if !paths.contains(path) { errors.append("[\(rule.id)] obsolete allowlist path: \(path)") }
+        if owner.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            errors.append("[\(rule.id)] allowlist path has no owning area: \(path)")
+        }
+    }
+    let patterns = try (rule.forbiddenPatterns ?? []).map { pattern in
+        (pattern, try NSRegularExpression(pattern: pattern,
+            options: rule.caseInsensitive == true ? [.caseInsensitive, .anchorsMatchLines] : [.anchorsMatchLines]))
+    }
+    let forbiddenImports = try (rule.forbiddenImports ?? []).map { ($0, try imports($0)) }
+    let requiredImports = try rule.requiredAnyImports?.map(imports)
+    for path in paths.sorted() {
+        let url = repo.appendingPathComponent(path)
+        guard fm.fileExists(atPath: url.path) else {
+            errors.append("[\(rule.id)] required file missing: \(path)")
+            continue
+        }
+        if sources[path] == nil { sources[path] = try String(contentsOf: url, encoding: .utf8) }
+        let source = sources[path]!
+        let context = "[\(rule.id)] \(path)"
+        for marker in rule.required ?? [] where !source.contains(marker) {
+            errors.append("\(context): missing required marker: \(marker)")
+        }
+        for marker in rule.forbidden ?? [] where source.contains(marker) {
+            errors.append("\(context): forbidden marker: \(marker)")
+        }
+        for (pattern, regex) in patterns {
+            for (offset, line) in source.components(separatedBy: "\n").enumerated() where matches(regex, in: line) {
+                errors.append("\(context):\(offset + 1): forbidden pattern \(pattern). \(rule.message ?? "")")
+            }
+        }
+        for (module, regex) in forbiddenImports where matches(regex, in: source) {
+            errors.append("\(context): forbidden import: \(module)")
+        }
+        if let modules = rule.requiredAnyImports, let requiredImports {
+            let hasImport = requiredImports.contains { matches($0, in: source) }
+            if hasImport, rule.allowlist?[path] != nil {
+                errors.append("\(context): remove satisfied temporary allowlist entry")
+            } else if !hasImport, rule.allowlist?[path] == nil {
+                errors.append("\(context): must import one of \(modules.joined(separator: ", ")). \(rule.message ?? "")")
+            }
+        }
+    }
+}

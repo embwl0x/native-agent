@@ -10,6 +10,7 @@ public struct AgentContactFailure: Error, Sendable {
     let code: Int
     public let message: String
     static let missing = Self(code: -32001, message: "Task not found")
+    var isMissing: Bool { code == Self.missing.code }
 }
 
 /// Protocol-independent content. A future binding maps these values without
@@ -20,7 +21,7 @@ public enum AgentContactPart: Codable, Sendable, Equatable {
     case data(JSONValue, metadata: JSONValue)
 
     static let maximumFileBytes = ChatAttachmentTypeResolver.fileByteLimit
-    static let maximumOutputBytes = 16_000_000
+    static let maximumOutputBytes = AgentPeerHTTP.maximumOutputBytes
     static let inputModes = ["text/plain", "application/json", "image/png", "image/jpeg", "image/heic",
         "image/webp", "image/gif", "application/pdf"]
 
@@ -55,7 +56,7 @@ public enum AgentContactPart: Codable, Sendable, Equatable {
         } else if let data = part["data"] {
             // Keep Foundation's escaped-byte limit for data; file bytes never
             // take a JSON round trip during admission.
-            let bytes = try JSONSerialization.data(withJSONObject: Self.object(data), options: [.sortedKeys, .fragmentsAllowed])
+            let bytes = try JSONSerialization.data(withJSONObject: data.foundationObject, options: [.sortedKeys, .fragmentsAllowed])
             guard bytes.count <= 64000 else { throw AgentContactFailure(code: -32602, message: "Data is too large") }
             return .data(data, metadata: metadata)
         } else {
@@ -96,12 +97,9 @@ public enum AgentContactPart: Codable, Sendable, Equatable {
         switch self {
         case .text(let text): return ["kind": "text", "text": text]
         case .file(let name, let mediaType, let bytes, let metadata):
-            return ["kind": "file", "file": ["name": name, "mimeType": mediaType, "bytes": bytes.base64EncodedString()], "metadata": Self.object(metadata)]
-        case .data(let value, let metadata): return ["kind": "data", "data": Self.object(value), "metadata": Self.object(metadata)]
+            return ["kind": "file", "file": ["name": name, "mimeType": mediaType, "bytes": bytes.base64EncodedString()], "metadata": metadata.foundationObject]
+        case .data(let value, let metadata): return ["kind": "data", "data": value.foundationObject, "metadata": metadata.foundationObject]
         }
-    }
-    public static func object(_ value: JSONValue) -> Any {
-        (try? JSONSerialization.jsonObject(with: JSONEncoder().encode(value), options: [.fragmentsAllowed])) ?? NSNull()
     }
 
     var attachment: ChatTurnRuntime.MultimodalAttachment? {

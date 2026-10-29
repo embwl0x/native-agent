@@ -10,7 +10,7 @@ import Security
 import ProviderRouting
 import CFNetwork
 import MacControl
-// Blueprint: | `ToolExecution+RunSandbox.swift` | `ToolPrimitiveBroker`: declared model/network/program/secret reach, raw network, programs over stdio, keyring secrets inserted at the edge and reply redaction (stream-piece boundaries may expose up to three leading secret bytes before the remainder is redacted), admitted-model thoughts (optional app tools and an existing routing surface, canonical tool-turn owner, same restricted host and caller limits) and fetch, the run's one screen watch and its hands; DNS handles remain owned until actual synchronous exit after cancellation/close, late results open nothing, and fetch timeout reports an unknown outcome; one arrival buffer per held thing that program and network reads take (one text-or-base64 shape), each arrival on which posts a resident ability's `held` signal; no file executor |
+// Blueprint: | `ToolExecution+RunSandbox.swift` | `ToolPrimitiveBroker`: declared model/network/program/secret reach, one raw receive for fetch and held connections, programs over stdio, keyring secrets inserted at the edge and reply redaction (stream-piece boundaries may expose up to three leading secret bytes before the remainder is redacted), admitted-model thoughts (optional app tools and an existing routing surface, canonical tool-turn owner, same restricted host and caller limits) and fetch, the run's one screen watch and its hands; DNS handles remain owned until actual synchronous exit after cancellation/close, late results open nothing, and fetch timeout reports an unknown outcome; one arrival buffer per held thing that program and network reads take (one text-or-base64 shape), each arrival on which posts a resident ability's `held` signal; no file executor |
 
 /// Declared-reach primitives for the shared JavaScript executor.
 actor ToolPrimitiveBroker {
@@ -19,8 +19,7 @@ actor ToolPrimitiveBroker {
         .union(["model.call", "fetch", "screen.watch"]).union(frameOperations).union(AuthoredToolEffects.handOperations)
     /// Reads inside the run's admitted watch: no admission and no receipt of their own.
     static let frameOperations: Set<String> = ["screen.next", "frame.read"]
-    /// Reading or ending a program it started: inside its admitted start, no
-    /// ledger row of its own. A send is an effect and is recorded as one.
+    /// Reading or ending a program it started: inside its admitted start, no ledger row of its own. A send is an effect and is recorded as one.
     static let programOperations: Set<String> = ["program.receive", "program.close"]
     static func readOnly(_ operation: String, _ arguments: JSONValue) -> Bool {
         if operation == "model.call" {
@@ -31,15 +30,12 @@ actor ToolPrimitiveBroker {
     }
     private let permissions: Set<String>
     private let abilityID: String
-    /// The store whose signal wakes a resident ability: what it holds outlives
-    /// each run, and what arrives on it between runs wakes it (`held`).
+    /// The store whose signal wakes a resident ability: what it holds outlives each run, and what arrives on it between runs wakes it (`held`).
     private let held: AbilityStore?
     private var connections: [String: NWConnection] = [:]
     private var listeners: [String: NWListener] = [:]
     private let queue = DispatchQueue(label: "nativeagent.authored.network")
-    /// What reached each held thing and was not read yet, in order: the one
-    /// buffer its reads take from. A connection reads its next piece only once
-    /// the last was taken; what ended a thing reads again.
+    /// What reached each held thing and was not read yet, in order: the one buffer its reads take from. A connection reads its next piece only once the last was taken; what ended a thing reads again.
     private var inbox: [String: [Arrival]] = [:]
     private var ended: [String: Arrival] = [:]
     private var readers: [String: (token: Int, reader: CheckedContinuation<Arrival?, Error>)] = [:]
@@ -57,23 +53,20 @@ actor ToolPrimitiveBroker {
         }
     }
     private(set) var closed = false
-    /// Non-cooperative system DNS stays accounted for until getaddrinfo exits,
-    /// including after the caller's response deadline or broker close.
+    /// Non-cooperative system DNS stays accounted for until getaddrinfo exits, including after the caller's response deadline or broker close.
     private var lookups: [UUID: Task<[String], Error>] = [:]
     private static let byteLimit = 4 * 1024 * 1024
     /// The run's one watch (a second replaces the first), and the receipts of those that ended.
     private var watch: MacScreenWatch?
     private var watched: [JSONValue] = []
     private var abilityObserver: (any NSObjectProtocol)?
-    /// Every secret value this run inserted, redacted from all it reads back;
-    /// the host each of its connections reached; each stream's redaction.
+    /// Every secret value this run inserted, redacted from all it reads back; the host each of its connections reached; each stream's redaction.
     private var redactor = SecretRedactor()
     private var hosts: [String: String] = [:]
     private var streams: [String: SecretStream] = [:]
     private var programs: [String: Program] = [:]
 
-    /// A program the ability started, alive until it closes it or what holds
-    /// it ends (the run, or a resident ability's residency).
+    /// A program the ability started, alive until it closes it or what holds it ends (the run, or a resident ability's residency).
     private final class Program {
         let process: Process, input: FileHandle, path: String, identity: String
         let launched: ProcessTreeSnapshot, backlog: Backlog
@@ -86,9 +79,7 @@ actor ToolPrimitiveBroker {
             self.process = process; self.input = input; self.path = path; self.identity = identity
             self.launched = launched; self.backlog = backlog
         }
-        /// Ended as the shell ends a command it stops: the tree from its
-        /// launch, rescanned and killed under the reaper's identity checks. A
-        /// program that detached into its own session outlives it, as from the shell.
+        /// Ended as the shell ends a command it stops: the tree from its launch, rescanned and killed under the reaper's identity checks. A program that detached into its own session outlives it, as from the shell.
         func end() {
             ended = true
             ProcessTreeReaper.quiesceAndKill(ProcessTreeReaper.snapshot(rootPID: process.processIdentifier, retaining: launched))
@@ -97,8 +88,7 @@ actor ToolPrimitiveBroker {
             try? input.close()
         }
 
-        /// Output written and not yet read, bounded: past the bound nothing
-        /// more is kept, the program ends, and the next read says so.
+        /// Output written and not yet read, bounded: past the bound nothing more is kept, the program ends, and the next read says so.
         final class Backlog: @unchecked Sendable {
             private let lock = NSLock()
             private var bytes = 0, over = false
@@ -141,12 +131,11 @@ actor ToolPrimitiveBroker {
             }
             if operation == "screen.watch" { _ = try MacScreenWatch.Request(args) }
         } else if operation == "model.call" || operation == "fetch" {
-            // A connector's credential is no longer NativeAgent's to attach (10-21).
+            // Connector credentials are not attached by this broker.
             guard args["connector"] == nil else {
                 throw Self.inputFailure("unsupported_connector_argument", field: "connector", accepted: "omitted", detail: operation == "model.call" ? "model.call takes no connector argument; remove it to use the run's admitted model or an existing routing surface." : "fetch takes no connector argument. Use {{secret:<name>}} where the key belongs and declare reach secret:<name>; an unsaved key is requested once on a card.")
             }
-            // A fetch to this Mac's own loopback (a local agent's endpoint) is
-            // reached as localhost is, and its secret may go there as network.send's does.
+            // A fetch to this Mac's own loopback (a local agent's endpoint) is reached as localhost is, and its secret may go there as network.send's does.
             let local = try operation == "fetch" && Self.loopback(Self.destination(args))
             let reach = operation == "model.call" ? "model" : local ? "network_localhost" : "network_public"
             guard permissions.contains(reach) else {
@@ -218,8 +207,7 @@ actor ToolPrimitiveBroker {
         do {
             if operation == "fetch" {
                 let host = try Self.destination(args), destination = Keyring.Destination.host(host), keys = ["url", "headers", "body"]
-                // The deadline bounds the reply. Outstanding DNS remains
-                // owned through actual exit, and its late result opens nothing.
+                // The deadline bounds the reply. Outstanding DNS remains owned through actual exit, and its late result opens nothing.
                 let wait = try Self.wait(args, default: 120)
                 func send(_ given: [String: JSONValue]) async throws -> JSONValue {
                     do { return try await TurnDeadline.withThrowingDeadline(seconds: wait) { try await self.fetch(given, to: host) } }
@@ -230,9 +218,7 @@ actor ToolPrimitiveBroker {
                 }
                 let (given, sent, grants, _) = try await inserting(args, keys, to: destination)
                 var result = try await send(given)
-                // A signed-in secret answered 401 is renewed once (unless another
-                // run already did) and the request sent once more, under the same
-                // grant only: never under one the person made meanwhile.
+                // A signed-in secret answered 401 is renewed once (unless another run already did) and the request sent once more, under the same grant only: never under one the person made meanwhile.
                 if Parts.fields(result)["status"] == .int(401), !sent.isEmpty {
                     let (again, _, _, renewed) = try await inserting(args, keys, to: destination, rejected: sent, grants: grants)
                     if renewed { result = try await send(again) }
@@ -255,8 +241,7 @@ actor ToolPrimitiveBroker {
                 given["base64"] = .string(try Self.outgoing(given).base64EncodedString())
             }
             if operation == "network.send" {
-                // A peer that stops reading never holds a send for good: one it has not
-                // taken by `wait` fails, and its connection closes (as a program's ends).
+                // A peer that stops reading never holds a send for good: one it has not taken by `wait` fails, and its connection closes (as a program's ends).
                 let wait = try Self.wait(args), id = try text(args, "id"), sending = given
                 do { return try await TurnDeadline.withThrowingDeadline(seconds: wait) { try await self.network(operation, args: sending) } }
                 catch is TurnDeadline.DeadlineExceeded {
@@ -267,8 +252,7 @@ actor ToolPrimitiveBroker {
             }
             let result = try await network(operation, args: given)
             guard operation == "network.connect", case .string(let id)? = Parts.fields(result)["id"] else { return result }
-            // A secret goes out only on a connection that established TLS, as
-            // the transport reports it (or to this Mac by host); udp carries none.
+            // A secret goes out only on a connection that established TLS, as the transport reports it (or to this Mac by host); udp carries none.
             if let host = Parts.string(args, "host"), args["transport"] != .string("udp"),
                connections[id]?.metadata(definition: NWProtocolTLS.definition) != nil || Self.loopback(host) { hosts[id] = host.lowercased() }
             pump(id)
@@ -281,9 +265,7 @@ actor ToolPrimitiveBroker {
         }
     }
 
-    /// The host a fetch goes to, read with each secret's place held. A secret
-    /// leaves this Mac only encrypted, and never names the host it goes to:
-    /// read with two stand-ins, the host must be the same.
+    /// The host a fetch goes to, read with each secret's place held. A secret leaves this Mac only encrypted, and never names the host it goes to: read with two stand-ins, the host must be the same.
     private static func destination(_ args: [String: JSONValue]) throws -> String {
         let names = Keyring.names(in: .object(args))
         let urls = try ["secret", "other"].map { stand in
@@ -299,9 +281,7 @@ actor ToolPrimitiveBroker {
         return url.host!.lowercased()
     }
 
-    /// Her request with each secret it names inserted, toward one destination
-    /// its grant names, the values inserted (they join what the run redacts)
-    /// and their grants, and whether a `rejected` one was renewed under its grant.
+    /// Her request with each secret it names inserted, toward one destination its grant names, the values inserted (they join what the run redacts) and their grants, and whether a `rejected` one was renewed under its grant.
     private func inserting(_ args: [String: JSONValue], _ keys: [String], to destination: Keyring.Destination,
                            rejected: [String: String] = [:], grants: [String: Date] = [:]) async throws
         -> (args: [String: JSONValue], values: [String: String], grants: [String: Date], renewed: Bool) {
@@ -331,14 +311,10 @@ actor ToolPrimitiveBroker {
         }
     }
 
-    /// A wait that ended with nothing new. What a stream holds back (a split
-    /// character, the start of a secret) stays held, its matching with it,
-    /// until the next piece or the end: a timeout never splits a secret.
+    /// A wait that ended with nothing new. What a stream holds back (a split character, the start of a secret) stays held, its matching with it, until the next piece or the end: a timeout never splits a secret.
     private static let pending: JSONValue = .object(["pending": .bool(true), "eof": .bool(false)])
 
-    /// How long a call waits: `wait` seconds, else its default. A read waits
-    /// that long (30) for something new; a send (30), for its program or
-    /// connection to take it; a fetch (120), for its whole answer.
+    /// How long a call waits: `wait` seconds, else its default. A read waits that long (30) for something new; a send (30), for its program or connection to take it; a fetch (120), for its whole answer.
     private static func wait(_ args: [String: JSONValue], default given: Double = 30) throws -> Double {
         let wait: Double = switch args["wait"] { case nil: given; case .int(let n)?: Double(n); case .double(let n)?: n; default: -1 }
         guard wait >= 0, wait <= 86_400 else { throw Self.inputFailure("invalid_wait", field: "wait", accepted: "a number of seconds from 0 to 86400") }
@@ -346,9 +322,7 @@ actor ToolPrimitiveBroker {
     }
     private static func deadline(_ args: [String: JSONValue]) throws -> ContinuousClock.Instant { .now + .seconds(try wait(args)) }
 
-    /// One piece read back, redacted, the same from a program and a
-    /// connection: `text` when it is UTF-8, else `base64` with `binary: true`;
-    /// nil while there is nothing to show yet.
+    /// One piece read back, redacted, the same from a program and a connection: `text` when it is UTF-8, else `base64` with `binary: true`; nil while there is nothing to show yet.
     private func piece(_ key: String, _ data: Data, end: Bool) -> [String: JSONValue]? {
         let data = streams[key, default: SecretStream()].characters(data, end: end, redactor)
         if data.isEmpty { return nil }
@@ -356,20 +330,15 @@ actor ToolPrimitiveBroker {
         return ["base64": .string(data.base64EncodedString()), "binary": .bool(true)]
     }
 
-    /// A program she names, talked to over its standard input and output for
-    /// as long as she holds it. It launches as any command line does (the
-    /// shell's access check, its sandbox and the folder it may start in), from
-    /// the login shell's PATH and the few variables a command needs (never
-    /// this app's own environment) plus `env`; a secret goes only to a program
-    /// its grant names.
+    /// A program she names, talked to over its standard input and output for as long as she holds it. It launches as any command line does (the shell's access check, its sandbox and the folder it may start in), from the login shell's PATH
+    /// and the few variables a command needs (never this app's own environment) plus `env`; a secret goes only to a program its grant names.
     private func program(_ operation: String, args: [String: JSONValue], host: any OwnedProgramToolHost) async throws -> JSONValue {
         if operation == "program.start" {
             let command = try text(args, "command")
             guard let path = AgentHostCommandLines.resolveCommand(command) else {
                 throw SenseFailure(code: "program_not_found", message: "\(command) is not an executable path or a program on the login PATH. Set program.start command to the installed executable's absolute path, or install the required program first.")
             }
-            // What runs is recorded now, secret or not: a secret goes to a
-            // program only as the file it was launched from, as granted.
+            // What runs is recorded now, secret or not: a secret goes to a program only as the file it was launched from, as granted.
             guard let identity = AgentHostCommandLines.identity(ofExecutable: path) else {
                 throw SenseFailure(code: "program_unreadable", message: "Executable \(path) could not be read. Inspect that file's existence and permissions; repair them or select the intended installed executable in program.start command.")
             }
@@ -399,8 +368,7 @@ actor ToolPrimitiveBroker {
             process.environment = environment
             process.currentDirectoryURL = URL(fileURLWithPath: cwd)
             process.standardInput = input; process.standardOutput = output; process.standardError = errors
-            // A write to a program that exited fails as an error, never a signal to
-            // the app; one that stops reading never blocks a write (program.send waits instead).
+            // A write to a program that exited fails as an error, never a signal to the app; one that stops reading never blocks a write (program.send waits instead).
             let writing = input.fileHandleForWriting.fileDescriptor
             _ = fcntl(writing, F_SETNOSIGPIPE, 1)
             _ = fcntl(writing, F_SETFL, fcntl(writing, F_GETFL) | O_NONBLOCK)
@@ -435,16 +403,14 @@ actor ToolPrimitiveBroker {
         }
         let id = try text(args, "id")
         guard let program = programs[id] else { throw denied("This ability does not own that program.", "Use the id returned to this ability by program.start; a closed or replaced program cannot be reused.") }
-        // Each talk asks the shell's access again: a posture that no longer
-        // lets a command line run ends the program.
+        // Each talk asks the shell's access again: a posture that no longer lets a command line run ends the program.
         do { _ = try await host.performReach("program.access", arguments: .object([:])) }
         catch { endProgram(id); throw error }
         switch operation {
         case "program.send":
             let data = try Self.outgoing(try await inserting(args, ["text"], to: .program(path: program.path, identity: program.identity)).args)
             let wait = try Self.wait(args)
-            // One that has not taken all of it by `wait` fails the send, and a
-            // failed send ends it (ToolHost.primitive).
+            // One that has not taken all of it by `wait` fails the send, and a failed send ends it (ToolHost.primitive).
             do { try await TurnDeadline.withThrowingDeadline(seconds: wait) { try await self.write(data, to: id) } }
             catch is TurnDeadline.DeadlineExceeded {
                 throw SenseFailure(code: "timeout", message: "The program did not take all of this input within \(String(format: "%g", wait)) seconds, so it was ended. "
@@ -463,8 +429,7 @@ actor ToolPrimitiveBroker {
                         return .object(piece)
                     }
                 case .exit(let status):
-                    // What a stream held back (a split character, the start of
-                    // a secret) reads before the exit, which then reads again.
+                    // What a stream held back (a split character, the start of a secret) reads before the exit, which then reads again.
                     for stream in ["stdout", "stderr"] {
                         if var piece = piece(id + stream, Data(), end: true) {
                             inbox[id, default: []].insert(.exit(status), at: 0)
@@ -517,14 +482,12 @@ actor ToolPrimitiveBroker {
     }
 
     private func model(_ args: [String: JSONValue], host: any OwnedProgramToolHost, profile: (any OwnedProgramHostProfile)?) async throws -> JSONValue {
-        // Model primitives own their envelope: both returned data and errors
-        // retain the effects of the nested tools, including schema failures.
+        // Model primitives own their envelope: both returned data and errors retain the effects of the nested tools, including schema failures.
         var effects = "none"
         do {
         let purpose = try text(args, "purpose").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !purpose.isEmpty else { throw Self.inputFailure("missing_model_purpose", field: "purpose", accepted: "a nonempty string describing why this model call is needed") }
-        // Tool thinking admits its requested surface through the canonical
-        // owner. It must not require an unrelated Chat pick first.
+        // Tool thinking admits its requested surface through the canonical owner. It must not require an unrelated Chat pick first.
         if args["tools"] == nil, args["surface"] == nil,
            LLMCallContext.client == nil || LLMCallContext.admittedModel == nil {
             if let admit = SkillRunContext.admitModel { return try await admit { try await self.model(args, host: host, profile: profile) } }
@@ -542,7 +505,8 @@ actor ToolPrimitiveBroker {
             }
         } else { throw Self.inputFailure("invalid_model_input", field: "prompt/messages", accepted: "a string prompt or a nonempty messages array, exclusively") }
         if let schema = args["schema"] {
-            messages.append(.user("Return only JSON matching this schema: " + String(decoding: try schema.serializedData(pretty: false), as: UTF8.self)))
+            messages.append(.user(try completionPolicy("authored-thought", arguments: [
+                String(decoding: try schema.serializedData(pretty: false), as: UTF8.self)])))
         }
         let signal = Parts.fields(SkillRunContext.input ?? .null)["signal"]
         let suffix = if case .string(let signal)? = signal { [signal] } else { [String]() }
@@ -569,7 +533,7 @@ actor ToolPrimitiveBroker {
             try await ConversationPrefixTelemetry.$sink.withValue(.unmeasuredRequestShape) {
                 var reply = ""
                 var cut: LLMToolBoundaryReason?
-                for try await event in client.streamMessages(messages: messages, system: nil, model: model,
+                for try await event in client.streamMessages(messages: messages, system: purpose, model: model,
                     surface: LLMCallContext.surface ?? "chat", tools: nil) {
                     switch event {
                     case .textDelta(let text): reply += text
@@ -592,8 +556,7 @@ actor ToolPrimitiveBroker {
         return ToolHost.receipt(value, effects: effects)
         } catch {
             var failure = Parts.fields(ToolHost.failure(Task.isCancelled || error is CancellationError ? CancellationError() : contextualFailure(error, operation: "model.call"), effects: effects, execution: "attempted"))
-            // A typed error describes its own effects; the thought also owns
-            // everything its nested tools already did or left unconfirmed.
+            // A typed error describes its own effects; the thought also owns everything its nested tools already did or left unconfirmed.
             let reported = failure["effects"]
             failure["effects"] = .string(["unknown", "partial", "occurred"].first {
                 effects == $0 || reported == .string($0)
@@ -602,8 +565,7 @@ actor ToolPrimitiveBroker {
         }
     }
 
-    /// `destination` is the host its grant was checked for: the request with
-    /// its secrets inserted goes there or nowhere.
+    /// `destination` is the host its grant was checked for: the request with its secrets inserted goes there or nowhere.
     private func fetch(_ args: [String: JSONValue], to destination: String) async throws -> JSONValue {
         let request = try Parts.fetchRequest(args)
         let url = request.url!, host = url.host!, tls = url.scheme?.lowercased() == "https"
@@ -629,17 +591,15 @@ actor ToolPrimitiveBroker {
             throw SenseFailure(code: "http_request_encoding", message: "fetch could not encode this HTTP request. Correct its URL, method, headers and body in the fetch call.")
         }
         _ = try await network("network.send", args: ["id": .string(id), "base64": .string(wire.base64EncodedString())])
+        guard let connection = connections[id] else { throw CancellationError() }
         var received = Data()
         while true {
-            let reply = Parts.fields(try await network("network.receive", args: ["id": .string(id)]))
-            guard let encoded = Parts.string(reply, "base64"), let chunk = Data(base64Encoded: encoded) else {
-                throw SenseFailure(code: "http_transport_bytes_invalid", message: "fetch received invalid transport bytes. Inspect the network.receive receipt and repair its byte encoding before another request.")
-            }
+            guard case .bytes(let chunk, _, let eof) = try await receive(connection) else { throw CancellationError() }
             guard received.count + chunk.count <= Self.byteLimit else {
                 throw SenseFailure(code: "output_limit", message: "fetch response exceeds 4 MiB. Request a smaller page or range; inspect service state before another modifying request.")
             }
             received.append(chunk)
-            if reply["eof"] == .bool(true) { break }
+            if eof { break }
         }
         guard !received.isEmpty else { throw SenseFailure(code: "http_response_empty", message: "fetch received no HTTP response. Check that the endpoint serves HTTP and inspect service state before another request.") }
         var response = CFHTTPMessageCreateEmpty(nil, false).takeRetainedValue()
@@ -697,8 +657,7 @@ actor ToolPrimitiveBroker {
         SenseFailure(code: "permission_denied", message: detail, remedy: Repair.remedy(owner: "ability \(abilityID)",
             nextCall: Parts.readCall(abilityID), tap: nil, instruction: fix + " Read this ability before revising its code or reach with ability.save and keeping the reviewed version."))
     }
-
-    fileprivate static func inputFailure(_ code: String, field: String, accepted: String, detail: String? = nil) -> ToolFailureError {
+    static func inputFailure(_ code: String, field: String, accepted: String, detail: String? = nil) -> ToolFailureError {
         ToolFailureError(detail ?? "\(field) must be \(accepted).", argumentPath: field, accepted: accepted, effects: .none,
             code: code, status: .refused, instruction: "Correct \(field) in this primitive call to match accepted.", recovery: .correctArguments)
     }
@@ -737,8 +696,7 @@ actor ToolPrimitiveBroker {
         }
         return data
     }
-    /// This Mac's own loopback: exactly localhost, or a loopback IP literal
-    /// (127.0.0.0/8, ::1, ::ffff:127.x.x.x); never a name that only looks like one.
+    /// This Mac's own loopback: exactly localhost, or a loopback IP literal (127.0.0.0/8, ::1, ::ffff:127.x.x.x); never a name that only looks like one.
     private static func loopback(_ host: String) -> Bool {
         if host.lowercased() == "localhost" { return true }
         var v4 = in_addr(), v6 = in6_addr()
@@ -748,9 +706,7 @@ actor ToolPrimitiveBroker {
         return bytes == Array(repeating: 0, count: 15) + [1] || bytes.prefix(12) == [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff] && bytes[12] == 127
     }
 
-    /// DNS runs off the broker. Its requesting call and this handle retain it
-    /// through actual exit; cancellation cannot interrupt synchronous DNS.
-    /// A response deadline bounds the answer, and a late lookup connects nowhere.
+    /// DNS runs off the broker. Its requesting call and this handle retain it through actual exit; cancellation cannot interrupt synchronous DNS. A response deadline bounds the answer, and a late lookup connects nowhere.
     private func address(_ host: String, publicOnly: Bool = false) async throws -> String {
         try Task.checkCancellation()
         guard !closed else { throw CancellationError() }
@@ -851,28 +807,16 @@ actor ToolPrimitiveBroker {
             case .failed(let error): throw error
             default: throw CancellationError()
             }
-        case "network.send", "network.receive":
+        case "network.send":
             let id = try text(args, "id")
             guard let connection = connections[id] else { throw denied("This ability does not own that connection.", "Use an id returned to this ability by network.connect or network.accept; a closed connection cannot be reused.") }
-            if operation == "network.send" {
-                let data = try Self.data(args)
-                try await networkReply(cancel: { connection.cancel() }) { (done: AsyncThrowingStream<Void, Error>.Continuation) in
-                    connection.send(content: data, completion: .contentProcessed { error in
-                        if let error { done.finish(throwing: error) } else { done.yield(()); done.finish() }
-                    })
-                }
-                return .object(["bytes": .int(Int64(data.count))])
+            let data = try Self.data(args)
+            try await networkReply(cancel: { connection.cancel() }) { (done: AsyncThrowingStream<Void, Error>.Continuation) in
+                connection.send(content: data, completion: .contentProcessed { error in
+                    if let error { done.finish(throwing: error) } else { done.yield(()); done.finish() }
+                })
             }
-            // fetch's own read; her connections read through receive.
-            return try await networkReply(cancel: { connection.cancel() }) { (done: AsyncThrowingStream<JSONValue, Error>.Continuation) in
-                connection.receive(minimumIncompleteLength: 1, maximumLength: Self.byteLimit) { data, _, complete, error in
-                    if let error { done.finish(throwing: error) }
-                    else {
-                        done.yield(.object(["base64": .string((data ?? Data()).base64EncodedString()),
-                                            "bytes": .int(Int64(data?.count ?? 0)), "eof": .bool(complete)])); done.finish()
-                    }
-                }
-            }
+            return .object(["bytes": .int(Int64(data.count))])
         case "network.close":
             let id = try text(args, "id")
             if let connection = connections.removeValue(forKey: id) { connection.cancel() }
@@ -931,10 +875,8 @@ actor ToolPrimitiveBroker {
 
     // MARK: - What it holds, and what arrives on it
 
-    /// Something reached a held thing: an ability that holds it across runs
-    /// is woken (EnginePartWake runs it one at a time and folds the same news
-    /// waiting twice into one). A read waiting on it takes it; else it waits
-    /// in the buffer reads take from.
+    /// Something reached a held thing: an ability that holds it across runs is woken (EnginePartWake runs it one at a time and folds the same news waiting twice into one). A read waiting on it takes it; else it waits in the buffer reads
+    /// take from.
     private func arrive(_ id: String, _ arrival: Arrival) {
         guard !closed, connections[id] != nil || programs[id] != nil || listeners[id] != nil else { return }
         // A program fails only past its output bound: it ends now, the failure kept for its next read.
@@ -949,9 +891,7 @@ actor ToolPrimitiveBroker {
         held?.signal("held", part: abilityID, ["id": .string(id), "kind": .string(kind)])
     }
 
-    /// The next arrival on a held thing, in order, waiting for one until
-    /// `deadline` (nil when it passed with nothing new); once it ended, what
-    /// ended it, again.
+    /// The next arrival on a held thing, in order, waiting for one until `deadline` (nil when it passed with nothing new); once it ended, what ended it, again.
     private func next(_ id: String, until deadline: ContinuousClock.Instant) async throws -> Arrival? {
         let arrival: Arrival
         if let first = inbox[id]?.first {
@@ -986,8 +926,7 @@ actor ToolPrimitiveBroker {
         if let error { waiting.reader.resume(throwing: error) } else { waiting.reader.resume(returning: nil) }
     }
 
-    /// A connection she holds keeps one read outstanding while nothing of it
-    /// waits unread, so what comes on it arrives, bounded to one piece.
+    /// A connection she holds keeps one read outstanding while nothing of it waits unread, so what comes on it arrives, bounded to one piece.
     private func pump(_ id: String) {
         guard let connection = connections[id], !pumping.contains(id), ended[id] == nil, inbox[id]?.isEmpty ?? true else { return }
         pumping.insert(id)
@@ -996,15 +935,17 @@ actor ToolPrimitiveBroker {
 
     private func pumped(_ id: String, _ connection: NWConnection) async {
         let arrival: Arrival
-        do {
-            arrival = try await networkReply(cancel: { connection.cancel() }) { (done: AsyncThrowingStream<Arrival, Error>.Continuation) in
-                connection.receive(minimumIncompleteLength: 1, maximumLength: Self.byteLimit) { data, _, complete, error in
-                    if let error { done.finish(throwing: error) } else { done.yield(.bytes(data ?? Data(), stream: nil, eof: complete)); done.finish() }
-                }
-            }
-        } catch { arrival = .failed(error) }
+        do { arrival = try await receive(connection) } catch { arrival = .failed(error) }
         pumping.remove(id)
         arrive(id, arrival)
+    }
+
+    private func receive(_ connection: NWConnection) async throws -> Arrival {
+        try await networkReply(cancel: { connection.cancel() }) { (done: AsyncThrowingStream<Arrival, Error>.Continuation) in
+            connection.receive(minimumIncompleteLength: 1, maximumLength: Self.byteLimit) { data, _, complete, error in
+                if let error { done.finish(throwing: error) } else { done.yield(.bytes(data ?? Data(), stream: nil, eof: complete)); done.finish() }
+            }
+        }
     }
 
     /// A held thing closed: what waited on it goes with it.
@@ -1017,8 +958,7 @@ actor ToolPrimitiveBroker {
     /// A run of the ability began: the watch it opens is its own.
     func begin() { running += 1 }
 
-    /// A run ended; returns the receipts of its watches. What a resident
-    /// ability holds stays held; anything else's reach ends with the run.
+    /// A run ended; returns the receipts of its watches. What a resident ability holds stays held; anything else's reach ends with the run.
     @discardableResult func finish() -> [JSONValue] {
         guard held != nil else { return close() }
         running -= 1
@@ -1054,176 +994,4 @@ actor ToolPrimitiveBroker {
         self.watch = nil; abilityObserver = nil
     }
 
-}
-
-/// Her text with each named placeholder replaced by its value; `url`
-/// percent-encodes the value for a URL.
-func insertingSecrets(_ text: String, _ values: [String: String], url: Bool = false) -> String {
-    values.reduce(text) { text, entry in
-        text.replacingOccurrences(of: "{{secret:\(entry.key)}}",
-            with: url ? entry.value.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-._~"))) ?? entry.value : entry.value)
-    }
-}
-
-/// What she reads back, with every value inserted in this run replaced by
-/// `[secret:<name>]` in each form an insertion writes it: as written,
-/// URL-encoded, escaped inside a JSON string (ASCII or UTF-8, slashes escaped or not) and
-/// base64; in a header name, in any case. A program granted a value can still re-encode it some other way;
-/// its grant is the fence.
-struct SecretRedactor: Sendable {
-    private(set) var values: [(name: String, bytes: Data)] = []
-    init() {}
-
-    mutating func add(_ values: [String: String]) {
-        for (name, value) in values {
-            let quoted = (try? JSONValue.string(value).serializedData(pretty: false)).map { String(decoding: $0.dropFirst().dropLast(), as: UTF8.self) } ?? value
-            // The UTF-8 JSON string most services write: only quote, backslash and control characters escaped.
-            let utf8 = value.unicodeScalars.map { scalar -> String in
-                switch scalar {
-                case "\"": "\\\""
-                case "\\": "\\\\"
-                case "\n": "\\n"
-                case "\r": "\\r"
-                case "\t": "\\t"
-                case _ where scalar.value < 0x20: String(format: "\\u%04x", scalar.value)
-                default: String(scalar)
-                }
-            }.joined()
-            let forms = [value, value.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-._~"))) ?? value,
-                         quoted, quoted.replacingOccurrences(of: "/", with: "\\/"), quoted.replacingOccurrences(of: "\\/", with: "/"), utf8,
-                         Data(value.utf8).base64EncodedString()]
-            for form in Set(forms) where !self.values.contains(where: { $0.bytes == Data(form.utf8) }) {
-                self.values.append((name, Data(form.utf8)))
-            }
-        }
-    }
-
-    func callAsFunction(_ text: String) -> String {
-        values.reduce(text) { $0.replacingOccurrences(of: String(decoding: $1.bytes, as: UTF8.self), with: "[secret:\($1.name)]") }
-    }
-
-    func callAsFunction(_ value: JSONValue) -> JSONValue { values.isEmpty ? value : value.mapStrings { self($0) } }
-
-    /// A header name, which HTTP does not case: lowercased, each value matched lowercased too.
-    func name(_ text: String) -> String {
-        values.reduce(text.lowercased()) { $0.replacingOccurrences(of: String(decoding: $1.bytes, as: UTF8.self).lowercased(), with: "[secret:\($1.name)]") }
-    }
-
-    func whole(_ data: Data) -> Data {
-        values.reduce(data) { data, secret in
-            var out = Data(), rest = data[...]
-            while let found = rest.range(of: secret.bytes) {
-                out += rest[..<found.lowerBound] + Data("[secret:\(secret.name)]".utf8); rest = rest[found.upperBound...]
-            }
-            return out + rest
-        }
-    }
-}
-
-/// Stream redaction holds secret prefixes of four or more bytes for the next
-/// piece. Up to three leading bytes may go out; their remainder is redacted.
-struct SecretStream: Sendable {
-    private var held = Data()
-    private var begun: [Data: Int] = [:]
-    public init() {}
-
-    mutating func pass(_ piece: Data, end: Bool, _ redactor: SecretRedactor) -> Data {
-        var data = held + piece
-        held = Data()
-        for (bytes, count) in begun {
-            let rest = bytes.dropFirst(count)
-            if data.starts(with: rest), let name = redactor.values.first(where: { $0.bytes == bytes })?.name {
-                data = Data("[secret:\(name)]".utf8) + data.dropFirst(rest.count)
-            } else if !end, rest.starts(with: data) {
-                held = data
-                return Data()
-            }
-        }
-        begun = [:]
-        data = redactor.whole(data)
-        guard !end else { return data }
-        var hold = 0
-        for secret in redactor.values {
-            guard let count = (1..<max(secret.bytes.count, 1)).reversed().first(where: { data.suffix($0) == secret.bytes.prefix($0) }) else { continue }
-            if count >= 4 { hold = max(hold, count) } else { begun[secret.bytes] = count }
-        }
-        if hold > 0 { begun = [:]; held = data.suffix(hold) }
-        return data.dropLast(hold)
-    }
-
-    /// The same pass, with a UTF-8 character split across pieces held whole:
-    /// only the start of a character that text before it can still complete;
-    /// bytes that cannot become UTF-8 go out at once. A value the shown text
-    /// began stays begun by what of it went out.
-    mutating func characters(_ piece: Data, end: Bool, _ redactor: SecretRedactor) -> Data {
-        var data = pass(piece, end: end, redactor)
-        if !end, let lead = data.suffix(4).lastIndex(where: { $0 & 0xC0 != 0x80 }), (0xC2...0xF4).contains(data[lead]) {
-            let width = data[lead] >= 0xF0 ? 4 : data[lead] >= 0xE0 ? 3 : 2
-            if data.endIndex - lead < width, String(data: data[..<lead], encoding: .utf8) != nil {
-                let moved = data.endIndex - lead
-                begun = begun.compactMapValues { $0 > moved ? $0 - moved : nil }
-                held = data[lead...] + held
-                data = data[..<lead]
-            }
-        }
-        return data
-    }
-}
-
-extension Parts {
-    public static func fetchRequest(_ args: [String: JSONValue]) throws -> URLRequest {
-        let fields = JSONValue.object(args).stringFields
-        guard let raw = fields["url"], let url = URL(string: raw),
-              ["https", "http"].contains(url.scheme?.lowercased() ?? ""), url.host != nil,
-              url.user == nil, url.password == nil, url.fragment == nil,
-              args["method"] == nil || fields["method"] != nil else {
-            throw ToolPrimitiveBroker.inputFailure("invalid_fetch_url", field: "url/method", accepted: "an http(s) URL without credentials or a fragment, and an optional string method")
-        }
-        let method = fields["method"]?.uppercased() ?? "GET"
-        guard !method.isEmpty, method.utf8.allSatisfy({ (65...90).contains($0) }) else {
-            throw ToolPrimitiveBroker.inputFailure("invalid_http_method", field: "method", accepted: "a nonempty HTTP method containing letters A-Z")
-        }
-        var request = URLRequest(url: url)
-        request.httpMethod = method
-        if let headers = args["headers"] {
-            guard case .object(let entries) = headers, entries.count == headers.stringFields.count,
-                  entries.keys.allSatisfy({ !["host", "connection", "content-length", "transfer-encoding"].contains($0.lowercased())
-                      && !$0.contains("\r") && !$0.contains("\n") }),
-                  headers.stringFields.values.allSatisfy({ !$0.contains("\r") && !$0.contains("\n") }) else {
-                throw ToolPrimitiveBroker.inputFailure("invalid_http_headers", field: "headers", accepted: "an object of string values without CR/LF; omit Host, Connection, Content-Length and Transfer-Encoding")
-            }
-            request.allHTTPHeaderFields = headers.stringFields
-        }
-        if let body = args["body"] {
-            if case .string(let text) = body { request.httpBody = Data(text.utf8) }
-            else {
-                request.httpBody = try body.serializedData(pretty: false)
-                if request.value(forHTTPHeaderField: "Content-Type") == nil {
-                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                }
-            }
-        }
-        guard (request.httpBody?.count ?? 0) <= 4 * 1024 * 1024, try JSONValue.object(args).serializedData(pretty: false).count <= 4 * 1024 * 1024 else {
-            throw ToolPrimitiveBroker.inputFailure("fetch_input_limit", field: "body/arguments", accepted: "a body and complete fetch arguments each no larger than 4 MiB")
-        }
-        return request
-    }
-
-    /// The protocol reads names as they came; a name is redacted only as it is shown to her.
-    public static func fetchReply(status: Int, headers: [String: String], data: Data,
-                                  name: (String) -> String = { $0 }, clean: (String) -> String) throws -> JSONValue {
-        guard let body = String(data: data, encoding: .utf8) else {
-            throw SenseFailure(code: "http_body_encoding", message: "fetch response body is not UTF-8. Request UTF-8 from the service or read binary bytes through network.receive; inspect service state before another modifying request.")
-        }
-        let safe = headers.reduce(into: [String: JSONValue]()) { result, entry in
-            if !["set-cookie", "authorization", "proxy-authenticate"].contains(entry.key.lowercased()) {
-                result[name(entry.key)] = .string(clean(entry.value))
-            }
-        }
-        let result: JSONValue = .object(["status": .int(Int64(status)), "headers": .object(safe), "body": .string(clean(body))])
-        guard try result.serializedData(pretty: false).count <= 4 * 1024 * 1024 else {
-            throw SenseFailure(code: "output_limit", message: "The complete fetch result exceeds 4 MiB. Request a smaller page or range; inspect service state before another modifying request.")
-        }
-        return result
-    }
 }

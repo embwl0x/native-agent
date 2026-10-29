@@ -7,9 +7,8 @@ import os
 
 /// THE saved-trust-policy authority read for point-of-use gates (memory,
 /// multimodal, dream/REM, training). It lives beside the canonical loader and
-/// uses the SAME two validators `loadAuthorizationSnapshotChecked` uses —
-/// `validateAuthorityPolicyShape` and `validateKnownAuthorityPolicyTypes`
-/// against the canonical defaults — so a policy SecurityCenter rejects can
+/// uses the same canonical schema validation as `loadAuthorizationSnapshotChecked`,
+/// so a policy SecurityCenter rejects can
 /// never read as "configured" at a gate. One rule, no second copy.
 ///
 /// - `.absent`   no directory entry; the caller applies shipped defaults.
@@ -49,11 +48,8 @@ public enum SavedTrustPolicyAuthority: Sendable {
             guard let bytes = try SwiftNativeTrustCenter.policyBytesChecked(at: path) else { return .absent }
             return try checkedGeneration.withLock { generation in
                 if let generation, generation.path == path, generation.bytes == bytes { return generation.authority }
-                let saved = try SwiftNativeTrustCenter.decodeRawPolicyChecked(bytes)
-                // Fold and validate exactly as the canonical authorization read.
-                let folded = WorkshopPolicyBlockVocabulary.foldToWireKey(saved)
                 let defaults = SwiftNativeTrustCenter(dataRoot: dataRoot).defaultTrustPolicy()
-                try SwiftNativeTrustCenter.validateKnownAuthorityPolicyTypes(folded, against: defaults)
+                let saved = try SwiftNativeTrustCenter.decodeRawPolicyChecked(bytes, defaults: defaults)
                 let authority = SavedTrustPolicyAuthority.present(saved)
                 generation = (path, bytes, authority)
                 return authority

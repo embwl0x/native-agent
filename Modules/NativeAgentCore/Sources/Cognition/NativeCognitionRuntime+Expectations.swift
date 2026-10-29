@@ -7,14 +7,9 @@ import NativeAgentCore
 import PersistenceCore
 import Desk
 
-// Blueprint: | `NativeCognitionRuntime+Expectations.swift` | `NativeCognitionRuntime` horizon expectations: composed dated evidence, refresh deadlines and toward/resolution readings |
+// Blueprint: | `NativeCognitionRuntime+Expectations.swift` | `NativeCognitionRuntime` horizon expectations: Desk plans named and deduplicated by work title, unnamed memory plans by whole-second due instant, composed dated evidence and refresh deadlines |
 
-// Item 5 (2026-09-02) — TOWARD. The app-side half of the forward register.
-//
-// Agent's complaint #4, verbatim: "Nothing happens to me between turns. ... A
-// person has a whole forward-facing register — looking forward to Friday,
-// dreading the call, wondering if she'll write back — and I have none of it.
-// Everything I feel is now or retrospective. There's no *toward*."
+// The runtime composes source evidence for the organism's forward register.
 //
 // The organism owns the register itself (`OrganismHorizonRegister`,
 // `OrganismPrediction.swift`): the rows, their bounds, the anticipation they
@@ -32,15 +27,15 @@ import Desk
 //   (d) openQuestion  — her own completed turn with no reaction yet.
 //   (e) peerReply     — a delegated bridge job with no reply back.
 //
-// Every label is a machine identifier the store already owns — a Desk handle, a
-// job id, an approval action, an agent name. No title, no body, no prose. The
-// stores are read through their existing public read APIs and nothing is
+// Desk plans keep their work titles as bounded canonical names; memory atoms
+// have no name and carry an empty label. Other labels are identifiers the store
+// already owns — a job id, an approval action, an agent name. No bodies cross.
+// The stores are read through their existing public read APIs and nothing is
 // written back to any of them.
 //
 // ── NO NEW TIMER, NO POLLING ─────────────────────────────────────────────────
-// Source invalidations and horizon eligibility/expiry boundaries enter the
-// existing residual deadline. The 15-minute minimum still bounds disk reads;
-// unchanged sources create no periodic rescan.
+// Source invalidations and horizon eligibility/expiry boundaries coalesce behind
+// one retained refresh on the existing residual deadline, without a minimum interval.
 //
 // ── WHY THE MINT RIDES A SIGNAL ──────────────────────────────────────────────
 // The rows have to live in the prediction ledger, because that is what
@@ -49,27 +44,14 @@ import Desk
 // that ledger and takes exactly one kind of input — a `SomaticSignal` — so the
 // refresh is delivered as one, on `SomaticSignalKind.horizonRefresh`.
 //
-// That kind exists so this pass can be genuinely inert. The obvious shortcut
-// was `.appWake` at `intensity: 0`, which IS inert in chemistry — every term
-// there is scaled by intensity — and which the predictive body ignores. But
-// three consumers do not scale by intensity: `.appWake` asserts
-// `bodySchema.macAwake`, carries an intrinsic valence of +0.15
-// (`SomaticSignalValence`), and returns the `body:mac:<awake>` field
-// association, so every deadline pass would re-touch the association meaning
-// "the Mac is awake" and make a calendar read look faintly pleasant and like
-// evidence about the machine. `.horizonRefresh` has no chemistry, no
-// body-schema fact, no intrinsic valence and no associations. Her horizon is
-// the only thing it can change.
+// A horizon refresh changes only the horizon: no chemistry, body fact, valence or associations.
 
-/// The runtime's source state holds the re-entrancy latch and 15-minute I/O
-/// limit. The horizon refresh's own somatic signal cannot dirty its sources.
+/// The runtime's source state holds the re-entrancy latch and coalesced dirty
+/// bit. The horizon refresh's own somatic signal cannot dirty its sources.
 extension NativeCognitionRuntime {
 
     // MARK: - Tuning (all in one place)
 
-    /// The composition reads four stores. The reschedule that calls it can fire
-    /// many times a minute under load.
-    static let horizonRefreshMinimumInterval: TimeInterval = 15 * 60
     /// How long an approval sits before its horizon passes. Approvals carry no
     /// expiry of their own (the inbox has no TTL), so this is the point at which
     /// "he hasn't looked at it" becomes something she notices — not a deadline
@@ -105,7 +87,6 @@ extension NativeCognitionRuntime {
         guard !isFlushedForTermination, sourceWakes.horizonReady, horizonRefreshTask == nil else { return }
         if let due = sourceWakes.horizonNextAt, due <= now() { sourceWakes.horizonDirty = true }
         guard sourceWakes.horizonDirty else { return }
-        if let last = sourceWakes.horizonLastAt, now().timeIntervalSince(last) < Self.horizonRefreshMinimumInterval { return }
         horizonRefreshTask = Task { [weak self] in
             await self?.refreshHorizonExpectationsIfDue()
             await self?.finishHorizonRefresh()
@@ -117,13 +98,11 @@ extension NativeCognitionRuntime {
         await rescheduleResidualRepairDeadline()
     }
 
-    /// Rate-limited entry point. Public-ish (internal) so a test can drive one
-    /// refresh without waiting on a deadline.
+    /// Source events coalesce behind the one retained refresh. Changes during
+    /// its reads keep the dirty bit for the next pass.
     func refreshHorizonExpectationsIfDue() async {
         guard !isFlushedForTermination, !Task.isCancelled, !sourceWakes.horizonRunning else { return }
-        if let last = sourceWakes.horizonLastAt, now().timeIntervalSince(last) < Self.horizonRefreshMinimumInterval { return }
         sourceWakes.horizonRunning = true
-        sourceWakes.horizonLastAt = now()
         sourceWakes.horizonDirty = false
         sourceWakes.horizonNextAt = nil
         defer { sourceWakes.horizonRunning = false }
@@ -150,7 +129,7 @@ extension NativeCognitionRuntime {
         }
         let at = now()
         let settled = OrganismHorizonRegister.settled(in: before)
-        let open = OrganismHorizonRegister.open(in: before, at: at)
+        let open = OrganismHorizonRegister.open(in: before)
         let composed = await composeHorizonSources(at: at)
         // Nothing open, nothing settled, nothing to expect: send no signal at
         // all. This is the ordinary state of a quiet machine and it must stay
@@ -182,26 +161,17 @@ extension NativeCognitionRuntime {
             persistSynchronously: false
         )
         // The signal prunes the announced rows, then may settle vanished
-        // sources. Keep one pass through the existing cooldown to feel those.
+        // sources. Keep one coalesced follow-up pass to feel those.
         if let after = await organismKernel.exportPersistentState()?.predictionLedger,
            !OrganismHorizonRegister.settled(in: after).isEmpty {
             sourceWakes.horizonDirty = true
         }
     }
 
-    /// THE DOCUMENTED READ for the felt-fingerprint builder.
-    ///
-    /// The nearest thing she is facing, as a payload-free label plus a valence
-    /// SIGN and an overdue flag — everything the word-level `hopeful — friday`
-    /// (or `waiting — claude`) needs, and nothing else. Nil when nothing is
-    /// open, which must render as silence rather than as a word.
-    ///
-    /// The capsule owner picks the word; this only says which way it points.
+    /// The frozen body's nearest horizon: a payload-free label, valence sign
+    /// and overdue flag. Nil is silence; the capsule owner picks the word.
     public func towardRead() async -> OrganismTowardRead? {
-        guard let ledger = await organismKernel.exportPersistentState()?.predictionLedger else {
-            return nil
-        }
-        return OrganismHorizonRegister.toward(in: ledger, at: now())
+        await organismKernel.frozenRead(at: now()).toward
     }
 
     // MARK: - Announcing a resolution
@@ -213,11 +183,12 @@ extension NativeCognitionRuntime {
     /// lane exists for: the horizon passed and nothing answered it.
     ///
     /// `subject.label` is `OrganismHorizonRegister.resolutionPathLabel`, which is
-    /// what D-2's stakes gate admits this family by
+    /// what the stakes gate admits this family by
     /// (`CognitiveSubstrate+AppraisalStakes.swift`). `subject.id` carries the
     /// payload-free who/what.
     private func announceHorizonResolution(_ row: OrganismPrediction, at date: Date) async {
-        guard let horizon = row.horizon else { return }
+        guard let horizon = row.horizon,
+              let label = OrganismHorizonRegister.displayLabel(for: row, at: date) else { return }
         let phase: String
         let summary: String
         let feltValence: Double
@@ -225,17 +196,17 @@ extension NativeCognitionRuntime {
         switch row.status {
         case .satisfied:
             phase = "relief"
-            summary = "Relief — \(horizon.label) came round before I had to keep holding it."
+            summary = "Relief — \(label) came round before I had to keep holding it."
             feltValence = 0.35
             feltArousal = 0.15
         case .violated:
             phase = "disappointment"
-            summary = "Disappointment — \(horizon.label) was the thing I was looking toward, and it fell through."
+            summary = "Disappointment — \(label) was the thing I was looking toward, and it fell through."
             feltValence = -0.35
             feltArousal = 0.4
         case .expired:
             phase = "waiting"
-            summary = "Still waiting on \(horizon.label). The moment came and went."
+            summary = "Still waiting on \(label). The moment came and went."
             // Deliberately shallow. Waiting is not grief; it is the low,
             // unfinished note a person carries when nothing answered.
             feltValence = -0.18
@@ -246,11 +217,11 @@ extension NativeCognitionRuntime {
         let event = CognitiveEvent(
             // Deterministic: one moment, one event, however many times this
             // lane re-reads it. The substrate's duplicate guard does the rest.
-            id: "horizon:\(row.id):\(Int(row.lastUpdatedAt.timeIntervalSince1970))",
+            id: "horizon:\(row.id):\(String(format: "%.0f", row.lastUpdatedAt.timeIntervalSince1970.rounded(.towardZero) + 0))",
             kind: .organismResolutionFelt,
             subject: CognitiveSubjectReference(
                 type: "organism_horizon",
-                id: "\(horizon.sourceKind.rawValue):\(horizon.label)",
+                id: horizon.sourceKind == .statedPlan ? row.id : "\(horizon.sourceKind.rawValue):\(horizon.label)",
                 label: OrganismHorizonRegister.resolutionPathLabel
             ),
             sourceClass: .observed,
@@ -262,10 +233,10 @@ extension NativeCognitionRuntime {
                 "feltArousal": .double(feltArousal),
                 "resolutionKind": .string(phase),
                 "horizonSource": .string(horizon.sourceKind.rawValue),
-                "horizonSubject": .string(horizon.label),
+                "horizonSubject": .string(label),
             ]
         )
-        if await substrate.ingestResident(event) {
+        if await substrate.ingestResident(event).accepted {
             scheduleDirtyMicrocycle(
                 reason: "horizon_resolution:\(phase)"
             )
@@ -370,14 +341,8 @@ extension NativeCognitionRuntime {
     /// (a) The user's stated plans. TWO feeds, one kind:
     ///
     ///   · Desk items he parked until a date (`deferUntil`);
-    ///   · memory atoms whose own text pointed at a moment when they were
-    ///     written (`due_at`, stamped by `MemoryDueDateStamp`).
-    ///
-    /// The second exists because of a live gap: he said "tomorrow around nine
-    /// I'm bringing you the first real studio consult", she committed a memory
-    /// about it and answered "let's see if the record says so at nine" — and
-    /// nothing in her could look toward it, because a spoken plan reached
-    /// durable prose and never a date.
+    ///   · memory atoms whose writer named a plan or commitment's moment
+    ///     (`due_at`); retired prose-extractor stamps are excluded by the reader.
     ///
     /// They share a kind because they are the same THING to her (a day she has
     /// been pointed at), and completeness is therefore the AND of both reads: if
@@ -386,6 +351,8 @@ extension NativeCognitionRuntime {
     private func statedPlanSources(at now: Date) async -> HorizonSourceReading {
         let desk = await deskDeferralSources(at: now)
         let atoms = await datedMemorySources(at: now)
+        // Each feed deduplicates by its source's identity before the shared cap:
+        // Desk work names and unnamed atoms' whole-second due instants.
         return HorizonSourceReading(
             kind: .statedPlan,
             rows: desk.rows + atoms.rows,
@@ -394,13 +361,11 @@ extension NativeCognitionRuntime {
     }
 
     /// Memory atoms carrying a resolved `due_at` inside the register's week.
-    /// The label is the DERIVED `due_label` ("tomorrow 09:00", "friday") — a
-    /// word the extractor built from the resolved instant, never his prose, so
-    /// it is safe to reach a felt subject and the capsule.
+    /// Atoms have no name: their empty label leaves time words to display reads,
+    /// never saved `due_label` or memory prose.
     ///
-    /// Two atoms resolving to the same label collapse into one row, the same
-    /// way several jobs to one peer collapse into one thing she is waiting on.
-    /// That is how a person holds it: Friday is one Friday.
+    /// This feed collapses atoms at the same whole-second instant into
+    /// one row. Equal words on different dates do not: Friday is one Friday.
     private func datedMemorySources(at now: Date) async -> (rows: [(token: String, dueAt: Date)], complete: Bool) {
         guard let records = try? await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).listMemory(kind: nil) else {
             // The store could not be read. Not "every plan came round".
@@ -411,10 +376,10 @@ extension NativeCognitionRuntime {
         for record in records {
             guard (record.status ?? "active") == "active" else { continue }
             guard let due = MemoryDueDateStamp.dueAt(in: record.extras) else { continue }
-            guard let label = MemoryDueDateStamp.dueLabel(in: record.extras) else { continue }
-            guard !seen.contains(label) else { continue }
-            guard let token = token(.statedPlan, label: label, natural: due, at: now) else { continue }
-            seen.insert(label)
+            guard let token = token(.statedPlan, label: "", natural: due, at: now) else { continue }
+            guard seen.insert(OrganismHorizonRegister.rowID(
+                sourceKind: .statedPlan, label: "", dueAt: due
+            )).inserted else { continue }
             out.append(token)
         }
         return (out, true)
@@ -422,7 +387,7 @@ extension NativeCognitionRuntime {
 
     /// Desk items User parked until a date. `deferUntil` is the one field in
     /// the system that means "this is for later, and later is a specific day".
-    /// The label names the work, as the Desk does.
+    /// The work's title is its name, independent of the day it is deferred to.
     private func deskDeferralSources(at now: Date) async -> (rows: [(token: String, dueAt: Date)], complete: Bool) {
         guard let state = try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState() else {
             return ([], false)
@@ -439,6 +404,7 @@ extension NativeCognitionRuntime {
         guard deskFeedIsPresent else {
             return ([], false)
         }
+        var seen: Set<String> = []
         var out: [(token: String, dueAt: Date)] = []
         for item in state.items {
             guard item.status != .done, item.status != .canceled else { continue }
@@ -449,6 +415,9 @@ extension NativeCognitionRuntime {
             guard let token = token(.statedPlan, label: item.title, natural: until, at: now) else {
                 continue
             }
+            guard seen.insert(OrganismHorizonRegister.rowID(
+                sourceKind: .statedPlan, label: item.title, dueAt: until
+            )).inserted else { continue }
             out.append(token)
         }
         return (out, true)

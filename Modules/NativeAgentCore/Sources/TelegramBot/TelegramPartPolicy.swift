@@ -30,10 +30,10 @@ extension SwiftNativeTelegramBot {
     /// can arrange their buttons, but cannot introduce another callback action.
     func modelPicker(_ op: String, menu: TelegramModelMenu?, args: [String] = [],
         providerId: String? = nil, modelId: String? = nil) async throws -> TelegramModelPickerDecision {
-        let packet: JSONValue = menu.map { menu in .object([
+        let packet: JSONValue = menu.flatMap { menu in menu.providers.map { providers in .object([
             "surface": .string(menu.surface), "currentModel": .string(menu.currentModel),
             "currentProvider": .string(menu.currentProvider),
-            "providers": .array(menu.providers.map { provider in .object([
+            "providers": .array(providers.map { provider in .object([
                 "id": .string(provider.id), "displayName": .string(provider.displayName),
                 "isCurrent": .bool(provider.isCurrent),
                 "callback": .string(TelegramModelSelectionCallback.providerData(id: provider.id)),
@@ -42,18 +42,18 @@ extension SwiftNativeTelegramBot {
                     "callback": .string(TelegramModelSelectionCallback.modelData(providerId: provider.id, modelId: model.id))
                 ]) })
             ]) })
-        ]) } ?? .null
-        let current = menu == nil ? await completenessDeps?.routing?.modelForSurface("telegram") : nil
+        ]) } } ?? .null
+        let current = packet == .null ? menu : nil
         let decision: TelegramModelPickerDecision = try await callTelegramPart("telegram-model-picker", input: .object([
             "op": .string(op), "menu": packet,
-            "menuStatus": .string(menu == nil ? "unavailable" : "available"),
+            "menuStatus": .string(packet == .null ? "unavailable" : "available"),
             "args": .array(args.map(JSONValue.string)),
             "providerId": providerId.map(JSONValue.string) ?? .null,
             "modelId": modelId.map(JSONValue.string) ?? .null,
             "providersCallback": .string(TelegramModelSelectionCallback.providersData),
             "current": .object(["status": .string(current == nil ? "unavailable" : "available"),
-                "model": current.map { .string($0.model) } ?? .null,
-                "provider": current.map { .string($0.provider) } ?? .null])
+                "model": current.map { .string($0.currentModel) } ?? .null,
+                "provider": current.map { .string($0.currentProvider) } ?? .null])
         ]))
         if op == "command", decision.reply?.isEmpty != false {
             throw PartCallError(code: "bad_result", message: "The model picker returned no command reply.")
@@ -70,7 +70,7 @@ extension SwiftNativeTelegramBot {
               case .array(let rows)? = markup["inline_keyboard"], rows.count <= 41 else {
             throw PartCallError(code: "bad_result", message: "The model picker returned an invalid Telegram menu.")
         }
-        let allowed = Set(menu.providers.flatMap { provider in
+        let allowed = Set((menu.providers ?? []).flatMap { provider in
             [TelegramModelSelectionCallback.providerData(id: provider.id)] + provider.models.map {
                 TelegramModelSelectionCallback.modelData(providerId: provider.id, modelId: $0.id)
             }

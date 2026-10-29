@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `SecurityCenter+RegistryReceipts.swift` | `SwiftNativeSecurityCenter`: `receiptSummary`, `isoTimestamp` |
@@ -14,7 +15,7 @@ extension SwiftNativeSecurityCenter {
         // non-blank before it becomes UI state.
         func required(_ key: String, aliases: [String] = []) -> String? {
             for candidate in [key] + aliases {
-                if let value = string(obj[candidate])?.trimmingCharacters(in: .whitespacesAndNewlines),
+                if let value = obj[candidate]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !value.isEmpty {
                     return value
                 }
@@ -31,7 +32,7 @@ extension SwiftNativeSecurityCenter {
         }
         let reasons: [String] = {
             guard case .array(let arr)? = obj["reasons"] else { return [] }
-            return arr.compactMap { string($0)?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            return arr.compactMap { $0.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
         }()
         return SecurityReceiptSummary(

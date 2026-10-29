@@ -52,9 +52,7 @@ extension QuietCognitionLane {
     func refreshQuietConnectors() async
 }
 
-/// Agent, 2026-10-01, under User's ruling that she is boss below his floor:
-/// the switches she may turn down. Each row calls the setter its page calls;
-/// the direction rule is Core's (`QuietSettings.lowerOnly` / `narrowOnly`).
+/// Lower-only rows use their page's setters and Core's `lowerOnly` / `narrowOnly` direction rules.
 extension QuietLowerOnlySettingsHost {
     public var lowerOnlyRows: [QuietSetting] {
         let root = dataRootOverride ?? PersistenceCore.defaultDataRoot()
@@ -213,7 +211,7 @@ extension QuietLowerOnlySettingsHost {
             try await self.configureQuietTelegram(chats: chats, users: users, mention: mention, enabled: enabled)
             let restart = self.restartQuietTelegram
             Task.detached {
-                await TelegramTurnCoordinator.shared.waitUntilAllIdle()
+                await TelegramTurns.shared.waitUntilAllIdle()
                 await restart()
             }
             await self.refreshQuietTelegram()

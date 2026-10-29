@@ -2,6 +2,7 @@ import PersistenceCore
 import Experiences
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 // Blueprint: | `RunLedger.swift` | `RunLedger`: cross-surface completed-run summary |
 
 // MARK: - RunLedger
@@ -13,11 +14,8 @@ import NativeAgentCore
 /// appends one row here at completion.
 ///
 /// Contract notes:
-/// - The on-disk shape is a BARE ARRAY of row objects, newest-first — the
-///   shape `RuntimeReadProjection.runs(dataRoot:)` already parses. Readers are not
-///   changed by this writer. If a daemon-era `{"runs": [...]}` wrapper file
-///   is ever encountered, its rows are preserved and the file is rewritten
-///   as a bare array.
+/// - Reads accept a bare array or a {"runs": [...]} wrapper. Appends
+///   preserve raw rows and write a bare array, newest first.
 /// - Rows carry the RunRecord fields the readers decode:
 ///   id / kind / status / model / prompt / output / error / createdAt /
 ///   durationSeconds. Swarm rows also retain the selected run reasoningEffort;
@@ -32,7 +30,7 @@ import NativeAgentCore
 ///   append that lands. A damaged ledger is never replaced by a fresh one:
 ///   its rows stay where they are until it is repaired or moved aside.
 public enum RunLedger {
-    /// Cap on retained run records. The daemon-era reader slices to 200;
+    /// Cap on retained run records. The Runs page slices to 200;
     /// keep a deeper on-disk tail so the UI cap isn't also the history cap.
     public static let maxRetainedRuns = 500
 
@@ -81,15 +79,14 @@ public enum RunLedger {
         let path = dataRoot
             .appendingPathComponent("runs", isDirectory: true)
             .appendingPathComponent("runs.json")
-        let persistence = SwiftNativePersistenceCore()
         do {
-            try await persistence.withFileLock(path) {
+            try await SwiftNativePersistenceCore.withFileLock(path) {
                 var rows = try Self.readLedgerRows(at: path)
                 rows.insert(finalRow, at: 0)
                 if rows.count > maxRetainedRuns {
                     rows.removeLast(rows.count - maxRetainedRuns)
                 }
-                try await persistence.writeJSON(.array(rows), to: path)
+                try await SwiftNativePersistenceCore.writeJSON(.array(rows), to: path)
             }
             await RepairOwed.settle(dataRoot, operation: ledgerOperation, evidence: .init(source: "run", id: id)).value
         } catch {
@@ -102,6 +99,12 @@ public enum RunLedger {
 
     static let ledgerOperation = "runs.ledger.append"
 
+    /// Typed reader projection; raw rows remain authoritative for mutation.
+    public static func records(from data: Data) throws -> [RunRecord] {
+        try JSONDecoder().decode([RunRecord].self,
+            from: JSONValue.array(ledgerRows(from: JSONDecoder().decode(JSONValue.self, from: data))).serializedData(pretty: false))
+    }
+
     /// Missing means a first run. Anything that is not the ledger's shape is
     /// damaged history: the append refuses rather than replacing it.
     private static func readLedgerRows(at path: URL) throws -> [JSONValue] {
@@ -111,16 +114,18 @@ public enum RunLedger {
         } catch CocoaError.fileReadNoSuchFile {
             return []
         }
-        switch try JSONValue.parse(data) {
+        return try ledgerRows(from: JSONValue.parse(data))
+    }
+
+    private static func ledgerRows(from raw: JSONValue) throws -> [JSONValue] {
+        switch raw {
         case .array(let rows):
             return rows
-        // Daemon-era wrapper tolerance: keep the rows, drop the wrapper
-        // (readers accept both; the writer emits bare).
         case .object(let obj):
             if case .array(let rows)? = obj["runs"] { return rows }
             fallthrough
         default:
-            throw PersistenceCoreError.ioFailure("\(path.path) is not a run ledger (expected an array of runs)")
+            throw PersistenceCoreError.ioFailure("Not a run ledger (expected an array of runs)")
         }
     }
 

@@ -44,8 +44,7 @@ public enum PartRunStore {
         guard let mac = await seal(run, root: root) else { return false }
         run["seal"] = .string(mac)
         guard let data = try? JSONValue.object(run).serializedData(pretty: false), data.count <= byteLimit,
-              (try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)) != nil,
-              (try? data.write(to: url, options: .atomic)) != nil else { return false }
+              (try? SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)) != nil else { return false }
         let runs = (try? fm.contentsOfDirectory(at: url.deletingLastPathComponent(),
                                                 includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
         let newest = runs.map { ($0, (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast) }

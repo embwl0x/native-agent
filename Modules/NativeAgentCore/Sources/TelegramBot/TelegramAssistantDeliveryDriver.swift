@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 // Blueprint: | `TelegramAssistantDeliveryDriver.swift` | `TelegramAssistantDeliveryDriver` actor; `onDelta`, `finalize` |
 
 enum TelegramAssistantDeliveryOutcome: Sendable, Equatable {
@@ -65,6 +66,7 @@ actor TelegramAssistantDeliveryDriver {
     private var draftsUnavailable = false
     private var lastRichDraftAt = Date.distantPast
     private var pendingRichText: String?
+    private var accumulatedText = ""
     private var richDraftFlush: Task<Void, Never>?
 
     init(
@@ -89,15 +91,12 @@ actor TelegramAssistantDeliveryDriver {
         self.sendGeneratedImage = sendGeneratedImage
     }
 
-    func onDelta(_ accumulated: String) async {
+    func onDelta(_ chunk: String) async {
         guard !terminal, !draftsUnavailable else { return }
-        let safeAccumulated = TelegramRichMessageRenderer.sanitize(
-            TelegramRichMessageRenderer.stripBoldMarkers(accumulated)
-        )
-        guard !safeAccumulated.isEmpty else { return }
         // Native drafts are private-chat previews; groups retain rich finals.
         guard destination.chatId > 0 else { return }
-        pendingRichText = safeAccumulated
+        accumulatedText += chunk
+        pendingRichText = accumulatedText
         scheduleRichDraftFlush()
     }
 
@@ -121,9 +120,10 @@ actor TelegramAssistantDeliveryDriver {
             }
             guard let text = pendingRichText else { break }
             pendingRichText = nil
+            let safeText = TelegramRichMessageRenderer.sanitize(TelegramRichMessageRenderer.stripBoldMarkers(text))
             // An opening code fence alone has no visible block yet. The next
             // delta can complete it without disabling the native preview.
-            guard let rich = TelegramRichMessageRenderer.render(text).last else { continue }
+            guard let rich = TelegramRichMessageRenderer.render(safeText).last else { continue }
             // One task owns the wire and claims this window before the send.
             lastRichDraftAt = Date()
             do {
@@ -255,7 +255,7 @@ actor TelegramAssistantDeliveryDriver {
         if let failure = error as? TelegramAPIFailure,
            failure.httpStatus != 429, failure.errorCode != 429,
            (failure.httpStatus ?? 0) < 500, (failure.errorCode ?? 0) < 500 {
-            let reason = TelegramTurnPresentationReducer.sanitized(String(describing: failure)) ?? "delivery failed"
+            let reason = TurnPresentationReducer.sanitized(String(describing: failure)) ?? "delivery failed"
             rejected.lastRejection = .init(
                 reason: "Reply rejected before acceptance: \(reason). Use /retry resend to deliver the saved answer.",
                 reply: rejected.reply, imagePaths: rejected.imagePaths)
@@ -273,14 +273,14 @@ actor TelegramAssistantDeliveryDriver {
     private func reportFailure(step: String, error: Error) async {
         await recordFailure(
             "Telegram assistant \(step) failed for chat \(destination.chatId): "
-                + (TelegramTurnPresentationReducer.sanitized(String(describing: error)) ?? "delivery failed")
+                + (TurnPresentationReducer.sanitized(String(describing: error)) ?? "delivery failed")
         )
     }
 
     static func isKnownNotDelivered(_ error: Error) -> Bool {
         guard let failure = error as? TelegramAPIFailure else { return false }
         switch failure.kind {
-        case .rejected:
+        case .rejected, .invalidDuration:
             return true
         case .httpStatus:
             if let status = failure.httpStatus { return (400..<500).contains(status) }

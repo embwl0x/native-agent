@@ -25,6 +25,9 @@ public struct WorkshopExecutorDrainRunner: EventDeadlineLoopRunner {
         EventDeadlinePhysiology.storeAndFileEvents(paths: [
             dataRoot.appendingPathComponent("workshop/executions", isDirectory: true),
             dataRoot.appendingPathComponent("trust/policy.json"),
+            dataRoot.appendingPathComponent("desk/desk_ops.jsonl"),
+            dataRoot.appendingPathComponent("desk/desk_ops_base.json"),
+            dataRoot.appendingPathComponent("desk/desk_archive.jsonl"),
         ], loopId: loopId)
     }
 

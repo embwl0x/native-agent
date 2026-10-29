@@ -8,24 +8,24 @@ extension AgentWorkspaceNavigation {
         placeIdentity(place).map { "window:place:" + SHA256.hash(data: Data($0.utf8)).map { String(format: "%02x", $0) }.joined() }
     }
 
-    /// Distinguish same-titled windows without exposing routing handles.
+    /// Title one recognized window set without exposing routing handles.
     /// Ordering by resident identity keeps labels stable across recency changes.
-    static func windowTitle(_ place: AgentWorkspaceLocation, session: Session) -> String {
-        func title(_ value: AgentWorkspaceLocation) -> String {
-            let display = placeIdentity(value).flatMap { session.browserBookmarks[$0] } ?? value
+    static func windowTitle(_ session: Session) -> [(place: AgentWorkspaceLocation, title: String)] {
+        let places = recognizedPlaces(session)
+        let displays = places.map { placeIdentity($0).flatMap { session.browserBookmarks[$0] } ?? $0 }
+        var titles = displays.map { display in
             let name = String(display.title.prefix(130))
             if case .browserBookmark(_, _, nil) = display { return name + " (saved source)" }
             return name
         }
-        let name = title(place)
-        let matches = recognizedPlaces(session).filter { title($0) == name }
-            .sorted {
-                let left = placeIdentity($0).flatMap { session.browserBookmarks[$0] } ?? $0
-                let right = placeIdentity($1).flatMap { session.browserBookmarks[$0] } ?? $1
-                return (placeIdentity(left) ?? "") < (placeIdentity(right) ?? "")
+        for group in Dictionary(grouping: places.indices, by: { titles[$0] }).values where group.count > 1 {
+            for (number, index) in group.sorted(by: {
+                (placeIdentity(displays[$0]) ?? "") < (placeIdentity(displays[$1]) ?? "")
+            }).enumerated() {
+                titles[index] += " (window \(number + 1))"
             }
-        guard matches.count > 1, let index = matches.firstIndex(where: { samePlace($0, place) }) else { return name }
-        return name + " (window \(index + 1))"
+        }
+        return zip(places, titles).map { (place: $0.0, title: $0.1) }
     }
     /// Explicitly selecting an app window brings that app forward through the
     /// normal Mac owner. Refresh/Back/restoration remain observations only.
@@ -44,38 +44,38 @@ extension AgentWorkspaceNavigation {
     func window(named query: String, key: String) -> AgentWorkspaceAction? {
         guard let session = sessions[key] else { return nil }
         let name = query.lowercased()
+        let windows = Self.windowTitle(session)
         if name.hasPrefix("place:") {
-            return Self.recognizedPlaces(session).first { Self.windowReference($0) == "window:" + name }
-                .map { .window(Self.windowAction($0)) }
+            return windows.first { Self.windowReference($0.place) == "window:" + name }
+                .map { .window(Self.windowAction($0.place)) }
         }
-        let places = Self.recognizedPlaces(session).filter {
-            Self.windowTitle($0, session: session).lowercased() == name || $0.title.lowercased() == name }
+        let places = windows.filter { $0.title.lowercased() == name || $0.place.title.lowercased() == name }
         if places.count > 1 { return nil }
-        if let place = places.first { return .window(Self.windowAction(place)) }
+        if let place = places.first { return .window(Self.windowAction(place.place)) }
         return AgentWorkspaceEnvironment.destinations.first { $0.title.lowercased() == name }.map { .open(.area($0.id)) }
     }
     /// The windows this chat holds (drafts, the work she returns to, pages
     /// she acted in), unfinished first: home's OPEN line.
     func openWindowTitles(key: String) -> [String] {
         guard let session = sessions[key] else { return [] }
-        return Self.recognizedPlaces(session).map { Self.windowTitle($0, session: session) }
+        return Self.windowTitle(session).map(\.title)
     }
 
     /// Recognition uses only this chat's bounded resident references. Listing
     /// does not read transcripts, acknowledge arrivals, or refresh owner state.
-    func recognizedOpenPlaces(key: String) -> AgentWorkspaceProjection {
+    func recognizedOpenPlaces(key: String) -> WorkspacePage {
         let session = sessions[key] ?? Session()
-        let places = Self.recognizedPlaces(session)
-        let current = session.path.reversed().first { !Self.isOverview($0) }
+        let windows = Self.windowTitle(session)
+        let current = session.arrangement.path.reversed().first { !Self.isOverview($0) }
         let returning = session.arrivalReturn?.path.last
-        let items = places.map { location -> AgentWorkspaceItem in
+        let items = windows.map { location, title -> AgentWorkspaceItem in
             let display = Self.placeIdentity(location).flatMap { session.browserBookmarks[$0] } ?? location
             var content = Self.placeRecognition(display)
             if let receipt = Self.placeAction(display, session: session) { content["last_action_here"] = receipt }
             let group = Self.placeGroup(location, session: session)
             content["group"] = .string(group)
             if Self.samePlace(location, current) { content["context"] = .string("Last selected place") }
-            if Self.samePlace(location, session.workAnchor) { content["work_context"] = .string(session.workTopic ?? "Current work") }
+            if Self.samePlace(location, session.arrangement.workAnchor) { content["work_context"] = .string(session.arrangement.workTopic ?? "Current work") }
             if Self.samePlace(location, returning) { content["return_point"] = .bool(true) }
             let close: AgentWorkspaceButton
             let openLabel: String
@@ -86,13 +86,13 @@ extension AgentWorkspaceNavigation {
                 close = .init(label: "Close place", action: .closePlace(location))
                 openLabel = "Open"
             }
-            return .init(title: Self.windowTitle(location, session: session), content: .object(content), actions: [
+            return .init(title: title, content: .object(content), actions: [
                 .init(label: openLabel, action: Self.windowAction(location)), close
             ])
         }
         let groups = ["Needs attention", "Unfinished drafts", "Return to work", "Recent places"]
         let counts = groups.compactMap { group -> JSONValue? in
-            let count = places.filter { Self.placeGroup($0, session: session) == group }.count
+            let count = windows.filter { Self.placeGroup($0.place, session: session) == group }.count
             return count == 0 ? nil : .object(["name": .string(group), "count": .int(Int64(count))])
         }
         return .init(title: "Open places", content: .object([
@@ -106,17 +106,17 @@ extension AgentWorkspaceNavigation {
         func append(_ location: AgentWorkspaceLocation) {
             let latest: AgentWorkspaceLocation
             if case .form(let form) = location {
-                guard let resident = session.drafts.first(where: { $0.draftID == form.draftID }) else { return }
+                guard let resident = session.arrangement.drafts.first(where: { $0.draftID == form.draftID }) else { return }
                 latest = .form(resident)
             } else { latest = location }
             guard !places.contains(where: { samePlace($0, latest) }) else { return }
             places.append(latest)
         }
         // Drafts belong to the chat and remain reachable across arrangements.
-        for draft in session.drafts.reversed() { append(.form(draft)) }
+        for draft in session.arrangement.drafts.reversed() { append(.form(draft)) }
         if let returning = session.arrivalReturn?.path.last, !isOverview(returning) { append(returning) }
-        if let anchor = session.workAnchor { append(anchor) }
-        for location in session.places.reversed() { append(location) }
+        if let anchor = session.arrangement.workAnchor { append(anchor) }
+        for location in session.arrangement.places.reversed() { append(location) }
         return places.enumerated().sorted { lhs, rhs in
             let a = placePriority(lhs.element, session: session)
             let b = placePriority(rhs.element, session: session)
@@ -126,7 +126,7 @@ extension AgentWorkspaceNavigation {
 
     private static func placePriority(_ location: AgentWorkspaceLocation, session: Session) -> Int {
         if case .form(let form) = location { return form.needsOutcomeReview || form.schemaIssue != nil ? 0 : 1 }
-        if samePlace(location, session.arrivalReturn?.path.last) || samePlace(location, session.workAnchor) { return 2 }
+        if samePlace(location, session.arrivalReturn?.path.last) || samePlace(location, session.arrangement.workAnchor) { return 2 }
         return 3
     }
 

@@ -1,8 +1,3 @@
-// E2 (upgrade-sweep 2026-08): action responses await a push-driven rendezvous
-// keyed on correlationID instead of a 0.5–0.75s file poll. A decision action
-// (300s timeout / 0.75s interval) used to fire ~400 CloudKit drains per tap;
-// with the waiter the drain only runs when the backstop tick fires without a
-// push having landed the response.
 import Foundation
 
 /// One MainActor-isolated rendezvous between the transport drain that persists
@@ -13,7 +8,7 @@ import Foundation
 final class ActionResponseWaiters {
     static let shared = ActionResponseWaiters()
 
-    /// Cadence used when no push arrives. Per E2 the poll is a backstop only.
+    /// Backstop cadence for transport drains when no push arrives.
     static let backstopInterval: TimeInterval = 5
 
     private var waiters: [String: [UUID: CheckedContinuation<Bool, Never>]] = [:]
@@ -63,6 +58,8 @@ final class ActionResponseWaiters {
     @discardableResult
     func wait(_ correlationID: String, timeout: TimeInterval) async -> Bool {
         if arrived.contains(correlationID) { return true }
+        guard timeout.isFinite, timeout >= 0,
+              let delay = UInt64(exactly: (timeout * 1_000_000_000).rounded(.towardZero)) else { return false }
         let token = UUID()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
@@ -76,7 +73,7 @@ final class ActionResponseWaiters {
                 }
                 waiters[correlationID, default: [:]][token] = continuation
                 timeoutTasks[token] = Task { @MainActor [weak self] in
-                    try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
+                    try? await Task.sleep(nanoseconds: delay)
                     self?.resume(correlationID: correlationID, token: token, signalled: false)
                 }
             }

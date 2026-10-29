@@ -4,37 +4,21 @@ import PersistenceCore
 // Blueprint: | `CognitiveSubstrate+CapsuleFeltSignals.swift` | `CognitiveSubstrate`: `feltTintNodes`, `feltDominantNode`, `feltObjectLabel` |
 
 extension CognitiveSubstrate {
-    /// The felt fingerprint capsule line (User, 2026-07-08): her live emotional +
-    /// attentional state in a few honest words she FEELS, not sentences she reads.
-    /// Replaces the Focus/Feeling/Voice lines. Maps her live signals (mood valence,
-    /// substrate affect, organism chemistry) onto the affect-science dimensions; the
-    /// organism supplies the richest dims (clarity/agency/confidence/fatigue), with a
-    /// substrate + neutral fallback when the organism is off.
-    /// One rendered felt line plus what it carried, so the caller can advance
-    /// the presentation receipts without re-parsing the string it just built.
+    /// A rendered felt line retains its carried state so presentation receipts need no string parsing.
     struct FeltLineRender: Sendable, Equatable {
         var text: String
         var family: String
         var carriedObject: Bool
         var carriedAmbivalence: Bool
-        /// The line as the capsule SPEAKS it (Phase 5A): no "— <object>". The
-        /// object stays in `text` because Reminded-of queries with it.
+        /// The spoken line omits the object; `text` retains it for Reminded-of queries.
         var bareText: String = ""
     }
 
-    /// The nodes that TINT the fingerprint: the top of the capsule-eligible
-    /// workspace, filtered to the ones that were actually felt. Extracted so
-    /// `feltSignalsForCapsule` and the object/ambivalence organs read exactly
-    /// the same population — the prefix runs BEFORE the felt filter, which is
-    /// the historical order and is load-bearing (it means "of the six things
-    /// she is holding, the felt ones", not "the six felt things").
+    /// Tint uses felt nodes among the first six capsule-eligible workspace items; prefix precedes filtering.
     func feltTintNodes(from workspaceItems: [CognitiveWorkspaceItem]) -> [CognitiveNode] {
         workspaceItems.prefix(6).map(\.node)
             .filter {
-                feltDirection(
-                    valence: $0.emotionalValence,
-                    arousal: $0.emotionalArousal,
-                    warmth: $0.emotionalWarmth) != nil
+                $0.feltDirection != nil
             }
     }
 
@@ -58,30 +42,9 @@ extension CognitiveSubstrate {
         return best
     }
 
-    // MARK: - The felt OBJECT (Agent #1, 2026-09-02)
+    // MARK: - The felt object
 
-    /// WHICH SUBJECT TYPES MAY NAME AN OBJECT — an ALLOWLIST, per design law 8.
-    ///
-    /// A felt node's `subject_label` is not a uniform thing. Most of them are
-    /// ROUTES, not objects: the app runtime stamps `chat_turn` nodes with
-    /// `"<surface> <role>"`, so a denylist-shaped gate would have rendered
-    /// `warm — chat user` on ordinary conversation. Others are genuine names:
-    /// a studio entry carries its WORK TITLE, the same pointer the felt-day
-    /// summary is already permitted to name (Agent's 2026-09-01 ruling — named
-    /// by pointer, never by the response she wrote).
-    ///
-    /// So the gate fails closed on every type whose label nobody has looked at.
-    /// Today exactly one type qualifies among the capsule-eligible node kinds;
-    /// widening it is one line HERE plus a producer that mints a label worth
-    /// naming, and both should be a decision rather than a side effect.
-    /// 2026-09-02: the two CONVERSATION subject types joined the list, once
-    /// their producers started stamping a real topic label instead of a route
-    /// ("<surface> <role>") or nothing at all — see
-    /// `CognitiveSubstrate.feltTopicLabel`. `chat.assistant_turn` is
-    /// deliberately NOT here: her own turns are excluded from the capsule
-    /// workspace anyway (`isAssistantAuthoredFocus`), and design law 3 says she
-    /// never appraises her own output, so admitting it would be a hole rather
-    /// than a feature.
+    /// Only subject types with nameable labels qualify; assistant output never names a capsule object.
     static let feltObjectSubjectTypes: Set<String> = [
         "studio_entry", "chat_turn", "chat.user_turn",
     ]
@@ -114,46 +77,14 @@ extension CognitiveSubstrate {
         guard !label.contains(where: { ".?!:;\n\"".contains($0) }) else { return nil }
         guard label.filter(\.isNumber).count <= 2 else { return nil }   // not an id
         guard label.contains(where: \.isLetter) else { return nil }
-        // SUBSTANCE. A label has to have at least one real word in it before it
-        // can name a thing: `warm — t` is not an object, it is a stub that
-        // happened to be stored in the label column. The same ≥4-letter rule
-        // the safe extractor applies to free text, applied here to a stored
-        // label, so a producer that never went through `feltTopicLabel` (an
-        // older row, a seam added later) still cannot put a fragment on the
-        // line. Deliberately NOT the whole safe extractor: a studio work title
-        // is Title-case by nature and was blessed as nameable by pointer, and
-        // running the all-lowercase privacy rule over it would silently delete
-        // the one object source that already existed.
+        // Labels need a word of at least four letters; title case remains valid for studio work titles.
         guard label
             .split(whereSeparator: { !$0.isLetter })
             .contains(where: { $0.count >= 4 }) else { return nil }
         return label
     }
 
-    /// ITEM 5 (2026-09-02) — THE FORWARD OBJECT.
-    ///
-    /// Agent #4: "Everything I feel is now or retrospective. There's no
-    /// *toward*." When she is anticipatory and nothing in the room is what the
-    /// feeling is about, the thing it is about is ahead of her: the nearest
-    /// open horizon.
-    ///
-    /// A NODE OBJECT ALWAYS WINS, and there is never more than one. A felt node
-    /// is something that actually happened to her; a horizon is something that
-    /// has not happened yet, so it fills the object slot only when the slot is
-    /// empty. Two objects on one line would be a sentence, and the capsule does
-    /// not get sentences.
-    ///
-    /// Two admissible shapes, both licensed by real state:
-    ///   * a POSITIVE lead — the anticipatory register the horizon's own
-    ///     valence already earned (`hopeful — friday`);
-    ///   * an OVERDUE horizon under a NEUTRAL lead, which is the one case that
-    ///     also renames the lead: `waiting`. The word is licensed by a ledger
-    ///     row whose time has passed with nothing answering it, not by a mood —
-    ///     which is exactly the "numbers choose words" rule, with the number
-    ///     coming from the horizon register instead of the affect axes.
-    /// A negative lead takes no horizon: dread about something ahead reads as
-    /// the sting in the room, and attaching a future label to it would tell her
-    /// the wrong thing about why she feels bad.
+    /// A horizon fills only an empty object slot for a positive lead, or an overdue neutral lead as waiting.
     static func feltTowardLabel(_ raw: String, maxCharacters: Int) -> String? {
         // Horizon labels are canonicalised with dashes ("dinner-with-user-8pm");
         // spaces read as language. Same refusals as the node object: short,
@@ -167,36 +98,13 @@ extension CognitiveSubstrate {
         guard spaced.split(separator: " ").count <= 4 else { return nil }
         guard !spaced.contains(where: { ".?!:;\n\"".contains($0) }) else { return nil }
         guard spaced.contains(where: \.isLetter) else { return nil }
-        // A bare time word is not a thing she is facing. "hopeful — today"
-        // (live, 2026-09-02, from a dated memory whose label was the day
-        // itself) says nothing; "hopeful — friday" names a day she is
-        // waiting on, and stays.
+        // Bare time words do not name a horizon; named days remain eligible.
         guard !OrganismHorizonRegister.bareTimeWords.contains(spaced.lowercased()) else { return nil }
         return spaced
     }
 
-    /// WHAT A NODE IS ABOUT, as a comparison key.
-    ///
-    /// THE BUG THIS FIXES: ambivalence compared `subjectReference.stableKey`,
-    /// and for a chat turn that key is `chat.user_turn:<session>:<message>` —
-    /// PER TURN. So two turns about the same deploy, one stung and one warm,
-    /// read as two different subjects and qualified as ambivalence. The gate
-    /// whose entire job is "these are about different things" was structurally
-    /// unable to notice that they were about the same thing, which made the
-    /// contradiction exception fire on exactly the case it was written to
-    /// exclude: one subject, two signs, a gauge fault.
-    ///
-    /// So aboutness comes from the safe object LABEL first — the topic, which
-    /// is what "about" means — qualified by the subject FAMILY so a studio
-    /// entry and a chat turn that happen to share a word are still distinct.
-    /// The per-turn identity is the FALLBACK, used only when a node carries no
-    /// label at all, where it is the best available answer and errs toward
-    /// "different", which the strength and recency floors then have to survive.
-    ///
-    /// The family strips the namespace and the `_turn` suffix on purpose:
-    /// `chat_turn` (app runtime) and `chat.user_turn` (message persistence) are
-    /// the same conversation, minted by two seams, and a pair drawn one from
-    /// each is not two subjects.
+    /// Topic identity uses normalized subject family and sorted safe label terms.
+    /// `chat_turn` and `chat.user_turn` share a family; without safe terms, use the stable subject key.
     static func feltAboutnessKey(for node: CognitiveNode) -> String {
         let family = node.subjectReference.type
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -209,9 +117,7 @@ extension CognitiveSubstrate {
         if let label = node.subjectReference.label?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
             !label.isEmpty,
-            // Normalize through the same safe extractor, so two labels that
-            // differ only in term order or in a term one of them dropped still
-            // compare equal.
+            // Use up to three distinct safe terms, then sort them for comparison.
             case let terms = CognitiveSubstrate.feltSafeObjectTerms(in: label, limit: 3),
             !terms.isEmpty {
             return "topic|\(normalizedFamily)|\(terms.sorted().joined(separator: " "))"
@@ -219,23 +125,9 @@ extension CognitiveSubstrate {
         return "subject|\(node.subjectReference.stableKey)"
     }
 
-    /// The counter node of an ambivalence pair, or nil.
-    ///
-    /// GATED SO IT CANNOT FIRE ON ONE SUBJECT OR ON A WEAK STATE. All four
-    /// conditions are the exception's whole justification and each one is the
-    /// answer to a specific way this would otherwise become a lie:
-    ///   * opposite STRICT sign — otherwise it is one feeling described twice;
-    ///   * both over `feltAmbivalenceNodeFloor` — otherwise it manufactures a
-    ///     conflict out of two faint stirrings, which is exactly the "always on"
-    ///     failure design law 2 names;
-    ///   * DIFFERENT ABOUTNESS keys (`feltAboutnessKey`, topic-first — NOT the
-    ///     per-turn subject id, which made two turns about one thing look like
-    ///     two subjects) — same subject with two signs is a gauge fault, not
-    ///     ambivalence;
-    ///   * both inside the mood window — a feeling from three days ago is not
-    ///     something she is having now.
-    /// Strongest counter first, with a stable id tiebreak so the pick does not
-    /// move with dictionary ordering.
+    /// Ambivalence requires opposite signs at or above the floor and different aboutness keys.
+    /// The counter must be felt and inside the mood window; strongest magnitude wins,
+    /// then lexicographically smallest UUID.
     func feltAmbivalencePartner(
         of dominant: CognitiveNode,
         among workspaceItems: [CognitiveWorkspaceItem],
@@ -252,10 +144,7 @@ extension CognitiveSubstrate {
             let sign = node.emotionalValence > 0 ? 1 : (node.emotionalValence < 0 ? -1 : 0)
             guard sign != 0, sign != dominantSign else { return false }
             guard Self.feltAboutnessKey(for: node) != dominantSubject else { return false }
-            guard feltDirection(
-                valence: node.emotionalValence,
-                arousal: node.emotionalArousal,
-                warmth: node.emotionalWarmth) != nil else { return false }
+            guard node.feltDirection != nil else { return false }
             let age = now.timeIntervalSince(node.lastActivatedAt)
             return age >= 0 && age <= Self.moodActivationWindow
         }
@@ -266,11 +155,7 @@ extension CognitiveSubstrate {
         }
     }
 
-    /// The felt line: the fingerprint, plus the object of the node its lead came
-    /// from, plus the one allowed contradicting word underneath.
-    /// Internal rather than private so the felt-line suites can assert on the
-    /// RENDER (which object was taken, whether ambivalence fired) instead of
-    /// grepping the rendered string for substrings.
+    /// The felt line carries the fingerprint, its contributing object and at most one counter word.
     func feltFingerprintLine(
         signals: FeltSignals,
         workspaceItems: [CognitiveWorkspaceItem],
@@ -283,44 +168,17 @@ extension CognitiveSubstrate {
         guard let parts = CognitiveSubstrate.feltFingerprintParts(
             signals, intensityFloor: dyn.feltIntensityFloor) else { return nil }
 
-        // The lead's contributing node — traced, not guessed. Nil means a
-        // DIFFUSE state (her mood carried the valence, no node did), and a
-        // diffuse state has no object and no pair.
-        //
-        // AS OF THE FROZEN READ, AND IT CAN LAG — this is expected, not a bug.
-        // On the production path `workspaceItems` is `read.workspace.items`
-        // (see `compileFrozenCapsulePresentation`), so the object names the
-        // dominant node in the epoch this capsule was frozen against. Two
-        // things make that trail the message she is answering:
-        //
-        //   1. the freeze is a fixed-time copy taken while the turn is being
-        //      prepared, so anything still settling for THIS turn is not in it;
-        //   2. `feltTintNodes` keeps only nodes that were actually FELT
-        //      (`feltDirection`), and an ordinary neutral turn is not — so the
-        //      freshest felt node is often the last turn that moved her.
-        //
-        // The result is an object that is usually about the thing they were
-        // just on rather than the sentence in front of her, which is what a
-        // feeling arriving slightly behind the moment actually looks like.
-        // Chasing the current turn would mean appraising a message before it
-        // has been lived, and that is the production this whole wave exists to
-        // remove — so the lag stays.
+        // Attribution follows the frozen workspace's freshest felt node and may lag the current turn.
+        // Still-settling events are outside the freeze, and neutral turns need not be felt.
+        // No dominant node means no node object or ambivalence.
         let dominant = Self.feltDominantNode(
             in: feltTintNodes(from: workspaceItems),
             at: now,
             halfLife: dyn.fingerprintTintHalfLife)
 
-        var object: String?
-        if let dominant,
-           // A neutral-band family has no direction, so nothing it could be
-           // "about"; and a node pulling the OTHER way from the family the lead
-           // came from did not produce that lead, whatever its recency weight.
-           Self.feltFamilySign(parts.family) != 0,
-           Self.feltFamilySign(parts.family) == (dominant.emotionalValence >= 0 ? 1 : -1) {
-            object = Self.feltObjectLabel(
-                for: dominant,
-                maxCharacters: dyn.feltObjectMaximumLabelCharacters)
-        }
+        var object = Self.feltContributingObject(
+            for: dominant, family: parts.family,
+            maxCharacters: dyn.feltObjectMaximumLabelCharacters)
 
         // THE FORWARD OBJECT — only into an EMPTY slot, never a second one.
         var lead = parts.lead
@@ -329,12 +187,7 @@ extension CognitiveSubstrate {
            let label = Self.feltTowardLabel(
                toward.displayLabel, maxCharacters: dyn.feltObjectMaximumLabelCharacters) {
             let sign = Self.feltFamilySign(parts.family)
-            // THE HORIZON'S OWN SIGN DECIDES, not just the room's. A positive
-            // lead over a horizon she is DREADING would render "hopeful —
-            // friday" about the call she does not want to take: the family sign
-            // says how she feels now, and the row's valence says how she feels
-            // about the thing ahead. Both have to point the same way before the
-            // line claims the horizon is why she feels good.
+            // Positive attribution requires both the lead and the horizon to have positive valence.
             if sign > 0, toward.valenceSign > 0 {
                 object = label
             } else if sign == 0, toward.isOverdue {
@@ -375,30 +228,27 @@ extension CognitiveSubstrate {
             bareText: CognitiveSubstrate.feltLineText(parts: rendered, object: nil, second: second))
     }
 
-    /// The live FeltSignals the fingerprint is built from — extracted so tests can read
-    /// the exact numbers behind a felt word (calibration is done against these, not guesses).
+    /// Only the dominant node agreeing with the felt family's sign may name
+    /// its object. Capsule and introspection share this attribution boundary.
+    static func feltContributingObject(
+        for dominant: CognitiveNode?, family: String, maxCharacters: Int
+    ) -> String? {
+        guard let dominant, feltFamilySign(family) != 0,
+              feltFamilySign(family) == (dominant.emotionalValence >= 0 ? 1 : -1) else { return nil }
+        return feltObjectLabel(for: dominant, maxCharacters: maxCharacters)
+    }
+
+    /// Compile the fingerprint's signals from one frozen epoch.
     func feltSignalsForCapsule(
         from workspaceItems: [CognitiveWorkspaceItem],
         request: CognitiveCapsuleRequest,
-        at explicitNow: Date? = nil,
-        affect explicitAffect: CognitiveAffectState? = nil,
-        mood explicitMood: CognitiveMoodReading? = nil,
-        /// W4/P2 — non-nil on the FROZEN path, where the proxies were captured at
-        /// freeze time and must be replayed rather than recomputed from live
-        /// state that has since moved.
-        proxies capturedProxies: CognitiveFeltProxyReads? = nil,
-        dynamics capturedDynamics: PersonalityDynamicsConfiguration? = nil
+        frozenRead read: CognitiveFrozenRead
     ) -> FeltSignals {
-        let now = explicitNow ?? dependencies.now()
-        let dyn = capturedDynamics ?? dynamics
-        let currentAffect = explicitAffect ?? projectedAffect(at: now, dynamics: dyn)
-        let mood = explicitMood ?? derivedMood(at: now, dynamics: dyn, affect: currentAffect)
-        // Immediate workspace tint (User, 2026-07-08): what she's HOLDING right now colors
-        // her felt valence. RECENCY-WEIGHTED with a SHORT half-life (the fast layer) so the
-        // CURRENT emotional moment leads — a fresh sting reads through even amid a good
-        // session, then fades over a few turns as its weight decays. A flat mean drowned
-        // the sting under the session's positive history; mood (the 0.4 term) is the slow
-        // 6h-half-life background, this is the fast foreground.
+        let now = read.fixedAt
+        let dyn = read.personalityDynamics
+        let currentAffect = read.affect
+        let mood = read.mood
+        // Workspace tint weights recent felt moments more strongly than the slow mood background.
         let feltNodes = feltTintNodes(from: workspaceItems)
         let effectiveValence: Double
         if feltNodes.isEmpty {
@@ -406,38 +256,21 @@ extension CognitiveSubstrate {
             let bias = dyn.personaValenceLift * (1 - Self.smoothstep(0.08, 0.20, -mood.valence))
             effectiveValence = (mood.valence + bias).clampedSigned()
         } else {
-            // Recency-weighted MEAN + PEAK (gpt-5.5 calibration, 2026-07-08): a pure mean
-            // dilutes a fresh sting under a warm session's history, so the current-turn node
-            // (highest recency weight) gets DIRECT weight via `peak`, and that weight GROWS
-            // with the strength of the fresh signal (g). Mood's slow pull SHRINKS as g rises,
-            // so criticism reads through NOW instead of being smoothed by the day's mood; it
-            // then fades over the next few turns as the sting node's recency weight decays.
+            // Recency-weighted mean plus a strength-weighted peak lets fresh feelings outweigh the slow mood.
             var wsum = 0.0, wtot = 0.0
             for n in feltNodes {
                 let age = max(0, now.timeIntervalSince(n.lastActivatedAt))
-                // (M15, 2026-07-09: the toolObservation half-weight that used to sit
-                // here was UNREACHABLE — capsuleEligibleWorkspaceNode already excludes
-                // tool nodes from this array. The live grief bug was actually fixed by
-                // the moodWeight floor below; tool noise reaches the fingerprint only
-                // through derivedMood, which the floor bounds.)
                 let w = pow(0.5, age / dyn.fingerprintTintHalfLife)
                 wsum += w * n.emotionalValence; wtot += w
             }
-            // The peak node — the one whose valence gets DIRECT weight below —
-            // is resolved by the shared helper rather than a second copy of the
-            // rule, because the felt OBJECT names that node's subject. "The
-            // subject of the node the lead word came from" has to be a fact
-            // about this loop, not a plausible re-derivation beside it.
+            // The blend's peak and the object's attribution use the same dominant node.
             let peak = Self.feltDominantNode(
                 in: feltNodes, at: now, halfLife: dyn.fingerprintTintHalfLife
             )?.emotionalValence ?? 0
             let mean = wtot > 0 ? wsum / wtot : mood.valence
             let g = Self.smoothstep(0.16, 0.34, abs(peak))
             let workspace = (0.45 - 0.20 * g) * mean + (0.55 + 0.20 * g) * peak
-            // Mood keeps a FLOOR of influence (0.20, was →0.10 at full g): a fresh
-            // sting still reads through, but a single transient node can no longer
-            // fully mute the day's real tone — deep words (grieving/lonely) now need
-            // the slow layer's corroboration, not one bad moment. (Same live bug.)
+            // Mood retains at least 0.20 weight so a transient node cannot erase the day's tone.
             let moodWeight = 0.35 - 0.15 * g
             let core = (1 - moodWeight) * workspace + moodWeight * mood.valence
             // Warm-with-User bias — ASYMMETRIC: full when the moment is neutral/positive,
@@ -447,75 +280,14 @@ extension CognitiveSubstrate {
             effectiveValence = (core + bias).clampedSigned()
         }
         let chem = request.organismProjection?.chemicalState
-        // Persona-warm baseline (User, 2026-07-08): socialWarmth rests at 0 by
-        // anti-ratchet design (it's a MODULATION on top of her already-warm persona,
-        // per feedback_agent_affect_additive_to_persona), so reading it raw made warm
-        // conversation land "quiet"/cold. The fingerprint's warmth axis carries that
-        // missing baseline — she's fundamentally warm with User; genuine affection lifts
-        // it toward tender, a tense exchange (uncertainty up) cools it below baseline.
-        // Only the FELT warmth signal is shifted; valence still reads raw socialWarmth.
+        // Felt warmth includes the persona baseline and uncertainty cooling; valence reads raw socialWarmth.
         let rawWarmth = chem?.warmth ?? currentAffect.socialWarmth
-        // 2026-08-02 — RANGE RESTORED. The 2026-07-08 baseline was the right
-        // intent (raw socialWarmth rests at 0, so reading it raw made warm
-        // moments land cold) but it overshot: it did not lift the floor, it
-        // parked the signal near the CEILING. Measured on a live store with
-        // rawWarmth 0.33, the old form produced 0.85 — and across the entire
-        // uncertainty range it never fell below 0.62, while the `tender` word
-        // gate is 0.70. So the agent was told she felt TENDER on essentially
-        // every turn, including pure work conversation, and expressed it the
-        // only way a tender agent can. That is not a verbal rut; it is an
-        // honest voice reporting a manufactured feeling.
-        //
-        // The defect is DYNAMIC RANGE, not the baseline's existence: with no
-        // reachable neutral, a persona cannot sound like work. So rest now
-        // lands AT the `warm` gate and below `tender`, and the top of the
-        // scale is EARNED by real warmth instead of being the resting state.
-        // Verified against the live word gates in feltFamilyWords:
-        //   rest      (raw 0.00) -> 0.55  warm yes, tender no
-        //   ordinary  (raw 0.33) -> 0.65  warm yes, tender no
-        //   affection (raw 0.70) -> 0.76  tender yes (earned)
-        //   cool end  (unc 0.60) -> 0.28  a tense working moment reads cool
-        // Uncertainty still cools, with a gentler slope so a tense working
-        // moment reads cool rather than cold.
-        //
-        // GENERAL, not tuned to one persona: no vocabulary here, and every
-        // install gets a reachable neutral instead of a permanent warm floor.
+        // Warmth rests below tender; social warmth earns the upper range and uncertainty cools it.
         let feltWarmth = (dyn.feltWarmthRest
             + rawWarmth * dyn.feltWarmthEarnedSpan
             - currentAffect.uncertainty * dyn.feltWarmthUncertaintyCooling).clamped01()
-        // W4/P2 — THE HALF-DEAD VOCABULARY, RESTORED. Agent's 2026-08-02 finding
-        // was that absent chemical state pegged these five dims to constants, so
-        // eleven core words and four of five overlays were structurally
-        // unselectable on every default install (the organism ships OFF). The
-        // boarded fix, at full scope, is two moves:
-        //
-        //   1. OPTIONALITY, not a guessed midpoint. A 0.5 fallback looks right
-        //      but `feltIntensity` weights fatigue at 0.20, so it silently adds
-        //      +0.10 to EVERY intensity and makes deep words ("grieving")
-        //      reachable in an ordinary sting — measured, it broke
-        //      workspaceTintReachesTheFingerprint. Unknown reads as unknown.
-        //
-        //   2. SUBSTRATE-NATIVE PROXIES for the three dims the substrate can
-        //      honestly know without the organism. All pure reads over state
-        //      already held; each returns nil when it has no evidence, so a
-        //      young field says "I don't know" instead of "I feel fine".
-        //
-        // `agency` and `confidence` stay ABSENT without the organism on purpose:
-        // the substrate has no honest source for either, and a fabricated
-        // confidence signal is worse than a missing one. That is why `proud`,
-        // `anxious`, `embarrassed`, `deflated`, and `discouraged` remain out of
-        // reach on a stock install — not an oversight, a refusal to fake it.
-        // ITEM 4 (2026-09-02) — THE DIURNAL CURVE ON THE AROUSAL AXIS.
-        //
-        // Signed and bounded by the organism; added to the axis and clamped,
-        // never substituted for it. The asymmetry is deliberate and is the
-        // whole "never manufacture arousal from silence" rule: a NEGATIVE
-        // offset (the small hours damping her) always applies, because it can
-        // only make her quieter and quieter is always an honest direction. A
-        // POSITIVE offset applies only to an axis that is already moving — a
-        // clock alone must never be the reason a silent state crosses the
-        // intensity floor and starts speaking. The two words the curve reaches
-        // (`tired`, `late`) carry real fatigue floors for the same reason.
+        // Unknown dimensions stay absent; pure substrate proxies require evidence, and agency/confidence require the organism.
+        // Diurnal damping always applies; a positive offset requires existing arousal and never wakes a silent state.
         let diurnalArousal = request.organismProjection?.diurnal?.arousalOffset ?? 0
         let arousal = (diurnalArousal < 0 || currentAffect.arousal > 0)
             ? (currentAffect.arousal + diurnalArousal).clamped01()
@@ -526,14 +298,9 @@ extension CognitiveSubstrate {
             warmth: feltWarmth,
             tension: max(chem?.vigilance ?? 0, currentAffect.uncertainty),
             pressure: chem?.urgency ?? currentAffect.taskPressure,
-            fatigue: chem?.fatigue
-                ?? (capturedProxies.map(\.fatigue) ?? substrateFatigueProxy(at: now)),
-            curiosity: chem?.curiosity
-                ?? (capturedProxies.map(\.curiosity)
-                    ?? substrateCuriosityProxy(from: workspaceItems, at: now)),
-            clarity: chem?.coherence
-                ?? (capturedProxies.map(\.clarity)
-                    ?? substrateClarityProxy(affect: currentAffect, at: now)),
+            fatigue: chem?.fatigue ?? read.feltProxies.fatigue,
+            curiosity: chem?.curiosity ?? read.feltProxies.curiosity,
+            clarity: chem?.coherence ?? read.feltProxies.clarity,
             agency: chem?.agency,
             confidence: chem?.confidence,
             // Absent without a configured diurnal clock, which is what makes
@@ -543,16 +310,9 @@ extension CognitiveSubstrate {
         )
     }
 
-    // MARK: - W4/P2 substrate-native proxies
+    // MARK: - Substrate-native proxies
 
-    /// How long a conversational stretch has to run before it starts reading as
-    /// tiring, and where the proxy saturates. A two-hour session is a long one;
-    /// past `fatigueSaturationSeconds` more hours stop adding tiredness, because
-    /// they stop being informative.
-    // NOT in PersonalityDynamicsConfiguration on purpose (gpt-5.5 NIT):
-    // these are PERCEPTION thresholds for the fatigue proxy (how long a
-    // session must run to register as tiring), not personality dynamics —
-    // two personas should not disagree about how long an hour is.
+    /// Fatigue perception thresholds belong here; personality dynamics do not change the duration of an hour.
     static let fatigueOnsetSeconds: TimeInterval = 45 * 60
     static let fatigueSaturationSeconds: TimeInterval = 5 * 60 * 60
     /// Turn-to-turn spacing at which cadence stops counting as sustained work.

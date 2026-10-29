@@ -52,7 +52,7 @@ extension MacSyncActionRouter {
                 jobID = id
             }
         }
-        let recovered = try await MobileSchedulerProjection.read(using: writer, jobID: jobID)
+        let recovered = try await MobileSchedules.read(using: writer, jobID: jobID)
         guard recovered.jobs.contains(where: { $0.id == jobID }) else {
             return ["status": "error", "message": "The Mac could not read back the scheduler job."]
         }

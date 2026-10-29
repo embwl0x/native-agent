@@ -149,8 +149,6 @@ enum DoctorSupportSnapshotPresentation {
         switch outcome {
         case .unavailable(let reason):
             return Notice(detail: "The support report is unavailable: \(reason)", status: "warn")
-        case .failed(let reason):
-            return Notice(detail: "The support report failed: \(reason)", status: "failed")
         case .loaded(let diagnostics, let reusedDoctorReport):
             let source = reusedDoctorReport ? "using the recent health report" : "from a fresh set of health checks"
             let status = diagnostics.doctorStatus?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -166,27 +164,13 @@ enum DoctorSupportSnapshotPresentation {
     }
 }
 
-/// The Doctor core marks only app-owned, conservative repairs with this
-/// instruction. Other repair text is a human next step (for example provider
-/// authentication) and must never make the local repair button runnable.
+/// DoctorSafeRepairPolicy classifies repairs; presentation carries their count.
 enum DoctorSafeRepairIssuesPresentation {
-    struct Plan: Equatable {
-        let checkIDs: [String]
-
-        var count: Int { checkIDs.count }
-        var canRun: Bool { !checkIDs.isEmpty }
-    }
-
     enum State: Equatable {
         case needsDoctorReport
         case noSafeIssues
-        case ready(Plan)
+        case ready(Int)
         case running
-
-        var canRun: Bool {
-            if case .ready(let plan) = self { return plan.canRun }
-            return false
-        }
 
         var detail: String {
             switch self {
@@ -194,8 +178,8 @@ enum DoctorSafeRepairIssuesPresentation {
                 return "Repair checks everything and fixes what is broken."
             case .noSafeIssues:
                 return "Nothing left for Repair to fix."
-            case .ready(let plan):
-                return "\(plan.count) issue\(plan.count == 1 ? "" : "s") to fix — press Repair."
+            case .ready(let count):
+                return "\(count) issue\(count == 1 ? "" : "s") to fix — press Repair."
             case .running:
                 return "Repairing…"
             }
@@ -220,10 +204,9 @@ enum DoctorSafeRepairIssuesPresentation {
     static func state(report: DoctorReport?, isRunning: Bool) -> State {
         if isRunning { return .running }
         guard let report else { return .needsDoctorReport }
-        let plan = Plan(checkIDs: DoctorSafeRepairPolicy.checkIDs(for: report.checks))
-        return plan.canRun ? .ready(plan) : .noSafeIssues
+        let count = DoctorSafeRepairPolicy.checkIDs(for: report.checks).count
+        return count > 0 ? .ready(count) : .noSafeIssues
     }
-
 
 }
 
@@ -241,21 +224,13 @@ struct DoctorView: View {
         loopVerdicts.count - unhealthyLoops.count
     }
 
-    private var loopPanelTint: Color {
-        if loopVerdicts.contains(where: { $0.level == .fail }) { return .red }
-        if loopVerdicts.contains(where: { $0.level == .warn }) { return .orange }
-        return .green
-    }
 
     private var groupedChecks: [(String, [CheckResult])] {
         guard let checks = appModel.engine.doctor.report?.checks else { return [] }
-        return DoctorStatusProjection.groupedChecks(checks)
+        return DoctorReadout.groupedChecks(checks)
     }
 
-    // UI-2 (public-user honesty, 2026-08-01): the page used to open on
-    // CODEX_HOME paths, raw loop IDs, and a bare "Ok" status word. A person who
-    // did not write this app cannot read any of that. The plain summary leads;
-    // every technical string still ships, one disclosure down.
+    // A plain summary leads, with technical details behind a disclosure.
     private var checkSummary: DoctorPlainCopy.Summary {
         DoctorPlainCopy.summarize(appModel.engine.doctor.report?.checks ?? [])
     }
@@ -279,9 +254,8 @@ struct DoctorView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                // User 09-29: one button. It runs every check, leaves what is
-                // right alone, fixes what is broken, and opens the one screen a
-                // person must act on. The support report is a right-click away.
+                // Repair runs every check and opens any required human step.
+                // The support report is a right-click away.
                 Button(appModel.engine.doctor.isRunning ? "Repairing…" : "Repair", systemImage: "cross.case.fill") {
                     beginRepair()
                 }
@@ -293,10 +267,7 @@ struct DoctorView: View {
                     }
                     .disabled(appModel.supportDiagnosticsLoading || appModel.engine.doctor.isRunning)
                 }
-                // PATCH-2026-05-30: in-flight indicator so the user sees the
-                // Doctor is working during the ~7-15s probe. Previously the
-                // UI looked frozen and people thought it wasn't running.
-                // TimelineView ticks once per second to show elapsed duration.
+                // TimelineView shows elapsed duration once per second while Doctor runs.
                 if appModel.engine.doctor.isRunning {
                     HStack(spacing: 6) {
                         ProgressView()
@@ -336,14 +307,12 @@ struct DoctorView: View {
                     .accessibilityIdentifier("doctor.supportSnapshot.notice")
             }
 
-            // Watchdog readout lives in Diagnostics ▸ Status (the canonical
-            // health surface). It rendered identically here too until the
-            // 2026-07-03 dead-weight audit flagged the duplication.
+            // Diagnostics → Status owns the watchdog readout.
 
             healthSummaryPanel
 
             // The engine publishes these verdicts with the report's loop row.
-            NativePanel(title: "Background tasks", systemImage: "arrow.triangle.2.circlepath", tint: loopPanelTint,
+            NativePanel(title: "Background tasks",
                         contentInsets: Self.panelInsets) {
                 if loopVerdicts.isEmpty {
                     Text("Background tasks have not started yet.")
@@ -466,7 +435,7 @@ struct DoctorView: View {
             if appModel.engine.doctor.report?.checks.contains(where: {
                 $0.checkID == "live.providers" && DoctorSafeRepairPolicy.isAdverse($0.status)
             }) == true {
-                NativeAgentAppCoordinator.shared.request(.sidebar(.providers))
+                ApplicationLifetime.shared.request(.sidebar(.providers))
             }
         }
     }
@@ -488,8 +457,6 @@ struct DoctorView: View {
     private var healthSummaryPanel: some View {
         NativePanel(
             title: "Overall health",
-            systemImage: "heart.text.square",
-            tint: DoctorPlainCopy.tint(for: checkSummary),
             contentInsets: Self.panelInsets
         ) {
             VStack(alignment: .leading, spacing: 6) {
@@ -529,19 +496,8 @@ struct DoctorView: View {
 
 // MARK: - Plain-English Doctor copy
 //
-// UI-2 (2026-08-01, public era): pure string/count helpers so the honesty copy
-// is unit-testable without a UI snapshot harness. No SwiftUI types here on
-// purpose — everything below is a value in, a String or Int out.
 extension DoctorPlainCopy {
-    static func tint(for summary: Summary) -> Color {
-        if summary.failing > 0 { return .red }
-        if summary.warning > 0 { return .orange }
-        if summary.total == 0 { return .secondary }
-        if summary.reading > 0 { return NativeAgentTheme.info }
-        return .green
-    }
-
-    /// Group keys come from DoctorStatusProjection.categoryID.
+    /// Group keys come from DoctorReadout.categoryID.
     /// These are the same seven groups said out loud.
     static func sectionTitle(for group: String) -> String {
         switch group {
@@ -566,12 +522,12 @@ struct DoctorCheckRow: View {
         VStack(alignment: .leading, spacing: 5) {
             HStack {
                 InlineStatusDot(status: check.status)
-                Text(check.title.withoutStaleNextGenPhaseCopy)
+                Text(check.title)
                     .font(NativeAgentFont.section)
                 Spacer()
                 StatusBadge(text: check.status.uppercased(), status: check.status)
             }
-            Text(check.detail.withoutStaleNextGenPhaseCopy)
+            Text(check.detail)
                 .font(NativeAgentFont.body)
                 .foregroundStyle(.secondary)
                 .textSelection(.enabled)
@@ -581,12 +537,12 @@ struct DoctorCheckRow: View {
                     .textSelection(.enabled)
             }
             if let repair = check.repair, !repair.isEmpty {
-                Text(repair.withoutStaleNextGenPhaseCopy)
+                Text(repair)
                     .font(NativeAgentFont.label)
                     .foregroundStyle(NativeAgentShell.secondary)
             }
             if let action = check.human_action, !action.isEmpty {
-                Text(action.withoutStaleNextGenPhaseCopy)
+                Text(action)
                     .font(NativeAgentFont.label)
                     .foregroundStyle(NativeAgentShell.secondary)
             }
@@ -596,7 +552,7 @@ struct DoctorCheckRow: View {
                     .foregroundStyle(NativeAgentShell.secondary)
             }
             if let receipt = check.receipt, !receipt.isEmpty {
-                Text(receipt.withoutStaleNextGenPhaseCopy)
+                Text(receipt)
                     .font(NativeAgentFont.label)
                     .foregroundStyle(NativeAgentShell.secondary)
             }

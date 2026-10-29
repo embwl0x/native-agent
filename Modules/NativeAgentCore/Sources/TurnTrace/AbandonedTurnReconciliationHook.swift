@@ -122,7 +122,7 @@ public enum AbandonedTurnReconciliationHook {
             throw ToolFailureError("The resumed turn still has unfinished work or an unaccepted reply.", effects: .unknown)
         }
         let days = Set([checkpoint.acceptedAt, checkpoint.updatedAt, Date()].flatMap { day in
-            [day] + [-1, 1].compactMap { AbandonedTurnReconciler.dayCalendar.date(byAdding: .day, value: $0, to: day) }
+            [day] + [-1, 1].compactMap { TurnTracePersistLane.dayCalendar.date(byAdding: .day, value: $0, to: day) }
         }.map { dataRoot.appendingPathComponent("turn_traces/" + TurnTracePersistLane.dayString(from: $0) + ".jsonl") })
         for day in days where FileManager.default.fileExists(atPath: day.path) {
             let read = TurnTraceReplayReader.parse(try Data(contentsOf: day))

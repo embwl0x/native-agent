@@ -2,15 +2,7 @@ import Foundation
 import Darwin
 // Blueprint: | `DreamRunReservation.swift` | `DreamRunReservation` struct; `acquire`, `release` |
 
-/// Exclusive, crash-safe reservation for a dream run (2026-09-06). Same
-/// `<target>.lock` + nonblocking `flock` shape the rest of the tree uses; the
-/// lock lives on the open file description, so a second runner in THIS process
-/// conflicts with the first exactly as another process would, and a crash
-/// releases it without leaving a stale claim file to clear by hand.
-///
-/// 2026-09-06: module-internal (was private) so the weekly REM pass takes the
-/// same reservation — a forced manual REM and the scheduled one could otherwise
-/// distil the same dreams concurrently.
+/// Dream and REM reservations exclude same-process and cross-process runners; crashes release flock.
 struct DreamRunReservation {
     private let fd: Int32
 

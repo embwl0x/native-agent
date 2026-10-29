@@ -6,17 +6,10 @@ import PersistenceCore
 struct ContinuityField: Sendable {
     private var nodesByKey: [String: CognitiveNode] = [:]
     private var decayAnchorsByKey: [String: Date] = [:]
-    /// Derived partition index for diagnostic/verification nodes. Keeping this
-    /// beside the canonical node dictionary makes the hot O(n) spread/decay and
-    /// capacity paths a set lookup instead of repeatedly re-inferring turn kind
-    /// from every node's strings.
+    /// Derived lived/audit partition for spreading, decay and eviction.
     private var nonLiveNodeKeys: Set<String> = []
     private var seenEventKeys: Set<String> = []
-    /// FIFO insertion order for `seenEventKeys`, so the dedup set can be evicted
-    /// oldest-first. M9 (2026-07-09): every other collection here is bounded —
-    /// `evictNodes`/`enforceCapacity` prune nodes, anchors and association
-    /// weights — but the dedup set grew ~900 entries/day and was only ever
-    /// cleared by `clear()`/`replaceNodes`, i.e. never in a long-lived process.
+    /// FIFO insertion order bounds the dedup set by evicting oldest keys first.
     private var seenEventKeyOrder: [String] = []
     private var associationWeights: [String: [String: Double]] = [:]
     /// Rebuildable lexical index for association spreading. Tokenizing every
@@ -25,12 +18,6 @@ struct ContinuityField: Sendable {
     /// This cache lives beside the canonical nodes, is updated atomically with
     /// them, and is discarded/rebuilt on restore; it owns no memory or policy.
     private var associationTokensByKey: [String: Set<String>] = [:]
-    /// Defensive classification is intentionally expensive because legacy
-    /// rows can contain an explicit `live` marker alongside diagnostic prose.
-    /// Derive it once at the owner boundary, then let hot projections consume
-    /// the result without rescanning every summary and nested metadata value.
-    private var turnKindByNodeID: [UUID: CognitiveTurnKind] = [:]
-
     /// Ring capacity for the event-dedup set. Well above a day's traffic, so a
     /// duplicate can only slip through after thousands of intervening events —
     /// long past the decay window that made deduplication matter.
@@ -46,7 +33,6 @@ struct ContinuityField: Sendable {
             && seenEventKeys.isEmpty
             && associationWeights.isEmpty
             && associationTokensByKey.isEmpty
-            && turnKindByNodeID.isEmpty
     }
 
     /// The node this ingest touched. Lets the substrate stamp the emotional tag onto
@@ -105,7 +91,6 @@ struct ContinuityField: Sendable {
             nodesByKey[key] = node
             decayAnchorsByKey[key] = now
             associationTokensByKey[key] = associationTokens(for: node)
-            turnKindByNodeID[node.id] = event.turnKind
         } else {
             let node = CognitiveNode(
                 id: makeUUID(),
@@ -124,7 +109,6 @@ struct ContinuityField: Sendable {
             nodesByKey[key] = node
             decayAnchorsByKey[key] = now
             associationTokensByKey[key] = associationTokens(for: node)
-            turnKindByNodeID[node.id] = event.turnKind
         }
         if contributesToLivedState {
             nonLiveNodeKeys.remove(key)
@@ -146,7 +130,7 @@ struct ContinuityField: Sendable {
         return IngestOutcome(key: key, isNewNode: isNewNode)
     }
 
-    // MARK: - Emotional tag stamping (Wave A)
+    // MARK: - Emotional tag stamping
 
     /// Reconsolidation blend rates. The asymmetry is the whole point: a feeling moves
     /// toward warmer / more-positive FAST, and toward colder / more-negative SLOW — so
@@ -192,6 +176,21 @@ struct ContinuityField: Sendable {
         return true
     }
 
+    /// Whether the lived moment `seq` already changed this node's feeling
+    /// (its watermark is at or past it). A node evicted since reads false.
+    func hasLived(_ seq: UInt64, key: String) -> Bool {
+        guard let lived = nodesByKey[key]?.livedSeq else { return false }
+        return lived >= seq
+    }
+
+    /// Stamp the node's watermark: the lived moment `seq` changed its feeling.
+    /// Never lowered.
+    mutating func markLived(_ seq: UInt64, key: String) {
+        guard var node = nodesByKey[key] else { return }
+        node.livedSeq = max(node.livedSeq ?? 0, seq)
+        nodesByKey[key] = node
+    }
+
     /// Non-mutating read of one node's stored emotional tag. The U1 user-reaction
     /// re-stamp passes the node's OWN arousal/warmth straight back into
     /// `stampEmotionTag`, so those two blends are exact no-ops and only valence
@@ -206,10 +205,6 @@ struct ContinuityField: Sendable {
     /// `pendingCompletion` slot (which stores only the field key) back to its summary.
     func node(forKey key: String) -> CognitiveNode? {
         nodesByKey[key]
-    }
-
-    func cachedTurnKind(for node: CognitiveNode) -> CognitiveTurnKind {
-        turnKindByNodeID[node.id] ?? node.turnKind
     }
 
     /// Workspace selection needs only whether a node participates in any
@@ -227,7 +222,7 @@ struct ContinuityField: Sendable {
         return ids
     }
 
-    // MARK: - Overnight emotional consolidation (Wave D)
+    // MARK: - Overnight emotional consolidation
 
     /// Overnight-consolidation tuning. Named next to the reconsolidation blend rates so
     /// all continuity-field emotional tuning lives in one place. Arousal-only, gentle:
@@ -239,7 +234,7 @@ struct ContinuityField: Sendable {
     static let overnightCalmFactor = 0.7                             // charge softens, memory stays
     static let overnightCalmArousalFloor = 0.35                      // only a real charge is worth calming
 
-    // MARK: - Affective spreading (Wave F)
+    // MARK: - Affective spreading
 
     /// Ceiling on the emotional-congruence whisper in `spreadActivation`: a felt
     /// node firing gives emotionally similar felt neighbors up to +25% on the
@@ -254,32 +249,13 @@ struct ContinuityField: Sendable {
     /// feeling, 0 = opposite. Returns 0 unless BOTH nodes are felt, so
     /// legacy/neutral (0,0,0) nodes spread byte-identically to pre-Wave-F.
     static func affectiveCongruence(_ source: CognitiveNode, _ target: CognitiveNode) -> Double {
-        guard isFelt(source), isFelt(target) else { return 0 }
+        guard source.feltDirection != nil, target.feltDirection != nil else { return 0 }
         let valenceDistance = abs(source.emotionalValence - target.emotionalValence) / 2
         let warmthDistance = abs(source.emotionalWarmth - target.emotionalWarmth)
         return max(0, 1 - (valenceDistance * 0.6 + warmthDistance * 0.4))
     }
 
-    /// A node carries a non-neutral emotional tag. Mirrors the thresholds in
-    /// `CognitiveSubstrate.feltDirection` (Wave B) — the field must not depend on the
-    /// substrate, so the same constant checks are inlined here; keep the two in sync.
-    /// A legacy/neutral node (0,0,0) is NOT felt, so the sweep leaves it fully untouched.
-    private static func isFelt(_ node: CognitiveNode) -> Bool {
-        node.emotionalValence <= -0.15
-            || node.emotionalValence >= 0.15
-            || node.emotionalWarmth >= 0.35
-            || node.emotionalArousal >= 0.6
-    }
-
-    /// Overnight emotional consolidation (Wave D): arousal-only.
-    /// - RECURRED (lastActivatedAt within 24h) + felt (non-neutral tag) + arousal > 0 →
-    ///   tiny saturating reinforce: `arousal += 0.05 * (1 − arousal)` (what keeps mattering
-    ///   stays a little alive).
-    /// - STALE (lastActivatedAt older than 48h) + arousal > 0.35 → calm: `arousal *= 0.7`
-    ///   (the charge softens; the memory stays).
-    /// - Everything else (the 24–48h band, mild/neutral tags, low arousal) untouched.
-    /// NEVER writes valence / warmth / summary / metadata — "she wakes lighter, not blanker."
-    /// Returns (reinforced, calmed) counts.
+    /// Consolidation changes arousal only: recurring felt nodes strengthen and stale strong charges soften.
     mutating func consolidateEmotionalArousal(
         at now: Date, configuration: CognitiveConfiguration
     ) -> (reinforced: Int, calmed: Int) {
@@ -291,7 +267,7 @@ struct ContinuityField: Sendable {
             guard var node = nodesByKey[key] else { continue }
             let age = now.timeIntervalSince(node.lastActivatedAt)
             if age >= 0, age <= Self.overnightRecurredWindow,
-               node.emotionalArousal > 0, Self.isFelt(node) {
+               node.emotionalArousal > 0, node.feltDirection != nil {
                 node.emotionalArousal = node.emotionalArousal
                     + Self.overnightReinforceRate * (1 - node.emotionalArousal)
                 nodesByKey[key] = node
@@ -319,17 +295,7 @@ struct ContinuityField: Sendable {
             .map(\.key)
         guard !victims.isEmpty else { return 0 }
         for key in victims {
-            if let id = nodesByKey[key]?.id {
-                turnKindByNodeID.removeValue(forKey: id)
-            }
-            nodesByKey.removeValue(forKey: key)
-            decayAnchorsByKey.removeValue(forKey: key)
-            nonLiveNodeKeys.remove(key)
-            associationTokensByKey.removeValue(forKey: key)
-            associationWeights.removeValue(forKey: key)
-            for source in associationWeights.keys {
-                associationWeights[source]?.removeValue(forKey: key)
-            }
+            removeNode(forKey: key)
         }
         return victims.count
     }
@@ -338,34 +304,15 @@ struct ContinuityField: Sendable {
         nodesByKey.values.contains(where: predicate)
     }
 
-    /// Non-mutating read of the raw node set — NO decay application, NO capacity
-    /// enforcement, NO sort. For read-only derivations (Wave C mood) that must never
-    /// change field state: `snapshot` is `mutating` (it applies decay and enforces
-    /// capacity), so routing a "pure" read through it would let a mood read with a
-    /// skewed/future date advance decay anchors (gpt-5.5 review, 2026-07-02). The
-    /// inputs mood needs — emotional tags and `lastActivatedAt` — are untouched by
-    /// decay anyway, so the raw view is exactly as correct.
+    /// Reads raw nodes without decay, capacity enforcement or sorting; mood reads never advance field state.
     func peekNodes() -> [CognitiveNode] {
         Array(nodesByKey.values)
     }
 
-    /// Non-mutating DECAYED view: the same activation/salience the mutating
-    /// `snapshot` would compute, WITHOUT advancing decay anchors, enforcing
-    /// capacity, or evicting. For the attention read (mind-into-circulation,
-    /// gpt-5.5 HIGH 2026-07-10): routing attention through `snapshot` meant
-    /// reading her mind CHANGED her mind — every attention read applied decay
-    /// writes and could evict nodes, so even a nil result mutated state.
+    /// Reads decayed copies without advancing anchors, enforcing capacity or evicting nodes.
     func peekDecayedNodes(at now: Date) -> [CognitiveNode] {
         nodesByKey.map { key, node in
-            var copy = node
-            let anchor = decayAnchorsByKey[key] ?? node.lastActivatedAt
-            let elapsed = max(0, now.timeIntervalSince(anchor))
-            if elapsed > 0, copy.decayHalfLife > 0 {
-                let factor = pow(0.5, elapsed / copy.decayHalfLife)
-                copy.activation = (copy.activation * factor).clamped01()
-                copy.salience = (copy.salience * factor).clamped01()
-            }
-            return copy
+            decayedNode(node, forKey: key, at: now) ?? node
         }
         .sorted(by: Self.snapshotSort)
     }
@@ -394,11 +341,8 @@ struct ContinuityField: Sendable {
         seenEventKeys.removeAll(keepingCapacity: true)
         seenEventKeyOrder.removeAll(keepingCapacity: true)
         associationTokensByKey.removeAll(keepingCapacity: true)
-        turnKindByNodeID.removeAll(keepingCapacity: true)
         for node in nodes {
-            // Restore honors CognitiveNode's defensive inference (an explicit
-            // live marker cannot override diagnostic text signals). This scan
-            // runs once per bounded restored node, never on the hot spread path.
+            // Restore the node's classification and lived/audit partition together.
             let turnKind = node.turnKind
             let key = nodeKey(
                 kind: node.kind,
@@ -418,7 +362,6 @@ struct ContinuityField: Sendable {
                 nonLiveNodeKeys.insert(key)
             }
             associationTokensByKey[key] = associationTokens(for: node)
-            turnKindByNodeID[node.id] = turnKind
         }
         associationWeights.removeAll(keepingCapacity: true)
         enforceCapacity(configuration.maximumActiveNodes)
@@ -436,9 +379,8 @@ struct ContinuityField: Sendable {
         nodesByKey.merge(resident.nodesByKey) { _, live in live }
         decayAnchorsByKey.merge(resident.decayAnchorsByKey) { _, live in live }
         associationTokensByKey.merge(resident.associationTokensByKey) { _, live in live }
-        turnKindByNodeID.merge(resident.turnKindByNodeID) { _, live in live }
         nonLiveNodeKeys = Set(nodesByKey.compactMap { key, node in
-            cachedTurnKind(for: node).contributesToLivedState ? nil : key
+            node.turnKind.contributesToLivedState ? nil : key
         })
         seenEventKeys = resident.seenEventKeys
         seenEventKeyOrder = resident.seenEventKeyOrder
@@ -454,7 +396,6 @@ struct ContinuityField: Sendable {
         seenEventKeyOrder.removeAll(keepingCapacity: false)
         associationWeights.removeAll(keepingCapacity: false)
         associationTokensByKey.removeAll(keepingCapacity: false)
-        turnKindByNodeID.removeAll(keepingCapacity: false)
     }
 
     mutating func associationEdges(at now: Date, configuration: CognitiveConfiguration) -> [CognitiveAssociationEdge] {
@@ -487,8 +428,8 @@ struct ContinuityField: Sendable {
         at now: Date,
         matchingLivedState: Bool? = nil
     ) {
-        for key in nodesByKey.keys {
-            guard var node = nodesByKey[key] else { continue }
+        for key in Array(nodesByKey.keys) {
+            guard let node = nodesByKey[key] else { continue }
             if let matchingLivedState {
                 if matchingLivedState {
                     if !nonLiveNodeKeys.isEmpty, nonLiveNodeKeys.contains(key) { continue }
@@ -496,14 +437,31 @@ struct ContinuityField: Sendable {
                     continue
                 }
             }
-            let anchor = decayAnchorsByKey[key] ?? node.lastActivatedAt
-            let elapsed = max(0, now.timeIntervalSince(anchor))
-            guard elapsed > 0, node.decayHalfLife > 0 else { continue }
-            let factor = pow(0.5, elapsed / node.decayHalfLife)
-            node.activation = (node.activation * factor).clamped01()
-            node.salience = (node.salience * factor).clamped01()
-            nodesByKey[key] = node
+            guard let decayed = decayedNode(node, forKey: key, at: now) else { continue }
+            nodesByKey[key] = decayed
             decayAnchorsByKey[key] = now
+        }
+    }
+
+    private func decayedNode(_ node: CognitiveNode, forKey key: String, at now: Date) -> CognitiveNode? {
+        let anchor = decayAnchorsByKey[key] ?? node.lastActivatedAt
+        let elapsed = max(0, now.timeIntervalSince(anchor))
+        guard elapsed > 0, node.decayHalfLife > 0 else { return nil }
+        let factor = pow(0.5, elapsed / node.decayHalfLife)
+        var decayed = node
+        decayed.activation = (decayed.activation * factor).clamped01()
+        decayed.salience = (decayed.salience * factor).clamped01()
+        return decayed
+    }
+
+    private mutating func removeNode(forKey key: String) {
+        nodesByKey.removeValue(forKey: key)
+        decayAnchorsByKey.removeValue(forKey: key)
+        nonLiveNodeKeys.remove(key)
+        associationTokensByKey.removeValue(forKey: key)
+        associationWeights.removeValue(forKey: key)
+        for source in Array(associationWeights.keys) {
+            associationWeights[source]?.removeValue(forKey: key)
         }
     }
 
@@ -536,17 +494,7 @@ struct ContinuityField: Sendable {
             .prefix(nodesByKey.count - cap)
             .map(\.key)
         for key in victims {
-            if let id = nodesByKey[key]?.id {
-                turnKindByNodeID.removeValue(forKey: id)
-            }
-            nodesByKey.removeValue(forKey: key)
-            decayAnchorsByKey.removeValue(forKey: key)
-            nonLiveNodeKeys.remove(key)
-            associationTokensByKey.removeValue(forKey: key)
-            associationWeights.removeValue(forKey: key)
-            for source in associationWeights.keys {
-                associationWeights[source]?.removeValue(forKey: key)
-            }
+            removeNode(forKey: key)
         }
     }
 
@@ -561,7 +509,7 @@ struct ContinuityField: Sendable {
             .union(significantTokens(in: event.summary))
         var boosted: [(key: String, weight: Double)] = []
         let hasNonLiveNodes = !nonLiveNodeKeys.isEmpty
-        for otherKey in nodesByKey.keys where otherKey != key {
+        for otherKey in Array(nodesByKey.keys) where otherKey != key {
             guard var node = nodesByKey[otherKey] else { continue }
             if hasNonLiveNodes, nonLiveNodeKeys.contains(otherKey) { continue }
             let weight = associationWeight(
@@ -575,11 +523,8 @@ struct ContinuityField: Sendable {
             let stored = max(associationWeights[key]?[otherKey] ?? 0, weight)
             associationWeights[key, default: [:]][otherKey] = stored
             associationWeights[otherKey, default: [:]][key] = stored
-            // Wave F: felt memories nudge emotionally congruent felt neighbors a
-            // little harder — activation only, facilitation-only (see constant doc).
-            // Gated on affectEnabled like every other affect path: stale persisted
-            // tags must not keep steering spread after User turns affect off.
-            let whisper = configuration.affectEnabled
+            // With affect enabled, felt congruence can only increase neighboring activation.
+            let whisper = configuration.enabled
                 ? Self.affectiveSpreadMaxWhisper * Self.affectiveCongruence(source, node)
                 : 0
             node.activation = (node.activation + input * stored * 0.18 * (1 + whisper)).clamped01()
@@ -587,12 +532,14 @@ struct ContinuityField: Sendable {
             nodesByKey[otherKey] = node
             boosted.append((otherKey, stored))
         }
-        if boosted.count > configuration.maximumWorkspaceItems * 4 {
+        let workspaceItems = max(0, configuration.maximumWorkspaceItems)
+        let associationCap = workspaceItems > Int.max / 4 ? Int.max : workspaceItems * 4
+        if boosted.count > associationCap {
             let keep = Set(boosted.sorted { lhs, rhs in
                 if lhs.weight != rhs.weight { return lhs.weight > rhs.weight }
                 return lhs.key < rhs.key
             }
-            .prefix(configuration.maximumWorkspaceItems * 4)
+            .prefix(associationCap)
             .map(\.key))
             for (otherKey, _) in boosted where !keep.contains(otherKey) {
                 associationWeights[key]?.removeValue(forKey: otherKey)
@@ -751,9 +698,7 @@ struct ContinuityField: Sendable {
     private static func orderedMetadataKeys(_ metadata: [String: JSONValue]) -> [String] {
         let priority = [
             CognitiveTurnKind.metadataKey,
-            // Mind-into-circulation (2026-07-10): the felt-memory bridge —
-            // attentionSignals maps these record ids to context activation;
-            // dropped under the key cap, that channel silently goes dark.
+            // Attention maps these record IDs to context activation; retain them under the metadata key cap.
             "memoryRecordIds",
             "sessionId",
             "runId",

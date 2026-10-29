@@ -1,4 +1,6 @@
 import Foundation
+import NativeAgentShared
+import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `NativeOAuthFlow+XAI.swift` | `NativeOAuthFlow`: `startXAIOAuthFlow` |
 
@@ -15,7 +17,7 @@ extension NativeOAuthFlow {
     ) async -> OAuthFlowResult {
         let attempt = signInAttempts.begin(providerId: "xai_oauth_direct", dataRoot: dataRoot)
         defer { signInAttempts.finish(attempt) }
-        let server: any OAuthLoopbackSession
+        let server: NativeOAuthLoopbackCallbackServer
         do {
             server = try platform.makeLoopbackSession(
                 preferredPort: 56121,
@@ -34,18 +36,18 @@ extension NativeOAuthFlow {
             discovery = try await fetchXAIDiscovery()
         } catch {
             return OAuthFlowResult(ok: false,
-                error: "Could not read xAI OAuth discovery: \(NativeOAuthSupport.redact(error.localizedDescription))")
+                error: "Could not read xAI OAuth discovery: \(OAuthGrantOperations.redact(error.localizedDescription))")
         }
 
         let pkce = PKCE.generate()
-        let state = NativeOAuthSupport.randomHex(16)
-        let nonce = NativeOAuthSupport.randomHex(16)
+        let state = OAuthGrantOperations.randomHex(16)
+        let nonce = OAuthGrantOperations.randomHex(16)
         let redirectURI = server.redirectURI.absoluteString
         let scope = "openid profile email offline_access grok-cli:access api:access"
 
         var comps = URLComponents(url: discovery.authorizationEndpoint, resolvingAgainstBaseURL: false)
         comps?.queryItems = [
-            URLQueryItem(name: "client_id", value: XAIOAuthDirectAdapter.clientID),
+            URLQueryItem(name: "client_id", value: XAIOAuthTransport.clientID),
             URLQueryItem(name: "response_type", value: "code"),
             URLQueryItem(name: "redirect_uri", value: redirectURI),
             URLQueryItem(name: "scope", value: scope),
@@ -71,12 +73,12 @@ extension NativeOAuthFlow {
             return OAuthFlowResult(ok: false, error: "xAI sign-in timed out.")
         } catch {
             return OAuthFlowResult(ok: false,
-                error: "xAI sign-in failed: \(NativeOAuthSupport.redact(error.localizedDescription))")
+                error: "xAI sign-in failed: \(OAuthGrantOperations.redact(error.localizedDescription))")
         }
 
         let code: String
         switch validateCallback(callbackURL, expectedState: state,
-            providerErrorMessage: { "xAI returned error: \(NativeOAuthSupport.redact($0))" },
+            providerErrorMessage: { "xAI returned error: \(OAuthGrantOperations.redact($0))" },
             missingCodeMessage: "xAI did not return an authorization code.") {
         case .code(let value): code = value
         case .failure(let message): return OAuthFlowResult(ok: false, error: message)
@@ -93,7 +95,7 @@ extension NativeOAuthFlow {
             )
         } catch {
             return OAuthFlowResult(ok: false,
-                error: "xAI token exchange failed: \(NativeOAuthSupport.redact(error.localizedDescription))")
+                error: "xAI token exchange failed: \(OAuthGrantOperations.redact(error.localizedDescription))")
         }
 
         do {
@@ -116,7 +118,7 @@ extension NativeOAuthFlow {
 
 
     private static func fetchXAIDiscovery() async throws -> XAIOIDCDiscovery {
-        let url = URL(string: "https://auth.x.ai/.well-known/openid-configuration")!
+        guard let url = URL(string: "https://auth.x.ai/.well-known/openid-configuration") else { throw URLError(.badURL) }
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
         req.timeoutInterval = 20
@@ -125,7 +127,7 @@ extension NativeOAuthFlow {
         if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
             let snippet = String(data: data.prefix(400), encoding: .utf8) ?? ""
             throw NSError(domain: "NativeOAuthFlow.xAI", code: http.statusCode, userInfo: [
-                NSLocalizedDescriptionKey: "Discovery HTTP \(http.statusCode): \(NativeOAuthSupport.redact(snippet))",
+                NSLocalizedDescriptionKey: "Discovery HTTP \(http.statusCode): \(OAuthGrantOperations.redact(snippet))",
             ])
         }
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -133,8 +135,8 @@ extension NativeOAuthFlow {
               let tokenRaw = obj["token_endpoint"] as? String,
               let authURL = URL(string: authRaw),
               let tokenURL = URL(string: tokenRaw),
-              XAIOAuthDirectAdapter.isTrustedXAIURL(authURL),
-              XAIOAuthDirectAdapter.isTrustedXAIURL(tokenURL) else {
+              XAIOAuthTransport.isTrustedXAIURL(authURL),
+              XAIOAuthTransport.isTrustedXAIURL(tokenURL) else {
             throw NSError(domain: "NativeOAuthFlow.xAI", code: -1, userInfo: [
                 NSLocalizedDescriptionKey: "Discovery returned untrusted xAI OAuth endpoints.",
             ])
@@ -149,14 +151,14 @@ extension NativeOAuthFlow {
         challenge: String,
         redirectURI: String
     ) async throws -> [String: Any] {
-        guard XAIOAuthDirectAdapter.isTrustedXAIURL(tokenEndpoint) else {
+        guard XAIOAuthTransport.isTrustedXAIURL(tokenEndpoint) else {
             throw NSError(domain: "NativeOAuthFlow.xAI", code: -2, userInfo: [
                 NSLocalizedDescriptionKey: "xAI token endpoint is not trusted.",
             ])
         }
-        let (data, response) = try await NativeOAuthSupport.post(tokenEndpoint, [
+        let (data, response) = try await OAuthGrantOperations.post(tokenEndpoint, [
             "grant_type": "authorization_code",
-            "client_id": XAIOAuthDirectAdapter.clientID,
+            "client_id": XAIOAuthTransport.clientID,
             "code": code,
             "redirect_uri": redirectURI,
             "code_verifier": verifier,
@@ -166,7 +168,7 @@ extension NativeOAuthFlow {
         if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
             let snippet = String(data: data.prefix(600), encoding: .utf8) ?? ""
             throw NSError(domain: "NativeOAuthFlow.xAI", code: http.statusCode, userInfo: [
-                NSLocalizedDescriptionKey: "HTTP \(http.statusCode): \(NativeOAuthSupport.redact(snippet))",
+                NSLocalizedDescriptionKey: "HTTP \(http.statusCode): \(OAuthGrantOperations.redact(snippet))",
             ])
         }
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -190,18 +192,17 @@ extension NativeOAuthFlow {
                 NSLocalizedDescriptionKey: "xAI token response did not include access_token.",
             ])
         }
-        let path = XAIOAuthDirectAdapter.tokenPath(dataRoot: dataRoot)
+        let path = XAIOAuthTransport.tokenPath(dataRoot: dataRoot)
         try ProviderStateValidation.credential(tokens)
-        try NativeOAuthSupport.updateProviderCredential(at: path, replacingXAIGrant: true) { existing in
-            // 2026-09-06: optional identity and expiry fields belong to this sign-in.
-            // Keeping an old refresh token can switch a new account back on refresh.
+        try OAuthGrantOperations.updateProviderCredential(at: path, replacingXAIGrant: true) { existing in
+            // Optional identity, expiry and refresh fields belong only to this sign-in.
             for key in ["tokens", "refresh_token", "id_token", "expires_in", "expires_at",
                         "oauth_account_identity", "refresh_token_account_identity"] {
                 existing.removeValue(forKey: key)
             }
             existing["provider_id"] = "xai_oauth_direct"
             existing["auth_mode"] = "oauth_pkce"
-            existing["client_id"] = XAIOAuthDirectAdapter.clientID
+            existing["client_id"] = XAIOAuthTransport.clientID
             existing["scope"] = (tokens["scope"] as? String) ?? scope
             existing["base_url"] = "https://api.x.ai/v1"
             existing["redirect_uri"] = redirectURI
@@ -213,13 +214,13 @@ extension NativeOAuthFlow {
                 existing["id_token"] = idToken
             }
             existing["token_type"] = (tokens["token_type"] as? String) ?? "Bearer"
-            existing["last_refresh"] = NativeOAuthSupport.isoNow()
+            existing["last_refresh"] = NativeTimestampFormat.plainZulu(Date())
             if let expiresIn = tokens["expires_in"] as? Int {
                 existing["expires_in"] = expiresIn
-                existing["expires_at"] = NativeOAuthSupport.isoBasic(Date().addingTimeInterval(TimeInterval(expiresIn)))
+                existing["expires_at"] = NativeTimestampFormat.basicZulu(Date().addingTimeInterval(TimeInterval(expiresIn)))
             } else if let expiresInDouble = tokens["expires_in"] as? Double {
                 existing["expires_in"] = expiresInDouble
-                existing["expires_at"] = NativeOAuthSupport.isoBasic(Date().addingTimeInterval(expiresInDouble))
+                existing["expires_at"] = NativeTimestampFormat.basicZulu(Date().addingTimeInterval(expiresInDouble))
             }
             existing["discovery"] = [
                 "authorization_endpoint": discovery.authorizationEndpoint.absoluteString,

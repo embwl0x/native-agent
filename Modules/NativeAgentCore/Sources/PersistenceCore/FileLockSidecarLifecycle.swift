@@ -1,24 +1,8 @@
 import Foundation
 import Darwin
+import os
 
 // Blueprint: | `FileLockSidecarLifecycle.swift` | `FileLockSidecarLifecycle`: bounded locked reaping of old regular orphan sidecars; live/fresh/link sidecars stay untouched |
-
-private final class FileLockSidecarEnumerationFailure: @unchecked Sendable {
-    private let lock = NSLock()
-    private var stored: Error?
-
-    func record(_ error: Error) {
-        lock.lock()
-        stored = error
-        lock.unlock()
-    }
-
-    var value: Error? {
-        lock.lock()
-        defer { lock.unlock() }
-        return stored
-    }
-}
 
 /// Outcome of one bounded sweep of orphaned `<target>.lock` sidecars.
 ///
@@ -76,8 +60,7 @@ public enum FileLockSidecarLifecycle {
         dataRoot: URL = defaultDataRoot(),
         now: Date = Date(),
         minimumAge: TimeInterval = defaultMinimumAge,
-        maximumCandidates: Int = maximumCandidatesPerPass,
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
+        maximumCandidates: Int = maximumCandidatesPerPass
     ) async throws -> FileLockSidecarReapReport {
         let fm = FileManager.default
         var rootIsDirectory: ObjCBool = false
@@ -87,7 +70,7 @@ public enum FileLockSidecarLifecycle {
         guard rootIsDirectory.boolValue else {
             throw PersistenceCoreError.ioFailure("lock-sidecar root is not a directory: \(dataRoot.path)")
         }
-        let enumerationFailure = FileLockSidecarEnumerationFailure()
+        let enumerationFailure = OSAllocatedUnfairLock<Error?>(initialState: nil)
         guard let enumerator = fm.enumerator(
             at: dataRoot,
             includingPropertiesForKeys: [
@@ -97,7 +80,7 @@ public enum FileLockSidecarLifecycle {
             ],
             options: [.skipsHiddenFiles, .skipsPackageDescendants],
             errorHandler: { _, error in
-                enumerationFailure.record(error)
+                enumerationFailure.withLock { $0 = error }
                 return false
             }
         ) else {
@@ -125,7 +108,7 @@ public enum FileLockSidecarLifecycle {
             }
             candidates.append((entry, state.modified))
         }
-        if let enumerationError = enumerationFailure.value {
+        if let enumerationError = enumerationFailure.withLock({ $0 }) {
             throw PersistenceCoreError.ioFailure(
                 "could not fully enumerate lock-sidecar root \(dataRoot.path): \(enumerationError)"
             )
@@ -146,7 +129,7 @@ public enum FileLockSidecarLifecycle {
             let auditPath = relativePath(sidecar, from: dataRoot)
             report.attempted += 1
             do {
-                let didReap = try await persistence.withFileLock(guarded, waitingAtMost: 0) { () -> Bool in
+                let didReap = try await SwiftNativePersistenceCore.withFileLock(guarded, waitingAtMost: 0) { () -> Bool in
                     // We now hold this candidate's flock. Recheck every
                     // destructive predicate after contention: a writer may
                     // have created the guarded target or replaced the sidecar
@@ -199,7 +182,9 @@ public enum FileLockSidecarLifecycle {
     private static func relativePath(_ artifact: URL, from dataRoot: URL) -> String {
         let root = dataRoot.standardizedFileURL.resolvingSymlinksInPath().path
         let path = artifact.standardizedFileURL.resolvingSymlinksInPath().path
-        precondition(path.hasPrefix(root + "/"), "lock sidecar artifact escaped its data root")
-        return String(path.dropFirst(root.count + 1))
+        guard let tail = NativeAgentWorkspaceRoot.relativePath(path, under: root), !tail.isEmpty else {
+            preconditionFailure("lock sidecar artifact escaped its data root")
+        }
+        return tail
     }
 }

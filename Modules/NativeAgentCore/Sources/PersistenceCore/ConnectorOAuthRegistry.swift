@@ -15,7 +15,7 @@ public enum ConnectorOAuthRegistry {
     /// migrate credentials; a recorded person-disconnect never may.
     /// Caller holds the registry lock through any resulting import or retirement.
     public static func permitsCredentialMigration(root: URL, provider: String) throws -> Bool {
-        let rows = try checkedConnectorRows(from: readRegistry(at: connectorRegistryPath(root: root)))
+        let rows = try readRegistry(at: connectorRegistryPath(root: root))
         guard let row = rows.first(where: { connectorRow($0, matches: normalizedConnectorID(provider)) }) else { return true }
         return row[decisionField] != ConnectionDecision.disconnected.value
     }
@@ -76,20 +76,16 @@ public enum ConnectorOAuthRegistry {
     /// Sole registry publication owner, including bootstrap and Slack recovery.
     /// Caller holds the registry lock across its read/edit/write transaction.
     public static func writeRegistry(_ value: JSONValue, at path: URL) throws {
-        _ = try checkedConnectorRows(from: value)
-        try SwiftNativePersistenceCore.writeDataAtomicDurable(value.serializedData(pretty: true), to: path)
+        let rows = try checkedConnectorRows(from: value).map(JSONValue.object)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONValue.array(rows).serializedData(pretty: true), to: path)
     }
 
-    public static func readRegistry(at path: URL) throws -> JSONValue {
+    public static func readRegistry(at path: URL) throws -> [[String: JSONValue]] {
         do {
             _ = try FileManager.default.attributesOfItem(atPath: path.path)
-        } catch CocoaError.fileReadNoSuchFile { return .array([]) }
+        } catch CocoaError.fileReadNoSuchFile { return [] }
         let value = try JSONValue.parse(Data(contentsOf: path))
-        let rows = try checkedConnectorRows(from: value).map(JSONValue.object)
-        if case .object(let entries) = value {
-            return .object(Dictionary(uniqueKeysWithValues: zip(entries.keys.sorted(), rows)))
-        }
-        return .array(rows)
+        return try checkedConnectorRows(from: value)
     }
 
     public static func connectorRow(_ row: [String: JSONValue], matches providerID: String) -> Bool {

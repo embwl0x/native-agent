@@ -1,11 +1,4 @@
-// NativeCognitionRuntime+Reach.swift
-// Phase 5 E (2026-10-03) — she can start a conversation. Agent: "Bring User
-// something worth sharing, at a considerate time, and be entirely fine with
-// no reply."
-//
-// ONE INITIATIVE PATH. The shoulder tap (a fixed push about a loud seed, two
-// taps ever) is folded in: its trigger (the residual reschedule), its
-// background gate and its push are this lane's now; the seed lane is gone.
+// One initiative path shares worthwhile things at considerate times, without requiring a reply.
 //
 //   1. On device, from state she already has, a few CANDIDATES — each a thing,
 //      with its source and why it might be worth his time: a plan of User's
@@ -24,298 +17,32 @@
 //      it is sent there too and nothing knocks; otherwise one quiet knock to
 //      his phone points at it.
 //
-// E2's counters are housekeeping facts in one bounded file: when he last
+// Counters are housekeeping facts in one bounded file: when he last
 // took a turn, what she offered, sent or passed on, whether he took a turn
 // within a day after (a fact, never a score), whether it knocked. They feed
-// the timing above and nothing else; no prompt ever reads them. Absence only
-// ever makes a moment considerate; it never makes a candidate.
+// the timing above; no prompt ever reads them. Absence only ever makes a
+// moment considerate; it never makes a candidate.
+//
+// How it landed is the care's, not the ledger's: once a care's offer to his
+// own conversation is settled, the care that sent it gets one story entry by
+// him, welcomed or unanswered, written on device. A welcome care grows; an
+// unanswered one only keeps the fact (moved 0).
 
 import ChatTurnRuntime
 import AgentWorkspace
 import AgentConversations
 import CognitiveSubstrate
 import Desk
+import DreamREMCycle
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
 import Transcripts
 import TurnTrace
+import NativeAgentShared
 
-// Blueprint: | `NativeCognitionRuntime+Reach.swift` | `ReachLedger` and runtime reach: one considerate initiative path, durable offer/answer accounting and exact delivery deadlines |
-
-/// One thing worth sharing, and why.
-struct ReachCandidate: Sendable, Equatable {
-    enum Kind: Int, Sendable, Comparable {
-        case plan, care, shipped, dream
-        static func < (lhs: Kind, rhs: Kind) -> Bool { lhs.rawValue < rhs.rawValue }
-        var name: String { ["plan", "care", "shipped", "dream"][rawValue] }
-    }
-    var kind: Kind
-    /// `desk:<handle>`, `care:<uuid>`, `view:<uuid>`, `ship:<builder>:<id>` or `dream:<id>`:
-    /// what the cooldown keys on and what `mind.reject` takes.
-    var subject: String
-    var source: String
-    var why: String
-    var text: String
-    /// When it happened. Something from before User's last turn, he has been
-    /// around for.
-    var at: Date
-}
-
-/// E2: housekeeping facts, bounded. Never a closeness score; never read into
-/// a prompt.
-struct ReachLedger: Codable, Equatable {
-    struct Offer: Codable, Equatable {
-        var id: String
-        var subject: String
-        var kind: String
-        var source: String
-        var why: String
-        var offeredAt: Date
-        /// offered (her turn is pending), sending (written just before
-        /// delivery), sent, declined (she passed), withheld (the moment passed
-        /// before it went).
-        var outcome: String
-        var sentAt: Date?
-        var session: String?
-        /// A push went out with it: an interruption.
-        var knocked: Bool?
-        /// He took a turn within a day after it (true) or did not (false).
-        var answered: Bool?
-        /// When the thing itself happened, for the delivery-time re-check.
-        var at: Date?
-
-        /// Confirmed in his conversation.
-        var isSent: Bool { outcome == "sent" }
-        /// `sending` is written before delivery and a crash can leave it
-        /// behind: it may have reached him, so pacing holds back for it, but
-        /// it is never counted as sent nor settled as answered.
-        var mayHaveReachedHim: Bool { isSent || outcome == "sending" }
-    }
-    var offers: [Offer] = []
-    static let cap = 40
-
-    static func url(_ root: URL) -> URL { root.appendingPathComponent("cognition/reach.json") }
-
-    /// Nil when the ledger exists and cannot be read: an unreadable history
-    /// is never an empty one to pace by or write over, so outreach waits.
-    static func read(_ root: URL) -> ReachLedger? {
-        guard FileManager.default.fileExists(atPath: url(root).path) else { return ReachLedger() }
-        do {
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .secondsSince1970
-            return try decoder.decode(ReachLedger.self, from: Data(contentsOf: url(root)))
-        } catch {
-            nativeLog("reach: ledger %@ unreadable, outreach paused until it reads: %@",
-                      url(root).path, error.localizedDescription)
-            return nil
-        }
-    }
-
-    @discardableResult
-    func write(_ root: URL) -> Bool {
-        var bounded = self
-        bounded.offers = Array(offers.suffix(Self.cap))
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .secondsSince1970
-        do {
-            try FileManager.default.createDirectory(
-                at: Self.url(root).deletingLastPathComponent(), withIntermediateDirectories: true)
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(bounded), to: Self.url(root))
-            return true
-        } catch {
-            nativeLog("reach: ledger not kept: %@", error.localizedDescription)
-            return false
-        }
-    }
-
-    /// Settles "did he answer" on sent offers as facts arrive: a turn of his
-    /// after it within the window is yes; a window that closed without one is no.
-    mutating func settleAnswers(lastUserTurn: Date?, now: Date) -> Bool {
-        var changed = false
-        for index in offers.indices where offers[index].isSent && offers[index].answered == nil {
-            guard let sent = offers[index].sentAt else { continue }
-            if let turn = lastUserTurn, turn > sent, turn.timeIntervalSince(sent) <= Reach.answerWindow {
-                offers[index].answered = true; changed = true
-            } else if now.timeIntervalSince(sent) > Reach.answerWindow {
-                offers[index].answered = false; changed = true
-            }
-        }
-        return changed
-    }
-
-    /// The housekeeping counters, as numbers for the record (receipts, the
-    /// probe). The gates read the rows directly.
-    func counters(lastUserTurn: Date?, now: Date) -> [String: JSONValue] {
-        let week = offers.filter { now.timeIntervalSince($0.offeredAt) <= 7 * 86_400 }
-        var subjects: [String: Int] = [:]
-        for offer in offers where offer.isSent { subjects[offer.subject, default: 0] += 1 }
-        var out: [String: JSONValue] = [
-            "outreach_7d": .int(Int64(week.filter(\.isSent).count)),
-            "unconfirmed_7d": .int(Int64(week.filter { $0.outcome == "sending" }.count)),
-            "answered": .int(Int64(offers.filter { $0.answered == true }.count)),
-            "unanswered": .int(Int64(offers.filter { $0.answered == false }.count)),
-            "interruptions_7d": .int(Int64(week.filter { $0.knocked == true }.count)),
-            "callbacks_repeated": .int(Int64(subjects.values.filter { $0 > 1 }.count)),
-        ]
-        if let lastUserTurn { out["last_user_turn"] = .double(lastUserTurn.timeIntervalSince1970) }
-        if let last = offers.filter(\.isSent).compactMap(\.sentAt).max() { out["last_outreach"] = .double(last.timeIntervalSince1970) }
-        return out
-    }
-}
-
-/// The policy, as pure functions over facts.
-enum Reach {
-    /// Offers (her wake turns) per local day. A pass spends it: the cost is
-    /// bounded to one turn a day whatever she decides.
-    static let dailyCap = 1
-    /// Between two offers, so a day boundary cannot put two side by side.
-    static let minimumSpacing: TimeInterval = 8 * 3_600
-    /// One subject at most once a week, whatever came of it.
-    static let subjectCooldown: TimeInterval = 7 * 86_400
-    /// User's last turn at a verified door (or Claude's last worklog line)
-    /// this recent means he is in the middle of something.
-    static let activeWindow: TimeInterval = 30 * 60
-    /// Older than this it is not news.
-    static let freshness: TimeInterval = 72 * 3_600
-    /// "He took a turn within a day after it."
-    static let answerWindow: TimeInterval = 24 * 3_600
-    /// How often the candidates are read from disk.
-    static let scanInterval: TimeInterval = 10 * 60
-
-    enum Verdict: String, Sendable, Equatable {
-        case offer, quietHours, userActive, withClaude, dailyCap, spacing, awaitingUser
-        case subjectCooldown, alreadySeen, rejected, stale
-    }
-
-    struct Timing: Sendable {
-        var now: Date
-        var quietHours: Bool
-        var liveTurn: Bool
-        var lastUserTurn: Date?
-        var lastClaude: Date?
-        var calendar: Calendar = .current
-    }
-
-    /// Is this a considerate moment: not his quiet hours, not while he is
-    /// talking to her or working with Claude.
-    static func presence(_ t: Timing) -> Verdict {
-        if t.quietHours { return .quietHours }
-        if t.liveTurn || t.lastUserTurn.map({ t.now.timeIntervalSince($0) < activeWindow }) == true { return .userActive }
-        if let claude = t.lastClaude, t.now.timeIntervalSince(claude) < activeWindow { return .withClaude }
-        return .offer
-    }
-
-    /// The pace of what actually reached him, on DELIVERY time (a wake from
-    /// yesterday that delivers today is today's): one a day, eight hours
-    /// apart, and after a message he has not come back to, nothing more until
-    /// he takes a turn — no escalation.
-    static func pace(_ t: Timing, ledger: ReachLedger) -> Verdict {
-        let sent = ledger.offers.filter(\.mayHaveReachedHim).compactMap(\.sentAt)
-        if sent.filter({ t.calendar.isDate($0, inSameDayAs: t.now) }).count >= dailyCap { return .dailyCap }
-        guard let last = sent.max() else { return .offer }
-        if t.now.timeIntervalSince(last) < minimumSpacing { return .spacing }
-        if (t.lastUserTurn ?? .distantPast) < last { return .awaitingUser }
-        return .offer
-    }
-
-    /// Offer time: presence, pace, and the cost bound — one wake of hers a
-    /// day for this, so a pass spends the day's.
-    static func timing(_ t: Timing, ledger: ReachLedger) -> Verdict {
-        let moment = presence(t)
-        guard moment == .offer else { return moment }
-        let paced = pace(t, ledger: ledger)
-        guard paced == .offer else { return paced }
-        let offered = ledger.offers.filter { $0.outcome != "withheld" && t.calendar.isDate($0.offeredAt, inSameDayAs: t.now) }
-        return offered.count >= dailyCap ? .dailyCap : .offer
-    }
-
-    /// Right before delivery, every gate again, on delivery time (her own
-    /// wake turn is the live one, so it does not count as his).
-    static func deliverable(_ offer: ReachLedger.Offer, timing t: Timing, ledger: ReachLedger,
-                            rejectedSources: [String]) -> Verdict {
-        var now = t
-        now.liveTurn = false
-        let moment = presence(now)
-        guard moment == .offer else { return moment }
-        let paced = pace(now, ledger: ledger)
-        guard paced == .offer else { return paced }
-        if rejectedSources.contains(where: { offer.subject == $0 || offer.subject.hasPrefix($0 + ":") }) { return .rejected }
-        if let user = t.lastUserTurn, let at = offer.at, at <= user { return .alreadySeen }
-        return .offer
-    }
-
-    /// The moment for an offer already made has passed: quiet hours began,
-    /// or he took a turn. (Not "a turn is live": her own wake is one.)
-    static func momentPassed(_ t: Timing) -> Bool {
-        var now = t
-        now.liveTurn = false
-        now.lastClaude = nil
-        return presence(now) != .offer
-    }
-
-    /// A Desk item's text came from User only when no peer steered it in: every
-    /// peer on its steps, elevated or not, must be one User trusts as his own.
-    static func deskProvenanceTrusted(_ item: DeskItem, trusts: (String) -> Bool) -> Bool {
-        item.refs.allSatisfy { ref in
-            guard case .step(let step) = ref.kind else { return true }
-            return (step.peers + step.elevated).allSatisfy(trusts)
-        }
-    }
-
-    static func decide(_ c: ReachCandidate, timing t: Timing, ledger: ReachLedger, rejectedSources: [String]) -> Verdict {
-        let gate = timing(t, ledger: ledger)
-        guard gate == .offer else { return gate }
-        if case .plan = c.kind, c.at > t.now { return .stale }
-        if rejectedSources.contains(where: { c.subject == $0 || c.subject.hasPrefix($0 + ":") }) { return .rejected }
-        if ledger.offers.contains(where: {
-            $0.subject == c.subject && $0.outcome != "withheld" && t.now.timeIntervalSince($0.offeredAt) < subjectCooldown
-        }) { return .subjectCooldown }
-        if let user = t.lastUserTurn, c.at <= user { return .alreadySeen }
-        if t.now.timeIntervalSince(c.at) > freshness { return .stale }
-        return .offer
-    }
-
-    /// What her wake reads: the thing, its source and why — no counters, no
-    /// absence, nothing about how long he has been gone.
-    static func wakeLine(_ c: ReachCandidate, person: String) -> String {
-        "Something you could share with \(person), if you want to. From \(c.source): \(c.text). "
-            + "Why it might be worth it: \(c.why). Nothing is owed and no reply will be chased. "
-            + "If you want to tell \(person), write the message itself as your whole reply; it goes to "
-            + "\(person)'s chat as you wrote it. If not, reply only: pass"
-    }
-
-    static func isDecline(_ reply: String) -> Bool {
-        let trimmed = reply.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return true }
-        let first = trimmed.lowercased().split(whereSeparator: { !$0.isLetter }).first.map(String.init) ?? ""
-        return first == "pass" && trimmed.count <= 80
-    }
-
-    /// The knock carries nothing of the message: that is in his chat.
-    static let knockLine = "Left you something in chat. No reply needed."
-
-    /// "About him and gentle": names him, and none of the hard words.
-    static func isGentleAboutHim(_ phrase: String, person: String) -> Bool {
-        let words = Set(phrase.lowercased().split(whereSeparator: { !$0.isLetter }).map(String.init))
-        guard !person.isEmpty, person != "you", words.contains(person.lowercased()) else { return false }
-        return words.isDisjoint(with: hardWords)
-    }
-
-    static let hardWords: Set<String> = [
-        "afraid", "alone", "angry", "anxious", "abandon", "abandoned", "ashamed", "broken", "cry", "crying",
-        "dead", "death", "die", "dread", "empty", "fail", "failed", "failure", "fear", "gone", "grief", "guilt",
-        "hate", "hurt", "jealous", "leave", "leaving", "lonely", "lose", "losing", "lost", "miss", "missing",
-        "need", "pain", "panic", "sad", "scared", "sorry", "worry", "worried", "wrong",
-    ]
-
-    static func digest(_ text: String) -> String {
-        var hash: UInt64 = 0xcbf29ce484222325
-        for byte in text.utf8 { hash ^= UInt64(byte); hash = hash &* 0x100000001b3 }
-        return String(hash, radix: 16)
-    }
-}
+// Blueprint: | `NativeCognitionRuntime+Reach.swift` | `NativeCognitionRuntime` outreach execution, durable offer settlement, care landing and exact delivery deadlines |
 
 /// Runtime-owned single flight and source-read limits. Memory only: the facts that
 /// must survive a restart are in the ledger.
@@ -369,13 +96,19 @@ extension NativeCognitionRuntime {
         let instant = now()
         sourceWakes.reachDirty = false
         sourceWakes.reachNextAt = nil
+        await reconcileReachDeliveries()
+        do { try ReachAnswerSettlement.record(dataRoot: dataRoot, now: instant) }
+        catch {
+            nativeLog("reach: answer settlement not kept: %@", error.localizedDescription)
+            return
+        }
         var timing = await reachTiming(at: instant)
         // Each read-modify-write of the ledger below is one synchronous
         // segment on this actor: no await between the read and the write, so
         // a delivery's `sending` row can never be overwritten by a stale copy.
         guard var ledger = ReachLedger.read(dataRoot) else { return }
         projectReachDeadline(timing: timing, ledger: ledger, candidates: [])
-        var changed = ledger.settleAnswers(lastUserTurn: timing.lastUserTurn, now: instant)
+        var changed = false
         // An offer still waiting for her wake whose moment has passed (he came
         // back, quiet hours began) is taken back before it costs a turn.
         if Reach.momentPassed(timing), let index = ledger.offers.lastIndex(where: { $0.outcome == "offered" }),
@@ -384,6 +117,7 @@ extension NativeCognitionRuntime {
             changed = true
         }
         if changed { ledger.write(dataRoot) }
+        await landReachAnswers(ledger)
         guard Reach.timing(timing, ledger: ledger) == .offer else { return }
         if let last = sourceWakes.reachLastScanAt, instant.timeIntervalSince(last) < Reach.scanInterval {
             sourceWakes.reachNextAt = last.addingTimeInterval(Reach.scanInterval)
@@ -421,6 +155,55 @@ extension NativeCognitionRuntime {
             "source": .string(pick.source), "why": .string(pick.why),
             "counters": .object(ledger.counters(lastUserTurn: timing.lastUserTurn, now: instant)),
         ]))
+    }
+
+    /// Reconcile uncertain offers without another attempt to speak.
+    private func reconcileReachDeliveries() async {
+        guard let snapshot = ReachLedger.read(dataRoot) else { return }
+        for offer in snapshot.offers where offer.outcome == "sending" {
+            guard let session = offer.session else { continue }
+            do {
+                // Positive evidence is safe even while a delivery is in flight.
+                // Absence here cannot prove it will not append after this read.
+                guard try await SwiftNativeChatOrchestrationClient.proactiveSpeechCommitted(
+                    dataRoot: dataRoot, caller: .reachOut, idempotencyScope: offer.id, sessionId: session),
+                      var fresh = ReachLedger.read(dataRoot),
+                      let row = fresh.offers.firstIndex(where: { $0.id == offer.id && $0.outcome == "sending" }) else { continue }
+                fresh.offers[row].outcome = "sent"
+                fresh.write(dataRoot)
+            } catch {
+                nativeLog("reach: delivery still uncertain for %@: %@", offer.id, error.localizedDescription)
+            }
+        }
+    }
+
+    /// Each settled answer lands once in its care. A failed care save is
+    /// retried from the offer's source identity, without another movement.
+    private func landReachAnswers(_ ledger: ReachLedger) async {
+        let person = Self.resolvedPerson(dataRoot: dataRoot)
+        var landed: [String] = []
+        for offer in ledger.offers where offer.landed == nil {
+            guard let answered = offer.answered, let sent = offer.sentAt, let session = offer.session,
+                  CognitiveSubstrate.peerIdentity(session: session, dataRoot: dataRoot) == nil, offer.subject.hasPrefix("care:"),
+                  let care = UUID(uuidString: String(offer.subject.dropFirst(5))) else { continue }
+            let closed = sent.addingTimeInterval(Reach.answerWindow)
+            do {
+                if try await substrate.noteReachLanded(
+                    care: care, answered: answered, person: person, source: offer.id,
+                    at: answered ? (offer.answeredAt ?? closed) : closed) {
+                    landed.append(offer.id)
+                }
+            } catch {
+                nativeLog("reach: how %@ landed is not in its care yet, the next pass tries again: %@",
+                          offer.id, String(describing: error))
+            }
+        }
+        // One segment: these rows only, on a fresh read.
+        guard !landed.isEmpty, var fresh = ReachLedger.read(dataRoot) else { return }
+        for index in fresh.offers.indices where landed.contains(fresh.offers[index].id) {
+            fresh.offers[index].landed = true
+        }
+        fresh.write(dataRoot)
     }
 
     private func projectReachDeadline(timing: Reach.Timing, ledger: ReachLedger, candidates: [ReachCandidate]) {
@@ -492,7 +275,7 @@ extension NativeCognitionRuntime {
             return
         }
         let text = reply.trimmingCharacters(in: .whitespacesAndNewlines)
-        let anchor = ConversationAnchor.currentSessionId(dataRoot: dataRoot).flatMap { $0 == ResidentWake.session ? nil : $0 }
+        let anchor = ConversationAnchor.currentSessionId(dataRoot: dataRoot)
         // One segment: every gate again on delivery time, then a durable
         // `sending` row BEFORE anything can reach him. A crash after delivery
         // leaves that row, which pacing holds back for, so the no-reply gate
@@ -512,38 +295,57 @@ extension NativeCognitionRuntime {
         guard ledger.write(dataRoot) else { return }
         var offer = ledger.offers[index]
         if offer.outcome == "sending", let anchor {
-            var outcome = "withheld"
+            var outcome = "sending"
             var knocked = false
+            var destination = anchor
             do {
                 switch try await chat.speakProactively(
                     content: text, caller: .reachOut,
                     idempotencyKey: SwiftNativeChatOrchestrationClient.proactiveSpeechIdempotencyKey(scope: itemID, content: text),
                     sessionId: anchor, initiative: .scheduled) {
-                case .posted, .duplicate:
+                case .posted:
                     outcome = "sent"
-                    // Her words are in his conversation; the one knock is his
-                    // phone, opening that conversation with Reply (User,
-                    // 2026-10-07: not Telegram-only).
+                    // Her words are in his conversation; one phone knock opens it with Reply.
                     if reachEnabled {
                         knocked = (try? await host.deliverShoulderTap(
                             eventId: itemID, title: PersonaCompiler.agentDisplayName(dataRoot: dataRoot),
                             body: Reach.knockLine, reason: itemID,
                             userInfo: ["screen": "chat", "source": "reach_out", "sessionId": anchor], at: instant)) != nil
                     }
+                case .duplicate(let originalSession):
+                    destination = originalSession
+                    if (try? await SwiftNativeChatOrchestrationClient.proactiveSpeechCommitted(
+                        dataRoot: dataRoot, caller: .reachOut, idempotencyScope: itemID, sessionId: originalSession)) == true {
+                        outcome = "sent"
+                    }
                 case .rateLimited:
-                    break
+                    outcome = "withheld"
                 }
+            } catch is ProactiveSpeechError {
+                // An older claim has no established destination. Neither a
+                // duplicate claim nor its failed reconciliation proves absence.
+                nativeLog("reach: claimed delivery still has no established destination")
             } catch {
-                // "Not proven posted"; the seam rolled its own claim back.
-                nativeLog("reach: not delivered: %@", error.localizedDescription)
+                // The append has ended. Only the speech owner's clean scan can
+                // establish non-delivery; an unreadable transcript stays open.
+                nativeLog("reach: delivery needs reconciliation: %@", error.localizedDescription)
+                do {
+                    outcome = try await SwiftNativeChatOrchestrationClient.proactiveSpeechCommitted(
+                        dataRoot: dataRoot, caller: .reachOut, idempotencyScope: itemID, sessionId: anchor)
+                        ? "sent" : "withheld"
+                } catch {
+                    nativeLog("reach: delivery still uncertain: %@", error.localizedDescription)
+                }
             }
             // One segment again: patch this row only, on a fresh read. An
             // unreadable ledger leaves the row `sending`: uncertain, not sent.
             if let fresh = ReachLedger.read(dataRoot), let row = fresh.offers.firstIndex(where: { $0.id == itemID }) {
                 ledger = fresh
+                if ledger.offers[row].isSent { outcome = "sent" }
                 ledger.offers[row].outcome = outcome
+                ledger.offers[row].session = destination
                 ledger.offers[row].knocked = knocked
-                if outcome != "sent" { ledger.offers[row].sentAt = nil }
+                if outcome == "withheld" { ledger.offers[row].sentAt = nil }
                 ledger.write(dataRoot)
                 offer = ledger.offers[row]
             }
@@ -619,12 +421,12 @@ extension NativeCognitionRuntime {
         // A dream association, only about him and gentle, marked as a dream.
         if let diary = try? Self.livingDiary(dataRoot: dataRoot, now: instant),
            let markdown = try? String(contentsOf: diary.url, encoding: .utf8) {
-            for (index, phrase) in Self.dreamThemeCandidates(markdown).phrases.enumerated()
-            where Reach.isGentleAboutHim(phrase, person: person) {
+            for claim in DreamClaim.read(in: markdown)
+            where claim.gentle == true && claim.aboutOwner == true {
                 out.append(ReachCandidate(
-                    kind: .dream, subject: "dream:\(diary.name)#\(index + 1)", source: "last night's dream diary",
+                    kind: .dream, subject: "dream:\(diary.name)#\(Reach.digest(claim.provenance.quote))", source: "last night's dream diary",
                     why: "it was about \(person), and gentle; a dream association, not something that happened",
-                    text: "\"\(phrase)\"", at: diary.written))
+                    text: "\"\(Self.clipped(claim.provenance.quote, 160))\"", at: diary.written))
             }
         }
 

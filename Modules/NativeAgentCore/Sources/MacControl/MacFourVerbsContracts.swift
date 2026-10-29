@@ -191,10 +191,9 @@ public struct MacActStep: Sendable, Equatable {
 
 /// What a verb answers with.
 ///
-/// `text` IS the reply — one line of answer followed by the screen render. A
-/// reply that requires her to parse nested JSON is a bug, so `detail` is a
-/// side-channel for a caller's telemetry and carries NO handle and NO frame id
-/// either: if she never sees one, it can never go stale on her.
+/// `text` answers in prose with the screen. `detail` carries diagnostics and
+/// workspace-owned exact references, including frame IDs and selection receipts;
+/// ordinary named actions resolve their targets from a fresh observation.
 public struct MacFourVerbsReply: Sendable, Equatable {
     public let ok: Bool
     public let text: String

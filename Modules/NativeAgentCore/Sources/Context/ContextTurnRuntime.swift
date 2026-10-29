@@ -1,19 +1,26 @@
 import Foundation
+import NativeAgentCore
 
-// Blueprint: | `ContextTurnRuntime.swift` | `ContextPreparedTurn`, request and embedding ticket: generation lease, bounded query-vector handoff and turn feedback/delivery accounting |
+// Blueprint: | `ContextTurnRuntime.swift` | `ContextPreparedTurn`, request and embedding ticket: generation lease, bounded query-vector handoff (the query, its other voice and a follow-up's own words) and turn feedback/delivery accounting |
 
 /// One-shot, RAM-only handoff for an optional query embedding. A turn waits a
 /// bounded moment for it (`value(within:)`); a vector that cannot come says
 /// why (`unavailable`), so the turn knows it ranks by words alone.
+///
+/// The primary reading lands first (`publish(…, readingsFollow: true)`)
+/// and the message's further readings attach after it (`attachReadings`), so
+/// the query vector never waits on them. A waiter takes the value once every
+/// reading has landed, or, at its deadline, whatever has: the primary alone
+/// when the others are late, and the selector's bar counts only the readings
+/// it got.
 public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
     private let lock = NSLock()
     private var value: ContextQueryEmbeddingValue?
+    /// False between a primary published with readings to follow and their
+    /// arrival (or their failure).
+    private var readingsComplete = true
     private var failure: String?
-    private struct Waiter {
-        let continuation: CheckedContinuation<ContextQueryEmbeddingValue?, Never>
-        let deadline: Task<Void, Never>
-    }
-    private var waiters: [UUID: Waiter] = [:]
+    private let ready = ScopedWaiter()
 
     public init() {}
 
@@ -27,108 +34,122 @@ public final class ContextQueryEmbeddingTicket: @unchecked Sendable {
     /// pass first. Read at the start of a turn, a vector still on its way
     /// would always miss it.
     public func value(within nanoseconds: UInt64) async -> ContextQueryEmbeddingValue? {
-        let id = UUID()
-        return await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                lock.withLock {
-                    if Task.isCancelled { continuation.resume(returning: nil); return }
-                    if let value { continuation.resume(returning: value); return }
-                    if failure != nil || nanoseconds == 0 { continuation.resume(returning: nil); return }
-                    // Register and read under the writer's lock: completion
-                    // cannot fall between the initial read and subscription.
-                    let deadline = Task { [weak self] in
-                        do { try await Task.sleep(nanoseconds: nanoseconds) }
-                        catch { return }
-                        self?.finishWaiter(id)
-                    }
-                    waiters[id] = Waiter(continuation: continuation, deadline: deadline)
-                }
+        guard !Task.isCancelled else { return nil }
+        let initial = lock.withLock { (failure != nil || (value != nil && readingsComplete) || nanoseconds == 0, value) }
+        if initial.0 { return initial.1 }
+        return await withTaskGroup(of: ContextQueryEmbeddingValue?.self) { group in
+            group.addTask {
+                await self.ready.park()
+                return self.lock.withLock { Task.isCancelled ? nil : self.value }
             }
-        } onCancel: {
-            self.finishWaiter(id)
-        }
-    }
-
-    private func finishWaiter(_ id: UUID) {
-        let waiter = lock.withLock { waiters.removeValue(forKey: id) }
-        waiter?.deadline.cancel()
-        waiter?.continuation.resume(returning: nil)
-    }
-
-    private func resume(_ waiters: [Waiter], with value: ContextQueryEmbeddingValue?) {
-        for waiter in waiters {
-            waiter.deadline.cancel()
-            waiter.continuation.resume(returning: value)
+            group.addTask {
+                do { try await Task.sleep(nanoseconds: nanoseconds) }
+                catch { return nil }
+                // Capture at the deadline, before the race joins either branch.
+                return self.lock.withLock { Task.isCancelled ? nil : self.value }
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return Task.isCancelled ? nil : first
         }
     }
 
     /// Why no vector is coming; nil while one may still land.
     public var unavailable: String? { lock.withLock { failure } }
 
+    /// Nothing more is coming. Before the primary reading: no vector, and
+    /// why. After it, with readings still to follow: the primary alone.
     public func fail(_ cause: String) {
-        let pending: [Waiter] = lock.withLock {
-            guard value == nil, failure == nil else { return [] }
-            failure = cause
-            let pending = Array(waiters.values)
-            waiters.removeAll()
-            return pending
+        let completed = lock.withLock {
+            if value != nil {
+                guard !readingsComplete else { return false }
+                readingsComplete = true
+            } else {
+                guard failure == nil else { return false }
+                failure = cause
+            }
+            return true
         }
-        resume(pending, with: nil)
+        if completed { ready.resume() }
     }
 
     public func publish(
         _ embedding: [Float],
         alternate: [Float]? = nil,
+        ownWords: [[Float]] = [],
         modelFingerprint: String = "legacy-unverified",
-        modelID: String
+        modelID: String,
+        readingsFollow: Bool = false
     ) {
         guard !embedding.isEmpty, embedding.allSatisfy(\.isFinite) else { return }
         let fingerprint = modelFingerprint.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !fingerprint.isEmpty else { return }
-        // The other voice is optional enrichment: a malformed second vector
-        // drops out rather than costing the turn its query embedding.
-        let alternateVector = alternate.flatMap {
-            !$0.isEmpty && $0.allSatisfy(\.isFinite) && $0.count == embedding.count ? $0 : nil
-        }
-        let (pending, landed): ([Waiter], ContextQueryEmbeddingValue?) = lock.withLock {
-            guard value == nil, failure == nil else { return ([], nil) }
+        let completed = lock.withLock {
+            guard value == nil, failure == nil else { return false }
             value = ContextQueryEmbeddingValue(
                 values: embedding,
-                alternateValues: alternateVector,
+                alternateValues: alternate,
+                ownWordsValues: ownWords,
                 modelFingerprint: fingerprint,
                 modelID: modelID
             )
-            let pending = Array(waiters.values)
-            waiters.removeAll()
-            return (pending, value)
+            readingsComplete = !readingsFollow
+            return readingsComplete
         }
-        resume(pending, with: landed)
+        if completed { ready.resume() }
+    }
+
+    /// The further readings of a primary published with `readingsFollow`.
+    /// Malformed ones drop out; empty (they failed) completes the value with
+    /// the primary alone. Either way, every waiter is released.
+    public func attachReadings(_ readings: ContextQueryEmbeddingValue) {
+        let completed = lock.withLock {
+            guard var current = value, !readingsComplete else { return false }
+            if readings.values.count == current.values.count {
+                current.alternateValues = current.alternateValues ?? readings.alternateValues
+                current.ownWordsValues += readings.ownWordsValues
+            }
+            value = current
+            readingsComplete = true
+            return true
+        }
+        if completed { ready.resume() }
     }
 }
 
 public struct ContextQueryEmbeddingValue: Sendable, Equatable {
     public let values: [Float]
-    /// User, 2026-09-06: the SAME question in the other voice ("me" → the
-    /// agent's name, "you" → the user's), embedded in the same batch and
-    /// therefore in the same vector space as `values`. Selection takes the
-    /// better of the two cosines per atom, which is what the legacy recall
-    /// lane has always done (`MemoryV2+RecallQueryExpansion`). nil when the
-    /// question reads the same in both voices, or when no names are known.
-    public let alternateValues: [Float]?
+    /// The question's other voice ("me" → agent, "you" → user), embedded with `values`.
+    /// Selection takes the better cosine; nil when voices match or names are unknown.
+    public fileprivate(set) var alternateValues: [Float]?
+    /// A follow-up's query is its words in the context of the recent
+    /// turns; these are its OWN words (and their other voice), embedded in the
+    /// same batch. Each is a separate reading the memory lane scores on its
+    /// own (`ContextSelector.memoryRelevance`): a self-contained follow-up
+    /// ("…headphones… connect over Bluetooth?") kept its subject only as a
+    /// fifth of a window filled by the previous exchange. Empty when the
+    /// query is the message itself.
+    public fileprivate(set) var ownWordsValues: [[Float]]
     public let modelFingerprint: String
-    /// The embedder's model id (`embedding.json` `model_id`, or the bundled
-    /// MiniLM's), read from the same runtime snapshot as the fingerprint. The
-    /// selector's semantic floor is per model (`memorySemanticFloors`).
+    /// The embedder's model id (`embedding.json` `model_id`), read from the
+    /// same runtime snapshot as the fingerprint. The
+    /// selector's meaning scale is per model (`memorySemanticFloors`).
     public let modelID: String
 
     public init(
         values: [Float],
         alternateValues: [Float]? = nil,
+        ownWordsValues: [[Float]] = [],
         modelFingerprint: String,
         modelID: String
     ) {
         self.values = values
-        self.alternateValues = alternateValues
+        // Malformed enrichment never costs the primary reading.
+        func usable(_ vector: [Float]) -> Bool {
+            !vector.isEmpty && vector.allSatisfy(\.isFinite) && vector.count == values.count
+        }
+        self.alternateValues = alternateValues.flatMap { usable($0) ? $0 : nil }
+        self.ownWordsValues = ownWordsValues.filter(usable)
         self.modelFingerprint = modelFingerprint
         self.modelID = modelID
     }
@@ -147,16 +168,9 @@ public struct ContextTurnRequest: Sendable, Equatable {
     public let predictedToolGroups: Set<String>
     public let contextualTerms: Set<String>
     public let cognitiveActivation: [ContextAtomID: Double]
-    public let workingAtomIDs: Set<ContextAtomID>
-    /// Phase 5 B0: memory atoms she rejected for this kind of message.
+    /// Memory atoms she rejected for this kind of message.
     public let suppressedAtomIDs: Set<ContextAtomID>
-    public let queryEmbedding: [Float]?
-    /// The question in the other voice, same vector space as `queryEmbedding`.
-    /// See `ContextQueryEmbeddingValue.alternateValues`.
-    public let alternateQueryEmbedding: [Float]?
-    public let queryEmbeddingModelFingerprint: String?
-    /// See `ContextQueryEmbeddingValue.modelID`.
-    public let queryEmbeddingModelID: String?
+    public let queryEmbedding: ContextQueryEmbeddingValue?
     public let allowedPrivacy: Set<ContextPrivacy>
     public let permissionLabels: Set<String>
     public let characterBudget: Int
@@ -208,12 +222,8 @@ public struct ContextTurnRequest: Sendable, Equatable {
         predictedToolGroups: Set<String> = [],
         contextualTerms: Set<String> = [],
         cognitiveActivation: [ContextAtomID: Double] = [:],
-        workingAtomIDs: Set<ContextAtomID> = [],
         suppressedAtomIDs: Set<ContextAtomID> = [],
-        queryEmbedding: [Float]? = nil,
-        alternateQueryEmbedding: [Float]? = nil,
-        queryEmbeddingModelFingerprint: String? = nil,
-        queryEmbeddingModelID: String? = nil,
+        queryEmbedding: ContextQueryEmbeddingValue? = nil,
         allowedPrivacy: Set<ContextPrivacy> = [.localPrivate, .trustedRemote, .publicSafe],
         permissionLabels: Set<String> = [],
         characterBudget: Int = 6_000,
@@ -237,22 +247,8 @@ public struct ContextTurnRequest: Sendable, Equatable {
         self.predictedToolGroups = predictedToolGroups
         self.contextualTerms = contextualTerms
         self.cognitiveActivation = cognitiveActivation
-        self.workingAtomIDs = workingAtomIDs
         self.suppressedAtomIDs = suppressedAtomIDs
-        self.queryEmbedding = queryEmbedding.flatMap { vector in
-            !vector.isEmpty && vector.allSatisfy(\.isFinite) ? vector : nil
-        }
-        self.alternateQueryEmbedding = self.queryEmbedding == nil
-            ? nil
-            : alternateQueryEmbedding.flatMap { vector in
-                !vector.isEmpty && vector.allSatisfy(\.isFinite) ? vector : nil
-            }
-        let fingerprint = queryEmbeddingModelFingerprint?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        self.queryEmbeddingModelFingerprint = self.queryEmbedding == nil
-            ? nil
-            : ((fingerprint?.isEmpty == false) ? fingerprint : nil)
-        self.queryEmbeddingModelID = self.queryEmbedding == nil ? nil : queryEmbeddingModelID
+        self.queryEmbedding = queryEmbedding
         self.allowedPrivacy = allowedPrivacy
         self.permissionLabels = permissionLabels
         self.characterBudget = max(1, characterBudget)
@@ -281,20 +277,6 @@ public struct ContextFlowBudgetExpansion: Sendable, Equatable {
     public let maximumCharacterBudget: Int
     public let mandatoryCharacterBudget: Int
     public let grantedPostMandatoryReserve: Int
-
-    public init(
-        requestedCharacterBudget: Int,
-        effectiveCharacterBudget: Int,
-        maximumCharacterBudget: Int,
-        mandatoryCharacterBudget: Int,
-        grantedPostMandatoryReserve: Int
-    ) {
-        self.requestedCharacterBudget = requestedCharacterBudget
-        self.effectiveCharacterBudget = effectiveCharacterBudget
-        self.maximumCharacterBudget = maximumCharacterBudget
-        self.mandatoryCharacterBudget = mandatoryCharacterBudget
-        self.grantedPostMandatoryReserve = grantedPostMandatoryReserve
-    }
 }
 
 /// Owns the immutable generation lease for the complete provider/tool loop.
@@ -362,20 +344,13 @@ public final class ContextPreparedTurn: @unchecked Sendable {
         return await verifier(generation.atoms.filter { $0.draft.id == pointer.atomID })
     }
 
-    /// Packet provenance (2026-07-11): the memory RECORD identities behind this
-    /// turn's selected `.memory`/`.correction` atoms. Atom/source IDs in the
-    /// packet are one-way digests, so only the projection owner (app layer) can
-    /// resolve them — it attaches the resolved IDs here after preparation.
-    /// Attach-once: the preparer sets it before the turn is shared; later calls
-    /// are ignored so a mid-turn re-attach can never mutate what the engine
-    /// already read. Never attached == empty == pre-provenance behavior.
-    /// This rides the prepared-turn object, NOT the packet: the packet, its
-    /// fingerprint, and selection receipts stay identity-free.
+    /// The projection owner resolves selected memory/correction locators in the leased generation to record IDs.
+    /// IDs attach once before sharing; unattached means empty; packets, fingerprints and receipts stay identity-free.
     public var selectedMemoryRecordIDs: [String] {
         feedbackLock.withLock { memoryRecordProvenance ?? [] }
     }
 
-    /// Phase 5 B0: the memory record behind one atom the selection scored,
+    /// The memory record behind one atom the selection scored,
     /// selected or not, once attached: the why receipt's source, never use.
     public func memoryRecordID(for atomID: ContextAtomID) -> String? {
         feedbackLock.withLock { listedMemoryRecords[atomID] }
@@ -445,13 +420,15 @@ public final class ContextPreparedTurn: @unchecked Sendable {
 
 public protocol ContextTurnPreparing: Sendable {
     func contextFlowMode() async -> ContextFlowMode
-    func beginQueryEmbedding(_ text: String) async -> ContextQueryEmbeddingTicket?
+    /// `ownWords`: the message alone when `text` is it in the context of the
+    /// recent turns (a follow-up); nil when `text` is the message.
+    func beginQueryEmbedding(_ text: String, ownWords: String?) async -> ContextQueryEmbeddingTicket?
     func prepareContextTurn(_ request: ContextTurnRequest) async throws -> ContextPreparedTurn
 }
 
 public extension ContextTurnPreparing {
-    func beginQueryEmbedding(_ text: String) async -> ContextQueryEmbeddingTicket? {
-        _ = text
+    func beginQueryEmbedding(_ text: String, ownWords: String?) async -> ContextQueryEmbeddingTicket? {
+        _ = (text, ownWords)
         return nil
     }
 }

@@ -1,21 +1,7 @@
 #!/usr/bin/env swift
 //
-// A2.1 round 2 (2026-07-24): derive the Ed25519 PUBLIC key from a Sparkle EdDSA
-// private key file — the check that makes "am I signing with the key this build
-// trusts?" independent of Sparkle's warning prose.
-//
-// WHY THIS EXISTS
-//   generate_appcast.sh used to detect a wrong signing key by grepping Sparkle's
-//   warning text ("does not match key"). Reword that line upstream and a release
-//   signed with the wrong key sails through: `sign_update --verify --ed-key-file`
-//   cannot catch it either, because it only proves the signature matches the key
-//   we just signed with, never the key baked into the app as SUPublicEDKey.
-//   Comparing derived-public-half against the bundle's SUPublicEDKey closes that
-//   gap with arithmetic.
-//
-// Swift, not a helper script in another language: this repo is under a zero-Python
-// source mandate (Modules/NativeAgentCore/Tests/DoctorChecksTests/
-// NoPythonRegressionTests.swift), and CryptoKit gives the derivation for free.
+// Derive the signing key's public half for comparison with the app's SUPublicEDKey.
+// Signature verification with the private key alone cannot prove the app trusts it.
 //
 // Usage:
 //   script/sparkle_ed_public_key.swift <private-key-file>   # prints base64 public key
@@ -31,19 +17,9 @@ func die(_ message: String) -> Never {
     exit(1)
 }
 
-/// The public half of whatever shape a Sparkle EdDSA private-key file comes in.
-///
-/// Sparkle accepts exactly two secret lengths — verified against its own
-/// `common_cli/Secret.swift` (`decodePrivateAndPublicKeys`), not assumed:
-///   * 32 bytes  — the private seed (what `generate_keys -x` writes today).
-///                 The public key is DERIVED from it.
-///   * 96 bytes  — legacy: the already SHA-512-expanded 64-byte orlp/Ed25519
-///                 private key CONCATENATED with its 32-byte public key. Bytes
-///                 64..<96 ARE the public key; re-deriving from the first 32
-///                 bytes here would hash an already-hashed key and produce a
-///                 plausible-looking WRONG answer — which would then be reported
-///                 as "your key pair does not match" on a perfectly good key.
-/// Anything else Sparkle itself rejects, so this does too.
+/// Sparkle accepts a 32-byte seed or a 96-byte expanded-private || public secret.
+/// Derive from the seed; expanded keys already hold the public half at bytes 64..<96.
+/// Re-deriving from an expanded key would hash an already-hashed key and give the wrong answer.
 func publicKeyBase64(fromKeyMaterial text: String) -> String {
     let compact = text.components(separatedBy: .whitespacesAndNewlines).joined()
     guard !compact.isEmpty else { die("private key file is empty") }

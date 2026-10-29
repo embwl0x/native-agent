@@ -12,13 +12,6 @@ extension AgentA2AWire {
         }
         var params = parameters
         if let tenant = interface.tenant { params["tenant"] = .string(tenant) }
-        func identifier(_ key: String) throws -> String {
-            guard case .string(let value)? = params[key], !value.isEmpty, value != ".", value != "..",
-                  let encoded = value.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-_~"))) else {
-                throw WireError.invalid("missing or invalid \(key)")
-            }
-            return encoded
-        }
         let path: String
         let verb: String
         switch method {
@@ -28,55 +21,32 @@ extension AgentA2AWire {
             path = "/tasks"; verb = "GET"
         case "SubscribeToTask":
             guard interface.streaming else { throw WireError.unsupported("streaming was not offered") }
-            path = try "/tasks/" + identifier("id") + ":subscribe"; verb = "GET"
+            path = try "/tasks/" + pathIdentifier(params["id"], "id") + ":subscribe"; verb = "GET"
         case "CreateTaskPushNotificationConfig", "GetTaskPushNotificationConfig", "ListTaskPushNotificationConfigs", "DeleteTaskPushNotificationConfig":
-            let collection = try "/tasks/" + identifier("taskId") + "/pushNotificationConfigs"
+            let collection = try "/tasks/" + pathIdentifier(params["taskId"], "taskId") + "/pushNotificationConfigs"
             if method == "CreateTaskPushNotificationConfig" {
                 try validatePushConfiguration(.object(params), interface: interface)
                 path = collection; verb = "POST"
             } else if method == "ListTaskPushNotificationConfigs" {
                 path = collection; verb = "GET"
             } else {
-                path = try collection + "/" + identifier("id")
+                path = try collection + "/" + pathIdentifier(params["id"], "id")
                 verb = method == "DeleteTaskPushNotificationConfig" ? "DELETE" : "GET"
             }
         default: throw WireError.unsupported("operation \(method)")
         }
         let expectedTaskID: String? = if method == "SubscribeToTask", case .string(let id)? = params["id"] { id } else { nil }
-        if interface.binding == "GRPC" {
-            return Request(url: interface.endpoint, httpMethod: "POST", headers: [:],
-                           body: .object(params), requestID: nil, grpcMethod: method,
-                           streamInterface: interface, expectedTaskID: expectedTaskID)
+        let pathKeys: Set<String> = method.contains("PushNotificationConfig") ? ["taskId", "id"] : (method == "SubscribeToTask" ? ["id"] : [])
+        return try request(interface: interface, method: method, params: params, requestID: requestID,
+                           path: { path }, httpMethod: verb, pathKeys: pathKeys, taskID: expectedTaskID)
+    }
+
+    static func pathIdentifier(_ value: JSONValue?, _ key: String) throws -> String {
+        guard case .string(let value)? = value, !value.isEmpty, value != ".", value != "..",
+              let encoded = value.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-_~"))) else {
+            throw WireError.invalid("missing or invalid \(key)")
         }
-        let rpc = interface.binding == "JSONRPC"
-        let headers = ["Content-Type": rpc ? "application/json" : "application/a2a+json",
-                       "Accept": method == "SubscribeToTask" ? "text/event-stream" : (rpc ? "application/json" : "application/a2a+json"),
-                       "A2A-Version": interface.version]
-        if rpc {
-            return Request(url: interface.endpoint, httpMethod: "POST", headers: headers,
-                           body: .object(["jsonrpc": .string("2.0"), "id": .string(requestID), "method": .string(method), "params": .object(params)]), requestID: requestID,
-                           streamInterface: interface, expectedTaskID: expectedTaskID)
-        }
-        guard var url = URLComponents(url: interface.endpoint, resolvingAgainstBaseURL: false) else { throw WireError.invalid("endpoint") }
-        let base = try httpPathBase(url, tenant: params["tenant"])
-        url.percentEncodedPath = base + path
-        params.removeValue(forKey: "tenant")
-        if verb != "POST" {
-            let pathKeys: Set<String> = method.contains("PushNotificationConfig") ? ["taskId", "id"] : (method == "SubscribeToTask" ? ["id"] : [])
-            url.queryItems = try (url.queryItems ?? []) + params.keys.sorted().filter { !pathKeys.contains($0) }.map { key in
-                let text: String
-                switch params[key]! {
-                case .string(let value): text = value
-                case .int(let value): text = String(value)
-                case .bool(let value): text = value ? "true" : "false"
-                default: throw WireError.invalid("query parameter \(key)")
-                }
-                return URLQueryItem(name: key, value: text)
-            }
-        }
-        guard let endpoint = url.url else { throw WireError.invalid("request URL") }
-        return Request(url: endpoint, httpMethod: verb, headers: headers, body: verb == "POST" ? .object(params) : nil, requestID: nil,
-                       streamInterface: interface, expectedTaskID: expectedTaskID)
+        return encoded
     }
 
     public static func operationResult(_ value: JSONValue, interface: Interface, requestID: String?) throws -> JSONValue {

@@ -3,6 +3,7 @@ import MacControl
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+import TrustCenter
 // Blueprint: | `SwiftToolDispatcher+MacControlNeed.swift` | `SwiftToolDispatcher`: `macControlCategoryNeedEnvelope`, `builderFullMacRequired`, `fileOpsNeedEnvelope` |
 
 extension SwiftToolDispatcher {
@@ -29,10 +30,10 @@ extension SwiftToolDispatcher {
     /// The shell-class gate. Same decision, same card; the prose envelope is
     /// what is left when the category is already on (so the refusal is about
     /// something else) or the person's posture forbids raising it at all.
-    func builderFullMacRequired(tool: String) -> JSONValue {
+    func builderFullMacRequired(tool: String, input: [String: JSONValue] = [:]) -> JSONValue {
         macControlCategoryNeedEnvelope(
             categories: ["file_ops"],
-            mode: .write,
+            mode: AuthoredToolEffects.shellReadOnly(tool, input: input) ? .read : .write,
             why: "\(tool) runs on your Mac, and file access is off right now.",
             declineConsequence:
                 "I won't run \(tool), and I'll tell you what I couldn't do without it."

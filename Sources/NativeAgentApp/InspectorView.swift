@@ -1,5 +1,6 @@
 import DoctorChecks
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import Foundation
 import Observation
@@ -8,10 +9,8 @@ import SwiftUI
 
 // Blueprint: | `InspectorView.swift` | `InspectorView` and `TurnInspectorStore`: per-window live/replay selection over engine traces with separate requested/displayed date provenance |
 
-// MARK: - Turn Inspector W3 — the Mac "Inspector" tab
-//
-// Cards and replay reads come from the engine's trace projection. Each
-// window owns only its mode, selected replay date and presentation result.
+// Engine trace evidence supplies live cards and replay; each window owns its
+// mode, selected replay date and presentation result.
 
 struct InspectorView: View {
     let feed: TurnInspectorFeed
@@ -101,20 +100,19 @@ struct InspectorView: View {
 
     @ViewBuilder
     private var content: some View {
+        let cards = store.cards
         if store.mode == .live, let issue = feed.readIssue {
             Text(issue).foregroundStyle(.orange)
         }
-        if store.mode == .replay, store.cards.isEmpty, store.replayPresentation.isLoading {
+        if store.mode == .replay, cards.isEmpty, store.replayPresentation.isLoading {
             ProgressView(store.replayPresentation.statusText)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if store.cards.isEmpty {
+        } else if cards.isEmpty {
             emptyState
         } else {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
-                    ForEach(store.cards) { card in
-                        TurnCardView(card: card)
-                    }
+                    ForEach(cards) { TurnCardView(card: $0) }
                 }
                 .padding(.vertical, NativeAgentSpacing.xs)
             }
@@ -160,7 +158,7 @@ private struct TurnCardView: View {
             }
         }
         .padding(NativeAgentSpacing.md)
-        // Alive glass (2026-09-23): a fill, never glass, on the content layer.
+        // Content-layer cards use a fill without glass.
         .aliveCard(radius: NativeAgentRadius.panel)
     }
 
@@ -268,9 +266,12 @@ private struct EventRowView: View {
 enum TurnInspectorReplayPresentation: Equatable {
     case loading(requested: Date, retained: Date?)
     case loaded(Date)
+    case unavailable(requested: Date, retained: Date?, reason: String)
 
-    static func resolve(requested: Date, loaded: Date?, isLoading: Bool) -> Self {
-        guard !isLoading, let loaded else { return .loading(requested: requested, retained: loaded) }
+    static func resolve(requested: Date, loaded: Date?, isLoading: Bool, failure: String?) -> Self {
+        if isLoading { return .loading(requested: requested, retained: loaded) }
+        if let failure { return .unavailable(requested: requested, retained: loaded, reason: failure) }
+        guard let loaded else { return .loading(requested: requested, retained: nil) }
         return .loaded(loaded)
     }
 
@@ -287,6 +288,10 @@ enum TurnInspectorReplayPresentation: Equatable {
             return "\(loading) Showing the turns from \(retained.formatted(date: .abbreviated, time: .omitted))."
         case let .loaded(date):
             return "Showing the turns from \(date.formatted(date: .abbreviated, time: .omitted))."
+        case let .unavailable(requested, retained, reason):
+            let issue = "Could not load the turns from \(requested.formatted(date: .abbreviated, time: .omitted)): \(reason)"
+            guard let retained else { return issue }
+            return "\(issue) Showing the turns from \(retained.formatted(date: .abbreviated, time: .omitted))."
         }
     }
 }
@@ -315,10 +320,11 @@ final class TurnInspectorStore {
     private(set) var replayLoadedDate: Date?
     @ObservationIgnored private let replayRead = LatestRead()
     private(set) var replayReadIssue: String?
+    private var replayReadFailure: String?
     private(set) var feed: TurnInspectorFeed?
 
     var replayPresentation: TurnInspectorReplayPresentation {
-        .resolve(requested: replayDate, loaded: replayLoadedDate, isLoading: replayLoading)
+        .resolve(requested: replayDate, loaded: replayLoadedDate, isLoading: replayLoading, failure: replayReadFailure)
     }
 
     func start(feed: TurnInspectorFeed) {
@@ -345,18 +351,22 @@ final class TurnInspectorStore {
         guard let feed else { return }
         replayDate = date
         replayLoading = true
+        replayReadFailure = nil
         _ = await replayRead.read { () -> Result<(exists: Bool, report: JSONLReadReport, cards: [InspectorTurnCard]), Error> in
             do { return Result.success(try await feed.loadReplay(for: date)) }
             catch { return Result<(exists: Bool, report: JSONLReadReport, cards: [InspectorTurnCard]), Error>.failure(error) }
         } publish: { result in
             switch result {
             case .success(let read):
+                replayReadFailure = nil
                 replayCards = read.cards
                 replayFileExists = read.exists
                 replaySkipped = read.report.malformedLineCount
                 replayReadIssue = read.report.trailingPartialLine ? "The final trace row is incomplete." : nil
                 replayLoadedDate = date
-            case .failure(let error): replayReadIssue = error.localizedDescription
+            case .failure(let error):
+                replayReadIssue = error.localizedDescription
+                replayReadFailure = error.localizedDescription
             }
             replayLoading = false
         }

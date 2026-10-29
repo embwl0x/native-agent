@@ -36,11 +36,13 @@ public struct WorkshopSessionReceipt: Sendable, Equatable {
     public let artifactPaths: [String]
     public let generatedAt: Date
     public let disposition: DeskWorkDisposition
+    /// Returned text, including partial output after Stop or deadline settlement.
+    public var output: String?
 
     public init(
         handle: String, reservationId: String, status: WorkshopSessionStatus,
         summary: String, model: String?, artifactPaths: [String], generatedAt: Date,
-        disposition: DeskWorkDisposition = .progress
+        disposition: DeskWorkDisposition = .progress, output: String? = nil
     ) {
         self.handle = handle
         self.reservationId = reservationId
@@ -50,5 +52,6 @@ public struct WorkshopSessionReceipt: Sendable, Equatable {
         self.artifactPaths = artifactPaths
         self.generatedAt = generatedAt
         self.disposition = disposition
+        self.output = output
     }
 }

@@ -1,7 +1,7 @@
 // Checked reads from the canonical MemoryV2 SQLite graph, with legacy JSON
 // compatibility only before SQLite exists. An unreadable store throws.
 //
-// The SwiftNative reader returns the SAME envelopes the daemon routes do:
+// Checked graph read envelopes:
 //   all  -> {"entities": [...], "edges": [...], "total_entities", "total_edges", "page"}
 //   search -> {"results": [...]}
 //   entity -> {"entity": {...}|null, "edges": [...], "neighbors": {...}}
@@ -42,70 +42,39 @@ public enum KnowledgeGraphReadError: Error, LocalizedError, Sendable {
 }
 
 extension SwiftNativeKnowledgeGraphReader {
-    /// Page one immutable legacy store, preserving insertion order and
-    /// deduplicating cross-page edges without re-reading its JSON file.
-    private func completeSnapshotByPagingChecked(
+    /// Assemble the loaded legacy store in insertion and first-page edge order.
+    private func legacySnapshotChecked(
         store: KnowledgeGraphStore, maxPages: Int
-    ) async throws -> JSONValue {
+    ) throws -> JSONValue {
+        try Task.checkCancellation()
         let pageLimit = max(1, maxPages)
-        var entities: [JSONValue] = []
-        var edges: [JSONValue] = []
+        let count = store.entityOrder.count
+        guard count / 100 + (count % 100 == 0 ? 0 : 1) <= pageLimit else {
+            throw KnowledgeGraphReadError.paginationLimitExceeded(pageLimit)
+        }
+        let entities = store.entityOrder.compactMap { store.entities[$0] }
+        var firstPageByID: [String: Int] = [:]
+        for (index, entity) in entities.enumerated() {
+            guard case .object(let object) = entity,
+                  case .string(let id)? = object["id"], !id.isEmpty else { continue }
+            if firstPageByID[id] == nil { firstPageByID[id] = index / 100 }
+        }
+        let orderedEdges = store.edges.enumerated().compactMap { index, edge -> (page: Int, index: Int, edge: JSONValue)? in
+            guard case .object(let object) = edge else { return nil }
+            let page = min(firstPageByID[Self.snapshotString(object["from"]) ?? ""] ?? .max,
+                           firstPageByID[Self.snapshotString(object["to"]) ?? ""] ?? .max)
+            return page == .max ? nil : (page, index, edge)
+        }.sorted { $0.page == $1.page ? $0.index < $1.index : $0.page < $1.page }
+        try Task.checkCancellation()
         var seenEdges = Set<String>()
-        var expectedEntities: Int?
-
-        for page in 0..<pageLimit {
-            try Task.checkCancellation()
-            guard case .object(let envelope) = store.allEntities(page: page),
-                  case .array(let pageEntities)? = envelope["entities"] else {
-                throw KnowledgeGraphReadError.malformedEnvelope(
-                    "page \(page) did not contain an entities array"
-                )
-            }
-            let total = Self.snapshotInteger(envelope["total_entities"])
-                ?? Self.snapshotInteger(envelope["total"])
-                ?? pageEntities.count
-            if let expectedEntities, expectedEntities != total {
-                throw KnowledgeGraphReadError.malformedEnvelope(
-                    "entity total changed from \(expectedEntities) to \(total) during the read"
-                )
-            }
-            expectedEntities = total
-            entities.append(contentsOf: pageEntities)
-
-            if case .array(let pageEdges)? = envelope["edges"] {
-                for edge in pageEdges {
-                    let identity = Self.snapshotEdgeIdentity(edge)
-                    if seenEdges.insert(identity).inserted {
-                        edges.append(edge)
-                    }
-                }
-            }
-
-            if entities.count >= total {
-                return .object([
-                    "entities": .array(entities),
-                    "edges": .array(edges),
-                    "total_entities": .int(Int64(entities.count)),
-                    "total_edges": .int(Int64(edges.count)),
-                    "page": .int(0),
-                ])
-            }
-            if pageEntities.isEmpty {
-                throw KnowledgeGraphReadError.malformedEnvelope(
-                    "page \(page) was empty before the declared total \(total) was reached"
-                )
-            }
+        let edges = orderedEdges.compactMap { item in
+            seenEdges.insert(Self.snapshotEdgeIdentity(item.edge)).inserted ? item.edge : nil
         }
-        throw KnowledgeGraphReadError.paginationLimitExceeded(pageLimit)
-    }
-
-    private static func snapshotInteger(_ value: JSONValue?) -> Int? {
-        switch value {
-        case .int(let value): return Int(value)
-        case .double(let value): return Int(exactly: value.rounded(.towardZero))
-        case .string(let value): return Int(value)
-        default: return nil
-        }
+        return .object([
+            "entities": .array(entities), "edges": .array(edges),
+            "total_entities": .int(Int64(entities.count)), "total_edges": .int(Int64(edges.count)),
+            "page": .int(0),
+        ])
     }
 
     private static func snapshotString(_ value: JSONValue?) -> String? {
@@ -133,8 +102,7 @@ extension SwiftNativeKnowledgeGraphReader {
     }
 }
 
-/// Result of an entity lookup: either the neighbors envelope, or an explicit
-/// not-found marker so the caller can reproduce the daemon's 404 contract.
+/// Entity lookup yields a neighbors envelope or an explicit not-found result.
 public enum KnowledgeGraphEntityResult: Sendable {
     case found(JSONValue)
     case notFound
@@ -150,26 +118,16 @@ public struct SwiftNativeKnowledgeGraphReader: Sendable {
         self.graphPath = graphPath
     }
 
-    /// Resolve the path the daemon used:
-    ///   the retired daemon `_kg_path = root / "memory" / "knowledge_graph.json"`
-    /// where `root` is the data root. PersistenceCore.defaultDataRoot() mirrors
-    /// the daemon's data-root resolution (env NATIVE_AGENT_DATA_ROOT, literal
-    /// tilde, default ~/.nativeagent).
+    /// Pre-SQLite JSON path under `PersistenceCore.defaultDataRoot()`.
     public static func defaultPath() -> URL {
         PersistenceCore.defaultDataRoot()
             .appendingPathComponent("memory", isDirectory: true)
             .appendingPathComponent("knowledge_graph.json")
     }
 
-    /// Honest store-load policy (U5 W-C):
-    ///   1. memory.sqlite present + readable              -> SQLite store,
-    ///      including a legitimately empty graph. The SQLite loader performs
-    ///      the one-time JSON import synchronously before it returns, so a
-    ///      second fallback here could only resurrect stale legacy state.
-    ///   2. memory.sqlite present + UNREADABLE            -> THROW. No JSON
-    ///      fallback: stale JSON rendering as healthy is the resurrection bug.
-    ///   3. memory.sqlite missing                          -> JSON; a missing
-    ///      JSON file is a legitimate empty graph, a corrupt one THROWS.
+    /// Existing SQLite is authoritative, including an empty graph; its loader imports JSON once.
+    /// Unreadable SQLite throws without consulting JSON.
+    /// Only absent SQLite admits JSON: a missing JSON file is empty; corrupt JSON throws.
     private func readChecked<T: Sendable>(
         sqlite: @Sendable (URL) async throws -> T,
         legacy: @Sendable (KnowledgeGraphStore) async throws -> T
@@ -194,7 +152,7 @@ public struct SwiftNativeKnowledgeGraphReader: Sendable {
                 memoryDir: memoryDir, jsonImportPath: graphPath, page: page
             )
         } legacy: { store in
-            // Reproduce the daemon route's max(0, int(page)) clamp.
+            // Negative pages clamp to zero.
             store.allEntities(page: max(0, page))
         }
     }
@@ -215,7 +173,7 @@ public struct SwiftNativeKnowledgeGraphReader: Sendable {
                 memoryDir: memoryDir, jsonImportPath: graphPath, id: id
             )
         } legacy: { store in
-            // The wired entity route returns the neighbors envelope on hit.
+            // An entity hit returns its neighbors envelope.
             guard store.hasEntity(id) else { return .notFound }
             return .found(store.neighbors(id))
         }
@@ -245,7 +203,7 @@ public struct SwiftNativeKnowledgeGraphReader: Sendable {
                 memoryDir: memoryDir, jsonImportPath: graphPath, maxPages: maxPages
             )
         } legacy: { store in
-            try await completeSnapshotByPagingChecked(store: store, maxPages: maxPages)
+            try legacySnapshotChecked(store: store, maxPages: maxPages)
         }
     }
 }

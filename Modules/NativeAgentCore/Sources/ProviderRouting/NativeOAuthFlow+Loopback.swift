@@ -1,28 +1,13 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `NativeOAuthFlow+Loopback.swift` | `NativeOAuthFlow`: `startOpenAILoopbackFlow`, `callbackTarget`, `callbackHasResult` |
+import NativeAgentShared
+// Blueprint: | `NativeOAuthFlow+Loopback.swift` | `NativeOAuthFlow`: `startOpenAILoopbackFlow`, `callbackPageMessage` |
 
 // MARK: - Loopback OAuth (ChatGPT / OpenAI)
 //
-// OpenAI's ChatGPT sign-in client (`app_EMoamEEZ73f0CkXaXp7hrann`, the same
-// public client the `codex` CLI uses) only allows a LOOPBACK redirect —
-// `http://localhost:1455/auth/callback` — never a custom URL scheme. So the
-// custom-scheme ASWebAuthenticationSession path that Anthropic/Grok use returns
-// an OpenAI "unknown_error" for ChatGPT (redirect_uri not registered).
-//
-// This runs codex's flow natively, minus the codex binary: bind a one-shot
-// local HTTP listener on 127.0.0.1:1455, open auth.openai.com in the default
-// browser, catch the `GET /auth/callback?code=…&state=…` redirect, hand the
-// browser a "you can close this" page, then PKCE-exchange the code exactly as
-// the shared ProviderOAuthConfig.openai already does. Verified port/path/params
-// against the shipped codex Rust binary (1455, /auth/callback, /success,
-// id_token_add_organizations, codex_cli_simplified_flow) — 2026-07-05.
-//
-// Hardening (gpt-5.5 review 2026-07-05): per-connection buffering so a split
-// request line can't hang; EXACT /auth/callback path match + require code/error
-// before resolving (stray probes like /favicon.ico get a 404 and are ignored);
-// open the browser only on listener .ready; fail loud on port-in-use; wire task
-// cancellation to tear the listener down.
+// ChatGPT sign-in requires the loopback redirect http://localhost:1455/auth/callback and a PKCE exchange.
+// Buffer each connection and accept only exact callback paths with code/error; other probes receive 404.
+// Open the browser only when the listener is ready; port conflicts fail and cancellation closes the listener.
 
 extension NativeOAuthFlow {
 
@@ -41,12 +26,15 @@ extension NativeOAuthFlow {
         let redirectURI = "http://localhost:\(openAILoopbackPort)\(openAILoopbackPath)"
 
         let pkce = PKCE.generate()
-        let state = NativeOAuthSupport.randomHex(16)
-        let authURL = config.buildAuthURL(
+        let state = OAuthGrantOperations.randomHex(16)
+        let authURL: URL
+        do { authURL = try config.buildAuthURL(
             redirectURI: redirectURI,
             state: state,
             challenge: pkce.challenge
-        )
+        ) } catch {
+            return OAuthFlowResult(ok: false, error: "Invalid authorization URL: \(error.localizedDescription)")
+        }
 
         let callbackURL: URL
         do {
@@ -78,7 +66,7 @@ extension NativeOAuthFlow {
             )
         } catch {
             return OAuthFlowResult(ok: false,
-                error: "Token exchange failed: \(NativeOAuthSupport.redact(error.localizedDescription))")
+                error: "Token exchange failed: \(OAuthGrantOperations.redact(error.localizedDescription))")
         }
 
         do {
@@ -109,23 +97,6 @@ extension NativeOAuthFlow {
         return declined
             ? "Sign-in didn't finish — return to NativeAgent to try again."
             : "Finishing sign-in — return to NativeAgent."
-    }
-
-    /// From `GET /auth/callback?code=…&state=… HTTP/1.1`, return the request
-    /// target (path+query) ONLY when the path is EXACTLY `/auth/callback`.
-    public static func callbackTarget(from requestLine: String) -> String? {
-        let parts = requestLine.split(separator: " ")
-        guard parts.count >= 2, parts[0] == "GET" else { return nil }
-        let target = String(parts[1])
-        guard OAuthLoopbackCallbackPolicy.validCallbackURL(target: target,
-            path: openAILoopbackPath, port: openAILoopbackPort) != nil else { return nil }
-        return target
-    }
-
-    /// True only when the callback carries an OAuth result (code or error) —
-    /// so a bare `/auth/callback` probe can't resolve the flow prematurely.
-    public static func callbackHasResult(_ url: URL) -> Bool {
-        OAuthLoopbackCallbackPolicy.hasResult(url)
     }
 
 }

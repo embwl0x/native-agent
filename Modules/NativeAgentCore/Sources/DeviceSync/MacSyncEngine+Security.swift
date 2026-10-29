@@ -1,9 +1,3 @@
-// PATCH-2026-05-07: ios-sync MacSyncEngine — SnapshotWriter + InboxWatcher (Mac side)
-// SnapshotWriter: every N seconds writes app-owned Swift runtime state to iCloud Drive `snapshots/`.
-//   Touches KVS key `snapshot_updated` so iOS observes immediately.
-// InboxWatcher: NSMetadataQuery on `inbox/`. When iOS drops an action JSON, dispatch to
-//   the in-process Swift runtime, write response to `responses/<msg_id>.json`, touch KVS `inbox_response_<msg_id>`.
-
 import AppKit
 import Foundation
 import NativeAgentShared
@@ -13,12 +7,7 @@ import PersistenceCore
 // Blueprint: | `MacSyncEngine+Security.swift` | MacSyncEngine pairing rotation and signed responses; complete signed CloudKit action-record budgeting before terminal ledger settlement; oversized readbacks return an explicit processed-action error; BridgeMessage owns HMAC, constant-time comparison and inner-action verification; outer signatures remain case-sensitive |
 
 extension MacSyncEngine {
-    // C.1: HMAC pairing secret — loaded lazily on first use via PairingSecretManager (single source of truth).
-    // TODO(iOS-side): iOS sender must compute HMAC-SHA256 over the canonical
-    // JSON body (fields sorted, "signature" key excluded) and include it as
-    // the "signature" field in the JSON.  Until then all unsigned messages are
-    // rejected when signature validation is enforced.
-
+    // The HMAC pairing secret is loaded lazily through PairingSecret.
     func pairingSecret() throws -> Data {
         guard !pairingSecretRotationInProgress else {
             throw NSError(
@@ -28,7 +17,7 @@ extension MacSyncEngine {
             )
         }
         if let s = _pairingSecret { return s }
-        let s = try PairingSecretManager.loadOrGenerateSecret()
+        let s = try PairingSecret.loadOrGenerateSecret()
         _pairingSecret = s
         return s
     }
@@ -54,6 +43,7 @@ extension MacSyncEngine {
 
     func actionResponse(_ response: [String: String], for action: InboxAction) throws -> [String: String] {
         var body = response
+        body["result_class"] = InboxAction.responseResultClass(response)
         body["msgId"] = action.msgId
         body["transactionId"] = action.transactionId ?? action.msgId
         body["action"] = action.action
@@ -114,17 +104,7 @@ extension MacSyncEngine {
                 validatedID: action.msgId
               ) else { return false }
         guard !FileManager.default.fileExists(atPath: responseURL.path) else { return true }
-        let lower = message.lowercased()
-        let code: String
-        if lower.contains("hmac") || lower.contains("signature wrong") {
-            code = "signature_invalid"
-        } else if lower.hasPrefix("message too old:") {
-            code = "expired_before_execution"
-        } else if lower.contains("timestamp") {
-            code = "timestamp_invalid"
-        } else {
-            code = "signature_required"
-        }
+        let code = message.hasPrefix("message too old:") ? "expired_before_execution" : "timestamp_invalid"
         guard let response = try? signedResponse([
             "status": "error",
             "ok": "false",
@@ -169,12 +149,7 @@ extension MacSyncEngine {
         }
     }
 
-    /// The ±5-minute window on its own, separated from authenticity (2026-09-06)
-    /// so the Drive inbox lane can ask the two questions in the order that lane
-    /// needs: HMAC first, because anything on the account can write into that
-    /// folder, then the ledger, and freshness LAST — an action that already
-    /// executed is answered from its ledger row no matter how long the
-    /// redelivery took, and freshness only ever gates NEW work.
+    /// Apply the ±5-minute freshness window only to new work, after HMAC verification and ledger lookup.
     func inboxActionFreshnessError(_ action: InboxAction) -> String? {
         guard let ts = NativeTimestampFormat.parseISO8601FractionalFirst(action.createdAt) else {
             return "invalid timestamp: \(action.createdAt)"
@@ -189,56 +164,4 @@ extension MacSyncEngine {
         return nil
     }
 
-    /// HMAC-SHA256 of the canonical body (JSON with keys sorted, signature excluded)
-    /// must match the "signature" field. Freshness gates new work after ledger lookup.
-    /// Returns nil on success, or an error string to log/reject.
-    func validateInboxAction(
-        data: Data,
-        action: InboxAction
-    ) async -> String? {
-        guard let sig = action.signature else {
-            // S.2: write an upgrade-required response so old iOS apps get a clear error
-            // instead of timing out waiting for a response that never comes.
-            let responseURL = responsesDir.flatMap {
-                InboxActionFileBoundary.jsonURL(in: $0, validatedID: action.msgId)
-            }
-            // fix-R9-3 Use [String: String] so iOS's JSONDecoder([String:String]) can parse it.
-            guard let upgradeResp = try? signedResponse([
-                "msgId":     action.msgId,
-                "ok":        "false",
-                "error":     "iOS app needs upgrade to enable HMAC signing. Update via App Store / TestFlight.",
-                "code":      "signature_required",
-                "createdAt": ISO8601DateFormatter().string(from: Date()),
-            ]) else {
-                return "pairing secret unavailable — could not sign upgrade response"
-            }
-            // PATCH-2026-05-08: review-fix-r7 Only set KVS after a successful
-            // atomic write. Otherwise old iOS gets pinged but finds no
-            // response file, and times out anyway.
-            var wrote = false
-            if let data = try? JSONSerialization.data(withJSONObject: upgradeResp),
-               let url = responseURL {
-                // crash-class-1: move iCloud write off the MainActor.
-                let writeError = await Task.detached(priority: .utility) { [data, url] in
-                    Self.atomicWrite(data: data, to: url)
-                }.value
-                if let writeError {
-                    // surface in returned error
-                    return "missing signature — failed to write upgrade response: \(writeError)"
-                }
-                wrote = true
-            }
-            if wrote {
-                let msgId = action.msgId
-                _ = await withCKTimeout("MacSyncEngine.validateInboxAction.upgradeResponseKVS") {
-                    let kvs = NSUbiquitousKeyValueStore.default
-                    kvs.set(msgId, forKey: "inbox_response_\(msgId)")
-                    return kvs.synchronize()
-                }
-            }
-            return "missing signature — upgrade response written for iOS client"
-        }
-
-        return BridgeMessage.innerActionSignatureError(data: data, signature: sig, secret: pairingSecret)
-    }
 }

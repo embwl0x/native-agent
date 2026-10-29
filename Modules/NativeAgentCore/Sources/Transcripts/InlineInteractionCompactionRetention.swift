@@ -7,14 +7,7 @@ import PersistenceCore
 /// WHICH inline-interaction rows a destructive transcript pass is allowed to
 /// fold away.
 ///
-/// An inline card is not transcript colour: it is the handle a person answers a
-/// need with, and — when it carries a continuation — the only record of a
-/// request that is still suspended. Agent's session 644D65F1 compacted 223 rows
-/// on 2026-09-14 and took 8 cards with them, two of them `failed` cards whose
-/// continuation was still `waiting`: a retryable ask vanished under her, and the
-/// suspended request behind it became unresumable.
-///
-/// So compaction may drop a card ONLY when both halves are finished with:
+/// Compaction may drop a card ONLY when both halves are finished with:
 /// the interaction reached a terminal state nobody is expected to act on
 /// (`settled` / `declined` / `superseded`), AND its continuation is not
 /// resumable (`resumed` / `invalidated`, or there is no continuation at all).

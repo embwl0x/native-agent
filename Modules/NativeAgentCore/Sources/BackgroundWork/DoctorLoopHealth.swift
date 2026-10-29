@@ -1,7 +1,10 @@
 import Foundation
+import NativeAgentShared
+import NativeAgentCore
 import BackgroundLoops
 import DoctorChecks
 import Privacy
+import PersistenceCore
 // Blueprint: | `DoctorLoopHealth.swift` | `DoctorLoopHealth`, `LoopHealthVerdict`; health, dormancy and schedule interpretation of supplied manager observations, plus bounded failure-receipt parsing |
 
 // Live scheduler state and bounded durable receipts distinguish persistent
@@ -73,7 +76,7 @@ public enum DoctorLoopHealth {
     /// Restart scheduling of the loops already registered with Core's manager.
     /// Never reassembles loops, forces a workload, or resets a due clock.
     public static func safeRepair(
-        manager: BackgroundLoops.BackgroundLoopsManager
+        manager: BackgroundLoops.BackgroundLoopLifetimes
     ) async -> DoctorExecutableRepair? {
         let statuses = await manager.status()
         guard statuses.contains(where: {
@@ -192,14 +195,7 @@ public enum DoctorLoopHealth {
     /// has not yet been given its threshold's worth of time to complete
     /// anything.
     ///
-    /// 2026-09-10 (D3): the bound applies only to a loop that was EXPECTED to
-    /// complete work in the window. A loop whose last tick legitimately skipped
-    /// — nothing due, feature off, no queued work — completed nothing because
-    /// there was nothing to complete, and a loop whose first tick has not fired
-    /// yet has had no chance at all. Calling either one dormant put nine
-    /// warnings on a healthy install ("no work completed in 9d. Last outcome:
-    /// skipped: no Desk notification due"), which is normal life reported as a
-    /// fault.
+    /// Dormancy requires a tick expected to complete work; legitimate skips are healthy.
     ///
     /// A loop that has NEVER completed is judged from `firstSeenAt` — the
     /// durable stamp of when it was first registered. `lastRun` cannot serve:
@@ -392,31 +388,23 @@ public enum DoctorLoopHealth {
         maxBytes: Int = 512 * 1024,
         maxReceipts: Int = 500
     ) -> [String: [FailureIncident]] {
-        guard let handle = try? FileHandle(forReadingFrom: receiptsFile) else { return [:] }
-        defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()) ?? 0
-        let start = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
-        guard (try? handle.seek(toOffset: start)) != nil,
-              let data = try? handle.readToEnd(),
-              let text = String(data: data, encoding: .utf8) else { return [:] }
-        let parser = ISO8601DateFormatter()
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        guard let read = try? SwiftNativePersistenceCore.tailPhysicalLines(receiptsFile, limit: .max, maxBytes: maxBytes),
+              let text = String(data: Data(read.lines.joined(separator: [0x0A])), encoding: .utf8) else { return [:] }
         var result: [String: [FailureIncident]] = [:]
         // Drop the first line when we started mid-file: it is almost certainly
         // a partial JSON row.
         let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
-        let usable = start > 0 ? lines.dropFirst() : lines[...]
+        let usable = read.truncatedToByteWindow ? lines.dropFirst() : lines[...]
         for line in usable.suffix(maxReceipts) {
             guard let rowData = line.data(using: .utf8),
                   let row = try? JSONSerialization.jsonObject(with: rowData) as? [String: Any],
                   let loopId = row["loopId"] as? String else { continue }
             let timestamp = (row["lastAt"] as? String) ?? (row["createdAt"] as? String) ?? ""
-            guard let date = parser.date(from: timestamp) ?? fractional.date(from: timestamp) else {
+            guard let date = NativeTimestampFormat.parseISO8601(timestamp) else {
                 continue
             }
             let firstTimestamp = (row["firstAt"] as? String) ?? (row["createdAt"] as? String) ?? ""
-            let firstAt = parser.date(from: firstTimestamp) ?? fractional.date(from: firstTimestamp)
+            let firstAt = NativeTimestampFormat.parseISO8601(firstTimestamp)
             result[loopId, default: []].append(FailureIncident(
                 firstAt: firstAt,
                 lastAt: date,

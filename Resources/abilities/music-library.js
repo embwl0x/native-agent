@@ -1,5 +1,5 @@
 /* NativeAgent ability
-{"id": "music-library", "kind": "tool", "version": 1, "reach": {"capabilities": ["app_read:com.apple.Music"]}, "face": {"page": "music"}, "record": {"description": "Read Music library search, playlist/library pages and current playback without opening Music.", "actions": [], "inputSchema": {"type": "object", "properties": {"operation": {"type": "string", "enum": ["search", "library", "playlists", "now_playing"]}, "input": {"type": "object"}}, "required": ["operation", "input"], "additionalProperties": false, "readOnly": true}}}
+{"id": "music-library", "kind": "tool", "version": 1, "reach": {"capabilities": ["app_read:com.apple.Music"]}, "face": {"page": "music"}, "record": {"description": "Read Music playback state and observed timing; page typed playlists and sorted, filtered library/search results with totals, without opening Music.", "actions": [], "inputSchema": {"type": "object", "properties": {"operation": {"type": "string", "enum": ["search", "library", "playlists", "now_playing"]}, "input": {"type": "object"}}, "required": ["operation", "input"], "additionalProperties": false, "readOnly": true}}}
 */
 const text = value => ["string", "number", "boolean"].includes(typeof value) ? String(value) : "";
 const escape = value => value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\r\n/g, "\\n").replace(/\n/g, "\\n").replace(/\r/g, "\\r");
@@ -36,16 +36,16 @@ function page(raw, operation, offset, limit) {
     const rows = operation === "library" ? tracks(records, true, offset)
         : records.trim().split("###").filter(e => e.trim()).map((entry, index) => {
             const p = entry.trim().split("|||"), count = /^\d+$/.test(p[2] || "") ? Number(p[2]) : "unknown";
-            return {index:integer(p[0], offset + index + 1, 0, Number.MAX_SAFE_INTEGER), name:p[1] || "", track_count:count, persistent_id:p[3] || "", special_kind:p[4] || ""};
+            return {index:integer(p[0], offset + index + 1, 0, Number.MAX_SAFE_INTEGER), name:p[1] || "", track_count:count, persistent_id:p[3] || "", special_kind:p[4] || "", kind:p[5]};
         });
-    return Object.assign({status:"completed", offset, limit, total, count:rows.length, hasMore:offset + rows.length < total}, {[operation === "library" ? "tracks" : "playlists"]:rows});
+    return Object.assign({status:"completed", offset, limit, total, count:rows.length, has_more:offset + rows.length < total, hasMore:offset + rows.length < total}, {[operation === "library" ? "tracks" : "playlists"]:rows});
 }
 
-function nowPlaying() {
+function playbackRead() {
     let raw;
     try { raw = script(nowScript(), false); }
     catch (error) {
-        if (error.reason === "not_running") return {status:"completed", isPlaying:false, playerState:"not_running", track:null, reason:"Music isn't open."};
+        if (error.reason === "not_running") return {status:"completed", isPlaying:false, playerState:"stopped", track:null, reason:"Music isn't open."};
         const result = error.receipt && error.receipt.result;
         if (result && result.code === -1751) return {status:"completed", isPlaying:false, playerState:"unknown", track:null, reason:"no_current_track"};
         return errorResult(error);
@@ -67,6 +67,38 @@ function nowPlaying() {
     return {status:"failed", integration:"music", isPlaying, playerState:state, track:null, reason:"malformed_now_playing_response", detail:unparsed};
 }
 
+function nowPlaying() {
+    const result = playbackRead(), observed_at = new Date().toISOString();
+    if (result.status !== "completed") return result;
+    const previous = host.state.get(), state = ["fast forwarding", "fast_forwarding", "rewinding"].includes(result.playerState) ? "playing" : result.playerState;
+    if (!["playing", "paused", "stopped"].includes(state)) return Object.assign(failed("playback_state_unavailable"), {track:null, observed_at});
+    const track_key = result.track ? [result.track.name, result.track.artist, result.track.album].join("\n") : null;
+    const observed_since = previous && previous.state === state && previous.track_key === track_key ? previous.observed_since : observed_at;
+    // Music supplies no state-transition date. Do not turn a remembered read
+    // into a claim that playback continued unseen between observations.
+    host.state.set({state, track_key, observed_since});
+    return Object.assign({state, since:observed_since, since_basis:"first observed; Music supplies no transition time and continuity between reads is unknown", observed_since, observed_at}, result);
+}
+
+function library(input, offset, limit) {
+    const sort = input.sort === undefined ? "title" : input.sort;
+    if (!["title", "artist", "added"].includes(sort)) return failed("unknown_sort");
+    const filter = input.filter === undefined ? {} : input.filter;
+    if (!filter || typeof filter !== "object" || Array.isArray(filter) || Object.keys(filter).some(k => !["artist", "album", "genre"].includes(k) || typeof filter[k] !== "string"))
+        return Object.assign(failed("invalid_filter"), {message:"filter takes artist, album and/or genre text; matching ignores case and contains all supplied values."});
+    const terms = Object.keys(filter).map(k => k + ' contains "' + escape(filter[k]) + '"');
+    const selection = "(every track of library playlist 1" + (terms.length ? " whose " + terms.join(" and ") : "") + ")";
+    const raw = script(libraryKeysScript(selection, sort), false);
+    if (!Array.isArray(raw) || raw.length !== 2 || !raw.every(Array.isArray) || raw[0].length !== raw[1].length)
+        return failed("malformed_library_sort_keys");
+    const ordered = raw[0].map((id, index) => ({id, key:raw[1][index], index}));
+    ordered.sort((a,b) => (sort === "added" ? Number(b.key) - Number(a.key) : String(a.key).localeCompare(String(b.key), undefined, {sensitivity:"base"})) || a.index - b.index);
+    const ids = ordered.slice(offset, offset + limit).map(row => row.id);
+    const rows = ids.length ? tracks(script(libraryScript(ids, offset), false), true, offset) : [];
+    const total = ordered.length, has_more = offset + rows.length < total;
+    return {status:"completed", sort, filter, offset, limit, count:rows.length, total, has_more, hasMore:has_more, tracks:rows};
+}
+
 function run(request) {
     const input = request.input, operation = request.operation;
     try {
@@ -76,25 +108,32 @@ function run(request) {
             if (!query) return Object.assign(failed("missing_query"), {message:"Nothing to search for: give a word or phrase in query."});
             if (!["track", "artist", "album"].includes(kind)) return failed("unknown_kind:" + kind);
             const predicate = kind === "artist" ? "artist contains q" : kind === "album" ? "album contains q" : "name contains q or artist contains q or album contains q";
-            const results = tracks(script(searchScript(query, predicate, integer(input.limit, 20, 1, 100)), false), false, 0);
-            return {status:"completed", count:results.length, results};
+            const offset = integer(input.offset, 0, 0, 1000000), limit = integer(input.limit, 20, 1, 100);
+            const raw = script(searchScript(query, predicate, offset, limit), false), pieces = raw.split(":::PAGE:::");
+            const total = integer(pieces.shift(), 0, 0, Number.MAX_SAFE_INTEGER), results = tracks(pieces.join(":::PAGE:::"), false, offset);
+            const has_more = offset + results.length < total;
+            return {status:"completed", offset, limit, count:results.length, total, has_more, hasMore:has_more, results};
         }
         const offset = integer(input.offset, 0, 0, 1000000), limit = integer(input.limit, 50, 1, 100);
-        return page(script(operation === "library" ? libraryScript(offset, limit) : playlistsScript(offset, limit), false), operation, offset, limit);
+        if (operation === "library") return library(input, offset, limit);
+        if (operation !== "playlists") return failed("unknown_operation");
+        return page(script(playlistsScript(offset, limit), false), operation, offset, limit);
     } catch (error) {
-        if (error.reason === "not_running") return {status:"completed", count:0, reason:"Music isn't open; music_control play opens it."};
+        if (error.reason === "not_running") return {status:"unavailable", count:0, total:null, has_more:null, reason:"Music isn't open; music.control play opens it."};
         return errorResult(error);
     }
 }
 
-function searchScript(query, predicate, limit) { return `
+function searchScript(query, predicate, offset, limit) { return `
 with timeout of 10 seconds
         set searchOutputString to ""
         set q to "${escape(query)}"
-        set searchHitsList to (every track whose ${predicate})
+        set searchHitsList to (every track of library playlist 1 whose ${predicate})
+        set totalHits to count of searchHitsList
         set searchCountedNum to 0
-        repeat with trackItem in searchHitsList
+        repeat with hitIndex from ${offset + 1} to totalHits
             if searchCountedNum ≥ ${limit} then exit repeat
+            set trackItem to item hitIndex of searchHitsList
             set trackNameString to ""
             set trackArtistString to ""
             set trackAlbumString to ""
@@ -114,23 +153,30 @@ with timeout of 10 seconds
             set searchOutputString to searchOutputString & trackNameString & "|||" & trackArtistString & "|||" & trackAlbumString & "|||" & trackDurationString & "###"
             set searchCountedNum to searchCountedNum + 1
         end repeat
-        return searchOutputString
+        return (totalHits as string) & ":::PAGE:::" & searchOutputString
 end timeout
 `; }
 
-function libraryScript(offset, limit) { return `
+function libraryKeysScript(selection, sort) { return `
 with timeout of 15 seconds
-        set totalTrackCountString to "0"
+    set libraryIDs to persistent ID of ${selection}
+    ${sort === "added" ? `set addedDates to date added of ${selection}
+    set sortKeys to {}
+    repeat with addedDate in addedDates
+        set end of sortKeys to (year of addedDate) * 10000000000 + ((month of addedDate) as integer) * 100000000 + (day of addedDate) * 1000000 + (time of addedDate)
+    end repeat` : "set sortKeys to " + (sort === "title" ? "name" : "artist") + " of " + selection}
+    return {libraryIDs, sortKeys}
+end timeout
+`; }
+
+function libraryScript(ids, offset) { return `
+with timeout of 15 seconds
         set libraryOutputString to ""
-        set totalTrackCountNum to count of tracks
-        set totalTrackCountString to totalTrackCountNum as string
-        set startIndexNum to ${offset + 1}
-        set requestedEndIndexNum to ${offset + limit}
-        if startIndexNum is less than or equal to totalTrackCountNum then
-            set endIndexNum to requestedEndIndexNum
-            if endIndexNum is greater than totalTrackCountNum then set endIndexNum to totalTrackCountNum
-            repeat with trackIndexNum from startIndexNum to endIndexNum
-                set trackItem to track trackIndexNum
+        set selectedIDs to {${ids.map(id => '"' + escape(id) + '"').join(", ")}}
+            repeat with selectedIndex from 1 to (count of selectedIDs)
+                set selectedID to item selectedIndex of selectedIDs
+                set trackIndexNum to ${offset} + selectedIndex
+                set trackItem to first track of library playlist 1 whose persistent ID is selectedID
                 set trackNameString to ""
                 set trackArtistString to ""
                 set trackAlbumString to ""
@@ -153,8 +199,7 @@ with timeout of 15 seconds
                 end try
                 set libraryOutputString to libraryOutputString & trackIndexNum & "|||" & trackNameString & "|||" & trackArtistString & "|||" & trackAlbumString & "|||" & trackDurationString & "|||" & trackPersistentIDString & "###"
             end repeat
-        end if
-        return totalTrackCountString & ":::PAGE:::" & libraryOutputString
+        return libraryOutputString
 end timeout
 `; }
 
@@ -175,6 +220,14 @@ with timeout of 15 seconds
                 set playlistTrackCountString to "unknown"
                 set playlistPersistentIDString to ""
                 set playlistSpecialKindString to ""
+                set playlistKindString to "library"
+                if class of playlistItem is user playlist then
+                    if smart of playlistItem then
+                        set playlistKindString to "smart"
+                    else
+                        set playlistKindString to "owner"
+                    end if
+                end if
                 try
                     set playlistNameString to (name of playlistItem) as string
                 end try
@@ -187,7 +240,7 @@ with timeout of 15 seconds
                 try
                     set playlistSpecialKindString to (special kind of playlistItem) as string
                 end try
-                set playlistOutputString to playlistOutputString & playlistIndexNum & "|||" & playlistNameString & "|||" & playlistTrackCountString & "|||" & playlistPersistentIDString & "|||" & playlistSpecialKindString & "###"
+                set playlistOutputString to playlistOutputString & playlistIndexNum & "|||" & playlistNameString & "|||" & playlistTrackCountString & "|||" & playlistPersistentIDString & "|||" & playlistSpecialKindString & "|||" & playlistKindString & "###"
             end repeat
         end if
         return totalPlaylistCountString & ":::PAGE:::" & playlistOutputString

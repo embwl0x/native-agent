@@ -2,70 +2,23 @@ import Foundation
 import CoreGraphics
 // Blueprint: | `VisionPerceptionTypes.swift` | `VisionConfidence`, `VisionStateGuess`, `VisionEvidenceSource`, `VisionCandidate` |
 
-// MARK: - MacVisionPerception v0 — the general screen, from PIXELS ONLY
-//
-// NORTHSTAR clause 5: the world reaches her as a SENSE, not as work. The AX
-// lane (MacPerceptionCompiler) gives her that for apps that publish an
-// accessibility tree. This lane is the other half: an AX-BLIND window
-// (a game, Telegram, a custom renderer) perceived from its pixels, emitting
-// the SAME `MacLookPercept` contract so glance/look/act and every downstream
-// consumer work unchanged.
-//
-// GENERAL BY LAW (feedback_build_the_general_capability): there is not one
-// app-specific rule in this lane. Every heuristic keys on SHAPE — colour
-// regions, text geometry, saliency — never on a bundle id, a window title, or
-// a known string. WoW is the bar these must clear, never a thing to hardcode.
-//
-// THE TRUST CONTRACT (Agent's design input, 2026-08-22 14:14Z, + the verbatim
-// audit that followed — docs/build_plans/native-look.md):
-//
-//   • PER-ATTRIBUTE confidence, FIVE attributes: bounds / role / state / text
-//     / TARGET. No single score. `target` ("how sure is this THE element you
-//     asked for") is deliberately distinct from `role` ("how sure is this a
-//     button"), because target is the one that gates ACTING.
-//   • CALIBRATED REFUSAL is half the contract, co-equal with verified effects.
-//     `ambiguous` is a FIRST-CLASS result — never hidden by forcing guesses.
-//   • STATE guesses name selected / checked / DISABLED explicitly, each with
-//     its OWN confidence, and never ride out as a bare boolean. `disabled` is
-//     load-bearing: acting on a control we believe is enabled when it is not
-//     is exactly the hopeful click this contract exists to prevent.
-//   • provenance: "vision" on EVERY row. An unknown role is
-//     "AXUnknown" + a low role confidence — never a guessed AXButton at 1.0.
-//
-// This lane is PURE: CGImage in, percept out. No capture, no injection, no
-// wiring into the four verbs (done: SwiftToolDispatcher+FourVerbPerception.swift
-// is the production caller; mac_look is legacy). Every
-// stage is therefore fully testable headless, which is why the tests render
-// synthetic scenes into real CGImages and run the real pipeline over real
-// pixels rather than over a fixture of what pixels "would" say.
+// Pixel perception compiles CGImage into VisionPercept; fourVerbSupplement
+// translates it into additive MacFourVerbsSupplement evidence and physical targets.
+// Heuristics use colour, text geometry and saliency, never app identity or known strings.
+// Every rendered row retains vision provenance and explicit abstention.
+// Pixel perception is pure: CGImage in, percept out, with no capture or input injection.
 
 // MARK: - Per-attribute confidence (the trust contract)
 
-/// FIVE attributes, never one score.
-///
-/// Collapsing these is exactly the conflation Agent asked us to avoid: "how
-/// sure am I this is a button" and "how sure am I this is THE button you asked
-/// for" are different questions with different answers, and only the second
-/// one should gate acting.
+/// Confidence is per attribute; only target confidence gates acting.
 public struct VisionConfidence: Sendable, Equatable {
     /// How precise are these bounds — did the region grow to a real edge?
     public let bounds: Double
-    /// How sure is the role GUESS (AXButton / AXTextField / AXRow / …).
-    public let role: Double
-    /// How sure are the state guesses (selected / checked / disabled).
-    public let state: Double
-    /// How sure are we the OCR text says what we think it says.
-    public let text: Double
-    /// How sure are we this is THE element the caller asked for. Distinct from
-    /// `role` by contract; capped hard by the abstain rule, and the attribute
-    /// an actuator must gate on.
+    /// Target certainty incorporates role evidence and is capped by abstention.
     public let target: Double
 
-    public init(bounds: Double, role: Double, state: Double, text: Double, target: Double) {
+    public init(bounds: Double, target: Double) {
         self.bounds = VisionConfidence.clamp(bounds)
-        self.role = VisionConfidence.clamp(role)
-        self.state = VisionConfidence.clamp(state)
-        self.text = VisionConfidence.clamp(text)
         self.target = VisionConfidence.clamp(target)
     }
 
@@ -83,17 +36,13 @@ public struct VisionConfidence: Sendable, Equatable {
 public struct VisionStateFlag: Sendable, Equatable {
     public let value: Bool
     public let confidence: Double
-    /// What in the pixels suggested it, so a reader can disbelieve it.
-    public let evidence: String
-
-    public init(value: Bool, confidence: Double, evidence: String) {
+    public init(value: Bool, confidence: Double) {
         self.value = value
         self.confidence = VisionConfidence.clamp(confidence)
-        self.evidence = evidence
     }
 }
 
-/// The three states Agent named. Each is OPTIONAL — absent means "we did not
+/// Each state is optional — absent means "we did not
 /// form a view", which is a different and more honest answer than `false`.
 public struct VisionStateGuess: Sendable, Equatable {
     public let selected: VisionStateFlag?
@@ -112,15 +61,6 @@ public struct VisionStateGuess: Sendable, Equatable {
         self.selected = selected
         self.checked = checked
         self.disabled = disabled
-    }
-
-    /// The confidence the `state` attribute reports: the weakest guess we
-    /// actually made, because a row is only as trustworthy as its shakiest
-    /// state claim. No guesses at all ⇒ 0 (we know nothing, and say so).
-    public var aggregateConfidence: Double {
-        let all = [selected, checked, disabled].compactMap { $0?.confidence }
-        guard let weakest = all.min() else { return 0 }
-        return weakest
     }
 }
 

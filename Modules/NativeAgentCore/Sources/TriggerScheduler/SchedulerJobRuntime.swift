@@ -52,9 +52,10 @@ public enum SchedulerJobRuntime {
         guard job["activeOccurrence"] == nil, job["retryPendingUntilEpoch"] == nil,
               let schedule = wallClockSchedule(job) else { return nil }
         let zone = TimeZone.autoupdatingCurrent
+        guard let utc = TimeZone(secondsFromGMT: 0) else { return nil }
         func civil(_ value: JSONValue?) -> Double? {
             // Machine stamps: an offset-less one was written as UTC.
-            string(value).flatMap { SchedulerJobNormalizer.parseISO($0, zone: TimeZone(secondsFromGMT: 0)!) }.flatMap {
+            string(value).flatMap { SchedulerJobNormalizer.parseISO($0, zone: utc) }.flatMap {
                 civilEpoch(occurrence(at: Date(timeIntervalSince1970: $0), zone: zone))
             }
         }
@@ -72,8 +73,8 @@ public enum SchedulerJobRuntime {
         guard let after = [anchor, claimed, civil(job["lastRunAt"])].compactMap({ $0 }).max()
             ?? civil(job["createdAt"]) else { return nil }
         guard let next = try? SchedulerJobNormalizer.nextFromSchedule(schedule, afterEpoch: after, now: { Date() },
-                                                                       zone: TimeZone(secondsFromGMT: 0)!) else { return nil }
-        return occurrence(at: Date(timeIntervalSince1970: next), zone: TimeZone(secondsFromGMT: 0)!)
+                                                                       zone: utc) else { return nil }
+        return occurrence(at: Date(timeIntervalSince1970: next), zone: utc)
     }
 
     /// Claims and rows bearing a legacy retry marker keep the saved instant, not the marker's value.
@@ -84,7 +85,8 @@ public enum SchedulerJobRuntime {
               wallClockSchedule(job) != nil else { return saved }
         guard let key = nextWallClockOccurrence(for: job), let next = civilEpoch(key) else { return nil }
         if let saved, wallClockOccurrence(for: job, epoch: saved) == key { return saved }
-        return wallClock(Date(timeIntervalSince1970: next), from: TimeZone(secondsFromGMT: 0)!, to: .autoupdatingCurrent)?.timeIntervalSince1970
+        guard let utc = TimeZone(secondsFromGMT: 0) else { return nil }
+        return wallClock(Date(timeIntervalSince1970: next), from: utc, to: .autoupdatingCurrent)?.timeIntervalSince1970
     }
 
     /// The civil minute `date` reads in `from`, formed again in `to`.
@@ -123,7 +125,9 @@ public enum SchedulerJobRuntime {
             return try SchedulerJobNormalizer.nextFromSchedule(schedule, afterEpoch: afterEpoch, now: now)
         }
         let interval = max(60, int(obj["intervalSeconds"] ?? obj["interval_seconds"], default: 3600))
-        return afterEpoch + Double(interval)
+        let next = afterEpoch + Double(interval)
+        _ = try SchedulerJobNormalizer.checkedEpoch(next)
+        return next
     }
 
     /// Past `now` and past the minute `dueEpoch` claimed: in a fall-back hour a

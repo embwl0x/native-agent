@@ -19,7 +19,7 @@ public struct TrustCenterMacControlPolicyProvider: MacControlPolicyProvider {
         let policy = MacControlPolicy.fromTrustPolicyObject(snapshot.policy, dataRoot: dataRoot)
         guard let operatorOrigin else { return policy }
         let authority = await SwiftNativeSecurityCenter(dataRoot: dataRoot).fullMacYoloAuthority(
-            tool: "mac_control", origin: operatorOrigin
+            origin: operatorOrigin
         )
         return MacControlGate.policyForAdmittedFullMac(policy, admitted: authority.admitted)
     }
@@ -46,7 +46,7 @@ public struct TrustCenterMacControlPolicyProvider: MacControlPolicyProvider {
 
 }
 
-extension SystemProcessAdapter {
+extension ProcessExecution {
     /// One process run bounded by `timeout`; a timeout reads as exit 124
     /// with its stderr (or a line naming the command that timed out).
     public static func runBounded(
@@ -55,7 +55,7 @@ extension SystemProcessAdapter {
         currentDirectory: URL,
         timeout: TimeInterval
     ) async throws -> (status: Int32, stdout: String, stderr: String) {
-        let result = try await SystemProcessAdapter().run(
+        let result = try await ProcessExecution().run(
             executable: executable,
             arguments: arguments,
             currentDirectory: currentDirectory,

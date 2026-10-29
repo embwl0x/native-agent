@@ -1,27 +1,13 @@
 import Foundation
 // Blueprint: | `VisionTextBandLayer.swift` | `VisionTextBand`, `VisionTextBandLayer` |
 
-// MARK: - ELEMENT LAYER (b): rows by Y-BAND clustering
-//
-// The element-layer spike close-out (v2) earned this the hard way. Clustering
-// OCR text by LEFT-X + pitch recovered the wrong thing: on a synthetic list it
-// grouped the right-hand VALUE COLUMN ("12 pts", "9 pts", …) into "rows" and
-// missed the actual rows, because each row's main text merged differently in
-// OCR and never shared a left edge.
-//
-//   "Rows should be formed by Y-BAND grouping — cluster ALL text boxes by
-//    vertical overlap into bands, then a band with ≥2 texts and repeated pitch
-//    across ≥3 bands = list rows, row rect = band bounding box. Column-first
-//    grouping is the wrong primitive."
-//
-// That is what this file implements. It is the half of the element layer that
-// covers what a colour heuristic correctly cannot see: white-on-white rows,
-// which have no fill contrast at all and are visible only as REPETITION.
+// Vertical overlap forms text bands; repeated pitch across multi-text bands
+// identifies rows even when their pixels have no fill contrast.
 
 /// A horizontal band of text — the primitive rows are built from.
 public struct VisionTextBand: Sendable, Equatable {
-    public let rect: VisionRect
-    public let texts: [VisionTextBox]
+    public internal(set) var rect: VisionRect
+    public internal(set) var texts: [VisionTextBox]
 
     public init(rect: VisionRect, texts: [VisionTextBox]) {
         self.rect = rect
@@ -47,37 +33,25 @@ public enum VisionTextBandLayer {
     /// band height — a row's hit area is not the text's hit area.
     private static let bandPaddingFraction: Double = 0.35
 
-    /// Cluster ALL text boxes by vertical overlap. Column-agnostic by
-    /// construction — this is the primitive the close-out named.
+    /// Cluster all text boxes by vertical overlap, independently of columns.
     public static func bands(
         from boxes: [VisionTextBox]
     ) -> [VisionTextBand] {
         let ordered = boxes.sorted { $0.rect.y < $1.rect.y }
-        var bands: [[VisionTextBox]] = []
+        var bands: [VisionTextBand] = []
         for box in ordered {
             let index = bands.firstIndex { band in
-                guard let rect = bandRect(band) else { return false }
-                return overlapFraction(rect, box.rect) >= verticalOverlapFraction
+                overlapFraction(band.rect, box.rect) >= verticalOverlapFraction
             }
             if let index {
-                bands[index].append(box)
+                bands[index].rect = bands[index].rect.union(box.rect)
+                bands[index].texts.append(box)
             } else {
-                bands.append([box])
+                bands.append(VisionTextBand(rect: box.rect, texts: [box]))
             }
         }
-        return bands.compactMap { band in
-            guard let rect = bandRect(band) else { return nil }
-            return VisionTextBand(
-                rect: rect,
-                texts: band.sorted { $0.rect.x < $1.rect.x }
-            )
-        }.sorted { $0.rect.y < $1.rect.y }
-    }
-
-    static func bandRect(_ boxes: [VisionTextBox]) -> VisionRect? {
-        guard var rect = boxes.first?.rect else { return nil }
-        for box in boxes.dropFirst() { rect = rect.union(box.rect) }
-        return rect
+        for index in bands.indices { bands[index].texts.sort { $0.rect.x < $1.rect.x } }
+        return bands.sorted { $0.rect.y < $1.rect.y }
     }
 
     /// Vertical overlap as a fraction of the SHORTER extent. Using the shorter

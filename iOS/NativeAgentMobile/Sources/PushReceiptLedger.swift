@@ -1,13 +1,4 @@
-// PushReceiptLedger.swift — records every remote push the app actually
-// receives from APNS, so "Mac sent it (HTTP 200) but nothing showed" can be
-// split into its two very different causes:
-//   • entry present  → delivered to the device, but silenced on-screen
-//     (Focus / Scheduled Summary / notification settings)
-//   • entry absent   → never reached the app (APNS drop, token mismatch,
-//     force-quit app can't be woken, network)
-// Written from didReceiveRemoteNotification (2026-07-04, lock-screen
-// notification debugging). Best-effort: a force-quit app is never woken for
-// remote pushes, so absence here is strong but not absolute evidence.
+// APNS receipt presence proves delivery to the app; absence is inconclusive after force-quit.
 
 import Foundation
 

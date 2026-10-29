@@ -30,9 +30,7 @@ public struct ContextStoreHealthSnapshot: Sendable, Equatable {
     }
 }
 
-/// Rebuildable ContextFlow storage. Canonical persona, memory, skill, and
-/// project sources remain authoritative; this actor only publishes immutable
-/// derived generations.
+/// Rebuildable ContextFlow generations; canonical persona, memory, skill and project sources stay authoritative.
 /// Storage: local backup excludes this derived SQLite store; off-disk backup
 /// includes it. No data export or phone sync; PrivacyMap category: context.
 public actor ContextSQLiteStore {
@@ -40,7 +38,7 @@ public actor ContextSQLiteStore {
         policy: "Kept to keep recall available; this active derived index cannot be safely dropped during cleanup.")
 
     public let databaseURL: URL
-    private let dbPool: DatabasePool
+    let dbPool: DatabasePool
 
     public init(dataRoot: URL) throws {
         let directory = dataRoot.appendingPathComponent("context", isDirectory: true)
@@ -59,13 +57,10 @@ public actor ContextSQLiteStore {
         configuration.prepareDatabase { db in
             try db.execute(sql: "PRAGMA journal_size_limit = 4194304")
         }
-        // WAL pool, like memory.sqlite: turn-path reads run beside a publish,
-        // prune or vacuum instead of queueing behind it on one connection.
+        // The WAL pool lets turn-path reads run beside publication, pruning and vacuum.
         self.dbPool = try DatabasePool(path: databaseURL.path, configuration: configuration)
         try Self.migrator.migrate(dbPool)
     }
-
-    // MARK: - Publication
 
     @discardableResult
     public func publish(_ draft: ContextGenerationDraft) async throws -> ContextGenerationRecord {
@@ -76,7 +71,10 @@ public actor ContextSQLiteStore {
                 db,
                 sql: "SELECT id FROM context_generations WHERE status = 'completed' ORDER BY id DESC LIMIT 1"
             )
-            let generationID = (parentID ?? 0) + 1
+            let (generationID, overflow) = (parentID ?? 0).addingReportingOverflow(1)
+            guard !overflow, generationID > 0 else {
+                throw ContextFlowStoreError.malformedStoredValue("generation id exhausted or invalid")
+            }
             let createdAt = draft.createdAt.timeIntervalSince1970
             let reason = Self.bounded(draft.reason, maxUTF8Bytes: 512, fallback: "source_change")
 
@@ -92,25 +90,20 @@ public actor ContextSQLiteStore {
 
             let affected = Set(draft.changedSources.map(\.descriptor.id)).union(draft.removedSourceIDs)
             for sourceID in affected.sorted() {
-                let activeAtomIDs = try String.fetchAll(
-                    db,
+                try db.execute(
                     sql: """
-                    SELECT atom_id FROM context_atom_versions
-                    WHERE source_id = ? AND valid_to_generation IS NULL
+                    UPDATE context_relationship_versions
+                    SET valid_to_generation = ?
+                    WHERE valid_to_generation IS NULL
+                      AND EXISTS (
+                        SELECT 1 FROM context_atom_versions AS atom
+                        WHERE atom.source_id = ? AND atom.valid_to_generation IS NULL
+                          AND (atom.atom_id = context_relationship_versions.source_atom_id
+                            OR atom.atom_id = context_relationship_versions.target_atom_id)
+                      )
                     """,
-                    arguments: [sourceID.rawValue]
+                    arguments: [generationID - 1, sourceID.rawValue]
                 )
-                for atomID in activeAtomIDs {
-                    try db.execute(
-                        sql: """
-                        UPDATE context_relationship_versions
-                        SET valid_to_generation = ?
-                        WHERE valid_to_generation IS NULL
-                          AND (source_atom_id = ? OR target_atom_id = ?)
-                        """,
-                        arguments: [generationID - 1, atomID, atomID]
-                    )
-                }
                 try db.execute(
                     sql: """
                     UPDATE context_atom_versions
@@ -298,9 +291,7 @@ public actor ContextSQLiteStore {
         }
     }
 
-    // Generation reads go through the writer, as they did on the queue: a
-    // reconciliation diffs against this baseline, so it must wait for an
-    // in-flight publish instead of reading the generation that publish replaces.
+    // Baseline reads use the writer to wait for in-flight publication.
     public func activeGeneration() async throws -> ContextGenerationRecord? {
         try await dbPool.write { db in
             guard let id = try Int64.fetchOne(
@@ -353,6 +344,12 @@ public actor ContextSQLiteStore {
                 arguments: [id, id]
             )
             let atoms = try atomRows.map(Self.decodeAtom)
+            var atomIDs = Set<ContextAtomID>()
+            for atom in atoms {
+                guard atomIDs.insert(atom.draft.id).inserted else {
+                    throw ContextFlowStoreError.duplicateAtom(atom.draft.id.rawValue)
+                }
+            }
 
             let relationshipRows = try Row.fetchAll(
                 db,
@@ -373,223 +370,6 @@ public actor ContextSQLiteStore {
                 atoms: atoms,
                 relationships: relationships
             )
-        }
-    }
-
-    // MARK: - Health and failures
-
-    public func markSourceDegraded(
-        _ sourceID: ContextSourceID,
-        error: String
-    ) async throws {
-        let boundedError = Self.bounded(error, maxUTF8Bytes: 2_048, fallback: "compile failed")
-        try await dbPool.write { db in
-            try db.execute(
-                sql: """
-                UPDATE context_sources
-                SET health = 'degraded'
-                WHERE id = ? AND health != 'removed'
-                """,
-                arguments: [sourceID.rawValue]
-            )
-            try db.execute(
-                sql: """
-                UPDATE context_source_versions
-                SET health = 'degraded', last_error = ?
-                WHERE source_id = ? AND valid_to_generation IS NULL AND health != 'removed'
-                """,
-                arguments: [boundedError, sourceID.rawValue]
-            )
-        }
-    }
-
-    /// Context feedback is derived, bounded state. Retaining its exact events
-    /// lets a new coordinator rebuild the same advisory ranking after restart
-    /// without turning Context into a second fact store.
-    public func recordFeedbackEvent(_ event: ContextFeedbackEvent) async throws {
-        try await dbPool.write { db in
-            try db.execute(
-                sql: """
-                INSERT INTO context_feedback_events (
-                    id, atom_ids_json, signal_json, time_bucket, evidence_ids_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                arguments: [
-                    event.id,
-                    try Self.encodeJSON(event.atomIDs),
-                    try Self.encodeJSON(event.signal),
-                    event.timeBucket,
-                    try Self.encodeJSON(event.evidenceIDs),
-                    Date().timeIntervalSince1970,
-                ]
-            )
-            try db.execute(sql: """
-                DELETE FROM context_feedback_events
-                WHERE sequence < COALESCE((
-                    SELECT sequence FROM context_feedback_events
-                    ORDER BY sequence DESC
-                    LIMIT 1 OFFSET 4095
-                ), 0)
-                """)
-        }
-    }
-
-    // Restoration reads go through the writer too, so they see a feedback
-    // event whose write is already in flight (its ordinal must not be reused).
-    public func recentFeedbackEvents(limit: Int = 4_096) async throws -> [ContextFeedbackEvent] {
-        try await dbPool.write { db in
-            let boundedLimit = max(0, min(limit, 4_096))
-            let rows = try Row.fetchAll(
-                db,
-                sql: """
-                SELECT id, atom_ids_json, signal_json, time_bucket, evidence_ids_json
-                FROM context_feedback_events
-                ORDER BY sequence ASC
-                LIMIT ?
-                """,
-                arguments: [boundedLimit]
-            )
-            return try rows.map(Self.decodeFeedbackEvent)
-        }
-    }
-
-    public func feedbackEventOrdinalHighWaterMark() async throws -> UInt64 {
-        try await dbPool.write { db in
-            let value = try Int64.fetchOne(
-                db,
-                sql: "SELECT COALESCE(MAX(sequence), 0) FROM context_feedback_events"
-            ) ?? 0
-            return UInt64(max(0, value))
-        }
-    }
-
-    public func healthSnapshot() async throws -> ContextStoreHealthSnapshot {
-        try await dbPool.read { db in
-            let activeGenerationID = try Int64.fetchOne(
-                db,
-                sql: "SELECT id FROM context_generations WHERE status = 'completed' ORDER BY id DESC LIMIT 1"
-            )
-            let healthy = try Self.countSources(health: .healthy, db: db)
-            let degraded = try Self.countSources(health: .degraded, db: db)
-            let removed = try Self.countSources(health: .removed, db: db)
-            let atoms = try Int.fetchOne(
-                db,
-                sql: "SELECT COUNT(*) FROM context_atom_versions WHERE valid_to_generation IS NULL"
-            ) ?? 0
-            return ContextStoreHealthSnapshot(
-                databaseURL: self.databaseURL,
-                activeGenerationID: activeGenerationID,
-                healthySources: healthy,
-                degradedSources: degraded,
-                removedSources: removed,
-                activeAtoms: atoms
-            )
-        }
-    }
-
-    // MARK: - Retention
-
-    public func prune(
-        retainingLatest generationLimit: Int = 8,
-        protectedGenerationIDs: Set<Int64> = []
-    ) async throws -> ContextStorePruneResult {
-        try await dbPool.write { db in
-            let activeID = try Int64.fetchOne(
-                db,
-                sql: "SELECT id FROM context_generations WHERE status = 'completed' ORDER BY id DESC LIMIT 1"
-            )
-            let latest = try Int64.fetchAll(
-                db,
-                sql: """
-                SELECT id FROM context_generations
-                WHERE status = 'completed'
-                ORDER BY id DESC LIMIT ?
-                """,
-                arguments: [max(1, generationLimit)]
-            )
-            var kept = Set(latest).union(protectedGenerationIDs)
-            if let activeID { kept.insert(activeID) }
-
-            let atomRows = try Row.fetchAll(
-                db,
-                sql: "SELECT version_key, valid_from_generation, valid_to_generation FROM context_atom_versions"
-            )
-            let deadAtomKeys = atomRows.compactMap { row -> String? in
-                guard let key: String = row["version_key"],
-                      let start: Int64 = row["valid_from_generation"] else { return nil }
-                let end: Int64? = row["valid_to_generation"]
-                return Self.interval(start: start, end: end, intersects: kept) ? nil : key
-            }
-            for key in deadAtomKeys {
-                try db.execute(sql: "DELETE FROM context_atom_versions WHERE version_key = ?", arguments: [key])
-            }
-
-            let deadSourceKeys = try Self.unusedVersionKeys(
-                table: "context_source_versions",
-                keyColumn: "version_key",
-                kept: kept,
-                db: db
-            )
-            for key in deadSourceKeys {
-                try db.execute(
-                    sql: "DELETE FROM context_source_versions WHERE version_key = ?",
-                    arguments: [key]
-                )
-            }
-
-            let deadRelationshipKeys = try Self.unusedVersionKeys(
-                table: "context_relationship_versions",
-                keyColumn: "version_key",
-                kept: kept,
-                db: db
-            )
-            for key in deadRelationshipKeys {
-                try db.execute(
-                    sql: "DELETE FROM context_relationship_versions WHERE version_key = ?",
-                    arguments: [key]
-                )
-            }
-
-            let allGenerations = try Int64.fetchAll(
-                db,
-                sql: "SELECT id FROM context_generations WHERE status = 'completed'"
-            )
-            let deadGenerations = allGenerations.filter { !kept.contains($0) }
-            for id in deadGenerations {
-                try db.execute(sql: "DELETE FROM context_generations WHERE id = ?", arguments: [id])
-            }
-
-            // A removed source has no active meaning. Once every retained
-            // generation-specific version is gone, retaining its identity row
-            // only makes each incremental compile scan a growing tombstone set.
-            try db.execute(sql: """
-                DELETE FROM context_sources
-                WHERE health = 'removed'
-                  AND NOT EXISTS (
-                    SELECT 1 FROM context_source_versions
-                    WHERE context_source_versions.source_id = context_sources.id
-                  )
-                """)
-
-            return ContextStorePruneResult(
-                deletedGenerations: deadGenerations.count,
-                deletedAtomVersions: deadAtomKeys.count,
-                deletedSourceVersions: deadSourceKeys.count,
-                deletedRelationshipVersions: deadRelationshipKeys.count
-            )
-        }
-    }
-
-    /// A5.5(b): reclaim the disk that `prune()`'s DELETEs freed. SQLite keeps
-    /// deleted rows' pages in the file as a free-list — the file never shrinks
-    /// without a VACUUM (or auto_vacuum, which this DB does not set). prune()
-    /// bounds the ROW count; this bounds the on-disk FILE size. VACUUM cannot run
-    /// inside a transaction, so it goes through `writeWithoutTransaction` (the
-    /// regular `write` wrapper opens a transaction). Caller gates the cadence —
-    /// VACUUM rewrites the whole file, so it runs far less often than prune.
-    public func vacuum() async throws {
-        try await dbPool.writeWithoutTransaction { db in
-            try db.execute(sql: "VACUUM")
         }
     }
 
@@ -627,359 +407,6 @@ public actor ContextSQLiteStore {
                 )
             }
         }
-    }
-
-    // MARK: - Migration
-
-    private static var migrator: DatabaseMigrator {
-        var migrator = DatabaseMigrator()
-        migrator.registerMigration("context_flow_v1") { db in
-            try db.execute(sql: """
-                CREATE TABLE context_meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-
-                CREATE TABLE context_generations (
-                    id INTEGER PRIMARY KEY,
-                    parent_id INTEGER,
-                    created_at REAL NOT NULL,
-                    reason TEXT NOT NULL,
-                    source_fingerprint TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK(status IN ('staging', 'completed')),
-                    atom_count INTEGER NOT NULL DEFAULT 0,
-                    source_count INTEGER NOT NULL DEFAULT 0,
-                    FOREIGN KEY(parent_id) REFERENCES context_generations(id) ON DELETE SET NULL
-                );
-                CREATE INDEX idx_context_generations_created
-                    ON context_generations(created_at DESC);
-
-                CREATE TABLE context_sources (
-                    id TEXT PRIMARY KEY,
-                    descriptor_json TEXT NOT NULL,
-                    owner TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    canonical_locator TEXT NOT NULL,
-                    authority TEXT NOT NULL,
-                    privacy TEXT NOT NULL,
-                    permitted_surfaces_json TEXT NOT NULL,
-                    injection_policy TEXT NOT NULL,
-                    source_hash TEXT NOT NULL,
-                    health TEXT NOT NULL CHECK(health IN ('healthy', 'degraded', 'removed')),
-                    last_error TEXT,
-                    updated_at REAL NOT NULL
-                );
-                CREATE INDEX idx_context_sources_health ON context_sources(health, kind);
-
-                CREATE TABLE context_source_versions (
-                    version_key TEXT PRIMARY KEY,
-                    source_id TEXT NOT NULL,
-                    valid_from_generation INTEGER NOT NULL,
-                    valid_to_generation INTEGER,
-                    descriptor_json TEXT NOT NULL,
-                    source_hash TEXT NOT NULL,
-                    health TEXT NOT NULL,
-                    last_error TEXT,
-                    FOREIGN KEY(source_id) REFERENCES context_sources(id)
-                );
-                CREATE INDEX idx_context_source_versions_active
-                    ON context_source_versions(source_id, valid_from_generation, valid_to_generation);
-
-                CREATE TABLE context_atom_versions (
-                    version_key TEXT PRIMARY KEY,
-                    atom_id TEXT NOT NULL,
-                    source_id TEXT NOT NULL,
-                    valid_from_generation INTEGER NOT NULL,
-                    valid_to_generation INTEGER,
-                    kind TEXT NOT NULL,
-                    source_hash TEXT NOT NULL,
-                    authority TEXT NOT NULL,
-                    privacy TEXT NOT NULL,
-                    injection_policy TEXT NOT NULL,
-                    content_role TEXT NOT NULL,
-                    expires_at REAL,
-                    body TEXT NOT NULL,
-                    summary TEXT,
-                    payload_json TEXT NOT NULL,
-                    FOREIGN KEY(source_id) REFERENCES context_sources(id)
-                );
-                CREATE INDEX idx_context_atom_versions_active
-                    ON context_atom_versions(atom_id, valid_from_generation, valid_to_generation);
-                CREATE INDEX idx_context_atom_versions_source
-                    ON context_atom_versions(source_id, valid_from_generation, valid_to_generation);
-                CREATE INDEX idx_context_atom_versions_eligibility
-                    ON context_atom_versions(privacy, injection_policy, expires_at);
-
-                CREATE TABLE context_embeddings (
-                    atom_version_key TEXT PRIMARY KEY,
-                    model_fingerprint TEXT NOT NULL,
-                    dimensions INTEGER NOT NULL,
-                    vector BLOB NOT NULL,
-                    FOREIGN KEY(atom_version_key) REFERENCES context_atom_versions(version_key)
-                        ON DELETE CASCADE
-                );
-
-                CREATE TABLE context_relationship_versions (
-                    version_key TEXT PRIMARY KEY,
-                    relationship_id TEXT NOT NULL,
-                    source_atom_id TEXT NOT NULL,
-                    target_atom_id TEXT NOT NULL,
-                    kind TEXT NOT NULL,
-                    weight REAL NOT NULL,
-                    provenance TEXT NOT NULL,
-                    valid_from_generation INTEGER NOT NULL,
-                    valid_to_generation INTEGER,
-                    payload_json TEXT NOT NULL
-                );
-                CREATE INDEX idx_context_relationship_source
-                    ON context_relationship_versions(source_atom_id, valid_from_generation, valid_to_generation);
-                CREATE INDEX idx_context_relationship_target
-                    ON context_relationship_versions(target_atom_id, valid_from_generation, valid_to_generation);
-
-                CREATE TABLE context_conflicts (
-                    id TEXT PRIMARY KEY,
-                    generation_id INTEGER NOT NULL,
-                    status TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    FOREIGN KEY(generation_id) REFERENCES context_generations(id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE context_receipts (
-                    id TEXT PRIMARY KEY,
-                    kind TEXT NOT NULL,
-                    generation_id INTEGER,
-                    summary TEXT NOT NULL,
-                    details_json TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    FOREIGN KEY(generation_id) REFERENCES context_generations(id) ON DELETE SET NULL
-                );
-                CREATE INDEX idx_context_receipts_created
-                    ON context_receipts(created_at DESC, kind);
-
-                CREATE TABLE context_compile_failures (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_id TEXT NOT NULL,
-                    error TEXT NOT NULL,
-                    created_at REAL NOT NULL
-                );
-                CREATE INDEX idx_context_compile_failures_source
-                    ON context_compile_failures(source_id, created_at DESC);
-
-                """)
-        }
-        // `context_fts` was never read by Context selection or any public
-        // query path. Drop the fossil table for existing installs instead of
-        // paying to duplicate every atom body on future publications.
-        migrator.registerMigration("context_feedback_events_v2") { db in
-            try db.execute(sql: "DROP TABLE IF EXISTS context_fts")
-            try db.execute(sql: """
-                CREATE TABLE context_feedback_events (
-                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    id TEXT NOT NULL UNIQUE,
-                    atom_ids_json TEXT NOT NULL,
-                    signal_json TEXT NOT NULL,
-                    time_bucket INTEGER NOT NULL,
-                    evidence_ids_json TEXT NOT NULL,
-                    created_at REAL NOT NULL
-                );
-                CREATE INDEX idx_context_feedback_events_sequence
-                    ON context_feedback_events(sequence);
-                """)
-        }
-        migrator.registerMigration("context_receipt_kind_retention_v3") { db in
-            try db.execute(sql: """
-                CREATE INDEX IF NOT EXISTS idx_context_receipts_kind_created_id
-                    ON context_receipts(kind, created_at DESC, id ASC);
-                """)
-        }
-        // Version payloads own source policy, atom eligibility and relationships.
-        // Keep the queried source hash/health and source-version errors
-        // without the unread failure history.
-        migrator.registerMigration("context_payload_ownership_v4") { db in
-            try db.execute(sql: """
-                DROP TABLE context_meta;
-                DROP TABLE context_compile_failures;
-                DROP TABLE context_conflicts;
-                DROP INDEX idx_context_sources_health;
-                DROP INDEX idx_context_atom_versions_eligibility;
-                ALTER TABLE context_sources DROP COLUMN descriptor_json;
-                ALTER TABLE context_sources DROP COLUMN owner;
-                ALTER TABLE context_sources DROP COLUMN kind;
-                ALTER TABLE context_sources DROP COLUMN canonical_locator;
-                ALTER TABLE context_sources DROP COLUMN authority;
-                ALTER TABLE context_sources DROP COLUMN privacy;
-                ALTER TABLE context_sources DROP COLUMN permitted_surfaces_json;
-                ALTER TABLE context_sources DROP COLUMN injection_policy;
-                ALTER TABLE context_sources DROP COLUMN last_error;
-                ALTER TABLE context_sources DROP COLUMN updated_at;
-                CREATE INDEX idx_context_sources_health ON context_sources(health);
-                ALTER TABLE context_atom_versions DROP COLUMN kind;
-                ALTER TABLE context_atom_versions DROP COLUMN source_hash;
-                ALTER TABLE context_atom_versions DROP COLUMN authority;
-                ALTER TABLE context_atom_versions DROP COLUMN privacy;
-                ALTER TABLE context_atom_versions DROP COLUMN injection_policy;
-                ALTER TABLE context_atom_versions DROP COLUMN content_role;
-                ALTER TABLE context_atom_versions DROP COLUMN expires_at;
-                ALTER TABLE context_relationship_versions DROP COLUMN kind;
-                ALTER TABLE context_relationship_versions DROP COLUMN weight;
-                ALTER TABLE context_relationship_versions DROP COLUMN provenance;
-                """)
-        }
-        migrator.registerMigration("context_drop_receipts_v5") { db in
-            try db.execute(sql: "DROP TABLE context_receipts")
-        }
-        return migrator
-    }
-
-    // MARK: - Row encoding
-
-    private struct PersistedAtomPayload: Codable {
-        let id: ContextAtomID
-        let sourceID: ContextSourceID
-        let kind: ContextAtomKind
-        let headingPath: [String]
-        let sourceRange: ContextSourceRange
-        let sourceHash: String
-        let authority: ContextAuthority
-        let confidence: Double
-        let freshness: ContextFreshness
-        let privacy: ContextPrivacy
-        let permittedSurfaces: Set<ContextSurface>
-        let injectionPolicy: ContextInjectionPolicy
-        let contentRole: ContextContentRole
-        let entities: [ContextEntity]
-        let triggers: [String]
-        let activation: Double
-        let recentUsefulness: Double
-        let decayState: Double
-
-        init(atom: ContextAtomDraft) {
-            id = atom.id
-            sourceID = atom.sourceID
-            kind = atom.kind
-            headingPath = atom.headingPath
-            sourceRange = atom.sourceRange
-            sourceHash = atom.sourceHash
-            authority = atom.authority
-            confidence = atom.confidence
-            freshness = atom.freshness
-            privacy = atom.privacy
-            permittedSurfaces = atom.permittedSurfaces
-            injectionPolicy = atom.injectionPolicy
-            contentRole = atom.contentRole
-            entities = atom.entities
-            triggers = atom.triggers
-            activation = atom.activation
-            recentUsefulness = atom.recentUsefulness
-            decayState = atom.decayState
-        }
-    }
-
-    private static func decodeSource(_ row: Row) throws -> ContextStoredSource {
-        guard let descriptorJSON: String = row["descriptor_json"],
-              let sourceHash: String = row["source_hash"],
-              let healthRaw: String = row["health"],
-              let health = ContextSourceHealth(rawValue: healthRaw),
-              let validFrom: Int64 = row["valid_from_generation"] else {
-            throw ContextFlowStoreError.malformedStoredValue("source")
-        }
-        let descriptor: ContextSourceDescriptor = try decodeJSON(descriptorJSON)
-        let validTo: Int64? = row["valid_to_generation"]
-        let lastError: String? = row["last_error"]
-        return ContextStoredSource(
-            descriptor: descriptor,
-            sourceHash: sourceHash,
-            health: health,
-            lastError: lastError,
-            validFromGeneration: validFrom,
-            validToGeneration: validTo
-        )
-    }
-
-    private static func decodeAtom(_ row: Row) throws -> ContextStoredAtom {
-        guard let versionKey: String = row["version_key"],
-              let body: String = row["body"],
-              let payloadJSON: String = row["payload_json"],
-              let validFrom: Int64 = row["valid_from_generation"] else {
-            throw ContextFlowStoreError.malformedStoredValue("atom")
-        }
-        let payload: PersistedAtomPayload = try decodeJSON(payloadJSON)
-        let summary: String? = row["summary"]
-        let validTo: Int64? = row["valid_to_generation"]
-        let modelFingerprint: String? = row["model_fingerprint"]
-        let dimensions: Int? = row["dimensions"]
-        let vectorData: Data? = row["vector"]
-        let embedding: ContextEmbedding?
-        if let modelFingerprint, let dimensions, let vectorData {
-            let values = try decodeVector(vectorData, expectedCount: dimensions)
-            embedding = ContextEmbedding(modelFingerprint: modelFingerprint, values: values)
-        } else {
-            embedding = nil
-        }
-        let draft = ContextAtomDraft(
-            id: payload.id,
-            sourceID: payload.sourceID,
-            kind: payload.kind,
-            headingPath: payload.headingPath,
-            sourceRange: payload.sourceRange,
-            sourceHash: payload.sourceHash,
-            body: body,
-            deterministicSummary: summary,
-            authority: payload.authority,
-            confidence: payload.confidence,
-            freshness: payload.freshness,
-            privacy: payload.privacy,
-            permittedSurfaces: payload.permittedSurfaces,
-            injectionPolicy: payload.injectionPolicy,
-            contentRole: payload.contentRole,
-            entities: payload.entities,
-            triggers: payload.triggers,
-            activation: payload.activation,
-            recentUsefulness: payload.recentUsefulness,
-            decayState: payload.decayState,
-            embedding: embedding
-        )
-        return ContextStoredAtom(
-            versionKey: versionKey,
-            draft: draft,
-            validFromGeneration: validFrom,
-            validToGeneration: validTo
-        )
-    }
-
-    private static func decodeRelationship(_ row: Row) throws -> ContextStoredRelationship {
-        guard let versionKey: String = row["version_key"],
-              let payloadJSON: String = row["payload_json"],
-              let validFrom: Int64 = row["valid_from_generation"] else {
-            throw ContextFlowStoreError.malformedStoredValue("relationship")
-        }
-        let draft: ContextRelationshipDraft = try decodeJSON(payloadJSON)
-        let validTo: Int64? = row["valid_to_generation"]
-        return ContextStoredRelationship(
-            versionKey: versionKey,
-            draft: draft,
-            validFromGeneration: validFrom,
-            validToGeneration: validTo
-        )
-    }
-
-    private static func decodeFeedbackEvent(_ row: Row) throws -> ContextFeedbackEvent {
-        guard let id: String = row["id"],
-              let atomIDsJSON: String = row["atom_ids_json"],
-              let signalJSON: String = row["signal_json"],
-              let timeBucket: Int64 = row["time_bucket"],
-              let evidenceIDsJSON: String = row["evidence_ids_json"] else {
-            throw ContextFlowStoreError.malformedStoredValue("feedback_event")
-        }
-        return ContextFeedbackEvent(
-            id: id,
-            atomIDs: try decodeJSON(atomIDsJSON),
-            signal: try decodeJSON(signalJSON),
-            timeBucket: timeBucket,
-            evidenceIDs: try decodeJSON(evidenceIDsJSON)
-        )
     }
 
     // MARK: - SQL helpers
@@ -1050,81 +477,11 @@ public actor ContextSQLiteStore {
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func countSources(health: ContextSourceHealth, db: Database) throws -> Int {
-        try Int.fetchOne(
-            db,
-            sql: "SELECT COUNT(*) FROM context_sources WHERE health = ?",
-            arguments: [health.rawValue]
-        ) ?? 0
-    }
-
-    private static func unusedVersionKeys(
-        table: String,
-        keyColumn: String,
-        kept: Set<Int64>,
-        db: Database
-    ) throws -> [String] {
-        let allowedTables = Set(["context_source_versions", "context_relationship_versions"])
-        guard allowedTables.contains(table), keyColumn == "version_key" else { return [] }
-        let rows = try Row.fetchAll(
-            db,
-            sql: "SELECT \(keyColumn), valid_from_generation, valid_to_generation FROM \(table)"
-        )
-        return rows.compactMap { row in
-            guard let key: String = row[keyColumn],
-                  let start: Int64 = row["valid_from_generation"] else { return nil }
-            let end: Int64? = row["valid_to_generation"]
-            return interval(start: start, end: end, intersects: kept) ? nil : key
-        }
-    }
-
-    private static func interval(start: Int64, end: Int64?, intersects kept: Set<Int64>) -> Bool {
-        kept.contains { generation in
-            generation >= start && (end == nil || generation <= end!)
-        }
-    }
-
     private static func versionKey(stableID: String, generationID: Int64) -> String {
         stableID + "@" + String(generationID)
     }
 
-    private static func encodeJSON<T: Encodable>(_ value: T) throws -> String {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .millisecondsSince1970
-        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let data = try encoder.encode(value)
-        guard let string = String(data: data, encoding: .utf8) else {
-            throw ContextFlowStoreError.malformedStoredValue("json_encode")
-        }
-        return string
-    }
-
-    private static func decodeJSON<T: Decodable>(_ string: String) throws -> T {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .millisecondsSince1970
-        guard let data = string.data(using: .utf8) else {
-            throw ContextFlowStoreError.malformedStoredValue("json_decode")
-        }
-        return try decoder.decode(T.self, from: data)
-    }
-
-    private static func encodeVector(_ values: [Float]) -> Data {
-        values.withUnsafeBufferPointer { Data(buffer: $0) }
-    }
-
-    private static func decodeVector(_ data: Data, expectedCount: Int) throws -> [Float] {
-        guard expectedCount >= 0,
-              data.count == expectedCount * MemoryLayout<Float>.stride else {
-            throw ContextFlowStoreError.malformedStoredValue("embedding")
-        }
-        var values = [Float](repeating: 0, count: expectedCount)
-        _ = values.withUnsafeMutableBytes { destination in
-            data.copyBytes(to: destination)
-        }
-        return values
-    }
-
-    private static func bounded(_ value: String, maxUTF8Bytes: Int, fallback: String) -> String {
+    static func bounded(_ value: String, maxUTF8Bytes: Int, fallback: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return fallback }
         guard trimmed.utf8.count > maxUTF8Bytes else { return trimmed }

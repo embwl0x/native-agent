@@ -4,6 +4,7 @@ import Cognition
 import PersistenceCore
 import Desk
 import WorkshopExecution
+import NativeAgentShared
 // Blueprint: | `WorkshopPumpLoopRunner.swift` | `WorkshopPumpLoopRunner` struct; `physiologyEvents`, `nextMeaningfulDeadline` |
 
 public struct WorkshopPumpLoopRunner: EventDeadlineLoopRunner {
@@ -35,7 +36,7 @@ public struct WorkshopPumpLoopRunner: EventDeadlineLoopRunner {
     public func nextMeaningfulDeadline(after now: Date) async -> Date? {
         do {
             let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
-            return WorkshopPump.nextMeaningfulDeadline(from: state, after: now)
+            return try WorkshopPump.nextMeaningfulDeadline(from: state, after: now)
         } catch {
             nativeLog("[workshop] deadline projection unavailable: %@", String(error.localizedDescription.prefix(600)))
             return nil
@@ -60,8 +61,7 @@ public struct WorkshopPumpLoopRunner: EventDeadlineLoopRunner {
         case .leaseHeld:
             return .skipped(reason: "background-work lease held")
         case .reservationRefused:
-            // The reservation could not be written, flushed or read back: the
-            // lane is broken, not idle. Doctor must see it (GPT-5.6, 2026-09-10).
+            // Reservation persistence failures reach Doctor as failed work.
             return .failed(error: "Desk reservation refused: the attempt could not be persisted")
         case .ran(let status):
             return .completed(result: "Desk work session \(status.rawValue)" + unknown)

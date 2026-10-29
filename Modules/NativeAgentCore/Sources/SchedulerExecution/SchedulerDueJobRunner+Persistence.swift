@@ -26,14 +26,12 @@ extension SchedulerDueJobRunner {
         }
         try await schedulerJobs.settleOccurrence(
             jobId: job.id, occurrenceKey: job.occurrenceKey, status: result.status,
-            detail: result.detail, output: result.output, at: runDate,
-            runDateKey: NativeAgentDreamCycleSchedule.runDateKey(runDate)
+            detail: result.detail, seen: result.seen, at: runDate
         )
     }
 
     func appendActivity(
         jobId: String?,
-        kind: String,
         title: String,
         detail: String,
         status: String,
@@ -54,8 +52,7 @@ extension SchedulerDueJobRunner {
         )
         do {
             try await SwiftNativePersistenceCore.appendActivityEvent(
-                event, to: activityPath, using: persistence,
-                logLabel: "SchedulerDueJobRunner"
+                event, to: activityPath, logLabel: "SchedulerDueJobRunner"
             )
         } catch {
             noteFault("Scheduler activity evidence could not be written: \(error.localizedDescription)")
@@ -102,11 +99,7 @@ extension SchedulerDueJobRunner {
             "schedulerJobId": .string(jobId),
             "presentation": presentation,
         ])
-        // 2026-08-31: through the feed's owner, not a raw capped append. The
-        // shared cap trims by keeping a suffix, which HARD-DELETES the oldest
-        // cards once the file crosses its budget; `LiveNotificationInbox` shelves
-        // every row it evicts to `notifications/inbox_archive.jsonl` first and
-        // ages finished history out on its own schedule.
+        // LiveNotificationInbox archives evicted rows before aging out finished history.
         try await LiveNotificationInbox(path: notificationInboxPath)
             .appendUnique(row, id: itemId)
         if notifyPhone {
@@ -123,51 +116,15 @@ extension SchedulerDueJobRunner {
 
     @discardableResult
     func archiveOlderDreamInboxItems(keeping keepItemId: String) async throws -> Int {
-        let inboxPath = notificationInboxPath
-        return try await persistence.withFileLock(inboxPath) { () async throws -> Int in
-            // 2026-08-11: raw-preserving read — a malformed line among valid
-            // rows survives the rewrite verbatim instead of being dropped.
-            let lines = try LiveNotificationInbox.readLines(inboxPath)
-            let decoded = lines.compactMap(\.row)
-            let result = NativeAgentDreamNotificationInboxPolicy.archiveOlderDreamRows(
-                decoded,
-                keeping: keepItemId
-            )
-            guard result.archivedCount > 0 else { return 0 }
-            // The policy maps rows 1:1 in order, so walk its output alongside
-            // the decoded lines; unchanged rows keep their original bytes.
-            // If the policy ever stops being 1:1 the zip-back below would
-            // misalign rows — refuse the rewrite loudly instead.
-            guard result.rows.count == decoded.count else {
-                throw NSError(
-                    domain: "NativeAgentSwiftOnly", code: -431,
-                    userInfo: [NSLocalizedDescriptionKey:
-                        "archiveOlderDreamRows returned \(result.rows.count) rows "
-                        + "for \(decoded.count) decoded — refusing misaligned rewrite"])
+        try await LiveNotificationInbox(path: notificationInboxPath)
+            .archiveSupersededRows(source: "dream_cycle", groupField: "source", keeping: keepItemId) {
+                let status = $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                return status != "archived" && status != "dismissed"
             }
-            var mutated: [Data] = []
-            mutated.reserveCapacity(lines.count)
-            var rowIndex = 0
-            for line in lines {
-                guard let row = line.row else {
-                    mutated.append(line.raw)
-                    continue
-                }
-                let rewritten = result.rows[rowIndex]
-                rowIndex += 1
-                if rewritten == row {
-                    mutated.append(line.raw)
-                } else {
-                    mutated.append(Data(try rewritten.serialize(pretty: false).utf8))
-                }
-            }
-            try LiveNotificationInbox.write(mutated, to: inboxPath)
-            return result.archivedCount
-        }
     }
 
     func notificationInboxContains(source: String, dateKey: String) async throws -> Bool {
-        let rows = (try? await persistence.readJSONL(notificationInboxPath)) ?? []
+        let rows = (try? await SwiftNativePersistenceCore.readJSONL(notificationInboxPath)) ?? []
         for row in rows {
             guard case .object(let obj) = row else { continue }
             guard SchedulerJobRuntime.string(obj["source"]) == source else { continue }
@@ -186,56 +143,35 @@ extension SchedulerDueJobRunner {
     }
 
     func postCycleNotification(title: String, body: String, jobId: String, source: String, itemId: String? = nil) async -> JSONValue {
-        await cycleNotificationDelivery(title, body, jobId, source, itemId)
-    }
-
-    static func deliverCycleNotification(
-        title: String,
-        body: String,
-        jobId: String,
-        source: String,
-        itemId: String? = nil,
-        platform: any SchedulerExecutionPlatform
-    ) async -> JSONValue {
         var delivered: [JSONValue] = []
         var errors: [JSONValue] = []
         var notDelivered: [JSONValue] = []
         let macResult = Mutex<NativeAgentNotificationPostResult?>(nil)
 
         do {
-            // 2026-09-13: urgency is projected by the router from the class
-            // below. An overnight dream/REM card is news; it no longer pierces
-            // Sleep Focus at 3:30am to say so, and quiet hours hold it until
-            // the window closes.
+            // The router derives urgency from importance and defers cycle news during quiet hours.
             var userInfo = ["screen": "inbox", "source": source, "jobId": jobId]
             if let itemId, !itemId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 userInfo["itemId"] = itemId
             }
-            // Item 26: overnight cycle deliveries (dream/REM) are news, not a
-            // request — informational, so they land on the phone once and the
-            // inbox card is the receipt. Payload unchanged.
+            // Cycle news is informational; the inbox card retains its receipt.
             let outcome = try await platform.attentionRouter.route(
                 eventId: "scheduler_cycle:\(userInfo["itemId"] ?? jobId)",
                 importance: .informational,
                 title: title,
                 body: body,
                 userInfo: userInfo,
-                postMacBanner: {
+                postMacBanner: { [platform] in
                     let mac = await platform.postNotification(title: title, body: body)
                     macResult.withLock { $0 = mac }
                 }
             )
-            // Report what actually happened, from the ROUTER'S OWN projection —
-            // the same one `TriggerNotifierBinding` reads — instead of "no
-            // failure was reported". A quiet-hours deferral and a routing that
-            // chose no channel delivered nothing, and both were being recorded
-            // as "push".
+            // The router's delivery projection determines the channel receipt.
             switch outcome.deliveryProjection {
             case .accepted:
                 delivered.append(.string("push"))
             case .queued:
-                // 2026-09-22: queued is CloudKit-only with APNS down; nothing
-                // has reached the phone yet.
+                // Queued means CloudKit-only with APNS unavailable; the phone has received nothing.
                 notDelivered.append(.string("push: queued (APNS unavailable)"))
             case .previouslyHandled:
                 delivered.append(.string("push_already_delivered"))
@@ -272,21 +208,6 @@ extension SchedulerDueJobRunner {
         formatter.timeZone = TimeZone(identifier: "UTC")
         formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS'+00:00'"
         return formatter.string(from: date)
-    }
-
-    func deliveryChannels(_ raw: JSONValue?) -> [String] {
-        switch raw {
-        case .array(let arr):
-            let values = arr.compactMap { string($0)?.lowercased() }
-            return values.isEmpty ? ["push"] : values
-        case .string(let s):
-            let values = s.replacingOccurrences(of: ",", with: " ")
-                .split(separator: " ")
-                .map { String($0).lowercased() }
-            return values.isEmpty ? ["push"] : values
-        default:
-            return ["push"]
-        }
     }
 
     func deliveryText(

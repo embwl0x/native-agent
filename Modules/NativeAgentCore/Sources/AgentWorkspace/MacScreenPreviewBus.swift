@@ -57,13 +57,8 @@ public enum MacScreenPreviewCaption {
 
     /// The caption for the frames captured WHILE a verb is in flight.
     ///
-    /// Tense matches the frame, which is the whole point. `act` looks at the
-    /// screen up to six times to resolve its target before it sends any input
-    /// (MacFourVerbs+Act.swift:321, :342, :364), so every frame the card can
-    /// show mid-verb is a PRE-action frame: it shows a Save button that has not
-    /// been clicked. The words therefore promise nothing — "About to click
-    /// Save" — and only ``settled(tool:input:ok:)`` speaks in the past tense,
-    /// after the verb returns with its own verified result over the
+    /// In-flight frames precede input, so only ``settled(tool:input:ok:)``
+    /// speaks in the past tense, backed by the verb's verified result and
     /// post-action frame.
     ///
     /// Returns `nil` for `screen`, whose best caption is the app the perception
@@ -80,10 +75,7 @@ public enum MacScreenPreviewCaption {
             let name = safeTarget(text(input["name"]) ?? text(input["target"]))
             return name.isEmpty ? "About to open something" : "About to open \(name)"
         case "wait":
-            // `wait` sends no input at all — it only looks, repeatedly
-            // (MacFourVerbs+Wait.swift:69, :119). Nothing is claimed by these
-            // words that the frame does not show, so they stand for the whole
-            // verb and there is no settled form.
+            // `wait` only looks, so its caption has no settled form.
             let until = safeTarget(text(input["until"]))
             return until.isEmpty ? "Waiting" : "Waiting for \(until)"
         default:
@@ -92,9 +84,8 @@ public enum MacScreenPreviewCaption {
     }
 
     /// The caption for the frame captured AFTER the verb finished, said in the
-    /// past tense only because two things now back it: the post-action look
-    /// (MacFourVerbs+Act.swift:542, MacFourVerbs+Navigation.swift:81) is the
-    /// frame on the card, and `ok` is the verb's own verified effect result.
+    /// past tense backed by the post-action frame and the verb's verified
+    /// effect result in `ok`.
     ///
     /// `nil` where there is nothing new to say: `screen` and `wait` never acted.
     public static func settled(tool: String, input: [String: JSONValue], ok: Bool) -> String? {
@@ -103,7 +94,8 @@ public enum MacScreenPreviewCaption {
             let verb = text(input["verb"])?.lowercased() ?? ""
             let target = safeTarget(text(input["target"]))
             let what = target.isEmpty ? "the screen" : target
-            return ok ? "\(pastTense(verb)) \(what)" : "Could not \(plainVerb(verb)) \(what)"
+            let forms = wordForms(verb)
+            return ok ? "\(forms.past) \(what)" : "Could not \(forms.plain) \(what)"
         case "go":
             let name = safeTarget(text(input["name"]) ?? text(input["target"]))
             guard !name.isEmpty else { return nil }
@@ -113,39 +105,21 @@ public enum MacScreenPreviewCaption {
         }
     }
 
-    static func pastTense(_ verb: String) -> String {
+    static func wordForms(_ verb: String) -> (past: String, plain: String) {
         switch verb {
-        case "click": return "Clicked"
-        case "open": return "Opened"
-        case "type": return "Typed into"
-        case "select": return "Selected"
-        case "toggle": return "Switched"
-        case "scroll": return "Scrolled"
-        case "dismiss": return "Dismissed"
-        case "hover": return "Hovered over"
-        case "move": return "Moved to"
-        case "drag": return "Dragged"
-        case "hold": return "Held"
-        case "key": return "Pressed"
-        default: return "Finished on"
-        }
-    }
-
-    static func plainVerb(_ verb: String) -> String {
-        switch verb {
-        case "click": return "click"
-        case "open": return "open"
-        case "type": return "type into"
-        case "select": return "select"
-        case "toggle": return "switch"
-        case "scroll": return "scroll"
-        case "dismiss": return "dismiss"
-        case "hover": return "hover over"
-        case "move": return "move to"
-        case "drag": return "drag"
-        case "hold": return "hold"
-        case "key": return "press"
-        default: return "act on"
+        case "click": return ("Clicked", "click")
+        case "open": return ("Opened", "open")
+        case "type": return ("Typed into", "type into")
+        case "select": return ("Selected", "select")
+        case "toggle": return ("Switched", "switch")
+        case "scroll": return ("Scrolled", "scroll")
+        case "dismiss": return ("Dismissed", "dismiss")
+        case "hover": return ("Hovered over", "hover over")
+        case "move": return ("Moved to", "move to")
+        case "drag": return ("Dragged", "drag")
+        case "hold": return ("Held", "hold")
+        case "key": return ("Pressed", "press")
+        default: return ("Finished on", "act on")
         }
     }
 
@@ -157,7 +131,7 @@ public enum MacScreenPreviewCaption {
 
     static func act(verb: String, target: String) -> String {
         let what = target.isEmpty ? "the screen" : target
-        return "About to \(plainVerb(verb)) \(what)"
+        return "About to \(wordForms(verb).plain) \(what)"
     }
 
     /// One line, bounded, and never the secret itself. `act.text` — the typed

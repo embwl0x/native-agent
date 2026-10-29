@@ -1,6 +1,35 @@
 import SwiftUI
 import NativeAgentShared
-// Blueprint: | `MobileTrustEditor.swift` | `MobileTrustEditor` struct; displays the engine-resolved preset and effective permission level |
+// Blueprint: | `MobileTrustEditor.swift` | Trust destination and editor share the sync projection; displays the engine-resolved preset and effective permission level |
+
+/// Absent policy fields stay visibly unknown.
+enum TrustPolicySummaryPresentation {
+    static let unknownValue = "Not reported by the Mac"
+}
+
+struct TrustPolicyView: View {
+    @StateObject private var store: SettingsStore
+
+    init(store: SettingsStore = SettingsStore()) {
+        _store = StateObject(wrappedValue: store)
+    }
+
+    var body: some View {
+        AlivePage(title: "Trust", line: "What I may do on my own.") {
+            if let policy = store.sync.trustPolicy {
+                MobileTrustEditor(policy: policy)
+            } else {
+                AliveCalmState(
+                    title: "Not here yet",
+                    line: "My trust policy comes over from the Mac and appears after the next iCloud sync."
+                )
+            }
+        }
+        .task { if MobileDesignSamples.screen == nil { await store.refresh() } }
+        .refreshable { await store.refresh() }
+    }
+
+}
 
 struct MobileTrustEditor: View {
     let policy: TrustPolicy
@@ -172,7 +201,6 @@ struct MobileTrustEditor: View {
         case .outsideDefault: "Outside default"
         case .developerMode: "Developer mode"
         case .workshopEnabled: "Desk enabled"
-        case .showTimeline: "Show timeline"
         case .autonomousTraining: "Autonomous training"
         case .dreamScheduler: "Dream scheduler"
         }

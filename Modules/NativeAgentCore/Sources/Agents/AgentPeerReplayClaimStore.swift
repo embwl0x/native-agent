@@ -145,26 +145,7 @@ public struct AgentPeerReplayClaimStore: Sendable {
     private func write(_ record: Record, to url: URL) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        let data = try encoder.encode(record)
-        let temporary = url.deletingLastPathComponent()
-            .appendingPathComponent(".\(UUID().uuidString).tmp")
-        try data.write(to: temporary, options: .atomic)
-        // rename atomically creates the first claim or replaces an existing one.
-        let renamed = url.withUnsafeFileSystemRepresentation { destination -> Int32 in
-            guard let destination else { return -1 }
-            return temporary.withUnsafeFileSystemRepresentation { source -> Int32 in
-                guard let source else { return -1 }
-                return rename(source, destination)
-            }
-        }
-        guard renamed == 0 else {
-            try? FileManager.default.removeItem(at: temporary)
-            throw NSError(
-                domain: NSPOSIXErrorDomain, code: Int(errno),
-                userInfo: [NSLocalizedDescriptionKey:
-                    "could not record peer claim at \(url.lastPathComponent): \(String(cString: strerror(errno)))"]
-            )
-        }
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(record), to: url)
     }
 
     private func makeRoomForClaim() throws {

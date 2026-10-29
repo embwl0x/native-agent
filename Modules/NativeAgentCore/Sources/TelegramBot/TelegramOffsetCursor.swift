@@ -12,14 +12,11 @@ public struct TelegramOffsetCursor: Sendable {
     public static let maximumPayloadBytes = 4 * 1024
 
     public let fileURL: URL
-    private let persistence: any PersistenceCoreProtocol
 
     public init(
-        fileURL: URL,
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
+        fileURL: URL
     ) {
         self.fileURL = fileURL
-        self.persistence = persistence
     }
 
     /// Loads the stored cursor. An absent file is the fresh-install cursor 0;
@@ -62,11 +59,11 @@ public struct TelegramOffsetCursor: Sendable {
             throw TelegramOffsetCursorError.invalidOffset
         }
         let cursor = self
-        return try await persistence.withFileLock(fileURL) {
+        return try await SwiftNativePersistenceCore.withFileLock(fileURL) {
             let current = try cursor.load()
             let next = max(current, requestedOffset)
             if next != current || !FileManager.default.fileExists(atPath: cursor.fileURL.path) {
-                try await cursor.persistence.writeJSON(
+                try await SwiftNativePersistenceCore.writeJSON(
                     .object(["offset": .int(Int64(next))]),
                     to: cursor.fileURL
                 )

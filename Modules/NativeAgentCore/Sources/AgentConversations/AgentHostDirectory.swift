@@ -113,13 +113,62 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
         }
     }
 
-    private static let installations = OSAllocatedUnfairLock(initialState: [String: (AgentHostRow, Installation)]())
+    private struct InstallationInput: Sendable, Equatable {
+        let path: String
+        let resolved: String
+        let device: dev_t
+        let inode: ino_t
+        let mode: mode_t
+        let size: off_t
+        let modified, changed: timespec
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.path == rhs.path && lhs.resolved == rhs.resolved && lhs.device == rhs.device
+                && lhs.inode == rhs.inode && lhs.mode == rhs.mode && lhs.size == rhs.size
+                && lhs.modified.tv_sec == rhs.modified.tv_sec && lhs.modified.tv_nsec == rhs.modified.tv_nsec
+                && lhs.changed.tv_sec == rhs.changed.tv_sec && lhs.changed.tv_nsec == rhs.changed.tv_nsec
+        }
+    }
+
+    private static let installations = OSAllocatedUnfairLock(initialState: [String: (AgentHostRow, Installation, [InstallationInput])]())
     static func installationsChanged() { installations.withLock { $0.removeAll() } }
 
-    /// One binding for discovery, connection and launch, until an installation edge.
+    /// Directory metadata changes for unrelated programs do not invalidate a binding.
+    static func refreshInstallations() -> Bool {
+        installations.withLock { cache in
+            let changed = cache.keys.filter { id in
+                let (row, binding, inputs) = cache[id]!
+                return row.installationInputs(binding) != inputs
+            }
+            for id in changed { cache.removeValue(forKey: id) }
+            return !changed.isEmpty
+        }
+    }
+
+    private func installationInputs(_ binding: Installation) -> [InstallationInput] {
+        var paths = Set(binding.locations + bundleIDs.compactMap(Self.applicationURL))
+        for app in paths where app.pathExtension == "app" {
+            let info = app.appendingPathComponent("Contents/Info.plist")
+            paths.insert(info)
+            if let name = NSDictionary(contentsOf: info)?["CFBundleExecutable"] as? String {
+                paths.insert(app.appendingPathComponent("Contents/MacOS/" + name))
+            }
+        }
+        return paths.sorted { $0.path < $1.path }.map { url in
+            var info = stat()
+            _ = stat(url.path, &info)
+            let directory = info.st_mode & S_IFMT == S_IFDIR
+            return InstallationInput(path: url.path, resolved: url.resolvingSymlinksInPath().path,
+                device: info.st_dev, inode: info.st_ino, mode: info.st_mode,
+                size: directory ? 0 : info.st_size, modified: directory ? timespec() : info.st_mtimespec,
+                changed: directory ? timespec() : info.st_ctimespec)
+        }
+    }
+
+    /// One binding for discovery, connection and launch, until its installation changes.
     public var installation: Installation {
         Self.installations.withLock { cache in
-            if let (row, binding) = cache[id], row == self { return binding }
+            if let (row, binding, _) = cache[id], row == self { return binding }
             let markers = installMarkers.map(AgentHostDirectory.expand)
             let apps = bundleIDs.compactMap(Self.applicationURL)
                 + markers.filter { $0.hasSuffix(".app") && Self.isInstalledProgram($0) }.map { URL(fileURLWithPath: $0) }
@@ -162,7 +211,7 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
             let binding = Installation(applicationURL: apps.first, executables: programs, environment: environment,
                 transports: failure == nil && (route != .mcpSettingsOnly || settingsSupported) ? [route] : [],
                 evidence: evidence, locations: locations, failure: failure)
-            cache[id] = (self, binding)
+            cache[id] = (self, binding, installationInputs(binding))
             return binding
         }
     }
@@ -255,9 +304,8 @@ public struct AgentHostRow: Sendable, Equatable, Codable {
         public var credential: String?
         public var read: Card? = nil
 
-        /// The public card only: the authenticated extended card is used for
-        /// its call and never kept. Extensions are the ones it declares; one
-        /// it requires is not spoken here (`protocol_mismatch`).
+        /// Selected effective-card fields and digest, including an authenticated extended card; no raw card is retained.
+        /// Extensions are those it declares; required ones are not spoken here (`protocol_mismatch`).
         public struct Card: Codable, Sendable, Equatable {
             public var endpoint, version, binding: String
             public var tenant: String?
@@ -304,9 +352,7 @@ public enum AgentHostDirectory {
         InstallPaths.current.bridgeDiscoveryDirectory(dataRoot: dataRoot)
     }
 
-    /// 2026-09-22: peers read a URL-only descriptor OUTSIDE `claude-bridge/`,
-    /// and the link authenticates with the peer's own secret, so a connected
-    /// agent never holds the main bridge bearer.
+    /// Peers use their own secret and URL-only descriptors outside `claude-bridge/`, never the bridge bearer.
     public static func peerDescriptorDirectory(dataRoot: URL) -> URL {
         bridgeDiscoveryDirectory(dataRoot: dataRoot).deletingLastPathComponent()
             .appendingPathComponent("nativeagent-link", isDirectory: true)
@@ -323,31 +369,8 @@ public enum AgentHostDirectory {
         + "These are messaging tools, not restrictions on what the other program can do itself. "
         + "This app applies its own permission settings when it handles a request."
 
-    // Vendor evidence fetched 2026-09-19 (restart notes below are plain-language
-    // instructions, not a promise that a saved entry is already connected):
-    // Claude Desktop: https://modelcontextprotocol.io/docs/develop/connect-local-servers
-    // "The application needs to restart to load the new configuration"
-    // Shape also confirmed by Anthropic's own code.claude.com/docs/en/mcp.
-    // LM Studio: https://lmstudio.ai/blog/lmstudio-v0.3.17
-    // "LM Studio will automatically load the MCP servers defined in it."
-    // Cursor: https://cursor.com/docs/mcp
-    // "For custom servers, update your local files and restart Cursor."
-    // Gemini: https://geminicli.com/docs/tools/mcp-server/ describes discovery
-    // at startup; starting a new session is the conservative reload instruction.
-    // Comments (but not trailing commas) confirmed in vendor settings.ts:
-    // https://github.com/google-gemini/gemini-cli/blob/main/packages/cli/src/config/settings.ts
-    // Zed: https://zed.dev/docs/ai/mcp says to check Settings → AI → MCP Servers
-    // and return to the Agent Panel. No app restart is prescribed in that flow;
-    // that is the basis of the note, not tools/list_changed (a different event).
-    // Path/comments: https://github.com/zed-industries/zed/blob/main/docs/src/configuring-zed.md
-    // VS Code: https://code.visualstudio.com/docs/agent-customization/mcp-servers
-    // prescribes inline start actions, not an app restart. macOS User directory:
-    // https://code.visualstudio.com/docs/configure/settings
-    // Goose: https://github.com/block/goose/blob/main/documentation/docs/guides/config-files.md
-    // "Direct edits to config files usually require restarting goose"
-    // OpenCode is deliberately omitted: /docs/mcp-servers uses mcp.<name>, while
-    // /v2/docs/mcp-servers uses mcp.servers.<name> and different enablement keys.
-    // A version-free name does not establish which published contract to write.
+    // Restart notes describe reload steps, not proof that a saved entry is connected.
+    // The seed omits OpenCode because its published configuration contracts conflict.
     /// THE SEED, and only that: `AgentRecipeStore` writes each row into
     /// agents/recipes/<id>.json, and every reader takes `rows`, the recipes.
     static let seed: [AgentHostRow] = [
@@ -361,20 +384,20 @@ public enum AgentHostDirectory {
             configPath: "~/.config/nativeagent-link/contacts/chatgpt-dot.env", format: .shellEnvironment,
             restartRequired: false, restartNote: "Nothing to restart. Give Dot the local message command.",
             documentation: "", settingsSupported: false,
-            declaredRoute: .dotIPC, bundleIDs: ["com.openai.codex"]),
+            declaredRoute: .dotIPC, bundleIDs: ["com.openai.codex"], discoveryWords: ["dot"]),
         AgentHostRow(id: "grok-bot", displayName: "Grok Bot",
             description: "A cloud assistant that answers through its desktop app.", aliases: ["grok"],
             installMarkers: [], configPath: "", format: .sessionMCP,
             restartRequired: false, restartNote: "Grok Bot asks before running the local reply command under its current policy.",
             documentation: "https://cursor.com/help/grok-bot/routines", settingsSupported: false,
-            declaredRoute: .grokBot, bundleIDs: ["com.anysphere.sand"]),
+            declaredRoute: .grokBot, bundleIDs: ["com.anysphere.sand"], discoveryWords: ["grok"]),
         AgentHostRow(id: "muse", displayName: "Muse",
             description: "Meta's assistant, reached through its Mac app in a chat of its own.", aliases: ["meta muse", "meta ai"],
             installMarkers: [], configPath: "", format: .sessionMCP,
             restartRequired: false, restartNote: "Nothing to restart.",
             documentation: "https://muse.meta.com", settingsSupported: false,
-            declaredRoute: .desktopChat, bundleIDs: ["com.meta.endo"],
-            // The labels Muse's window exposes, as seen on the installed app 09-22.
+            declaredRoute: .desktopChat, bundleIDs: ["com.meta.endo"], discoveryWords: ["muse", "endo"],
+            // The labels Muse's window exposes.
             desktopChat: .init(
                 newChat: "New side chat",            // button, and a new chat's title
                 backToMain: "Back to main chat",     // header button; the title follows it
@@ -400,7 +423,18 @@ public enum AgentHostDirectory {
             restartNote: "required — it reads this file when a session starts, so a session that is "
                 + "already open keeps its current servers until it is restarted.",
             documentation: "https://code.claude.com/docs/en/mcp",
-            configPaths: ["~/.claude.json"]
+            configPaths: ["~/.claude.json"],
+            commandLine: AgentHostCommandLine(
+                executable: "claude",
+                arguments: ["-p", "--output-format", "json", "--name", AgentHostCommandLine.sessionNamePlaceholder,
+                            "--", AgentHostCommandLine.messagePlaceholder],
+                continuation: ["-p", "--output-format", "json", "--resume", AgentHostCommandLine.sessionPlaceholder,
+                               "--", AgentHostCommandLine.messagePlaceholder],
+                capturesThreadID: true, jsonResultReply: true,
+                resultFields: ["reply": "result", "session": "session_id", "status": "subtype", "success": "success", "error": "is_error", "errors": "errors"],
+                automaticMCPProbe: false, permissionFlags: .claude, timeoutSeconds: 300,
+                documentation: "https://code.claude.com/docs/en/headless", minimumVersion: "2.1.76"),
+            executables: ["claude"], discoveryWords: ["claude"]
         ),
         AgentHostRow(
             id: "codex",
@@ -415,13 +449,38 @@ public enum AgentHostDirectory {
             restartNote: "required — its documentation says a change to this file is picked up when "
                 + "Codex restarts.",
             documentation: "https://learn.chatgpt.com/docs/extend/mcp?surface=cli",
-            bundleIDs: ["com.openai.codex"], configPaths: ["~/.codex/config.toml"]
+            bundleIDs: ["com.openai.codex"], configPaths: ["~/.codex/config.toml"],
+            // Resume uses the CLI-minted thread.started UUID.
+            commandLine: AgentHostCommandLine(
+                executable: "codex",
+                arguments: ["exec", "--json", "--skip-git-repo-check", "-o", AgentHostCommandLine.replyFilePlaceholder,
+                            "--", AgentHostCommandLine.messagePlaceholder],
+                continuation: ["exec", "resume", "--json", "--skip-git-repo-check",
+                               "-o", AgentHostCommandLine.replyFilePlaceholder,
+                               "--", AgentHostCommandLine.sessionPlaceholder, AgentHostCommandLine.messagePlaceholder],
+                replyFileName: "reply.txt",
+                capturesThreadID: true, stream: .codex, permissionFlags: .codex,
+                timeoutSeconds: 300,
+                documentation: "https://learn.chatgpt.com/docs/non-interactive-mode"),
+            discoveryWords: ["codex"]
         ),
         AgentHostRow(
             id: "antigravity-cli", displayName: "Antigravity CLI", description: "Google's current terminal agent for Gemini with continuing conversations.", aliases: ["antigravity", "agy", "gemini"],
             installMarkers: [], configPath: "~/.gemini/config/mcp_config.json", format: .jsonMCPServers,
             restartRequired: false, restartNote: "Each message starts the CLI with the current connection settings and resumes the requested conversation.",
-            documentation: "https://www.antigravity.google/docs/mcp"),
+            documentation: "https://www.antigravity.google/docs/mcp",
+            commandLine: AgentHostCommandLine(
+                executable: "agy",
+                arguments: ["--mode", "plan", "--sandbox", "--disable-slash-commands", "--output-format", "stream-json",
+                            "--print=" + AgentHostCommandLine.messagePlaceholder],
+                continuation: ["--mode", "plan", "--sandbox", "--disable-slash-commands", "--output-format", "stream-json",
+                               "--conversation", AgentHostCommandLine.sessionPlaceholder,
+                               "--print=" + AgentHostCommandLine.messagePlaceholder],
+                capturesThreadID: true, jsonResultReply: true,
+                resultFields: ["reply": "response", "session": "conversation_id", "status": "status", "success": "SUCCESS"],
+                automaticMCPProbe: false, stream: .antigravity, timeoutSeconds: 300,
+                documentation: "https://www.antigravity.google/docs/cli/headless/"),
+            discoveryWords: ["antigravity"], messagingPermissionsPath: "~/.gemini/antigravity-cli/settings.json"),
         AgentHostRow(
             id: "claude-desktop", displayName: "Claude Desktop", description: "A chat app for talking with Claude.", aliases: ["claude app"],
             installMarkers: ["/Applications/Claude.app", "~/Applications/Claude.app"],
@@ -434,13 +493,13 @@ public enum AgentHostDirectory {
             installMarkers: ["/Applications/LM Studio.app"],
             configPath: "~/.lmstudio/mcp.json", format: .jsonMCPServers,
             restartRequired: false, restartNote: "No restart needed; LM Studio loads connections when this file is saved.",
-            documentation: "https://lmstudio.ai/blog/lmstudio-v0.3.17", bundleIDs: ["ai.elementlabs.lmstudio"]),
+            documentation: "https://lmstudio.ai/blog/lmstudio-v0.3.17", bundleIDs: ["ai.elementlabs.lmstudio"], discoveryWords: ["lmstudio", "ollama"]),
         AgentHostRow(
             id: "cursor", displayName: "Cursor", description: "A code editor with an AI assistant.", aliases: ["cursor global"],
             installMarkers: ["/Applications/Cursor.app", "~/Applications/Cursor.app"],
             configPath: "~/.cursor/mcp.json", format: .jsonMCPServers,
             restartRequired: true, restartNote: "Restart Cursor to load the new connection.",
-            documentation: "https://cursor.com/docs/mcp", bundleIDs: ["com.todesktop.230313mzl4w4u92"], configPaths: ["~/.cursor/mcp.json"]),
+            documentation: "https://cursor.com/docs/mcp", bundleIDs: ["com.todesktop.230313mzl4w4u92"], configPaths: ["~/.cursor/mcp.json"], discoveryWords: ["cursor"]),
         AgentHostRow(
             id: "cursor-workspace", displayName: "Cursor Workspace", description: "An AI coding assistant connected to one project folder.", aliases: ["cursor project"],
             installMarkers: ["/Applications/Cursor.app", "~/Applications/Cursor.app"],
@@ -453,27 +512,38 @@ public enum AgentHostDirectory {
             configPath: "", format: .sessionMCP,
             restartRequired: false, restartNote: "No restart needed; connection starts an ACP session with reply tools.",
             documentation: "https://github.com/agentclientprotocol/registry/blob/main/cursor/agent.json",
-            settingsSupported: false),
+            settingsSupported: false,
+            acp: AgentHostACP(executable: "cursor-agent", arguments: ["acp", "--mode=ask", "--sandbox=enabled"],
+                              documentation: "https://cursor.com/docs/cli/acp",
+                              permissionMode: "ask", referenceVersion: "2026.09.15", protocolVersion: 1)),
         AgentHostRow(
             id: "gemini-cli", displayName: "Gemini CLI (Legacy)", description: "The older Gemini CLI connection. Use Antigravity CLI for Gemini.", aliases: ["Gemini CLI"],
             installMarkers: ["/opt/homebrew/bin/gemini", "~/.local/bin/gemini"],
             configPath: "", format: .sessionMCP,
             restartRequired: false, restartNote: "No restart needed; connection starts an ACP session with reply tools.",
             documentation: "https://geminicli.com/docs/tools/mcp-server/", settingsSupported: false,
-            configPaths: ["~/.gemini/settings.json"]),
+            configPaths: ["~/.gemini/settings.json"],
+            acp: AgentHostACP(executable: "gemini", arguments: ["--acp", "--approval-mode=plan", "--sandbox"],
+                              documentation: "https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/acp-mode.md",
+                              permissionMode: "plan", referenceVersion: "0.60.0", protocolVersion: 1),
+            discoveryWords: ["gemini"]),
         AgentHostRow(
             id: "zed", displayName: "Zed", description: "A code editor with a built-in agent panel.", aliases: [],
             installMarkers: ["/Applications/Zed.app"],
             configPath: "~/.config/zed/settings.json", format: .jsonContextServers,
             restartRequired: false, restartNote: "No app restart is needed; check the connection in Zed's AI settings.",
-            documentation: "https://zed.dev/docs/ai/mcp", bundleIDs: ["dev.zed.Zed"], configPaths: ["~/.config/zed/settings.json"]),
+            documentation: "https://zed.dev/docs/ai/mcp", bundleIDs: ["dev.zed.Zed"], configPaths: ["~/.config/zed/settings.json"], discoveryWords: ["zed"]),
         AgentHostRow(
             id: "goose", displayName: "Goose", description: "A local assistant for coding and other tasks.", aliases: ["goose cli"],
             installMarkers: ["/Applications/Goose.app", "~/.local/bin/goose"],
             configPath: "", format: .sessionMCP,
             restartRequired: false, restartNote: "No restart needed; connection starts an ACP session with reply tools.",
             documentation: "https://github.com/agentclientprotocol/registry/blob/main/goose/agent.json",
-            settingsSupported: false),
+            settingsSupported: false,
+            acp: AgentHostACP(executable: "goose", arguments: ["acp"],
+                              documentation: "https://block-goose.mintlify.app/advanced/acp-protocol",
+                              permissionMode: "chat", referenceVersion: "1.51.0", environment: ["GOOSE_MODE": "chat"], protocolVersion: 1),
+            discoveryWords: ["goose"]),
         // Nous Research Hermes. Nothing of its own is written: the connection
         // starts `hermes acp`, which runs the person's own Hermes with its
         // memory, provider and model as they are.
@@ -484,19 +554,14 @@ public enum AgentHostDirectory {
             configPath: "", format: .sessionMCP,
             restartRequired: false, restartNote: "No restart needed; connection starts an ACP session with reply tools.",
             documentation: "https://hermes-agent.nousresearch.com/docs/user-guide/features/acp",
-            settingsSupported: false, bundleIDs: ["com.nousresearch.hermes"]),
-    ].map { row in
-        var row = row
-        row.acp = AgentHostACP.seed[row.id]
-        row.commandLine = AgentHostCommandLines.seed[row.id]
-        row.discoveryWords = ["claude-code": ["claude"], "codex": ["codex"], "cursor": ["cursor"],
-            "zed": ["zed"], "lm-studio": ["lmstudio", "ollama"], "muse": ["muse", "endo"],
-            "grok-bot": ["grok"], "gemini-cli": ["gemini"], "antigravity-cli": ["antigravity"],
-            "goose": ["goose"], "hermes": ["hermes"], "chatgpt-dot": ["dot"]][row.id]
-        if row.id == "claude-code" { row.executables = ["claude"] }
-        if row.id == "antigravity-cli" { row.messagingPermissionsPath = "~/.gemini/antigravity-cli/settings.json" }
-        return row
-    }
+            settingsSupported: false, bundleIDs: ["com.nousresearch.hermes"],
+            // Hermes' default session mode asks before edits and supports continuing its sessions.
+            acp: AgentHostACP(executable: "hermes", arguments: ["acp"],
+                              documentation: "https://hermes-agent.nousresearch.com/docs/user-guide/features/acp",
+                              permissionMode: "default", referenceVersion: "0.21.3", protocolVersion: 1,
+                              modes: ["default", "accept_edits", "dont_ask"], supportsLoad: true, supportsResume: true),
+            discoveryWords: ["hermes"]),
+    ]
 
     /// An A2A contact's seed: its card, and its port when that is on this Mac
     /// (the local scan looks there). What the card offers is read later.

@@ -14,11 +14,7 @@ import Transcripts
 // snake_case file at `<dataRoot>/harness/rem_proposals.jsonl` is import-only
 // (see `importLegacyHarnessFileIfNeeded`) — no production writer remains.
 //
-// Locking: every mutation is a read-modify-write inside ONE
-// `withFileLock(proposalsURL)` critical section (cross-process flock on the
-// sibling `<path>.lock`, the the retired daemon convention). Bare reads are
-// lock-free: the file is only appended or atomically rewritten under the
-// lock, so a reader can't observe a torn row.
+// Mutations hold the sibling `<path>.lock` flock; lock-free reads see appends or atomic rewrites.
 
 // MARK: - REMProposalRow
 
@@ -46,7 +42,7 @@ public struct REMProposalRow: Codable, Sendable, Equatable {
     /// reads this: a thing dwelt on is offered deliberately, under its own
     /// name, and is never presented as a pattern.
     public var support: REMSupportKind?
-    /// Phase 5 C1: the circumstance behind the lesson (`REMProposal.whatChanged`).
+    /// The circumstance behind the lesson, never written to GROWTH.
     public var whatChanged: String?
 
     public init(
@@ -56,7 +52,7 @@ public struct REMProposalRow: Codable, Sendable, Equatable {
         evidenceDates: [String],
         confidence: Double,
         createdAt: String,
-        status: String,
+        status: String = "pending",
         approvalId: String? = nil,
         supportingPassages: [REMSupportingPassage]? = nil,
         livedDates: [String]? = nil,
@@ -77,42 +73,23 @@ public struct REMProposalRow: Codable, Sendable, Equatable {
         self.support = support
     }
 
-    /// Wire a pipeline proposal into a pending row. `targetDoc` is
-    /// normalized to carry the `.md` suffix — the pins index and approval
-    /// surfaces key on the doc FILENAME, and the legacy loop hands bare
-    /// names like "GROWTH".
-    public init(from proposal: REMProposal, status: String = "pending") {
-        let raw = REMProposalStore.normalizedTargetDoc(proposal.targetDoc)
-        self.init(
-            id: proposal.id,
-            targetDoc: raw.hasSuffix(".md") ? raw : raw + ".md",
-            proposalText: proposal.proposalText,
-            evidenceDates: proposal.evidenceDates,
-            confidence: proposal.confidence,
-            createdAt: proposal.createdAt,
-            status: status,
-            supportingPassages: proposal.supportingPassages,
-            livedDates: proposal.livedDates,
-            support: proposal.support,
-            whatChanged: proposal.whatChanged
-        )
+    public var supportingExperienceReferences: [String]? {
+        let passages = supportingPassages ?? []
+        guard !passages.isEmpty, passages.allSatisfy({ $0.claimBound == true }) else { return nil }
+        // Recollection row IDs change on folding; only canonical exchanges and
+        // messages count, each once by its identity.
+        return passages.flatMap(\.sourceRefs).filter {
+            $0.hasPrefix("exchange:") || $0.hasPrefix("message:") || UUID(uuidString: $0) != nil
+                || $0.hasPrefix("chat.user_turn:") || $0.hasPrefix("chat.assistant_turn:")
+        }
     }
 
-    /// Back to the pipeline shape (tombstone recording takes a REMProposal).
-    public var asREMProposal: REMProposal {
-        REMProposal(
-            id: id,
-            targetDoc: targetDoc,
-            proposalText: proposalText,
-            evidenceDates: evidenceDates,
-            confidence: confidence,
-            createdAt: createdAt,
-            supportingPassages: supportingPassages,
-            livedDates: livedDates,
-            support: support,
-            whatChanged: whatChanged
-        )
+    public func supportingExperienceCount(identities: [String: String]) -> Int? {
+        supportingExperienceReferences.map { Set($0.compactMap { identities[$0] }).count }
     }
+
+    /// Distinct dream dates — how many nights she dreamt about it.
+    public var dreamDateCount: Int { Set(evidenceDates).count }
 }
 
 /// Stages one pending row into the approval queue; returns the created
@@ -152,19 +129,8 @@ public enum REMProposalStoreError: Error, LocalizedError, Equatable {
 
 public struct REMProposalStore: Sendable {
     public let dataRoot: URL
-    private let lockCore = SwiftNativePersistenceCore()
 
-    // P-L3 (tightness round 2): the feed was a raw op-log that only ever grew —
-    // terminal (approved/denied) rows accumulate forever, and the pins emitter +
-    // approval executor read them, so a naive newest-N line cap would VANISH a
-    // live approved pin. Adopt the shared SnapshotTailOpLog snapshot+tail engine
-    // (as DeskStore/GitHubCommandStore/TaskLedger did): once the feed crosses
-    // `compactionThreshold`, old TERMINAL rows fold into an id-keyed base file
-    // (`rem_proposals_base.json`), written BEFORE the feed truncate so a crash or
-    // a lock-free reader racing the compaction never loses a terminal row. PENDING
-    // rows are NEVER compacted — they still mutate in place, so they must stay in
-    // the feed where the in-place status-flip rewrites can find them. Every read
-    // (loadAll, the pins emitter) folds base + feed.
+    // SnapshotTailOpLog folds terminal rows into a base before truncating; pending rows stay in the feed.
     /// Feed row count that triggers a snapshot+truncate on the next mutation.
     static let compactionThreshold = 512
     /// Newest feed rows always retained after a compaction (recency + torn-read
@@ -179,9 +145,7 @@ public struct REMProposalStore: Sendable {
         dataRoot.appendingPathComponent("rem_proposals.jsonl")
     }
 
-    /// `<dataRoot>/rem_proposals_base.json` — the compaction snapshot the feed
-    /// folds FROM (P-L3). Written atomically BEFORE the feed truncate; a crash
-    /// between the two leaves the full feed intact and the id-union fold heals it.
+    /// Compaction base, written before truncation; reads fold its id-union with the feed.
     public var basePath: URL {
         dataRoot.appendingPathComponent("rem_proposals_base.json")
     }
@@ -196,49 +160,47 @@ public struct REMProposalStore: Sendable {
 
     // MARK: Read
 
-    /// Tolerant load of the FULL authoritative view: the compaction base folded
-    /// under the live feed. Lines that don't decode are skipped here but
-    /// preserved verbatim by every rewrite path below.
-    ///
-    /// Read order is FEED FIRST, base SECOND: the base is written BEFORE the feed
-    /// truncate during compaction, so a lock-free reader racing it sees every
-    /// terminal row in the full feed OR the just-written base — never neither.
-    /// Feed wins on an id collision (in steady state feed and base ids are
-    /// disjoint; a collision means the feed holds the newer copy).
+    /// Display reads retain partial evidence and name every unreadable part.
     public func loadAll() -> [REMProposalRow] { loadAllChecked().rows }
 
-    /// The tolerant read, with what it could not read named beside the rows.
     public func loadAllChecked() -> (rows: [REMProposalRow], unreadable: [String]) {
-        var unreadable: [String] = []
-        let lines: [Data]
-        do { lines = try Data(contentsOf: proposalsURL).split(separator: 0x0A).map { Data($0) } }
-        catch CocoaError.fileReadNoSuchFile { lines = [] }
-        catch { lines = []; unreadable.append("\(proposalsURL.lastPathComponent): \(error.localizedDescription)") }
-        let feedRows = lines.compactMap(Self.decodeRow)
-        if feedRows.count < lines.count {
-            unreadable.append("\(proposalsURL.lastPathComponent): \(lines.count - feedRows.count) malformed row(s)")
-        }
-        let baseRows = readBaseRows()
-        if baseRows == nil { unreadable.append("\(basePath.lastPathComponent): did not decode; feed folded alone") }
-        return (Self.fold(feedRows: feedRows, baseRows: baseRows ?? []), unreadable)
+        let read = readChecked()
+        return (Self.fold(feedRows: read.feed, baseRows: read.base), read.unreadable)
     }
 
-    /// Every row, or a throw: GROWTH eviction and a GROWTH rewrite cannot
-    /// drop approved lessons without reading the approval evidence.
     public func loadAllStrictly() throws -> [REMProposalRow] {
-        func readIfPresent(_ url: URL) throws -> Data? {
+        let read = try readStrictly()
+        return Self.fold(feedRows: read.feed, baseRows: read.base)
+    }
+
+    /// Feed first, then base: compaction publishes the base before truncating the feed.
+    private func readChecked() -> (lines: [Data], feed: [REMProposalRow], base: [REMProposalRow], unreadable: [String]) {
+        var unreadable: [String] = []
+        func read(_ url: URL) -> Data? {
             do { return try Data(contentsOf: url) }
             catch CocoaError.fileReadNoSuchFile { return nil }
+            catch { unreadable.append("\(url.lastPathComponent): \(error.localizedDescription)"); return nil }
         }
-        let feed = try readIfPresent(proposalsURL) ?? Data()
-        let feedRows = try feed.split(separator: 0x0A).map {
-            try JSONDecoder().decode(REMProposalRow.self, from: Data($0))
+        let lines = (read(proposalsURL) ?? Data()).split(separator: 0x0A).map { Data($0) }
+        let feed = lines.compactMap(Self.decodeRow)
+        if feed.count < lines.count {
+            unreadable.append("\(proposalsURL.lastPathComponent): \(lines.count - feed.count) malformed row(s)")
         }
-        var baseRows: [REMProposalRow] = []
-        if let base = try readIfPresent(basePath) {
-            baseRows = try JSONDecoder().decode(REMProposalCompactionBase.self, from: base).rows
+        var base: [REMProposalRow] = []
+        if let data = read(basePath) {
+            do { base = try JSONDecoder().decode(REMProposalCompactionBase.self, from: data).rows }
+            catch { unreadable.append("\(basePath.lastPathComponent): \(error.localizedDescription); feed folded alone") }
         }
-        return Self.fold(feedRows: feedRows, baseRows: baseRows)
+        return (lines, feed, base, unreadable)
+    }
+
+    /// Incomplete evidence grants no write authority; damaged bytes remain untouched.
+    private func readStrictly() throws -> (lines: [Data], feed: [REMProposalRow], base: [REMProposalRow], unreadable: [String]) {
+        let read = readChecked()
+        guard read.unreadable.isEmpty else {
+            throw REMProposalStoreError.storeUnavailable(read.unreadable.joined(separator: "; ") + "; bytes were preserved")
+        }
+        return read
     }
 
     private static func fold(feedRows: [REMProposalRow], baseRows: [REMProposalRow]) -> [REMProposalRow] {
@@ -247,11 +209,7 @@ public struct REMProposalStore: Sendable {
         var order: [String] = []
         for r in baseRows where byID[r.id] == nil { order.append(r.id); byID[r.id] = r }
         for r in feedRows {
-            // A pending feed row must never shadow a TERMINAL base row with the
-            // same id: a deterministic emitter can re-emit an id after its
-            // approved copy folded to base, and letting the feed win would make
-            // approved pins vanish (gpt-5.5 fix round, HIGH). Terminal-over-
-            // terminal keeps feed-wins (the feed copy is the newer decision).
+            // Terminal base decisions outrank pending feed rows; newer terminal feed decisions win.
             if let existing = byID[r.id],
                existing.status == "approved" || existing.status == "denied",
                r.status == "pending" {
@@ -261,35 +219,6 @@ public struct REMProposalStore: Sendable {
             byID[r.id] = r
         }
         return order.compactMap { byID[$0] }
-    }
-
-    /// Distinguishes MISSING base (`[]` — genesis feed, safe to create) from
-    /// CORRUPT base (`nil` — exists but undecodable). Read paths degrade to
-    /// feed-only on nil; COMPACTION MUST ABORT on nil, because merging an
-    /// "empty" base and rewriting would permanently discard every previously
-    /// folded terminal row (gpt-5.5 fix round, MED).
-    func readBaseRows() -> [REMProposalRow]? {
-        guard FileManager.default.fileExists(atPath: basePath.path) else { return [] }
-        do {
-            let data = try Data(contentsOf: basePath)
-            return try JSONDecoder().decode(REMProposalCompactionBase.self, from: data).rows
-        } catch PersistenceCoreError.ioFailure("REM proposal base has an invalid row") {
-            nativeLog("REMProposalStore: base at %@ contains malformed rows — folding feed only",
-                  basePath.path)
-        } catch {
-            nativeLog("REMProposalStore: base at %@ exists but did not decode — folding feed only",
-                  basePath.path)
-        }
-        return nil
-    }
-
-    private func requireReadableBaseRows() throws -> [REMProposalRow] {
-        guard let rows = readBaseRows() else {
-            throw REMProposalStoreError.storeUnavailable(
-                "compaction base is unreadable; bytes were preserved"
-            )
-        }
-        return rows
     }
 
     // MARK: Append (dedupe by id)
@@ -348,41 +277,20 @@ public struct REMProposalStore: Sendable {
     /// Append proposals as pending rows, skipping ids already present.
     /// Returns the number of rows actually appended.
     @discardableResult
-    public func appendPending(_ proposals: [REMProposal]) async throws -> Int {
+    public func appendPending(_ proposals: [REMProposalRow]) async throws -> Int {
         try await appendPendingWithReceipt(proposals).appended
     }
 
-    /// The same append, with the receipt (fable51 #11).
-    ///
-    /// The GROWTH.md-only fence stays — SOUL.md and VOICE.md are User's, and a
-    /// dream pass does not get to edit who she is. What changes is the
-    /// silence: a SOUL/VOICE-targeted proposal used to vanish inside the
-    /// `where` clause of this loop with no counter, no log line, and no
-    /// receipt, so a week could burn an Opus call, keep zero proposals, and
-    /// report nothing at all.
-    ///
-    /// Why the invitation stays: the REM system prompt embeds all four persona
-    /// docs so a distilled reflex is coherent with the whole self, and the
-    /// per-target guidance already tells the model not to write proposals for
-    /// non-GROWTH docs. The rest of the REM contract keeps its drops LOUD
-    /// rather than pre-censoring the model (`lastParseErrors`,
-    /// `lastEvidenceDateDrops`, `lastTargetMismatchDrops` all exist for
-    /// exactly this) — this is the last of those choke points to stay quiet,
-    /// so it is made loud in the same shape rather than narrowing the prompt.
+    /// Append only GROWTH reflexes; every refused target or passage bound is named.
     @discardableResult
     public func appendPendingWithReceipt(
-        _ proposals: [REMProposal]
+        _ proposals: [REMProposalRow]
     ) async throws -> AppendReceipt {
         guard !proposals.isEmpty else { return AppendReceipt(appended: 0) }
-        return try await lockCore.withFileLock(proposalsURL) {
+        return try await SwiftNativePersistenceCore.withFileLock(proposalsURL) {
             // Compaction can throw; finish it before committing new proposals.
             let feedRows = try await self.compactIfNeededLocked()
-            // Dedupe against base AND feed: an id folded to base is a settled
-            // decision, and re-appending it as pending would shadow it
-            // (gpt-5.5 fix round, HIGH). Corrupt base (nil) degrades to
-            // feed-only dedupe — loadAll's terminal-shadow refusal still holds.
             var seen = Set(feedRows.map(\.id))
-            seen.formUnion((self.readBaseRows() ?? []).map(\.id))
             var buffer = Data()
             var appended = 0
             var droppedByTarget: [String: Int] = [:]
@@ -398,13 +306,16 @@ public struct REMProposalStore: Sendable {
                     droppedOverBound[reason, default: 0] += 1
                     continue
                 }
-                let row = REMProposalRow(from: p)
+                var row = p
+                row.targetDoc = Self.normalizedTargetDoc(p.targetDoc)
+                row.status = "pending"
+                row.approvalId = nil
                 buffer.append(Data((try Self.encodeRow(row) + "\n").utf8))
                 seen.insert(p.id)
                 appended += 1
             }
             if !buffer.isEmpty {
-                try Self.appendData(buffer, to: self.proposalsURL)
+                try SwiftNativePersistenceCore.appendLines(buffer, to: self.proposalsURL)
             }
             let receipt = AppendReceipt(
                 appended: appended,
@@ -434,7 +345,7 @@ public struct REMProposalStore: Sendable {
         // process may complete the import while we wait on the flock.
         guard fm.fileExists(atPath: legacy.path),
               !fm.fileExists(atPath: migrated.path) else { return 0 }
-        return try await lockCore.withFileLock(proposalsURL) {
+        return try await SwiftNativePersistenceCore.withFileLock(proposalsURL) {
             let fm = FileManager.default
             guard fm.fileExists(atPath: legacy.path),
                   !fm.fileExists(atPath: migrated.path) else { return 0 }
@@ -460,21 +371,15 @@ public struct REMProposalStore: Sendable {
                 if finals[wire.id] == nil { order.append(wire.id) }
                 finals[wire.id] = wire
             }
-            let seen = Set(Self.readLines(self.proposalsURL).compactMap(Self.decodeRow).map(\.id))
+            let seen = Set(try self.loadAllStrictly().map(\.id))
             var buffer = Data()
             var imported = 0
             for id in order {
                 guard let wire = finals[id], !seen.contains(id) else { continue }
                 guard Self.supportsProposalTarget(wire.target_doc) else { continue }
-                // Same passage bound as a fresh append: a daemon-era essay
-                // does not get in through the migration door.
+                // Imported lessons obey the same passage bound as fresh proposals.
                 guard Self.growthPassageRefusal(wire.proposed_text) == nil else { continue }
-                // Daemon-era "applied" finals were ALREADY actioned (the
-                // content lives in the persona docs) — importing them as
-                // pending would re-stage long-settled approvals. Skip; the
-                // .migrated file preserves the history. "applying" never
-                // completed (daemon died mid-apply) → human re-decides,
-                // import as pending.
+                // Applied rows stay in migrated history; unfinished rows import as pending for human approval.
                 if wire.status == "applied" { continue }
                 let row = REMProposalRow(
                     id: wire.id,
@@ -489,7 +394,7 @@ public struct REMProposalStore: Sendable {
                 imported += 1
             }
             if !buffer.isEmpty {
-                try Self.appendData(buffer, to: self.proposalsURL)
+                try SwiftNativePersistenceCore.appendLines(buffer, to: self.proposalsURL)
             }
             // Rename even when 0 rows survived the dedupe — the rename is
             // the one-time marker.
@@ -510,20 +415,20 @@ public struct REMProposalStore: Sendable {
     ) async throws -> Int {
         let resolver = resolver ?? ChatSessionRecollections.ExperienceResolver(dataRoot: dataRoot)
         do {
-        let staged = try await lockCore.withFileLock(proposalsURL) {
-            _ = try self.requireReadableBaseRows()
-            var lines = Self.readLines(self.proposalsURL)
+        let staged = try await SwiftNativePersistenceCore.withFileLock(proposalsURL) {
+            let read = try self.readStrictly()
+            var lines = read.lines
             guard !lines.isEmpty else { return 0 }
-            let pending = lines.indices.compactMap { i -> (Int, REMProposalRow)? in
-                guard let row = Self.decodeRow(lines[i]), row.status == "pending", row.approvalId == nil,
+            let pending = read.feed.enumerated().compactMap { i, row -> (Int, REMProposalRow)? in
+                guard row.status == "pending", row.approvalId == nil,
                       Self.supportsProposalTarget(row.targetDoc) else { return nil }
                 return (i, row)
             }
             var staged = 0
             for (i, row) in pending.prefix(max(0, limit)) {
                 let identities = try await resolver.resolve(
-                    for: row.asREMProposal.supportingExperienceReferences ?? [], includingSourceRows: false).identities
-                guard let approvalId = try await stage(row, row.asREMProposal.supportingExperienceCount(identities: identities)) else { continue }
+                    for: row.supportingExperienceReferences ?? [], includingSourceRows: false).identities
+                guard let approvalId = try await stage(row, row.supportingExperienceCount(identities: identities)) else { continue }
                 var stamped = row
                 stamped.approvalId = approvalId
                 lines[i] = Data(try Self.encodeRow(stamped).utf8)
@@ -553,11 +458,11 @@ public struct REMProposalStore: Sendable {
     /// was neither applied nor refused — clear the stamp so the next
     /// pipeline pass stages a fresh approval instead of leaving a dead row.
     public func clearApprovalStamp(proposalId: String) async throws {
-        try await lockCore.withFileLock(proposalsURL) {
-            _ = try self.requireReadableBaseRows()
-            var lines = Self.readLines(self.proposalsURL)
-            for i in lines.indices {
-                guard var row = Self.decodeRow(lines[i]), row.id == proposalId else { continue }
+        try await SwiftNativePersistenceCore.withFileLock(proposalsURL) {
+            let read = try self.readStrictly()
+            var lines = read.lines
+            for (i, original) in read.feed.enumerated() where original.id == proposalId {
+                var row = original
                 row.approvalId = nil
                 lines[i] = Data(try Self.encodeRow(row).utf8)
                 try Self.writeLines(lines, to: self.proposalsURL)
@@ -588,8 +493,7 @@ public struct REMProposalStore: Sendable {
     /// card is closed with `tombstone: false`: its lesson was not refused.
     @discardableResult
     public func applyDenial(proposalId: String, reason: String, tombstone: Bool = true) async throws -> REMProposalRow {
-        _ = try requireReadableBaseRows()
-        guard let current = loadAll().first(where: { $0.id == proposalId }) else {
+        guard let current = try loadAllStrictly().first(where: { $0.id == proposalId }) else {
             throw REMProposalStoreError.notFound(proposalId)
         }
         if current.status == "denied" { return current } // re-fire: no-op
@@ -597,7 +501,7 @@ public struct REMProposalStore: Sendable {
             throw REMProposalStoreError.conflict(id: proposalId, status: current.status)
         }
         if tombstone {
-            try await REMTombstoneStore(dataRoot: dataRoot).record(current.asREMProposal, reason: reason)
+            try await REMTombstoneStore(dataRoot: dataRoot).record(current, reason: reason)
         }
         let row = try await setStatus(proposalId: proposalId, to: "denied")
         try REMConsolidator.emitREMPinsIndex(dataRoot: dataRoot)
@@ -612,18 +516,18 @@ public struct REMProposalStore: Sendable {
         to newStatus: String,
         requireSupportedTarget: Bool = false
     ) async throws -> REMProposalRow {
-        try await lockCore.withFileLock(proposalsURL) {
+        try await SwiftNativePersistenceCore.withFileLock(proposalsURL) {
             // A row already folded into the base is TERMINAL (pending rows are
             // never compacted), so it can only be re-targeted idempotently. Match
             // the in-feed idempotency/conflict semantics without touching the feed.
-            let baseRows = try self.requireReadableBaseRows()
-            if let baseRow = baseRows.first(where: { $0.id == proposalId }) {
+            let read = try self.readStrictly()
+            if let baseRow = read.base.first(where: { $0.id == proposalId }) {
                 if baseRow.status == newStatus { return baseRow }
                 throw REMProposalStoreError.conflict(id: proposalId, status: baseRow.status)
             }
-            var lines = Self.readLines(self.proposalsURL)
-            for i in lines.indices {
-                guard var row = Self.decodeRow(lines[i]), row.id == proposalId else { continue }
+            var lines = read.lines
+            for (i, original) in read.feed.enumerated() where original.id == proposalId {
+                var row = original
                 if row.status == newStatus { return row }
                 if requireSupportedTarget, !Self.supportsProposalTarget(row.targetDoc) {
                     throw REMProposalStoreError.unsupportedTarget(row.targetDoc)
@@ -656,13 +560,11 @@ public struct REMProposalStore: Sendable {
     /// pending) was the unbounded-growth failure mode.
     @discardableResult
     private func compactIfNeededLocked() async throws -> [REMProposalRow] {
-        let feedLines = Self.readLines(proposalsURL)
-        let feedRows = feedLines.compactMap(Self.decodeRow)
-        // A torn or malformed physical row is repair evidence. The snapshot
-        // writer only accepts decoded rows, so leave this feed intact.
-        guard feedRows.count == feedLines.count else { return feedRows }
+        let read = try readStrictly()
+        let feedRows = read.feed
+        let rows = Self.fold(feedRows: feedRows, baseRows: read.base)
         guard feedRows.count >= Self.compactionThreshold,
-              feedRows.count > Self.compactionKeepTail else { return feedRows }
+              feedRows.count > Self.compactionKeepTail else { return rows }
         let keepSuffixIDs = Set(feedRows.suffix(Self.compactionKeepTail).map(\.id))
         var toBase: [REMProposalRow] = []
         var keepInFeed: [REMProposalRow] = []
@@ -674,33 +576,16 @@ public struct REMProposalStore: Sendable {
                 keepInFeed.append(row)
             }
         }
-        guard !toBase.isEmpty else { return feedRows }
-        // FAIL CLOSED on a corrupt base: rewriting it from an "empty" merge
-        // would permanently discard every previously folded terminal row.
-        // Skipping compaction just leaves the feed longer until a human or a
-        // repair pass restores the base (gpt-5.5 fix round, MED).
-        guard let existingBase = readBaseRows() else {
-            nativeLog("REMProposalStore: base unreadable — compaction skipped to avoid overwriting folded terminal rows")
-            return feedRows
-        }
-        // Merge into the existing base, id-keyed, newest (the just-folded row) wins.
-        var byID: [String: REMProposalRow] = [:]
-        var order: [String] = []
-        for r in existingBase where byID[r.id] == nil { order.append(r.id); byID[r.id] = r }
-        for r in toBase {
-            if byID[r.id] == nil { order.append(r.id) }
-            byID[r.id] = r
-        }
-        let mergedBase = order.compactMap { byID[$0] }
+        guard !toBase.isEmpty else { return rows }
+        let mergedBase = Self.fold(feedRows: toBase, baseRows: read.base)
         let base = REMProposalCompactionBase(rows: mergedBase)
         try await SnapshotTailOpLog.commitCompaction(
             baseJSON: base.toJSON(compactedAt: ISO8601DateFormatter().string(from: Date())),
             tailRows: try keepInFeed.map(Self.encodeRowJSON),
             basePath: basePath,
-            opsPath: proposalsURL,
-            persistence: lockCore
+            opsPath: proposalsURL
         )
-        return keepInFeed
+        return Self.fold(feedRows: keepInFeed, baseRows: mergedBase)
     }
 
     // MARK: Line helpers
@@ -721,9 +606,7 @@ public struct REMProposalStore: Sendable {
 
     // MARK: GROWTH.md passage bound
 
-    /// A GROWTH.md passage is ONE SHORT LINE. User, 2026-09-14: REM output and
-    /// every line written into GROWTH.md stay short — they had to be stopped
-    /// writing essays once. 240 Unicode scalars, no newlines.
+    /// A GROWTH.md passage is one line of at most 240 Unicode scalars.
     public static let growthPassageScalarCap = 240
 
     /// The bound in one sentence — the prompt and every refusal say the same
@@ -756,7 +639,7 @@ public struct REMProposalStore: Sendable {
     private static func encodeRow(_ row: REMProposalRow) throws -> String {
         let enc = JSONEncoder()
         enc.outputFormatting = [.sortedKeys]
-        return String(data: try enc.encode(row), encoding: .utf8) ?? "{}"
+        return String(decoding: try enc.encode(row), as: UTF8.self)
     }
 
     /// A row as its JSONValue wire form (for the base snapshot + `commitCompaction`
@@ -768,44 +651,17 @@ public struct REMProposalStore: Sendable {
         return try JSONDecoder().decode(JSONValue.self, from: enc.encode(row))
     }
 
-    private static func appendData(_ data: Data, to url: URL) throws {
-        let fm = FileManager.default
-        let dir = url.deletingLastPathComponent()
-        if !fm.fileExists(atPath: dir.path) {
-            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        }
-        if fm.fileExists(atPath: url.path) {
-            let handle = try FileHandle(forUpdating: url)
-            defer { try? handle.close() }
-            let end = try handle.seekToEnd()
-            if end > 0 {
-                try handle.seek(toOffset: end - 1)
-                let tail = try handle.read(upToCount: 1)
-                try handle.seek(toOffset: end)
-                if tail != Data([0x0A]) {
-                    try handle.write(contentsOf: Data([0x0A]))
-                }
-            }
-            try handle.write(contentsOf: data)
-        } else {
-            try data.write(to: url, options: .atomic)
-        }
-    }
-
     private static func writeLines(_ lines: [Data], to url: URL) throws {
         var body = Data()
         for line in lines {
             body.append(line)
             body.append(0x0A)
         }
-        try body.write(to: url, options: .atomic)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(body, to: url)
     }
 }
 
-/// The compaction snapshot (P-L3). `rows` is the id-keyed set of TERMINAL
-/// proposals folded out of the feed, in first-folded order. ADDITIVE on disk: it
-/// lives in a NEW file beside the feed, so an old feed with no base loads as pure
-/// genesis (`readBaseRows()` → `[]`).
+/// Terminal proposals folded out of the feed, in first-folded order.
 struct REMProposalCompactionBase: Sendable, Equatable {
     let rows: [REMProposalRow]
 

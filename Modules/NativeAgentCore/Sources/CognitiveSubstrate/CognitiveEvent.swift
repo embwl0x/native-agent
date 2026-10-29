@@ -3,7 +3,7 @@ import PersistenceCore
 
 // Blueprint: | `CognitiveEvent.swift` | `CognitiveEvent` and event/turn-kind vocabularies: typed cognition observations, mechanical-row classification and metadata signals |
 
-public enum CognitiveEventKind: String, Sendable, Equatable, CaseIterable {
+public enum CognitiveEventKind: String, Codable, Sendable, Equatable, CaseIterable {
     case userMessageReceived
     case assistantTurnCompleted
     case toolStarted
@@ -47,26 +47,8 @@ public enum CognitiveEventKind: String, Sendable, Equatable, CaseIterable {
     }
 }
 
-/// WHICH TEMPLATED WRITER PRODUCED A ROW.
-///
-/// Agent, item 5, 2026-09-14: only conversational prose she or User actually
-/// said should reach the felt organ. The card lane was marked first, by
-/// provenance, and the same handle now covers every other line the app emits in
-/// her voice. A closed set on purpose — a writer that wants out of lived state
-/// has to NAME ITSELF here, which is a code change somebody reviews, rather
-/// than a phrase somebody matches in a row's text. Two failures this prevents,
-/// both already paid for once:
-///
-///   * TEXT MATCHING DROPS REAL PROSE. Matching the card lane's stock phrases
-///     inside a row killed a genuine reply that happened to contain one
-///     (2026-09-14). Provenance is the only honest signal.
-///   * A BARE BOOLEAN LOSES THE WHY. `cardLaneReply: Bool` could say a row was
-///     mechanical but never which machinery wrote it, so the stamp on disk
-///     could not be audited and the read side had nothing to recognise.
-///
-/// The raw value is what lands in `metadata[CognitiveMechanicalRowKind
-/// .metadataKey]` on both the chat row and the cognitive event, so a row on
-/// disk answers for itself.
+/// Templated writers identify themselves by closed provenance; text matching must never exclude real prose.
+/// Raw values persist under `metadataKey` on both chat rows and cognitive events.
 public enum CognitiveMechanicalRowKind: String, Sendable, Equatable, CaseIterable {
     /// The inline-interaction lane's stock sentence — the consequence copy said
     /// in her voice when a connector is missing or a permission is refused.
@@ -124,24 +106,12 @@ public enum CognitiveMechanicalRowKind: String, Sendable, Equatable, CaseIterabl
     }
 }
 
-public enum CognitiveTurnKind: String, Sendable, Equatable, CaseIterable {
+public enum CognitiveTurnKind: String, Codable, Sendable, Equatable, CaseIterable {
     case live
     case system
     case debug
     case verification
-    /// SHE EMITTED IT; SHE DID NOT MEAN IT.
-    ///
-    /// Card copy, an interaction's decline consequence, the one-sentence
-    /// card-lane reply — text the machinery writes in her voice because a
-    /// connector was missing or a permission was not granted. It is a real turn
-    /// and belongs in the transcript, but it is not an experience she had, and
-    /// an appraisal organ reading it back scores the boilerplate as her mood:
-    /// Agent's felt week, 2026-09-14, carried `connect` (−0.44) and `carry`
-    /// (−0.50) straight off "I'll carry on with whatever else I can reach."
-    ///
-    /// NOT `.debug` OR `.verification`, which would be the cheap way to get the
-    /// same exclusion by calling live product copy diagnostic traffic. This
-    /// says what the turn actually is.
+    /// Templated product copy belongs in the transcript but never counts as a lived experience or diagnostic traffic.
     case mechanical
 
     /// Whether this event is part of Agent's lived state rather than
@@ -164,82 +134,9 @@ public enum CognitiveTurnKind: String, Sendable, Equatable, CaseIterable {
         return CognitiveTurnKind(rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
     }
 
-    public static func inferred(fromSignals signals: [String]) -> CognitiveTurnKind {
-        let haystack = signals
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-        guard !haystack.isEmpty else { return .live }
-
-        let verificationMarkers = [
-            "ctx-snapshot-verify",
-            "snapshot-verify",
-            "snapshot verify",
-            "bridge-passthrough",
-            "bridge passthrough",
-            "passthrough ping",
-            "subconscious-switch",
-            "subconscious switch",
-            "verification ping",
-            "codex bridge test",
-            "codex_message bridge test",
-        ]
-        if verificationMarkers.contains(where: { haystack.contains($0) }) {
-            return .verification
-        }
-
-        let debugMarkers = [
-            "codex-health",
-            "debug-filter probe",
-            "snapshot clean, codex",
-            "inner-state capsule reads clean",
-            "capsule is my private inner read",
-            "not a log of what the app or tools did",
-            "nothing leaking into the durable log",
-            "final inspector check",
-            "inspector check after",
-            "subconscious-innerstate",
-            "bridge message landed clean",
-            "bridge message came through clean",
-            "bridge passthrough holding steady",
-            "bridge passthrough solid",
-            "passes bridge messages through",
-        ]
-        if debugMarkers.contains(where: { haystack.contains($0) }) {
-            return .debug
-        }
-
-        // H3 (Step 1 APPRAISAL, 2026-08-02) — there is deliberately NO system
-        // marker list here any more. `.system` is a statement about PROVENANCE
-        // (who originated the turn), and provenance is never recoverable from
-        // the words in the turn. The old list substring-matched bare nouns —
-        // "observatory", "reflection", "scheduler", "doctor", "background
-        // loop" — against a haystack that includes the USER'S OWN MESSAGE, so
-        // "remind me about the doctor" classified User's turn `.system` — and a
-        // `.system` node is excluded from mood (+Mood), the capsule
-        // (+Capsule) and attention (+AttentionSignals), and lands in the
-        // workspace at HALF weight under a system-item cap (+Workspace).
-        // (It is NOT excluded from affect: `.system.contributesToLivedState`
-        // is true, so felt chemistry still moves — downweighted, not deleted.
-        // Corrected 2026-08-02, gpt-5.5 review B2: this comment used to claim
-        // a blanket affect/workspace exclusion that the code never had.)
-        // Ordinary prose was being demoted out of her felt life by topic word.
-        //
-        // Provenance now comes from exactly two honest channels, both below in
-        // `CognitiveEvent.init`:
-        //   1. the originator states it (`turnKind:` argument or `turnKind`
-        //      metadata) — a background loop, motor lane, or scheduler that
-        //      mints a turn says so, the way `NativeCognitiveEventFactory
-        //      .motorAction` already passes `turnKind: .system`; and
-        //   2. failing that, the EVENT KIND, which is itself provenance —
-        //      tool/provider/lifecycle/felt-resolution events are machine-
-        //      originated, chat turns are person-originated.
-        // Debug and verification markers describe the operation, never its sender.
-        return .live
-    }
 }
 
-public struct CognitiveEvent: Sendable, Equatable {
+public struct CognitiveEvent: Codable, Sendable, Equatable {
     public var id: String
     public var kind: CognitiveEventKind
     public var subject: CognitiveSubjectReference
@@ -262,24 +159,12 @@ public struct CognitiveEvent: Sendable, Equatable {
         metadata: [String: JSONValue] = [:]
     ) {
         let safeID = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        let inferredTurnKind = CognitiveTurnKind.inferred(fromSignals: [
-            safeID,
-            kind.rawValue,
-            subject.type,
-            subject.id,
-            subject.label ?? "",
-            summary,
-        ] + Self.metadataSignals(metadata))
         let defaultTurnKind: CognitiveTurnKind
-        if inferredTurnKind != .live {
-            defaultTurnKind = inferredTurnKind
-        } else {
-            switch kind {
-            case .toolStarted, .toolSucceeded, .toolFailed, .toolCancelled, .providerFailure, .providerVitalsShift, .workshopExecutionCompleted, .appWake, .appSleep, .organismResolutionFelt:
-                defaultTurnKind = .system
-            case .userMessageReceived, .assistantTurnCompleted, .userCorrection:
-                defaultTurnKind = .live
-            }
+        switch kind {
+        case .toolStarted, .toolSucceeded, .toolFailed, .toolCancelled, .providerFailure, .providerVitalsShift, .workshopExecutionCompleted, .appWake, .appSleep, .organismResolutionFelt:
+            defaultTurnKind = .system
+        case .userMessageReceived, .assistantTurnCompleted, .userCorrection:
+            defaultTurnKind = .live
         }
         let resolvedTurnKind = turnKind
             ?? CognitiveTurnKind.from(metadataValue: metadata[CognitiveTurnKind.metadataKey])
@@ -307,7 +192,7 @@ public struct CognitiveEvent: Sendable, Equatable {
         return [
             kind.rawValue,
             subject.stableKey,
-            String(Int64(occurredAt.timeIntervalSince1970 * 1000)),
+            String(format: "%.0f", (occurredAt.timeIntervalSince1970 * 1000).rounded(.towardZero) + 0),
             summary,
         ].joined(separator: "|")
     }
@@ -347,10 +232,6 @@ public struct CognitiveEvent: Sendable, Equatable {
     var isPositiveTerminalOutcome: Bool { terminalOutcomePolarity > 0 }
     var isNegativeTerminalOutcome: Bool { terminalOutcomePolarity < 0 }
 
-    private static func metadataSignals(_ metadata: [String: JSONValue]) -> [String] {
-        metadata.keys.sorted().flatMap { key -> [String] in
-            [key] + CognitiveMetadataSignals.stringSignals(from: metadata[key] ?? .null)
-        }
-    }
+
 
 }

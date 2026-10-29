@@ -131,11 +131,7 @@ private struct MobileSchedulerJobDetail: View {
 private func schedulerDate(_ value: String?, macTimeZone: String?) -> String {
     guard let value, !value.isEmpty else { return "Not available" }
     guard let macTimeZone, let timeZone = TimeZone(identifier: macTimeZone) else { return value }
-    let formatter = ISO8601DateFormatter()
-    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    let fractional = formatter.date(from: value)
-    formatter.formatOptions = [.withInternetDateTime]
-    guard let date = fractional ?? formatter.date(from: value) else { return value }
+    guard let date = NativeTimestampFormat.parseISO8601FractionalFirst(value) else { return value }
     return date.formatted(Date.FormatStyle(date: .abbreviated, time: .shortened, timeZone: timeZone))
 }
 

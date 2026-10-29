@@ -1,10 +1,8 @@
-// PATCH-2026-05-19: ui-pull-together SettingsViewFull — app/device settings.
-// Personality, Trust and Connectors are first-class More links.
-// 2026-10-07: the one Settings door — Telegram, Providers and every setting
-// the Mac sends (`MobileAppSettingsSections`) live here, not as More rows.
+// Settings owns Telegram, Providers and Mac settings; More links to Personality, Trust and Connectors.
 import SwiftUI
 import Combine
 import NativeAgentShared
+// Blueprint: | `SettingsViewFull.swift` | Device settings, shared SettingsStore refresh/loading and snapshot availability presentation |
 
 enum SettingsMacHealthPresentation {
     static func uptimeText(_ seconds: Double) -> String {
@@ -28,8 +26,6 @@ enum SettingsLegalLinksPresentation {
         "\(label) link is unavailable in this build."
     }
 }
-
-// MARK: - Settings View
 
 struct SettingsViewFull: View {
     var opensConnection = false
@@ -195,7 +191,7 @@ struct SettingsViewFull: View {
             // toast host. Re-host the shared queue here so pairing-time
             // delivery and sync feedback remains visible.
             .safeAreaInset(edge: .bottom) {
-                iOSSystemToastBar(center: iOSSystemToastCenter.shared)
+                iOSSystemToastBar(center: SystemToastCenter.shared)
             }
         }
     }
@@ -236,17 +232,12 @@ struct SettingsViewFull: View {
             if !pairingStore.isICloudSigned {
                 AliveNote("This iPhone has no pairing key for the Mac. Setup checks iCloud and connects both devices using the same Apple Account.")
                 AliveTapRow(title: "Set up Mac connection") { showRePairSheet = true }
-            } else if bridgeClient.bridgeStatus == .offline || bridgeClient.bridgeStatus == .deviceOffline {
-                AliveNote(bridgeClient.bridgeStatus == .deviceOffline
-                         ? "This iPhone has no network connection. Reconnect to Wi-Fi or cellular data, then return here."
-                         : "The iCloud connection is unavailable. Check the Apple Account and iCloud Drive settings on this iPhone.")
+            } else if bridgeClient.connection.transport.state == .broken {
+                AliveNote(bridgeClient.connection.transport.lever ?? bridgeClient.connection.transport.line)
                 AliveTapRow(title: "Connection setup help") { showRePairSheet = true }
             } else {
                 AliveTapRow(title: isForceRefreshing ? "Checking for Mac updates…" : "Check for Mac updates") {
-                    // KVS synchronization runs under PairingStore's timeout, so
-                    // this never blocks the MainActor. Reload the settings
-                    // snapshots afterward: the control promises an iCloud
-                    // refresh, not merely a secret-rotation check.
+                    // Refresh both pairing material and settings snapshots without blocking MainActor.
                     Task {
                         guard !isForceRefreshing else { return }
                         isForceRefreshing = true
@@ -339,8 +330,6 @@ enum SettingsICloudRefreshPresentation {
     }
 }
 
-// MARK: - Store
-
 @MainActor
 final class SettingsStore: ObservableObject {
     let sync: iCloudSyncEngine
@@ -374,8 +363,6 @@ final class SettingsStore: ObservableObject {
     }
 }
 
-// MARK: - Personality detail (read-only; edits via inbox)
-
 enum SettingsSnapshotContentPresentation: Equatable {
     case loading, unavailable, empty, content, stale
 
@@ -390,343 +377,5 @@ enum SettingsSnapshotContentPresentation: Equatable {
         }
         if isLoading || !hasCompletedRefresh { return .loading }
         return fieldAvailable ? .empty : .unavailable
-    }
-}
-
-enum PersonalitySnapshotPresentation {
-    static func state(
-        lastSyncedAt: Date?,
-        now: Date = Date()
-    ) -> StatusConnectionPresentation.SyncState {
-        StatusConnectionPresentation.syncState(lastSyncedAt: lastSyncedAt, now: now)
-    }
-
-    static func value(for state: StatusConnectionPresentation.SyncState) -> String {
-        StatusConnectionPresentation.cardValue(for: state)
-    }
-
-    static func detail(for state: StatusConnectionPresentation.SyncState) -> String? {
-        switch state {
-        case .current:
-            return nil
-        case .stale:
-            return "Traits may be out of date until a newer Mac personality snapshot arrives."
-        case .neverSynced:
-            return "Personality snapshot freshness is unknown; these traits may be out of date."
-        case .clockMismatch:
-            return "Personality snapshot time cannot be compared with this phone; these traits may be out of date."
-        }
-    }
-
-    static func needsAttention(_ state: StatusConnectionPresentation.SyncState) -> Bool {
-        StatusConnectionPresentation.needsAttention(state)
-    }
-}
-
-struct PersonalityDetailView: View {
-    @ObservedObject var store: SettingsStore
-
-    var body: some View {
-        AlivePage(title: "Personality", line: "How I think and sound.") {
-            if let p = store.sync.personality {
-                let snapshotState = PersonalitySnapshotPresentation.state(
-                    lastSyncedAt: store.sync.transportDeliveryAt(screenGroup: "personality")
-                )
-                AliveSection("Identity") {
-                    if store.hasCompletedRefresh, !store.availableFields.contains(.personality) {
-                        AliveNote("Personality could not be refreshed. Showing the last known profile.")
-                        AliveDivider()
-                    }
-                    AliveValueRow(label: "Name", value: p.name)
-                    AliveDivider()
-                    AliveValueRow(label: "Kind", value: p.personaKind)
-                    AliveDivider()
-                    AliveValueRow(label: "Snapshot", value: PersonalitySnapshotPresentation.value(for: snapshotState),
-                                 emphasized: PersonalitySnapshotPresentation.needsAttention(snapshotState))
-                    if let detail = PersonalitySnapshotPresentation.detail(for: snapshotState) {
-                        AliveNote(detail)
-                    }
-                }
-                AliveSection("Essence") {
-                    MorePassage(text: p.essence)
-                }
-                AliveSection("Voice") {
-                    MorePassage(text: p.voice)
-                }
-                // Answer "can I change these?" where the question arises —
-                // not in a detached section below.
-                AliveSection("Traits", footer: "Mirrored from the Mac. Edit in the Mac app's Personality view.") {
-                    let traits: [(String, Double)] = [
-                        ("Warmth", p.traits.warmth), ("Directness", p.traits.directness),
-                        ("Humor", p.traits.humor), ("Proactivity", p.traits.proactivity),
-                        ("Rigor", p.traits.rigor), ("Autonomy", p.traits.autonomy),
-                        ("Creativity", p.traits.creativity), ("Brevity", p.traits.brevity),
-                    ]
-                    VStack(spacing: 14) {
-                        ForEach(traits, id: \.0) { trait in
-                            TraitRow(label: trait.0, value: trait.1)
-                        }
-                    }
-                    .aliveRow()
-                }
-            } else if store.isLoading || !store.hasCompletedRefresh {
-                ProgressView("Loading Personality…")
-                    .tint(AlivePalette.secondary)
-                    .foregroundStyle(AlivePalette.secondary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.top, 40)
-            } else {
-                AliveCalmState(
-                    title: "Not here yet",
-                    line: "My personality comes over from the Mac. Keep the Mac app open and try again.",
-                    actionTitle: "Try again",
-                    action: { Task { await store.refresh() } }
-                )
-            }
-        }
-        .refreshable { await store.refresh() }
-    }
-}
-
-/// A paragraph inside a card, at reading size.
-private struct MorePassage: View {
-    let text: String
-
-    var body: some View {
-        Text(text)
-            .font(.body)
-            .lineSpacing(3)
-            .foregroundStyle(AlivePalette.text)
-            .fixedSize(horizontal: false, vertical: true)
-            .aliveRow()
-    }
-}
-
-struct TraitValuePresentation: Equatable {
-    let normalizedValue: Double
-    let wasClamped: Bool
-    let percentageText: String
-    let warningText: String?
-
-    static func project(_ rawValue: Double) -> TraitValuePresentation {
-        guard rawValue.isFinite else {
-            return .init(
-                normalizedValue: 0,
-                wasClamped: true,
-                percentageText: "0%",
-                warningText: "The Mac reported an invalid trait value; displaying 0%."
-            )
-        }
-
-        let normalizedValue = min(max(rawValue, 0), 1)
-        guard normalizedValue == rawValue else {
-            return .init(
-                normalizedValue: normalizedValue,
-                wasClamped: true,
-                percentageText: String(format: "%.0f%%", normalizedValue * 100),
-                warningText: "The Mac reported a trait value outside 0–100%; displaying a clamped value."
-            )
-        }
-
-        return .init(
-            normalizedValue: normalizedValue,
-            wasClamped: false,
-            percentageText: String(format: "%.0f%%", normalizedValue * 100),
-            warningText: nil
-        )
-    }
-}
-
-struct TraitRow: View {
-    let label: String
-    let value: Double
-
-    var body: some View {
-        let projection = TraitValuePresentation.project(value)
-        MobileAdaptiveRow(spacing: 12) {
-            Text(label)
-                .foregroundStyle(AlivePalette.text)
-                .frame(minWidth: 96, alignment: .leading)
-                .fixedSize(horizontal: false, vertical: true)
-            // One ink for every trait: the value is information, the color
-            // is not. Traffic-light tints made low traits (a personality
-            // fact) read as warnings (a health problem).
-            Capsule()
-                .fill(AlivePalette.divider)
-                .frame(height: 4)
-                .overlay(alignment: .leading) {
-                    GeometryReader { geo in
-                        Capsule()
-                            .fill(AlivePalette.secondary)
-                            .frame(width: geo.size.width * projection.normalizedValue)
-                    }
-                }
-            Text(projection.wasClamped ? "\(projection.percentageText) clamped" : projection.percentageText)
-                .font(.subheadline.monospacedDigit())
-                .foregroundStyle(AlivePalette.secondary)
-                .frame(minWidth: 40, alignment: .trailing)
-                .fixedSize(horizontal: true, vertical: true)
-        }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(
-            "\(label): \(projection.percentageText)"
-                + (projection.warningText.map { " — \($0)" } ?? "")
-        )
-    }
-}
-
-// MARK: - Trust policy
-
-/// A policy snapshot can predate a field. Keep absent text values visibly
-/// unknown instead of making a missing default look like an intentional one.
-enum TrustPolicySummaryPresentation {
-    static let unknownValue = "Not reported by the Mac"
-}
-
-struct TrustPolicyView: View {
-    @ObservedObject var store: SettingsStore
-
-    var body: some View {
-        AlivePage(title: "Trust", line: "What I may do on my own.") {
-            if let policy = store.sync.trustPolicy {
-                MobileTrustEditor(policy: policy)
-            } else {
-                AliveCalmState(
-                    title: "Not here yet",
-                    line: "My trust policy comes over from the Mac and appears after the next iCloud sync."
-                )
-            }
-        }
-        .refreshable { await store.refresh() }
-    }
-
-}
-
-// MARK: - Connectors
-
-enum ConnectorHealthPresentation: Equatable {
-    case disabled
-    case healthy(String)
-    case needsAttention(String)
-    case reportedStatus(String)
-    case unknown
-
-    static func resolve(
-        enabled: Bool?,
-        status: String? = nil,
-        healthStatus: String?
-    ) -> ConnectorHealthPresentation {
-        if enabled == false { return .disabled }
-
-        if let health = normalized(healthStatus) {
-            switch health.lowercased() {
-            case "ok", "healthy", "ready", "connected", "active":
-                return .healthy(health)
-            default:
-                return .needsAttention(health)
-            }
-        }
-
-        // A connector's published status is useful context, but without a
-        // health result it is not proof that the live integration works.
-        if let status = normalized(status) { return .reportedStatus(status) }
-        return .unknown
-    }
-
-    private static func normalized(_ value: String?) -> String? {
-        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !value.isEmpty else {
-            return nil
-        }
-        return value
-    }
-
-    var displayText: String {
-        switch self {
-        case .disabled:
-            return "Off"
-        case .healthy(let health), .needsAttention(let health):
-            return Self.word(health)
-        case .reportedStatus(let status):
-            return "Status: \(Self.word(status))"
-        case .unknown:
-            return "Health unknown"
-        }
-    }
-
-    /// The Mac's words for the same states (Connectors on the Mac).
-    static func word(_ raw: String) -> String {
-        switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "needs_auth", "auth_required", "needs_sign_in": return "Needs sign-in"
-        case "connected", "live", "ok", "healthy", "active": return "Connected"
-        case "ready": return "Ready"
-        case "connecting", "starting": return "Connecting"
-        case "disconnected", "offline": return "Disconnected"
-        case "disabled": return "Off"
-        case "failed", "error", "unavailable": return "Unavailable"
-        case "unverified": return "Not checked"
-        case let other: return AliveWords.humanized(other)
-        }
-    }
-
-    var tint: Color {
-        switch self {
-        case .healthy:
-            return .green
-        case .disabled, .reportedStatus:
-            return .secondary
-        case .needsAttention, .unknown:
-            return .orange
-        }
-    }
-}
-
-struct ConnectorsView: View {
-    @ObservedObject var store: SettingsStore
-
-    private var presentation: SettingsSnapshotContentPresentation {
-        .state(
-            hasContent: !store.sync.connectors.isEmpty,
-            fieldAvailable: store.availableFields.contains(.connectors),
-            isLoading: store.isLoading,
-            hasCompletedRefresh: store.hasCompletedRefresh
-        )
-    }
-
-    var body: some View {
-        AlivePage(title: "Connectors", line: "The services I can reach.") {
-            switch presentation {
-            case .loading:
-                ProgressView("Loading connectors…")
-                    .tint(AlivePalette.secondary)
-                    .foregroundStyle(AlivePalette.secondary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.top, 40)
-            case .unavailable:
-                AliveCalmState(
-                    title: "Not here yet",
-                    line: "My connectors come over from the Mac. Keep the Mac app open and try again.",
-                    actionTitle: "Try again",
-                    action: { Task { await store.refresh() } }
-                )
-            case .empty:
-                AliveCalmState(
-                    title: "No connectors yet",
-                    line: "Connect services in the Mac app's Connectors view and they show up here."
-                )
-            case .content, .stale:
-                AliveSection(nil) {
-                    if presentation == .stale {
-                        AliveNote("Connectors could not be refreshed. Showing the last known rows.")
-                        AliveDivider()
-                    }
-                    ForEach(Array(store.sync.connectors.enumerated()), id: \.element.id) { index, connector in
-                        if index > 0 { AliveDivider() }
-                        MobileConnectorRow(connector: connector)
-                    }
-                }
-            }
-        }
-        .refreshable { await store.refresh() }
     }
 }

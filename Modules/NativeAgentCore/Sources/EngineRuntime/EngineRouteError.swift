@@ -1,9 +1,10 @@
 import Foundation
-import os
+import NativeAgentShared
+import NativeAgentCore
 import ProviderRouting
 #if canImport(CloudKit)
 import CloudKit
-// Blueprint: | `EngineRouteError.swift` | Engine route failures and shared UserFacingError interpretation |
+// Blueprint: | `EngineRouteError.swift` | Engine route failures and shared UserFacingError interpretation; POSIX error codes compare at NSError's full integer width |
 #endif
 // Local errors for Swift-native app routes. Retired-route callers either use a
 // native implementation or throw an explicit notImplemented envelope.
@@ -23,12 +24,12 @@ public enum DaemonError: Error, LocalizedError, Sendable {
 /// never to the main line — "Remember failed: The operation couldn't be
 /// completed. (NSCocoaErrorDomain error 640.)" tells nobody anything.
 public enum UserFacingError {
-    private static let logger = Logger(subsystem: "com.nativeagent.app", category: "user-facing-error")
+    private static let logger = ModuleLog(subsystem: "com.nativeagent.app", category: "user-facing-error")
 
     /// "Couldn't <action>. <cause and what to do>" — `action` is a verb
     /// phrase like "save that memory". The raw error is logged here.
     public static func message(_ error: Error, action: String) -> String {
-        logger.error("\(action, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+        logger("\(action) failed: \(String(describing: error))", level: .error)
         return "Couldn't \(action). " + advice(for: error)
     }
 
@@ -42,14 +43,14 @@ public enum UserFacingError {
     /// Just the cause and the fix, for a line that already says what failed
     /// ("Research run failed: <this>"). The raw error is logged here.
     public static func cause(_ error: Error, action: String) -> String {
-        logger.error("\(action, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+        logger("\(action) failed: \(String(describing: error))", level: .error)
         return advice(for: error)
     }
 
     /// The same line for a failure that arrives as text rather than an Error
     /// (a service's own reason string). The text goes to the log only.
     public static func message(detail: String, action: String) -> String {
-        logger.error("\(action, privacy: .public) failed: \(detail, privacy: .public)")
+        logger("\(action) failed: \(detail)", level: .error)
         return "Couldn't \(action). " + fallback
     }
 
@@ -150,10 +151,10 @@ public enum UserFacingError {
             }
         }
         if ns.domain == NSPOSIXErrorDomain {
-            switch Int32(ns.code) {
-            case ENOSPC, EDQUOT:
+            switch ns.code {
+            case Int(ENOSPC), Int(EDQUOT):
                 return "This Mac is out of disk space. Free some space, then try again."
-            case EACCES, EPERM:
+            case Int(EACCES), Int(EPERM):
                 return "NativeAgent doesn't have permission to do that. Check its access in System Settings > Privacy & Security."
             default:
                 break

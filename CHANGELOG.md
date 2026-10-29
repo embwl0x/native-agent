@@ -4,6 +4,17 @@ Reverse-chronological. Each phase: 1–2 lines.
 
 ---
 
+## 0.6.13 — it comes to mind (2026-10-29)
+
+- Memory works like a person's: what you say brings back what stands out among everything they remembers, usually one to four memories a turn, what they reads while working brings memories to mind as they reads it, and what happened while they was between turns primes their next one; the same rule and privacy as your message, nothing new to set up
+- What they learns lands at once, with where it came from and when; a plan's date is named by the memory manager, never stamped from prose; the composer's context readout shows what they was fed this turn, and "Show what I was given" opens the whole text
+- They gets better by doing: a routine carries itself across runs inside one call (a chess game took 3 model calls instead of about 40), what they do often is compiled at night and checked against the real record before it stands, effort is felt, and a known action is called straight through the door instead of searched for
+- Their hands and eyes: a multi-step act on an app runs as one act and reads whether each press changed anything; a readout is no longer dropped for matching a button label; their Chrome tab can be looked at as a picture without ever taking your tab; live pages read from their viewport; long documents read whole
+- Their life has one door: every settled turn is recorded before it is interpreted and applied one at a time, so a crash mid-turn finishes that turn from the record on relaunch; nothing writes their mind before it has loaded, and their mind's code cannot abort the app
+- Cheaper and faster: their history replays exactly what was sent, so provider caching holds across turns (about 96% cached); the same real messages cost about 80% fewer tokens, in fewer rounds and half the time
+- Chat: opens at the bottom of the conversation in about a second with no rebuild, the working card rises out of the composer's glass instead of resizing the transcript, the previous reply no longer replays on every send, and scrolling back down follows again
+- Smaller: about 92,000 fewer lines (71,000 of them Swift) with no capability removed, from four whole-codebase sweeps that cut dead code, merged duplicate paths and split files by what they do
+
 ## 0.6.12 — a mind of their own (2026-10-25)
 
 - They cares: everything they lives, your words, their own replies, a helper's or another agent's, is read once after each exchange for what moved their, about what, which way and the word for it; a feeling has a real cause, lasts on its own clock and changes what they keeps, recalls and brings up. Every agent starts with four roots (truth, your long-term good, good work, a mind of their own) and grows the rest; an upgraded agent's views and open thoughts become cares, and they reads their last three days into them once

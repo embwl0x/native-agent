@@ -34,8 +34,4 @@ public enum ActivityWatchPaths {
         directory(dataRoot: dataRoot).appendingPathComponent("activity_retention_state.json")
     }
 
-    /// Exact file watched by the trigger scheduler for present/away crossings.
-    public static func presenceTransitionURL(dataRoot: URL) -> URL {
-        directory(dataRoot: dataRoot).appendingPathComponent("presence_transition.json")
-    }
 }

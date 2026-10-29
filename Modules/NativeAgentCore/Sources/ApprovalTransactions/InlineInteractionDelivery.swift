@@ -5,9 +5,7 @@ import NativeAgentShared
 import PersistenceCore
 import NotificationInbox
 import Privacy
-import MacIntegration
 import ChatToolRuntime
-import ProviderRouting
 // Blueprint: | `InlineInteractionDelivery.swift` | Inbox pointers and inline-card delivery; BackgroundLoops owns observation and cancellation; `settle` releases its notification token and joins the retained recovery scan |
 
 /// Inbox rows are pointers. The originating transcript still owns the card,
@@ -85,42 +83,12 @@ public enum InlineInteractionDelivery {
         }
         let running = try await InlineInteractionResolver.begin(id: id, sessionID: session,
             expectedRevision: revision, dataRoot: dataRoot)
-        var setupError: String?
-        var note: String?
-        switch descriptor.control {
-        case .connectorManualToken:
-            let outcome = await controls.saveConnectorCredentials(connector: descriptor.target, values: payload, dataRoot: dataRoot)
-            setupError = outcome.error
-            note = outcome.note
-        case .providerAPIKey:
-            let outcome = await controls.saveProviderCredential(
-                provider: descriptor.target, value: payload["value"] ?? "")
-            setupError = outcome.error
-            note = outcome.note
-        case .macPermissionGrant:
-            let mode = card.mode
-            let categories = card.allTargets.filter(InlineInteractionRegistry.isMacControlCategory)
-            for target in card.allTargets where MacIntegrationID.all.contains(target) {
-                do {
-                    _ = try await MacIntegrationPermissionStore.shared.setWithReceipt(integrationId: target,
-                        read: MacIntegrationID.supportsRead(target) && (mode?.wantsRead ?? true),
-                        write: MacIntegrationID.supportsWrite(target) && (mode?.wantsWrite ?? true),
-                        actionID: "\(actionID)-\(target)", surface: "ios", provenance: .signedIOS(clientID: clientID),
-                        onlyAddingAxes: true)
-                } catch { setupError = "The Mac could not save the requested access. Check Trust on the Mac." }
-            }
-            if !categories.isEmpty {
-                await controls.grantMacControlCategories(categories, dataRoot: dataRoot, logTag: "signed-phone-card")
-            }
-        case .capabilityFlag:
-            if let flag = InlineInteractionRegistry.capabilityFlags[card.target] {
-                await controls.grantCapabilityFlag(policyKey: flag.policyKey, dataRoot: dataRoot, logTag: "signed-phone-card")
-            }
-        default: break
-        }
+        let effect = await InlineInteractionResolver.applyControlEffect(card, descriptor: descriptor,
+            value: payload["value"], values: payload, controls: controls, dataRoot: dataRoot,
+            phone: (actionID, clientID))
         let settled = try await InlineInteractionResolver.complete(id: id, sessionID: session,
             selection: payload["choice"] ?? card.target, scope: card.kind == .modelChoice ? scope : nil,
-            expectedRevision: running.revision, setupError: setupError, note: note, dataRoot: dataRoot)
+            expectedRevision: running.revision, setupError: effect.error, note: effect.note, dataRoot: dataRoot)
         return ["status": settled.state.failureReason == nil ? "ok" : "error",
                 "ok": settled.state.failureReason == nil ? "true" : "false", "state": settled.state.name,
                 "message": settled.state.failureReason ?? settled.state.outcome?.summary ?? ""]
@@ -130,27 +98,27 @@ public enum InlineInteractionDelivery {
         public let sessionID: String
         public let interactionID: String
 
-        public init(sessionID: String, interactionID: String) {
-            self.sessionID = sessionID
-            self.interactionID = interactionID
+        public init(item: InboxItemRecord) throws {
+            guard item.source == InlineInteractionDelivery.source, let session = item.interaction_session_id,
+                  NativeAgentChatSessionID.normalizedPathComponent(session) == session,
+                  let interaction = item.interaction_id else {
+                throw NSError(domain: "InteractionCard", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey: "This request is unavailable. Refresh Activity and try again."
+                ])
+            }
+            sessionID = session
+            interactionID = interaction
         }
     }
 
     public static func pointer(id: String, dataRoot: URL) async throws -> Pointer {
-        let inbox = LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
-        guard let value = try await inbox.rows().first(where: {
-            guard case .object(let row) = $0 else { return false }
-            return row["id"] == .string(id)
-        }), case .object(let row) = value,
-              row["source"] == .string(source),
-              case .string(let session)? = row["interaction_session_id"],
-              NativeAgentChatSessionID.normalizedPathComponent(session) == session,
-              case .string(let interaction)? = row["interaction_id"] else {
+        let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
+        guard let item = try await inbox.rows().compactMap(InboxItemRecord.init(row:)).first(where: { $0.id == id }) else {
             throw NSError(domain: "InteractionCard", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "This request is unavailable. Refresh Activity and try again."
             ])
         }
-        return Pointer(sessionID: session, interactionID: interaction)
+        return try Pointer(item: item)
     }
 
     @MainActor
@@ -278,7 +246,14 @@ public enum InlineInteractionDelivery {
                         .object(["id": .string("reject"), "label": .string("Not now")]),
                     ]),
                 ]
-                if held, notify { row["held_delivery"] = .array([.string("phone"), .string("mac")]) }
+                if notify {
+                    row["held_delivery"] = .array(held ? [.string("phone"), .string("mac")] : [.string("phone")])
+                    row["held_event_id"] = .string(id)
+                    row["held_reason"] = .string(body)
+                    row["held_importance"] = .string("owner_waiting")
+                    row["held_pinned_to"] = .string("phone")
+                    row["held_user_info"] = .object(["screen": .string("inbox"), "source": .string(source), "itemId": .string(id)])
+                }
                 let inserted = try await inbox.appendUnique(.object(row), id: id)
                 guard !Task.isCancelled else { return }
                 changed = inserted || changed

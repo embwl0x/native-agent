@@ -1,6 +1,5 @@
-// Move-only extraction (tightness Wave C) from NativeCognitionRuntime.swift
-
 import Foundation
+import NativeAgentShared
 import MemoryV2
 import ApprovalInbox
 import AuthoredCapabilities
@@ -14,7 +13,7 @@ import PersistenceCore
 import ProviderRouting
 import TurnTrace
 
-// Blueprint: | `NativeCognitionRuntime+Organism.swift` | `NativeCognitionRuntime` organism integration: approval lifecycle expectations, somatic ingestion, felt resolutions and live body projections |
+// Blueprint: | `NativeCognitionRuntime+Organism.swift` | `NativeCognitionRuntime` live organism integration: approval lifecycle expectations, somatic ingestion, felt resolutions and live body projections |
 
 extension NativeCognitionRuntime {
     func startApprovalLifecycleObservationIfNeeded() async {
@@ -42,19 +41,17 @@ extension NativeCognitionRuntime {
 
     /// An approved life card: the care becomes part of who she is, and the
     /// approval says so. Called live on the resolution and again by the night
-    /// for one the live path missed; a care already at life depth is a no-op.
+    /// for one the live path missed; an already-life retry saves before acknowledging.
     public func applyCareLifeApproval(_ record: ApprovalRecord) async {
         guard record.decision == "approved", let id = Self.careLifeCardCareID(record) else { return }
-        let applied = await substrateForIntegration().deepenCareToLife(id, source: "approval:\(record.id)")
+        guard await substrateForIntegration().deepenCareToLife(id, source: "approval:\(record.id)") else { return }
         do {
             try await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
                 record.id, executedAction: .object(["op": .string("care_life"), "careId": .string(id.uuidString),
-                                                    "applied": .bool(applied)]),
-                detail: applied ? "It is part of who I am now (life depth)."
-                    : "That care is no longer in my mind (cleared or off), so nothing changed.")
+                                                    "applied": .bool(true)]),
+                detail: "It is part of who I am now (life depth).")
         } catch {
-            nativeLog("[cares] life card %@ applied=%@ but not annotated: %@", record.id,
-                      applied ? "true" : "false", error.localizedDescription)
+            nativeLog("[cares] life card %@ saved but not annotated: %@", record.id, error.localizedDescription)
         }
     }
 
@@ -127,22 +124,19 @@ extension NativeCognitionRuntime {
 
     private nonisolated static func approvalLifecycleDate(_ raw: String?) -> Date? {
         guard let raw, !raw.isEmpty else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: raw) { return date }
-        return ISO8601DateFormatter().date(from: raw)
+        return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
     }
 
     private nonisolated static func approvalLifecycleSource(for record: ApprovalRecord) -> String {
         "approval.\(record.action.isEmpty ? "unknown" : record.action)"
     }
 
-    /// Round 3 Wave A2: notable resolutions the body just felt (relief /
+    /// Notable resolutions the body just felt (relief /
     /// earned disappointment) become substrate nodes with real aboutness.
     /// Straight into ingestResident — never back through the somatic bus, so
     /// the body can't loop into itself. Rate-bounded at the source; called
     /// from BOTH kernel-feed paths (bus-driven observe + direct injection).
-    func drainFeltResolutionsIntoSubstrate() async {  // internal for actor extensions (move-only Wave C)
+    func drainFeltResolutionsIntoSubstrate() async {
         for felt in await organismKernel.drainResolutionFelt() {
             let isRelief = felt.kind == .relief
             var metadata: [String: JSONValue] = [
@@ -163,11 +157,7 @@ extension NativeCognitionRuntime {
                 kind: .organismResolutionFelt,
                 subject: CognitiveSubjectReference(
                     type: "organism_path",
-                    // Distinct id per felt moment: subject-keyed nodes would
-                    // otherwise COLLAPSE repeated feelings about one path into
-                    // a single re-activated node (the audit-C2 class), and the
-                    // A3 pattern read counts moments. The path grouping rides
-                    // the label.
+                    // Distinct IDs retain each felt moment; the label groups its path.
                     id: "\(felt.sourceOrgan)#\(UUID().uuidString.prefix(8))",
                     label: felt.pathKind.rawValue
                 ),
@@ -179,7 +169,7 @@ extension NativeCognitionRuntime {
                 importance: 0.65,
                 metadata: metadata
             )
-            if await substrate.ingestResident(feltEvent) {
+            if await substrate.ingestResident(feltEvent).accepted {
                 scheduleDirtyMicrocycle(
                     reason: "felt_resolution:\(felt.kind.rawValue)"
                 )
@@ -216,7 +206,7 @@ extension NativeCognitionRuntime {
 
     /// Ingest a PRE-BUILT somatic signal — the seam the INTEROCEPTION vitals path
     /// uses so a `.providerVitalsShift` CognitiveEvent can be mapped by
-    /// `CognitiveSomaticSignalAdapter` (the design's required path) and the
+    /// `CognitiveSomaticSignals` (the design's required path) and the
     /// resulting graded signal ride the exact same organism tail as every other
     /// body signal.
     func ingestPreparedOrganismSignal(
@@ -232,70 +222,13 @@ extension NativeCognitionRuntime {
         )
     }
 
-    /// ONE CARING MOMENT INTO THE BODY (2026-09-11, fourth pass). The appraisal
-    /// owner's verdict arrives here the moment its model call returns, instead of
-    /// riding out on the next somatic signal's metadata.
-    ///
-    /// THE TAIL MATTERS AS MUCH AS THE DOSE. A caring dose used to happen inside
-    /// `organismKernel.ingest`, so the signal path's tail ran with it: the cached
-    /// body read was dropped, continuity persistence was scheduled, and the
-    /// runtime published the change. A dose that arrives between signals has no
-    /// such tail of its own, so it runs the same three steps here — otherwise the
-    /// felt word would go on reading the pre-dose level until the next signal, and
-    /// a quit before that signal would lose the moment.
-    func admitCaringEventIntoBody(
-        _ reading: OrganismCaringEvent.Reading,
-        window: TimeInterval
-    ) async -> OrganismCaringEventOutcome {
-        let outcome = await organismKernel.admitCaringEvent(reading, window: window)
-        // A coalesced moment moved the encounter window without changing the
-        // chemistry; the window is persisted state too (review r2: a crash after
-        // a coalesced turn restored the older window and let the next turn dose
-        // early), so it gets the same persistence, just no publish.
-        // 2026-09-22: both branches awaited, since unawaited saves now sit in a
-        // 30s debounce — a crash inside it would let the next turn dose again.
-        if outcome.dosed {
-            cachedBodyRead = nil
-            await persistOrganismContinuity(reason: "caring:\(reading.kind.rawValue)")
-            publishRuntimeChange(reason: "caring:\(reading.kind.rawValue)")
-        } else {
-            await persistOrganismContinuity(reason: "caring:coalesced")
-        }
-        // AND THE RECEIPT LEARNS WHAT THE BODY DID. The appraisal owner wrote the
-        // model's verdict a moment ago and had no way to know the outcome yet;
-        // this is the first place that does, so it amends that same line with
-        // dosed / coalesced / refused-and-why and the level the axis now holds.
-        // One line per appraisal, with both halves of the story on it.
-        let tendernessAfter = await organismKernel.snapshot().chemicalState.tenderness
-        await MindCaringAppraiser.amendReceipt(
-            session: reading.session,
-            turn: reading.turn,
-            outcome: outcome,
-            tendernessAfter: tendernessAfter
-        )
-        return outcome
-    }
-
-    func finishAfterTurnReaction(_ event: CognitiveEvent, metadata: [String: JSONValue]) async {
-        if !metadata.isEmpty {
-            var enriched = event
-            enriched.metadata.merge(metadata) { _, new in new }
-            if let signal = CognitiveSomaticSignalAdapter.signal(from: enriched, id: UUID()) {
-                await organismKernel.admitAfterTurnReaction(signal)
-                await persistOrganismContinuity(reason: "after_turn_interpretation")
-            }
-        }
-        cachedBodyRead = nil
-        publishRuntimeChange(reason: "after_turn_interpretation")
-    }
-
     private func ingestPreparedOrganismSignalAfterBootstrap(
         _ signal: SomaticSignal,
         reflectionMaterial: [String: CognitiveReflectionCause] = [:],
         persistSynchronously: Bool
     ) async {
         let kind = signal.kind
-        await organismKernel.ingest(signal, movesFeelings: CognitiveSomaticSignalAdapter.movesFeelings(kind))
+        await organismKernel.ingest(signal, movesFeelings: CognitiveSomaticSignals.movesFeelings(kind))
         // A committed diary is a new Reach source even after a clean scan.
         if kind == .dreamCompleted { sourceWakes.reachDirty = true }
         await drainFeltResolutionsIntoSubstrate()
@@ -318,7 +251,7 @@ extension NativeCognitionRuntime {
             let outcome = await runEventDrivenReplayWithDeadline(reason: reason)
             await handleEventDrivenReplayOutcome(outcome, reason: reason, allowRetry: true)
             await reportLoopOutcome(loopId: "cognition_replay", outcome: outcome)
-            // A4.6: reflection follows the same commit signal, AFTER the replay
+            // Reflection follows the same commit signal, AFTER the replay
             // await above so it reflects on post-replay substrate state. Fire-
             // and-forget after the previous flight; budget gates stay inside.
             await scheduleEventDrivenReflection(reason: "reflection_event:\(kind.rawValue)", material: reflectionMaterial)
@@ -326,11 +259,12 @@ extension NativeCognitionRuntime {
     }
 
     public func setOrganismKernelEnabled(_ enabled: Bool) async {
+        await bootstrap()
         preferenceDefaults.set(enabled, forKey: Self.organismKernelEnabledKey)
         await refreshConfiguration()
         if enabled {
-            organismContinuityRestored = false
-            await restoreOrganismContinuityIfAvailable()
+            // The body was restored at the opening whether or not its effects
+            // were on (dormant); enabling never reloads the file over it.
             await refreshOrganismBodySchema(reason: "enabled")
             await persistOrganismContinuity(reason: "enabled")
         }
@@ -391,80 +325,69 @@ extension NativeCognitionRuntime {
 
     /// A failed reset restores its baseline only while it still owns the
     /// kernel revision. Newer events survive a partial persistence failure.
+    /// The substrate stamps turns with the body's epoch; it follows the kernel
+    /// on every exit of reset, settle and clear, so a failed or rolled-back
+    /// forgetting can never leave the two disagreeing (which would refuse
+    /// every later caring dose, reaction and correction cause).
+    func syncBodyEpoch() async {
+        let read = await organismKernel.epochAtRevision()
+        await substrate.adoptBodyEpoch(read.epoch, revision: read.revision)
+    }
+
     public func resetOrganismContinuityChecked() async -> OrganismContinuityApplyOutcome {
-        guard let mutation = await organismKernel.beginContinuityMutation(reset: true) else {
-            return OrganismContinuityApplyOutcome(
-                status: .organismDisabled,
-                snapshot: await organismKernel.snapshot(),
-                error: "The organism kernel is disabled."
-            )
-        }
-        // Reset Body clears the chemistry the caring lane doses, so the lane
-        // clears with it (review item 4): the context ring, the per-turn ledger,
-        // the recent encounters, and every verdict still in flight. A verdict
-        // that landed after a reset would dose a body that had just been emptied.
-        await substrate.clearCaringState()
-        // Reset is the explicit recovery path for a corrupt prior organism file.
-        // Permit this one atomic replacement attempt, but restore the freeze if
-        // it fails so a failed reset cannot overwrite or launder damaged bytes.
-        let wasRestoreFrozen = organismRestoreFailedHard
-        organismRestoreFailedHard = false
-        guard await persistOrganismContinuity(reason: "reset") else {
-            organismRestoreFailedHard = wasRestoreFrozen
-            let restored = await organismKernel.rollbackContinuityMutation(mutation)
-            return OrganismContinuityApplyOutcome(
-                status: .persistenceFailed,
-                snapshot: await organismKernel.snapshot(),
-                error: restored
-                    ? "The reset was not saved; the previous organism state was restored."
-                    : "The reset was not saved completely; newer organism events were preserved."
-            )
-        }
-        lastInjectedBodyLine = nil
-        lastInjectedBodyLineAt = nil
-        organismRestoreFailedHard = false
-        let snapshot = await organismKernel.snapshot()
-        publishRuntimeChange(reason: "organism:reset")
-        return OrganismContinuityApplyOutcome(status: .applied, snapshot: snapshot, error: nil)
+        await applyOrganismContinuityChecked(reset: true)
     }
 
-    /// Settle has the same revision-owned rollback as reset.
     public func settleOrganismContinuityChecked() async -> OrganismContinuityApplyOutcome {
-        guard let mutation = await organismKernel.beginContinuityMutation(reset: false) else {
+        await applyOrganismContinuityChecked(reset: false)
+    }
+
+    private func applyOrganismContinuityChecked(reset: Bool) async -> OrganismContinuityApplyOutcome {
+        let outcome = await applyOrganismContinuity(reset: reset)
+        await syncBodyEpoch()
+        return outcome
+    }
+
+    private func applyOrganismContinuity(reset: Bool) async -> OrganismContinuityApplyOutcome {
+        // Restore precedes mutation; reset alone holds the door against folds.
+        await bootstrap()
+        if reset { await enterDoor() }
+        defer { if reset { leaveDoor() } }
+        guard let mutation = await organismKernel.beginContinuityMutation(reset: reset) else {
             return OrganismContinuityApplyOutcome(
                 status: .organismDisabled,
                 snapshot: await organismKernel.snapshot(),
                 error: "The organism kernel is disabled."
             )
         }
-        guard await persistOrganismContinuity(reason: "settle") else {
+        // Reset's new body epoch refuses old in-flight body effects, not mind effects.
+        // Only reset may replace damaged continuity; a failed save restores its freeze.
+        let wasRestoreFrozen = organismRestoreFailedHard
+        if reset { organismRestoreFailedHard = false }
+        let action = reset ? "reset" : "settle"
+        guard await persistOrganismContinuity(reason: action) else {
+            if reset { organismRestoreFailedHard = wasRestoreFrozen }
             let restored = await organismKernel.rollbackContinuityMutation(mutation)
             return OrganismContinuityApplyOutcome(
                 status: .persistenceFailed,
                 snapshot: await organismKernel.snapshot(),
                 error: restored
-                    ? "The settle was not saved; the previous organism state was restored."
-                    : "The settle was not saved completely; newer organism events were preserved."
+                    ? "The \(action) was not saved; the previous organism state was restored."
+                    : "The \(action) was not saved completely; newer organism events were preserved."
             )
         }
+        if reset {
+            lastInjectedBodyLine = nil
+            lastInjectedBodyLineAt = nil
+            organismRestoreFailedHard = false
+        }
         let snapshot = await organismKernel.snapshot()
-        publishRuntimeChange(reason: "organism:settled")
+        publishRuntimeChange(reason: reset ? "organism:reset" : "organism:settled")
         return OrganismContinuityApplyOutcome(status: .applied, snapshot: snapshot, error: nil)
     }
 
-    /// Item 4 (2026-09-02) — THE BODY'S CLOCK, pushed from the ONE source the
-    /// turn engine already reads.
-    ///
-    /// `TurnQuietHoursWindow.read(dataRoot:)` is the turn engine's own reader for
-    /// `data/user_prefs.json` → `quiet_hours.{start,end}` (it renders the clock
-    /// line's quiet-hours clause). Reusing it verbatim is the point: two answers
-    /// to "is it quiet right now" is exactly the shape that makes an agent
-    /// contradict itself, and item 4 must not introduce a second config surface.
-    /// An absent file or window degrades to zone-only, and the curve falls back
-    /// to its shipped 4 AM trough.
-    ///
-    /// The runtime registers the preference/clock invalidation before the first
-    /// read. Unchanged preferences are never resampled on a body-read cadence.
+    /// Preference/clock invalidation pushes the turn engine's quiet-hours window
+    /// into the body clock; a missing window retains the default 4 AM trough.
     private func refreshOrganismDiurnalClockIfInvalidated(at fixedAt: Date) async {
         guard !isFlushedForTermination, sourceWakes.clockDirty else { return }
         sourceWakes.clockDirty = false
@@ -473,12 +396,11 @@ extension NativeCognitionRuntime {
             OrganismDiurnalClock(
                 quietStartHour: window?.startHour,
                 quietEndHour: window?.endHour
-            ),
-            at: fixedAt
+            )
         )
     }
 
-    func refreshOrganismBodySchema(reason _: String) async {  // internal for actor extensions (move-only Wave C)
+    func refreshOrganismBodySchema(reason _: String) async {
         let fixedAt = now()
         let sample = await organismBodySample(at: fixedAt)
         let canonicalAffect = await substrate.canonicalAffectProjection(at: fixedAt)
@@ -489,7 +411,7 @@ extension NativeCognitionRuntime {
         )
     }
 
-    func organismBodySample(at fixedAt: Date) async -> OrganismBodyRead {  // internal for actor extensions (move-only Wave C)
+    func organismBodySample(at fixedAt: Date) async -> OrganismBodyRead {
         // The frozen per-turn read (`refreshBodySchemaAndFrozenRead`) enters
         // here too, so the clock is fresh for the capsule as well as for the
         // background refresh above.
@@ -520,12 +442,8 @@ extension NativeCognitionRuntime {
             } else {
                 ProviderPathBeliefProjector.project(evidence: providerEvidence, now: fixedAt)
             }
-            // Availability is exact configuration truth; health is derived
-            // exclusively from the lifecycle belief above.
-            liveRead.providersHealthy = nil
         } else {
             liveRead.providerPathBelief = nil
-            liveRead.providersHealthy = false
         }
         if let override = organismDebugBodyOverride, override.expiresAt > fixedAt {
             return Self.simulatedOrganismBodyRead(
@@ -535,7 +453,7 @@ extension NativeCognitionRuntime {
             )
         } else {
             organismDebugBodyOverride = nil
-            // Phase 5 E3: provider, tool, memory, phone and thermal facts are
+            // Provider, tool, memory, phone and thermal facts are
             // health for the ops posture, never a feeling.
             return liveRead
         }
@@ -548,743 +466,5 @@ extension NativeCognitionRuntime {
             return nil
         }
         return override
-    }
-
-    private var organismPersistentStateURL: URL {
-        dataRoot
-            .appendingPathComponent("cognition", isDirectory: true)
-            .appendingPathComponent("organism_state.json")
-    }
-
-    func restoreOrganismContinuityIfAvailable() async {  // internal for actor extensions (move-only Wave C)
-        guard !organismContinuityRestored else { return }
-        organismContinuityRestored = true
-        let url = organismPersistentStateURL
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        do {
-            let data = try Data(contentsOf: url)
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            let state = try decoder.decode(OrganismPersistentState.self, from: data)
-            await organismKernel.restorePersistentState(state)
-            // Audit C1 follow-up (gpt-5.5 MED): a clean decode UNFREEZES organism
-            // persistence — a prior failure must not block writes forever once a
-            // good restore (or reset) has run.
-            organismRestoreFailedHard = false
-            await substrate.recordReceipt(
-                kind: "organism.restore",
-                payload: .object([
-                    "path": .string("cognition/organism_state.json"),
-                    "schemaVersion": .int(Int64(state.schemaVersion)),
-                    "signalCount": .int(Int64(state.signalCount)),
-                ])
-            )
-        } catch {
-            // Audit C1 (2026-07-09): a failed decode must FREEZE organism persistence
-            // for the session — persistOrganismContinuity would otherwise overwrite
-            // organism_state.json with freshly-initialized state, destroying the very
-            // continuity this receipt is warning about.
-            organismRestoreFailedHard = true
-            await substrate.recordReceipt(
-                kind: "organism.restore_failed",
-                payload: .object([
-                    "path": .string("cognition/organism_state.json"),
-                    "error": .string(String(describing: error)),
-                ])
-            )
-        }
-    }
-
-    @discardableResult
-    func persistOrganismContinuity(reason: String) async -> Bool {  // internal for actor extensions (move-only Wave C)
-        guard let generation = scheduleOrganismContinuityPersistence(reason: reason) else {
-            return false
-        }
-        return await awaitOrganismContinuityPersistence(through: generation)
-    }
-
-    /// Advances the desired durable generation without suspending the caller.
-    /// The actor owns exactly one drain task regardless of event burst size.
-    @discardableResult
-    func scheduleOrganismContinuityPersistence(reason: String) -> UInt64? {  // internal for actor extensions (move-only Wave C)
-        // Never write through a failed restore (audit C1) — memory-only until a clean boot.
-        guard !organismRestoreFailedHard else { return nil }
-        organismPersistenceRequestedGeneration &+= 1
-        organismPersistenceLatestReason = String(reason.prefix(120))
-        if organismPersistenceDrainTask == nil {
-            organismPersistenceDrainTask = Task { [weak self] in
-                await self?.drainOrganismContinuityPersistence()
-            }
-        }
-        return organismPersistenceRequestedGeneration
-    }
-
-    private func awaitOrganismContinuityPersistence(through generation: UInt64) async -> Bool {
-        if organismPersistenceCompletedGeneration >= generation {
-            return organismPersistenceLastResult
-        }
-        return await withCheckedContinuation { continuation in
-            organismPersistenceWaiters[generation, default: []].append(continuation)
-            // An awaited save never waits out the debounce.
-            organismPersistenceDebounceTask?.cancel()
-        }
-    }
-
-    /// Serial latest-state drain. If more events arrive while a write is in
-    /// flight, they coalesce into one subsequent export/write instead of
-    /// allocating one task and one snapshot per event.
-    private func drainOrganismContinuityPersistence() async {
-        while !Task.isCancelled {
-            guard organismPersistenceCompletedGeneration < organismPersistenceRequestedGeneration else {
-                organismPersistenceDrainTask = nil
-                return
-            }
-            // 2026-09-22: every accepted event rewrote the whole 257KB state
-            // (~3,000x/day). Un-awaited saves now land at most once per 30s,
-            // latest state wins; a waiter cancels the sleep and flushes now.
-            if organismPersistenceWaiters.isEmpty,
-               let last = organismPersistenceLastWriteAt,
-               ContinuousClock.now < last + .seconds(30) {
-                let due = last + .seconds(30)
-                let debounce = Task<Void, Never> {
-                    try? await Task.sleep(until: due, clock: .continuous)
-                }
-                organismPersistenceDebounceTask = debounce
-                await debounce.value
-                organismPersistenceDebounceTask = nil
-                continue
-            }
-            let generation = organismPersistenceRequestedGeneration
-            let reason = organismPersistenceLatestReason
-            let succeeded = await writeOrganismContinuitySnapshot(reason: reason)
-            organismPersistenceLastWriteAt = ContinuousClock.now
-            organismPersistenceCompletedGeneration = generation
-            organismPersistenceLastResult = succeeded
-            resumeOrganismPersistenceWaiters(through: generation, result: succeeded)
-        }
-        organismPersistenceDrainTask = nil
-        resumeOrganismPersistenceWaiters(
-            through: organismPersistenceRequestedGeneration,
-            result: false
-        )
-    }
-
-    private func resumeOrganismPersistenceWaiters(through generation: UInt64, result: Bool) {
-        let completed = organismPersistenceWaiters.keys.filter { $0 <= generation }
-        for key in completed {
-            let continuations = organismPersistenceWaiters.removeValue(forKey: key) ?? []
-            for continuation in continuations {
-                continuation.resume(returning: result)
-            }
-        }
-    }
-
-    private func writeOrganismContinuitySnapshot(reason: String) async -> Bool {
-        guard let state = await organismKernel.exportPersistentState() else { return false }
-        do {
-            let url = organismPersistentStateURL
-            try await Self.writeOrganismPersistentState(state, to: url)
-            return true
-        } catch {
-            await substrate.recordReceipt(
-                kind: "organism.persist_failed",
-                payload: .object([
-                    "reason": .string(String(reason.prefix(120))),
-                    "path": .string("cognition/organism_state.json"),
-                    "error": .string(String(describing: error)),
-                ])
-            )
-            return false
-        }
-    }
-
-    /// Encoding and filesystem work run outside the cognition actor. Awaiting
-    /// this detached job keeps write ordering in the sole drain while allowing
-    /// new sensory events to enter the actor during a slow disk operation.
-    private nonisolated static func writeOrganismPersistentState(
-        _ state: OrganismPersistentState,
-        to url: URL
-    ) async throws {
-        try await Task.detached(priority: .utility) {
-            try FileManager.default.createDirectory(
-                at: url.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            let encoder = JSONEncoder()
-            encoder.dateEncodingStrategy = .iso8601
-            let data = try encoder.encode(state)
-            try data.write(to: url, options: .atomic)
-        }.value
-    }
-
-    nonisolated static func makeOrganismBodyRead(
-        dataRoot: URL,
-        mobileConfigured: Bool,
-        now: Date = Date(),
-        phoneDeliveryPrediction: OrganismPrediction? = nil
-    ) async -> OrganismBodyRead {
-        let signedPeer = SignedPeerEvidenceStore.load(dataRoot: dataRoot)
-        let mobileLastSeen = signedPeer?.contactAt
-        let staleAfter: TimeInterval = 60 * 60 * 36
-        let peerPresenceBelief = PeerPresenceBelief(
-            generatedAt: now,
-            evidence: signedPeer.map {
-                [BodyEvidenceReference(
-                    id: "signed-peer:\($0.eventID)",
-                    evidenceClass: .signedPeerContact,
-                    observedAt: $0.peerCreatedAt,
-                    // The phone's own time, bounded by this authenticated receipt, controls freshness.
-                    receivedAt: $0.contactAt
-                )]
-            } ?? [],
-            staleAfter: staleAfter
-        )
-        let notificationDeliveryBelief = notificationDeliveryReading(
-            dataRoot: dataRoot,
-            now: now,
-            configured: mobileConfigured,
-            staleAfter: staleAfter,
-            phoneDeliveryPrediction: phoneDeliveryPrediction
-        )
-        let memoryIntegrityReading = makeMemoryIntegrityReading(dataRoot: dataRoot, now: now)
-        let dreamIntegrityReading = makeDreamIntegrityReading(dataRoot: dataRoot, now: now)
-        let toolCapabilityReading = await makeToolCapabilityReading(dataRoot: dataRoot, now: now)
-        let approvalPathReading = makeApprovalPathReading(dataRoot: dataRoot, now: now)
-        let resourcePressureReading = currentResourcePressureReading(dataRoot: dataRoot, now: now)
-
-        let providersAvailable = SwiftNativeProviderRouting(dataRoot: dataRoot).hasUsableCredentials()
-        return OrganismBodyRead(
-            macAwake: true,
-            iPhoneReachable: peerPresenceBelief.compatibilityReachable,
-            iPhoneLastSeenAt: mobileLastSeen,
-            iPhoneStaleAfter: staleAfter,
-            providersHealthy: nil,
-            providersAvailable: providersAvailable,
-            peerPresenceBelief: peerPresenceBelief,
-            notificationDeliveryBelief: notificationDeliveryBelief,
-            memoryIntegrityReading: memoryIntegrityReading,
-            dreamIntegrityReading: dreamIntegrityReading,
-            toolCapabilityReading: toolCapabilityReading,
-            approvalPathReading: approvalPathReading,
-            resourcePressureReading: resourcePressureReading,
-            memoryHealthy: memoryIntegrityReading.compatibilityHealthy,
-            dreamHealthy: dreamIntegrityReading.compatibilityHealthy,
-            toolHandsAvailable: toolCapabilityReading.compatibilityAvailable,
-            approvalChannelsOpen: approvalPathReading.compatibilityOpen,
-            notificationPathHealthy: notificationDeliveryBelief.compatibilityPathHealthy
-                ?? peerPresenceBelief.compatibilityReachable,
-            resourcePressure: resourcePressureReading.category
-        )
-    }
-
-    nonisolated static func simulatedOrganismBodyRead(
-        base: OrganismBodyRead,
-        scenario: OrganismDebugBodyScenario,
-        now: Date = Date()
-    ) -> OrganismBodyRead {
-        var read = base
-        switch scenario {
-        case .providerBrittle:
-            read.providersHealthy = false
-            read.toolHandsAvailable = false
-            read.providerPathBelief = ProviderPathBeliefProjection(
-                generatedAt: now,
-                estimate: 0.05,
-                freshness: 1,
-                uncertainty: 0,
-                evidenceCount: 1,
-                newestEvidenceAt: now,
-                state: .brittle,
-                bodySchemaProvidersHealthy: false
-            )
-            read.toolCapabilityReading = ToolCapabilityReading(
-                generatedAt: now,
-                configured: false,
-                liveCapabilityObserved: false,
-                evidence: []
-            )
-        case .stalePhone:
-            read.iPhoneReachable = false
-            read.iPhoneLastSeenAt = now.addingTimeInterval(-(read.iPhoneStaleAfter + 60))
-            read.notificationPathHealthy = false
-            let staleAt = now.addingTimeInterval(-(read.iPhoneStaleAfter + 60))
-            read.peerPresenceBelief = PeerPresenceBelief(
-                generatedAt: now,
-                evidence: [BodyEvidenceReference(
-                    id: "debug-stale-peer",
-                    evidenceClass: .signedPeerContact,
-                    observedAt: staleAt,
-                    receivedAt: staleAt
-                )],
-                staleAfter: read.iPhoneStaleAfter
-            )
-            read.notificationDeliveryBelief = NotificationDeliveryBelief(
-                generatedAt: now,
-                transportConfigured: true,
-                transportFailed: true,
-                evidence: [BodyEvidenceReference(
-                    id: "debug-notification-failure",
-                    evidenceClass: .notificationTransportFailure,
-                    observedAt: now,
-                    receivedAt: now
-                )]
-            )
-        case .resourceTight:
-            read.resourcePressure = .critical
-            read.resourcePressureReading = ResourcePressureReading(
-                generatedAt: now,
-                thermalPressure: .critical,
-                evidence: [BodyEvidenceReference(
-                    id: "debug-resource-critical",
-                    evidenceClass: .processThermalState,
-                    observedAt: now,
-                    receivedAt: now
-                )]
-            )
-        case .memoryBrittle:
-            read.memoryHealthy = false
-            read.memoryIntegrityReading = MemoryIntegrityReading(
-                generatedAt: now,
-                storeAvailable: true,
-                maintenanceSucceeded: false,
-                evidence: [BodyEvidenceReference(
-                    id: "debug-memory-maintenance-failure",
-                    evidenceClass: .maintenanceReceipt,
-                    observedAt: now,
-                    receivedAt: now
-                )]
-            )
-        case .approvalClosed:
-            read.approvalChannelsOpen = false
-            read.approvalPathReading = ApprovalPathReading(
-                generatedAt: now,
-                writable: false,
-                evidence: [BodyEvidenceReference(
-                    id: "debug-approval-closed",
-                    evidenceClass: .approvalStore,
-                    observedAt: now,
-                    receivedAt: now
-                )]
-            )
-        }
-        return read
-    }
-
-    private nonisolated static func notificationDeliveryReading(
-        dataRoot: URL,
-        now: Date,
-        configured: Bool,
-        staleAfter: TimeInterval,
-        phoneDeliveryPrediction: OrganismPrediction?
-    ) -> NotificationDeliveryBelief {
-        let apnsPath = dataRoot
-            .appendingPathComponent("mobile_push", isDirectory: true)
-            .appendingPathComponent("apns_outcomes.jsonl")
-        let apns = lastJSONObjectInJSONL(at: apnsPath)
-        let apnsDate = (apns?["at"] as? String).flatMap {
-            ISO8601DateFormatter().date(from: $0)
-        }
-        let eventID = (apns?["eventId"] as? String) ?? "apns-unknown"
-        let receipts = (apns?["receipts"] as? [[String: Any]]) ?? []
-        let targets = (apns?["targets"] as? NSNumber)?.intValue ?? 0
-        let acceptedCount = (apns?["accepted"] as? NSNumber)?.intValue ?? 0
-        var evidence: [BodyEvidenceReference] = []
-        var accepted = false
-        var failed = targets > acceptedCount || !(apns?["errors"] as? [String] ?? []).isEmpty
-        if let apnsDate {
-            for receipt in receipts {
-                let status = (receipt["status"] as? String)?.lowercased()
-                let httpStatus = (receipt["httpStatus"] as? NSNumber)?.intValue
-                let success = status == "ok" && httpStatus.map { (200..<300).contains($0) } == true
-                accepted = accepted || success
-                failed = failed || !success
-                let deviceID = (receipt["deviceId"] as? String) ?? "unknown"
-                let apnsID = (receipt["apnsId"] as? String) ?? "unknown"
-                evidence.append(BodyEvidenceReference(
-                    id: "apns:\(eventID):\(deviceID):\(apnsID):\(status ?? "unknown")",
-                    evidenceClass: success ? .apnsAcceptance : .notificationTransportFailure,
-                    observedAt: apnsDate, receivedAt: apnsDate
-                ))
-            }
-            // A deadline or fan-out error can leave a target without a receipt.
-            if targets > receipts.count || !(apns?["errors"] as? [String] ?? []).isEmpty {
-                evidence.append(BodyEvidenceReference(
-                    id: "apns:\(eventID):fan-out-failed",
-                    evidenceClass: .notificationTransportFailure,
-                    observedAt: apnsDate, receivedAt: apnsDate
-                ))
-            }
-        }
-
-        var deviceReceived = false
-        var deviceFailed = false
-        var deviceOutcomeAt: Date?
-        var deviceEvidence: BodyEvidenceReference?
-        if let latest = phoneDeliveryPrediction, latest.kind == .phoneDelivery {
-            deviceReceived = latest.status == .satisfied
-            deviceFailed = latest.status == .violated
-            deviceOutcomeAt = latest.lastUpdatedAt
-            if latest.status == .satisfied || latest.status == .violated {
-                deviceEvidence = BodyEvidenceReference(
-                    id: "phone-delivery:\(latest.id):\(latest.status.rawValue)",
-                    evidenceClass: latest.status == .satisfied
-                        ? .deviceProcessReceipt
-                        : .deviceProcessFailure,
-                    observedAt: latest.lastUpdatedAt,
-                    receivedAt: latest.lastUpdatedAt
-                )
-            }
-        }
-
-        if let deviceEvidence { evidence.append(deviceEvidence) }
-        let latestSuccessAt = [accepted ? apnsDate : nil, deviceReceived ? deviceOutcomeAt : nil]
-            .compactMap { $0 }
-            .max()
-        let latestFailureAt = [failed ? apnsDate : nil, deviceFailed ? deviceOutcomeAt : nil]
-            .compactMap { $0 }
-            .max()
-        let currentlyFailed = latestFailureAt.map { failureAt in
-            latestSuccessAt.map { failureAt >= $0 } ?? true
-        } ?? false
-        return NotificationDeliveryBelief(
-            generatedAt: now,
-            transportConfigured: configured,
-            transportAccepted: accepted,
-            deviceReceived: deviceReceived,
-            // No canonical display/read receipt exists. Never promote process
-            // receipt or APNS acceptance into those stronger claims.
-            displayed: false,
-            userSeen: false,
-            transportFailed: currentlyFailed,
-            evidence: evidence,
-            staleAfter: staleAfter
-        )
-    }
-
-    private nonisolated static func makeMemoryIntegrityReading(
-        dataRoot: URL,
-        now: Date
-    ) -> MemoryIntegrityReading {
-        let memoryRoot = dataRoot.appendingPathComponent("memory", isDirectory: true)
-        let storePaths = [
-            memoryRoot.appendingPathComponent("memory.sqlite"),
-            memoryRoot.appendingPathComponent("profile.json"),
-            memoryRoot.appendingPathComponent("knowledge_graph.json"),
-        ]
-        let readableStores = storePaths.filter(hasReadableContent)
-        let hygienePath = memoryRoot.appendingPathComponent("hygiene_last_run.json")
-        let hygieneExists = FileManager.default.fileExists(atPath: hygienePath.path)
-        let hygiene = MemoryStatusProjection.readHygieneLastRun(dataRoot: dataRoot)
-        let status = hygiene?.status?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        let successfulStatuses = ["ok", "complete", "completed", "success", "succeeded"]
-        var matchingAppliedReceiptPath: URL?
-        let maintenanceSucceeded: Bool? = {
-            guard let status else { return hygieneExists ? false : nil }
-            if successfulStatuses.contains(status) { return true }
-            guard status == "staged",
-                  let runId = hygiene?.consolidationRunId?
-                    .trimmingCharacters(in: .whitespacesAndNewlines),
-                  !runId.isEmpty
-            else { return false }
-            let receiptPath = memoryRoot
-                .appendingPathComponent("consolidation/receipts", isDirectory: true)
-                .appendingPathComponent("\(runId).json")
-            guard let receipt = jsonObject(at: receiptPath) as? [String: Any],
-                  (receipt["run_id"] as? String) == runId,
-                  let receiptStatus = (receipt["status"] as? String)?.lowercased(),
-                  ["applied", "applied_prior"].contains(receiptStatus),
-                  let at = receipt["at"] as? String,
-                  parseISODate(at) != nil
-            else { return false }
-            matchingAppliedReceiptPath = receiptPath
-            return true
-        }()
-        var evidence = readableStores.compactMap { path -> BodyEvidenceReference? in
-            guard let receivedAt = modificationDate(path) else { return nil }
-            return BodyEvidenceReference(
-                id: "memory-store:\(path.lastPathComponent):\(receivedAt.timeIntervalSince1970)",
-                evidenceClass: .localStorePresence,
-                observedAt: receivedAt,
-                receivedAt: receivedAt
-            )
-        }
-        if let receivedAt = modificationDate(hygienePath) {
-            evidence.append(BodyEvidenceReference(
-                id: "memory-maintenance:\(receivedAt.timeIntervalSince1970):\(status ?? "unknown")",
-                evidenceClass: .maintenanceReceipt,
-                observedAt: receivedAt,
-                receivedAt: receivedAt
-            ))
-        }
-        if let matchingAppliedReceiptPath,
-           let receivedAt = modificationDate(matchingAppliedReceiptPath) {
-            evidence.append(BodyEvidenceReference(
-                id: "memory-consolidation-applied:\(receivedAt.timeIntervalSince1970)",
-                evidenceClass: .maintenanceReceipt,
-                observedAt: receivedAt,
-                receivedAt: receivedAt
-            ))
-        }
-        return MemoryIntegrityReading(
-            generatedAt: now,
-            storeAvailable: !readableStores.isEmpty,
-            maintenanceSucceeded: maintenanceSucceeded,
-            evidence: evidence
-        )
-    }
-
-    private nonisolated static func makeDreamIntegrityReading(
-        dataRoot: URL,
-        now: Date
-    ) -> DreamIntegrityReading {
-        let dreamRoot = dataRoot.appendingPathComponent("dream_diary", isDirectory: true)
-        let statePath = dreamRoot.appendingPathComponent(".dream_state.json")
-        let stateDate = latestDateValue(inJSONAt: statePath, keys: ["lastdreamedat", "last_dreamed_at"])
-        let newestEntryDate = newestFileModificationDate(in: dreamRoot, suffix: ".md")
-        let latest = [stateDate, newestEntryDate].compactMap { $0 }.max()
-        let evidence: [BodyEvidenceReference] = latest.map {
-            [BodyEvidenceReference(
-                id: "dream-completion:\($0.timeIntervalSince1970)",
-                evidenceClass: .dreamCompletion,
-                observedAt: $0,
-                receivedAt: $0
-            )]
-        } ?? []
-        let fm = FileManager.default
-        let storeAvailable = fm.fileExists(atPath: dreamRoot.path)
-            || fm.isWritableFile(atPath: dataRoot.path)
-        return DreamIntegrityReading(
-            generatedAt: now,
-            storeAvailable: storeAvailable,
-            completionEvidence: evidence
-        )
-    }
-
-    private nonisolated static func makeToolCapabilityReading(
-        dataRoot: URL,
-        now: Date
-    ) async -> ToolCapabilityReading {
-        // Her hands are her abilities as they stand now: any one on means
-        // configured; a missing or stale run leaves them unproven, never unavailable.
-        let abilities = AbilityStore(dataRoot: dataRoot)
-        let configured = ((try? abilities.files(kind: .part, includeProposals: false)) ?? [])
-            .contains { $0.record?["status"] == .string("active") }
-        let rows = try? await TurnTraceRecentReader(dataRootOverride: dataRoot)
-            .traceEvidence(now: now, maximumReadBytes: 128 * 1_024).rows
-        let liveReceipt = rows?.reversed().compactMap { row -> [String: JSONValue]? in
-            guard case .object(let object) = row, object["kind"] == .string("tool.dispatch"),
-                  object["status"] == .string("ok") else { return nil }
-            return object
-        }.first
-        let liveReceiptAt: Date? = if case .string(let raw)? = liveReceipt?["createdAt"] {
-            TurnTraceEvent.parseISO8601(raw)
-        } else { nil }
-        let live = liveReceiptAt.map {
-            $0.timeIntervalSince(now) <= 5 && now.timeIntervalSince($0) <= 6 * 60 * 60
-        } == true
-        var evidence: [BodyEvidenceReference] = []
-        if configured {
-            let date = modificationDate(abilities.root) ?? now
-            evidence.append(BodyEvidenceReference(
-                id: "ability-catalog:\(date.timeIntervalSince1970)",
-                evidenceClass: .toolConfiguration,
-                observedAt: date,
-                receivedAt: date
-            ))
-        }
-        if live, let liveReceiptAt {
-            let receiptID = if case .string(let id)? = liveReceipt?["id"] { id } else { "tool-success" }
-            evidence.append(BodyEvidenceReference(
-                id: "tool-live:\(receiptID):\(liveReceiptAt.timeIntervalSince1970)",
-                evidenceClass: .liveToolCapability,
-                observedAt: liveReceiptAt,
-                receivedAt: liveReceiptAt
-            ))
-        }
-        return ToolCapabilityReading(
-            generatedAt: now,
-            configured: configured || live,
-            liveCapabilityObserved: live,
-            evidence: evidence
-        )
-    }
-
-    private nonisolated static func makeApprovalPathReading(
-        dataRoot: URL,
-        now: Date
-    ) -> ApprovalPathReading {
-        let approvalDir = dataRoot
-            .appendingPathComponent("workflows", isDirectory: true)
-            .appendingPathComponent("approvals", isDirectory: true)
-        let inboxDir = dataRoot.appendingPathComponent("notifications", isDirectory: true)
-        let fm = FileManager.default
-        let writable = fm.fileExists(atPath: approvalDir.path)
-            || fm.fileExists(atPath: inboxDir.path)
-            || fm.isWritableFile(atPath: dataRoot.path)
-        let path = fm.fileExists(atPath: approvalDir.path) ? approvalDir : inboxDir
-        let date = modificationDate(path) ?? now
-        return ApprovalPathReading(
-            generatedAt: now,
-            writable: writable,
-            evidence: [BodyEvidenceReference(
-                id: "approval-path:\(writable):\(date.timeIntervalSince1970)",
-                evidenceClass: .approvalStore,
-                observedAt: date,
-                receivedAt: date
-            )]
-        )
-    }
-
-    /// The only *process-global* sense in the body read: every other reading
-    /// above is derived from `dataRoot`. Sampling the host's thermal
-    /// state under a non-default root breaks custom-root hermeticity — and it
-    /// is not cosmetic, because `resourcePressure != .nominal` sets
-    /// `resourceInhibited` in `OrganismResidualRepair.opportunity`, which nils
-    /// `nextWakeAt`/`nextRepairAt` and silently disarms the residual-repair
-    /// deadline. A warm build machine would therefore change scheduler
-    /// behaviour in any embedded/test body. Only the live app body senses the
-    /// host; every other root reads nominal with the same evidence shape.
-    private nonisolated static func currentResourcePressureReading(
-        dataRoot: URL,
-        now: Date
-    ) -> ResourcePressureReading {
-        let sensesHost = dataRoot.standardizedFileURL
-            == PersistenceCore.defaultDataRoot().standardizedFileURL
-        let thermal: OrganismResourcePressure
-        switch sensesHost ? ProcessInfo.processInfo.thermalState : .nominal {
-        case .nominal:
-            thermal = .nominal
-        case .fair:
-            thermal = .elevated
-        case .serious:
-            thermal = .high
-        case .critical:
-            thermal = .critical
-        @unknown default:
-            thermal = .elevated
-        }
-        // Low Power Mode is not part of her body (User 10-24): it never changes what she does.
-        return ResourcePressureReading(
-            generatedAt: now,
-            thermalPressure: thermal,
-            evidence: [
-                BodyEvidenceReference(
-                    id: "thermal:\(thermal.rawValue):\(now.timeIntervalSince1970)",
-                    evidenceClass: .processThermalState,
-                    observedAt: now,
-                    receivedAt: now
-                ),
-            ]
-        )
-    }
-
-    nonisolated static func hasReadableContent(_ url: URL) -> Bool {  // internal for actor extensions (move-only Wave C)
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let size = attrs[.size] as? NSNumber else {
-            return false
-        }
-        return size.intValue > 2
-    }
-
-    private nonisolated static func modificationDate(_ url: URL) -> Date? {
-        (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate]) as? Date
-    }
-
-    /// Reads only a bounded tail and returns the newest complete JSON object.
-    /// Receipt files can live for months; a body read must not ingest the full
-    /// ledger merely to rebuild one transient delivery belief.
-    private nonisolated static func lastJSONObjectInJSONL(
-        at url: URL,
-        maximumBytes: Int = 128 * 1_024,
-        requiredKind: String? = nil,
-        requiredStatus: String? = nil
-    ) -> [String: Any]? {
-        guard maximumBytes > 0,
-              let handle = try? FileHandle(forReadingFrom: url) else { return nil }
-        defer { try? handle.close() }
-        guard let end = try? handle.seekToEnd() else { return nil }
-        let start = end > UInt64(maximumBytes) ? end - UInt64(maximumBytes) : 0
-        guard (try? handle.seek(toOffset: start)) != nil else { return nil }
-        let data: Data
-        do {
-            data = try handle.read(upToCount: maximumBytes) ?? Data()
-        } catch {
-            return nil
-        }
-        guard !data.isEmpty,
-              let text = String(data: data, encoding: .utf8) else { return nil }
-        var lines = text.split(separator: "\n", omittingEmptySubsequences: true)
-        if start > 0, !text.hasPrefix("\n"), !lines.isEmpty {
-            lines.removeFirst()
-        }
-        for line in lines.reversed() {
-            guard let data = String(line).data(using: .utf8),
-                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { continue }
-            if let requiredKind,
-               (object["kind"] as? String)?.lowercased() != requiredKind.lowercased() {
-                continue
-            }
-            if let requiredStatus,
-               (object["status"] as? String)?.lowercased() != requiredStatus.lowercased() {
-                continue
-            }
-            return object
-        }
-        return nil
-    }
-
-    private nonisolated static func latestDateValue(inJSONAt url: URL, keys: Set<String>) -> Date? {
-        guard let object = jsonObject(at: url) else { return nil }
-        return latestDateValue(in: object, keys: keys)
-    }
-
-    private nonisolated static func latestDateValue(in object: Any, keys: Set<String>) -> Date? {
-        if let array = object as? [Any] {
-            return array.compactMap { latestDateValue(in: $0, keys: keys) }.max()
-        }
-        guard let dictionary = object as? [String: Any] else { return nil }
-        var dates: [Date] = []
-        for (key, value) in dictionary {
-            let normalized = key.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if keys.contains(normalized),
-               let string = value as? String,
-               let date = parseISODate(string) {
-                dates.append(date)
-            }
-            if let nested = latestDateValue(in: value, keys: keys) {
-                dates.append(nested)
-            }
-        }
-        return dates.max()
-    }
-
-    private nonisolated static func jsonObject(at url: URL) -> Any? {
-        guard hasReadableContent(url),
-              let data = try? Data(contentsOf: url) else {
-            return nil
-        }
-        return try? JSONSerialization.jsonObject(with: data)
-    }
-
-    private nonisolated static func parseISODate(_ string: String) -> Date? {
-        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
-        return NativeTimestampFormat.parseISO8601FractionalFirst(trimmed)
-    }
-
-    private nonisolated static func newestFileModificationDate(in directory: URL, suffix: String) -> Date? {
-        guard let urls = try? FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return nil
-        }
-        return urls
-            .filter { $0.lastPathComponent.hasSuffix(suffix) }
-            .compactMap { try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate }
-            .max()
     }
 }

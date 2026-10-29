@@ -1,8 +1,8 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `KnowledgeGraphReadProjection.swift` | Checked complete graph projection, including typed canvas entities/edges and derived entity neighborhoods from the same snapshot; `canonicalAgentGraphProjection`, `agentGraph`, `canonicalKnowledgeGraphSnapshotData` |
+// Blueprint: | `KnowledgeGraphReadProjection.swift` | Checked complete graph projection, including typed canvas entities/edges and derived entity neighborhoods from the same snapshot; `canonicalAgentGraphProjection`, `canonicalKnowledgeGraphSnapshotData` |
 
-public struct CanonicalAgentGraphProjection: Sendable {
+public struct CanonicalAgentGraphReadout: Sendable {
     public let entities: [GraphEntity]
     public let edges: [AgentGraphEdge]
     public let canvasEntities: [KnowledgeGraphEntity]
@@ -21,11 +21,11 @@ public struct CanonicalAgentGraphProjection: Sendable {
 }
 
 /// Checked graph projections shared by mounted views and remote snapshots.
-public enum KnowledgeGraphReadProjection {
+public enum AgentGraphReads {
     public static func canonicalAgentGraphProjection(
         graphPath: URL = SwiftNativeKnowledgeGraphReader.defaultPath(),
         timestamp: (Date) -> String
-    ) async throws -> CanonicalAgentGraphProjection {
+    ) async throws -> CanonicalAgentGraphReadout {
         let reader = makeKnowledgeGraphReader(graphPath: graphPath)
         let snapshot = try await reader.completeSnapshotChecked()
         guard case .object(let envelope) = snapshot,
@@ -38,21 +38,21 @@ public enum KnowledgeGraphReadProjection {
 
         let entities = rawEntities.compactMap { value -> GraphEntity? in
             guard case .object(let object) = value,
-                  let id = graphString(object["id"]),
+                  let id = object["id"]?.stringValue,
                   !id.isEmpty else { return nil }
             return graphEntity(id: id, object: object)
         }.sorted { $0.id < $1.id }
         let validEntityIDs = Set(entities.map(\.id))
         let edges = rawEdges.enumerated().compactMap { index, value -> AgentGraphEdge? in
             guard case .object(let object) = value,
-                  let from = graphString(object["from"]),
-                  let to = graphString(object["to"]),
+                  let from = object["from"]?.stringValue,
+                  let to = object["to"]?.stringValue,
                   !from.isEmpty,
                   !to.isEmpty,
                   validEntityIDs.contains(from),
                   validEntityIDs.contains(to) else { return nil }
-            let label = graphString(object["type"]) ?? graphString(object["kind"])
-            let id = graphString(object["id"])
+            let label = object["type"]?.stringValue ?? object["kind"]?.stringValue
+            let id = object["id"]?.stringValue
                 ?? "\(from)->\(to):\(label ?? "edge"):\(index)"
             return AgentGraphEdge(id: id, fromNode: from, toNode: to, label: label)
         }
@@ -61,7 +61,7 @@ public enum KnowledgeGraphReadProjection {
             entities: entities,
             timestamp: timestamp
         )
-        return CanonicalAgentGraphProjection(
+        return CanonicalAgentGraphReadout(
             entities: entities,
             edges: edges,
             canvasEntities: try rawEntities.map(KnowledgeGraphEntity.init(checked:)),
@@ -78,27 +78,7 @@ public enum KnowledgeGraphReadProjection {
         return try snapshot.serializedData(pretty: false)
     }
 
-    public static func agentGraph(
-        from projection: CanonicalAgentGraphProjection,
-        executionCount: Int?
-    ) -> AgentGraph {
-        let nodes = projection.entities.map {
-            AgentGraphNode(id: $0.id, label: $0.name, kind: $0.kind, status: nil)
-        }
-        return AgentGraph(
-            nodes: nodes,
-            edges: projection.edges,
-            summary: AgentGraphCounts(
-                nodes: nodes.count,
-                edges: projection.edges.count,
-                executions: executionCount,
-                capabilities: nil
-            ),
-            createdAt: projection.updatedAt
-        )
-    }
-
-    public static func graphIndexStatus(from projection: CanonicalAgentGraphProjection) -> GraphIndexStatus {
+    public static func graphIndexStatus(from projection: CanonicalAgentGraphReadout) -> GraphIndexStatus {
         GraphIndexStatus(
             status: "ready",
             embeddingModel: "swift-memory-v2",
@@ -150,7 +130,7 @@ public enum KnowledgeGraphReadProjection {
         }
         let results: [GraphSearchResult] = rawResults.prefix(50).compactMap { value in
             guard case .object(let raw) = value,
-                  let id = Self.graphString(raw["id"]),
+                  let id = raw["id"]?.stringValue,
                   !id.isEmpty else { return nil }
             let entity = Self.graphEntity(id: id, object: raw)
             return GraphSearchResult(
@@ -161,7 +141,7 @@ public enum KnowledgeGraphReadProjection {
                     kind: entity.kind,
                     status: nil
                 ),
-                score: Self.graphDouble(raw["score"]) ?? 0,
+                score: raw["score"]?.numberValue(coercingStrings: true, finiteOnly: false) ?? 0,
                 matchedTerms: [trimmed],
                 matchedEntities: [entity.name],
                 relatedEdges: nil,
@@ -179,10 +159,10 @@ public enum KnowledgeGraphReadProjection {
     private static func graphEntity(id: String, object: [String: JSONValue]) -> GraphEntity {
         GraphEntity(
             id: id,
-            name: graphString(object["name"]) ?? id,
+            name: object["name"]?.stringValue ?? id,
             aliases: graphStringArray(object["aliases"]).isEmpty ? nil : graphStringArray(object["aliases"]),
-            kind: graphString(object["type"]) ?? graphString(object["kind"]),
-            confidence: graphDouble(object["confidence"]),
+            kind: object["type"]?.stringValue ?? object["kind"]?.stringValue,
+            confidence: object["confidence"]?.numberValue(coercingStrings: true, finiteOnly: false),
             mentions: {
                 let value = graphInt(object["mention_count"])
                 return value == 0 ? nil : value
@@ -193,19 +173,13 @@ public enum KnowledgeGraphReadProjection {
                 let camel = graphStringArray(object["sourceNodeIds"])
                 return camel.isEmpty ? nil : camel
             }(),
-            updatedAt: graphString(object["last_seen"])
+            updatedAt: object["last_seen"]?.stringValue
         )
-    }
-
-    private static func graphString(_ value: JSONValue?) -> String? {
-        guard let value else { return nil }
-        if case .string(let string) = value { return string }
-        return nil
     }
 
     private static func graphStringArray(_ value: JSONValue?) -> [String] {
         guard case .array(let values)? = value else { return [] }
-        return values.compactMap { graphString($0) }
+        return values.compactMap(\.stringValue)
     }
 
     private static func graphInt(_ value: JSONValue?) -> Int {
@@ -215,16 +189,6 @@ public enum KnowledgeGraphReadProjection {
         case .double(let double): return Int(exactly: double.rounded(.towardZero)) ?? 0
         case .string(let string): return Int(string) ?? 0
         default: return 0
-        }
-    }
-
-    private static func graphDouble(_ value: JSONValue?) -> Double? {
-        guard let value else { return nil }
-        switch value {
-        case .double(let double): return double
-        case .int(let int): return Double(int)
-        case .string(let string): return Double(string)
-        default: return nil
         }
     }
 }

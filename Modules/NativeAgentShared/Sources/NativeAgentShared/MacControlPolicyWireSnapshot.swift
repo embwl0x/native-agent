@@ -1,22 +1,21 @@
 import Foundation
 
-// Blueprint: | `MacControlPolicyWireSnapshot.swift` | `MacControlPolicyWireSnapshot`: shared policy snapshot decoding/defaults; TrustCenter retains policy authority |
+// Blueprint: | `MacControlPolicyWireSnapshot.swift` | `MacControlPolicyWireSnapshot`: shared Codable/Hashable policy snapshot, decoding/defaults; TrustCenter retains policy authority |
 
-/// Decoding compatibility for Mac Control snapshots; TrustCenter retains policy authority.
-/// Shared immutable defaults keep phone decoding and TrustCenter's schema equal.
-public struct MacControlPolicyWireSnapshot: Decodable, Sendable {
-    public let enabled: Bool
-    public let applesScriptAllowed: Bool
-    public let jxaAllowed: Bool
-    public let shortcutsAllowed: Bool
-    public let accessibilityAllowed: Bool
-    public let systemControlAllowed: Bool
-    public let fileOpsAllowed: Bool
-    public let shellAllowed: Bool
-    public let notificationsAllowed: Bool
-    public let spotlightAllowed: Bool
-    public let approvalRequiredFor: [String]
-    public let remoteFromIosAllowed: Bool
+/// Shared policy fields and compatibility defaults; TrustCenter retains authority.
+public struct MacControlPolicyWireSnapshot: Codable, Hashable, Sendable {
+    public var enabled: Bool
+    public var applesScriptAllowed: Bool
+    public var jxaAllowed: Bool
+    public var shortcutsAllowed: Bool
+    public var accessibilityAllowed: Bool
+    public var systemControlAllowed: Bool
+    public var fileOpsAllowed: Bool
+    public var shellAllowed: Bool
+    public var notificationsAllowed: Bool
+    public var spotlightAllowed: Bool
+    public var approvalRequiredFor: [String]
+    public var remoteFromIosAllowed: Bool
 
     public static let defaults = Self(
         enabled: false, applesScriptAllowed: false, jxaAllowed: false,
@@ -25,6 +24,34 @@ public struct MacControlPolicyWireSnapshot: Decodable, Sendable {
         spotlightAllowed: true,
         approvalRequiredFor: ["shell", "file_ops", "applescript", "jxa", "accessibility"],
         remoteFromIosAllowed: false)
+
+    public init(
+        enabled: Bool = MacControlPolicyWireSnapshot.defaults.enabled,
+        applesScriptAllowed: Bool = MacControlPolicyWireSnapshot.defaults.applesScriptAllowed,
+        jxaAllowed: Bool = MacControlPolicyWireSnapshot.defaults.jxaAllowed,
+        shortcutsAllowed: Bool = MacControlPolicyWireSnapshot.defaults.shortcutsAllowed,
+        accessibilityAllowed: Bool = MacControlPolicyWireSnapshot.defaults.accessibilityAllowed,
+        systemControlAllowed: Bool = MacControlPolicyWireSnapshot.defaults.systemControlAllowed,
+        fileOpsAllowed: Bool = MacControlPolicyWireSnapshot.defaults.fileOpsAllowed,
+        shellAllowed: Bool = MacControlPolicyWireSnapshot.defaults.shellAllowed,
+        notificationsAllowed: Bool = MacControlPolicyWireSnapshot.defaults.notificationsAllowed,
+        spotlightAllowed: Bool = MacControlPolicyWireSnapshot.defaults.spotlightAllowed,
+        approvalRequiredFor: [String] = MacControlPolicyWireSnapshot.defaults.approvalRequiredFor,
+        remoteFromIosAllowed: Bool = MacControlPolicyWireSnapshot.defaults.remoteFromIosAllowed
+    ) {
+        self.enabled = enabled
+        self.applesScriptAllowed = applesScriptAllowed
+        self.jxaAllowed = jxaAllowed
+        self.shortcutsAllowed = shortcutsAllowed
+        self.accessibilityAllowed = accessibilityAllowed
+        self.systemControlAllowed = systemControlAllowed
+        self.fileOpsAllowed = fileOpsAllowed
+        self.shellAllowed = shellAllowed
+        self.notificationsAllowed = notificationsAllowed
+        self.spotlightAllowed = spotlightAllowed
+        self.approvalRequiredFor = approvalRequiredFor
+        self.remoteFromIosAllowed = remoteFromIosAllowed
+    }
 
     private enum CodingKeys: String, CodingKey {
         case enabled

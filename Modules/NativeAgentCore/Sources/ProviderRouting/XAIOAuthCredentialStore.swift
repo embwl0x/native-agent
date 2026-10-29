@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+import NativeAgentShared
 // Blueprint: | `XAIOAuthCredentialStore.swift` | Locked xAI token migration, immutable Keychain references, refresh reads and sign-out cleanup |
 
 /// xAI credentials retain their locked metadata file; only immutable Keychain

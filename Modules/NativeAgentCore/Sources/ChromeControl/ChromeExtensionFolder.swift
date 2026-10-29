@@ -3,11 +3,10 @@ import PersistenceCore
 import NativeAgentCore
 import MacControl
 import TrustCenter
-// Blueprint: | `ChromeExtensionFolder.swift` | `ChromeExtensionFolder` enum; `isComplete`; extension completeness, staged replacement and registered-host refresh; incomplete bundles and copy failures name the defect and person recovery step, never a coding request |
+import NativeAgentShared
+// Blueprint: | `ChromeExtensionFolder.swift` | `ChromeExtensionFolder` enum; executable-closure completeness through ChromeExtensionFiles, staged replacement and registered-host refresh; incomplete bundles and copy failures name the defect and person recovery step, never a coding request |
 
 public enum ChromeExtensionFolder {
-    public static let requiredFiles = ["manifest.json", "src/background.js", "src/protocol.js", "src/browser-workspace.js", "src/page-agent.js", "src/user-touch.js"]
-
     public static var bundled: URL? {
         Bundle.main.resourceURL?.appendingPathComponent("NativeAgentChrome", isDirectory: true)
     }
@@ -18,7 +17,9 @@ public enum ChromeExtensionFolder {
     }
 
     public static func isComplete(_ folder: URL) -> Bool {
-        requiredFiles.allSatisfy { FileManager.default.isReadableFile(atPath: folder.appendingPathComponent($0).path) }
+        var paths = Set<URL>()
+        return (try? ChromeExtensionFiles.object(folder.appendingPathComponent("manifest.json")))
+            .flatMap { ChromeExtensionFiles.codeDigest(folder: folder, manifest: $0, paths: &paths) } != nil
     }
 
     @discardableResult

@@ -83,7 +83,7 @@ public enum ChatGeneratedImageArtifacts {
             let path = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !path.isEmpty else { continue }
             let url = URL(fileURLWithPath: path).standardizedFileURL
-            guard url.path == generatedRoot || url.path.hasPrefix(generatedRoot + "/") else { continue }
+            guard NativeAgentWorkspaceRoot.relativePath(url.path, under: generatedRoot) != nil else { continue }
             let name: String?
             if case .string(let filename)? = imageObject["filename"],
                !filename.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -92,7 +92,7 @@ public enum ChatGeneratedImageArtifacts {
                 name = nil
             }
             if let attachment = attachment(url, name: name,
-                    byteSize: intValue(imageObject["byteSize"]) ?? intValue(imageObject["byte_size"])) {
+                    byteSize: imageObject["byteSize"]?.integerValue.flatMap(Int.init(exactly:)) ?? imageObject["byte_size"]?.integerValue.flatMap(Int.init(exactly:))) {
                 out.append(attachment)
             }
         }
@@ -127,14 +127,6 @@ public enum ChatGeneratedImageArtifacts {
 
     private static func fileByteSize(_ url: URL) -> Int? {
         (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize)
-    }
-
-    private static func intValue(_ value: JSONValue?) -> Int? {
-        switch value {
-        case .int(let value): return Int(value)
-        case .double(let value): return Int(exactly: value.rounded(.towardZero))
-        default: return nil
-        }
     }
 
     /// From the whole path: two files of one name are two attachments.

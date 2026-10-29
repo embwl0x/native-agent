@@ -1,22 +1,19 @@
-// PATCH-2026-05-07: summon-1 Universal summon — global hotkey + enhanced menu bar
 import SwiftUI
 import AppKit
 import Carbon.HIToolbox
 
-// Blueprint: | `MenuBarController.swift` | `GlobalHotkeyManager`: Carbon summon registration and tap/hold push-to-talk state with cancellable voice lifecycle |
-
-// MARK: - GlobalHotkeyManager
+// Blueprint: | `MenuBarController.swift` | `GlobalHotkey`: Carbon summon registration and tap/hold push-to-talk state with cancellable voice lifecycle |
 
 /// Registers a global hotkey using Carbon's RegisterEventHotKey.
 /// Default: ⌘-⇧-J (configurable via AppStorage "globalHotkey").
 /// Tap = bring the main window forward. Hold >200ms = voice push-to-talk (wired to VoiceInputCapture).
 @MainActor
-final class GlobalHotkeyManager: NSObject {
+final class GlobalHotkey: NSObject {
     enum RegistrationTransition: Equatable, Sendable {
         case none, register, unregister
     }
 
-    static let shared = GlobalHotkeyManager()
+    static let shared = GlobalHotkey()
 
     private var hotKeyRef: EventHotKeyRef?
     private var eventHandlerRef: EventHandlerRef?
@@ -105,7 +102,7 @@ final class GlobalHotkeyManager: NSObject {
                 guard let id = hotKeyID(of: event), id.signature == fourCharCode("NASP"), id.id == 1 else {
                     return OSStatus(eventNotHandledErr)
                 }
-                let manager = Unmanaged<GlobalHotkeyManager>.fromOpaque(userData).takeUnretainedValue()
+                let manager = Unmanaged<GlobalHotkey>.fromOpaque(userData).takeUnretainedValue()
                 let eventKind = GetEventKind(event)
                 Task { @MainActor in
                     if eventKind == UInt32(kEventHotKeyPressed) {
@@ -125,7 +122,7 @@ final class GlobalHotkeyManager: NSObject {
 
     func handleKeyDown() {
         guard isRegistered else { return }
-        let token = pressState.keyDown(now: Date())
+        let token = pressState.keyDown()
         voiceStartTask?.cancel()
         voiceStartTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 200_000_000)
@@ -136,7 +133,7 @@ final class GlobalHotkeyManager: NSObject {
 
     func handleKeyUp() {
         guard isRegistered else { return }
-        guard let action = pressState.keyUp(now: Date()) else { return }
+        guard let action = pressState.keyUp() else { return }
         voiceStartTask?.cancel()
         voiceStartTask = nil
         switch action {
@@ -151,39 +148,35 @@ final class GlobalHotkeyManager: NSObject {
 struct GlobalHotkeyPressState: Sendable {
     enum ReleaseAction: Equatable, Sendable { case openWindow, endVoice }
 
-    private(set) var pressStart: Date?
     private(set) var pressToken: UUID?
     private(set) var voiceHoldActive = false
 
     var isVoiceHoldCurrent: Bool {
-        pressStart != nil && pressToken != nil && voiceHoldActive
+        pressToken != nil && voiceHoldActive
     }
 
-    mutating func keyDown(now: Date) -> UUID {
+    mutating func keyDown() -> UUID {
         let token = UUID()
-        pressStart = now
         pressToken = token
         voiceHoldActive = false
         return token
     }
 
     mutating func activateVoice(for token: UUID) -> Bool {
-        guard pressToken == token, pressStart != nil, !voiceHoldActive else { return false }
+        guard pressToken == token, !voiceHoldActive else { return false }
         voiceHoldActive = true
         return true
     }
 
-    mutating func keyUp(now: Date) -> ReleaseAction? {
-        guard let start = pressStart else { return nil }
-        let action: ReleaseAction = now.timeIntervalSince(start) >= 0.2 && voiceHoldActive
-            ? .endVoice
-            : .openWindow
+    mutating func keyUp() -> ReleaseAction? {
+        guard pressToken != nil else { return nil }
+        // Activation has already passed the monotonic hold delay.
+        let action: ReleaseAction = voiceHoldActive ? .endVoice : .openWindow
         cancel()
         return action
     }
 
     mutating func cancel() {
-        pressStart = nil
         pressToken = nil
         voiceHoldActive = false
     }
@@ -203,8 +196,8 @@ func hotKeyID(of event: EventRef) -> EventHotKeyID? {
 
 func fourCharCode(_ string: String) -> FourCharCode {
     var result: FourCharCode = 0
-    for char in string.unicodeScalars {
-        result = (result << 8) + FourCharCode(char.value)
+    for byte in string.utf8 {
+        result = (result << 8) | FourCharCode(byte)
     }
     return result
 }

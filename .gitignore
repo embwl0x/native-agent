@@ -70,80 +70,42 @@ daemon/*.bak.*
 .idea/
 .vscode/
 
-# Phase 11: persona — keep personal identity private, ship clean templates
+# Personal persona identity stays private; clean templates are committed.
 persona/SOUL.md
-persona/SOUL.md.*.bak
 persona/USER.md
-persona/USER.md.*.bak
 persona/VOICE.md
-persona/VOICE.md.*.bak
 persona/GROWTH.md
-persona/GROWTH.md.*.bak
 persona/*.lock
-# Phase 14: AGENTS.md is personal (template is committed; personal copy is gitignored)
 persona/AGENTS.md
-persona/AGENTS.md.*.bak
 persona/notes.jsonl
 persona/*/notes.jsonl
 persona/*.bak
-# PATCH-2026-05-30: catch backups with the .bak.<suffix> naming pattern too
-# (e.g. GROWTH.md.bak.pre-feedback-cleanup-2026-05-28). The existing
-# persona/*.bak and persona/SOUL.md.*.bak patterns only match files where
-# .bak is the literal suffix; this catches the other shape that cleanup
-# scripts produce, which was leaving the repo perpetually dirty and
-# pausing self-improvement.
+# Ignore persona backups with suffixes after .bak.
 persona/*.bak.*
 # Per-persona local backups / private Agent vault digests stay local
 persona/*/*.bak
 persona/*/*.bak.*
 persona/*/workspace/
-# Agent-specific skill bodies are personal persona content, NOT generic
-# shippable capabilities. Blanket-ignore every agent-*.md body so a new one
-# can never leak by being missed off an explicit list (2026-07-04: agent-
-# soul-original.md + agent-taste.md had slipped past the enumerated form).
+# Agent-specific skill bodies are private persona content.
 persona/skills/bodies/agent-*.md
-# PATCH-2026-05-30: multi-agent inbox state. Per docs/agent_inbox/REPORTING.md,
-# each agent (Claude, Codex, etc.) appends standups to its own inbox file
-# before ending a session. These are persistent local state, never meant to
-# be committed — and like the persona backups, they were leaving the repo
-# perpetually dirty and pausing the self-improvement gate.
+# Agent inbox logs, worker reports and proofs stay private.
 docs/agent_inbox/
-# N13 fix (R16): per-persona identity files under persona/<name>/ must also be gitignored.
-# Without these, a second persona's SOUL.md/USER.md/VOICE.md/GROWTH.md would be committed.
+# Keep every persona's identity files private.
 persona/*/SOUL.md
 persona/*/USER.md
 persona/*/VOICE.md
 persona/*/GROWTH.md
 persona/*/AGENTS.md
 persona/*/*.lock
-persona/*/SOUL.md.*.bak
-persona/*/USER.md.*.bak
-persona/*/VOICE.md.*.bak
-persona/*/GROWTH.md.*.bak
-persona/*/AGENTS.md.*.bak
 
-# Phase 11: runtime state stays local — entire data/ is gitignored except .gitkeep
+# Runtime data stays local.
 data/
 !data/.gitkeep
-# MiniLM's CoreML package uses Apple's required case-sensitive `Data/` payload
-# directory. On default macOS filesystems the broad runtime rule above also
-# matched that build resource, leaving fresh private clones without the model.
-# Keep this one verified package payload reproducible in source control.
-!Modules/NativeAgentCore/Sources/MemoryV2/Resources/minilm.mlpackage/Data/
-!Modules/NativeAgentCore/Sources/MemoryV2/Resources/minilm.mlpackage/Data/**
 
-# Phase 11b: Workspace — Agent's work product (drafts, scratch, generated files)
-# Contents are gitignored; .gitkeep preserves the directory in the repo.
-# Use workspace/* (not workspace/) so specific files below can be
-# re-included — git cannot un-ignore a file whose parent DIR is excluded.
+# Workspace drafts, scratch and generated files stay local; retain .gitkeep.
 workspace/*
 !workspace/.gitkeep
-# Self-improvement E2E harness is the canonical regression test for the
-# snapshot/promote/pending lifecycle — track it despite the workspace/ ignore.
-!workspace/test_selfimprove_loop_e2e.py
 
-# Skill bodies are committed — they are built-in capabilities useful to everyone
-# (no ignore entry needed; persona/skills/bodies/ is not excluded above)
 .claude/
 iOS/NativeAgentMobile/build/
 
@@ -161,6 +123,6 @@ data.backup.*/
 extras/embedding/
 extras/codex/
 
-# Local capture/replay leftovers from the deleted test suites (personal data; never commit)
+# Local capture/replay data stays private.
 tests/
 DerivedData-ios/

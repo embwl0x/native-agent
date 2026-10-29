@@ -1,101 +1,37 @@
-// CognitiveSubstrate+Workspace.swift
-// Move-only extraction (R8b) from CognitiveSubstrate.swift — see docs/build_plans/fable5-wave2-r8b-decomposition.md
-
 import Foundation
 import NativeAgentCore
-import PersistenceCore
 // Blueprint: | `CognitiveSubstrate+Workspace.swift` | `CognitiveSubstrate`: `workspaceSnapshot`, `frozenRead` |
 
-/// Exact read-side ownership for cognition maintenance. Analytic affect and node
-/// reads do not need a checkpoint merely because five minutes
-/// elapsed; only discrete lifecycle boundaries do. The app runtime uses this
-/// projection to own one cancellable deadline while the periodic loop remains a
-/// slow crash/integrity fallback.
-public struct CognitiveMaintenanceOpportunity: Sendable, Equatable {
-    public var generatedAt: Date
-    public var dueReasons: [String]
-    public var nextMaintenanceAt: Date?
-
-    public init(
-        generatedAt: Date,
-        dueReasons: [String] = [],
-        nextMaintenanceAt: Date? = nil
-    ) {
-        self.generatedAt = generatedAt
-        self.dueReasons = Array(Set(dueReasons)).sorted()
-        self.nextMaintenanceAt = nextMaintenanceAt
-    }
-
-    public var isDue: Bool { !dueReasons.isEmpty }
-}
-
 extension CognitiveSubstrate {
-    public func workspaceSnapshot(currentSessionId: String? = nil) async -> CognitiveWorkspaceSnapshot {
-        let now = dependencies.now()
-        // Observatory ablation is a real read-side intervention: it must
-        // change the exact workspace the panel and capsule consume, rather
-        // than merely recording a checkbox in experiment metadata.
-        guard configuration.enabled,
-              ablations["workspace"] != false else {
-            return CognitiveWorkspaceSnapshot(generatedAt: now, items: [])
-        }
-        let settledNodes = field.snapshot(at: now, configuration: configuration)
-        return workspaceSnapshot(
-            at: now,
-            settledNodes: settledNodes,
-            currentSessionId: currentSessionId
-        )
-    }
-
     /// Build a workspace from the exact field settlement already owned by the
     /// caller. A microcycle uses this once-settled node set for both selection
     /// and durability, avoiding a second full 256-node decay/sort at the same
     /// timestamp without changing canonical state.
-    private func workspaceSnapshot(
+    func workspaceSnapshot(
         at now: Date,
-        settledNodes: [CognitiveNode],
-        currentSessionId: String? = nil
+        settledNodes: [CognitiveNode]
     ) -> CognitiveWorkspaceSnapshot {
         guard configuration.enabled else {
             return CognitiveWorkspaceSnapshot(generatedAt: now, items: [])
         }
-        let sessionId = Self.cleanedSessionId(currentSessionId)
-        let turnKindsByNodeID = Dictionary(settledNodes.map {
-            ($0.id, field.cachedTurnKind(for: $0))
-        }, uniquingKeysWith: { first, _ in first })
-        let nodes = settledNodes.filter {
-            workspaceEligible(
-                $0,
-                currentSessionId: sessionId,
-                at: now,
-                turnKind: turnKindsByNodeID[$0.id]
-            )
-        }
         let associatedNodeIds = field.associatedNodeIDs()
-        // Wave C: derive mood ONCE and thread it through scoring/reasons so recall is
-        // mood-congruent (a node whose stored feeling matches her mood surfaces a little
-        // more readily). Neutral mood + untagged nodes → the mood term is 0 everywhere,
-        // so scores/reasons stay byte-identical to pre-Wave-C.
+        // Capture mood and affect once for selection and reasons.
         let dyn = dynamics
         let currentAffect = projectedAffect(at: now, dynamics: dyn)
         let mood = derivedMood(at: now, dynamics: dyn, affect: currentAffect)
         return makeWorkspaceSnapshot(
             at: now,
-            nodes: nodes,
+            nodes: settledNodes,
             associatedNodeIds: associatedNodeIds,
             mood: mood,
-            affect: currentAffect,
-            turnKindsByNodeID: turnKindsByNodeID
+            affect: currentAffect
         )
     }
 
     /// Settle one copied continuity field at an explicit timestamp. The
     /// resulting snapshot/workspace may be rendered into a frozen provider
     /// packet without advancing the live field's decay anchors.
-    public func frozenRead(
-        at fixedAt: Date,
-        currentSessionId: String? = nil
-    ) async -> CognitiveFrozenRead {
+    public func frozenRead(at fixedAt: Date) async -> CognitiveFrozenRead {
         let frozenConfiguration = configuration
         let frozenDynamics = dynamics
         let fixedAffect = projectedAffect(at: fixedAt, dynamics: frozenDynamics)
@@ -104,12 +40,10 @@ extension CognitiveSubstrate {
         // actual felt mode/valence. Capture its immutable inputs here instead of
         // preselecting with nil/default register values.
         let frozenSoundLandingScores = soundLandingScoreSnapshot()
-        let frozenPresentationState = capsulePresentationStateSnapshot()
-        let frozenPendingCompletionOpen = pendingCompletion != nil
+        let frozenPresentationState = capsulePresentationState
         let frozenSuppressions = associationSuppressions
-        let peerIds = Set(field.peekNodes().compactMap { Self.peerIdentity(metadata: $0.metadata) })
+        let peerIds = Set(field.peekNodes().compactMap { Self.peerIdentity(metadata: $0.metadata, dataRoot: conversationDataRoot) })
         let frozenTrustedPeers = Set(peerIds.filter { dependencies.peerTrusted($0) })
-        // W4/P2: captured, never recomputed downstream (see CognitiveFeltProxyReads).
         // Curiosity is workspace-relative, so it is captured below where
         // the frozen workspace is known; the other two are workspace-independent.
         let frozenFatigue = substrateFatigueProxy(at: fixedAt)
@@ -126,32 +60,18 @@ extension CognitiveSubstrate {
         )
         let workspace: CognitiveWorkspaceSnapshot
         if frozenConfiguration.enabled, ablations["workspace"] != false {
-            let sessionId = Self.cleanedSessionId(currentSessionId)
-            let turnKindsByNodeID = Dictionary(settledNodes.map {
-                ($0.id, copiedField.cachedTurnKind(for: $0))
-            }, uniquingKeysWith: { first, _ in first })
-            let eligible = settledNodes.filter {
-                workspaceEligible(
-                    $0,
-                    currentSessionId: sessionId,
-                    at: fixedAt,
-                    turnKind: turnKindsByNodeID[$0.id]
-                )
-            }
             workspace = makeWorkspaceSnapshot(
                 at: fixedAt,
-                nodes: eligible,
+                nodes: settledNodes,
                 associatedNodeIds: copiedField.associatedNodeIDs(),
                 mood: fixedMood,
-                affect: fixedAffect,
-                turnKindsByNodeID: turnKindsByNodeID
+                affect: fixedAffect
             )
         } else {
             workspace = CognitiveWorkspaceSnapshot(generatedAt: fixedAt, items: [])
         }
         return CognitiveFrozenRead(
             fixedAt: fixedAt,
-            stateRevision: dirtyRevision,
             configuration: frozenConfiguration,
             personalityDynamics: frozenDynamics,
             snapshot: snapshot,
@@ -169,9 +89,10 @@ extension CognitiveSubstrate {
                 clarity: frozenClarity),
             soundLandingScores: frozenSoundLandingScores,
             capsulePresentationState: frozenPresentationState,
-            pendingCompletionOpen: frozenPendingCompletionOpen,
             associationSuppressions: frozenSuppressions,
-            trustedPeerIds: frozenTrustedPeers
+            trustedPeerIds: frozenTrustedPeers,
+            mindEpoch: mindEpoch,
+            cares: Array(cares.values)
         )
     }
 
@@ -180,21 +101,16 @@ extension CognitiveSubstrate {
         nodes: [CognitiveNode],
         associatedNodeIds: Set<UUID>,
         mood: CognitiveMoodReading,
-        affect currentAffect: CognitiveAffectState,
-        turnKindsByNodeID: [UUID: CognitiveTurnKind]
+        affect currentAffect: CognitiveAffectState
     ) -> CognitiveWorkspaceSnapshot {
-        // Score first, then materialize reasons only for selected items. The
-        // prior path allocated a complete reason array and copied a full node
-        // into a workspace item for all 256 candidates before discarding most
-        // of them at the cap.
-        let scored = nodes.map { node in
+        // Classify and score candidates before materializing selected reasons.
+        let scored = nodes.filter { workspaceEligible($0) }.map { node in
             (
                 node: node,
                 score: workspaceScore(
                     for: node,
                     mood: mood,
-                    affect: currentAffect,
-                    turnKind: turnKindsByNodeID[node.id]
+                    affect: currentAffect
                 )
             )
         }
@@ -210,11 +126,7 @@ extension CognitiveSubstrate {
         var inhibited: [UUID] = []
         var seenSubjects: Set<String> = []
         var keptSystemItems = 0
-        // Audit C2 follow-up (gpt-5.5 MED, 2026-07-09): user turns are per-turn nodes
-        // now (the session-collapse fix), so they bypass the subject de-dupe — a long
-        // session could fill the whole workspace and dominate the fingerprint's felt
-        // read with one conversation's turns. Cap live user-turn nodes per SESSION at
-        // selection; storage stays per-turn (mood/recall still see every turn).
+        // Bound each session's user turns while storage remains per turn.
         var userTurnsPerSession: [String: Int] = [:]
         let maximumUserTurnsPerSession = 2
         let maximumSystemItems = max(1, min(3, configuration.maximumWorkspaceItems / 3))
@@ -238,7 +150,7 @@ extension CognitiveSubstrate {
                 }
                 userTurnsPerSession[sessionKey] = count + 1
             }
-            if turnKindsByNodeID[candidate.node.id] == .system,
+            if candidate.node.turnKind == .system,
                keptSystemItems >= maximumSystemItems {
                 inhibited.append(candidate.node.id)
                 continue
@@ -251,11 +163,10 @@ extension CognitiveSubstrate {
                     for: candidate.node,
                     associatedNodeIds: associatedNodeIds,
                     mood: mood,
-                    affect: currentAffect,
-                    turnKind: turnKindsByNodeID[candidate.node.id]
+                    affect: currentAffect
                 )
             ))
-            if turnKindsByNodeID[candidate.node.id] == .system {
+            if candidate.node.turnKind == .system {
                 keptSystemItems += 1
             }
             if kept.count >= configuration.maximumWorkspaceItems { break }
@@ -264,323 +175,6 @@ extension CognitiveSubstrate {
             inhibited.append(contentsOf: scored.dropFirst(processedCount).map { $0.node.id })
         }
         return CognitiveWorkspaceSnapshot(generatedAt: now, items: kept, inhibitedNodeIds: inhibited)
-    }
-
-    @discardableResult
-    public func runMicrocycleChecked(reason: String) async throws -> CognitiveWorkspaceSnapshot? {
-        await waitForMaintenanceTransition()
-        // The existing commit exclusion also single-flights microcycles. Hand
-        // ownership directly to a waiting caller so its dirty follow-up is not
-        // dropped and maintenance cannot enter between holders.
-        if maintenanceCommitInFlight {
-            await withCheckedContinuation { microcycleWaiters.append($0) }
-        } else {
-            maintenanceCommitInFlight = true
-        }
-        defer {
-            if microcycleWaiters.isEmpty { maintenanceCommitInFlight = false }
-            else { microcycleWaiters.removeFirst().resume() }
-        }
-        guard configuration.enabled, configuration.backgroundMicrocyclesEnabled else { return nil }
-        guard dirtySince != nil else { return nil }
-        let priorDirtySince = dirtySince
-        let settledAt = dependencies.now()
-        let settledNodes = field.snapshot(at: settledAt, configuration: configuration)
-        let workspace = workspaceSnapshot(at: settledAt, settledNodes: settledNodes)
-        // This cycle has consumed the dirty state represented by `workspace`.
-        // Clear before any awaiting persistence work: a concurrent event will
-        // set it again and must survive this cycle's completion.
-        dirtySince = nil
-        publishAttentionProjection(at: workspace.generatedAt)
-        var flushedPresentation = false
-        do {
-            if configuration.persistenceEnabled {
-                // Resident sensory admission defers its per-event affect and
-                // node writes here. Affect, nodes, pruning, and
-                // the receipt are one canonical SQLite transaction—not four
-                // sequential commits for one physiological settlement.
-                var artifacts: [CognitiveArtifactWrite] = configuration.enabled
-                    ? [CognitiveArtifactWrite(
-                        kind: "affect",
-                        id: stableArtifactID("affect"),
-                        status: "current",
-                        score: affect.arousal,
-                        payload: affect.toJSON(
-                            lastUserPresenceAt: lastUserPresenceAt,
-                            lastWarmPresenceAt: lastWarmPresenceAt
-                        )
-                    )]
-                    : []
-                // The resident ingest's accepted-turn tick (and any unflushed
-                // cadence move) rides the same transaction.
-                if capsulePresentationDirty {
-                    capsulePresentationDirty = false
-                    flushedPresentation = true
-                    artifacts.append(CognitiveArtifactWrite(
-                        kind: "capsule_presentation",
-                        id: stableArtifactID("capsule_presentation"),
-                        status: "current",
-                        score: 0,
-                        payload: capsulePresentationArtifactPayload(at: workspace.generatedAt)
-                    ))
-                }
-                try await persistMaintenanceTransition(
-                    nodes: settledNodes,
-                    artifacts: artifacts,
-                    deletedArtifactIDs: [],
-                    receipts: [CognitiveReceiptWrite(
-                        kind: "microcycle",
-                        payload: .object([
-                        "reason": .string(bounded(reason, maxCharacters: 120)),
-                        "workspaceCount": .int(Int64(workspace.items.count)),
-                        "inhibitedCount": .int(Int64(workspace.inhibitedNodeIds.count)),
-                        ])
-                    )],
-                    at: workspace.generatedAt
-                )
-            }
-        } catch {
-            if dirtySince == nil { dirtySince = priorDirtySince }
-            if flushedPresentation { capsulePresentationDirty = true }
-            throw error
-        }
-        return workspace
-    }
-
-    /// Wave D overnight consolidation self-gate: at most once per ~20h, riding the existing
-    /// maintenance cadence (no new loop/timer).
-    static let emotionalConsolidationInterval: TimeInterval = 20 * 60 * 60
-
-    public func runMaintenance(reason: String) async {
-        _ = try? await runMaintenanceChecked(reason: reason)
-    }
-
-    /// Pure, mutation-free deadline projection over the existing cognition
-    /// owners. Continuous decay is already analytic at every read. Maintenance
-    /// is due at the existing 20-hour emotional consolidation boundary.
-    public func maintenanceOpportunity() -> CognitiveMaintenanceOpportunity {
-        currentMaintenanceOpportunity(at: dependencies.now())
-    }
-
-    @discardableResult
-    public func runMaintenanceChecked(reason: String) async throws -> Bool {
-        guard configuration.enabled else { return false }
-        // R-F2: refuse to start while a microcycle is inside its commit window
-        // (maintenanceCommitInFlight). Combined with the microcycle waiting on
-        // waitForMaintenanceTransition before it begins, this makes the
-        // commit exclusion symmetric — the two can never interleave commits.
-        guard !maintenanceRunInFlight, !maintenanceCommitInFlight else { return false }
-        let now = dependencies.now()
-        guard currentMaintenanceOpportunity(at: now).isDue else { return false }
-        beginMaintenanceTransition()
-        defer { endMaintenanceTransition() }
-        let previousField = field
-        let previousAffect = affect
-        let previousConsolidationAt = lastEmotionalConsolidationAt
-        let previousDisposition = disposition
-        let previousPatternNudgeDay = resolutionPatternNudgeDay
-        let initialDirtyRevision = dirtyRevision
-
-        // One checkpoint operation materializes the same full affect projection
-        // that live reads use (base decay + quiet calming + warm-presence floor).
-        _ = decayAffectInMemory(to: now)
-
-        var artifacts: [CognitiveArtifactWrite] = []
-        var receipts: [CognitiveReceiptWrite] = []
-        var stagedTimelineEvents: [CognitiveDevelopmentalTimelineEvent] = []
-        if configuration.enabled {
-            artifacts.append(CognitiveArtifactWrite(
-                kind: "affect",
-                id: stableArtifactID("affect"),
-                status: "current",
-                score: affect.arousal,
-                payload: affect.toJSON(
-                    lastUserPresenceAt: lastUserPresenceAt,
-                    lastWarmPresenceAt: lastWarmPresenceAt
-                )
-            ))
-        }
-        if let consolidation = consolidateEmotionalArousalIfDueInMemory(reason: reason, at: now) {
-            artifacts.append(contentsOf: consolidation.artifacts)
-            receipts.append(contentsOf: consolidation.receipts)
-            stagedTimelineEvents.append(contentsOf: consolidation.timelineEvents)
-        }
-
-        let nodes = field.snapshot(at: now, configuration: configuration)
-        publishAttentionProjection(at: now)
-        receipts.append(CognitiveReceiptWrite(
-            kind: "maintenance",
-            payload: .object([
-                "reason": .string(bounded(reason, maxCharacters: 120)),
-                "nodeCount": .int(Int64(nodes.count)),
-            ])
-        ))
-
-        guard configuration.persistenceEnabled else { return true }
-        do {
-            try await persistMaintenanceTransition(
-                nodes: nodes,
-                artifacts: artifacts,
-                deletedArtifactIDs: [],
-                receipts: receipts,
-                at: now
-            )
-        } catch {
-            // The SQLite transaction has already rolled back. Revert the
-            // bounded in-memory transition only when no reentrant live event
-            // changed that family while the store actor was committing.
-            if dirtyRevision == initialDirtyRevision {
-                field = previousField
-                affect = previousAffect
-                removeTimelineEventsIfMatching(stagedTimelineEvents)
-                lastEmotionalConsolidationAt = previousConsolidationAt
-                disposition = previousDisposition
-                resolutionPatternNudgeDay = previousPatternNudgeDay
-            }
-            publishAttentionProjection(at: dependencies.now())
-            throw error
-        }
-        return true
-    }
-
-    private func currentMaintenanceOpportunity(at now: Date) -> CognitiveMaintenanceOpportunity {
-        guard configuration.enabled else {
-            return CognitiveMaintenanceOpportunity(generatedAt: now)
-        }
-        var dueReasons: [String] = []
-        var futureDeadlines: [Date] = []
-
-        if configuration.enabled {
-            let consolidationAt = lastEmotionalConsolidationAt?
-                .addingTimeInterval(Self.emotionalConsolidationInterval) ?? now
-            if consolidationAt <= now {
-                dueReasons.append("emotional_consolidation")
-            } else {
-                futureDeadlines.append(consolidationAt)
-            }
-        }
-
-        return CognitiveMaintenanceOpportunity(
-            generatedAt: now,
-            dueReasons: dueReasons,
-            nextMaintenanceAt: dueReasons.isEmpty ? futureDeadlines.min() : now
-        )
-    }
-
-    private struct EmotionalConsolidationTransition {
-        var artifacts: [CognitiveArtifactWrite]
-        var receipts: [CognitiveReceiptWrite]
-        var timelineEvents: [CognitiveDevelopmentalTimelineEvent]
-    }
-
-    /// Overnight emotional consolidation (Wave D), gated to run once per ~20h on the
-    /// existing maintenance cadence. Softens stale high-arousal charges and gently sustains
-    /// what keeps recurring — AROUSAL ONLY; valence/warmth/content are never touched. Gated
-    /// on `affectEnabled` (with affect off, no tags are ever stamped, so the sweep is a
-    /// no-op anyway and mood/emotion stays fully off).
-    ///
-    /// The sweep runs even when 0 nodes qualify so the cadence tick is observable (gate +
-    /// artifact + receipt with zero counts), but the timeline event is skipped on a
-    /// zero-count sweep so her timeline carries no noise.
-    private func consolidateEmotionalArousalIfDueInMemory(
-        reason: String,
-        at now: Date
-    ) -> EmotionalConsolidationTransition? {
-        guard configuration.enabled else { return nil }
-        if let last = lastEmotionalConsolidationAt,
-           now.timeIntervalSince(last) < Self.emotionalConsolidationInterval {
-            return nil
-        }
-        let previousTick = lastEmotionalConsolidationAt
-        let counts = field.consolidateEmotionalArousal(at: now, configuration: configuration)
-        lastEmotionalConsolidationAt = now
-        // Round 3 Wave A3 — the slow layer learns from resolution PATTERNS.
-        // A path that keeps disappointing her (≥3 felt disappointments in
-        // 48h) leaves a settled negative undertone; a path she keeps bracing
-        // for that keeps landing fine teaches the body the dread was
-        // oversized. Routes through the SAME disposition cap + day-scale decay
-        // as every other writer, reads only her own felt-resolution nodes, and
-        // fires AT MOST ONCE per (path, kind) per day — the growth gate stops
-        // the same moments re-nudging, the day claim stops genuine same-day
-        // growth from a second nudge (review bf74aecde2fa).
-        var artifacts: [CognitiveArtifactWrite] = []
-        let dayKey = Self.resolutionPatternDayKey(at: now)
-        if let hit = resolutionPatternHit(at: now, newerThan: previousTick),
-           resolutionPatternNudgeDay[hit.claimKey] != dayKey {
-            let decayed = decayedDispositionValence(at: now)
-            let cap = dynamics.dispositionValenceCap
-            let next = min(cap, max(-cap, decayed + hit.tone * dynamics.dispositionNudgeMagnitude))
-            disposition = CognitiveDisposition(valence: next, updatedAt: now)
-            // Claim the day and drop every stale (prior-day) claim so the map
-            // stays a handful of entries at most.
-            resolutionPatternNudgeDay[hit.claimKey] = dayKey
-            resolutionPatternNudgeDay = resolutionPatternNudgeDay.filter { $0.value == dayKey }
-            artifacts.append(CognitiveArtifactWrite(
-                kind: "disposition",
-                id: stableArtifactID("disposition"),
-                status: "current",
-                score: (next + 1) / 2,
-                payload: dispositionArtifactPayload(at: now)
-            ))
-        }
-        artifacts.append(CognitiveArtifactWrite(
-            kind: "emotional_consolidation",
-            id: stableArtifactID("emotional_consolidation"),
-            status: "current",
-            score: Double(counts.reinforced + counts.calmed),
-            payload: .object([
-                "ranAt": .double(now.timeIntervalSince1970),
-                "reinforced": .int(Int64(counts.reinforced)),
-                "calmed": .int(Int64(counts.calmed)),
-            ])
-        ))
-        let receipts = [CognitiveReceiptWrite(
-            kind: "emotional_consolidation",
-            payload: .object([
-                "reason": .string(bounded(reason, maxCharacters: 120)),
-                "reinforced": .int(Int64(counts.reinforced)),
-                "calmed": .int(Int64(counts.calmed)),
-            ])
-        )]
-        // Only surface a timeline event when the sweep actually moved something (no noise
-        // in her Observatory timeline for a zero-count cadence tick). Reuses the existing,
-        // currently-unemitted `.replayRun` kind — overnight consolidation IS an offline
-        // replay-style reprocessing pass, and every decode site tolerates the kind (it is
-        // an existing enum case; the only JSON-rawValue decode, restoreDevelopmentalTimeline,
-        // skips unknown kinds, and the Observatory view renders kind.rawValue as plain text).
-        var timelineEvents: [CognitiveDevelopmentalTimelineEvent] = []
-        if counts.reinforced > 0 || counts.calmed > 0 {
-            // The per-run date rides in the summary: the timeline event ID seeds on
-            // kind + artifactId + summary, and this sweep's artifact ID is stable —
-            // without a per-run token two nights with identical counts would collapse
-            // into one upserted event (gpt-5.5 review, 2026-07-02). Human-readable on
-            // purpose; it's her Observatory timeline.
-            let formatter = DateFormatter()
-            formatter.locale = Locale(identifier: "en_US_POSIX")
-            formatter.timeZone = .current
-            formatter.dateFormat = "yyyy-MM-dd HH:mm zzz"
-            let event = recordTimelineEventInMemory(
-                kind: .replayRun,
-                title: "Overnight emotional consolidation",
-                summary: "softened \(counts.calmed), sustained \(counts.reinforced) · \(formatter.string(from: now))",
-                artifactId: stableArtifactID("emotional_consolidation"),
-                lineageId: "emotional_consolidation",
-                externalEvidenceIds: []
-            )
-            timelineEvents.append(event)
-            artifacts.append(CognitiveArtifactWrite(
-                kind: "developmental_timeline",
-                id: event.id,
-                status: "recorded",
-                score: 0.5,
-                payload: event.toJSON()
-            ))
-        }
-        return EmotionalConsolidationTransition(
-            artifacts: artifacts,
-            receipts: receipts,
-            timelineEvents: timelineEvents
-        )
     }
 
     func evictSpentVerificationNodes(before event: CognitiveEvent, at now: Date) -> Int {
@@ -604,17 +198,8 @@ extension CognitiveSubstrate {
         return evicted
     }
 
-    func workspaceEligible(
-        _ node: CognitiveNode,
-        currentSessionId: String?,
-        at now: Date,
-        turnKind resolvedTurnKind: CognitiveTurnKind? = nil
-    ) -> Bool {
-        // ONE RULE, NOT A SECOND COPY OF IT. Workspace eligibility has always
-        // been exactly "is this part of her lived state", spelled out a second
-        // time — so a new turn kind had to be remembered in two places or the
-        // two would disagree. It asks the enum now.
-        return (resolvedTurnKind ?? node.turnKind).contributesToLivedState
+    func workspaceEligible(_ node: CognitiveNode) -> Bool {
+        node.turnKind.contributesToLivedState
     }
 
     func capsuleEligibleWorkspaceNode(_ node: CognitiveNode) -> Bool {
@@ -688,8 +273,7 @@ extension CognitiveSubstrate {
     func workspaceScore(
         for node: CognitiveNode,
         mood: CognitiveMoodReading,
-        affect currentAffect: CognitiveAffectState,
-        turnKind resolvedTurnKind: CognitiveTurnKind? = nil
+        affect currentAffect: CognitiveAffectState
     ) -> Double {
         let kindBoost: Double
         switch node.kind {
@@ -703,12 +287,11 @@ extension CognitiveSubstrate {
         let affectBoost = configuration.enabled
             ? min(0.12, currentAffect.taskPressure * 0.08 + currentAffect.uncertainty * 0.04)
             : 0
-        // Wave C mood-congruent recall — small, gated to felt nodes under a non-neutral
-        // mood; 0 otherwise (byte-identical for legacy/neutral).
+        // Mood congruence applies only to felt nodes under a non-neutral mood.
         let congruence = moodCongruence(for: node, mood: mood)
         let base = node.activation * 0.45 + node.salience * 0.35 + node.confidence * 0.2 + kindBoost + affectBoost + congruence
         let turnKindMultiplier: Double
-        switch resolvedTurnKind ?? node.turnKind {
+        switch node.turnKind {
         case .live: turnKindMultiplier = 1
         case .system: turnKindMultiplier = 0.5
         case .debug: turnKindMultiplier = 0.05
@@ -724,21 +307,19 @@ extension CognitiveSubstrate {
         for node: CognitiveNode,
         associatedNodeIds: Set<UUID>,
         mood: CognitiveMoodReading,
-        affect currentAffect: CognitiveAffectState,
-        turnKind resolvedTurnKind: CognitiveTurnKind? = nil
+        affect currentAffect: CognitiveAffectState
     ) -> [String] {
         var reasons = ["activation", "salience"]
         if node.confidence >= 0.8 { reasons.append("high-confidence") }
         if node.kind == .correction { reasons.append("correction-priority") }
-        let turnKind = resolvedTurnKind ?? node.turnKind
+        let turnKind = node.turnKind
         if turnKind != .live { reasons.append("turn-\(turnKind.rawValue)") }
         if configuration.enabled && currentAffect.taskPressure > 0.4 { reasons.append("task-pressure") }
         if associatedNodeIds.contains(node.id) { reasons.append("spreading-activation") }
-        // Wave C: a meaningful mood-congruent contribution is named so provenance is honest.
+        // Name meaningful mood-congruent contributions in the provenance.
         if moodCongruence(for: node, mood: mood) > Self.moodCongruenceReasonThreshold {
             reasons.append("mood-congruent")
         }
         return reasons
     }
-
 }

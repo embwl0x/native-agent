@@ -14,10 +14,9 @@ extension MacSyncActionRouter {
         guard let session = NativeAgentChatSessionID.normalizedPathComponent(payload["sessionId"]) else {
             return ["status": "error", "ok": "false", "message": "Name the chat session."]
         }
-        let generation = try await sync.host.getChatSessions().first { $0.id == session }?.transcriptGeneration
+        let generation = try await sync.host.getChatTranscriptGenerations()[session] ?? nil
         let messages = try await sync.host.getChatMessages(sessionId: session)
-        guard let after = try await sync.host.getChatSessions().first(where: { $0.id == session }),
-              after.transcriptGeneration == generation else {
+        guard let after = try await sync.host.getChatTranscriptGenerations()[session], after == generation else {
             throw DeviceSyncError.underlying(message: "This chat changed while its history was being read. Refresh it.")
         }
         func position(_ key: String) -> Int? {
@@ -39,7 +38,7 @@ extension MacSyncActionRouter {
             end = messages.count
         }
         let limit = min(max(Int(payload["limit"] ?? "") ?? 80, 1), 80)
-        func response(_ rows: [DeviceSyncTranscriptRow], start: Int) throws -> [String: String] {
+        func response(_ rows: [ChatMessageRecord], start: Int) throws -> [String: String] {
             let data = try MobileSnapshotBuilder.encoder().encode(rows)
             var result = ["status": "ok", "ok": "true", "messages": String(decoding: data, as: UTF8.self),
                           "hasOlder": String(messages[..<start].contains(where: \.isPersonVisible))]
@@ -54,30 +53,30 @@ extension MacSyncActionRouter {
             } catch DeviceSyncError.payloadTooLarge { return false }
         }
         var start = end
-        var rows: [DeviceSyncTranscriptRow] = []
+        var rows: [ChatMessageRecord] = []
         var taken = 0
         while start > 0, taken < limit {
             // A row that is hers alone is skipped, not counted: it still
             // anchors paging (an older phone may hold its id) but is not shown.
             guard messages[start - 1].isPersonVisible else { start -= 1; continue }
-            var row = DeviceSyncTranscriptRow(message: messages[start - 1])
+            var row = messages[start - 1]
             var candidate = try response([row] + rows, start: start - 1)
             if try !fits(candidate) {
                 // Preserve transcript words and rows before optional images.
-                row.message.omitAttachmentPreviews()
-                for index in rows.indices { rows[index].message.omitAttachmentPreviews() }
+                row.omitAttachmentPreviews()
+                for index in rows.indices { rows[index].omitAttachmentPreviews() }
                 candidate = try response([row] + rows, start: start - 1)
             }
             if try !fits(candidate) {
                 guard rows.isEmpty else { break }
-                var content = row.message.content
+                var content = row.content
                 repeat {
                     guard !content.isEmpty else {
                         throw DeviceSyncError.payloadTooLarge(actualBytes: try JSONEncoder().encode(candidate).count,
                             maximumBytes: Self.historyPageByteBudget)
                     }
                     content = String(content.prefix(content.count / 2))
-                    row.message.content = content + "\n\nThe rest is on the Mac."
+                    row.content = content + "\n\nThe rest is on the Mac."
                     candidate = try response([row], start: start - 1)
                 } while try !fits(candidate)
             }

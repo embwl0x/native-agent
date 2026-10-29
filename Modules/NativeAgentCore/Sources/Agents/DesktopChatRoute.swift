@@ -4,15 +4,11 @@ import AgentConversations
 import MacControl
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `DesktopChatRoute.swift` | Recipe-bound conversation selection, send confirmation and learned reads; MacControl owns bounded window/subtree reads, attributes, activation, AX mutations and input construction/emission; control searches exclude the message log, and incomplete reads remain read failures through waits and delivery receipts; shared desktop observation preserves reply quiet, title and setup deadlines, including a final condition read; answered receipts name the read method and wake; uncertain delivery without automatic resend; sends and late readers preserve produced text and release their resources through `settle` |
+import NativeAgentShared
+// Blueprint: | `DesktopChatRoute.swift` | Recipe-bound conversation selection, send confirmation and learned reads; deepest exact-title entries come from one bounded postorder snapshot; MacControl owns window/subtree reads, attributes, activation, AX mutations and input construction/emission; control searches exclude the message log, and incomplete reads remain read failures through waits and delivery receipts; shared desktop observation preserves reply quiet, title and setup deadlines, including a final condition read; answered receipts name the read method and wake; uncertain delivery without automatic resend; sends and late readers preserve produced text and release their resources through `settle` |
 
-/// A chat app driven through its own window, by the labels its recipe names
-/// (agents/recipes/<host>.json, `desktopChat`). The agent gets a side chat of
-/// her own there; every message selects that chat by its title, types into it,
-/// and reads the answer back from it — never from any other chat. Seen on the
-/// first such app (09-22): the composer is one AX button whose title is its
-/// whole text ("Message Attach file Dictate a message Send" when empty), so
-/// text goes in by click and paste.
+/// Recipe-bound desktop chat (`agents/recipes/<host>.json`, `desktopChat`):
+/// select the agent's side chat, submit input, and read the answer from that chat.
 @MainActor public struct DesktopChatRoute {
     enum Blocker: String, Error {
         case offline = "{app} isn't open. Open {app} and show its chat before sending. Nothing was sent."
@@ -162,7 +158,7 @@ import PersistenceCore
     func controls() async throws {
         try await showWindow()
         try await showSideChats()
-        _ = try composer()
+        _ = try composer(walk(window()))
         guard try !buttons({ MacAXAttributeRead.text($0, kAXTitleAttribute) == ui.newChat }).isEmpty else { throw Mismatch(key: "newChat", wanted: ui.newChat) }
     }
 
@@ -196,7 +192,7 @@ import PersistenceCore
     func unconfirmed(_ before: Int?, name: String) -> (detail: String, fields: [String: JSONValue]) {
         let unsure = "The message may have gone out; check \(name)'s chat in \(appName) and don't resend it."
         let rows: [AXUIElement]
-        do { rows = try logRows() }
+        do { rows = try logRows(walk(window())) }
         catch { return (error.localizedDescription + " " + unsure, ["reason": .string("accessibility_read_incomplete")]) }
         guard let before, rows.count > before else {
             // Nothing came: today's words, and the window's labels for the fix.
@@ -281,7 +277,6 @@ import PersistenceCore
                 }
                 if submissionConfirmed {
                     if !stopped, let blocker = error as? Blocker, [.moved, .timeout].contains(blocker) {
-                        // User 10-07: an answer is delivered whenever it comes.
                         if let live, let row = live.recordID, let operation = live.operationID,
                            let occurrence = Self.lastOccurrence, let events = try? MacAppSourceEvents(bundleID: bundleID) {
                             let receipt = await uncertain(Blocker.named(Blocker.late, name, app: appName), ["reply_observation": .string("running")])
@@ -313,7 +308,7 @@ import PersistenceCore
                 }
                 if let blocker = error as? Blocker {
                     if [.moved, .timeout, .submission].contains(blocker) || Self.pressedReturn { return await uncertain(blocker.detail(name, app: appName)) }
-                    // Say what the app shows instead of its chat (09-25: a forced-update alert over its login window).
+                    // Describe what the app shows when its chat is unavailable.
                     let shown = blocker == .window ? try? await MacAccessibilityReader.read { showing() } : nil
                     let detail = shown.map { "\(appName) isn't showing its chat; it shows \($0). Nothing was sent." }
                     var result: [String: JSONValue] = ["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(detail ?? blocker.detail(name, app: appName))]
@@ -339,21 +334,24 @@ import PersistenceCore
         try await showWindow()
         var (reopen, chat) = try await openThread(thread, first: first)
         Self.lastChat = chat
-        let key = String(flat(message).prefix(40))
-        func mine(_ turns: [Turn]) -> Int? { turns.lastIndex { $0.user && flat($0.text).hasPrefix(key) } }
-        func sent() throws -> Int { try turns().filter { $0.user && flat($0.text).hasPrefix(key) }.count }
+        let key = flat(message)
+        func sent() throws -> Int { try turns(walk(window())).filter { $0.user && flat($0.text) == key }.count }
         func ownsChat() throws -> Bool {
-            let all = try turns()
+            let all = try turns(walk(window()))
             return thread == nil ? all.isEmpty : opensWith(all, first)
         }
         var rows: Int?
         let before = try await typeAndSubmit(message, chat: chat ?? untitled, reopen: reopen, ownsChat: ownsChat,
-                                             count: { rows = try? logRows().count; return try sent() })
+                                             count: { rows = try? logRows(walk(window())).count; return try sent() })
+        // An additional exact outgoing row confirms submission, not answer delivery.
         do {
             try await until(seconds: 15) { try sent() > before }
         } catch let failure as MacAccessibilityReader.NativeReadFailure { throw failure }
         catch { throw Unconfirmed(rows: rows) }
         Self.lastOccurrence = before
+        func mine(_ turns: [Turn]) -> Int? {
+            turns.indices.filter { turns[$0].user && flat(turns[$0].text) == key }.dropFirst(before).first
+        }
         didSubmit()
         let events = try DesktopRouteObservation(bundleID: bundleID)
         defer { events.stop() }
@@ -372,8 +370,10 @@ import PersistenceCore
             var wake = deadline
             if let index = mine(all) {
                 Self.lastChat = title ?? Self.lastChat
-                let reply = all[(index + 1)...].filter { !$0.user }.map(\.text).joined(separator: "\n\n")
+                let after = all[(index + 1)...].prefix { !$0.user }
+                let reply = after.map(\.text).joined(separator: "\n\n")
                 Self.lastReply = reply
+                guard all[(index + 1)...].allSatisfy({ !$0.user }) else { throw Blocker.moved }
                 if reply != last { last = reply; stableSince = Date() }
                 if !reply.isEmpty, !snapshot.generating {
                     let quiet = stableSince.addingTimeInterval(3)
@@ -396,7 +396,7 @@ import PersistenceCore
     /// `occurrence`: which of her same-text messages in that chat this send was.
     func lateAnswer(_ message: String, occurrence: Int, first: String?, peerID: String, row: String, operation: String,
                     events: MacAppSourceEvents, receipt: JSONValue, dataRoot: URL) async {
-        let key = String(flat(message).prefix(40))
+        let key = flat(message)
         var fields: [String: JSONValue] = if case .object(let fields) = receipt { fields } else { [:] }
         var answer: String?
         do {
@@ -412,7 +412,7 @@ import PersistenceCore
                 Self.busy = false
                 guard opensWith(snapshot.turns, first) else { continue }
                 let all = snapshot.turns
-                let mine = all.indices.filter { all[$0].user && flat(all[$0].text).hasPrefix(key) }
+                let mine = all.indices.filter { all[$0].user && flat(all[$0].text) == key }
                 guard mine.count > occurrence else { continue }
                 let index = mine[occurrence]
                 let text = all[(index + 1)...].prefix { !$0.user }.map(\.text).joined(separator: "\n\n")
@@ -468,30 +468,25 @@ import PersistenceCore
         var saved = firsts(peerID: peerID, dataRoot: dataRoot)
         if let thread, thread != title { saved[thread] = nil }
         saved[title] = first
-        try? FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? JSONEncoder().encode(saved).write(to: file, options: .atomic)
+        try? SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(saved), to: file)
     }
 
-    /// Her chat by its saved title, or a new side chat on first use. Returns
-    /// true when her chat's list entry still has to be clicked: the app ignores
-    /// AXPress and background clicks on entries (09-22), so that click happens
-    /// in front, in the same brief window as typing.
-    /// Also returns the chat's title now: when the app has renamed her chat, the
-    /// one it marks current is hers only if its first user turn is exactly her saved first message.
+    /// Select her saved side chat or create one; a rename must match her exact first user turn.
+    /// `reopen` requires a foreground click on the chat's list entry before typing.
     func openThread(_ thread: String?, first: String?) async throws -> (reopen: Bool, chat: String?) {
-        let open = try openTitle()
+        let open = try openTitle(walk(window()))
         if let thread, open == thread {
-            guard try opensWith(turns(), first) else { throw Blocker.thread }
+            guard try opensWith(turns(walk(window())), first) else { throw Blocker.thread }
             return (false, thread)
         }
-        let openIsHers = try thread != nil && opensWith(turns(), first)
+        let openIsHers = try thread != nil && opensWith(turns(walk(window())), first)
         try await showSideChats()
         if let thread {
             let saved = try sideChatEntries(named: thread).count
             if saved == 1 { return (true, thread) }
             guard let open, open != untitled, openIsHers, try sideChatEntries(named: open).count == 1 else {
                 // Gone only when the side-chat list is shown and has no entry by that title.
-                if saved == 0, try sideChatsPanel() != nil { throw Blocker.missing }
+                if saved == 0, try sideChatsPanel(walk(window())) != nil { throw Blocker.missing }
                 throw Blocker.thread
             }
             return (true, open)
@@ -499,7 +494,7 @@ import PersistenceCore
             let new = try buttons { MacAXAttributeRead.text($0, kAXTitleAttribute) == ui.newChat }
             if new.isEmpty { throw Mismatch(key: "newChat", wanted: ui.newChat) }
             guard new.count == 1, try SystemMacAXActSource().performNative(new[0], action: kAXPressAction).get() == .success else { throw Blocker.thread }
-            try await until(seconds: 5, else: Blocker.thread) { try openTitle() == untitled && turns().isEmpty }
+            try await until(seconds: 5, else: Blocker.thread) { try openTitle(walk(window())) == untitled && turns(walk(window())).isEmpty }
             return (false, nil)
         }
     }
@@ -507,23 +502,18 @@ import PersistenceCore
     func showSideChats() async throws {
         if let back = try buttons({ MacAXAttributeRead.text($0, kAXTitleAttribute) == ui.backToMain }).first {
             guard try SystemMacAXActSource().performNative(back, action: kAXPressAction).get() == .success else { throw Blocker.thread }
-            try await until(seconds: 5, else: Blocker.thread) { try headerTitle() == nil }
+            try await until(seconds: 5, else: Blocker.thread) { try headerTitle(walk(window())) == nil }
         }
-        if try sideChatsPanel() == nil {
+        if try sideChatsPanel(walk(window())) == nil {
             guard let open = try buttons({ MacAXAttributeRead.text($0, kAXTitleAttribute).hasPrefix(ui.chatsButton) }).first else { throw Mismatch(key: "chatsButton", wanted: ui.chatsButton) }
             guard try SystemMacAXActSource().performNative(open, action: kAXPressAction).get() == .success else { throw Blocker.window }
-            try await until(seconds: 5, else: Mismatch(key: "chatsPanel", wanted: ui.chatsPanel)) { try sideChatsPanel() != nil }
+            try await until(seconds: 5, else: Mismatch(key: "chatsPanel", wanted: ui.chatsPanel)) { try sideChatsPanel(walk(window())) != nil }
         }
     }
 
-    /// Type with the app in front (its composer only takes real input), then
-    /// give the front back to whoever had it.
-    /// Returns `count` as read in her verified-open chat just before input.
+    /// Type with the app in front, then restore the prior front app.
     func typeAndSubmit(_ message: String, chat: String, reopen: Bool, ownsChat: () throws -> Bool, count: () throws -> Int) async throws -> Int {
-        // The app's box label never shows its text and drops "Send" in some states
-        // (09-22: User's main chat read "Message Attach file Dictate a message"),
-        // so no draft check here: select-all + paste in her own chat replaces it.
-        _ = try composer()
+        _ = try composer(walk(window()))
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first else { throw Blocker.offline }
         // Register before reading keyboard idle. Input renews the same two-second
         // quiet deadline, with the existing five-second overall limit.
@@ -597,20 +587,15 @@ import PersistenceCore
             let entries = try sideChatEntries(named: chat)
             guard entries.count == 1 else { throw Blocker.thread }
             try click(entries[0])
-            // 09-22: wait for her log too, so the baseline below counts her rows, not a half-loaded log's.
-            try await until(seconds: 5, else: Blocker.thread) { try openTitle() == chat && !turns().isEmpty }
+            // Wait for the selected chat's log to load before counting its rows.
+            try await until(seconds: 5, else: Blocker.thread) { try openTitle(walk(window())) == chat && !turns(walk(window())).isEmpty }
         }
         // Activation can change the window: verify her opening message before any input.
-        guard try openTitle() == chat, try ownsChat() else { throw Blocker.thread }
-        // 09-22: baseline taken here, in her chat; counted in whatever chat was open
-        // before the reopen, an older same-prefix row of hers could confirm as new.
+        guard try openTitle(walk(window())) == chat, try ownsChat() else { throw Blocker.thread }
+        // Count the loaded log in her verified chat immediately before input.
         let before = try count()
-        // The app never exposes the box's text (its label stays "Message …"), so a
-        // draft can't be seen; this is her own side chat, so select-all + paste
-        // replaces whatever is in her box. Delivery is proven after Return by
-        // her "User message:" row appearing (see send()).
-        // The app ignores postToPid key events (09-22 live test), so keys use the
-        // HID tap with the app re-checked frontmost immediately before each one.
+        // Draft text is unavailable; select-all and paste replace her side-chat composer.
+        // Use HID input, checking frontmost ownership before each event.
         func keys(_ code: CGKeyCode, flags: CGEventFlags = []) throws {
             guard let events = sink.keyEvents(code, flags: flags) else { throw Blocker.typing }
             for event in events {
@@ -619,7 +604,7 @@ import PersistenceCore
                 sink.postNative(event)
             }
         }
-        try click(composer().node)
+        try click(composer(walk(window())).node)
         try await Task.sleep(for: .milliseconds(300))
         let pasteboard = NSPasteboard.general
         let saved = try AX.copyPasteboard(pasteboard)
@@ -635,20 +620,18 @@ import PersistenceCore
         }
         guard wrote else { throw Blocker.typing }
         // User can switch chats during the pauses: recheck hers before select-all and before Return.
-        guard try openTitle() == chat, try ownsChat() else { throw Blocker.thread }
+        guard try openTitle(walk(window())) == chat, try ownsChat() else { throw Blocker.thread }
         try keys(0, flags: .maskCommand)   // select all in her box
         try keys(9, flags: .maskCommand)   // paste
         try await Task.sleep(for: .milliseconds(400))
-        guard try openTitle() == chat, try ownsChat() else { throw Blocker.thread }
+        guard try openTitle(walk(window())) == chat, try ownsChat() else { throw Blocker.thread }
         Self.pressedReturn = true
         try keys(36)
         try await Task.sleep(for: .milliseconds(300))
         return before
     }
 
-    /// First use: wait briefly for the app to name the new chat. Every exchange
-    /// returns the title the chat shows now (2026-09-22: the app renames chats
-    /// after the first minutes, and a stale saved title broke the next send).
+    /// Wait briefly for a new chat's name; return its current title on every exchange.
     func settledTitle(_ thread: String?, first: String?) async throws -> String {
         let events = thread == nil ? try DesktopRouteObservation(bundleID: bundleID) : nil
         defer { events?.stop() }
@@ -665,15 +648,34 @@ import PersistenceCore
 
     // MARK: - Reading the window
 
+    /// Send-only couriers share this recipe's native outgoing-row reader.
+    /// Composer values never enter `turns`; a missing recipe or changed chat
+    /// supplies no delivery evidence. Couriers may still submit without a
+    /// reader, leaving delivery unconfirmed.
+    static func outgoingOccurrences(_ message: String, bundle: String, label: String) async throws -> Int? {
+        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == bundle,
+              let recipe = AgentRecipeStore.recipes.first(where: { $0.host.bundleIDs.contains(bundle) && $0.host.desktopChat != nil }),
+              let ui = recipe.host.desktopChat else { return nil }
+        let route = Self(recipe: recipe, bundleID: bundle, ui: ui)
+        let read = try await route.passiveRead()
+        guard read.title == label else { return nil }
+        return read.turns.filter { $0.user && route.flat($0.text) == route.flat(message) }.count
+    }
+
     struct Turn: Sendable { let user: Bool; let text: String }
 
     struct Read: Sendable { let turns: [Turn]; let title: String?; let generating: Bool }
 
     func passiveRead() async throws -> Read {
         try await MacAccessibilityReader.read {
-            let title = try openTitle()
-            let read = try Read(turns: turns(), title: title, generating: generating())
-            guard try openTitle() == title else { throw Blocker.moved }
+            let tree = try walk(window())
+            let title = try openTitle(tree)
+            let answering = try composer(tree).title.hasSuffix(" " + ui.stop) || tree.contains { button in
+                MacAXAttributeRead.text(button, kAXRoleAttribute) == kAXButtonRole
+                    && [kAXTitleAttribute, kAXDescriptionAttribute].contains { MacAXAttributeRead.text(button, $0).hasPrefix(ui.stop) }
+            }
+            let read = try Read(turns: turns(tree), title: title, generating: answering)
+            guard try openTitle(walk(window())) == title else { throw Blocker.moved }
             return read
         }
     }
@@ -681,11 +683,8 @@ import PersistenceCore
     /// Keys and paste on a locked Mac would go to the lock screen's password field.
     /// The screensaver sets the same flag, so it is woken first.
     func unlocked() async throws {
-        try await MacScreenLock.wakeIfCovered()
-        // Fail closed: no session dictionary, or no proof it is on console and unlocked, sends nothing.
-        guard let session = CGSessionCopyCurrentDictionary() as? [String: Any],
-              session["kCGSSessionOnConsoleKey"] as? Bool == true,
-              session["CGSSessionScreenIsLocked"] as? Bool != true else { throw Blocker.locked }
+        let session = try await MacScreenLock.wakeIfCovered().after
+        guard session.sessionReadable, session.onConsole, !session.screenIsLocked else { throw Blocker.locked }
     }
 
     nonisolated func windows() throws -> [AXUIElement] {
@@ -712,7 +711,7 @@ import PersistenceCore
 
     nonisolated func hasLog(_ window: AXUIElement) throws -> Bool { try walk(window).contains { MacAXAttributeRead.text($0, kAXTitleAttribute) == ui.log } }
 
-    /// The window holding the chat log (09-22: a Settings window beside it failed as "signed out").
+    /// The window holding the chat log.
     nonisolated func window() throws -> AXUIElement {
         let all = try windows()
         if all.count == 1 { return all[0] }
@@ -741,8 +740,7 @@ import PersistenceCore
     }
 
     /// The window's elements without descending into the message log: a long
-    /// chat otherwise exhausts a bounded walk before the side-chat controls
-    /// (09-22: User's main chat hid "New side chat"). The log node itself is kept.
+    /// chat otherwise exhausts a bounded walk. The log node itself is kept.
     nonisolated func walk(_ root: AXUIElement) throws -> [AXUIElement] {
         try MacAccessibilityReader.elements(in: root, searching: "the desktop chat controls") {
             MacAXAttributeRead.text($0, kAXTitleAttribute) != self.ui.log
@@ -753,9 +751,9 @@ import PersistenceCore
         try walk(window()).filter { MacAXAttributeRead.text($0, kAXRoleAttribute) == kAXButtonRole && match($0) }
     }
 
-    nonisolated func composer() throws -> (title: String, node: AXUIElement) {
+    nonisolated func composer(_ tree: [AXUIElement]) throws -> (title: String, node: AXUIElement) {
         // While the app replies its Send button reads "Stop", so match the stable part.
-        let boxes = try buttons { MacAXAttributeRead.text($0, kAXTitleAttribute).contains(ui.composerCore) }
+        let boxes = tree.filter { MacAXAttributeRead.text($0, kAXRoleAttribute) == kAXButtonRole && MacAXAttributeRead.text($0, kAXTitleAttribute).contains(ui.composerCore) }
         if boxes.isEmpty { throw Mismatch(key: "composerCore", wanted: ui.composerCore) }
         guard boxes.count == 1 else { throw Blocker.window }
         return (MacAXAttributeRead.text(boxes[0], kAXTitleAttribute), boxes[0])
@@ -766,12 +764,11 @@ import PersistenceCore
         return frame
     }
 
-    /// The open side chat's title, beside "Back to main chat"; nil in the main chat.
     /// The open chat's title: the header when the side-chat panel is closed,
     /// else the panel entry the app marks current.
-    nonisolated func openTitle() throws -> String? {
-        if let title = try headerTitle() { return title }
-        guard let panel = try sideChatsPanel() else { return nil }
+    nonisolated func openTitle(_ tree: [AXUIElement]) throws -> String? {
+        if let title = try headerTitle(tree) { return title }
+        guard let panel = try sideChatsPanel(tree) else { return nil }
         return try MacAccessibilityReader.elements(in: panel, searching: "the current desktop chat").first { MacAXAttributeRead.text($0, ui.current) == ui.currentValue }
             .map { entryTitle(MacAXAttributeRead.text($0, kAXTitleAttribute)) }
     }
@@ -788,8 +785,8 @@ import PersistenceCore
         return text
     }
 
-    nonisolated func headerTitle() throws -> String? {
-        guard let back = try buttons({ MacAXAttributeRead.text($0, kAXTitleAttribute) == ui.backToMain }).first,
+    nonisolated func headerTitle(_ tree: [AXUIElement]) throws -> String? {
+        guard let back = tree.first(where: { MacAXAttributeRead.text($0, kAXRoleAttribute) == kAXButtonRole && MacAXAttributeRead.text($0, kAXTitleAttribute) == ui.backToMain }),
               let row = MacAXAttributeRead.parent(back) else { return nil }
         let siblings = try MacAccessibilityReader.childElements(in: row, searching: "the desktop chat header")
         guard let index = siblings.firstIndex(where: { CFEqual($0, back) }) else { return nil }
@@ -797,40 +794,37 @@ import PersistenceCore
             .map { MacAXAttributeRead.text($0, kAXValueAttribute) }
     }
 
-    nonisolated func sideChatsPanel() throws -> AXUIElement? {
-        try walk(window()).first { MacAXAttributeRead.text($0, kAXSubroleAttribute) == "AXLandmarkNavigation" && MacAXAttributeRead.text($0, kAXTitleAttribute) == ui.chatsPanel }
+    nonisolated func sideChatsPanel(_ tree: [AXUIElement]) throws -> AXUIElement? {
+        tree.first { MacAXAttributeRead.text($0, kAXSubroleAttribute) == "AXLandmarkNavigation" && MacAXAttributeRead.text($0, kAXTitleAttribute) == ui.chatsPanel }
     }
 
     /// The deepest pressable entries in the side-chat list that carry exactly this title.
     func sideChatEntries(named title: String) throws -> [AXUIElement] {
-        guard let panel = try sideChatsPanel() else { return [] }
-        func pressable(_ node: AXUIElement) -> Bool {
-            MacAXAttributeRead.copyActions(node).contains(kAXPressAction)
-        }
-        func labelled(_ node: AXUIElement) throws -> Bool {
-            try MacAccessibilityReader.elements(in: node, searching: "the saved desktop chat title").contains { item in [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute].contains { key in
-                let label = MacAXAttributeRead.text(item, key).trimmingCharacters(in: .whitespacesAndNewlines)
-                // The app appends a status to unread entries: "<title> Unread updates".
-                return entryTitle(label) == title } }
-        }
-        let found = try MacAccessibilityReader.elements(in: panel, searching: "the desktop chat entries").filter {
-            try MacAXAttributeRead.text($0, kAXRoleAttribute) != kAXTextFieldRole && pressable($0) && labelled($0)
-        }
-        return found.filter { candidate in
-            !found.contains { other in
-                guard !CFEqual(other, candidate) else { return false }
-                var node = MacAXAttributeRead.parent(other)
-                while let current = node { if CFEqual(current, candidate) { return true }; node = MacAXAttributeRead.parent(current) }
-                return false
+        try MacAccessibilityReader.withReadBudget {
+            guard let panel = try sideChatsPanel(walk(window())) else { return [] }
+            let (source, snapshot) = try MacAccessibilityReader.nativeSnapshot(in: panel, searching: "the desktop chat entries")
+            var labelled: Set<[Int]> = [], entries: Set<[Int]> = [], found: [AXUIElement] = []
+            for node in snapshot.nodes.reversed() {
+                guard let element = node.element.flatMap(source.element) else { throw MacAccessibilityReader.NativeReadFailure(detail: "The desktop chat entry could not be read.") }
+                let matches = labelled.contains(node.path) || [kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute].contains {
+                    entryTitle(MacAXAttributeRead.text(element, $0)) == title
+                }
+                let entry = matches && node.attributes.role != kAXTextFieldRole && MacAXAttributeRead.copyActions(element).contains(kAXPressAction)
+                if entry && !entries.contains(node.path) { found.append(element) }
+                if matches { labelled.insert(Array(node.path.dropLast())) }
+                if entry || entries.contains(node.path) { entries.insert(Array(node.path.dropLast())) }
             }
+            try Task.checkCancellation()
+            guard MacAXLimits.readDeadline.map({ Date() < $0 }) == true else { throw MacAccessibilityReader.NativeReadFailure(detail: "The desktop chat entry search exhausted the shared reader time budget.") }
+            return found.reversed()
         }
     }
 
     /// The open chat's turns, oldest first. Two shapes are live in one log:
     /// "User message: …"/"Assistant message: …" texts, and grouped turns where
     /// the person's starts with "You:" and the assistant's carries "Copy response".
-    nonisolated func turns() throws -> [Turn] {
-        try logRows().compactMap { child in
+    nonisolated func turns(_ tree: [AXUIElement]) throws -> [Turn] {
+        try logRows(tree).compactMap { child in
             if MacAXAttributeRead.text(child, kAXRoleAttribute) == kAXStaticTextRole {
                 let value = MacAXAttributeRead.text(child, kAXValueAttribute)
                 if value.hasPrefix(ui.userPrefix) { return Turn(user: true, text: String(value.dropFirst(ui.userPrefix.count))) }
@@ -848,8 +842,8 @@ import PersistenceCore
     }
 
     /// The open chat's log rows, as the window has them.
-    nonisolated func logRows() throws -> [AXUIElement] {
-        guard let log = try walk(window()).first(where: { MacAXAttributeRead.text($0, kAXTitleAttribute) == ui.log }) else { throw Mismatch(key: "log", wanted: ui.log) }
+    nonisolated func logRows(_ tree: [AXUIElement]) throws -> [AXUIElement] {
+        guard let log = tree.first(where: { MacAXAttributeRead.text($0, kAXTitleAttribute) == ui.log }) else { throw Mismatch(key: "log", wanted: ui.log) }
         return try MacAccessibilityReader.childElements(in: log, searching: "the desktop transcript rows")
     }
 
@@ -858,12 +852,6 @@ import PersistenceCore
             .filter { MacAXAttributeRead.text($0, kAXRoleAttribute) == kAXStaticTextRole }
             .map { MacAXAttributeRead.text($0, kAXValueAttribute) }
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-    }
-
-    nonisolated func generating() throws -> Bool {
-        // While answering, the composer's label ends in " Stop" rather than starting with it.
-        if try composer().title.hasSuffix(" " + ui.stop) { return true }
-        return try !buttons { button in [kAXTitleAttribute, kAXDescriptionAttribute].contains { MacAXAttributeRead.text(button, $0).hasPrefix(ui.stop) } }.isEmpty
     }
 
     /// True only when the chat's first user turn is exactly this saved first message.

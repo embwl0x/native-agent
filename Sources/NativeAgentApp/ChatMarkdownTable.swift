@@ -1,4 +1,4 @@
-import EngineRuntime
+import NativeAgentShared
 import SwiftUI
 
 // Blueprint: | `ChatMarkdownTable.swift` | `ChatMarkdownTableParser` and view: pure prose segmentation, alignment/cell parsing and rendered transcript tables |

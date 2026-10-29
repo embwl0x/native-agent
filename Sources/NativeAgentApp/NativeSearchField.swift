@@ -3,9 +3,7 @@ import SwiftUI
 
 // Blueprint: | `NativeSearchField.swift` | `NativeSearchField`: NSSearchField bridge with native clear/escape/return behavior and explicit focus tokens |
 
-/// The Mac's own search field (NSSearchField): magnifier, placeholder, clear
-/// button, Escape-to-clear and the system look in every appearance (User
-/// 09-27: all controls Mac native).
+/// Native search field with magnifier, placeholder, clear and Escape-to-clear.
 struct NativeSearchField: NSViewRepresentable {
     @Binding var text: String
     var prompt: String
@@ -45,9 +43,9 @@ struct NativeSearchField: NSViewRepresentable {
         }
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
+    func makeCoordinator() -> SearchEdits { SearchEdits(text: $text) }
 
-    final class Coordinator: NSObject, NSSearchFieldDelegate {
+    final class SearchEdits: NSObject, NSSearchFieldDelegate {
         var text: Binding<String>
         var onSubmit: (() -> Void)?
         var onEscape: (() -> Void)?

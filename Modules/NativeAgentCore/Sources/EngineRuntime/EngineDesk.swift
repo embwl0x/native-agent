@@ -6,11 +6,10 @@ import BackgroundLoops
 import TrustCenter
 import ChatTurnRuntime
 import ChatToolRuntime
-import ProviderRouting
+import ChatToolParsing
 import ApprovalTransactions
 import AppToolRuntime
 import Desk
-import WorkflowOrchestration
 import Foundation
 import OSLog
 import Observation
@@ -23,41 +22,7 @@ import ApprovalInbox
 import NativeAgentShared
 import NotificationInbox
 import Experiences
-// Blueprint: | `EngineDesk.swift` | DeskFacade retains one complete board/overview/page snapshot for Mac and DeviceSync, including prepared attention rows and deadlines; engine inbox/approvals/bots supply its lanes. LatestRead orders board, workflow, research and scheduler publication; committed research receipts use write, scheduler repairs fence older reads before checked feed readback. Job observation and refresh coalescing share the retained feed. DeskToolDispatchRouter retains checked routing and the local-click approval filer while dispatching through the canonical part door, including Make's Try again. |
-
-/// Scheduler refreshes come from Desk invalidations, the mounted jobs watcher
-/// and explicit Retry. Keep those refreshes single-flight,
-/// while preserving one edge that arrives during the active read so a mutation
-/// is not lost merely because the first snapshot was still being decoded.
-private struct SchedulerJobsRefreshCoalescer: Equatable {
-    private(set) var isRefreshing = false
-    private(set) var trailingRefreshQueued = false
-
-    mutating func requestRefresh() -> Bool {
-        guard !isRefreshing else {
-            trailingRefreshQueued = true
-            return false
-        }
-        isRefreshing = true
-        trailingRefreshQueued = false
-        return true
-    }
-
-    mutating func completeRefresh() -> Bool {
-        guard isRefreshing else { return false }
-        if trailingRefreshQueued {
-            trailingRefreshQueued = false
-            return true
-        }
-        cancel()
-        return false
-    }
-
-    mutating func cancel() {
-        isRefreshing = false
-        trailingRefreshQueued = false
-    }
-}
+// Blueprint: | `EngineDesk.swift` | DeskFacade retains one complete board/overview/page snapshot for Mac and DeviceSync, including prepared attention rows and deadlines; engine inbox/approvals/bots supply its lanes. LatestRead orders board, workflow, research and scheduler publication; committed research receipts use write, scheduler repairs fence older reads before checked feed readback. Job observation and refresh coalescing share the retained feed. DeskToolDispatchRouter retains the local-click approval filer while dispatching native mutations through the canonical part door without a model-routing prerequisite, including Make's Try again. |
 
 /// One root's retained Desk revision: board, overview and page lanes. Mac,
 /// diagnostics, status publication and DeviceSync all render this owner.
@@ -65,6 +30,7 @@ private struct SchedulerJobsRefreshCoalescer: Equatable {
 @Observable
 public final class DeskFacade {
     public nonisolated let dataRoot: URL
+    public nonisolated let vetoHandler: WorkshopVeto
     private nonisolated let inbox: InboxFacade
     private nonisolated let approvals: ApprovalsFacade
     private nonisolated let bots: BotRunnerScheduler
@@ -76,7 +42,8 @@ public final class DeskFacade {
     public private(set) var jobs: [ScheduledJob] = []
     public private(set) var jobsFeedState: SchedulerJobsFeedState?
     @ObservationIgnored private lazy var jobsRead = LatestRead()
-    private var jobsRefresh = SchedulerJobsRefreshCoalescer()
+    private var jobsRefresh = LivingStatusRefreshCoalescer()
+    @ObservationIgnored private var jobsRefreshTask: Task<SchedulerJobsFeedState, Never>?
     public var isRefreshingJobs: Bool { jobsRefresh.isRefreshing }
 
     public func watchJobs() async {
@@ -93,7 +60,7 @@ public final class DeskFacade {
 
     public func refreshWorkflows() async throws {
         let result: Result<[WorkflowRecord], Error> = await workflowsRead.read({
-            do { return .success(try await SwiftNativeWorkflowOrchestrationClient(root: dataRoot).listWorkflowRecords()) }
+            do { return .success(try await SavedWorkflows(root: dataRoot).listWorkflowRecords()) }
             catch { return .failure(error) }
         }, publish: { result in
             switch result {
@@ -106,6 +73,7 @@ public final class DeskFacade {
 
     public nonisolated init(dataRoot: URL, inbox: InboxFacade, approvals: ApprovalsFacade, bots: BotRunnerScheduler) {
         self.dataRoot = dataRoot
+        self.vetoHandler = WorkshopVeto(dataRoot: dataRoot)
         self.inbox = inbox
         self.approvals = approvals
         self.bots = bots
@@ -120,6 +88,13 @@ public final class DeskFacade {
 
     public var board: DeskBoardRead { page.board ?? DeskBoardRead() }
     public private(set) var page = DeskPageSnapshot.empty
+    private var availableOverview: WorkOverview? {
+        guard let overview = page.overview, overview.unavailable.isEmpty else { return nil }
+        return overview
+    }
+    /// Full Needs you values from the retained revision; nil when any overview source is unavailable.
+    public var ownerWaitingCount: Int? { availableOverview?.needsYouCount }
+    public var ownerWaitingKinds: [WorkOverviewReference.Kind: Int]? { availableOverview?.needsYouCounts }
     public private(set) var readCount = 0
     public private(set) var liveUpdateError: String?
     @ObservationIgnored private lazy var boardRead = LatestRead()
@@ -127,6 +102,7 @@ public final class DeskFacade {
     @ObservationIgnored private var watcher: FileChangeWatcher?
     @ObservationIgnored private var busTask: Task<Void, Never>?
     @ObservationIgnored private var experienceTask: Task<Void, Never>?
+    @ObservationIgnored private var clockTask: Task<Void, Never>?
     @ObservationIgnored private var deadlineTask: Task<Void, Never>?
     @ObservationIgnored private var watchedPaths: Set<URL> = []
     @ObservationIgnored private lazy var debouncer = StoreReloadDebouncer { [weak self] in
@@ -149,16 +125,15 @@ public final class DeskFacade {
         var read = DeskBoardRead()
         let runner = SwiftNativeWorkshopRunner(root: dataRoot)
         async let deskState = store.liveState()
-        async let records = runner.listAll()
+        async let records = runner.scanAllQueueWorkshopExecutions()
         do {
             read.deskState = try await deskState
-            read.debugProjection = read.deskState.map { DeskProjection.render($0) } ?? ""
+            read.debugProjection = read.deskState.map { DeskPage.render($0) } ?? ""
         } catch {
             read.deskError = Self.loadFailure(error)
         }
-        // "Lenient" used to mean "silent": a corrupt store returned [] and the
-        // surface said "Quiet right now". Each lane reports rows OR a reason.
-        read.executions = DeskLaneState.classify(rows: await records, root: runner.executionRecordsRoot)
+        let rows = await records.sorted { $0.record.createdAt > $1.record.createdAt }
+        read.executions = DeskLaneState.classify(rows: rows.map(\.record), root: runner.executionRecordsRoot)
         let overview = await loadOverview(read)
         read.overview = overview.overview
         read.approvals = overview.approvals
@@ -170,7 +145,7 @@ public final class DeskFacade {
     private nonisolated func loadOverview(_ board: DeskBoardRead) async -> (
         overview: WorkOverview,
         approvals: Result<[ApprovalRecord], Error>,
-        inbox: Result<[NotificationInbox.InboxItemRecord], Error>
+        inbox: Result<[NativeAgentShared.InboxItemRecord], Error>
     ) {
         async let approvalsRead = self.approvals.list()
         async let inboxRead = self.inbox.list()
@@ -178,9 +153,9 @@ public final class DeskFacade {
         if let reason = board.deskError { unavailable.append("Desk: \(reason)") }
         if let reason = board.executions.unavailableReason { unavailable.append("Executions: \(reason)") }
         var approvalRows: [ApprovalRecord] = []
-        var inboxRows: [NotificationInbox.InboxItemRecord] = []
+        var inboxRows: [NativeAgentShared.InboxItemRecord] = []
         let approvals: Result<[ApprovalRecord], Error>
-        let inbox: Result<[NotificationInbox.InboxItemRecord], Error>
+        let inbox: Result<[NativeAgentShared.InboxItemRecord], Error>
         var experiences: [Experience] = []
         do { experiences = try await ExperienceStore.at(dataRoot).projection() }
         catch { unavailable.append("Experiences: \(Self.loadFailure(error))") }
@@ -202,31 +177,14 @@ public final class DeskFacade {
             inbox: inboxRows, experiences: experiences, unavailable: unavailable, now: Date()), approvals, inbox)
     }
 
-    /// Every Desk execution, queue then legacy, as the phone's
-    /// workshop_tasks.json and the graph's execution count read them. A row
-    /// that is not an execution is skipped, but a feed where no row reads is
-    /// corruption, never an empty bench, and throws.
-    public nonisolated func taskRows() async throws -> [WorkshopTaskRow] {
-        let rows = try await SwiftNativeWorkshopRunner(root: dataRoot).listWorkshopExecutions()
-        let tasks = rows.compactMap(WorkshopTaskRow.init(row:))
-        if tasks.count < rows.count {
-            nativeLog("[DeskFacade] taskRows dropped \(rows.count - tasks.count) of \(rows.count) malformed execution row(s)")
-        }
-        if !rows.isEmpty && tasks.isEmpty {
-            throw NSError(domain: "NativeAgent", code: -3, userInfo: [
-                NSLocalizedDescriptionKey:
-                    "getWorkshopExecutions(swift Workshop; surface=executions): all \(rows.count) element(s) failed to decode"
-            ])
-        }
-        return tasks
-    }
-
     deinit {
         watcher?.cancel()
         busTask?.cancel()
         experienceTask?.cancel()
+        clockTask?.cancel()
         deadlineTask?.cancel()
         refreshTask?.cancel()
+        jobsRefreshTask?.cancel()
     }
 
     // MARK: schedule
@@ -239,7 +197,7 @@ public final class DeskFacade {
 
     /// Read the canonical jobs feed without treating absent, damaged, or
     /// partially readable durable state as an empty schedule. The final row
-    /// projection comes from `SchedulerJobWriter.listJobs()` so callers retain
+    /// projection comes from `SwiftNativeTriggerScheduler.listJobs()` so callers retain
     /// the same next-run decoration as the production list route.
     public func jobsFeed() async -> SchedulerJobsFeedState {
         await jobsRead.read({ await self.readJobsFeed() }) { feed in
@@ -252,16 +210,6 @@ public final class DeskFacade {
     }
 
     private nonisolated func readJobsFeed() async -> SchedulerJobsFeedState {
-        let path = jobsPath
-        let manager = FileManager.default
-        var isDirectory: ObjCBool = false
-        guard manager.fileExists(atPath: path.path, isDirectory: &isDirectory) else {
-            return .sourceAbsent
-        }
-        guard !isDirectory.boolValue else {
-            return .unavailable("scheduler/jobs.json is a directory")
-        }
-
         do {
             guard let rows = try await SwiftNativeTriggerScheduler(root: dataRoot).listJobsIfPresent() else {
                 return .sourceAbsent
@@ -278,19 +226,6 @@ public final class DeskFacade {
                 }
             }
             return rejectedRows == 0 ? .current(jobs) : .partial(jobs, rejectedRows: rejectedRows)
-        } catch TriggerSchedulerError.persistenceFailure(let detail) {
-            switch detail {
-            case "scheduler jobs file exceeds 4 MiB":
-                return .unavailable("scheduler/jobs.json exceeds \(4 * 1_024 * 1_024) bytes")
-            case "scheduler jobs file exceeds 1024 rows":
-                return .unavailable("scheduler/jobs.json exceeds \(1_024) rows")
-            case "scheduler jobs file must contain a JSON array":
-                return .unavailable("scheduler/jobs.json must contain a JSON array")
-            default:
-                let prefix = "scheduler jobs file is unreadable or malformed: "
-                return .unavailable(detail.hasPrefix(prefix) ? String(detail.dropFirst(prefix.count))
-                    : TriggerSchedulerError.persistenceFailure(detail).localizedDescription)
-            }
         } catch {
             return .unavailable(error.localizedDescription)
         }
@@ -313,17 +248,23 @@ public final class DeskFacade {
     @discardableResult
     public func refreshJobs() async -> SchedulerJobsFeedState? {
         if jobsRefresh.requestRefresh() {
-            repeat {
-                _ = await jobsFeed()
-                if Task.isCancelled { jobsRefresh.cancel(); break }
-            } while jobsRefresh.completeRefresh()
+            jobsRefreshTask = Task {
+                var feed = await jobsFeed()
+                while !Task.isCancelled, jobsRefresh.completePass() {
+                    feed = await jobsFeed()
+                }
+                jobsRefresh.cancel()
+                jobsRefreshTask = nil
+                return feed
+            }
         }
-        return jobsFeedState
+        // A joining request queues a trailing read above and waits for it.
+        // Return that operation's result, never the previously retained feed.
+        return await jobsRefreshTask?.value
     }
 
     public func setJobEnabled(id: String, enabled: Bool) async throws -> ScheduledJob {
-        let writer = makeSchedulerJobWriter(
-            connectorActionIDs: Set(connectorActionDescriptors().map(\.id)), dataRoot: dataRoot)
+        let writer = makeSchedulerJobWriter(dataRoot: dataRoot)
         let result = try await writer.setJobEnabled(jobId: id, enabled: enabled)
         // Readback follows the commit; pre-commit reads may no longer publish.
         jobsRead.write {}
@@ -383,11 +324,16 @@ public final class DeskFacade {
         }
     }
 
-    /// Research lab runs from `research/lab/runs.json`, newest first. A run
-    /// that does not read is skipped.
+    /// Research lab runs from `research/lab/runs.json`, newest first. Damage
+    /// fails the read, preserving the retained history and the original bytes.
     public nonisolated func listResearchRuns() async throws -> [ResearchLabRun] {
-        try await SwiftNativeResearchClient(dataRoot: dataRoot).researchLabRuns()
-            .compactMap(ResearchLabRun.init(row:))
+        let rows = try await SwiftNativeResearchClient(dataRoot: dataRoot).researchLabRuns()
+        let runs = rows.compactMap(ResearchLabRun.init(row:))
+        guard runs.count == rows.count else {
+            throw ResearchClientError.malformedResponse(
+                "Saved research history is unavailable: \(rows.count - runs.count) of \(rows.count) runs are malformed. Original contents have been preserved.")
+        }
+        return runs
     }
 }
 
@@ -491,9 +437,12 @@ extension DeskFacade {
             let hourExpiry = hour.flatMap { UserDisplayFormatters.parseISOTimestamp($0.at) }
                 .map { DeskRelativeTimePresentation.nextRefreshAt(for: $0, now: snapshot.now) }
             snapshot.jobs = jobs
-            snapshot.rows = await Task.detached(priority: .userInitiated) { [snapshot] in
-                DeskPageContent.project(snapshot: snapshot, now: snapshot.now, nags: snapshot.nagConfig,
+            snapshot = await Task.detached(priority: .userInitiated) { [snapshot] in
+                var snapshot = snapshot
+                snapshot.plan = DeskSequencing.compute(DeskState(items: snapshot.boardItems, generatedTs: ""), now: snapshot.now)
+                snapshot.rows = DeskPageContent.project(snapshot: snapshot, now: snapshot.now, nags: snapshot.nagConfig,
                     timedBots: snapshot.timedBots, jobStamps: snapshot.jobs.compactMap(\.nextRunAt), hourExpiry: hourExpiry)
+                return snapshot
             }.value
             return snapshot
         } publish: { snapshot in
@@ -512,6 +461,17 @@ extension DeskFacade {
     public func signalRefresh() async { await debouncer.signal() }
 
     private func bindLiveUpdates() async {
+        if clockTask == nil {
+            let changes = EventDeadlinePhysiology.storeAndFileEvents(paths: [], notifications: [
+                .NSSystemClockDidChange, .NSSystemTimeZoneDidChange,
+            ])
+            clockTask = Task { [weak self] in
+                for await _ in changes {
+                    guard !Task.isCancelled else { return }
+                    await self?.signalRefresh()
+                }
+            }
+        }
         if experienceTask == nil {
             let changes = await ExperienceStore.at(dataRoot).changes()
             experienceTask = Task { [weak self] in
@@ -584,110 +544,6 @@ public enum SchedulerJobsFeedError: LocalizedError, Sendable {
     }
 }
 
-// MARK: - The phone's execution row
-
-/// One Desk execution as workshop_tasks.json has always carried it, read from
-/// Core's merged wire row. The queue writes snake_case and the legacy store
-/// camelCase, so both spellings read; a queue row with no phase repeats its
-/// status. A present field of the wrong type makes the row unreadable.
-public struct WorkshopTaskRow: Encodable, Hashable, Sendable {
-    public var id: String
-    public var deskHandle: String?
-    public var projectSpaceId: String?
-    public var title: String
-    public var objective: String
-    public var status: String
-    public var phase: String
-    public var priority: String?
-    public var autonomyLevel: String?
-    public var permissionProfile: String?
-    public var summary: String?
-    public var createdAt: String
-    public var updatedAt: String?
-    public var lastMovementAt: String?
-    public var completedAt: String?
-    public var receiptCount: Int?
-    public var currentStepId: String?
-    public var requiresApproval: Bool { WorkOverviewRead.requiresApproval(status: status) }
-
-    public init?(row: JSONValue) {
-        guard case .object(let obj) = row else { return nil }
-        var malformed = false
-        func text(_ keys: String...) -> String? {
-            for key in keys {
-                switch obj[key] {
-                case nil, .null?: continue
-                case .string(let value)?: return value
-                default: malformed = true; return nil
-                }
-            }
-            return nil
-        }
-        func count(_ keys: String...) -> Int? {
-            for key in keys {
-                switch obj[key] {
-                case nil, .null?: continue
-                case .int(let value)?:
-                    if let value = Int(exactly: value) { return value }
-                    malformed = true; return nil
-                case .double(let value)?:
-                    if let value = Int(exactly: value) { return value }
-                    malformed = true; return nil
-                default: malformed = true; return nil
-                }
-            }
-            return nil
-        }
-        guard case .string(let id)? = obj["id"] else { return nil }
-        self.id = id
-        deskHandle = text("deskHandle", "desk_handle")
-        projectSpaceId = text("projectSpaceId", "project_space_id")
-        title = text("title") ?? ""
-        objective = text("objective") ?? ""
-        status = text("status") ?? "queued"
-        phase = text("phase") ?? status
-        priority = text("priority")
-        autonomyLevel = text("autonomyLevel", "autonomy_level")
-        permissionProfile = text("permissionProfile", "permission_profile")
-        summary = text("summary")
-        createdAt = text("createdAt", "created_at") ?? ""
-        updatedAt = text("updatedAt", "updated_at")
-        lastMovementAt = text("lastMovementAt", "last_movement_at")
-        completedAt = text("completedAt", "completed_at")
-        receiptCount = count("receiptCount", "receipt_count")
-        currentStepId = text("currentStepId", "current_step_id")
-        guard !malformed else { return nil }
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case id, deskHandle, projectSpaceId, title, objective, status, phase, priority
-        case autonomyLevel, permissionProfile, summary
-        case createdAt, updatedAt, lastMovementAt, completedAt, receiptCount, currentStepId, requiresApproval
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(id, forKey: .id)
-        try c.encodeIfPresent(deskHandle, forKey: .deskHandle)
-        try c.encodeIfPresent(projectSpaceId, forKey: .projectSpaceId)
-        try c.encode(title, forKey: .title)
-        try c.encode(objective, forKey: .objective)
-        try c.encode(status, forKey: .status)
-        try c.encode(phase, forKey: .phase)
-        try c.encodeIfPresent(priority, forKey: .priority)
-        try c.encodeIfPresent(autonomyLevel, forKey: .autonomyLevel)
-        try c.encodeIfPresent(permissionProfile, forKey: .permissionProfile)
-        try c.encodeIfPresent(summary, forKey: .summary)
-        try c.encode(createdAt, forKey: .createdAt)
-        try c.encodeIfPresent(updatedAt, forKey: .updatedAt)
-        try c.encodeIfPresent(lastMovementAt, forKey: .lastMovementAt)
-        try c.encodeIfPresent(completedAt, forKey: .completedAt)
-        try c.encodeIfPresent(receiptCount, forKey: .receiptCount)
-        try c.encodeIfPresent(currentStepId, forKey: .currentStepId)
-        try c.encode(requiresApproval, forKey: .requiresApproval)
-    }
-}
-
 public struct DeskToolDispatchRouter: Sendable {
     /// Surface tag carried into the dispatch. Distinct from "chat" so a receipt
     /// reader can tell User's click from Agent's tool call.
@@ -699,27 +555,9 @@ public struct DeskToolDispatchRouter: Sendable {
     }
 
     public func run(tool: String, input: [String: JSONValue]) async throws -> JSONValue {
-        let surface = canonicalRoutingSurface(Self.surface)
-        guard MODEL_SURFACES.contains(surface) else { throw ProviderRoutingError.invalidRequest }
-        // A Desk click does not make an LLM call, but it is still a product
-        // surface with independently persisted provider/policy selection. Read
-        // the same checked snapshot before the autonomy gate so corrupt or
-        // incomplete routing cannot turn the click into a hidden chat-default
-        // bypass, and so its provider selection is observed at the canonical
-        // boundary rather than merely listed in a catalog.
-        let routingSnapshot = try await SwiftNativeProviderRouting(dataRoot: dataRoot)
-            .checkedRoutingSnapshot()
-        guard routingSnapshot.preferences[surface] != nil else {
-            throw ProviderRoutingError.unavailable
-        }
-        // Same impl AND same gate: chat-lane desk_* calls pass through the
-        // FileAccessGated + AutonomyGated membrane, and a bare dispatcher here
-        // let a desk click write where the same mutation from chat would have
-        // required approval (gpt-5.5 review 2026-08-06, blocking #1). The
-        // gated chain resolves Trust Center policy identically. Only this local
-        // action boundary supplies the click approval filer.
+        // Desk clicks use chat's Trust Center gates; only this boundary supplies the click approval filer.
         return try await NativeAgentEngine.forRoot(dataRoot).tools.withPartDoor(
-            envelope: .native("mac_ui:desk:" + tool, surface: surface),
+            envelope: .native("mac_ui:desk:" + tool, surface: Self.surface),
             approvalFiler: DeskClickApprovalFiler(dataRoot: dataRoot)) {
             guard let dispatch = AppDoorReentry.perform else {
                 throw PartCallError(code: "door_unavailable", message: "The local Desk click has no originating app door.")
@@ -737,38 +575,31 @@ public struct DeskActionOutcome: Equatable, Sendable {
 }
 
 public enum DeskActionResultReader {
-    /// The desk tools answer in three shapes and ALL THREE must be surfaced:
-    ///   status "ok"      → `confirmation`
-    ///   status "refused" → `reason`, ok == false (the store's honest refusal:
-    ///                      a cycle, a bad date, a cap — these are results, not
-    ///                      exceptions, and rendering one as success is a lie)
-    ///   status "failed"  → `reason`/`detail`, ok == false
-    /// Anything else is reported as unknown rather than assumed fine.
+    /// Shared receipt evidence decides success; Desk selects its feedback words.
     public static func read(_ value: JSONValue, fallback: String) -> DeskActionOutcome {
         guard case .object(let obj) = value else {
             return DeskActionOutcome(ok: false, message: "\(fallback): unreadable tool result")
         }
-        let status: String
-        if case .string(let s)? = obj["status"] { status = s } else { status = "" }
         func text(_ keys: [String]) -> String? {
             for key in keys {
                 if case .string(let s)? = obj[key], !s.isEmpty { return s }
             }
             return nil
         }
-        switch status {
-        case "ok":
+        let result = ChatToolOutcome.exactResultClass(value)
+        switch result {
+        case .succeeded:
             return DeskActionOutcome(ok: true, message: text(["confirmation", "summary"]) ?? fallback)
-        case "refused":
+        case .refused:
             return DeskActionOutcome(ok: false, message: text(["reason"]) ?? "\(fallback) refused")
-        case "failed":
+        case .failed, .cancelled, .timeout:
             return DeskActionOutcome(
                 ok: false,
-                message: text(["reason", "detail", "fix"]) ?? "\(fallback) failed")
-        default:
+                message: text(["reason", "detail", "fix"]) ?? "\(fallback) \(result.receipt.label.lowercased())")
+        case .unknown:
             return DeskActionOutcome(
                 ok: false,
-                message: "\(fallback): unexpected tool status '\(status)'")
+                message: "\(fallback): result unconfirmed")
         }
     }
 }
@@ -814,7 +645,7 @@ public extension DeskQuickAction {
 /// The owner-facing mutation behind the Observatory's Veto button. A repeated
 /// button event is held while the first durable operation is in flight; once
 /// settled, the store's idempotent veto makes retries safe across relaunches.
-public actor WorkshopObservatoryVetoHandler {
+public actor WorkshopVeto {
     public enum Outcome: Equatable, Sendable {
         case completed
         case alreadyVetoed

@@ -2,50 +2,136 @@ import EngineRuntime
 import AppToolRuntime
 import ChatSessionWork
 import SwiftUI
+import Transcripts
+import UniformTypeIdentifiers
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `ChatView+ShellColumn.swift` | `ChatView`: `shellSessionHasUnsentWork`, `shellSessionIsPinned`, `shellSessionRow` |
+// Blueprint: | `ChatView+ShellColumn.swift` | `ChatView`: conversation sidebar, archive control and cached opening-line/pin projection; stable section row identities |
 
-// ui-simplify 2026-09-02 (Lane A): the conversations column.
-//
-// What it replaces: a machine log. `[from: codex, via bridge] …`, `iOS chat
-// 03108B46`, `Telegram 1394548068` three times over, a yellow "Warning" badge
-// on the header, and a Pinned/Recent split that made forty rows read as eighty.
-//
-// What it is now: ONE list. Every row says what the conversation was about and
-// where it happened. The bridge sessions — real conversations, but hers with
-// other agents — ride under one collapsed "Working" row. The warning badge is
-// gone from this header; the room's single status dot carries that state.
+// Person conversations and agent/helper conversations are grouped by recorded kind.
+
+let chatSessionDragType = UTType(exportedAs: "com.nativeagent.chat-session")
+let chatSessionDragPlainTextPrefix = "nativeagent-chat-session:"
+let chatSessionDropTypes: [UTType] = [chatSessionDragType, .plainText]
+
+struct ChatSidebarSections {
+    let pinned: [ChatSession]
+    let unpinned: [ChatSession]
+
+    static func split(visible: [ChatSession], orderedPinned: [ChatSession]) -> Self {
+        let visibleByID = Dictionary(
+            visible.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        var seenPinned = Set<String>()
+        let pinned: [ChatSession] = orderedPinned.compactMap { candidate -> ChatSession? in
+            guard seenPinned.insert(candidate.id).inserted else { return nil }
+            return visibleByID[candidate.id]
+        }
+        let pinnedIDs = Set(pinned.map(\.id))
+        var seenUnpinned = Set<String>()
+        return Self(
+            pinned: pinned,
+            // Keep the first row per ID so lazy view state cannot alias duplicate sessions.
+            unpinned: visible.filter {
+                !pinnedIDs.contains($0.id) && seenUnpinned.insert($0.id).inserted
+            }
+        )
+    }
+}
+
+/// Cache exact session, pin, search and opening-line inputs independently of streaming text.
+@MainActor
+final class ChatSidebarProjectionCache {
+    private var sessions: [ChatSession]?
+    private var navigation: ChatSessionNavigation?
+    private var search = ""
+    private var openingLines: ChatShellOpeningLine?
+    private var openingRevision: UInt64 = 0
+    private var cached = ChatSidebarSections(pinned: [], unpinned: [])
+
+    func project(
+        sessions newSessions: [ChatSession],
+        navigation newNavigation: ChatSessionNavigation,
+        search newSearch: String,
+        openingLines newOpeningLines: ChatShellOpeningLine
+    ) -> ChatSidebarSections {
+        let newOpeningRevision = newOpeningLines.revision
+        if sessions == newSessions,
+           navigation == newNavigation,
+           search == newSearch,
+           openingLines === newOpeningLines,
+           openingRevision == newOpeningRevision {
+            return cached
+        }
+
+        let query = newSearch.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let visible = newSessions.filter {
+            newOpeningLines.isPrepared(for: $0)
+                && (query.isEmpty || $0.title.lowercased().contains(query)
+                || ($0.lastMessagePreview ?? "").lowercased().contains(query)
+                )
+        }
+        let result = ChatSidebarSections.split(
+            visible: visible, orderedPinned: newNavigation.rows.map(\.session)
+        )
+        sessions = newSessions
+        navigation = newNavigation
+        search = newSearch
+        openingLines = newOpeningLines
+        openingRevision = newOpeningRevision
+        cached = result
+        return result
+    }
+}
+
+/// Section changes remount sidebar rows instead of recycling their local state.
+struct ChatSidebarSessionRowIdentity: Hashable, Sendable {
+    enum Section: Hashable, Sendable {
+        case pinned
+        case recent
+    }
+
+    let sessionID: String
+    let section: Section
+
+    init(sessionID: String, pinned: Bool) {
+        self.sessionID = sessionID
+        self.section = pinned ? .pinned : .recent
+    }
+}
 
 extension ChatView {
-    /// The visible rows, split into the human conversations and the bridge
-    /// ones. Both halves come from the same cached projection the classic
-    /// sidebar uses, so search, pinning and archiving behave identically.
+    var sidebarProjection: ChatSidebarSections {
+        sidebarProjectionCache.project(
+            sessions: appModel.engine.transcripts.sessions,
+            navigation: appModel.engine.transcripts.navigation,
+            search: sessionSearch,
+            openingLines: appModel.engine.transcripts.openingLines
+        )
+    }
+
+    /// Visible conversations grouped by their recorded kind.
     var shellConversationSections: (rows: [ChatSession], working: [ChatSession], briefs: [ChatSession]) {
-        let sections = sidebarProjection.sections
+        let sections = sidebarProjection
         var rows: [ChatSession] = []
         var working: [ChatSession] = []
         var briefs: [ChatSession] = []
-        // User, 2026-09-06: a pin is a choice. A pinned bridge session sat in
-        // the list only while it was on screen and fell into Working the
-        // moment another chat was opened, so the pin meant nothing.
-        rows.append(contentsOf: sections.pinned)
+        // Pins order conversations within their own section without changing their kind.
+        for session in sections.pinned {
+            if ChatShellConversationRow.isWorking(session) { working.append(session) } else { rows.append(session) }
+        }
         for session in sections.unpinned {
-            // The conversation on screen is never folded out of sight.
-            if session.id == appModel.activeChatSessionId {
-                rows.append(session)
-            } else if (session.messageCount ?? 0) == 0, !shellSessionHasUnsentWork(session.id) {
-                // Agent, 2026-09-02: "a row with no name is a row with no
-                // home." An empty conversation nobody is in shows nothing.
-                // 2026-09-06: unless something unsent is waiting in it. Text
-                // typed here and left behind when the human switched away had
-                // no row to click back to, so the draft was unreachable.
+            let onScreen = session.id == appModel.activeChatSessionId
+            if !onScreen, (session.messageCount ?? 0) == 0, !shellSessionHasUnsentWork(session.id) {
+                // Hide offscreen empty conversations only when they have no unsent work.
                 continue
             } else if ChatShellConversationRow.isWorking(session) {
                 working.append(session)
-            } else if ChatShellConversationRow.isHerOwn(session) {
-                // Agent, 2026-09-02: twenty morning briefs where she spoke
-                // first are one row, not a wall of the same greeting.
+            } else if onScreen {
+                rows.append(session)
+            } else if ChatShellConversationRow.isHerOwn(session, openingLines: appModel.engine.transcripts.openingLines) {
+                // Morning briefs share one row.
                 briefs.append(session)
             } else {
                 rows.append(session)
@@ -54,20 +140,13 @@ extension ChatView {
         return (rows, working, briefs)
     }
 
-    /// Unsent text or attachments waiting in a conversation with no messages.
-    /// 2026-09-06: such a session is still worth a row — it is the only way
-    /// back to the draft.
+    /// Unsent text or attachments keep an empty conversation reachable from its row.
     func shellSessionHasUnsentWork(_ sessionId: String) -> Bool {
         !appModel.chatDraft(for: sessionId).isEmpty
             || !(appModel.chatPendingAttachments[sessionId] ?? []).isEmpty
     }
 
-    /// Only the HUMAN's pins. 2026-09-06: this read the merged projection,
-    /// which carries the live conversation anchor as well, so a row nobody
-    /// ever pinned showed a filled pin and "Unpin Tab" — and clicking it
-    /// reached the human pin store, which answered "already unpinned". The
-    /// anchor still rides in `sections.pinned` and still stays in the list;
-    /// it just is not described as the person's choice.
+    /// Only the person's saved pins count as pinned; the live conversation anchor does not.
     func shellSessionIsPinned(_ session: ChatSession) -> Bool {
         humanPinnedSessionIds().contains(session.id)
     }
@@ -81,17 +160,11 @@ extension ChatView {
                     .foregroundStyle(NativeAgentShell.text)
                     .lineLimit(1)
                 Spacer(minLength: 4)
-                // Agent, 2026-09-02, glyph diet: an archive box and a plus
-                // over a list of conversations are a guess each. Same two
-                // actions, same code paths — now with their words on them.
                 ChatSidebarArchiveButton(shell: true)
 
                 Button {
                     Task {
                         await appModel.newChatSession()
-                        await MainActor.run {
-                            renameTitle = activeSession?.displayTitle ?? ""
-                        }
                     }
                 } label: {
                     Text("New")
@@ -118,8 +191,7 @@ extension ChatView {
                               accessibilityLabel: "Search conversations")
                 .padding(.bottom, 8)
 
-            // M12: a list that could not refresh says so rather than passing
-            // off an old snapshot as live. Both notices survive the reshape.
+            // A failed list refresh identifies the retained snapshot as stale.
             PanelStaleNoticeView(item: .chat)
             if appModel.chatSessionIndexRefreshFailed {
                 StalePanelNotice(
@@ -127,8 +199,7 @@ extension ChatView {
                 )
             }
 
-            // User 09-27: all controls Mac native — the system sidebar list:
-            // its own selection, arrow keys and collapsible sections.
+            // Native sidebar selection owns arrow keys and collapsible sections.
             let sections = shellConversationSections
             // A screenshot's copy draws the selection itself (below): the
             // list's own highlight is a vibrancy view, which a bitmap capture
@@ -139,7 +210,6 @@ extension ChatView {
                     guard let id, id != appModel.activeChatSessionId, renamingSessionId == nil,
                           let session = (sections.rows + sections.briefs + sections.working)
                             .first(where: { $0.id == id }) else { return }
-                    renameTitle = session.displayTitle
                     Task { await appModel.selectChatSession(session) }
                 }
             )) {
@@ -172,12 +242,14 @@ extension ChatView {
                                 .foregroundStyle(NativeAgentShell.secondary)
                         }
                     case "working" where !sections.working.isEmpty:
-                        Section(isExpanded: shellFold("working")) {
+                        // The conversation on screen is never folded out of sight.
+                        Section(isExpanded: shellFold("working",
+                            openWhile: sections.working.contains { $0.id == appModel.activeChatSessionId })) {
                             ForEach(sections.working) { session in
                                 shellSessionRow(session).tag(session.id)
                             }
                         } header: {
-                            Text("\(ChatShellCopy.workingRowTitle)  \(sections.working.count)")
+                            Text("\(ChatShellCopy.workingRowTitle(agentName: appModel.agentAddressName))  \(sections.working.count)")
                                 .foregroundStyle(NativeAgentShell.secondary)
                         }
                     default:
@@ -190,24 +262,11 @@ extension ChatView {
             .opacity(appModel.chatSidebarSessionListOpacity)
         }
         .padding(.horizontal, NativeAgentShellLayout.conversationsInset)
-        // The column is 288 wide edge to edge — the measured number. The
-        // source used to say 264, which was the content inside the gutter.
+        // Measure the conversation column edge to edge, including its gutter.
         .frame(width: NativeAgentShellLayout.conversationsWidth)
         .padding(.top, NativeAgentShellLayout.columnHeaderTopInset)
         .padding(.bottom, 16)
-        // User, 2026-09-03: the same move the rail made. The
-        // NSVisualEffectView under a 0.28 colour coat could not adapt to what
-        // was behind the window, so the column read as paint, not glass — and
-        // it read as a different material from the rail beside it. Rail and
-        // list now wear one material: a hint of the column's own tone under
-        // real Liquid Glass. Reduce transparency takes the fill opaque and the
-        // glass to .identity — that setting asks for more opacity, never less.
-        // User, 2026-09-03: one sheet. The list sits on the room's own
-        // material and coat, and keeps a hairline on its trailing edge.
-        // The sheet is the window's (ShellFrame); the list is transparent over
-        // it. Alive glass, 2026-09-23: the trailing hairline is gone too — the
-        // haze stopped at it and the list read as a slab. Its gutter is the
-        // only separation from the room; the rail is the one plate.
+        // The list stays transparent over ShellFrame's sheet; only its gutter separates it from the room.
     }
 
     /// The conversations column's blocks as this chat's view shows them;
@@ -217,8 +276,8 @@ extension ChatView {
     }
 
     /// A fold the person opens or closes: the layout's, written as theirs.
-    func shellFold(_ block: String) -> Binding<Bool> {
-        Binding(get: { appModel.engine.layout.layout.expanded("chat", block) },
+    func shellFold(_ block: String, openWhile forced: Bool = false) -> Binding<Bool> {
+        Binding(get: { forced || appModel.engine.layout.layout.expanded("chat", block) },
                 set: { open in Task { await appModel.engine.setSurfaceExpanded(open, surface: "chat", block: block) } })
     }
 
@@ -233,7 +292,6 @@ extension ChatView {
         let selectSession: () -> Void = {
             guard !renaming else { return }
             if renamingSessionId != nil { renamingSessionId = nil }
-            renameTitle = session.displayTitle
             Task { await appModel.selectChatSession(session) }
         }
         Group {
@@ -255,13 +313,12 @@ extension ChatView {
             } else {
                 ShellConversationRow(
                     session: session,
+                    openingLines: appModel.engine.transcripts.openingLines,
                     selected: session.id == appModel.activeChatSessionId,
                     isPinned: isPinned,
-                    onSelect: selectSession,
                     onTogglePin: {
                         if isPinned { unpinSession(session.id) } else { pinSession(session.id, selectAfterPin: false) }
-                    },
-                    barNamespace: shellConversationBar
+                    }
                 )
             }
         }
@@ -315,19 +372,14 @@ extension ChatView {
 
     var shellStatus: ChatShellStatus {
         .make(
-            policy: appModel.engine.trust.policy,
             hasPendingApproval: shellHasPendingApproval,
             hasTrouble: shellHasTrouble
         )
     }
 
-    /// 2026-09-06: this used to switch to "Keep typing. I'll send it when I'm
-    /// back." on any trouble — a promise about a queue nothing here consults.
-    /// One placeholder, and the trouble card says what happened.
+    /// One placeholder; the trouble card reports failures without promising queued work.
     var shellComposerPlaceholder: String {
-        // 2026-09-15: once the agent has a name, the composer uses it. Read
-        // from `agentDisplayName` inside an observed body, so the rename the
-        // person just made lands on the next frame.
+        // The observed agent name keeps the composer placeholder current.
         ChatShellCopy.composerPlaceholder(agentName: appModel.agentAddressName)
     }
 }
@@ -355,8 +407,7 @@ extension ChatView {
         ChatMessageListView(
             messages: appModel.chatMessages,
             sessionId: appModel.activeChatSessionId,
-            isStreaming: appModel.isBusy
-                && appModel.currentChatTaskSessionId == appModel.activeChatSessionId,
+            isStreaming: appModel.isBusy && appModel.isChatStreaming,
             highlightedMessageID: showTranscriptSearch ? transcriptSearch.selectedMessageID : nil,
             animatesArrival: animatesMessageArrival,
             latestRequest: transcriptLatestRequest,
@@ -367,9 +418,6 @@ extension ChatView {
                 Text(reason).font(.caption).foregroundStyle(.red).textSelection(.enabled)
             }
         }
-        .environment(\.inlineCardSource) { [appModel] rowID in
-            appModel.engine.transcripts.cards(forRow: rowID, in: appModel.activeChatSessionId)
-        }
         .environment(\.inlineCardAction) { [inlineCards, appModel] card, action in
             inlineCards.handle(card: card, action: action, appModel: appModel)
         }
@@ -378,15 +426,10 @@ extension ChatView {
     /// The pill that says there is something below the fold. It enters on
     /// `.snappy` and its glyph bounces once per arriving message — the whole
     /// point being that the arrival itself is off-screen.
-    func latestPillOverlay(_ proxy: ScrollViewProxy) -> some View {
+    var latestPillOverlay: some View {
         ChatLatestPillGate(coordinator: scrollCoordinator, animation: latestPillAnimation) {
             Button {
                 transcriptLatestRequest &+= 1
-                scrollCoordinator.forceFollow()
-                // User, 2026-09-13: the pill jumps, it does not ease. An
-                // eased jump across a long transcript re-lays the whole
-                // column for every frame of the ease.
-                scrollToBottom(proxy, animated: false, delay: 0.03, force: true)
             } label: {
                 latestPillLabel
                     .padding(.horizontal, 10)
@@ -403,10 +446,7 @@ extension ChatView {
             .accessibilityLabel("Jump to latest message")
             .padding(.horizontal, 18)
             .padding(.top, 18)
-            // phase 4: lift clear of the floating thinking row while a turn
-            // streams so it stays visible/clickable. 2026-09-13: the
-            // clearance is read inside the modifier's own body, so a card
-            // that grows re-lays out this pill and not ChatView.
+            // The modifier observes card clearance so growth re-lays out only this pill.
             .modifier(ChatTurnCardClearancePadding(
                 store: turnCardClearanceStore,
                 idle: 18
@@ -431,7 +471,7 @@ extension ChatView {
 /// Reads the follow state in its own body, so the reader crossing the bottom
 /// re-renders the pill and not ChatView.
 struct ChatLatestPillGate<Pill: View>: View {
-    let coordinator: ChatScrollCoordinator
+    let coordinator: ChatScrollFollow
     let animation: Animation?
     @ViewBuilder let pill: () -> Pill
 
@@ -443,5 +483,48 @@ struct ChatLatestPillGate<Pill: View>: View {
             if shows { pill() }
         }
         .animation(animation, value: shows)
+    }
+}
+
+/// Kept as its own mounted control so the durable archive route can be hosted
+/// without starting ChatView's unrelated provider, voice, and file-watch work.
+struct ChatSidebarArchiveButton: View {
+    @Environment(AppModel.self) private var appModel
+    var shell = false
+    @State private var failure: String?
+    @State private var isArchiving = false
+
+    var body: some View {
+        Button {
+            isArchiving = true
+            Task {
+                let result = await appModel.archiveActiveChat()
+                if !result.succeeded { failure = result.userMessage }
+                isArchiving = false
+            }
+        } label: {
+            if shell {
+                Text("Archive")
+                    .font(ShellType.labelSemibold)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .contentShape(Rectangle())
+                    .foregroundStyle(NativeAgentShell.secondary)
+            } else {
+                Image(systemName: "archivebox")
+            }
+        }
+        .buttonStyle(.borderless)
+        .disabled(appModel.activeChatSessionId.isEmpty || isArchiving)
+        .help("Archive active chat")
+        .accessibilityLabel("Archive active chat")
+        .alert("Couldn’t archive conversation", isPresented: Binding(
+            get: { failure != nil },
+            set: { if !$0 { failure = nil } }
+        )) {
+            Button("OK") { failure = nil }
+        } message: {
+            Text(failure ?? "The conversation was not archived.")
+        }
     }
 }

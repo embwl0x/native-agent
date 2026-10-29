@@ -42,12 +42,12 @@ public enum MacAppWindowText {
         guard let image = shot.cgImage else {
             throw SenseFailure(code: "image_encode_failed", message: "The captured window has no image for text recognition.", remedy: MacScreenCaptureFailure.encodeFailed.remedy(app: bundleID))
         }
-        let recognized = try await recognize(image: image, bounds: shot.bounds)
+        let recognized = try await recognize(image: image)
         guard source.runningApps().contains(where: { $0.processIdentifier == app.processIdentifier && $0.bundleIdentifier == bundleID }),
               let current = source.attributes(of: selected.ref), current.frame == frame, current.title == node.title else {
             throw SenseFailure(code: "source_unavailable", message: "The app window changed during text recognition; this material was discarded.")
         }
-        return recognized
+        return material(recognized, geometry: MacScreenViewGeometry(shot: shot))
         #else
         throw SenseFailure(code: "source_unavailable", message: "On-device app window text recognition requires macOS Vision.")
         #endif
@@ -62,56 +62,61 @@ public enum MacAppWindowText {
               bounds.x.isFinite, bounds.y.isFinite, bounds.w.isFinite, bounds.h.isFinite else {
             throw SenseFailure(code: "source_unavailable", message: "The app capture is incomplete; no live screen was substituted.")
         }
-        return try await recognize(image: image, bounds: bounds)
+        return material(try await recognize(image: image), geometry: MacScreenViewGeometry(shot: shot))
         #else
         throw SenseFailure(code: "source_unavailable", message: "On-device app window text recognition requires macOS Vision.")
         #endif
     }
 
+    private static func material(_ text: [VisionRecognizedText], geometry: MacScreenViewGeometry) -> (rows: JSONValue, text: String) {
+        let rows = text.map { line in JSONValue.object([
+            "text": line.text.json, "confidence": .double(line.confidence),
+            "frame": line.rect.map { geometry.screenRect($0).toJSON() } ?? .null,
+            "source": .string("on-device window text recognition")]) }
+        return (.array(rows), text.compactMap { $0.text.display }.joined(separator: "\n"))
+    }
+
     #if canImport(Vision) && canImport(ApplicationServices) && os(macOS)
-    private static func recognize(image: CGImage, bounds: MacAXFrame) async throws -> (rows: JSONValue, text: String) {
+    public static func recognize(image: CGImage) async throws -> [VisionRecognizedText] {
         try Task.checkCancellation()
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = false
         request.automaticallyDetectsLanguage = true
         let work = WindowTextRecognition(request: request)
-        try await withTaskCancellationHandler {
-            try Task.checkCancellation()
-            try VNImageRequestHandler(cgImage: image).perform([request])
-        } onCancel: {
-            work.cancel()
-        }
-        try Task.checkCancellation()
-        let observations = (request.results ?? []).sorted {
-            if abs($0.boundingBox.midY - $1.boundingBox.midY) > 0.01 { return $0.boundingBox.midY > $1.boundingBox.midY }
-            return $0.boundingBox.minX < $1.boundingBox.minX
-        }
-        let boxes: [VisionTextBox] = observations.compactMap { observation in
-            guard let candidate = observation.topCandidates(1).first else { return nil }
-            let box = observation.boundingBox
-            return VisionTextBox(text: candidate.string,
-                rect: VisionRect(x: box.minX * Double(image.width),
-                    y: (1 - box.maxY) * Double(image.height),
-                    w: box.width * Double(image.width), h: box.height * Double(image.height)),
-                confidence: Double(candidate.confidence))
-        }
-        // Redact the WHOLE image before assembling either output. A caption
-        // in a different observation must protect its value in every sink.
-        // Keep this reader's existing full-line output for non-secret text.
+        let boxes = try await withTaskCancellationHandler {
+            try VisionKitTextRecognizer().recognizeText(in: image, request: request, select: Self.readingOrder)
+        } onCancel: { work.cancel() }
+        // Whole-image captions protect values before either output is assembled.
         let redacted = VisionTextRedaction.redact(boxes: boxes,
             imageSize: VisionSize(width: Double(image.width), height: Double(image.height)),
-            config: VisionRedactionConfig(valueChars: boxes.map { $0.text.count }.max() ?? 120))
-        let lines = redacted.compactMap(\.display)
-        let rows: [JSONValue] = zip(boxes, redacted).map { box, value in
-            return .object(["text": value.json, "confidence": .double(box.confidence),
-                "frame": MacAXFrame(x: bounds.x + box.rect.x / Double(image.width) * bounds.w,
-                    y: bounds.y + box.rect.y / Double(image.height) * bounds.h,
-                    w: box.rect.w / Double(image.width) * bounds.w,
-                    h: box.rect.h / Double(image.height) * bounds.h).toJSON(),
-                "source": .string("on-device window text recognition")])
+            valueChars: boxes.map { $0.text.count }.max() ?? 120)
+        return zip(boxes, redacted).map { box, value in
+            VisionRecognizedText(text: value, confidence: box.confidence, rect: box.rect)
         }
-        return (.array(rows), lines.joined(separator: "\n"))
+    }
+
+    private static func readingOrder(_ observations: [VNRecognizedTextObservation]) -> [VNRecognizedTextObservation] {
+        // Anchor lines vertically before sorting within them; pairwise tolerances are not transitive.
+        let vertical = observations.enumerated().sorted {
+            let left = $0.element.boundingBox, right = $1.element.boundingBox
+            if left.midY != right.midY { return left.midY > right.midY }
+            return $0.offset < $1.offset
+        }
+        var linesByPosition: [[(offset: Int, element: VNRecognizedTextObservation)]] = []
+        for observation in vertical {
+            if let anchor = linesByPosition.last?.first,
+               anchor.element.boundingBox.midY - observation.element.boundingBox.midY <= 0.01 {
+                let index = linesByPosition.count - 1
+                linesByPosition[index].append(observation)
+            } else { linesByPosition.append([observation]) }
+        }
+        return linesByPosition.flatMap { line in
+            line.sorted {
+                let left = $0.element.boundingBox.minX, right = $1.element.boundingBox.minX
+                return left == right ? $0.offset < $1.offset : left < right
+            }.map(\.element)
+        }
     }
     #endif
     private static func number(_ value: JSONValue?) -> Double? {

@@ -1,33 +1,7 @@
-// MacClipboard.swift — THE CLIPBOARD ORGAN (fable51 sweep item 30).
-//
-// The Mac's clipboard is the one place where every app already agrees to hand
-// its content to whoever asks. Agent could press ⌘C through `act` and then had
-// nowhere to read the result: the pasteboard existed only in UI code
-// (ChatPlatformAdapters, the Desk, RunsView), never as an organ. That made
-// "copy this document and tell me what it says" impossible for a reason that
-// was pure omission.
-//
-// TWO ACTIONS, TWO CONTRACTS:
-//
-//   • `clipboard_read` — perception. It emits nothing, changes nothing, and
-//     goes through the SAME shape redactor every other perception organ uses
-//     (`MacScreenViewTextRedaction`). This is not optional politeness: a
-//     password manager's ⌘C puts a live credential on the pasteboard, and an
-//     unredacted read would ship it to a provider, a turn trace and every sink
-//     that syncs one. Redaction is applied LINE BY LINE, because a copied
-//     document is prose with (at most) a secret in it, and blanking the whole
-//     document because one line is a token would blind the organ this exists
-//     to build.
-//
-//   • `clipboard_write` — a local write. It replaces the general pasteboard's
-//     contents, which is a change to the world (the next ⌘V anywhere pastes
-//     it), so it sits at the same tier as the other Mac verbs that move
-//     things. It never echoes the text back: the caller already knows what it
-//     wrote, and echoing would put it through the redactor's blind spot.
-//
-// NON-TEXT is REPORTED, never dumped. An image or a file promise on the
-// pasteboard is named by its UTI; its size stays unknown without reading bytes.
-// "There is a PNG here" is the honest answer, and it is the useful one.
+// MacClipboard.swift — clipboard contracts.
+// Reads apply line-by-line perception redaction so one secret does not hide an entire document.
+// Writes replace the general pasteboard without echoing input.
+// Non-text content is named by UTI without reading its bytes or claiming a size.
 
 import Foundation
 import NativeAgentCore
@@ -75,9 +49,7 @@ public struct MacPasteboardContents: Sendable, Equatable {
     }
 }
 
-/// The pasteboard seam. Production reads `NSPasteboard.general`; tests inject a
-/// scripted board so redaction, round-trip and the non-text path are pinned
-/// without touching User's real clipboard.
+/// Pasteboard access; production uses `NSPasteboard.general`.
 public protocol MacPasteboardSource: Sendable {
     /// `nil` when no pasteboard exists on this platform at all — which the
     /// caller REPORTS rather than dressing up as an empty clipboard.

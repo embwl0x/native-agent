@@ -9,6 +9,7 @@ import MacControl
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+import Privacy
 import TrustCenter
 // Blueprint: | `AppToolExecutor+InteractionAct.swift` | `AppToolExecutor`: `cardRefusal`, `runCardAction`, `applyMacControlCategoryGrant` |
 
@@ -24,7 +25,7 @@ import TrustCenter
 ///
 /// What it deliberately does NOT do:
 ///
-///  * **It never opens a window.** No `NativeAgentAppCoordinator.request`, no
+///  * **It never opens a window.** No `ApplicationLifetime.request`, no
 ///    sheet, no activate. A control that IS a page or a browser handoff
 ///    (Trust posture, OAuth, Providers' group picker) has no honest non-UI
 ///    path, so the answer is `needs_glass` with the reason — never a silent
@@ -137,10 +138,10 @@ extension AppToolExecutor {
         let openSession = appModel.activeChatSessionId
         var sessionID = openSession
         var found = openSession.isEmpty ? nil
-            : await interactions.interaction(id: id, sessionID: openSession, dataRoot: dataRoot)
-        if found == nil, let raisedIn = await interactions.sessionID(ofCard: id, dataRoot: dataRoot) {
+            : await InlineInteractionResolver.interaction(id: id, sessionID: openSession, dataRoot: dataRoot)
+        if found == nil, let raisedIn = try? await InlineInteractionDelivery.pointer(id: "interaction:\(id)", dataRoot: dataRoot).sessionID {
             sessionID = raisedIn
-            found = await interactions.interaction(id: id, sessionID: raisedIn, dataRoot: dataRoot)
+            found = await InlineInteractionResolver.interaction(id: id, sessionID: raisedIn, dataRoot: dataRoot)
         }
         guard let current = found else {
             return refuse(Self.interactionFailure(
@@ -161,7 +162,7 @@ extension AppToolExecutor {
         // The caller is asked by identity, not by door: the transport-verified
         // chat and person must agree where either side recorded one, and the
         // turn must be in the conversation that raised the card.
-        guard let cardOrigin = await interactions.originEnvelope(
+        guard let cardOrigin = await InlineInteractionResolver.originEnvelope(
             of: id, sessionID: sessionID, dataRoot: dataRoot
         ), !cardOrigin.surface.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return refuse(Self.interactionFailure(
@@ -238,7 +239,7 @@ extension AppToolExecutor {
             return .success(CardPlan(appModel: appModel, dataRoot: dataRoot, sessionID: sessionID, current: current,
                                      posture: posture, route: nil, value: value, choice: choice))
         }
-        let descriptor = interactions.descriptor(for: current, dataRoot: dataRoot)
+        let descriptor = InlineInteractionResolver.descriptor(for: current, dataRoot: dataRoot)
         let route = Self.route(
             control: descriptor.control, interaction: current,
             descriptor: descriptor, value: value, choice: choice
@@ -306,7 +307,7 @@ extension AppToolExecutor {
         var effective = plan.posture
         guard let route = plan.route else {
             do {
-                let declined = try await interactions.decline(
+                let declined = try await InlineInteractionResolver.decline(
                     id: id, sessionID: sessionID,
                     expectedRevision: current.revision, dataRoot: dataRoot
                 )
@@ -324,9 +325,9 @@ extension AppToolExecutor {
         // and a dead control, which is what makes a second call safe.
         let began: InlineInteraction
         do {
-            began = try await interactions.begin(
+            began = try await InlineInteractionResolver.begin(
                 id: id, sessionID: sessionID,
-                expectedRevision: current.revision, dataRoot: dataRoot
+                expectedRevision: current.revision, byAgent: true, dataRoot: dataRoot
             )
         } catch {
             return Self.cardTransitionFailure("not_begun", error, id: id)
@@ -348,11 +349,11 @@ extension AppToolExecutor {
                 // never the state this process wished for.
                 let pending: InlineInteraction
                 do {
-                    pending = try await interactions.returnToPending(
+                    pending = try await InlineInteractionResolver.returnToPending(
                         began, sessionID: sessionID, dataRoot: dataRoot
                     )
                 } catch {
-                    guard let onDisk = await interactions.interaction(
+                    guard let onDisk = await InlineInteractionResolver.interaction(
                         id: id, sessionID: sessionID, dataRoot: dataRoot
                     ) else {
                         return Self.interactionFailure(
@@ -381,14 +382,15 @@ extension AppToolExecutor {
 
         var selection: String? = current.target
         var scope: InlineInteraction.Scope?
-        // A fixed reason class, never the service's own text (it can echo the
-        // secret back); the raw text goes to the local log, redacted.
+        // Provider setup supplies its safe reason class; grant failures are
+        // scrubbed by the shared credential redactor before settlement.
         var setupError: String?
         var note: String?
+        var grant: InteractionGrantOutcome?
         switch route {
         case .permissionGrant:
             // Below Full Mac `cardGate` refused the card by its kind.
-            await grantInteractionPermissions(current, appModel: appModel, dataRoot: dataRoot)
+            grant = await grantInteractionPermissions(current, appModel: appModel, dataRoot: dataRoot)
             HarnessDecidedRow.post(requester: "Full Mac", tool: "card.answer \(current.kind.rawValue)",
                                    sessionID: sessionID, dataRoot: dataRoot)
 
@@ -398,7 +400,7 @@ extension AppToolExecutor {
             guard let flag = InlineInteractionRegistry.capabilityFlags[current.target],
                   Self.selfAdminCapabilityPolicyKeys.contains(flag.policyKey)
             else { break }
-            await Self.applyCapabilityFlagGrant(
+            grant = await Self.applyCapabilityFlagGrant(
                 policyKey: flag.policyKey, appModel: appModel,
                 dataRoot: dataRoot, logTag: "interaction_act"
             )
@@ -420,11 +422,15 @@ extension AppToolExecutor {
         case .needsGlass:
             break
         }
+        if let grant {
+            setupError = grant.setupError
+            note = grant.note
+        }
 
         // The owner's answer, not ours — carrying, on the settled card's own
         // receipt line, the fact that nobody tapped it.
         do {
-            let settled = try await interactions.complete(
+            let settled = try await InlineInteractionResolver.complete(
                 id: id, sessionID: sessionID,
                 selection: selection, scope: scope,
                 // The revision THIS call acquired when it marked the card
@@ -437,7 +443,7 @@ extension AppToolExecutor {
                     : "Allowed by the agent",
                 setupError: setupError,
                 note: note,
-                dataRoot: dataRoot
+                byAgent: true, dataRoot: dataRoot
             )
             return interactionReceipt(
                 settled, action: action,
@@ -445,11 +451,13 @@ extension AppToolExecutor {
                 posture: effective, surface: surface, dataRoot: dataRoot,
                 extra: continuationExtra(id)
                     .merging(value.isEmpty ? [:] : ["value": .string("[redacted]")]) { a, _ in a }
+                    .merging(grant.map { ["grant_outcome": $0.receipt] } ?? [:]) { a, _ in a }
             )
         } catch {
             return Self.interactionFailure(
                 "not_settled", error.localizedDescription,
                 extra: ["interaction_id": .string(id)]
+                    .merging(grant.map { ["grant_outcome": $0.receipt] } ?? [:]) { a, _ in a }
             )
         }
     }
@@ -517,14 +525,39 @@ extension AppToolExecutor {
         }
     }
 
+    /// Evidence from the existing grant owners, carried into card settlement.
+    public struct InteractionGrantOutcome: Sendable {
+        public struct Failure: Sendable {
+            public let target: String
+            public let message: String
+        }
+        public var completedTargets: [String] = []
+        public var failures: [Failure] = []
+
+        mutating func failed(_ target: String, _ message: String) {
+            failures.append(Failure(target: target, message: NativeAppSecretRedactor.redactText(message)))
+        }
+        var note: String? {
+            completedTargets.isEmpty ? nil : "Grant writes completed: " + completedTargets.joined(separator: ", ") + "."
+        }
+        var setupError: String? {
+            failures.isEmpty ? nil : (failures.map { $0.target + ": " + $0.message } + [note].compactMap { $0 }).joined(separator: " ")
+        }
+        var receipt: JSONValue {
+            .object(["completed_targets": .array(completedTargets.map(JSONValue.string)),
+                "failures": .array(failures.map { .object(["target": .string($0.target), "message": .string($0.message)]) })])
+        }
+    }
+
     /// The same receipted grant the card's own handler makes, capability by
     /// capability, on exactly the axis the need asked for.
     @MainActor
     private func grantInteractionPermissions(
         _ interaction: InlineInteraction, appModel: any QuietSettingsHost, dataRoot: URL
-    ) async {
+    ) async -> InteractionGrantOutcome {
         let mode = interaction.mode
         var categories: [String] = []
+        var outcome = InteractionGrantOutcome()
         for capability in interaction.allTargets {
             if InlineInteractionRegistry.isMacControlCategory(capability) {
                 categories.append(capability)
@@ -545,13 +578,18 @@ extension AppToolExecutor {
                     // whatever the person already decided about it.
                     onlyAddingAxes: true
                 )
+                outcome.completedTargets.append(capability)
             } catch {
                 nativeLog("[interaction_act] grant failed for \(capability): \(error)")
+                outcome.failed(capability, error.localizedDescription)
             }
         }
-        await Self.applyMacControlCategoryGrant(
+        let mac = await Self.applyMacControlCategoryGrant(
             categories, appModel: appModel, dataRoot: dataRoot, logTag: "interaction_act"
         )
+        outcome.completedTargets += mac.completedTargets
+        outcome.failures += mac.failures
+        return outcome
     }
 
     /// The ONE Mac-control write either grant path makes: exactly the
@@ -563,29 +601,25 @@ extension AppToolExecutor {
     /// (`InlineInteractionChatBinding`) comes through here too, and the Full
     /// Mac check is re-run inside the lock the patch merges into.
     @MainActor
+    @discardableResult
     public static func applyMacControlCategoryGrant(
         _ categories: [String], appModel: any QuietSettingsHost, dataRoot: URL, logTag: String
-    ) async {
-        guard !categories.isEmpty else { return }
+    ) async -> InteractionGrantOutcome {
+        var outcome = InteractionGrantOutcome()
+        guard !categories.isEmpty else { return outcome }
         guard InlineInteractionRegistry.macControlPostureAllowsCategories(dataRoot: dataRoot) else {
             nativeLog("[\(logTag)] mac control grant refused: posture does not allow categories")
-            return
+            for category in categories { outcome.failed(category, "The current posture does not allow Mac control categories.") }
+            return outcome
         }
         var block: [String: Any] = ["enabled": true]
+        var granted: [String] = []
         for category in categories {
-            switch category {
-            case "shell": block["shell_allowed"] = true
-            case "file_ops": block["file_ops_allowed"] = true
-            case "applescript": block["applescript_allowed"] = true
-            case "jxa": block["jxa_allowed"] = true
-            case "accessibility": block["accessibility_allowed"] = true
-            case "system": block["system_control_allowed"] = true
-            case "notifications": block["notifications_allowed"] = true
-            case "spotlight": block["spotlight_allowed"] = true
-            default: continue
-            }
+            guard InlineInteractionRegistry.isMacControlCategory(category) else { continue }
+            block[categoryPolicyKey(category)] = true
+            granted.append(category)
         }
-        guard block.count > 1 else { return }
+        guard block.count > 1 else { return outcome }
         do {
             let saved = try await TrustPolicyToolWriter.applyTrustPolicyPatch(
                 body: ["macControlPolicy": block],
@@ -598,9 +632,12 @@ extension AppToolExecutor {
                 }
             )
             appModel.applySavedTrustPolicy(saved, status: "Mac control policy saved")
+            outcome.completedTargets = granted
         } catch {
             nativeLog("[\(logTag)] mac control grant failed: \(error)")
+            for category in granted { outcome.failed(category, error.localizedDescription) }
         }
+        return outcome
     }
 
     /// The ONE multimodal-capability write either grant path makes: the single
@@ -610,10 +647,12 @@ extension AppToolExecutor {
     @MainActor
     /// `requireFullMac` is for the agent answering; a person's tap on the card
     /// is the same switch they could flip in Trust, in any mode.
+    @discardableResult
     public static func applyCapabilityFlagGrant(
         policyKey: String, appModel: any QuietSettingsHost, dataRoot: URL, logTag: String,
         requireFullMac: Bool = true
-    ) async {
+    ) async -> InteractionGrantOutcome {
+        var outcome = InteractionGrantOutcome()
         do {
             let saved = try await TrustPolicyToolWriter.applyTrustPolicyPatch(
                 body: ["multimodalPolicy": [policyKey: true]],
@@ -627,11 +666,12 @@ extension AppToolExecutor {
                 }
             )
             appModel.applySavedTrustPolicy(saved, status: "Multimodal policy saved")
+            outcome.completedTargets.append(policyKey)
         } catch {
-            // The resolver re-reads the owner, so a refused write fails the
-            // card in the owner's own words rather than settling it.
             nativeLog("[\(logTag)] capability flag write failed for \(policyKey): \(error)")
+            outcome.failed(policyKey, error.localizedDescription)
         }
+        return outcome
     }
 
     /// The continuation the resolver handed back to THIS turn, when the card
@@ -645,7 +685,7 @@ extension AppToolExecutor {
     /// ordinary way.
     @MainActor
     private func continuationExtra(_ id: String) -> [String: JSONValue] {
-        guard let carried = interactions.takeContinuationHandBack(id: id)
+        guard let carried = InlineInteractionResolver.takeContinuationHandBack(id: id)
         else { return [:] }
         return [
             "continuation": .string(carried),
@@ -843,15 +883,27 @@ extension AppToolExecutor {
         dataRoot: URL,
         extra: [String: JSONValue] = [:]
     ) -> JSONValue {
-        let descriptor = interactions.descriptor(
+        let descriptor = InlineInteractionResolver.descriptor(
             for: interaction, dataRoot: dataRoot
         )
+        let card = InlineCards.model(interaction, descriptor: descriptor)
         var body: [String: JSONValue] = [
             "status": .string(status),
             "interaction_id": .string(interaction.id),
             "action": .string(action),
-            "card": .object(interactions.cardFields(interaction, descriptor: descriptor)),
-            "receipt": interactions.receiptEnvelope(interaction),
+            "card": .object([
+                "title": .string(card.title),
+                "state": .string(card.state.rawValue),
+                "why": .string(card.why),
+                "primary": .string(card.primaryLabel),
+                "secondary": .string(card.secondaryLabel),
+                "scope_lines": .array(card.scopeLines.map { .string($0) }),
+                "outcome": card.outcome.map { JSONValue.string($0) } ?? .null,
+                "outcome_meta": card.outcomeMeta.map { JSONValue.string($0) } ?? .null,
+                "can_retry": .bool(card.canRetry),
+                "revision": .int(Int64(interaction.revision)),
+            ]),
+            "receipt": InlineInteractionResolver.receiptEnvelope(interaction),
             "trust_mode": .string(posture.name),
             "surface": .string(surface),
             // Not a human tap, and it never reads as one.

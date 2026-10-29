@@ -1,5 +1,3 @@
-// PATCH-2026-05-07: kg-1 KnowledgeGraphView — Memory > Graph sub-section.
-// Shows entity list + edges. Simple adjacency list layout (no external libs).
 import SwiftUI
 import MemoryV2
 import PersistenceCore

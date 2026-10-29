@@ -5,11 +5,6 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `OwnedProgram.swift` | Program contract separating source digest from caller/candidate version, run/face entries over the same source, and ProgramProgressWindow: shared ContinuousClock renewal, host-wait exclusion and deadlines, with independent supervisor/JSC enforcement |
 
-/// App events stay in the app process; the isolated executor only supplies JSON.
-public protocol OwnedAppCalling: Sendable {
-    func callApp(_ arguments: JSONValue, targets: [String: String]) async throws -> JSONValue
-}
-
 /// Exact executable bytes, not an admission. The lifecycle owner checks the
 /// selected version and authority before handing a program to the runner.
 public struct OwnedProgram: Codable, Sendable, Equatable {

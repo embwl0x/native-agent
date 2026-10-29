@@ -5,8 +5,7 @@ import EngineRuntime
 // Blueprint: | `MacAssistantWatchSetupView.swift` | `MacAssistantWatchSetupView`: assistant watch/access controls, readiness reads and actionable Mail/permission checks |
 
 struct MacAssistantWatchSetupView: View {
-    var refreshToken: Int
-    private let loadsOnAppear: Bool
+    var refreshToken: Int = 0
 
     @Environment(AppModel.self) private var appModel
     @State private var isCheckingMail = false
@@ -14,17 +13,7 @@ struct MacAssistantWatchSetupView: View {
     private var loadState: MacAssistantWatchSetupLoadState { appModel.engine.macIntegration.watchState }
     private var isLoading: Bool { appModel.engine.macIntegration.isLoadingWatches }
 
-    init(
-        refreshToken: Int = 0,
-        loadsOnAppear: Bool = true
-    ) {
-        self.refreshToken = refreshToken
-        self.loadsOnAppear = loadsOnAppear
-    }
-
-    // Alive glass (2026-09-23): the watches and what they can use are two
-    // eyebrows over one group card each. Status words are quiet; only a read
-    // that failed is trouble.
+    // Watches and access each use one group card; only failed reads are trouble.
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
             VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
@@ -68,10 +57,7 @@ struct MacAssistantWatchSetupView: View {
             }
         }
         .accessibilityElement(children: .contain)
-        .task {
-            guard loadsOnAppear else { return }
-            await load()
-        }
+        .task { await load() }
         .onChange(of: refreshToken) { _, _ in
             Task { await load() }
         }
@@ -135,36 +121,25 @@ struct MacAssistantWatchSetupView: View {
     }
 
     private func accessRow(_ item: MacAssistantAccessItem) -> some View {
-        let plain = Self.plainAccess[item.id]
-        let title = plain?.title ?? item.title
         let status = item.status
-        // The macOS prompt note matters only until access is ready.
-        var detail = plain?.detail ?? item.detail
-        if status != "ready", let note = Self.promptNote[item.id] {
-            detail = detail + note
-        }
         // A next step that is a place in this app becomes a button to
         // that place, not a sentence pointing at it; Mac Mail gets a real check.
         let action: (label: String, go: () -> Void)? = if item.id == "local_mail" {
             isCheckingMail ? nil : ("Check Mail", { Task { await checkMail() } })
-        } else {
-            switch item.nextStep {
-            case "Configure mobile push in NativeAgent settings":
+        } else if item.id == "iphone_push" && status != "ready" {
                 ("Set up iPhone notifications", {
                     // The iPhone is paired on Connectors' iPhone tab. The route
                     // lands on the page's first tab, synchronously, so the tab is
                     // chosen after it.
-                    NativeAgentAppCoordinator.shared.request(.sidebar(.connectors))
+                    ApplicationLifetime.shared.request(.sidebar(.connectors))
                     UserDefaults.standard.set("iphone", forKey: ShellRailTab.storageKey(.connectors))
                 })
-            default: nil
-            }
-        }
+        } else { nil }
         let next = item.id == "local_mail" && ["failed", "needs_permission", "needs_setup"].contains(status)
-            ? item.nextStep : action != nil ? nil : item.nextStep.flatMap { $0.isEmpty ? nil : (Self.plainNextStep[$0] ?? $0) }
+            ? item.nextStep : action != nil ? nil : item.nextStep.flatMap { $0.isEmpty ? nil : $0 }
         return statusRow(
-            title: title,
-            detail: detail,
+            title: item.title,
+            detail: item.detail,
             nextStep: status == "ready" ? nil : next,
             action: status == "ready" ? nil : action,
             status: status,
@@ -265,33 +240,4 @@ struct MacAssistantWatchSetupView: View {
         }
     }
 
-    private static let plainAccess: [String: (title: String, detail: String)] = [
-        "mac_control": ("Mac control", "Lets me run shortcuts, post notifications, read files and script apps on this Mac."),
-        "mac_notifications": ("Mac notifications", "I post notifications on this Mac."),
-        "iphone_push": ("iPhone notifications", "I send what a watch found to your iPhone."),
-        "local_mail": ("Mac Mail", "I read your Mail inbox (read only)."),
-        "local_calendar": ("Mac Calendar", "I read Calendar (read only)."),
-        "local_reminders": ("Mac Reminders", "I read Reminders (read only)."),
-    ]
-
-    /// Said only while the source is not ready yet.
-    private static let promptNote: [String: String] = [
-        "local_mail": " The first check shows the macOS permission prompt.",
-        "local_calendar": " The first check shows the macOS permission prompt.",
-        "local_reminders": " The first check shows the macOS permission prompt.",
-    ]
-
-    /// The status client's known next steps, said plainly. Anything else is
-    /// shown as it comes.
-    private static let plainNextStep: [String: String] = [
-        "Enable Mac Control in Trust Center.": "Turn on Mac control above.",
-        "Enable Mac Control notifications and send a test notification.": "Turn on Notifications under Advanced Mac control, then send a test notification.",
-        "Run mac.mail_list_recent once from the app to prove Mail.app access.": "Use Check Mail so macOS can ask for access.",
-        "Run mac.calendar_list_upcoming once from the app to prove Calendar access.": "Use Check Calendar and Reminders above so macOS can ask for access.",
-        "Run mac.reminders_list_due_today once from the app to prove Reminders access.": "Use Check Calendar and Reminders above so macOS can ask for access.",
-        "Open NativeAgent > Mac Integration and click Grant beside Calendar to open the macOS permission prompt.": "Click Grant beside Calendar on Trust's Mac tab.",
-        "Open NativeAgent > Mac Integration and click Grant beside Reminders to open the macOS permission prompt.": "Click Grant beside Reminders on Trust's Mac tab.",
-        "Enable Calendar access for NativeAgent in System Settings > Privacy & Security.": "Allow Calendar for NativeAgent in System Settings → Privacy & Security.",
-        "Enable Reminders access for NativeAgent in System Settings > Privacy & Security.": "Allow Reminders for NativeAgent in System Settings → Privacy & Security.",
-    ]
 }

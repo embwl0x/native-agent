@@ -1,24 +1,12 @@
 import ChatToolParsing
 // SwiftToolDispatcher+InnerStateTools.swift
-// Personality depth, item 3 — the `inner_state` pull (2026-09-02).
-//
-// Agent: "introspection is production … I can't reliably tell noticing from
-// making-on-demand." Asked how she feels, she had nothing to READ, so she
-// composed — and the composition bent toward whatever the question expected.
+// The `inner_state` pull: read the recorded state before speaking about it.
 //
 // This is the tool that gives her something to read. It returns her own organs'
 // record: the felt fingerprint and its object, the mood integral and the
 // disposition undertone as words AND numbers, the window's felt nodes as
 // labelled points, the body's chemistry in the body line's own vocabulary,
 // what she is still waiting on, what the night left, and her cares.
-//
-// ── WIRING CANON ─────────────────────────────────────────────────────────────
-// ALWAYS-ON (in `alwaysOnCoreNames`), unlike the studio/desk/task lanes. A tool
-// she has to `tool_load` before she can answer "how are you" is a tool she will
-// not reach for mid-sentence — the same chicken-and-egg that made
-// `agent_introspect` always-on. NORTHSTAR clause 6 is satisfied by REACH: the
-// cost of this lane is one catalog row, and zero prompt bytes until she pulls.
-// The description is deliberately explicit that pulling comes BEFORE speaking.
 //
 // ── PAYLOAD-FREE, BY CONSTRUCTION ────────────────────────────────────────────
 // The reading itself (CognitiveSubstrate+InnerState.swift) is where the
@@ -37,9 +25,8 @@ import ChatToolParsing
 //      no tool-call syntax can ride back in as text and be re-parsed as a call.
 //      The stripper deletes the two attribute forms the tool loop emits; the
 //      neutralizer catches the bare `<tool_use>{…}</tool_use>` a hand-written
-//      care can carry, keeping her words and breaking the syntax
-//      (Agent, 2026-09-06).
-//   2. `ChatSecretRedactor.redactText` — the canonical eight-pattern,
+//      care can carry, keeping her words and breaking the syntax.
+//   2. `ChatSecretRedactor.redactText` — the shared credential patterns,
 //      digest-bearing secret contract every durable local surface uses.
 //   3. `promptSafeCapabilityText` — the shipped prompt-injection marker scan,
 //      which also collapses whitespace and enforces the bound.
@@ -86,15 +73,7 @@ extension SwiftToolDispatcher {
         return Self.innerStateJSON(reading, requestedWindowHours: Self.innerStateRawWindowHours(input))
     }
 
-    /// The window as ASKED FOR, before the clamp. Nil when the caller omitted
-    /// it (or sent something unparseable) — there is then no request to report,
-    /// only the default.
-    ///
-    /// Agent asked for 168 and was answered 48.0 with nothing saying so
-    /// (2026-09-13). The clamp is right — the felt field is a day-scale record
-    /// and a week-wide window would put an honest-looking number over nodes
-    /// that were never there — but a cap that applies in silence is a cap she
-    /// cannot read, so she reads the shortfall as her own memory being empty.
+    /// Return the finite requested window, or nil if absent or invalid, so results can disclose clamping.
     static func innerStateRawWindowHours(_ input: [String: JSONValue]) -> Double? {
         let raw: Double?
         switch input["window_hours"] {
@@ -135,16 +114,7 @@ extension SwiftToolDispatcher {
         )
     }
 
-    /// `stripToolUseMarkers` deletes only the two ATTRIBUTE forms the tool loop
-    /// emits (`<tool_use name="…">…</tool_use>` and the id form) — by design:
-    /// its other callers render assistant prose, where a leftover bracket would
-    /// be worse than a clean deletion. A care she wrote by hand can carry the
-    /// bare form, `<tool_use>{"name":"shell"}</tool_use>`, and that survived
-    /// intact into a rendered inner-state payload (Agent, 2026-09-06).
-    ///
-    /// Here the words are hers and worth keeping, so the marker is NEUTRALISED
-    /// rather than deleted: the angle brackets become square ones, which
-    /// `ToolCallParser` cannot parse as a call, and the sentence still reads.
+    /// Square brackets preserve care prose while making bare tool markers unparseable as calls.
     static func neutralizeToolUseMarkers(_ raw: String) -> String {
         guard raw.contains("<") else { return raw }
         let pattern = #"</?\s*tool_(?:use|result)\b[^>]*>"#
@@ -217,10 +187,7 @@ extension SwiftToolDispatcher {
             "felt_moments": .array(reading.feltNodes.map { node in
                 .object([
                     "when": .string(iso.string(from: node.when)),
-                    // HOW LONG AGO, beside the stamp. A correctly-dated moment
-                    // from last night read as "now" to Agent (2026-09-14) when
-                    // it was the only thing on its subject in the list; an age
-                    // makes that impossible to misread.
+                    // Age beside the timestamp distinguishes past moments from the present.
                     "age_hours": .double(
                         (reading.generatedAt.timeIntervalSince(node.when) / 3600 * 10).rounded() / 10),
                     // Which list it came from: `felt` = among the window's

@@ -16,8 +16,7 @@ extension SchedulerDueJobRunner {
         let reason = string(job.payload["reason"]) ?? "scheduled_proactive_scan"
         let scan = try await NativeAgentScheduledProactiveScan.evaluate(
             dataRoot: root,
-            payload: job.payload,
-            persistence: persistence
+            payload: job.payload
         )
         var itemIds: [String] = []
         for opportunity in scan.surfaced {

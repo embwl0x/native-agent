@@ -1,12 +1,12 @@
 import CognitiveSubstrate
 import Foundation
 
-// Blueprint: | `CognitiveAttentionResidentProjection.swift` | `CognitiveAttentionResidentProjection`: lock-backed immutable cognition/organism handoff for turn reads without actor, disk or provider work |
+// Blueprint: | `CognitiveAttentionResidentProjection.swift` | `ResidentAttention`: lock-backed immutable cognition/organism handoff for turn reads without actor, disk or provider work |
 
 /// Lock-backed immutable handoff from the canonical cognition/organism owners
 /// to turn preparation. Writers publish after state transitions; readers never
 /// enter an actor, touch disk, schedule work, or call a model.
-final class CognitiveAttentionResidentProjection: @unchecked Sendable {
+final class ResidentAttention: @unchecked Sendable {
     private struct PursuitIntent: Sendable, Equatable {
         let activeTask: String
         let goal: String
@@ -14,24 +14,15 @@ final class CognitiveAttentionResidentProjection: @unchecked Sendable {
 
     private struct State: Sendable {
         var substrate: CognitiveAttentionSignals?
-        var substratePublishedAt: Date?
         var predictedToolGroups: Set<String> = []
         var pursuit: PursuitIntent?
     }
 
-    /// Mirrors CognitiveSubstrate's pending-completion horizon. The resident
-    /// handoff may outlive the actor mutation that published it, so the open
-    /// question expires defensively even when no later event arrives.
-    private static let unresolvedQuestionMaximumAge: TimeInterval = 10 * 60
-
     private let lock = NSLock()
     private var state = State()
 
-    func replaceSubstrate(_ signals: CognitiveAttentionSignals?, publishedAt: Date) {
-        lock.withLock {
-            state.substrate = signals
-            state.substratePublishedAt = publishedAt
-        }
+    func replaceSubstrate(_ signals: CognitiveAttentionSignals?) {
+        lock.withLock { state.substrate = signals }
     }
 
     func replacePredictedToolGroups(_ groups: Set<String>) {
@@ -57,20 +48,19 @@ final class CognitiveAttentionResidentProjection: @unchecked Sendable {
         let snapshot = lock.withLock { state }
         let base = snapshot.substrate
         let unresolvedQuestion: String? = {
-            guard let question = base?.unresolvedQuestion else { return nil }
-            guard let publishedAt = snapshot.substratePublishedAt else { return nil }
-            let age = date.timeIntervalSince(publishedAt)
-            return age >= 0 && age <= Self.unresolvedQuestionMaximumAge ? question : nil
+            guard let window = base?.completionWindow,
+                  date >= window.openedAt, date <= window.expiresAt else { return nil }
+            return base?.unresolvedQuestion
         }()
         let signals = CognitiveAttentionSignals(
             terms: base?.terms ?? [:],
             unresolvedQuestion: unresolvedQuestion,
+            completionWindow: base?.completionWindow,
             activeTask: snapshot.pursuit?.activeTask ?? base?.activeTask,
             goal: snapshot.pursuit?.goal ?? base?.goal,
             residentWorkIntent: snapshot.pursuit != nil,
             predictedToolGroups: snapshot.predictedToolGroups,
             memoryActivation: base?.memoryActivation ?? [:],
-            workingMemoryRecordIDs: base?.workingMemoryRecordIDs ?? [],
             suppressedMemory: base?.suppressedMemory ?? [:]
         )
         return signals.isEmpty ? nil : signals

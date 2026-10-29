@@ -1,9 +1,10 @@
 import Foundation
+import NativeAgentShared
 import CryptoKit
-import Darwin
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `ChatSessionRetention.swift` | Canonical archive-index schema, manual archive transaction and durable append, shared by discovery/restoration; retention row removal delegates to ChatSessionIndexFile; locked pruning/enforcement snapshot, nonblocking transcript admission and exact acknowledged-version guard; retains all chat storage including the history index during disk cleanup |
+import os
+// Blueprint: | `ChatSessionRetention.swift` | Archive eligibility and protected conversations; manual/retention archive settlement and durable append before hot-row removal; index to transcript to archive lock order, exact acknowledged-version guard and retained chat storage |
 
 public struct ChatSessionRetentionPolicy: Sendable, Equatable {
     public var maxActiveSessions: Int
@@ -45,151 +46,36 @@ public struct ChatSessionRetentionReport: Sendable, Equatable {
     }
 }
 
-/// Bounds the hot chat session index without hard-deleting conversations.
-///
-/// `enforce`'s caller holds the shared `chat/sessions.json` lock against the
-/// live data root; `archiveSession` owns its transaction locks. Rows append to
-/// `chat/archive/sessions.jsonl`; transcript files move from `chat/messages/`
-/// to `chat/archive/messages/`.
-///
-/// Lock order is `chat/sessions.json.lock` first, then the selected
-/// `chat/messages/<session>.jsonl.lock`. Transcript writers take only the
-/// transcript lock while appending, release it, and only then take the sessions
-/// lock to update the index. No writer may hold those locks in the reverse
-/// order. If the nonblocking transcript lock is contended, that session stays
-/// hot for a later pass.
-/// Storage: archive rows and transcripts are in local/off-disk backups and
-/// PrivacyMap/chat; data export and phone sync exclude the raw archive files.
+/// Bounds the hot index without deleting history; `enforce` uses the caller's locked rows.
+/// Manual archive owns its locks. Rows append to `chat/archive/sessions.jsonl`;
+/// transcripts move from `chat/messages/` to `chat/archive/messages/`.
+/// Lock sessions index, transcript, then archive index; writers release the transcript
+/// lock before index sync. Contended transcripts stay hot for a later pass.
+/// Archive history belongs to local/off-disk backups and PrivacyMap/chat;
+/// data export and phone sync exclude raw archive files.
 public enum ChatSessionRetention {
     public static let diskStorageOwner = DiskStorageOwner.retained(id: "chat", roots: ["chat"],
         policy: "Transcripts, archives and compaction backups are memory; Clean Up keeps them. The history search index belongs to chat and is kept because launch rebuilds it. chat.archive organizes conversations without reclaiming transcript bytes. No history erasure control is provided by this cleanup.")
 
-    public static let macPinnedSessionIdsDefaultsKey = "NativeAgent.pinnedChatSessionIds"
-
-    // Storage: pinned_session_ids.json mirrors the Mac preference for retention.
-    // Local backup/data export exclude it; off-disk backup includes it. Phone
-    // pins project the host preference, not this file. PrivacyMap: chat.
-
-    /// The concrete outcome of a pinned-tab close request. Keeping refusal
-    /// separate from success lets the mounted control show an honest outcome
-    /// when another surface has already removed a pin.
-    public enum CloseResult: Equatable {
-        case closed(encoded: String)
-        case refusedInvalidSessionID
-        case refusedAlreadyUnpinned
-    }
-
-    public nonisolated static func decode(_ raw: String) -> [String] {
-        let cleanRaw = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        let ids: [String]
-        if let data = cleanRaw.data(using: .utf8),
-           let decoded = try? JSONDecoder().decode([String].self, from: data) {
-            ids = decoded
-        } else {
-            ids = cleanRaw.split(separator: "|").map(String.init)
-        }
-        return cleanedSessionIds(ids)
-    }
-
-    @MainActor
-    public static func load(defaults: UserDefaults = .standard) -> [String] {
-        decode(defaults.string(forKey: macPinnedSessionIdsDefaultsKey) ?? "")
-    }
-
-    /// Persists the retention mirror before publishing the reactive defaults
-    /// value. A failed disk write therefore cannot make the UI claim a pin
-    /// state that retention did not record.
-    @discardableResult
-    @MainActor
-    public static func save(
-        _ ids: [String],
-        defaults: UserDefaults = .standard,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) throws -> String {
-        let clean = cleanedSessionIds(ids)
-        try ChatSessionRetention.saveMacPinnedChatSessionIds(clean, dataRoot: dataRoot)
-        let data = try JSONEncoder().encode(clean)
-        let encoded = String(decoding: data, as: UTF8.self)
-        defaults.set(encoded, forKey: macPinnedSessionIdsDefaultsKey)
-        return encoded
-    }
-
-    /// Removes one pin through the same mirror-first transaction used by every
-    /// pinned-session mutation. If the retention mirror cannot be written,
-    /// `save` throws before it changes `UserDefaults`, leaving the visible tab
-    /// pinned now and after the next reload.
-    @MainActor
-    public static func closePinnedTab(
-        sessionID: String,
-        defaults: UserDefaults = .standard,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) throws -> CloseResult {
-        let cleanSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanSessionID.isEmpty else {
-            return .refusedInvalidSessionID
-        }
-
-        let current = load(defaults: defaults)
-        guard current.contains(cleanSessionID) else {
-            return .refusedAlreadyUnpinned
-        }
-
-        return .closed(encoded: try save(
-            current.filter { $0 != cleanSessionID },
-            defaults: defaults,
-            dataRoot: dataRoot
-        ))
-    }
-
-    @discardableResult
-    @MainActor
-    public static func request(
-        encodedPinnedIDs: String,
-        defaults: UserDefaults = .standard,
-        publish: ([String]) -> Void
-    ) -> Bool {
-        let requested = decode(encodedPinnedIDs)
-        let persisted = load(defaults: defaults)
-        guard requested == persisted else { return false }
-        publish(persisted)
-        return true
-    }
-
     // Archived transcripts and their locator rows are durable history. Only
     // explicit deletion may remove them; the active index remains bounded.
-    /// F6 (2026-08-28): `chat/session_state/<id>/` holds derived per-session
-    /// state (`digest.txt` from SessionDigestProvider, `provider_usage.json`
-    /// from LLMCallTelemetry). No pruner ever touched it, so archived sessions
-    /// left their state dirs behind forever (1,279 orphans on the live root).
-    /// A dir with no row in `chat/sessions.json` whose newest mtime is older
-    /// than this is removed on the archive-prune pass. Transcripts are never
-    /// touched — this tier is derived state only.
-    public static let sessionStateRetentionSeconds: TimeInterval = 30 * 24 * 60 * 60
-    /// Orphan state dirs removed per prune pass. Bounds a backlog sweep (the
-    /// live root's ~1,300 orphans clear in a handful of passes) so no single
-    /// pass stalls the caller, which runs inside the sessions lock.
-    public static let sessionStatePruneMaxPerPass = 200
-
     public nonisolated static func defaultBestEffortFailureLogger(_ message: String) {
         nativeLog("%@", message)
     }
 
     public static func enforce(
         dataRoot: URL,
+        rows: [[String: JSONValue]],
         now: Date = Date(),
         policy: ChatSessionRetentionPolicy = .default
-    ) throws -> ChatSessionRetentionReport {
+    ) throws -> (rows: [[String: JSONValue]], report: ChatSessionRetentionReport) {
         let sessionsPath = dataRoot
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("sessions.json")
-        guard FileManager.default.fileExists(atPath: sessionsPath.path) else {
-            return ChatSessionRetentionReport()
-        }
-        let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
         // Pruning and enforcement share the caller's locked index snapshot.
-        pruneArchive(dataRoot: dataRoot, now: now, rows: rows)
+        if FileManager.default.fileExists(atPath: sessionsPath.path) { pruneArchive(dataRoot: dataRoot, now: now, rows: rows) }
         guard !rows.isEmpty else {
-            return ChatSessionRetentionReport()
+            return (rows, ChatSessionRetentionReport())
         }
 
         let protectedSessionIds = try resolvedProtectedSessionIds(policy, dataRoot: dataRoot)
@@ -200,7 +86,7 @@ public enum ChatSessionRetention {
             protectedSessionIds: protectedSessionIds
         )
         guard !reasons.isEmpty else {
-            return ChatSessionRetentionReport(keptSessions: rows.count)
+            return (rows, ChatSessionRetentionReport(keptSessions: rows.count))
         }
 
         var kept: [[String: JSONValue]] = []
@@ -208,9 +94,6 @@ public enum ChatSessionRetention {
         var indexedRows = rows
         // The caller holds the sessions lock. Checkpoint each removal while
         // archive still holds the transcript lock, before deleting hot history.
-        func removeArchivedRowFromIndex(_ row: [String: JSONValue]) throws {
-            try ChatSessionIndexFile.removeArchivedRow(row, from: &indexedRows, at: sessionsPath)
-        }
         var report = ChatSessionRetentionReport()
         var staleEmptyAborts = 0
         for (index, row) in rows.enumerated() {
@@ -219,7 +102,7 @@ public enum ChatSessionRetention {
                 continue
             }
             if try archive(row: row, reason: reason, dataRoot: dataRoot, now: now,
-                           commitIndexRemoval: { try removeArchivedRowFromIndex(row) }) {
+                           commitIndexRemoval: { try ChatSessionIndexFile.removeArchivedRow(row, from: &indexedRows, at: sessionsPath) }) {
                 report.archivedSessions += 1
                 switch reason {
                 case .activeCap:
@@ -233,14 +116,8 @@ public enum ChatSessionRetention {
             }
         }
 
-        // Wave-2 deferral closed (wave 5): stale-empty candidates were
-        // excluded from active-cap planning on the assumption they leave.
-        // An ABORTED stale-empty archive (transcript grew non-empty under
-        // the lock) re-enters the active population with no planned reason,
-        // so the count can exceed the cap until some later sweep. One
-        // bounded re-plan over the kept rows closes that window — aborted
-        // rows are non-empty now and participate as ordinary active
-        // sessions. Second pass executes activeCap only, so it terminates.
+        // Aborted stale-empty archives rejoin active-cap planning as nonempty
+        // sessions. The bounded second pass executes only active-cap removals.
         if staleEmptyAborts > 0 {
             let secondReasons = plannedArchiveReasons(
                 rows: kept,
@@ -248,28 +125,17 @@ public enum ChatSessionRetention {
                 policy: policy,
                 protectedSessionIds: protectedSessionIds
             )
-            if secondReasons.contains(where: { $0.value == .activeCap }) {
-                var secondKept: [[String: JSONValue]] = []
-                secondKept.reserveCapacity(kept.count)
-                for (index, row) in kept.enumerated() {
-                    guard secondReasons[index] == .activeCap else {
-                        secondKept.append(row)
-                        continue
-                    }
-                    if try archive(row: row, reason: .activeCap, dataRoot: dataRoot, now: now,
-                                   commitIndexRemoval: { try removeArchivedRowFromIndex(row) }) {
-                        report.archivedSessions += 1
-                        report.archivedForCap += 1
-                    } else {
-                        secondKept.append(row)
-                    }
+            for (index, row) in kept.enumerated() where secondReasons[index] == .activeCap {
+                if try archive(row: row, reason: .activeCap, dataRoot: dataRoot, now: now,
+                               commitIndexRemoval: { try ChatSessionIndexFile.removeArchivedRow(row, from: &indexedRows, at: sessionsPath) }) {
+                    report.archivedSessions += 1
+                    report.archivedForCap += 1
                 }
-                kept = secondKept
             }
         }
 
-        report.keptSessions = kept.count
-        return report
+        report.keptSessions = indexedRows.count
+        return (indexedRows, report)
     }
 
     /// Best-effort enforcement for callers whose success path must continue even
@@ -278,13 +144,14 @@ public enum ChatSessionRetention {
     @discardableResult
     public static func enforceBestEffort(
         dataRoot: URL,
+        rows: [[String: JSONValue]],
         now: Date = Date(),
         policy: ChatSessionRetentionPolicy = .default,
         context: String,
         failureLogger: @escaping @Sendable (String) -> Void = defaultBestEffortFailureLogger
-    ) -> ChatSessionRetentionReport? {
+    ) -> (rows: [[String: JSONValue]], report: ChatSessionRetentionReport)? {
         do {
-            return try enforce(dataRoot: dataRoot, now: now, policy: policy)
+            return try enforce(dataRoot: dataRoot, rows: rows, now: now, policy: policy)
         } catch {
             failureLogger(
                 "\(context): ChatSessionRetention.enforce failed at \(dataRoot.path): \(error)"
@@ -300,8 +167,7 @@ public enum ChatSessionRetention {
         guard NativeAgentChatSessionID.normalizedPathComponent(id) != nil else { return nil }
         let index = dataRoot.appendingPathComponent("chat/sessions.json")
         let archive = dataRoot.appendingPathComponent("chat/archive/sessions.jsonl")
-        let persistence = SwiftNativePersistenceCore()
-        return try await persistence.withFileLock(index) {
+        return try await SwiftNativePersistenceCore.withFileLock(index) {
             var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: index)
             guard let position = rows.firstIndex(where: { $0["id"] == .string(id) }) else { return nil }
             var archived = rows[position]
@@ -309,7 +175,7 @@ public enum ChatSessionRetention {
             archived["archivedBy"] = .string("mac_chat")
             archived["archivedAt"] = .string(ISO8601DateFormatter().string(from: Date()))
             let row = archived
-            try await persistence.withFileLock(archive) {
+            try await SwiftNativePersistenceCore.withFileLock(archive) {
                 var latest = try archiveIndexRows(dataRoot: dataRoot).last { $0["id"] == .string(id) }
                 // Ignore only this operation's timestamp when recognizing a retry.
                 latest?["archivedAt"] = row["archivedAt"]
@@ -321,152 +187,6 @@ public enum ChatSessionRetention {
             try ChatSessionIndexFile.write(rows, to: index, removeWhenEmpty: true)
             return archived
         }
-    }
-
-    private static func archiveIndexRows(dataRoot: URL) throws -> [[String: JSONValue]] {
-        let index = dataRoot.appendingPathComponent("chat/archive/sessions.jsonl")
-        let bytes: Data
-        do { bytes = try Data(contentsOf: index) }
-        catch CocoaError.fileReadNoSuchFile { return [] }
-        let directory = dataRoot.appendingPathComponent("chat/archive/messages", isDirectory: true)
-            .resolvingSymlinksInPath().standardizedFileURL
-        return try bytes.split(separator: 10).map { line in
-            guard case .object(let row) = try JSONValue.parse(Data(line)),
-                  case .string(let id)? = row["id"],
-                  NativeAgentChatSessionID.normalizedPathComponent(id) != nil else {
-                throw CocoaError(.fileReadCorruptFile)
-            }
-            if case .string(let relative)? = row["messagesArchivePath"] {
-                let file = dataRoot.appendingPathComponent(relative).standardizedFileURL
-                guard file.resolvingSymlinksInPath().deletingLastPathComponent() == directory else {
-                    throw CocoaError(.fileReadCorruptFile)
-                }
-            }
-            return row
-        }
-    }
-
-    public static func archivedTranscripts(dataRoot: URL) throws -> [String: [URL]] {
-        func entries(_ directory: URL) throws -> [URL] {
-            do { return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isDirectoryKey]) }
-            catch CocoaError.fileReadNoSuchFile { return [] }
-        }
-        var files: [String: [URL]] = [:]
-        for row in try archiveIndexRows(dataRoot: dataRoot).reversed() {
-            guard case .string(let id)? = row["id"],
-                  case .string(let relative)? = row["messagesArchivePath"] else { continue }
-            let file = dataRoot.appendingPathComponent(relative).standardizedFileURL
-            if !files[id, default: []].contains(file) { files[id, default: []].append(file) }
-        }
-        let sessions = dataRoot.appendingPathComponent("chat/sessions", isDirectory: true).resolvingSymlinksInPath()
-        for session in try entries(sessions) {
-            let id = session.lastPathComponent
-            guard NativeAgentChatSessionID.normalizedPathComponent(id) != nil,
-                  try session.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else { continue }
-            guard session.resolvingSymlinksInPath().deletingLastPathComponent().path == sessions.path else {
-                throw CocoaError(.fileReadCorruptFile)
-            }
-            let backups = try entries(session).filter {
-                $0.lastPathComponent.hasPrefix("messages.compact.") && $0.pathExtension == "jsonl"
-            }.sorted { $0.lastPathComponent > $1.lastPathComponent }
-            for file in backups {
-                guard file.resolvingSymlinksInPath().deletingLastPathComponent().path == session.path else {
-                    throw CocoaError(.fileReadCorruptFile)
-                }
-                files[id, default: []].append(file)
-            }
-        }
-        let originals = dataRoot.appendingPathComponent("chat/archive/originals", isDirectory: true).resolvingSymlinksInPath()
-        for file in try entries(originals) where file.pathExtension == "jsonl" {
-            guard let id = NativeAgentChatSessionID.normalizedPathComponent(file.deletingPathExtension().lastPathComponent),
-                  file.resolvingSymlinksInPath().deletingLastPathComponent().path == originals.path else {
-                throw CocoaError(.fileReadCorruptFile)
-            }
-            files[id, default: []].append(file)
-        }
-        return files
-    }
-
-    public static func transcriptFiles(
-        dataRoot: URL, sessionId: String? = nil, prefix: String = "", archived: [String: [URL]]
-    ) throws -> [(String, URL)] {
-        let messages = dataRoot.appendingPathComponent("chat/messages", isDirectory: true)
-        if let sessionId {
-            guard let id = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
-                throw CocoaError(.fileReadInvalidFileName)
-            }
-            let hot = messages.appendingPathComponent("\(id).jsonl")
-            let cold = archived[id] ?? []
-            return ((FileManager.default.fileExists(atPath: hot.path) || cold.isEmpty ? [hot] : []) + cold)
-                .map { (id, $0) }
-        }
-        let hot: [URL]
-        do {
-            let files = try FileManager.default.contentsOfDirectory(
-                at: messages, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]
-            ).filter { $0.pathExtension == "jsonl" && $0.lastPathComponent.hasPrefix(prefix) }
-            // One stat per file, never one per comparison.
-            let dated: [(url: URL, at: Date)] = files.map { ($0, transcriptModifiedDate($0) ?? .distantPast) }
-            hot = dated.sorted { $0.at == $1.at ? $0.url.lastPathComponent < $1.url.lastPathComponent : $0.at > $1.at }.map(\.url)
-        } catch CocoaError.fileReadNoSuchFile { hot = [] }
-        let coldDated: [(id: String, files: [URL], at: Date)] = archived.filter { $0.key.hasPrefix(prefix) }
-            .map { ($0.key, $0.value, $0.value.first.flatMap(transcriptModifiedDate) ?? .distantPast) }
-        let cold: [(String, URL)] = coldDated.sorted { $0.at == $1.at ? $0.id < $1.id : $0.at > $1.at }
-            .flatMap { entry in entry.files.map { (entry.id, $0) } }
-        return hot.map { ($0.deletingPathExtension().lastPathComponent, $0) } + cold
-    }
-
-    /// The row a door (Telegram, Slack) should re-create for `sessionId` when
-    /// its map points at a session retention archived: the newest archived
-    /// row with its transcript copied back into the hot tier. The archive copy
-    /// stays where it is. Nil when nothing restorable is archived under that
-    /// id. Caller holds the `chat/sessions.json` lock (lock order is sessions
-    /// first, transcript second).
-    public static func restoreArchivedRow(
-        sessionId: String,
-        dataRoot: URL
-    ) async throws -> [String: JSONValue]? {
-        guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
-            return nil
-        }
-        let chat = dataRoot.appendingPathComponent("chat", isDirectory: true)
-        guard var row = try archiveIndexRows(dataRoot: dataRoot).last(where: { $0["id"] == .string(sessionId) }),
-              case .string(let relative)? = row["messagesArchivePath"] else { return nil }
-        let archivedBytes: Data
-        do { archivedBytes = try Data(contentsOf: dataRoot.appendingPathComponent(relative)) }
-        // Legacy retention or explicit deletion may have removed the bytes.
-        catch CocoaError.fileReadNoSuchFile { return nil }
-        let messagesPath = chat
-            .appendingPathComponent("messages", isDirectory: true)
-            .appendingPathComponent("\(safeSessionId).jsonl")
-        try await SwiftNativePersistenceCore().withFileLock(messagesPath) {
-            let hot: Data
-            do { hot = try Data(contentsOf: messagesPath) }
-            catch CocoaError.fileReadNoSuchFile { hot = Data() }
-            // The atomic copy may have succeeded before the caller's index
-            // commit failed. Its exact prefix also survives later appends.
-            if !archivedBytes.isEmpty, hot.starts(with: archivedBytes) { return }
-            try ContactThread.replace(archivedBytes + hot, to: messagesPath)
-        }
-        for key in ["archivedBy", "retentionArchivedAt", "retentionReason", "messagesArchivePath"] {
-            row.removeValue(forKey: key)
-        }
-        row["archived"] = .bool(false)
-        return row
-    }
-
-    public static func saveMacPinnedChatSessionIds(
-        _ ids: [String],
-        dataRoot: URL = defaultDataRoot()
-    ) throws {
-        let clean = cleanedSessionIds(ids)
-        let path = macPinnedSessionIdsPath(dataRoot: dataRoot)
-        try FileManager.default.createDirectory(
-            at: path.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
-        let payload = try JSONValue.array(clean.map { .string($0) }).serializedData(pretty: true)
-        try payload.write(to: path, options: .atomic)
     }
 
     private enum ArchiveReason: String {
@@ -512,18 +232,8 @@ public enum ChatSessionRetention {
         if policy.includeMacPinnedSessions {
             protected.formUnion(try macPinnedChatSessionIds(dataRoot: dataRoot))
         }
-        // The anchor is the conversation the human is IN right now, on
-        // whichever surface. Archiving it because 200 other rows happen to be
-        // newer would pick the worst possible moment to enforce a cap.
-        //
-        // Independent of the pin strip on purpose: the Mac auto-INCLUDES the
-        // anchor for visibility, but a human can unpin anything, and an unpin
-        // must not be able to make the live conversation archivable. Surface-
-        // agnostic — nothing here knows which adapter published it.
-        //
-        // We are already inside the caller's sessions lock, which is the same
-        // lock `ConversationAnchor.publish` writes under, so this read cannot
-        // see a half-written pin.
+        // The live anchor stays protected independently of pins on every surface.
+        // Its publisher shares this caller's sessions lock, so the read is atomic.
         protected.formUnion(ConversationAnchor.protectedSessionIds(dataRoot: dataRoot))
         // A session a door (Telegram chat, Slack channel/thread) is bound to is
         // where that door's next message lands; archiving it would restart
@@ -539,11 +249,6 @@ public enum ChatSessionRetention {
     public static func contactSessionPrefix(owner: String) -> String {
         let digest = SHA256.hash(data: Data(owner.utf8))
         return "agent-" + digest.map { String(format: "%02x", $0) }.joined().prefix(12) + "-"
-    }
-
-    /// Whether a session is one a contact owns (`contactSessionPrefix`).
-    public static func isContactSession(_ id: String) -> Bool {
-        id.range(of: "^agent-[0-9a-f]{12}-", options: .regularExpression) != nil
     }
 
     private static func contactSessionIds(dataRoot: URL) throws -> Set<String> {
@@ -584,46 +289,6 @@ public enum ChatSessionRetention {
         return ids
     }
 
-    private static func macPinnedChatSessionIds(dataRoot: URL) throws -> Set<String> {
-        var protected = try sharedMacPinnedChatSessionIds(dataRoot: dataRoot)
-        protected.formUnion(decode(UserDefaults.standard.string(forKey: macPinnedSessionIdsDefaultsKey) ?? ""))
-        return protected
-    }
-
-    private static func sharedMacPinnedChatSessionIds(dataRoot: URL) throws -> Set<String> {
-        let path = macPinnedSessionIdsPath(dataRoot: dataRoot)
-        let data: Data
-        do { data = try Data(contentsOf: path) }
-        catch CocoaError.fileReadNoSuchFile { return [] }
-        // An unreadable or newer pin format is not an empty pin list. Stop
-        // retention before moving any conversation whose protection is unknown.
-        guard case .array(let values) = try JSONValue.parse(data) else {
-            throw PersistenceCoreError.ioFailure("I couldn’t read your pinned chats. I’ve left your conversations in place.")
-        }
-        return Set(try values.map { value in
-            guard case .string(let id) = value else {
-                throw PersistenceCoreError.ioFailure("I couldn’t read your pinned chats. I’ve left your conversations in place.")
-            }
-            let clean = id.trimmingCharacters(in: .whitespacesAndNewlines)
-            return clean
-        })
-    }
-
-    private static func macPinnedSessionIdsPath(dataRoot: URL) -> URL {
-        dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("pinned_session_ids.json")
-    }
-
-    private static func cleanedSessionIds(_ ids: [String]) -> [String] {
-        var seen = Set<String>()
-        return ids.compactMap { id -> String? in
-            let clean = id.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !clean.isEmpty, seen.insert(clean).inserted else { return nil }
-            return clean
-        }
-    }
-
     private static func isProtected(
         _ row: [String: JSONValue],
         protectedSessionIds: Set<String>
@@ -655,29 +320,18 @@ public enum ChatSessionRetention {
         var baseArchivedRow = row
         baseArchivedRow["archived"] = .bool(true)
         baseArchivedRow["archivedBy"] = .string("chat_session_retention")
-        baseArchivedRow["retentionArchivedAt"] = .string(iso8601(now))
+        baseArchivedRow["retentionArchivedAt"] = .string(NativeTimestampFormat.fractionalZulu(now))
         baseArchivedRow["retentionReason"] = .string(reason.rawValue)
 
-        let archived = try withNonblockingTranscriptLock(messagesPath) { () throws -> Bool in
+        let archived = try CredentialFileLock.tryWithLock(messagesPath) { () throws -> Bool in
             if reason == .activeCap, ChatSessionIndexFile.hasPendingTranscriptIndexSync(at: messagesPath) {
                 return false
             }
-            // Re-validate the staleEmpty PREMISE under the lock (2026-08-01).
-            // The decision came from the pre-lock `sessions.json` snapshot; a
-            // writer can append the session's first message and release the
-            // transcript lock between that snapshot and here. The existence
-            // check below only chose whether to COPY — it never aborted — so a
-            // now-non-empty transcript was copied to the archive and the hot
-            // file deleted, losing a live session's first message from the hot
-            // tier.
+            // Recheck emptiness under the transcript lock before archiving a stale-empty session.
             if reason == .staleEmpty, transcriptIsNonEmpty(messagesPath) {
                 return false
             }
-            // 2026-09-06: `.activeCap` needs the same premise re-checked, for a
-            // different reason. A writer commits its transcript row and only
-            // then synchronizes `sessions.json`; archiving in that gap deletes
-            // the hot transcript, and the writer's index sync then recreates an
-            // ACTIVE row for the session with none of its history behind it.
+            // Archive only the transcript version acknowledged by the session index.
             if reason == .activeCap, transcriptModifiedDate(messagesPath) != nil {
                 // A pending writer changes the exact transcript version before
                 // synchronizing the index. Legacy rows stay hot until bounded
@@ -709,17 +363,9 @@ public enum ChatSessionRetention {
             if let archivedMessagesPath {
                 archivedRow["messagesArchivePath"] = .string(relativePath(archivedMessagesPath, under: dataRoot))
             }
-            // Review round 2 (MED): the index has its own lock so concurrent
-            // archivals of DIFFERENT sessions (each holding only their own
-            // transcript lock) and the prune's cap rewrite cannot interleave
-            // and drop a freshly appended row. Lock ordering is one-way
-            // (transcript → index); the prune takes only the index lock.
-            //
-            // Lock contention (nil return) must not count as archived —
-            // deleting the hot transcript with no index row written would
-            // orphan the session. On contention, undo the transcript copy and
-            // report not-archived; retention simply retries on its next pass.
-            let indexRowWritten = try withNonblockingTranscriptLock(archiveIndex) {
+            // Lock archive after transcript. On contention, discard the copy and
+            // keep the session hot; no removal may precede its durable archive row.
+            let indexRowWritten = try CredentialFileLock.tryWithLock(archiveIndex) {
                 try appendJSONL(.object(archivedRow), to: archiveIndex)
                 return true
             }
@@ -742,11 +388,8 @@ public enum ChatSessionRetention {
         return archived ?? false
     }
 
-    /// True when the transcript at `path` holds at least one non-blank JSONL
-    /// line. Must be called while holding that transcript's lock. An unreadable
-    /// file reads as EMPTY: a session with no transcript on disk is the normal
-    /// stale-empty case, and failing closed there would park every such session
-    /// hot forever.
+    /// Under the transcript lock, detect a non-blank JSONL line.
+    /// Unreadable bytes count as empty, allowing stale-empty sessions to leave the hot tier.
     private static func transcriptIsNonEmpty(_ path: URL) -> Bool {
         guard let data = try? Data(contentsOf: path), !data.isEmpty else { return false }
         guard let text = String(data: data, encoding: .utf8) else { return true }
@@ -756,223 +399,8 @@ public enum ChatSessionRetention {
     }
 
     /// The transcript's last-write time, or nil when there is no transcript.
-    private static func transcriptModifiedDate(_ path: URL) -> Date? {
+    static func transcriptModifiedDate(_ path: URL) -> Date? {
         (try? FileManager.default.attributesOfItem(atPath: path.path))?[.modificationDate] as? Date
-    }
-
-    /// Synchronous, nonblocking counterpart to `PersistenceCoreProtocol.withFileLock`.
-    /// `enforce` is intentionally synchronous because production callers invoke
-    /// it while already inside the async sessions-file lock. Contention defers
-    /// the session without parking a cooperative-pool thread under that lock.
-    private static func withNonblockingTranscriptLock<T>(
-        _ targetPath: URL,
-        _ body: () throws -> T
-    ) throws -> T? {
-        let lockPath = targetPath.path + ".lock"
-        let parent = (lockPath as NSString).deletingLastPathComponent
-        try? FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
-
-        let fd = Darwin.open(lockPath, O_CREAT | O_WRONLY, 0o600)
-        if fd < 0 {
-            throw NSError(
-                domain: "FileLock",
-                code: Int(errno),
-                userInfo: [NSLocalizedDescriptionKey: "open lock failed: \(String(cString: strerror(errno)))"]
-            )
-        }
-        defer { Darwin.close(fd) }
-        if flock(fd, LOCK_EX | LOCK_NB) != 0 {
-            let lockError = errno
-            if lockError != EWOULDBLOCK && lockError != EINTR {
-                throw NSError(
-                    domain: "FileLock",
-                    code: Int(lockError),
-                    userInfo: [
-                        NSLocalizedDescriptionKey:
-                            "flock LOCK_EX failed: \(String(cString: strerror(lockError)))",
-                    ]
-                )
-            }
-            return nil
-        }
-        defer { _ = flock(fd, LOCK_UN) }
-        return try body()
-    }
-
-    /// Archive changes trigger cleanup of disposable session state. Canonical
-    /// transcript bytes and locator rows never expire automatically.
-    private static func pruneArchive(dataRoot: URL, now: Date, rows: [[String: JSONValue]]) {
-        let archiveDir = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("archive", isDirectory: true)
-
-        guard pruneIsDue(archiveDir: archiveDir, now: now) else { return }
-        // Stamp the tier as it stood BEFORE the scan (gpt-5.5 wave-2
-        // NEEDS_FIX): stamping after the pass would mark an archival that
-        // landed mid-pass as already handled, delaying it up to the full
-        // interval. Storing the pre-scan stamp means our own deletions read
-        // as a change and cost one extra no-op scan next pass (≤1 per
-        // interval) — a mid-pass landing is never missed.
-        let preScanStamp = archiveTierStamp(archiveDir)
-        defer { notePruneCompleted(archiveDir: archiveDir, now: now, stamp: preScanStamp) }
-
-        // Sweep orphaned per-session state dirs. Shares this pass's
-        // throttle: an archival changes the tier stamp, so the sweep runs on
-        // the pass after a session leaves the hot index, and otherwise at most
-        // once per interval.
-        pruneSessionState(dataRoot: dataRoot, now: now, rows: rows)
-    }
-
-    /// Remove `chat/session_state/<id>/` dirs whose session is no longer in
-    /// the live index and whose newest mtime (dir or any immediate child) is
-    /// older than `sessionStateRetentionSeconds`. mtime is the conservative
-    /// proxy for "archived (or abandoned) that long ago": nothing writes to an
-    /// archived session's state dir, and anything touched recently is kept.
-    /// Best-effort and bounded; deletes only derived state, never transcripts.
-    private static func pruneSessionState(dataRoot: URL, now: Date, rows: [[String: JSONValue]]) {
-        let fm = FileManager.default
-        let chatDir = dataRoot.appendingPathComponent("chat", isDirectory: true)
-        let stateDir = chatDir.appendingPathComponent("session_state", isDirectory: true)
-        guard fm.fileExists(atPath: stateDir.path) else { return }
-
-        var liveDirNames = Set<String>()
-        for row in rows {
-            guard case .string(let id)? = row["id"],
-                  let safe = NativeAgentChatSessionID.normalizedPathComponent(id) else { continue }
-            liveDirNames.insert(safe)
-        }
-
-        guard let entries = try? fm.contentsOfDirectory(
-            at: stateDir,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else { return }
-
-        let cutoff = now.addingTimeInterval(-sessionStateRetentionSeconds)
-        var removed = 0
-        for entry in entries {
-            if removed >= sessionStatePruneMaxPerPass { break }
-            guard (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
-                  !liveDirNames.contains(entry.lastPathComponent),
-                  newestModification(in: entry) < cutoff,
-                  (try? fm.removeItem(at: entry)) != nil else { continue }
-            removed += 1
-        }
-    }
-
-    /// Newest mtime among the directory and its immediate children. Undatable
-    /// entries read as `distantFuture` — never delete what we cannot prove is
-    /// old.
-    private static func newestModification(in directory: URL) -> Date {
-        func mtime(_ url: URL) -> Date {
-            (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
-                ?? .distantFuture
-        }
-        var newest = mtime(directory)
-        if let children = try? FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: []
-        ) {
-            for child in children {
-                newest = max(newest, mtime(child))
-            }
-        }
-        return newest
-    }
-
-    // MARK: - Archive-prune throttle (perf wave 2)
-
-    /// Longest derived state goes without an opportunistic cleanup pass.
-    public static let pruneMinIntervalSeconds: TimeInterval = 10 * 60
-
-    /// The archive tier's cheap change signal: the (mtime, size) of the
-    /// transcript directory and of the archived-sessions index. An archival
-    /// mutates one or both — a new transcript file changes the directory's
-    /// mtime, a new index row changes the index's mtime and size.
-    private struct ArchiveTierStamp: Equatable {
-        let messagesSeconds: Int
-        let messagesNanoseconds: Int
-        let messagesSize: Int64
-        let indexSeconds: Int
-        let indexNanoseconds: Int
-        let indexSize: Int64
-    }
-
-    private struct PruneMark {
-        let at: Date
-        let stamp: ArchiveTierStamp
-    }
-
-    private static let pruneStateLock = NSLock()
-    nonisolated(unsafe) private static var pruneMarks: [String: PruneMark] = [:]
-    /// Bound on distinct data roots tracked at once — inserting a new root at
-    /// the cap evicts the stalest mark, so a process that walks many temp
-    /// roots (the test suite) cannot grow this map without limit, and live
-    /// roots' marks survive the churn.
-    private static let pruneMarksMax = 16
-
-    private static func archiveTierStamp(_ archiveDir: URL) -> ArchiveTierStamp {
-        func statOf(_ url: URL) -> (Int, Int, Int64) {
-            var info = stat()
-            guard stat(url.path, &info) == 0 else { return (-1, -1, -1) }
-            return (info.st_mtimespec.tv_sec, info.st_mtimespec.tv_nsec, Int64(info.st_size))
-        }
-        let messages = statOf(archiveDir.appendingPathComponent("messages", isDirectory: true))
-        let index = statOf(archiveDir.appendingPathComponent("sessions.jsonl"))
-        return ArchiveTierStamp(
-            messagesSeconds: messages.0,
-            messagesNanoseconds: messages.1,
-            messagesSize: messages.2,
-            indexSeconds: index.0,
-            indexNanoseconds: index.1,
-            indexSize: index.2
-        )
-    }
-
-    /// True when the prune should actually run, and RECORDS the decision. The
-    /// mark is stamped only when the answer is yes, so a skipped pass leaves
-    /// the previous deadline in place rather than sliding it forward.
-    private static func pruneIsDue(archiveDir: URL, now: Date) -> Bool {
-        let key = archiveDir.resolvingSymlinksInPath().path
-        let stamp = archiveTierStamp(archiveDir)
-        pruneStateLock.lock()
-        defer { pruneStateLock.unlock() }
-        if let mark = pruneMarks[key],
-           mark.stamp == stamp,
-           now.timeIntervalSince(mark.at) < pruneMinIntervalSeconds,
-           now >= mark.at {
-            return false
-        }
-        evictStalestMarkIfAtCapLocked(insertingKey: key)
-        pruneMarks[key] = PruneMark(at: now, stamp: stamp)
-        return true
-    }
-
-    /// Stamp with the tier as it stood BEFORE the scan (caller captures it).
-    /// Our own deletions therefore read as a change next pass — one no-op
-    /// rescan per real prune — in exchange for never missing an archival
-    /// that lands while the pass is running.
-    private static func notePruneCompleted(archiveDir: URL, now: Date, stamp: ArchiveTierStamp) {
-        let key = archiveDir.resolvingSymlinksInPath().path
-        pruneStateLock.lock()
-        evictStalestMarkIfAtCapLocked(insertingKey: key)
-        pruneMarks[key] = PruneMark(at: now, stamp: stamp)
-        pruneStateLock.unlock()
-    }
-
-    /// Caller must hold `pruneStateLock`. Evicts the stalest root's mark when
-    /// inserting a NEW key would exceed the cap. A blanket removeAll here
-    /// wiped LIVE marks belonging to other roots mid-interval — under
-    /// parallel test execution that re-armed another suite's prune inside its
-    /// throttle window and made the skip tests flaky. Dropping a mark can
-    /// only cause an extra prune, never a skip, so the throttle's latency
-    /// bound is unchanged.
-    private static func evictStalestMarkIfAtCapLocked(insertingKey key: String) {
-        if pruneMarks[key] == nil, pruneMarks.count >= pruneMarksMax,
-           let oldest = pruneMarks.min(by: { $0.value.at < $1.value.at })?.key {
-            pruneMarks.removeValue(forKey: oldest)
-        }
     }
 
     private static func isStaleEmpty(
@@ -1004,18 +432,7 @@ public enum ChatSessionRetention {
         guard case .string(let raw)? = value else { return nil }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let parsed = fractional.date(from: trimmed) { return parsed }
-        let standard = ISO8601DateFormatter()
-        standard.formatOptions = [.withInternetDateTime]
-        return standard.date(from: trimmed)
-    }
-
-    private static func iso8601(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
+        return NativeTimestampFormat.parseISO8601FractionalFirst(trimmed)
     }
 
     private static func uniqueArchivePath(
@@ -1027,7 +444,7 @@ public enum ChatSessionRetention {
         guard FileManager.default.fileExists(atPath: preferred.path) else {
             return preferred
         }
-        let stamp = iso8601(now)
+        let stamp = NativeTimestampFormat.fractionalZulu(now)
             .replacingOccurrences(of: ":", with: "-")
             .replacingOccurrences(of: ".", with: "-")
         var candidate = directory.appendingPathComponent("\(safeSessionId).\(stamp).jsonl")
@@ -1052,86 +469,8 @@ public enum ChatSessionRetention {
     }
 
     private static func relativePath(_ url: URL, under root: URL) -> String {
-        let rootPath = root.standardizedFileURL.path
         let path = url.standardizedFileURL.path
-        if path == rootPath { return "" }
-        let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
-        if path.hasPrefix(prefix) {
-            return String(path.dropFirst(prefix.count))
-        }
-        return path
+        return NativeAgentWorkspaceRoot.relativePath(path, under: root.standardizedFileURL.path) ?? path
     }
-}
-
-/// A saved row's stamp, as the writer that saved it put it there, read by
-/// every reader of a row through this one projection: the door its
-/// envelope's verified userId names (`peer:<id>`), else the lane its origin
-/// names; the peers that steered it (`untrusted_sources`); and whether it is
-/// another agent's turn rather than hers or the person's. A row that only
-/// names a generic agent, or that the history import wrote (its words came
-/// from no transport: `unattested`, `<id>-reply`, `agent-live:`), attests no one.
-public struct TranscriptRowStamp: Sendable, Equatable {
-    public let source: String?
-    public let steeredBy: [String]
-    public let contact: Bool
-
-    public init(source: String?, steeredBy: [String], contact: Bool) {
-        self.source = source
-        var seen: Set<String> = []
-        // The speaker can be among its own steering sources (a reply written
-        // under the peer that steered it); the combined principal list drops
-        // the repeat, the stamp keeps the steering.
-        self.steeredBy = steeredBy.filter { !$0.isEmpty && seen.insert($0).inserted }
-        self.contact = contact
-    }
-
-    static func of(id: String, role: String, userId: String?, originAgent: String?, replyTo: String?, authored: String?,
-                   envelopeAgent: String?, surfaces: [String], byPerson: Bool, unattested: Bool, untrusted: [String]) -> Self {
-        let imported = unattested || id.hasSuffix("-reply") || replyTo?.hasPrefix("agent-live:") == true
-        let source: String? = if imported { nil }
-            else if let door = userId, !door.isEmpty { door.hasPrefix("peer:") ? door : "peer:" + door }
-            else if let agent = originAgent, !["agent", "peer", "another agent", ""].contains(agent) { agent }
-            else { nil }
-        let contact = role == "user" && !byPerson && authored != "human"
-            && (originAgent != nil || envelopeAgent != nil || surfaces.contains { $0.hasSuffix("-bridge") })
-        return .init(source: source, steeredBy: untrusted, contact: contact)
-    }
-
-    public static func of(id: String, role: String, metadata: [String: Any]?, rowSource: String? = nil) -> Self {
-        let origin = metadata?["origin"] as? [String: Any], envelope = metadata?["envelope"] as? [String: Any]
-        return of(id: id, role: role, userId: envelope?["userId"] as? String, originAgent: origin?["agent"] as? String,
-                  replyTo: origin?["replyTo"] as? String, authored: origin?["authored"] as? String, envelopeAgent: envelope?["agent"] as? String,
-                  surfaces: [origin?["surface"], envelope?["surface"], rowSource].compactMap { $0 as? String },
-                  byPerson: metadata?["byPerson"] as? Bool == true, unattested: metadata?["unattested"] as? Bool == true,
-                  untrusted: metadata?["untrusted_sources"] as? [String] ?? [])
-    }
-
-    public static func of(id: String, role: String, metadata: [String: JSONValue], rowSource: String? = nil) -> Self {
-        func text(_ value: JSONValue?) -> String? { if case .string(let text)? = value { text } else { nil } }
-        let origin: [String: JSONValue] = if case .object(let value)? = metadata["origin"] { value } else { [:] }
-        let envelope: [String: JSONValue] = if case .object(let value)? = metadata["envelope"] { value } else { [:] }
-        let untrusted: [String] = if case .array(let values)? = metadata["untrusted_sources"] { values.compactMap(text) } else { [] }
-        return of(id: id, role: role, userId: text(envelope["userId"]), originAgent: text(origin["agent"]), replyTo: text(origin["replyTo"]),
-                  authored: text(origin["authored"]), envelopeAgent: text(envelope["agent"]),
-                  surfaces: [text(origin["surface"]), text(envelope["surface"]), rowSource].compactMap { $0 },
-                  byPerson: metadata["byPerson"] == .bool(true), unattested: metadata["unattested"] == .bool(true), untrusted: untrusted)
-    }
-
-    /// As an index row keeps it beside the preview it stamps.
-    public var json: JSONValue {
-        .object(["source": source.map(JSONValue.string) ?? .null, "steered_by": .array(steeredBy.map(JSONValue.string)), "contact": .bool(contact)])
-    }
-
-    public init?(json: JSONValue?) {
-        guard case .object(let fields)? = json, case .bool(let contact)? = fields["contact"] else { return nil }
-        let source: String? = if case .string(let text)? = fields["source"] { text } else { nil }
-        let steering: [String] = if case .array(let values)? = fields["steered_by"] {
-            values.compactMap { if case .string(let peer) = $0 { peer } else { nil } }
-        } else { [] }
-        self.init(source: source, steeredBy: steering, contact: contact)
-    }
-
-    /// The index row key that carries the stamp of its `lastMessagePreview`.
-    public static let previewKey = "lastMessagePreviewStamp"
 }
 

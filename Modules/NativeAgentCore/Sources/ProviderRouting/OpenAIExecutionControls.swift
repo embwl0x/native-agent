@@ -28,15 +28,7 @@ public enum OpenAIExecutionControls {
     /// Models intentionally exposed by the model-facing Codex bridge tools.
     /// The parser remains open to account-discovered models for compatibility;
     /// these are the built-in choices advertised to the model.
-    public static let codexBridgeModelIDs = [
-        "gpt-5.6-sol",
-        "gpt-5.6-terra",
-        "gpt-5.6-luna",
-        FirstPartyModelCatalog.gpt6AstraModelID,
-        "gpt-6.1-sol",
-        "gpt-6-sol",
-        "gpt-6-luna",
-    ]
+    public static let codexBridgeModelIDs = FirstPartyModelCatalog.chatGPTAccountFallbackModels.map(\.id)
 
     /// The efforts the transport's catalog row declares for the model; a model
     /// no row carries takes the standard set, whatever its spelling.

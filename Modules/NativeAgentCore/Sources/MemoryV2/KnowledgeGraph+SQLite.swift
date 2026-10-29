@@ -1,33 +1,13 @@
-// F6 (eval E06 fix-2): SQLite-backed loader for KnowledgeGraphStore.
-//
-// Round-3 F3 added kg_entities + kg_relationships tables to the MemoryV2
-// migration as additive groundwork but never flipped the reader, leaving
-// the source of truth on <root>/memory/knowledge_graph.json. This file
-// flips it: the reader queries memory.sqlite directly through the shared
-// KnowledgeGraphPoolCache, and on the first call (no `.kg_migrated_to_sqlite_v1`
-// sentinel + empty tables + JSON file present) it ingests the JSON into
-// SQLite once. Completion is committed with the rows in memory_metadata;
-// the file sentinel remains the compatibility fast path.
-//
-// U5 W-C (2026-06-11):
-//   - The pool is no longer constructed fresh per query — it resolves through
-//     KnowledgeGraphPoolCache to the owning MemoryStorage's pool.
-//   - SQLite reads THROW instead of returning an empty store on failure.
-//     Empty-vs-error: a MISSING database is `.databaseMissing` (the
-//     reader legitimately falls back to the JSON file); an EXISTING database
-//     that cannot be opened or read is `.unreadable` — an ERROR that must
-//     surface to the user, never render as an empty-but-healthy graph and
-//     never fall back to a stale JSON snapshot (resurrected-entities bug).
-//   - `sqliteHasAnyEntities` deleted — zero callers repo-wide (cutover
-//     residue; it was also a fresh-pool-per-call site).
-//
-// Row shapes are reconstructed into the SAME JSONValue envelopes
-// KnowledgeGraphStore expects so allEntities / searchEntities / neighbors /
-// hasEntity keep working unchanged (and the Mac decode models continue to
-// decode the result identically).
+// Read canonical memory.sqlite through the owning MemoryStorage pool.
+// Import JSON once into empty tables, committing completion with the rows in memory_metadata.
+// The `.kg_migrated_to_sqlite_v1` file sentinel remains a compatibility fast path.
+// A missing database permits JSON reads; unreadable existing SQLite throws.
+// Reconstruct the JSONValue envelopes KnowledgeGraphStore readers expect.
 
 import Foundation
+import NativeAgentShared
 import GRDB
+import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `KnowledgeGraph+SQLite.swift` | Checked prepared-pool boundary and shared entity/edge serialization; legacy import rechecks eligibility and records durable completion in its row-write transaction; batched entity reads retain per-entity relationship limits and failures in one transaction |
 
@@ -62,9 +42,7 @@ extension KnowledgeGraphStore {
     /// agrees with ordering by instant everywhere except a sub-second tie, which
     /// no ranking decision rests on.
     static func orderingTimestamp(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
+        NativeTimestampFormat.fractionalZulu(date)
     }
 
     /// Read one bounded page directly from SQLite. The entity count, page rows,
@@ -76,8 +54,7 @@ extension KnowledgeGraphStore {
         page: Int
     ) async throws -> JSONValue {
         let clampedPage = max(0, page)
-        // 2026-09-06: an overflowing offset is beyond every representable
-        // entity count. Keep the checked store read and return an empty page.
+        // An overflowing offset returns an empty page after the checked store read.
         let (offset, offsetOverflow) = clampedPage.multipliedReportingOverflow(by: sqlitePageSize)
         return try await withPreparedPool(
             memoryDir: memoryDir,
@@ -181,30 +158,8 @@ extension KnowledgeGraphStore {
                 let clauses = Array(repeating: "instr(\(haystack), ?) > 0", count: needles.count)
                     .joined(separator: " OR ")
                 var arguments: [DatabaseValueConvertible] = needles
-                // Preserve the legacy Swift ranker's most important ordering
-                // before applying the candidate cap. Ordering only by id could
-                // discard an exact name match merely because its id sorted
-                // after 2,000 weaker summary/token matches.
-                //
-                // B5 (2026-08-28): the recency term sits BETWEEN the match-class
-                // bucket and `id`, so it can only reorder rows the matcher
-                // already considers equally good — never promote a weaker match
-                // class. Its real job is the candidate cap: when a generic query
-                // matches more than `sqliteSearchCandidateLimit` rows, the rows
-                // that survive into the Swift reranker are now the recently seen
-                // ones instead of whichever ids happened to sort first.
-                //
-                // The CASE is load-bearing, not decoration (gpt-5.5 review HIGH,
-                // 2026-08-28). A raw `last_seen DESC` ranks FUTURE and MALFORMED
-                // timestamps as the freshest rows in the store, and it does so
-                // BEFORE the LIMIT — so junk can evict valid candidates from the
-                // window entirely, and the Swift reranker never gets to apply
-                // its `recencyScore == 0` rule to them. Stage 1 must therefore
-                // enforce the same invariant stage 2 does. Folding NULL and
-                // `last_seen > now` to '' sorts both as oldest under DESC, which
-                // also catches non-parseable junk: text like "not a date" is
-                // lexicographically greater than any ISO year, so it lands in
-                // the same clamped bucket rather than at the top.
+                // Before the candidate cap, order by match class, recency, then id so weaker matches cannot displace stronger ones.
+                // Clamp missing, future and malformed timestamps to oldest, matching the Swift reranker's recency rule.
                 arguments.append(qLower)
                 arguments.append(qLower)
                 arguments.append(Self.orderingTimestamp(now))
@@ -355,7 +310,8 @@ extension KnowledgeGraphStore {
                 let total = try Int.fetchOne(
                     db, sql: "SELECT COUNT(*) FROM kg_entities"
                 ) ?? 0
-                guard total <= pageLimit * sqlitePageSize else {
+                let (capacity, overflow) = pageLimit.multipliedReportingOverflow(by: sqlitePageSize)
+                guard overflow || total <= capacity else {
                     throw KnowledgeGraphReadError.paginationLimitExceeded(pageLimit)
                 }
                 let relationshipTotal = try Int.fetchOne(
@@ -366,10 +322,27 @@ extension KnowledgeGraphStore {
                         sqliteCompleteSnapshotRelationshipLimit
                     )
                 }
-                return try storeFromDatabase(db).allEntities(
-                    page: 0,
-                    pageSize: max(total, 1)
-                )
+                let entities = try Row.fetchAll(db, sql: """
+                    SELECT id, name, type, summary, aliases_json, mention_count,
+                           first_seen, last_seen, provenance, metadata_json
+                    FROM kg_entities ORDER BY id
+                    """).compactMap(entityValue)
+                let edges = try Row.fetchAll(db, sql: """
+                    SELECT r.from_id, r.to_id, r.type, r.weight,
+                           r.mention_count, r.provenance, r.metadata_json
+                    FROM kg_relationships r
+                    JOIN kg_entities source ON source.id = r.from_id
+                    JOIN kg_entities target ON target.id = r.to_id
+                    WHERE source.id != '' AND target.id != ''
+                    ORDER BY r.from_id, r.to_id, r.type
+                    """).compactMap(edgeValue)
+                return .object([
+                    "entities": .array(entities),
+                    "edges": .array(edges),
+                    "total_entities": .int(Int64(entities.count)),
+                    "total_edges": .int(Int64(edges.count)),
+                    "page": .int(0),
+                ])
             }
         }
     }
@@ -414,39 +387,12 @@ extension KnowledgeGraphStore {
                 sentinelPath: sentinelPath
             )
         }
+        let dataRoot = memoryDir.deletingLastPathComponent()
+        if MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot) {
+            let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
+            try await indexer.reconcileMemoryIndexFingerprints()
+        }
         return pool
-    }
-
-    private static func storeFromDatabase(_ db: Database) throws -> KnowledgeGraphStore {
-        // SQLite pages use stable id order; legacy JSON retains insertion order.
-        let entityRows = try Row.fetchAll(db, sql: """
-            SELECT id, name, type, summary, aliases_json, mention_count,
-                   first_seen, last_seen, provenance, metadata_json
-            FROM kg_entities ORDER BY id
-            """)
-        var entities: [String: JSONValue] = [:]
-        var entityOrder: [String] = []
-        for row in entityRows {
-            guard let entity = entityValue(row), let id: String = row["id"] else { continue }
-            entities[id] = entity
-            entityOrder.append(id)
-        }
-        let edgeRows = try Row.fetchAll(db, sql: """
-            SELECT from_id, to_id, type, weight, mention_count, provenance, metadata_json
-            FROM kg_relationships
-            ORDER BY from_id, to_id, type
-            """)
-        let entityIds = Set(entities.keys)
-        let edges = edgeRows.compactMap { row -> JSONValue? in
-            guard let from: String = row["from_id"], let to: String = row["to_id"],
-                  entityIds.contains(from), entityIds.contains(to) else { return nil }
-            return edgeValue(row)
-        }
-        return KnowledgeGraphStore(
-            entities: entities,
-            entityOrder: entityOrder,
-            edges: edges
-        )
     }
 
     private static func entityValue(_ row: Row) -> JSONValue? {
@@ -574,13 +520,7 @@ extension KnowledgeGraphStore {
                 let lastSeen: String? = {
                     if case .string(let s)? = e["last_seen"] { return s }; return nil
                 }()
-                // 2026-09-06: the import stamps its OWN provenance on every
-                // row instead of copying the JSON's. The canonical rebuild
-                // keeps a row only when a writer claims it, and an unstamped
-                // (or arbitrarily stamped) import is indistinguishable from the
-                // daemon-era residue the purge exists to delete — so the first
-                // rebuild after an import destroyed it. The original value is
-                // no longer a known column, so it rides along in metadata.
+                // Stamp import provenance so canonical rebuilds retain these rows; preserve original provenance in metadata.
                 let provenance = SwiftNativeKnowledgeGraphIndexer.legacyImportProvenance
                 // Metadata bag — everything not modeled as a column.
                 let metaKnown: Set<String> = [

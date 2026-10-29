@@ -2,6 +2,7 @@ import Foundation
 import PersistenceCore
 import PersonaEngine
 import TrustCenter
+import NativeAgentShared
 // Blueprint: | `FirstRunWelcomeTransaction.swift` | `FirstRunWelcomeTransaction` class; `hasConversationRows`, `isPersistedFailureRow` |
 
 /// The one-time greeting writer's outcome as observed by the onboarding route.
@@ -40,43 +41,13 @@ public enum FirstRunGreetingOutcome: Equatable, Sendable {
 
 // MARK: - First-run welcome greeting
 //
-// On first install, once an LLM provider is connected, the agent opens the first
-// conversation itself, before the person has typed anything. Agent-initiated: a
-// hidden kickoff drives the turn (suppressUserAppend + hideUserBubble) so only the
-// agent's own words are shown and persisted. Fires once, gated on a
-// `.needs_welcome` marker written at onboarding.
-//
-// WHAT THE OPENING IS FOR (User + Agent, 2026-09-15 — mockups/onboarding/flow.md
-// and NOTE.md are the approved design and this is the one path that implements
-// them). The agent asks what the person wants it to be, writes the answer as ONE
-// line into SOUL.md through the ordinary persona writers, shows it as a settled
-// receipt where the answer happened, and hands the floor back.
-//
-// It carries its name in already — the wizard collects it (User, 2026-09-15:
-// that is the simple way to get a name and it stays), so the conversation never
-// asks for one.
-//
-// It is a DIRECTIVE, not a route: the one fact to capture is stated and the
-// agent is free to follow the person. Nothing schedules a third question, and
-// how the person wants to be treated is deliberately NOT asked here — that is
-// learned from a real moment later, which is Agent's binding ruling (NOTE.md
-// constraint 6) and is written into the directive as a "never".
-//
-// FRESH PERSONAS ONLY. `.needs_welcome` says the wizard finished; the
-// `.first_conversation` marker beside SOUL.md says this persona has been met.
-// Both are checked, because a restored data root keeps its persona documents.
-//
-// PUBLIC-RELEASE ONLY (User, 2026-07-11): the welcome exists for someone's fresh
-// download of the distributed app, never for dev installs. Both the marker write
-// and the fire path guard on `NativeAgentPaths.isPublicReleaseBundle` (REPO_PATH-
-// stamped dev builds can never pass it), so a rebuild/reinstall/relaunch on a dev
-// machine cannot synthesize a greeting. Release upgrades don't re-greet either:
-// the marker is only written when onboarding completes, which only happens on a
-// blank-slate first run.
-//
-// The reliable trigger is ContentView's onboarding-complete callback (fires AFTER
-// submitOnboarding writes the marker); ChatView's .task/onChange are backup
-// triggers that fire before the marker exists on a fresh run and simply no-op.
+// With a provider connected, a hidden kickoff opens the first conversation; only the agent's words persist.
+// The opener writes the person's requested role as one SOUL.md line through persona writers and shows a settled receipt.
+// Onboarding supplies the name; the opener never asks for it again.
+// The directive follows the person, schedules no third question and leaves treatment preferences to later lived moments.
+// Fresh personas require .needs_welcome from onboarding and no .first_conversation marker beside SOUL.md.
+// Marker creation and greeting require NativeAgentPaths.isPublicReleaseBundle; upgrades and dev installs never re-greet.
+// ContentView triggers after onboarding writes the marker; earlier ChatView hooks do nothing without it.
 
 /// Read-only first-conversation evidence from the existing transcript model.
 /// Keeping this projection as a protocol avoids a dependency on EngineRuntime.
@@ -96,7 +67,6 @@ public protocol FirstRunWelcomePort: AnyObject {
     associatedtype FirstRunMessage: FirstRunWelcomeMessage
     var firstRunDataRoot: URL { get }
     var firstRunIsPublicRelease: Bool { get }
-    var firstRunGreetingPublicReleaseOverride: Bool? { get }
     var activeChatSessionId: String { get }
     var chatMessages: [FirstRunMessage] { get }
     var firstRunSessionIsBusy: Bool { get }
@@ -129,16 +99,6 @@ public final class FirstRunWelcomeTransaction {
 
     // MARK: - The first conversation: fresh personas only
 
-    /// The persona root the first conversation will append to. Resolved the
-    /// same way the persona writers resolve it, so the marker below can never
-    /// end up beside a different set of documents than the ones written.
-    private func firstConversationPersonaRoot(port: some FirstRunWelcomePort) -> URL {
-        let root = port.firstRunDataRoot
-        // Scoped strictly to this data root — see the helper's own note on why
-        // the general resolver is the wrong tool for this question.
-        return FirstConversationPersonaExemption.personaRoot(forDataRoot: root)
-    }
-
     /// The durable "the agent has already introduced itself" marker, deliberately
     /// a sibling of SOUL.md rather than of the data root.
     ///
@@ -148,53 +108,35 @@ public final class FirstRunWelcomeTransaction {
     /// keeps its documents and therefore keeps this marker — so a person who
     /// already named their agent is never asked who it should be a second time.
     private func firstConversationMarkerURL(port: some FirstRunWelcomePort) -> URL {
-        firstConversationPersonaRoot(port: port)
+        PersonaRootResolver.resolveIsolated(dataRoot: port.firstRunDataRoot)
             .appendingPathComponent(".first_conversation", isDirectory: false)
     }
 
-    /// True only for a persona nobody has met yet.
-    ///
-    /// Tightened after Sol's P1-8 (2026-09-15). Every refusal below is a
-    /// separate way of already having met this agent, and the cost of a false
-    /// positive is the app interrogating someone about an agent they named
-    /// months ago:
-    ///
-    ///   1. the marker beside the persona docs, or a write token either live or
-    ///      already spent — any of the three means the opener has run;
-    ///   2. a SOUL.md that EXISTS but cannot be read. That used to count as
-    ///      fresh, which is exactly backwards: an unreadable identity document
-    ///      is the one case where the app knows least and should assume most.
-    ///      Absent is different from unreadable and stays fresh, because the
-    ///      opener legitimately runs before the first append;
-    ///   3. a SOUL.md already carrying a "Who I am to …" heading;
-    ///   4. a transcript that is not empty. This is the strongest signal of the
-    ///      four and the cheapest to trust: an agent someone has talked to is
-    ///      not an agent waiting to introduce itself.
+    /// Markers, live/spent write tokens, unreadable SOUL.md, a role heading or conversation rows exclude freshness.
+    /// An absent SOUL.md remains fresh because the opener may precede its first append.
     private func firstConversationIsFreshPersona(port: some FirstRunWelcomePort) -> Bool {
         let files = FileManager.default
-        let root = firstConversationPersonaRoot(port: port)
+        let root = PersonaRootResolver.resolveIsolated(dataRoot: port.firstRunDataRoot)
         for marker in [
-            FirstConversationPersonaExemption.metMarkerFilename,
-            FirstConversationPersonaExemption.writeTokenFilename,
-            FirstConversationPersonaExemption.spentTokenFilename,
+            FirstConversationPersonaProgression.metMarkerFilename,
+            FirstConversationPersonaProgression.writeTokenFilename,
+            FirstConversationPersonaProgression.spentTokenFilename,
         ] where files.fileExists(atPath: root.appendingPathComponent(marker).path) {
             return false
         }
 
         let soul = root.appendingPathComponent(
-            FirstConversationPersonaExemption.exemptDocument
+            FirstConversationPersonaProgression.soulDocument
         )
         if files.fileExists(atPath: soul.path) {
             guard let body = try? String(contentsOf: soul, encoding: .utf8) else { return false }
-            if FirstConversationPersonaExemption.bodyHasRoleSection(body) { return false }
+            if FirstConversationPersonaProgression.bodyHasRoleSection(body) { return false }
         }
 
         return !Self.hasConversationRows(port.chatMessages, syntheticErrorIDPrefix: port.firstRunSyntheticErrorIDPrefix)
     }
 
-    /// The opener may only speak into a conversation that is idle and empty
-    /// (Sol P1-6). A greeting queued behind someone else's in-flight turn can
-    /// land after their reply, which reads as the app talking over them.
+    /// The opener requires an idle conversation with no real user or assistant rows.
     private func firstConversationSessionIsIdleAndEmpty(port: some FirstRunWelcomePort) -> Bool {
         !port.firstRunSessionIsBusy && !Self.hasConversationRows(port.chatMessages, syntheticErrorIDPrefix: port.firstRunSyntheticErrorIDPrefix)
     }
@@ -221,21 +163,13 @@ public final class FirstRunWelcomeTransaction {
     /// drift into exempting a section the flow does not actually write.
     static let firstConversationRoleSectionPrefix = "Who I am to "
 
-    /// Write the durable "this persona has been met" marker AND VERIFY it.
-    ///
-    /// Sol P1-7: the in-flight marker used to be removed before this was
-    /// written, so a failure here (full disk, read-only persona directory) lost
-    /// both records at once and the next launch greeted a second time. The
-    /// caller removes the in-flight marker only when this returns true.
+    /// Write and read back the durable marker that this persona has been met.
     private func markFirstConversationDone(port: some FirstRunWelcomePort, sessionID: String) -> Bool {
         let url = firstConversationMarkerURL(port: port)
         let payload = ["session_id": sessionID, "met_at": ISO8601DateFormatter().string(from: Date())]
         guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return false }
-        try? FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(), withIntermediateDirectories: true
-        )
         do {
-            try data.write(to: url, options: [.atomic])
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
         } catch {
             nativeLog("[first-run-welcome] could not write the met marker: %@", error.localizedDescription)
             return false
@@ -249,35 +183,26 @@ public final class FirstRunWelcomeTransaction {
         return true
     }
 
-    /// Everything that has to become true once — and only once — the opener's
-    /// own turn has actually finished.
-    ///
-    /// Ordering is deliberate and is Sol P1-7: the durable met marker is
-    /// written and verified FIRST, the in-flight marker is removed LAST, and
-    /// the one-shot write token is armed in between. A crash anywhere in here
-    /// leaves the in-flight marker on disk, which reads as an honest unknown
-    /// and suppresses a duplicate greeting rather than inventing one.
+    /// After a real completed reply, verify the met marker, arm answer progression
+    /// and write its next-turn directive, then retire the in-flight marker.
+    /// A retained in-flight marker suppresses duplicate delivery after an unknown outcome.
     @MainActor
     private func completeFirstRunGreeting(port: some FirstRunWelcomePort, sessionID: String) {
         guard markFirstConversationDone(port: port, sessionID: sessionID) else { return }
 
         let root = port.firstRunDataRoot
-        let title = FirstConversationPersonaExemption.roleSectionTitle(
+        let title = FirstConversationPersonaProgression.roleSectionTitle(
             personName: port.firstConversationPersonName
         )
 
-        // The exemption becomes live only now: before this, no dispatch can
-        // find a token at all, so nothing can slip a persona write past the
-        // guard while the agent is still talking.
-        FirstConversationPersonaExemption.armWriteToken(
-            dataRoot: root, sessionID: sessionID, title: title
+        // Arm answer progression only after the opener has settled.
+        FirstConversationPersonaProgression.armWriteToken(
+            dataRoot: root, sessionID: sessionID, title: title,
+            token: FirstConversationPersonaProgression.writeTokenFilename,
+            spent: FirstConversationPersonaProgression.spentTokenFilename
         )
 
-        // Sol P1-4: carry the write instruction into the turn that will hold
-        // the person's ANSWER. The kickoff that produced the opener is a hidden
-        // user message and is not persisted, so the next turn can be assembled
-        // without it — and then the answer arrives with nothing telling the
-        // agent to write anything down.
+        // The hidden kickoff is not persisted; the answer turn needs its own write directive.
         ChatSessionDirective.write(
             ChatSessionDirectiveRecord(
                 createdAt: ISO8601DateFormatter().string(from: Date()),
@@ -306,9 +231,7 @@ public final class FirstRunWelcomeTransaction {
         """
     }
 
-    /// User, 2026-09-25: the second first-run question. Its answer is written to
-    /// VOICE.md under the voice token FirstConversationPersonaExemption arms
-    /// when the soul line is granted.
+    /// The second answer writes VOICE.md under the voice token armed when FirstConversationPersonaProgression grants the soul line.
     static let firstConversationVoiceQuestion = """
     Ask how they would like you to sound with them, close to: "And how would you like me \
     to sound? Energetic, calm, serious, playful, joking, sarcastic, warm, blunt — or name \
@@ -336,12 +259,7 @@ public final class FirstRunWelcomeTransaction {
     /// either way; "marked" is not a postcondition of calling this.
     @MainActor
     public func markFirstRunWelcomePending(port: some FirstRunWelcomePort) {
-        guard port.firstRunIsPublicRelease else {
-            // Only isolated behavior evals can supply this internal seam.
-            guard port.firstRunGreetingPublicReleaseOverride == true else { return }
-            armFirstRunWelcomePending(port: port)
-            return
-        }
+        guard port.firstRunIsPublicRelease else { return }
         armFirstRunWelcomePending(port: port)
     }
 
@@ -349,10 +267,7 @@ public final class FirstRunWelcomeTransaction {
     private func armFirstRunWelcomePending(port: some FirstRunWelcomePort) {
         guard firstRunWelcomeMarkerState(port: port) == .absent else { return }
         let url = firstRunWelcomeMarkerURL(port: port)
-        try? FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(), withIntermediateDirectories: true
-        )
-        try? Data("pending\n".utf8).write(to: url, options: [.atomic])
+        try? SwiftNativePersistenceCore.writeDataAtomicDurable(Data("pending\n".utf8), to: url)
     }
 
     /// Atomically claim a pending greeting before its irreversible chat handoff.
@@ -457,12 +372,7 @@ public final class FirstRunWelcomeTransaction {
         // one trigger can claim the in-flight flag before the first await.
         // Belt-and-suspenders with the marker-write gate: a stray marker on a
         // dev data root (e.g. restored from a backup) still can't fire here.
-        guard port.firstRunIsPublicRelease else {
-            // Only isolated behavior evals can opt in; development installs
-            // retain the public-release-only behavior above.
-            guard port.firstRunGreetingPublicReleaseOverride == true else { return .notArmed }
-            return await sendFirstRunGreetingIfEligible(kickoff, port: port)
-        }
+        guard port.firstRunIsPublicRelease else { return .notArmed }
         return await sendFirstRunGreetingIfEligible(kickoff, port: port)
     }
 
@@ -480,8 +390,6 @@ public final class FirstRunWelcomeTransaction {
         // their agent to be after they have already told it.
         guard firstConversationIsFreshPersona(port: port) else { return .existingPersona }
         guard !port.activeChatSessionId.isEmpty else { return .noActiveSession }
-        // Sol P1-6: never speak over a turn already in flight, and never open
-        // a conversation that is not actually empty.
         guard firstConversationSessionIsIdleAndEmpty(port: port) else { return .noActiveSession }
         let sid = port.activeChatSessionId
         firstRunGreetingInFlight = true

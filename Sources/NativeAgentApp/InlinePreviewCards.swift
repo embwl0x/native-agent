@@ -13,7 +13,7 @@ import NativeAgentCore
 /// an identical outcome. Returns the error text to show beside the buttons,
 /// or nil when the decision landed.
 enum ApprovalDecisionAction {
-    static func resolve(
+    @MainActor static func resolve(
         id: String,
         decision: String,
         appModel: AppModel
@@ -24,21 +24,15 @@ enum ApprovalDecisionAction {
                 for: resolvedApproval,
                 requestedID: id
             )
-            var failure: String?
-            await MainActor.run {
-                ApprovalDecisionToastPresentation.publish(toast, to: appModel.systemToasts)
-                if toast.kind == .error { failure = toast.text }
-            }
+            ApprovalDecisionToastPresentation.publish(toast, to: appModel.systemToasts)
             // Refresh the approvals list + health card so the row disappears
             // once the decision lands.
             await appModel.engine.approvals.refresh()
             await appModel.loadHealthCard()
-            return failure
+            return toast.kind == .error ? toast.text : nil
         } catch {
             let toast = ApprovalDecisionToastPresentation.unavailable(error)
-            await MainActor.run {
-                ApprovalDecisionToastPresentation.publish(toast, to: appModel.systemToasts)
-            }
+            ApprovalDecisionToastPresentation.publish(toast, to: appModel.systemToasts)
             return toast.text
         }
     }

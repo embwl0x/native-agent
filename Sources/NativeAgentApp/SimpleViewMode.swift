@@ -4,11 +4,7 @@ import PersistenceCore
 
 // Blueprint: | `SimpleViewMode.swift` | `ViewModeSwitch`: Simple/Advanced/Agent selection and shared top chrome placement |
 
-// Simple view, User 2026-09-23 (approved from a mockup): one floating glass
-// sidebar — the agent, the agents it talks to, its helpers — beside the
-// agent's ordinary chat. No settings pages; everything else is asked of the
-// agent. Advanced is the full app, unchanged. The whole feature lives in the
-// Simple*.swift files; the shared views carry one hook each.
+// Simple view places agent contacts and helpers beside chat, with other tasks asked of the agent.
 
 /// Simple | Advanced | Agent: a small glass segmented control in the title strip,
 /// clear of the traffic lights. A pill is right here — it IS a segmented

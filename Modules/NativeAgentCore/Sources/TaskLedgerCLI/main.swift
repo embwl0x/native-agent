@@ -33,10 +33,8 @@ struct TaskLedgerCLI {
         }
         let commandArgs = Array(args.dropFirst())
         switch command {
-        case "append":
-            return try await append(commandArgs, dataRoot: dataRoot)
-        case "claim":
-            return try await claim(commandArgs, dataRoot: dataRoot)
+        case "append", "claim":
+            return try await write(commandArgs, dataRoot: dataRoot, command: command)
         case "list":
             return try await list(commandArgs, dataRoot: dataRoot)
         case "help", "--help", "-h":
@@ -49,17 +47,19 @@ struct TaskLedgerCLI {
         }
     }
 
-    static func append(_ args: [String], dataRoot: URL) async throws -> Int {
+    static func write(_ args: [String], dataRoot: URL, command: String) async throws -> Int {
+        let claiming = command == "claim"
         let parsed = parseOptions(
             args,
-            single: ["actor", "kind", "task-id", "title", "note"],
-            repeated: ["ref"]
+            single: claiming ? ["actor", "task-id", "title", "note"] : ["actor", "kind", "task-id", "title", "note"],
+            repeated: ["ref"],
+            flags: claiming ? ["force"] : []
         )
         guard parsed.positionals.isEmpty else {
-            fputs("error: append received unexpected positional argument '\(parsed.positionals[0])'\n", stderr)
+            fputs("error: \(command) received unexpected positional argument '\(parsed.positionals[0])'\n", stderr)
             return 64
         }
-        let kindRaw = parsed.options["kind"] ?? "created"
+        let kindRaw = claiming ? "claimed" : parsed.options["kind"] ?? "created"
         guard let kind = TaskLedgerKind(rawValue: kindRaw) else {
             fputs("error: unknown kind '\(kindRaw)' (expected one of \(kindList()))\n", stderr)
             return 64
@@ -69,7 +69,7 @@ struct TaskLedgerCLI {
             return 64
         }
         guard let actor = actor(parsed.options["actor"]) else {
-            fputs("error: append requires --actor claude|assistant|codex|user\n", stderr)
+            fputs("error: \(command) requires --actor claude|assistant|codex|user\n", stderr)
             return 64
         }
         let taskId: String
@@ -78,58 +78,21 @@ struct TaskLedgerCLI {
         } else if kind == .created {
             taskId = UUID().uuidString
         } else {
-            fputs("error: --task-id is required for kind '\(kind.rawValue)' (only 'created' may omit it)\n", stderr)
+            fputs(claiming ? "error: claim requires --task-id\n" : "error: --task-id is required for kind '\(kind.rawValue)' (only 'created' may omit it)\n", stderr)
             return 64
         }
-        let event = makeEvent(
+        let event = TaskLedgerEvent(
+            taskId: taskId,
             actor: actor,
             kind: kind,
-            taskId: taskId,
-            title: parsed.options["title"],
-            note: parsed.options["note"],
-            refs: parsed.repeated["ref"] ?? []
+            title: emptyToNil(parsed.options["title"]),
+            note: emptyToNil(parsed.options["note"]),
+            refs: (parsed.repeated["ref"] ?? []).filter { !$0.isEmpty }
         )
         let ledger = SwiftNativeTaskLedger(dataRoot: dataRoot)
         let written = kind == .claimed
-            ? try await ledger.claim(event, force: false)
+            ? try await ledger.claim(event, force: parsed.flags.contains("force"))
             : try await ledger.append(event)
-        printJSON(.object([
-            "status": .string("ok"),
-            "event": written.toJSON(),
-            "task_id": .string(taskId),
-        ]))
-        return 0
-    }
-
-    static func claim(_ args: [String], dataRoot: URL) async throws -> Int {
-        let parsed = parseOptions(
-            args,
-            single: ["actor", "task-id", "title", "note"],
-            repeated: ["ref"],
-            flags: ["force"]
-        )
-        guard parsed.positionals.isEmpty else {
-            fputs("error: claim received unexpected positional argument '\(parsed.positionals[0])'\n", stderr)
-            return 64
-        }
-        guard let actor = actor(parsed.options["actor"]) else {
-            fputs("error: claim requires --actor claude|assistant|codex|user\n", stderr)
-            return 64
-        }
-        guard let taskId = parsed.options["task-id"], !taskId.isEmpty else {
-            fputs("error: claim requires --task-id\n", stderr)
-            return 64
-        }
-        let event = makeEvent(
-            actor: actor,
-            kind: .claimed,
-            taskId: taskId,
-            title: parsed.options["title"],
-            note: parsed.options["note"],
-            refs: parsed.repeated["ref"] ?? []
-        )
-        let written = try await SwiftNativeTaskLedger(dataRoot: dataRoot)
-            .claim(event, force: parsed.flags.contains("force"))
         printJSON(.object([
             "status": .string("ok"),
             "event": written.toJSON(),
@@ -151,7 +114,8 @@ struct TaskLedgerCLI {
         let ledger = SwiftNativeTaskLedger(dataRoot: dataRoot)
         let pretty = parsed.flags.contains("pretty")
         if let taskId = parsed.options["task-id"], !taskId.isEmpty {
-            guard let snapshot = try await ledger.taskWithEvents(taskID: taskId) else {
+            let snapshot = try await ledger.taskDetail(id: taskId)
+            guard let task = snapshot.state else {
                 printJSON(.object([
                     "status": .string("not_found"),
                     "task_id": .string(taskId),
@@ -160,7 +124,7 @@ struct TaskLedgerCLI {
             }
             printJSON(.object([
                 "status": .string("ok"),
-                "task": snapshot.task.toJSON(),
+                "task": task.toJSON(),
                 "events": .array(snapshot.events.map { $0.toJSON() }),
             ]), pretty: pretty)
             return 0
@@ -173,24 +137,6 @@ struct TaskLedgerCLI {
             "tasks": .array(states.map { $0.toJSON() }),
         ]), pretty: pretty)
         return 0
-    }
-
-    static func makeEvent(
-        actor: TaskLedgerActor,
-        kind: TaskLedgerKind,
-        taskId: String,
-        title: String?,
-        note: String?,
-        refs: [String]
-    ) -> TaskLedgerEvent {
-        TaskLedgerEvent(
-            taskId: taskId,
-            actor: actor,
-            kind: kind,
-            title: emptyToNil(title),
-            note: emptyToNil(note),
-            refs: refs.filter { !$0.isEmpty }
-        )
     }
 
     static func actor(_ raw: String?) -> TaskLedgerActor? {
@@ -210,13 +156,9 @@ struct TaskLedgerCLI {
     /// Explicit `--data-root` overrides the app's shared process-root resolver.
     static func resolveDataRoot(_ explicit: String?) -> URL {
         if let explicit, !explicit.isEmpty {
-            return URL(fileURLWithPath: expandTilde(explicit), isDirectory: true)
+            return URL(fileURLWithPath: (explicit as NSString).expandingTildeInPath, isDirectory: true)
         }
         return PersistenceCore.defaultDataRoot()
-    }
-
-    static func expandTilde(_ path: String) -> String {
-        (path as NSString).expandingTildeInPath
     }
 
     static func extractOption(_ name: String, from args: inout [String]) -> String? {

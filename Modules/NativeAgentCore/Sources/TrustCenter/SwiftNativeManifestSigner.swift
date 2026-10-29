@@ -2,7 +2,7 @@ import Foundation
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SwiftNativeManifestSigner.swift` | `SwiftNativeManifestSigner` actor; 32-byte regular 0600 signing authority with explicit backup/export/sync/privacy decisions; `canonicalBytes`, `compactCanonicalJSON`, read-only `existingSigningKey` for proof checks |
+// Blueprint: | `SwiftNativeManifestSigner.swift` | `SwiftNativeManifestSigner` actor; 32-byte regular 0600 signing authority with explicit backup/export/sync/privacy decisions; `canonicalBytes`, read-only `existingSigningKey` for proof checks |
 
 // MARK: - SwiftNativeManifestSigner
 //
@@ -47,18 +47,6 @@ public actor SwiftNativeManifestSigner {
         return Data(out.utf8)
     }
 
-    /// Generic compact canonical-JSON encoder for an arbitrary JSONValue.
-    /// Compact sorted JSON encoder for arbitrary payloads. Unlike `canonicalBytes`,
-    /// this performs NO manifest-specific field mutation — the caller owns
-    /// payload shaping (e.g. the capability-pack signer strips `signature`).
-    /// Wave 31 W15: shared by the capability-pack HMAC port so pack signatures
-    /// stay identical to `capability_pack_signature()`.
-    public static func compactCanonicalJSON(_ value: JSONValue) throws -> Data {
-        var out = String()
-        try encode(value, into: &out, path: "$")
-        return Data(out.utf8)
-    }
-
     private static func encode(_ value: JSONValue, into out: inout String, path: String) throws {
         switch value {
         case .null:
@@ -90,16 +78,17 @@ public actor SwiftNativeManifestSigner {
             out += "]"
         case .object(let dict):
             out += "{"
-            let sortedKeys = dict.keys.sorted { a, b in
-                Array(a.utf8).lexicographicallyPrecedes(Array(b.utf8))
+            let sortedEntries = dict.sorted { a, b in
+                Array(a.key.utf8).lexicographicallyPrecedes(Array(b.key.utf8))
             }
-            for (i, k) in sortedKeys.enumerated() {
+            for (i, entry) in sortedEntries.enumerated() {
+                let (k, value) = entry
                 if i > 0 { out += "," }
                 JSONValue.encodeString(k, into: &out)
                 out += ":"
                 var key = String()
                 JSONValue.encodeString(k, into: &key)
-                try encode(dict[k]!, into: &out, path: "\(path)[\(key)]")
+                try encode(value, into: &out, path: "\(path)[\(key)]")
             }
             out += "}"
         }
@@ -197,16 +186,10 @@ public actor SwiftNativeManifestSigner {
 
     // MARK: - timestamp
 
-    /// Format `YYYY-MM-DDTHH:MM:SS[.uuuuuu]+00:00` with six microsecond\n    /// digits when needed and no fractional component when subsecond is zero.
-    // PUBLIC wave 30 W07 (2026-06-01): exposed so App-target NativeClient
-    // capability-catalog ports (getCapabilityCatalog) can produce the SAME
-    // `+00:00`/microsecond ISO stamp the SwiftNative ports
-    // use internally — avoids the App target inventing a divergent
-    // `ISO8601DateFormatter` (`Z`/millisecond) timestamp and breaking parity
-    // with `listCapabilityCatalog(dataRoot:nowISO:)`. Pure nonisolated static.
+    /// Emits `YYYY-MM-DDTHH:MM:SS[.uuuuuu]+00:00` with six fractional digits only when nonzero.
     public nonisolated static func isoTimestamp(_ date: Date) -> String {
         var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone(identifier: "UTC")!
+        cal.timeZone = .gmt
         let comps = cal.dateComponents(
             [.year, .month, .day, .hour, .minute, .second], from: date
         )

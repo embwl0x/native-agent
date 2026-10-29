@@ -13,13 +13,13 @@ public struct SupportDiagnostics: Codable, Hashable, Sendable {
     /// (`live.*`) that `runAll` never produces, so the snapshot is
     /// byte-identical to a cold run. The export path (and any stale-cache
     /// caller) passes nil → full run.
-    public static func read(reusingChecks checks: [CheckResult]?) async throws -> SupportDiagnostics {
+    public static func read(reusingChecks checks: [CheckResult]?) async -> SupportDiagnostics {
         let doctorStatus: String
         if let checks {
-            doctorStatus = DoctorStatusProjection.supportSnapshotOfflineRollup(checks)
+            doctorStatus = DoctorReadout.supportSnapshotOfflineRollup(checks)
         } else {
-            let statuses = try await makeDoctorChecks().runAll().map(\.status)
-            doctorStatus = DoctorStatusProjection.doctorRollup(statuses)
+            let statuses = await makeDoctorChecks().runAll().map(\.status)
+            doctorStatus = DoctorReadout.doctorRollup(statuses)
         }
         let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"
         return SupportDiagnostics(

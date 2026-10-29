@@ -14,18 +14,20 @@ public struct ConnectorActionRegistry: Codable, Hashable, Sendable {
     /// readiness overlay the connector list uses, and the newest of its last
     /// 50 receipts. A failed connector read propagates: it is a read failure,
     /// not an unavailable registry.
-    public static func read(dataRoot: URL, platform: any ConnectorStatusPlatform) async throws -> ConnectorActionRegistry {
-        let connectors = try await ConnectorStatusProjection.readConnectorRecords(
+    public static func read(dataRoot: URL, platform: AppConnectorStatusPlatform) async throws -> ConnectorActionRegistry {
+        let connectors = try await ConnectorReadiness.readConnectorRecords(
             root: dataRoot, platform: platform
         )
-        return await read(dataRoot: dataRoot, connectors: connectors)
+        return try await read(dataRoot: dataRoot, connectors: connectors)
     }
 
-    public static func read(dataRoot: URL, connectors: [ConnectorRecord]) async -> ConnectorActionRegistry {
+    public static func read(dataRoot: URL, connectors: [ConnectorRecord]) async throws -> ConnectorActionRegistry {
         let actions = ConnectorActionRecord.records(connectors: connectors)
         let receiptsPath = ConnectorActionReceipt.receiptsPath(root: dataRoot)
-        let receipts: [ConnectorActionReceipt] = await RuntimeReadProjection.tailJSONL(path: receiptsPath, limit: 50)
-            .sorted { ($0.createdAt ?? "") > ($1.createdAt ?? "") }
+        let read: (rows: [ConnectorActionReceipt], malformedRows: Int, blankRows: Int, truncated: Bool, readFailed: Bool, failure: String?) =
+            await RuntimeReadouts.tailJSONL(path: receiptsPath, limit: 50)
+        if let failure = read.failure { throw RuntimeReadError.unreadableFeed(failure) }
+        let receipts = read.rows.sorted { ($0.createdAt ?? "") > ($1.createdAt ?? "") }
         return ConnectorActionRegistry(
             status: actions.isEmpty ? "unavailable" : "ready",
             actions: actions,
@@ -39,8 +41,8 @@ public struct ConnectorActionRegistry: Codable, Hashable, Sendable {
 extension ConnectorActionRecord {
     /// Each action's capability status for TrustCenter: active when its
     /// connector is ready, else the connector's state or needs_setup.
-    public static func checkedStatuses(root: URL, platform: any ConnectorStatusPlatform) async throws -> [String: String] {
-        let connectors = try await ConnectorStatusProjection.readConnectorRecords(
+    public static func checkedStatuses(root: URL, platform: AppConnectorStatusPlatform) async throws -> [String: String] {
+        let connectors = try await ConnectorReadiness.readConnectorRecords(
             root: root, platform: platform
         )
         let ready: Set<String> = ["active", "ready", "ok", "healthy", "connected"]

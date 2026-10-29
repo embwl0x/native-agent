@@ -117,8 +117,7 @@ public struct RunawayOutputDetector: Sendable {
                 openBlock = nil
                 blockCursor = end
                 let block = String(decoding: bytes[open.start..<end], as: UTF8.self)
-                // Runaway repeats are byte-identical; only the outer edges
-                // are trimmed, so "red fox" and "redfox" stay different (Sol).
+                // Preserve call bytes in signatures, trimming only outer whitespace.
                 let signature = block.trimmingCharacters(in: .whitespacesAndNewlines)
                 if signature == lastSignature {
                     return setToolBoundary(.repeatedBlock, "tool block repeated", at: lastBlockEnd)
@@ -139,12 +138,8 @@ public struct RunawayOutputDetector: Sendable {
                 committed += block
                 released = end
             } else {
-                // After a complete call, a result she writes herself or a long
-                // run of prose with no new call ends the reply there, so the
-                // calls dispatch — desk-walk 8795fd5b: three bare <invoke>s,
-                // then invented "<system>Tool ran without output</system>"
-                // lines until the loop guard cut the reply and nothing ran.
-                // Short narration between two calls stays (Sol).
+                // After a complete call, invented results or over-budget prose end the reply for dispatch.
+                // Short narration between calls remains admitted.
                 if blockCount > 0, let why = gapAfterCall() {
                     return setToolBoundary(why.kind, why.detail, at: lastBlockEnd)
                 }

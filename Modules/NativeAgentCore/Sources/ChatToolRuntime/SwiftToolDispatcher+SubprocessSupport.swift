@@ -10,11 +10,15 @@ extension SwiftToolDispatcher {
         private let stderrBuffer: BoundedBuffer
         private let stdoutDrain: ProcessPipeDrain
         private let stderrDrain: ProcessPipeDrain
+        private let stdout: Pipe
+        private let stderr: Pipe
 
-        init(process: Process, stderrCap: Int = 128 * 1024) throws {
-            let stdout = Pipe()
-            let stderr = Pipe()
-            let stdoutBuffer = BoundedBuffer(cap: 512 * 1024)
+        init(process: Process, stdoutCap: Int = 512 * 1024, stderrCap: Int = 128 * 1024,
+             onStdoutLine: (@Sendable (String) -> Void)? = nil) throws {
+            let stdout = Pipe(), stderr = Pipe()
+            self.stdout = stdout
+            self.stderr = stderr
+            let stdoutBuffer = BoundedBuffer(cap: stdoutCap, onLine: onStdoutLine)
             let stderrBuffer = BoundedBuffer(cap: stderrCap)
             self.stdoutBuffer = stdoutBuffer
             self.stderrBuffer = stderrBuffer
@@ -30,23 +34,30 @@ extension SwiftToolDispatcher {
             self.stdoutDrain = stdoutDrain
         }
 
-        func stopReading() {
+        private func stopReading() {
+            try? stdout.fileHandleForWriting.close()
+            try? stderr.fileHandleForWriting.close()
             // Settle queued reads and their appends before any output snapshot.
             stdoutDrain.stopAndWait()
             stderrDrain.stopAndWait()
+            stdoutBuffer.finishLines()
+            try? stdout.fileHandleForReading.close()
+            try? stderr.fileHandleForReading.close()
         }
 
-        func finish(strictUTF8: Bool = false) -> (stdout: String, stderr: String) {
+        var truncated: Bool { stdoutBuffer.truncated || stderrBuffer.truncated }
+
+        func finish(strictUTF8: Bool = false, appendTruncationNotes: Bool = true) -> (stdout: String, stderr: String) {
             stopReading()
             let decode: (Data) -> String = strictUTF8
                 ? { String(data: $0, encoding: .utf8) ?? "" }
                 : { String(decoding: $0, as: UTF8.self) }
             var stdoutText = decode(stdoutBuffer.data)
             var stderrText = decode(stderrBuffer.data)
-            if stdoutBuffer.truncated {
+            if appendTruncationNotes, stdoutBuffer.truncated {
                 stdoutText += "\n[stdout truncated]"
             }
-            if stderrBuffer.truncated {
+            if appendTruncationNotes, stderrBuffer.truncated {
                 stderrText += "\n[stderr truncated]"
             }
             return (stdoutText, stderrText)

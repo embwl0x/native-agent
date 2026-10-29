@@ -3,16 +3,14 @@ import SwiftUI
 
 // Blueprint: | `NativeDisclosureTriangle.swift` | `NativeDisclosureTriangle`: AppKit disclosure button bridge sharing the row's expansion binding |
 
-/// The Mac's own disclosure triangle (NSButton, disclosure bezel) for rows
-/// that fold in place but keep their own layout, where a DisclosureGroup
-/// would move the triangle off the title (User 09-27: all controls native).
+/// Native disclosure button folds rows in place while retaining their layout.
 struct NativeDisclosureTriangle: NSViewRepresentable {
     var isOpen: Bool
     var accessibilityLabel: String
     var onToggle: () -> Void
 
     func makeNSView(context: Context) -> NSButton {
-        let button = NSButton(title: "", target: context.coordinator, action: #selector(Coordinator.clicked))
+        let button = NSButton(title: "", target: context.coordinator, action: #selector(DisclosureToggle.clicked))
         button.bezelStyle = .disclosure
         button.setButtonType(.onOff)
         button.state = isOpen ? .on : .off
@@ -27,9 +25,9 @@ struct NativeDisclosureTriangle: NSViewRepresentable {
         if button.state != state { button.state = state }
     }
 
-    func makeCoordinator() -> Coordinator { Coordinator(onToggle: onToggle) }
+    func makeCoordinator() -> DisclosureToggle { DisclosureToggle(onToggle: onToggle) }
 
-    final class Coordinator: NSObject {
+    final class DisclosureToggle: NSObject {
         var onToggle: () -> Void
         init(onToggle: @escaping () -> Void) { self.onToggle = onToggle }
         @objc func clicked() { onToggle() }

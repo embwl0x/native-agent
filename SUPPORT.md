@@ -27,7 +27,7 @@ installation.
 
 ### iPhone and iPad
 
-- iOS or iPadOS 17 or newer
+- iOS or iPadOS 26 or newer
 - the NativeAgent mobile app and a compatible NativeAgent Mac release
 - both devices signed into the intended Apple account with iCloud enabled
 - a Mac release signed for the same production iCloud/CloudKit container as
@@ -132,11 +132,13 @@ other protected services each have separate Apple authorization.
 
 ### Chrome is not connected
 
-In **Trust**, click **Set up Chrome**. The extension is bundled with the app:
-turn on **Developer mode** at Chrome's extensions page, click **Load unpacked**,
-and select the folder revealed in Finder. Keep the app in its installed
-location, enable **Chrome control**, and keep Chrome open. The switch allows
-access; it does not install the extension. See the [setup guide](Extensions/NativeAgentChrome/README.md).
+In **Trust**, enable **Chrome control** first (Full Mac already allows it),
+then click **Set up Chrome**. The agent opens Chrome, enables **Developer mode**
+if needed, loads the bundled extension and verifies the connection. Allow Mac
+access if asked and follow the setup message if a permission or Chrome step
+fails. Keep NativeAgent in its installed location and Chrome open. Allowing
+Chrome control alone does not install the extension. See the
+[extension guide](Extensions/NativeAgentChrome/README.md).
 
 ## Reporting a problem
 

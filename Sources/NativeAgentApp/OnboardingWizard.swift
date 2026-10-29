@@ -1,228 +1,21 @@
-import ProviderRouting
 import AppToolRuntime
 import Onboarding
 import EngineRuntime
-import NativeAgentCore
-// PATCH-2026-05-07: onboarding-2 Generic onboarding wizard — name + persona type
 import SwiftUI
-import AppKit
-// Blueprint: | `OnboardingWizard.swift` | `OnboardingWizard` struct; provider rows, connection and Chat readiness derive from ProvidersFacade settings; only setup progress and drafts are local |
+import NativeAgentShared
+// Blueprint: | `OnboardingWizard.swift` | Fresh identity setup and shared wizard presentation; recovery, profile repair and reset are separate identity operations |
 
 // MARK: - Models
 
-extension AbilityOverviewEntry: @retroactive Identifiable {
-    /// Also translate older start-response copy without changing the stored catalog.
-    var displayDetail: String {
-        detail.replacingOccurrences(of: "keep receipts", with: "show results and keep an activity record")
-            .replacingOccurrences(of: "behind Trust settings", with: "with your permission, managed in Trust")
-    }
-}
-
-// MARK: - Wizard State
-
-@Observable
-@MainActor
-final class OnboardingWizardState {
-    enum Step: Int, CaseIterable {
-        case identity = 0
-        case provider = 1
-        case building = 2
-        /// Reached only by a profile repair; a fresh setup goes straight to
-        /// the greeting, which does the "ready" job.
-        case done = 3
-        case error = 4
-        /// User, 2026-09-06: memory/profile.json is missing on an install that
-        /// really did onboard. Deliberately numbered ABOVE `.building` so it
-        /// inherits the "no progress dots, no shared nav bar" gates — this is a
-        /// one-field repair, not step 1 of 2 — and carries its own action.
-        case profileRepair = 5
-    }
-
-    /// Number of user-facing steps before the build spinner — drives the
-    /// progress dots and the "show the nav bar / progress" gate. Kept as a
-    /// single source so adding a step updates both.
-    static let interactiveStepCount = 2
-
-    var step: Step = .identity
-    weak var draftOwner: AppModel?
-    private var savedAgentName: String
-    private var savedUserName = ""
-    var agentName: String {
-        get { draftOwner?.editDraft("persona/new/agentName", seed: savedAgentName) ?? savedAgentName }
-        set {
-            if let draftOwner { draftOwner.setEditDraft(newValue, for: "persona/new/agentName") }
-            else { savedAgentName = newValue }
-        }
-    }
-    /// The public build ships a SINGLE AI persona — onboarding no longer offers
-    /// a female/male/ai choice (User, 2026-07-04: "just give it a name and tell
-    /// it your name"). Fixed to "ai"; the backend still accepts it.
-    var personaType: String = "ai"
-    var providers: [ProviderInfo] { draftOwner?.engine.providers.connections ?? [] }
-    var providersLoading = false
-    var savingModel = false
-    var providerLoadError: String? {
-        draftOwner?.engine.providers.settingsError == nil ? nil : "Couldn't check your connected accounts"
-    }
-    var providerConnected: Bool {
-        !providersLoading && providerLoadError == nil && providers.contains { $0.auth_status.eligible }
-    }
-    var connectedProviderLabel: String? {
-        let ready = providers.filter { $0.auth_status.eligible }
-        let providerID = draftOwner?.engine.providers.settings?.activeProviders["chat"]
-        return (ready.first { $0.provider_id == providerID } ?? ready.first)?.display_name
-    }
-    var chatModelReady: Bool {
-        guard let settings = draftOwner?.engine.providers.settings else { return false }
-        return ProvidersFacade.chatModelIsReady(
-            providers: settings.providers, providerID: settings.activeProviders["chat"] ?? "",
-            model: settings.preferences["chat"]?.model ?? ""
-        )
-    }
-    private var pendingConnectedProviderID: String?
-    @ObservationIgnored private let providerRead = LatestRead()
-    private var pendingProviderReads = 0
-
-    /// A retry retains the explicit sign-in choice without treating cached rows as proof.
-    func reloadProviders(
-        connectedId: String? = nil,
-        refresh: () async -> Bool,
-        adopt: (String) async -> Void
-    ) async {
-        if let connectedId { pendingConnectedProviderID = connectedId }
-        pendingProviderReads += 1
-        defer { pendingProviderReads -= 1; providersLoading = pendingProviderReads > 0 }
-        providersLoading = true
-        var connected: String?
-        _ = await providerRead.read({ await refresh() }, publish: { refreshed in
-        if refreshed,
-           let pendingConnectedProviderID,
-           providers.contains(where: { $0.provider_id == pendingConnectedProviderID && $0.auth_status.eligible }) {
-            self.pendingConnectedProviderID = nil
-            connected = pendingConnectedProviderID
-        }
-        })
-        if let connected { await adopt(connected) }
-    }
-    // Blank by default — never pre-fill from the macOS account name
-    // (NSFullUserName): a public user's Mac account isn't their answer to
-    // "your name," and it leaked the host account into onboarding (User, 2026-07-05).
-    var userName: String {
-        get { draftOwner?.editDraft("persona/new/userName", seed: savedUserName) ?? savedUserName }
-        set {
-            if let draftOwner { draftOwner.setEditDraft(newValue, for: "persona/new/userName") }
-            else { savedUserName = newValue }
-        }
-    }
-
-    func prepareProfileRepair() {
-        savedAgentName = ""
-        savedUserName = ""
-    }
-
-    func releaseNames(agent: String, user: String) {
-        savedAgentName = agent
-        savedUserName = user
-        draftOwner?.clearEditDraft("persona/new/agentName")
-        draftOwner?.clearEditDraft("persona/new/userName")
-    }
-    var abilities: [AbilityOverviewEntry] = SwiftNativeOnboardingClient.abilityOverview
-    var showsAbilityOverview = false
-    var errorMessage: String?
-    var pendingRecoveryNeedsReset = false
-    var isLoading: Bool = false
-    /// True once this wizard has submitted a Build that did NOT succeed.
-    ///
-    /// fix-blank-install-onboarding (2026-08-02): the retry path re-read the
-    /// durable start state and called `onComplete()` whenever it reported
-    /// `hasExisting` — so a Build that failed with `persona_already_exists`
-    /// (pre-existing persona bytes this wizard did not write) dismissed the
-    /// wizard as though onboarding had SUCCEEDED, leaving an unnamed agent and
-    /// no identity docs. A failed Build is never completion; while this flag is
-    /// set, existing persona state is treated as the obstacle it is and the
-    /// user is offered the backup-preserving reset instead.
-    var buildFailed = false
-
-    /// True when the persona documents committed but the post-completion
-    /// scaffold repair did not succeed (gpt-5.5 review BLOCKING 2, 2026-08-02).
-    ///
-    /// Distinct from `buildFailed` on purpose. `buildFailed` means "pre-existing
-    /// persona bytes blocked this Build" and its remedy is the backup-preserving
-    /// reset. This means "identity landed, the app's own local files did not" —
-    /// resetting would throw away good identity docs over an unrelated problem,
-    /// so the retry re-runs the repair instead of re-reading start state (which
-    /// would see the now-committed docs and dismiss the wizard as complete).
-    var scaffoldRepairFailed = false
-
-    /// True when this wizard was opened ONLY to rewrite a missing
-    /// memory/profile.json (User, 2026-09-06). The persona documents already
-    /// exist and are untouched, so the completion screen must not claim a fresh
-    /// install, and the one-time first-run welcome must not be re-armed.
-    var profileRepairOnly = false
-
-    /// True after a repair was refused because the durable state moved under
-    /// it (User, 2026-09-06). The step then offers a re-read instead of only a
-    /// Save that would be refused the same way — the sheet is
-    /// `interactiveDismissDisabled`, so "close and reopen" was not an option
-    /// the person actually had.
-    var profileRepairRecheckOffered = false
-
-    private static let nameSuggestions = ["Aria", "Max", "Ada", "Soren", "Clio", "Zev", "Noa"]
-    // Pick once per sheet; editing the value must never recreate the field.
-    let suggestedName: String
-
-    init() {
-        let suggestion = Self.nameSuggestions[abs(Int(Date().timeIntervalSince1970) / 3) % Self.nameSuggestions.count]
-        suggestedName = suggestion
-        savedAgentName = suggestion
-    }
-
-    var trimmedAgentName: String { agentName.trimmingCharacters(in: .whitespacesAndNewlines) }
-    var trimmedUserName: String { userName.trimmingCharacters(in: .whitespacesAndNewlines) }
-
-    var missingNamesMessage: String? {
-        if trimmedUserName.isEmpty && trimmedAgentName.isEmpty {
-            return "Enter your name and an agent name."
-        }
-        if trimmedUserName.isEmpty { return "Enter your name." }
-        if trimmedAgentName.isEmpty { return "Enter an agent name." }
-        return nil
-    }
-
-    var canContinue: Bool {
-        switch step {
-        case .identity:
-            return missingNamesMessage == nil
-        case .provider:
-            return !providersLoading && !savingModel && (!providerConnected || chatModelReady)
-        case .building, .done, .error, .profileRepair:
-            return false
-        }
-    }
-
-    func goBack() {
-        guard let previous = Step(rawValue: step.rawValue - 1),
-              previous.rawValue >= Step.identity.rawValue else { return }
-        step = previous
-    }
-
-}
-
-// MARK: - OnboardingWizard
+extension AbilityOverviewEntry: @retroactive Identifiable {}
 
 struct OnboardingWizard: View {
     let onComplete: () -> Void
 
     // Loading/actions require the real model; an offscreen identity fixture only
     // needs wizard state. Optional lookup avoids eagerly starting a runtime.
-    @Environment(AppModel.self) private var environmentAppModel: AppModel?
-    private var appModel: AppModel {
-        guard let environmentAppModel else {
-            preconditionFailure("Onboarding actions require AppModel")
-        }
-        return environmentAppModel
-    }
-    @State private var state = OnboardingWizardState()
+    @Environment(AppModel.self) private var appModel: AppModel?
+    @State private(set) var state = OnboardingWizardState()
     init(onComplete: @escaping () -> Void) {
         self.onComplete = onComplete
     }
@@ -259,11 +52,7 @@ struct OnboardingWizard: View {
                             onRecheck: { Task { await loadOnboardingState() } }
                         )
                     case .error:      ErrorStep(state: state, onRetry: {
-                        // A scaffold-repair failure is NOT an onboarding-state
-                        // problem: the transaction already committed, so
-                        // re-reading start state would report `hasExisting` and
-                        // dismiss the wizard over the very scaffold that failed.
-                        // Retry the repair itself.
+                        // Identity is committed; retry the scaffold repair itself.
                         if state.scaffoldRepairFailed {
                             Task {
                                 state.step = .building
@@ -271,11 +60,7 @@ struct OnboardingWizard: View {
                             }
                             return
                         }
-                        // Otherwise re-read the durable start state before
-                        // choosing a retry path. A normal submit may have failed
-                        // after publishing its transaction manifest, so blindly
-                        // returning to the account step can lose the payload-free
-                        // recovery lane and retry with blank wizard fields.
+                        // Re-read durable state so interrupted transactions resume without a payload.
                         Task { await loadOnboardingState() }
                     }, onReset: state.pendingRecoveryNeedsReset ? {
                         Task { await resetPendingOnboarding() }
@@ -317,118 +102,13 @@ struct OnboardingWizard: View {
 
     // MARK: - Logic
 
-    private func loadOnboardingState() async {
-        // WAVE 15 (2026-06-01): switched from raw URLSession to the Swift onboarding
-        // owner so the SwiftNative gate in startOnboarding() is exercised rather than bypassed.
-        // Runtime MUST be passed — daemon-side /v1/onboarding/start is retired (would throw
-        // DaemonError.swiftOnlyRoute on fallthrough), and only the SwiftNative path is live.
-        // R22: AppModel picks the onboarding owner for its own root.
-        let resp: OnboardingStartResult
-        // Any path through start state is a fresh verdict; a stale scaffold flag
-        // must not hijack the next Retry.
-        state.scaffoldRepairFailed = false
-        do {
-            resp = try await appModel.startOnboarding()
-        } catch {
-            state.pendingRecoveryNeedsReset = true
-            state.errorMessage = UserFacingError.message(error, action: "read where setup left off")
+    func setupModel() -> AppModel? {
+        guard let appModel else {
+            state.errorMessage = "Setup is unavailable because the app model is missing."
             state.step = .error
-            return
+            return nil
         }
-        let disposition = resp.disposition(buildFailed: state.buildFailed)
-        if disposition == .resume {
-            state.step = .building
-            do {
-                let resumed = try await appModel.resumePendingOnboarding()
-                if resumed.ok {
-                    state.pendingRecoveryNeedsReset = false
-                    state.agentName = resumed.agentName ?? resp.currentPersonaName ?? state.agentName
-                    state.userName = resumed.userName ?? state.userName
-                    state.personaType = resumed.personaType ?? state.personaType
-                    await finishSuccessfulOnboarding()
-                } else {
-                    state.pendingRecoveryNeedsReset = true
-                    state.errorMessage = resumed.detail ?? resumed.error ?? "Onboarding recovery failed."
-                    state.step = .error
-                }
-            } catch {
-                state.pendingRecoveryNeedsReset = true
-                state.errorMessage = UserFacingError.message(error, action: "pick up setup where it left off")
-                state.step = .error
-            }
-            return
-        }
-        // User, 2026-09-06: an install that really did onboard but lost
-        // memory/profile.json. `hasExisting` is true, so this used to fall
-        // straight through to `onComplete()` and the wizard closed over a
-        // default profile — the configured names silently gone. Reset is the
-        // wrong remedy (it would back out good persona documents over one
-        // missing file), so this state gets its own two-field repair lane.
-        if disposition == .repairProfile {
-            // User, 2026-09-06: blank the fields only on FIRST entry. A re-read
-            // from inside the lane (the refusal recheck below) must not throw
-            // away the names the person just typed.
-            if !state.profileRepairOnly {
-                state.prepareProfileRepair()
-            }
-            state.profileRepairOnly = true
-            state.pendingRecoveryNeedsReset = false
-            state.buildFailed = false
-            state.errorMessage = nil
-            state.step = .profileRepair
-            return
-        }
-        state.profileRepairRecheckOffered = false
-        state.profileRepairOnly = false
-        // An unreadable profile on a finished install is its own receipt: no reset offered.
-        if disposition == .profileUnreadable {
-            state.pendingRecoveryNeedsReset = false
-            state.errorMessage = resp.profileUnreadable
-            state.step = .error
-            return
-        }
-        if disposition == .reset {
-            state.pendingRecoveryNeedsReset = true
-            state.errorMessage = "Incomplete persona documents were found. Reset will back them up before onboarding starts again."
-            state.step = .error
-            return
-        }
-        if disposition == .alreadyOnboarded || disposition == .blockedNeedsReset {
-            if disposition == .alreadyOnboarded {
-                onComplete()
-            } else {
-                state.pendingRecoveryNeedsReset = true
-                state.errorMessage = state.errorMessage
-                    ?? Self.buildFailureMessage(error: "persona_already_exists", detail: nil)
-                state.step = .error
-            }
-            return
-        }
-        state.pendingRecoveryNeedsReset = false
-        // Persona-type picker removed 2026-07-04 (single AI persona) — only the
-        // ability overview is still consumed from the start response.
-        state.abilities = resp.abilityOverview.isEmpty ? SwiftNativeOnboardingClient.abilityOverview : resp.abilityOverview
-        if state.step == .error {
-            state.step = state.trimmedUserName.isEmpty || state.trimmedAgentName.isEmpty
-                ? .identity : .provider
-        }
-    }
-
-    private func resetPendingOnboarding() async {
-        do {
-            let reset = try await appModel.resetOnboarding(confirm: true)
-            guard reset.ok else {
-                state.errorMessage = reset.error ?? "Onboarding reset failed."
-                return
-            }
-            state.pendingRecoveryNeedsReset = false
-            state.buildFailed = false
-            state.errorMessage = nil
-            state.releaseNames(agent: state.suggestedName, user: "")
-            state.step = .identity
-        } catch {
-            state.errorMessage = UserFacingError.message(error, action: "reset setup")
-        }
+        return appModel
     }
 
     private func handleContinue() async {
@@ -445,78 +125,8 @@ struct OnboardingWizard: View {
         }
     }
 
-    /// Writes ONLY memory/profile.json from the two re-entered names, then
-    /// joins the normal completion path. Failures stay on this step with the
-    /// fields intact — the user's next move is to correct a name and try again,
-    /// not to be handed a reset button that would destroy the persona docs.
-    private func submitProfileRepair() async {
-        state.isLoading = true
-        state.errorMessage = nil
-        do {
-            let resp = try await appModel.repairOnboardingProfile(
-                agentName: state.trimmedAgentName,
-                personaType: state.personaType,
-                userName: state.trimmedUserName
-            )
-            state.isLoading = false
-            guard resp.ok else {
-                let message = Self.profileRepairFailureMessage(error: resp.error, detail: resp.detail)
-                // User, 2026-09-06: these two refusals mean the durable state
-                // changed under the sheet — the profile appeared, or a pending
-                // onboarding must finish first. The copy told the person to
-                // close and reopen, but the sheet is interactiveDismissDisabled
-                // and the step offered only Save, so they were stuck. Re-read
-                // the start state instead: it completes the wizard when the
-                // profile is now there, and otherwise leaves a Check again.
-                if resp.requiresProfileRepairRecheck {
-                    await loadOnboardingState()
-                    if state.step == .profileRepair {
-                        state.profileRepairRecheckOffered = true
-                        state.errorMessage = message
-                    }
-                    return
-                }
-                state.errorMessage = message
-                return
-            }
-            state.profileRepairRecheckOffered = false
-            state.releaseNames(agent: state.trimmedAgentName, user: state.trimmedUserName)
-            // User, 2026-09-06: the repair lane ends here, on its own. It must
-            // NOT borrow the shared `.building` step — that copy says the four
-            // persona documents are being written, and a repair writes exactly
-            // one file and never touches them — and it must not run
-            // `finishSuccessfulOnboarding`, whose Doctor scaffold repair
-            // reaches into unrelated stores on an install that has been in use
-            // for months. The one file is already committed and verified.
-            state.step = .done
-        } catch {
-            state.isLoading = false
-            state.errorMessage = UserFacingError.message(error, action: "save the names")
-        }
-    }
-
-    /// Backend codes are not user-facing copy. Copy names the agent by the
-    /// entered name or "the agent" — never a pronoun.
-    static func profileRepairFailureMessage(error: String?, detail: String?) -> String {
-        switch error {
-        case "missing_agent_name":
-            return "Enter a name for the agent before saving."
-        case "missing_user_name":
-            return "Enter your name before saving."
-        case "profile_already_present":
-            return "A profile file is already there, so nothing was overwritten. Check again to pick up the current state."
-        case "profile_repair_not_required":
-            return "No completed onboarding was found on this Mac, so there is no profile to repair."
-        case "onboarding_in_progress":
-            return "An interrupted onboarding is still pending. Check again to finish it first."
-        case .some(let code) where detail == nil || detail?.isEmpty == true:
-            return "Saving the names failed (\(code))."
-        default:
-            return detail ?? error ?? "Saving the names failed."
-        }
-    }
-
     private func submitOnboarding() async {
+        guard let appModel = setupModel() else { return }
         state.scaffoldRepairFailed = false
         state.step = .building
         do {
@@ -531,10 +141,6 @@ struct OnboardingWizard: View {
             } else {
                 state.buildFailed = true
                 state.errorMessage = Self.buildFailureMessage(error: resp.error, detail: resp.detail)
-                // `persona_already_exists` means unrelated persona bytes are in
-                // the way. That is precisely what reset (which BACKS UP before
-                // clearing) exists for, so surface the affordance instead of
-                // showing a raw error code with no way forward.
                 if resp.requiresPersonaReset {
                     state.pendingRecoveryNeedsReset = true
                 }
@@ -559,50 +165,32 @@ struct OnboardingWizard: View {
         }
     }
 
-    /// Runs the fresh-install scaffold repair and only then declares onboarding
-    /// done. Reached from BOTH completion paths: submit-success and the
-    /// payload-free pending-recovery resume.
-    ///
-    /// The remaining scaffold repairs run through their registered owners.
-    /// Runtime stores begin through canonical owners, never Doctor defaults.
-    ///
-    /// gpt-5.5 review BLOCKING 2 (2026-08-02): the repair result was DISCARDED,
-    /// so a repair that threw — or that reported failing scaffold checks over a
-    /// store it could not fix — still wrote the first-run welcome marker and
-    /// showed "<Agent> is ready" over a broken install. A failed repair now
-    /// blocks completion and names what failed. The persona documents really did
-    /// commit at this point, so this is NOT `buildFailed` and must not offer
-    /// reset (which would back out good identity docs over a scaffold problem);
-    /// the actionable retry is the repair itself.
-    private func finishSuccessfulOnboarding() async {
+    /// Fresh completion and pending-transaction resume both require scaffold repair.
+    /// Registered owners repair scaffolding; canonical owners initialize runtime stores.
+    /// Failure keeps committed identity documents and offers repair again, never reset.
+    func finishSuccessfulOnboarding() async {
+        guard let appModel = setupModel() else { return }
         state.releaseNames(agent: state.agentName, user: state.userName)
         let outcome = await appModel.runDoctor(repair: true, repairScope: .onboarding)
         guard outcome.didRun, outcome.failingScaffoldChecks.isEmpty else {
             state.scaffoldRepairFailed = true
-            // Reset would back out the identity docs that DID commit. Never
-            // offer it for a scaffold problem.
             state.pendingRecoveryNeedsReset = false
             state.errorMessage = Self.scaffoldRepairFailureMessage(outcome)
             state.step = .error
             return
         }
         state.scaffoldRepairFailed = false
-        // A profile repair is not a first run — arming the one-time welcome
-        // would greet a user who has been using this install for months.
         guard !state.profileRepairOnly else {
             state.step = .done
             return
         }
         appModel.markFirstRunWelcomePending()
-        // User, 2026-09-25: a fresh setup lands in Simple view, straight into
-        // the greeting — no "ready" screen in between.
+        // Fresh setup opens Simple view and the greeting.
         UserDefaults.standard.set(SimpleViewMode.simple, forKey: SimpleViewMode.key)
         onComplete()
     }
 
-    /// Honest, actionable copy for a scaffold repair that did not succeed.
-    /// Says what DID land (identity docs) so the user is not told their work was
-    /// lost, names the failing check, and points at the one action that helps.
+    /// Name the failed scaffold check, the saved identity and the repair action.
     static func scaffoldRepairFailureMessage(_ outcome: DoctorFacade.RunOutcome) -> String {
         let detail = outcome.failureDetail.trimmingCharacters(in: .whitespacesAndNewlines)
         return [
@@ -694,19 +282,6 @@ private enum OnboardingInk {
     }
 }
 
-/// The shell's card for onboarding's grouped fields.
-private struct OnboardingCard<Content: View>: View {
-    @ViewBuilder var content: () -> Content
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.md) { content() }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(NativeAgentSpacing.lg)
-            .aliveCard()
-            .accessibilityElement(children: .contain)
-    }
-}
-
 private struct AbilityOverviewTile: View {
     let ability: AbilityOverviewEntry
     @Environment(\.colorScheme) private var scheme
@@ -724,7 +299,7 @@ private struct AbilityOverviewTile: View {
                     .font(.system(size: bodySize))
                     .fontWeight(.semibold)
                     .fixedSize(horizontal: false, vertical: true)
-                Text(ability.displayDetail)
+                Text(ability.detail)
                     .font(.system(size: detailSize))
                     .foregroundStyle(OnboardingInk.secondary(scheme))
                     .fixedSize(horizontal: false, vertical: true)
@@ -736,18 +311,10 @@ private struct AbilityOverviewTile: View {
     }
 }
 
-// MARK: - Provider connect step (G4-2, 2026-07-04)
+// MARK: - Provider connect step
 
-/// Fresh-install blocker fix: onboarding used to jump from persona straight to
-/// "ready to chat" with NO provider connected, so a stranger's first message
-/// died. This step MIRRORS the working Providers tab surface (User,
-/// 2026-07-04: "we dont have to have a preferred one, just show all the options
-/// we have — you have the working app to go off of") — the SAME OAuth buttons,
-/// setup-token input, and per-provider config sheet, so every provider (ChatGPT
-/// OAuth, Anthropic OAuth/token, Grok OAuth, OpenAI/OpenRouter/Anthropic API
-/// keys) is connectable here, none preferred. On first connect the chat surface
-/// is pointed at whatever the user connected (the default active provider is
-/// ChatGPT/Codex, which a fresh Mac can't use). Skippable.
+/// Uses the Providers sign-in and configuration controls; connecting adopts the account for Chat.
+/// Setup can finish without a connection.
 private struct ProviderConnectStep: View {
     @Bindable var state: OnboardingWizardState
     @Environment(AppModel.self) private var appModel
@@ -775,27 +342,19 @@ private struct ProviderConnectStep: View {
 
                 // Sign in with a subscription account (same OAuth buttons as
                 // the Providers tab).
-                OnboardingCard {
+                NativePanel {
                     VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
                         Text("Sign in with your account")
                             .font(NativeAgentFont.section)
                         Text("Use your existing ChatGPT, Claude, or Grok subscription.")
                             .font(NativeAgentFont.label)
                             .foregroundStyle(.secondary)
-                        // A2.2 close-out (2026-07-24): the codex-CLI caveat that
-                        // lived here was stale — ChatGPT sign-in has been the
-                        // codex-free native loopback flow since 2026-07-05
-                        // (NativeOAuthFlow+Loopback). No dependency, no caveat.
-                        OAuthSignInButton(provider: .chatgpt) { Task { await reload(connectedId: "openai_oauth_direct") } }
+                        OAuthSignInButton(provider: .chatgpt)
                         Divider()
-                        OAuthSignInButton(provider: .anthropic) { Task { await reload(connectedId: "anthropic_oauth_direct") } }
-                        // Claude's other way in, as on the Providers page: a
-                        // `claude setup-token` paste (10-18, a fresh-install VM: the browser
-                        // sign-in is not always possible on a first run, and the
-                        // 09-22 cleanup had taken the row that held the paste).
-                        AnthropicSetupTokenInput { Task { await reload(connectedId: "anthropic_oauth_direct") } }
+                        OAuthSignInButton(provider: .anthropic)
+                        AnthropicSetupTokenInput()
                         Divider()
-                        OAuthSignInButton(provider: .xai) { Task { await reload(connectedId: "xai_oauth_direct") } }
+                        OAuthSignInButton(provider: .xai)
                     }
                 }
 
@@ -806,13 +365,10 @@ private struct ProviderConnectStep: View {
                         .disabled(state.providersLoading)
                 }
 
-                // The rest of the provider list — API keys and per-provider
-                // config, the SAME row + sheet as the Providers tab — folded
-                // behind one line so sign-in is the first-run path.
+                // Keep API-key configuration behind disclosure so account sign-in stays prominent.
                 DisclosureGroup(isExpanded: $showsAPIKeys) {
-                    OnboardingCard {
-                        // 2026-09-22: sign-in rows repeat the buttons above;
-                        // onboarding lists API-key rows only (Providers keeps all).
+                    NativePanel {
+                        // Sign-in controls are above; this list contains API-key rows only.
                         ForEach(state.providers.filter { !Self.signInProviderIDs.contains($0.provider_id) }) { provider in
                             ProviderRowView(provider: provider) { configureSheet = provider.provider_id }
                         }
@@ -849,7 +405,7 @@ private struct ProviderConnectStep: View {
                             Task {
                                 defer { state.savingModel = false }
                                 do {
-                                    _ = try await appModel.saveProviderGroupSelection(
+                                    _ = try await appModel.engine.saveProviderGroupSelection(
                                         group: ProviderSurfaceGroups.chat,
                                         providerID: provider.id, model: model.id
                                     )
@@ -857,8 +413,7 @@ private struct ProviderConnectStep: View {
                                     modelSaveError = UserFacingError.message(error, action: "save your model choice")
                                 }
                             }
-                        },
-                        integrated: true
+                        }
                     )
                     if let modelSaveError {
                         Text(modelSaveError).font(.caption).foregroundStyle(.red)
@@ -875,9 +430,7 @@ private struct ProviderConnectStep: View {
         .sheet(isPresented: Binding(get: { configureSheet != nil }, set: { if !$0 { configureSheet = nil } })) {
             if let provider = appModel.engine.providers.connections.first(where: { $0.provider_id == configureSheet }) {
             ProviderConfigSheet(provider: provider) {
-                let configuredId = provider.provider_id
                 configureSheet = nil
-                Task { await reload(connectedId: configuredId) }
             }
             .environment(appModel)
             }
@@ -887,20 +440,9 @@ private struct ProviderConnectStep: View {
         }
     }
 
-    /// Reload the provider list and reflect whether ANY provider is ready.
-    /// `connectedId` is set ONLY when the user just connected a specific
-    /// provider (an OAuth button, the setup-token, or a config-sheet save) —
-    /// and ONLY then do we point the chat surface at it, so the first message
-    /// uses what they connected (the default active provider is ChatGPT/Codex,
-    /// unusable on a fresh Mac). The passive initial `.task` load passes nil so
-    /// it NEVER repins an existing choice — critical on a persona RESET, where
-    /// provider files + the active pin persist (gpt-5.5 review 2026-07-04).
-    private func reload(connectedId: String? = nil) async {
-        await state.reloadProviders(
-            connectedId: connectedId,
-            refresh: { await appModel.loadProvidersForChat() },
-            adopt: { await appModel.adoptProviderForBlankSurfaces($0) }
-        )
+    /// Passive reads preserve saved provider choices; connection operations own adoption.
+    private func reload() async {
+        await state.reloadProviders(refresh: { await appModel.loadProvidersForChat() })
     }
 }
 
@@ -921,180 +463,13 @@ private struct BuildingStep: View {
     }
 }
 
-private struct DoneStep: View {
-    let state: OnboardingWizardState
-    let onComplete: () -> Void
-
-    var body: some View {
-        VStack(spacing: NativeAgentSpacing.xl) {
-            Image(systemName: "sparkles")
-                .font(.system(size: 48))
-                .foregroundStyle(NativeAgentShell.secondary)
-            Text("\(state.agentName) is back.")
-                .font(ShellType.display)
-            // A repair changed one file. It says nothing about providers,
-            // so it must not nag about connecting one.
-            Text("The names are saved again. Nothing else on this Mac was changed.")
-                .font(NativeAgentFont.title)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-            // A name repair leaves the saved Simple/Advanced choice alone.
-            Button("Start") { onComplete() }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
-        }
-        .multilineTextAlignment(.center)
-    }
-}
-
-// MARK: - Profile repair step (User, 2026-09-06)
-
-/// Reached only from `profile_repair_required`: this Mac finished onboarding —
-/// SOUL.md and/or the `.onboarded` sentinel are on disk — but
-/// `memory/profile.json` is gone, so the configured agent name and user name
-/// went with it and every reader downstream falls back to a default profile.
-///
-/// Nothing may invent those names, so the wizard asks for them. This step
-/// rewrites that one file and touches nothing else; the existing persona
-/// documents are the identity of record and are left exactly as they are.
-private struct ProfileRepairStep: View {
-    @Bindable var state: OnboardingWizardState
-    let onSave: () -> Void
-    let onRecheck: () -> Void
-
-    private var canSave: Bool {
-        !state.trimmedAgentName.isEmpty && !state.trimmedUserName.isEmpty && !state.isLoading
-    }
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
-                VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                    Label("Names missing", systemImage: "person.text.rectangle")
-                        .font(NativeAgentFont.label)
-                        .foregroundStyle(.orange)
-                    Text("Enter the names again to finish setting this Mac back up.")
-                        .font(NativeAgentFont.display)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Text("Setup finished on this Mac, but the file holding your name and the agent's name is gone, so a default is being used instead. Nothing here can guess them. The existing personality documents are kept exactly as they are — only the names file is rewritten.")
-                        .font(NativeAgentFont.body)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                OnboardingCard {
-                    VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Your name")
-                                .font(NativeAgentFont.label)
-                                .foregroundStyle(.secondary)
-                            TextField("Your name", text: $state.userName)
-                                .font(NativeAgentFont.body)
-                                .textFieldStyle(.roundedBorder)
-                        }
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("Agent name")
-                                .font(NativeAgentFont.label)
-                                .foregroundStyle(.secondary)
-                            TextField("Agent name", text: $state.agentName)
-                                .accessibilityLabel("Agent name")
-                                .font(NativeAgentFont.body)
-                                .textFieldStyle(.roundedBorder)
-                        }
-                    }
-                }
-
-                if let message = state.missingNamesMessage {
-                    Text(message)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                if let message = state.errorMessage {
-                    Text(message)
-                        .font(NativeAgentFont.body)
-                        .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                HStack {
-                    Spacer()
-                    if state.profileRepairRecheckOffered {
-                        Button("Check again") { onRecheck() }
-                            .buttonStyle(.bordered)
-                            .controlSize(.large)
-                            .disabled(state.isLoading)
-                    }
-                    Button(state.isLoading ? "Saving\u{2026}" : "Save names") { onSave() }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.large)
-                        .disabled(!canSave)
-                }
-            }
-            .padding(.vertical, 4)
-        }
-    }
-}
-
-private struct ErrorStep: View {
-    let state: OnboardingWizardState
-    let onRetry: () -> Void
-    let onReset: (() -> Void)?
-
-    var body: some View {
-        VStack(spacing: NativeAgentSpacing.xl) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 48))
-                .foregroundStyle(.orange)
-            Text("Setup didn't finish on this Mac.")
-                .font(NativeAgentFont.title)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-            Text(state.scaffoldRepairFailed
-                 ? "Your identity documents are saved. Try again to finish setting up the app's local files."
-                 : state.pendingRecoveryNeedsReset
-                    ? "Try again to check setup, or start over. Any existing identity documents are backed up before starting over."
-                    : "Try again to continue setup.")
-                .font(NativeAgentFont.body)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: false, vertical: true)
-            Button("Try again") { onRetry() }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-            DisclosureGroup("Details") {
-                Text(state.errorMessage ?? "No detail was reported.")
-                    .font(NativeAgentFont.label)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.leading)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.top, 6)
-            }
-            .font(NativeAgentFont.label)
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: 360)
-            if let onReset {
-                Button("Start setup over") { onReset() }
-                    .buttonStyle(.link)
-                    .font(NativeAgentFont.label)
-            }
-        }
-    }
-}
-
 // MARK: - Nav Bar
 
 private struct OnboardingNavBar: View {
     @Bindable var state: OnboardingWizardState
     let onContinue: () -> Void
 
-    /// Sweep R4 C2: on the provider step with nothing connected, the big blue
-    /// button used to read "Skip for now" — the app advertised skipping the one
-    /// load-bearing step. Skipping is still allowed and unblocked (deliberate,
-    /// User 2026-07-04) but it is a plain link; the sign-in buttons are the
-    /// action. Once connected, the prominent button is "Continue" as before.
+    /// Without a connection, skipping stays a plain link so sign-in is the primary action.
     private var isUnconnectedProviderStep: Bool {
         state.step == .provider && !state.providerConnected
     }
@@ -1136,70 +511,5 @@ private struct OnboardingNavBar: View {
             }
         }
         .padding(.horizontal, NativeAgentSpacing.xl)
-    }
-}
-
-// MARK: - Settings: Reset Persona
-
-struct ResetPersonaView: View {
-    @Environment(AppModel.self) private var appModel
-    var onReset: (@MainActor () async -> Void)?
-    @State private var showConfirmAlert = false
-    @State private var isResetting = false
-    @State private var resetResult: String?
-
-    var body: some View {
-        // Alive glass (2026-09-23): its one home is the Personality page, so
-        // it wears that page's eyebrow and card.
-        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-            AliveEyebrow("Reset identity")
-            VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                Text("Reset the agent's identity documents.")
-                    .font(NativeAgentFont.body)
-                Text("Existing documents are backed up before reset. This lets you run the onboarding wizard again.")
-                    .font(NativeAgentFont.label)
-                    .foregroundStyle(.secondary)
-                if let result = resetResult {
-                    Text(result)
-                        .font(NativeAgentFont.label)
-                        .foregroundStyle(.secondary)
-                }
-                Button(isResetting ? "Resetting…" : "Reset identity") {
-                    showConfirmAlert = true
-                }
-                .buttonStyle(.bordered)
-                .disabled(isResetting)
-            }
-            .padding(.horizontal, AliveMetrics.rowInsetH)
-            .padding(.vertical, 16)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .aliveCard()
-        }
-        .accessibilityElement(children: .contain)
-        .alert("Reset identity?", isPresented: $showConfirmAlert) {
-            Button("Reset", role: .destructive) {
-                Task { await performReset() }
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("The agent's identity documents will be backed up and cleared. The onboarding wizard will appear next launch.")
-        }
-    }
-
-    private func performReset() async {
-        isResetting = true
-        resetResult = nil
-        do {
-            let resp = try await appModel.resetOnboarding(confirm: true)
-            if resp.ok {
-                resetResult = "Reset complete. \(resp.backedUp.count) doc(s) backed up."
-                await onReset?()
-            } else {
-                resetResult = UserFacingError.message(detail: resp.error ?? "no reason given", action: "reset the identity documents")
-            }
-        } catch {
-            resetResult = UserFacingError.message(error, action: "reset the identity documents")
-        }
-        isResetting = false
     }
 }

@@ -1,8 +1,8 @@
+import NativeAgentShared
 import Cognition
 import Foundation
 
 // Blueprint: | `CognitionObservatoryView+Affect.swift` | Observatory affect presentation: snapshot axes and warmth context distinguish disabled/unavailable evidence from real zero |
-// Move-only extraction (tightness Wave C) from CognitionObservatoryView.swift
 
 import SwiftUI
 import CognitiveSubstrate
@@ -81,17 +81,6 @@ struct CognitionObservatoryAffectPresentation: Equatable, Sendable {
             axes = []
             return
         }
-        guard configuration.observatoryEnabled else {
-            state = .unavailable("This readout is off, so mood values are not being shown.")
-            axes = []
-            return
-        }
-        guard configuration.affectEnabled else {
-            state = .disabled("Affect signals are off, so a zero readout would be misleading.")
-            axes = []
-            return
-        }
-
         let axes = [
             Axis(label: "Activation", value: affect.arousal),
             Axis(label: "Uncertainty", value: affect.uncertainty),

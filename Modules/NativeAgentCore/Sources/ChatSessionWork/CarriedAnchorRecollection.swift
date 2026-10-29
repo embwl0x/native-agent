@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Transcripts
@@ -6,37 +7,26 @@ import Transcripts
 
 // MARK: - The carried recollection
 //
-// A brand-new chat session used to open knowing NOTHING about the
-// conversation the human has actually been having.
-//
-// Continuity lives in the session TRANSCRIPT: the aging lane distils older
-// turns into a `compaction_summary` row and the history reader pins it at the
-// head of the prompt as `[session recollection] …`. That row exists only in
-// the session that aged. Every surface that mints a fresh session per chat —
-// iOS does, on every chat — therefore starts with persona plus recall and no
-// recollection at all, even while the SAME agent has a long, live main
-// conversation elsewhere.
-//
-// `ConversationAnchor` already names that main conversation. So a session with
-// no recollection of its own borrows the anchor's, at the head, marked as
-// borrowed:
+// A session with no recollection of its own borrows the main conversation's
+// recollection, admitted by the frozen handoff and marked as borrowed:
 //
 //     [session recollection, carried from your main conversation] …
 //
 // THREE PROPERTIES, and every one of them is load-bearing:
 //
-//   1. READ-ONLY. The row is synthesised per turn, in memory, from the
-//      anchor's transcript. It is never written into this session's
-//      transcript, so the autocompactor never sees it, it can never be folded
-//      into a recollection of this session's own, and it never moves this
+//   1. READ-ONLY. The rows are synthesised per turn, in memory, from the
+//      anchor's transcript. They are never written into this session's
+//      transcript, so the autocompactor never sees them, they can never be folded
+//      into a recollection of this session's own, and they never move this
 //      session's aging boundary.
-//   2. CACHE-STABLE. It is projected as an ordinary `compaction_summary` row,
+//   2. CACHE-STABLE. Each is projected as an ordinary `compaction_summary` row,
 //      which puts it ahead of the `HistoryWindowCursor` boundary in the stable
 //      head of the replayed prefix — exactly where the session's own
 //      recollection sits. Its identity is derived from the ANCHOR'S row id, so
 //      the head changes when (and only when) the anchor's recollection does.
 //   3. IT YIELDS. The moment this session gets a `compaction_summary` of its
-//      own, the carried one is not seeded at all: one recollection, never two.
+//      own, no anchor recollections are seeded. All borrowed spans stay in
+//      transcript order, including recollections preserved across the dream mark.
 //
 // Failure is not an event. No anchor, an anchor that is this session, an
 // unreadable transcript, an anchor that has not compacted yet — all of them
@@ -63,7 +53,7 @@ package enum CarriedAnchorRecollection {
     }
 
     /// The rows the v2 prefix projection should admit: `prior` unchanged, or
-    /// `prior` with one synthetic recollection row in front of it.
+    /// `prior` with the anchor's synthetic recollection rows in front of it.
     ///
     /// Called with the rows the reader already returned, so seeding costs at
     /// most two small transcript reads and only for a session that has no
@@ -72,22 +62,22 @@ package enum CarriedAnchorRecollection {
     package static func seeded(
         _ prior: [ChatMessage],
         sessionId: String,
-        dataRoot: URL
+        dataRoot: URL,
+        admittedPriorSessionId: String? = nil
     ) -> [ChatMessage] {
-        guard let row = syntheticRow(
-            sessionId: sessionId, prior: prior, dataRoot: dataRoot
-        ) else { return prior }
-        return [row] + prior
+        syntheticRows(
+            sessionId: sessionId, prior: prior, dataRoot: dataRoot, admittedPriorSessionId: admittedPriorSessionId
+        ) + prior
     }
 
-    /// The seed decision, whole, as a value. Nil means "this turn carries
-    /// nothing", which is the answer for every session that does not need one.
-    static func syntheticRow(
+    /// The seed decision, whole, as a value. Empty means this turn carries nothing.
+    static func syntheticRows(
         sessionId: String,
         prior: [ChatMessage],
-        dataRoot: URL
-    ) -> ChatMessage? {
-        guard isEnabled() else { return nil }
+        dataRoot: URL,
+        admittedPriorSessionId: String?
+    ) -> [ChatMessage] {
+        guard isEnabled() else { return [] }
         // A SESSION ID IS A STORAGE KEY AND NOTHING ELSE, and this one arrives
         // from a JSON file on disk. `anchor_pin.json` is written by surface
         // adapters, so a malformed or hostile pin could name `../../…` and
@@ -96,68 +86,65 @@ package enum CarriedAnchorRecollection {
         // anything that fails validation carries nothing.
         guard let session = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
             noteUnsafeIdentifier(role: "session", raw: sessionId)
-            return nil
+            return []
         }
         // Its own beats a borrowed one, and the rows in hand answer that for
         // free in the common case.
-        guard !prior.contains(where: isOwnRecollection) else { return nil }
+        guard !prior.contains(where: isOwnRecollection) else { return [] }
         // The anchor names the human's main conversation. A session that IS
         // the anchor has nothing to borrow from.
         guard let published = ConversationAnchor.currentSessionId(dataRoot: dataRoot) else {
-            return nil
+            return []
         }
         guard let anchor = NativeAgentChatSessionID.normalizedPathComponent(published) else {
             noteUnsafeIdentifier(role: "anchor", raw: published)
-            return nil
+            return []
         }
-        guard anchor != session else { return nil }
-        guard SessionDigestProvider.frozenPriorSessionId(
+        guard anchor != session else { return [] }
+        // Nil is unobserved; an empty admitted donor means the handoff carried no thread.
+        guard (admittedPriorSessionId ?? SessionDigestProvider.frozenPriorSessionId(
             sessionId: session, dataRoot: dataRoot
-        ) == anchor else { return nil }
+        )) == anchor else { return [] }
         // The window the reader returned is a TAIL: a long session's own
         // recollection can sit above it. Confirm against the transcript before
         // borrowing, or a session with its own would carry a second one.
-        guard newestRecollection(forSession: session, dataRoot: dataRoot) == nil else {
-            return nil
+        guard recollections(forSession: session, dataRoot: dataRoot).isEmpty else {
+            return []
         }
         // A transcript that cannot be read, or an anchor that has never
         // compacted, lands here as "nothing to carry" — the honest answer,
         // receipted once.
-        guard let carried = newestRecollection(forSession: anchor, dataRoot: dataRoot) else {
+        let carried = recollections(forSession: anchor, dataRoot: dataRoot)
+        guard !carried.isEmpty else {
             noteNoRecollection(session: session, anchor: anchor)
-            return nil
+            return []
         }
-        return row(carrying: carried, into: session)
+        return carried.map { row(carrying: $0, into: session) }
     }
 
     // MARK: - The recollection lookup, memoized on the transcript's stat
 
-    /// The newest recollection in one session's transcript, or nil.
+    /// Every recollection in one session's transcript, in transcript order.
     ///
-    /// This runs on the HOT PROMPT PATH, twice per eligible turn, and the
-    /// underlying accessor reads the WHOLE transcript — unbounded by the
-    /// history reader's tail caps. A transcript only changes when a turn is
-    /// appended or compaction rewrites it, so an unchanged one must cost a
-    /// `stat`, not a read. The key is (path, mtime, size) — the same triple
-    /// the doctor's transcript scan memo uses, and the one that still sees a
-    /// same-size rewrite in place.
+    /// Unchanged transcripts cost a stat; validated appends reuse completed
+    /// rows and scan from the prior cursor. Replacements and rewrites rescan.
     ///
     /// `sessionId` MUST already be normalized: this builds a path from it.
-    static func newestRecollection(
+    static func recollections(
         forSession sessionId: String,
         dataRoot: URL
-    ) -> ChatSessionRecollection? {
+    ) -> [ChatSessionRecollection] {
         let path = dataRoot
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(sessionId).jsonl")
         // No file, no recollection — and that answer already cost only a stat.
-        guard let stamp = stamp(of: path) else { return nil }
+        guard let stamp = stamp(of: path), case let .present(device, inode, size, _, _, _, _) = stamp else { return [] }
         let key = path.path
         cacheLock.lock()
         if let hit = cache.first(where: { $0.key == key && $0.stamp == stamp }) {
             cacheLock.unlock()
-            return hit.recollection
+            return hit.scan.recollections
         }
         let old = cache.first(where: { $0.key == key })
         cacheLock.unlock()
@@ -165,27 +152,28 @@ package enum CarriedAnchorRecollection {
         // Transcript append retains inode; compaction atomically replaces it.
         // Same-size changes and truncation always rescan. A tail checkpoint
         // additionally rejects a replaced suffix before reusing the cursor.
-        let append = old.map {
-            $0.stamp.device == stamp.device && $0.stamp.inode == stamp.inode
-                && stamp.size > $0.stamp.size && checkpoint(path, size: $0.stamp.size) == $0.checkpoint
-        } ?? false
-        guard let scan = try? ChatSessionRecollections.scanLatest(
+        let appendSource = old.flatMap { entry -> ChatSessionRecollections.Scan? in
+            guard case let .present(oldDevice, oldInode, oldSize, _, _, _, _) = entry.stamp,
+                  oldDevice == device, oldInode == inode, size > oldSize,
+                  checkpoint(path, size: oldSize) == entry.checkpoint else { return nil }
+            return entry.scan
+        }
+        guard let scan = try? ChatSessionRecollections.scan(
             path: path, sessionId: sessionId,
-            offset: append ? old!.nextOffset : 0,
-            previous: append ? old?.recollection : nil
-        ) else { return nil }
-        let newest = scan.recollection
-        guard self.stamp(of: path) == stamp else { return newest }
+            offset: appendSource?.nextOffset ?? 0,
+            previous: appendSource?.completeRecollections ?? []
+        ) else { return [] }
+        guard self.stamp(of: path) == stamp else { return scan.recollections }
 
         cacheLock.lock()
         cache.removeAll { $0.key == key }
-        cache.append(Entry(key: key, stamp: stamp, recollection: newest,
-                           nextOffset: scan.nextOffset, checkpoint: checkpoint(path, size: stamp.size)))
+        cache.append(Entry(key: key, stamp: stamp, scan: scan,
+                           checkpoint: checkpoint(path, size: size)))
         // Bounded, oldest out first. A handful covers the anchor plus the
         // sessions actually taking turns; this is a memo, not a store.
         if cache.count > cacheCapacity { cache.removeFirst(cache.count - cacheCapacity) }
         cacheLock.unlock()
-        return newest
+        return scan.recollections
     }
 
     private static func checkpoint(_ path: URL, size: Int64) -> Data? {
@@ -199,31 +187,16 @@ package enum CarriedAnchorRecollection {
 
     /// stat identity of a file, or nil when it cannot be stat'd — which is
     /// also the "no transcript" answer.
-    private static func stamp(of path: URL) -> Stamp? {
+    private static func stamp(of path: URL) -> SnapshotTailOpLog.FileStamp? {
         var info = stat()
         guard stat(path.path, &info) == 0 else { return nil }
-        return Stamp(
-            device: Int64(info.st_dev),
-            inode: UInt64(info.st_ino),
-            size: Int64(info.st_size),
-            modifiedSeconds: Int64(info.st_mtimespec.tv_sec),
-            modifiedNanoseconds: Int64(info.st_mtimespec.tv_nsec)
-        )
-    }
-
-    struct Stamp: Equatable {
-        let device: Int64
-        let inode: UInt64
-        let size: Int64
-        let modifiedSeconds: Int64
-        let modifiedNanoseconds: Int64
+        return SnapshotTailOpLog.FileStamp(info)
     }
 
     private struct Entry {
         let key: String
-        let stamp: Stamp
-        let recollection: ChatSessionRecollection?
-        let nextOffset: UInt64
+        let stamp: SnapshotTailOpLog.FileStamp
+        let scan: ChatSessionRecollections.Scan
         let checkpoint: Data?
     }
 

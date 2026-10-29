@@ -49,8 +49,8 @@ public enum StandingBotSchedule {
         case .manual: return "Manual only"
         case .interval(let seconds):
             return seconds == 43200 ? "Twice daily" : seconds == 86400 ? "Daily" : seconds == 604800 ? "Weekly"
-                : seconds < 3600 ? "Every \(Int(seconds / 60)) minutes"
-                : seconds.truncatingRemainder(dividingBy: 86400) == 0 ? "Every \(Int(seconds / 86400)) days"
+                : seconds < 3600 ? "Every \((seconds / 60).rounded(.towardZero).formatted(.number.precision(.fractionLength(0)))) minutes"
+                : seconds.truncatingRemainder(dividingBy: 86400) == 0 ? "Every \((seconds / 86400).formatted(.number.precision(.fractionLength(0)))) days"
                 : "Every \((seconds / 3600).formatted()) hours"
         case .cron:
             // "Daily at 23:57", not the raw cron.

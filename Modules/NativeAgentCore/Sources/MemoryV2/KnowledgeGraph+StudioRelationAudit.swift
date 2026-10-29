@@ -1,27 +1,7 @@
-// The studio subgraph, CHECKED — and read back as canon evidence.
-//
-// Two jobs, both about the same rows, which is why they share a file:
-//
-// 1. THE CONSISTENCY GUARD (Agent's addendum, 2026-09-01, binding). The
-//    journal's `relations` field stays provenance-only and accepted — but a
-//    provenance line that no edge cites back is a claim nobody can follow, and
-//    the whole point of moving relations into the graph was that "this work
-//    deepens that one" becomes traceable. So on the SAME trigger as the
-//    backfill/idempotency pass, every relation on every entry is checked against
-//    a real edge citing that entry id.
-//
-//    FAIL LOUD, NEVER REPAIR. A mismatch is reported and surfaced; it is never
-//    silently written into existence, because a repair here would manufacture a
-//    graph claim she never made. And it never blocks recall: an inconsistent
-//    graph is a reason to say so, not a reason to withhold her own journal.
-//
-// 2. CANON EVIDENCE (desk 903 phase 4). "A work is proposed when N later entries
-//    deepen/echo it … evidence is the graph." This reads the recurrence directly
-//    off the edges rather than re-walking the JSONL, so the canon's evidence and
-//    the graph's claim cannot disagree — and the guard above is what makes that
-//    trust earned rather than assumed.
-//
-// Both are READ-ONLY against the graph. Nothing in this file writes a row.
+// On the backfill trigger, check every journal relation against a graph edge citing its entry.
+// Report mismatches without repairing the graph or blocking recall.
+// Canon recurrence counts later journal entries corroborated by graph edges.
+// Both operations are read-only against the graph.
 
 import Foundation
 import GRDB
@@ -123,13 +103,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
     /// Every studio edge the graph holds, as
     /// `(fromNodeKey, toNodeKey, type) → citing journal entry ids`.
     ///
-    /// User, 2026-09-06: the endpoints are the WRITER'S node keys — a work is a
-    /// title BY SOMEONE — not folded names. Keying on names alone made two
-    /// same-title works by different creators one endpoint here, exactly the
-    /// collapse `deriveStudioGraph` stopped doing on the write side. The
-    /// creator is read off the work's own `created_by` edge rather than the
-    /// stamped `studio_node_key`, so a row still carrying the pre-2026-09-06
-    /// title-only key is keyed correctly before the next re-derive rewrites it.
+    /// Endpoints use title + creator from `created_by`, including rows with title-only `studio_node_key` stamps.
     ///
     /// Restricted to `provenance = studio-journal`, so a same-named memory edge
     /// can never be mistaken for one of her claims.
@@ -201,10 +175,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         for entry in entries {
             let title = Self.studioClean(entry.work.title)
             guard !title.isEmpty else { continue }
-            // User, 2026-09-06: the writer's identity — title BY SOMEONE. On the
-            // folded title alone, a relation between two same-title works by
-            // different creators was excused as a self-relation, so the one
-            // edge that records the connection went unchecked.
+            // Self-relations compare title + creator so same-title works by different creators remain distinct.
             let creator = Self.studioClean(entry.work.creator ?? "")
             workByEntry[entry.id] = (
                 Self.studioWorkNodeKey(title: title, creator: creator), title
@@ -253,29 +224,9 @@ extension SwiftNativeKnowledgeGraphIndexer {
         )
     }
 
-    /// Canon evidence: LATER entries, corroborated by the graph.
-    ///
-    /// Two rules the earlier version got wrong, both load-bearing:
-    ///
-    /// **"N LATER entries."** An edge carries no time, so counting edges counted
-    /// any link in either temporal direction — an earlier entry linking forward
-    /// to a work counted as that work recurring. Recurrence has to mean she came
-    /// BACK. So the count is driven by the entries, where the timestamps live,
-    /// and a relation is only evidence when the asserting entry was recorded
-    /// STRICTLY LATER than the entry it points at.
-    ///
-    /// **Identity is title + creator.** Canon membership is keyed that way, so
-    /// the evidence must be too. The target WORK is read off the target ENTRY,
-    /// which carries both — never off a folded title, which silently merged two
-    /// different works that happen to share a name.
-    ///
-    /// The graph is still the evidence, and still decides: a relation the
-    /// journal asserts but no `studio-journal` edge cites is NOT counted. That
-    /// intersection is what makes the relation audit load-bearing rather than
-    /// decorative — an unindexed claim cannot argue for canon.
-    ///
-    /// `recallCounts` comes from the studio store's bounded production-pull
-    /// counter; the graph knows nothing about pulls and must not.
+    /// Canon evidence counts strictly later journal entries cited by `studio-journal` edges.
+    /// Work identity is title + creator from the target entry.
+    /// `recallCounts` comes from the studio store's bounded production-pull counter, not the graph.
     public func studioCanonEvidence(
         entries: [StudioJournalEntry],
         recallCounts: [String: (count: Int, lastAt: String)]
@@ -359,10 +310,9 @@ extension SwiftNativeKnowledgeGraphIndexer {
     }
 }
 
-/// A studio edge, identified by the endpoints' NODE KEYS rather than row ids:
-/// the indexer's upsert may reuse an id a memory lane already minted for the
-/// same name, so the node key — type, folded name, and for a work its creator —
-/// is the stable identity across both writers.
+/// The studio edge identity shared by derivation, audit and canon evidence.
+/// Endpoints are node keys (type, folded name, and a work's creator), never
+/// SQL row IDs, which may be reused from memory indexing.
 public struct StudioEdgeKey: Hashable, Sendable {
     public let from: String
     public let to: String

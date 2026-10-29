@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Transcripts
+import NativeAgentShared
 // Blueprint: | `ChatCompactionBackupRetention.swift` | `ChatCompactionBackupRetention` enum; `enforce` |
 
 /// Result of one bounded sweep over pre-compaction transcript backups.
@@ -38,8 +39,7 @@ public enum ChatCompactionBackupRetention {
     public static func enforce(
         dataRoot: URL,
         maximumSessions: Int = defaultMaximumSessions,
-        now: Date = Date(),
-        persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore()
+        now: Date = Date()
     ) async -> ChatCompactionBackupRetentionReport {
         let sessionsRoot = dataRoot
             .appendingPathComponent("chat", isDirectory: true)
@@ -97,12 +97,12 @@ public enum ChatCompactionBackupRetention {
                 .appendingPathComponent("\(sessionID).jsonl")
             do {
                 let index = dataRoot.appendingPathComponent("chat/sessions.json")
-                let result = try await persistence.withFileLock(index) {
+                let result = try await SwiftNativePersistenceCore.withFileLock(index) {
                     let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: index)
                     var canonical = rows.first { $0["id"] == .string(sessionID) }
                     if canonical == nil {
                         let archiveIndex = dataRoot.appendingPathComponent("chat/archive/sessions.jsonl")
-                        let archive = try await persistence.readJSONLReporting(archiveIndex)
+                        let archive = try await SwiftNativePersistenceCore.readJSONLReporting(archiveIndex)
                         guard archive.report.malformedLineCount == 0, !archive.report.trailingPartialLine else {
                             throw NSError(domain: "NativeAgent.ChatCompactionRetention", code: 1)
                         }
@@ -112,7 +112,7 @@ public enum ChatCompactionBackupRetention {
                         }.last
                     }
                     guard let canonical else { throw NSError(domain: "NativeAgent.ChatCompactionRetention", code: 2) }
-                    return try await persistence.withFileLock(transcript) {
+                    return try await SwiftNativePersistenceCore.withFileLock(transcript) {
                         let source: URL
                         if FileManager.default.fileExists(atPath: transcript.path) { source = transcript }
                         else if case .string(let relative)? = canonical["messagesArchivePath"],
@@ -122,7 +122,7 @@ public enum ChatCompactionBackupRetention {
                         guard FileManager.default.fileExists(atPath: source.path) else {
                             throw NSError(domain: "NativeAgent.ChatCompactionRetention", code: 4)
                         }
-                        let scan = try await persistence.readJSONLReporting(source)
+                        let scan = try await SwiftNativePersistenceCore.readJSONLReporting(source)
                         guard scan.report.malformedLineCount == 0, !scan.report.trailingPartialLine else {
                             throw NSError(domain: "NativeAgent.ChatCompactionRetention", code: 5)
                         }

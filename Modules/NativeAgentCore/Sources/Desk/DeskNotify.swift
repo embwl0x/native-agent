@@ -1,6 +1,6 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `DeskNotify.swift` | `DeskNotificationRead`, `DeskNotificationProposal`: frozen native policy inputs and typed proposals; native consent/ceilings and defer truth; Desk/config revision checks and baseline/ledger/window commit under native locks, with no part execution under a lock. Notification, nag, drift wording and deadline policy live in Resources/abilities/desk-notify.js; the person's unmute and scheduled loop share it |
+// Blueprint: | `DeskNotify.swift` | `DeskNotificationRead`, `DeskNotificationProposal`: frozen native policy inputs and typed proposals; native consent/ceilings and defer truth; Desk/config revision checks and baseline/window commit under native locks; a nag's baseline and ledger settle only after channel acceptance or durable hold. No part execution under a lock. Notification, nag, drift wording and deadline policy live in Resources/abilities/desk-notify.js; the person's unmute and scheduled loop share it |
 
 /// An editable decision, never a write to Desk or its notification ledger.
 public struct DeskNotificationProposal: Codable, Sendable {
@@ -34,35 +34,42 @@ public struct DeskNotificationRead: Sendable {
     public let config: DeskNagConfig
     public let now: Date
     public let unmute: Bool
+    private let facts: [String: (parking: (parked: Bool, until: Date?), observed: DeskNagObservation)]
 
     public static func read(dataRoot: URL, now: Date, unmute: Bool = false) async throws -> Self {
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
-        let state = try await store.persistence.withFileLock(store.opsPath) {
+        let state = try await SwiftNativePersistenceCore.withFileLock(store.opsPath) {
             let feed = try await store.readFeedUnlocked()
             guard feed.integrity.isClean else { throw UnavailableRead() }
             return SwiftNativeDeskStore.compact(base: feed.base, feed.ops)
         }
         let config = try await DeskNagConfigStore(dataRoot: dataRoot).loadChecked()
-        return Self(state: state, config: config, now: now, unmute: unmute)
+        let plan = DeskSequencing.compute(state, now: now)
+        let facts = Dictionary(uniqueKeysWithValues: state.items.map { item in
+            let parked = Self.parking(item, in: state, now: now)
+            return (item.handle, (parking: parked, observed: DeskNagObservation(updatedAt: item.updatedAt,
+                effectiveBlockerCount: plan.byHandle[item.handle]?.effectiveBlockers.count ?? 0,
+                deferElapsed: !parked.parked)))
+        })
+        return Self(state: state, config: config, now: now, unmute: unmute, facts: facts)
     }
 
     /// Only policy facts cross this boundary, never notes, refs or work receipts.
     public var input: JSONValue {
-        let plan = DeskSequencing.compute(state, now: now)
         func seconds(_ date: Date?) -> JSONValue { date.map { .double($0.timeIntervalSince1970) } ?? .null }
         var facts: [String: JSONValue] = [:]
         let items = state.items.map { item -> JSONValue in
-            let parked = Self.parking(item, in: state, now: now)
+            let parked = self.facts[item.handle]?.parking
             facts[item.handle] = .object([
                 "updated": seconds(DeskClock.parseISO(item.updatedAt)),
                 "closed": seconds(item.closedAt.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap(DeskClock.parseISO)),
                 "last": seconds(item.notify.lastNotifiedAt.flatMap(DeskClock.parseISO)),
                 "lastSet": .bool(item.notify.lastNotifiedAt != nil),
-                "cooldown": item.notify.cooldown.flatMap(DeskProjection.parseDuration).map(JSONValue.double) ?? .null,
-                "staleAfter": item.cadence.staleAfter.flatMap(DeskProjection.parseDuration).map(JSONValue.double) ?? .null,
+                "cooldown": item.notify.cooldown.flatMap(DeskPage.parseDuration).map(JSONValue.double) ?? .null,
+                "staleAfter": item.cadence.staleAfter.flatMap(DeskPage.parseDuration).map(JSONValue.double) ?? .null,
                 "deferred": .bool(DeskSequencing.isDeferred(item, now: now)),
-                "parked": .bool(parked.parked), "until": seconds(parked.until),
-                "blockers": .int(Int64(plan.byHandle[item.handle]?.effectiveBlockers.count ?? 0)),
+                "parked": .bool(parked?.parked == true), "until": seconds(parked?.until),
+                "blockers": .int(Int64(self.facts[item.handle]?.observed.effectiveBlockerCount ?? 0)),
                 "scoped": .bool(config.scopeEnabled(for: item)),
             ])
             return .object([
@@ -94,7 +101,7 @@ public struct DeskNotificationRead: Sendable {
         for notification in proposal.notifications {
             guard let item = state.items.first(where: { $0.handle == notification.handle }),
                   notification.observedUpdatedAt == item.updatedAt,
-                  !Self.parking(item, in: state, now: now).parked,
+                  facts[item.handle]?.parking.parked == false,
                   let level = NotifyLevel(rawValue: notification.level), [.direct, .urgent].contains(level),
                   let ceiling = notificationConsent(item), level != .urgent || ceiling == .urgent,
                   notification.oneTimeAnnouncement == Self.explicit(item) else { throw InvalidProposal() }
@@ -108,6 +115,7 @@ public struct DeskNotificationRead: Sendable {
         for nag in proposal.nags {
             guard config.enabled, !config.isMuted(now: now), !proposal.openWindow,
                   let item = state.items.first(where: { $0.handle == nag.handle }),
+                  facts[item.handle]?.parking.parked == false,
                   !item.status.isTerminal, item.project != MyQueue.project, config.scopeEnabled(for: item),
                   config.ledger[item.handle] != config.windowId,
                   proposal.consume.contains(item.handle) else { throw InvalidProposal() }
@@ -119,20 +127,23 @@ public struct DeskNotificationRead: Sendable {
         }
     }
 
-    /// Persist before delivery, comparing BOTH sources under their native locks.
+    /// Compare BOTH sources under their native locks before publication.
+    /// A scheduled mute-expiry digest consumes its window only after delivery.
     /// No JavaScript executes here. A changed read fails visibly, without replay.
-    public func commit(_ proposal: DeskNotificationProposal, dataRoot: URL, quietHours: Bool = false) async throws -> DeskNagConfig {
+    public func commit(_ proposal: DeskNotificationProposal, dataRoot: URL, quietHours: Bool = false,
+                       digestAccepted: Bool = false) async throws -> DeskNagConfig {
         try validate(proposal)
         try Task.checkCancellation()
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
-        return try await store.persistence.withFileLock(store.opsPath) {
+        return try await SwiftNativePersistenceCore.withFileLock(store.opsPath) {
             try Task.checkCancellation()
             let feed = try await store.readFeedUnlocked()
             let currentState = SwiftNativeDeskStore.compact(base: feed.base, feed.ops)
             guard feed.integrity.isClean, currentState.items == state.items else { throw ChangedRead() }
-            // Disabled and quiet-hours passes never open/create a config lock.
-            // No config write is possible on this path; direct pings are separate.
-            if !unmute && (quietHours || !config.enabled) {
+            // No config write while disabled, quiet, or awaiting digest delivery.
+            // Direct pings are separate.
+            if !unmute && (quietHours || !config.enabled
+                || proposal.openWindow && !proposal.digest.isEmpty && !digestAccepted) {
                 guard try await DeskNagConfigStore(dataRoot: dataRoot).loadChecked() == config else { throw ChangedRead() }
                 return config
             }
@@ -140,20 +151,28 @@ public struct DeskNotificationRead: Sendable {
                 try Task.checkCancellation()
                 guard current == config else { throw ChangedRead() }
                 var next = current
-                let plan = DeskSequencing.compute(state, now: now)
-                for handle in proposal.consume {
-                    let item = state.items.first { $0.handle == handle }!
-                    next.observed[handle] = DeskNagObservation(updatedAt: item.updatedAt,
-                        effectiveBlockerCount: plan.byHandle[handle]?.effectiveBlockers.count ?? 0,
-                        deferElapsed: !Self.parking(item, in: state, now: now).parked)
+                let awaitingDelivery = Set(proposal.nags.map(\.handle))
+                for handle in proposal.consume where !awaitingDelivery.contains(handle) {
+                    next.observed[handle] = facts[handle]?.observed
                 }
-                for nag in proposal.nags { next.ledger[nag.handle] = current.windowId }
-                let known = Set(state.items.map(\.handle))
-                next.observed = next.observed.filter { known.contains($0.key) }
-                next.ledger = next.ledger.filter { known.contains($0.key) }
+                next.observed = next.observed.filter { facts[$0.key] != nil }
+                next.ledger = next.ledger.filter { facts[$0.key] != nil }
                 if proposal.openWindow { next = next.unmuted() }
                 return (next, ())
             }.config
+        }
+    }
+
+    /// A failed delivery leaves both the movement baseline and window unconsumed.
+    public func recordNagDelivery(_ nag: DeskNotificationProposal.Nag, dataRoot: URL) async throws {
+        guard let observed = facts[nag.handle]?.observed else { throw InvalidProposal() }
+        _ = try await DeskNagConfigStore(dataRoot: dataRoot).updating { current in
+            guard current.windowId == config.windowId,
+                  current.observed[nag.handle] == config.observed[nag.handle] else { throw ChangedRead() }
+            var next = current
+            next.observed[nag.handle] = observed
+            next.ledger[nag.handle] = config.windowId
+            return (next, ())
         }
     }
 

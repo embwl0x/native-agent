@@ -1,36 +1,9 @@
-// DeviceSyncTransport.swift — the device-sync transport SEAM (CK-1).
-//
-// This introduces the abstraction that does NOT exist today: `iCloudBridge`
-// (Mac) and its iOS twin hardcode the iCloud KVS control plane + ubiquity/Drive
-// data plane on both sides. This protocol is the single swap point between that
-// KVS/ubiquity transport (personal build) and a CloudKit transport (public,
-// Developer-ID direct-download build).
-//
-// The method shapes mirror the CURRENT Mac `iCloudBridge` public API so the
-// existing KVS/ubiquity code can later implement this same protocol without a
-// signature rewrite:
-//   sendChatMessage(...)        -> send(_:)
-//   observeIncomingMessages(_:) -> observeIncoming(_:)
-//   sendShortStatus(key:value:) -> setStatus(key:value:)
-//   observeStatusKey(_:onChange:) -> observeStatus(key:onChange:)
-//   PairingSecretManager publish/observe -> publishPairing(secret:) / observePairing(onChange:)
-//
-// CK-1 lands the compiling, unit-testable seam + a CloudKit implementation +
-// an in-memory mock. It does NOT wire any of this into `iCloudBridge` and does
-// NOT change runtime behavior — the resolver defaults to `.kvs` so nothing
-// switches. Wiring is CK-2 / CK-3.
-//
-// BridgeMessage stays the wire model end-to-end. The CloudKit record carries a
-// verbatim `payloadJSON` copy of the encoded BridgeMessage (lossless — signature,
-// attachments, and metadata survive), plus flat scalar fields for CloudKit
-// querying / dedup / last-write-wins.
-
 import Foundation
 
-// Blueprint: | `DeviceSyncTransport.swift` | `DeviceSyncTransport`: shared transport seam, role/message codecs, account/recovery outcomes and transport resolution |
+// Blueprint: | `DeviceSyncTransport.swift` | Shared device-sync role/message codecs, account/recovery outcomes and transport resolution |
 
 /// A background recovery caller can bound reads without changing the transport
-/// protocol. Foreground callers retain their ordinary per-operation budgets.
+/// operations. Foreground callers retain their ordinary per-operation budgets.
 public enum NADeviceSyncRecoveryBudget {
     @TaskLocal public static var deadline: Date?
     @TaskLocal public static var didApplyData: (@Sendable () -> Void)?
@@ -86,25 +59,6 @@ public enum NADeviceSyncRecordType {
 public enum NAMacPresence {
     public static let beat: TimeInterval = 120
     public static let phoneWindow: TimeInterval = 300
-}
-
-/// Cross-device proof that the iOS peer successfully installed the exact
-/// Apple-presented CloudKit notification subscription expected by this build.
-///
-/// The contract identifier changes whenever the visible subscription shape
-/// changes. A stale status row from an older build therefore cannot make the
-/// Mac claim that the current route is eligible.
-public enum NAVisualNotificationCapability {
-    public static let statusKey = "notification.visual.capability"
-    public static let contract = "nanotification-v2-max-three-desired-keys"
-
-    public static func encoded(ready: Bool) -> String {
-        "\(contract):\(ready ? "ready" : "unavailable")"
-    }
-
-    public static func isReady(_ value: String) -> Bool {
-        value == encoded(ready: true)
-    }
 }
 
 /// Flat, CloudKit-queryable projection of a `BridgeMessage`.
@@ -194,18 +148,21 @@ public enum NAChatMessageCodec {
         guard let payloadJSON = String(data: data, encoding: .utf8) else {
             throw DeviceSyncError.underlying(message: "BridgeMessage payload was not UTF-8 encodable")
         }
-        let recordName = message.metadata?[recordIDMetadataKey] ?? message.id
-        let projectedScalarBytes =
-            recordName.utf8.count
-            + message.text.utf8.count
-            + (message.sessionID?.utf8.count ?? 0)
-            + message.sender.utf8.count
-            + (message.metadata?["kind"]?.utf8.count ?? 0)
-            + (message.metadata?["title"]?.utf8.count ?? 0)
-            + (message.metadata?["userInfo.screen"]?.utf8.count ?? 0)
-            + (message.metadata?["userInfo.eventId"]?.utf8.count ?? 0)
-            + 4_096
-        let projectedRecordBytes = data.count + projectedScalarBytes
+        let fields = NAChatMessageFields(
+            recordName: message.metadata?[recordIDMetadataKey] ?? message.id,
+            direction: direction(forSender: message.sender).rawValue,
+            sessionId: message.sessionID,
+            text: message.text,
+            payloadJSON: payloadJSON,
+            createdAt: NativeTimestampFormat.fractionalZulu(message.timestamp),
+            senderDevice: message.sender,
+            kind: message.metadata?["kind"],
+            notificationTitle: message.metadata?["title"],
+            notificationScreen: message.metadata?["userInfo.screen"],
+            notificationEventID: message.metadata?["userInfo.eventId"]
+        )
+        let projectedRecordBytes = recordValueBytes(fields)
+        let projectedScalarBytes = projectedRecordBytes - data.count
         let assetEligible = message.attachments?.isEmpty == false
             && message.attachments?.allSatisfy({ $0.byteSize > 0 && $0.byteSize <= ChatAttachmentTypeResolver.fileByteLimit }) == true
         guard projectedScalarBytes <= maxCloudKitRecordValueBytes,
@@ -216,19 +173,7 @@ public enum NAChatMessageCodec {
                     ? maxAssetPayloadBytes : maxCloudKitRecordValueBytes
             )
         }
-        return NAChatMessageFields(
-            recordName: recordName,
-            direction: direction(forSender: message.sender).rawValue,
-            sessionId: message.sessionID,
-            text: message.text,
-            payloadJSON: payloadJSON,
-            createdAt: isoString(message.timestamp),
-            senderDevice: message.sender,
-            kind: message.metadata?["kind"],
-            notificationTitle: message.metadata?["title"],
-            notificationScreen: message.metadata?["userInfo.screen"],
-            notificationEventID: message.metadata?["userInfo.eventId"]
-        )
+        return fields
     }
 
     /// Decode record fields back into a BridgeMessage. `payloadJSON` is
@@ -251,9 +196,7 @@ public enum NAChatMessageCodec {
         existingDirection: String?,
         intended: NAChatMessageFields
     ) -> Bool {
-        // 2026-09-06: older records and retained-message retries can serialize
-        // keys differently. Compare every JSON field, including the signature
-        // and unknown fields, without a lossy BridgeMessage decode/re-encode.
+        // Compare all JSON fields, including signatures and unknown fields, without decoding into BridgeMessage.
         guard existingDirection == intended.direction,
               let existingPayloadJSON,
               let existing = canonicalPayload(existingPayloadJSON),
@@ -267,11 +210,6 @@ public enum NAChatMessageCodec {
         return try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
 
-    private static func isoString(_ date: Date) -> String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f.string(from: date)
-    }
 }
 
 // MARK: - Device transport errors
@@ -349,109 +287,6 @@ public enum DeviceSyncError: Error, LocalizedError, Sendable {
         case .pairedElsewhere: return "Your iPhone is paired with another Mac on this Apple Account."
         }
     }
-}
-
-// MARK: - The seam
-
-/// A device-sync transport: the swap point between the KVS/ubiquity bridge and
-/// CloudKit. All members are async so an `actor` (the mock) and a lock-guarded
-/// `final class` (the CloudKit impl) can both satisfy it.
-public protocol DeviceSyncTransport: Sendable {
-    /// Which side this transport instance runs on.
-    var role: NADeviceRole { get }
-
-    /// True only after this transport has registered an Apple-presented visual
-    /// notification route. Callers use this to avoid scheduling a second local
-    /// copy when CloudKit already owns presentation.
-    var presentsVisualNotifications: Bool { get }
-
-    /// Ensure the live CloudKit subscription set exists and matches this
-    /// build's exact shape. Event-driven callers use this at startup and on
-    /// foreground activation; it is not an idle poll.
-    func ensurePushSubscriptions() async -> Bool
-
-    /// Push one chat message to the other device. Mirrors
-    /// `iCloudBridge.sendChatMessage`.
-    func send(_ message: BridgeMessage) async throws
-    /// Commit the route's dispatch journal only after local preparation succeeds.
-    func send(_ message: BridgeMessage, beforeDispatch: @Sendable () async throws -> Void) async throws
-
-    /// Register the single forwarder for messages arriving FROM the other
-    /// device. Mirrors `iCloudBridge.observeIncomingMessages`. Idempotent —
-    /// last registration wins (there is exactly one logical forwarder).
-    /// The handler returns `true` when the message was accepted/delivered.
-    /// Returns whether the push subscriptions were successfully established.
-    @discardableResult
-    func observeIncoming(_ onMessage: @escaping @Sendable (BridgeMessage) async -> Bool) async -> Bool
-
-    /// Publish this device's pairing secret. Mirrors
-    /// `PairingSecretManager.publishMaterialToKVS`.
-    func publishPairing(secret: Data) async throws
-
-    /// Take the account's Mac pairing only if it is free or already this
-    /// Mac's; true when held, false when another Mac holds it, nil unknown.
-    @discardableResult
-    func claimPairing(secret: Data) async -> Bool?
-
-    /// True while another Mac on this Apple Account holds the pairing.
-    var pairingHeldElsewhere: Bool { get }
-
-    /// Observe the peer device's published pairing secret. Every drain offers
-    /// the record to the handler, which returns true only when the canonical
-    /// pairing owner durably installed a key different from the one it held.
-    func observePairing(onChange: @escaping @Sendable (Data) async -> Bool) async
-
-    /// Set a short status/progress value. Mirrors `iCloudBridge.sendShortStatus`.
-    func setStatus(key: String, value: String) async throws
-
-    /// Observe a status key. Mirrors `iCloudBridge.observeStatusKey`.
-    func observeStatus(key: String, onChange: @escaping @Sendable (String) async -> Void) async
-
-    /// 2026-09-06: the ACKNOWLEDGING form. The handler returns true only once
-    /// the value has been durably applied; a false result leaves the peer's
-    /// record eligible for a later drain. The unacknowledged form above claims
-    /// the record's modification date BEFORE the handler runs, so a snapshot
-    /// the phone failed to store was never redelivered.
-    func observeStatus(key: String, onApply: @escaping @Sendable (String) async -> Bool) async
-    func observeStatus(key: String, onApply: @escaping @Sendable (String, Date?) async -> Bool) async
-
-    /// iCloud account availability: "available" | "noAccount" | "restricted" |
-    /// "temporarilyUnavailable" | "unknown".
-    func accountStatus() async -> String
-
-    /// Pull any pending inbound messages NOW and dispatch to the `observeIncoming`
-    /// handler; distinguishes success, failure and skipped work. The wakeup for a pull-based
-    /// transport (CloudKit) — called after a late handler registration and on an
-    /// APNs silent push (CK-3c). Idempotent per message id.
-    @discardableResult
-    func drainIncoming() async -> DeviceSyncDrainResult
-
-    /// Pull the peer's pairing singleton now; returns true if it installed a new key.
-    @discardableResult
-    func drainPairing() async -> Bool
-
-    /// 2026-09-06: read the peer's published pairing secret WITHOUT applying it
-    /// — the material a manually pasted recovery key is verified against on a
-    /// build whose only pairing channel is this transport.
-    func peekPairingSecret() async -> Data?
-
-    /// Rewrite the Mac's presence record (`NAMacPresence`). Never pushed.
-    func setPresence(pairingSecret: Data) async throws
-
-    /// When the Mac last rewrote its presence record, or nil if unknown.
-    func peerPresence(pairingSecret: Data) async -> Date?
-
-    /// Pull the peer's status singletons now; returns the number of handlers fired.
-    @discardableResult
-    func drainStatus() async -> Int
-
-    /// 2026-09-06: delete device-sync records past the retention window and
-    /// return how many went. Nothing else ever deletes a chat/notification
-    /// record, so without this the store grows for the life of the account.
-    /// Only the always-on Mac owner calls (and performs) this; the phone never
-    /// deletes.
-    @discardableResult
-    func sweepExpiredRecords() async -> Int
 }
 
 // MARK: - Build/runtime flag + resolver (deliverable 4)

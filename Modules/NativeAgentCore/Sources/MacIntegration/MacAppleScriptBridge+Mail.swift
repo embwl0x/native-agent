@@ -36,10 +36,10 @@ extension MacAppleScriptBridge {
         guard !toList.isEmpty else {
             return failedEnvelope(integration: "mail", reason: "missing_to")
         }
-        guard let subject = inputString(input["subject"]) else {
+        guard let subject = input["subject"]?.scalarText else {
             return failedEnvelope(integration: "mail", reason: "missing_subject")
         }
-        guard let body = inputString(input["body"]) else {
+        guard let body = input["body"]?.scalarText else {
             return failedEnvelope(integration: "mail", reason: "missing_body")
         }
         let ccList = inputStringArray(input["cc"])
@@ -139,7 +139,7 @@ extension MacAppleScriptBridge {
                   case .int(let id)? = row["message_id"], id > 0,
                   case .string? = row["expected_message_id"],
                   case .string(let account)? = row["expected_account"], !account.isEmpty,
-                  row["name"] == nil || (inputString(row["name"]).map { $0.hasPrefix("mail.") && $0.count <= 32 } ?? false),
+                  row["name"] == nil || (row["name"]?.scalarText.map { $0.hasPrefix("mail.") && $0.count <= 32 } ?? false),
                   let locator = MailReadLocator.parse(row, allowMissingMessageID: !effects), locator.account == account,
                   (scope == .string("inbox") || (!effects && scope == .string("sent"))),
                   validOffset, !effects || validActions else {
@@ -303,10 +303,8 @@ extension MacAppleScriptBridge {
         }
     }
 
-    /// Mark read, archive or delete: the exact message (message_id +
-    /// expected_message_id from mail_list_recent), or by subject (and optional
-    /// sender). Archive and delete act on one message only: several subject
-    /// matches are refused, never all moved (2026-09-24).
+    /// Mark read, archive or delete by message_id + expected_message_id from mail_list_recent,
+    /// or by subject and optional sender; archive and delete refuse multiple matches.
     /// Returns: {status, action, matched_count, subject}.
     public static func mailMarkRead(input: [String: JSONValue]) async throws -> JSONValue {
         if input["messages"] != nil { return await mailBatch(input: input, effects: true) }
@@ -337,7 +335,7 @@ extension MacAppleScriptBridge {
         if (input["message_id"] != nil || input["expected_message_id"] != nil) && exact == nil {
             return failedEnvelope(integration: "mail", reason: "invalid_message_locator")
         }
-        let subject = inputString(input["subject"]) ?? ""
+        let subject = input["subject"]?.scalarText ?? ""
         guard exact != nil || !subject.isEmpty else { return failedEnvelope(integration: "mail", reason: "missing_subject") }
         let moveToTrash = """
             set msg to item 1 of hits
@@ -399,7 +397,7 @@ extension MacAppleScriptBridge {
         }, nil, nil, nil) == SQLITE_OK else {
             return failedEnvelope(integration: "mail", reason: "mail_index_unavailable")
         }
-        let sender = inputString(input["sender"]) ?? ""
+        let sender = input["sender"]?.scalarText ?? ""
         let predicate = exact == nil
             ? "(coalesce(m.subject_prefix, '') || coalesce(s.subject, '')) = ?1 COLLATE NOCASE AND (?2 = '' OR instr(lower(mail_sender_text(a.comment, a.address)), lower(?2)) > 0)"
             : "g.message_id_header IN (?2, ?3)"
@@ -491,10 +489,10 @@ extension MacAppleScriptBridge {
     private static func mailManage(input: [String: JSONValue], action: String, single: Bool, body: String) async -> JSONValue {
         let exact = MailReadLocator.parse(input)
         if (input["message_id"] != nil || input["expected_message_id"] != nil) && exact == nil { return failedEnvelope(integration: "mail", reason: "invalid_message_locator") }
-        let subject = inputString(input["subject"]) ?? ""
+        let subject = input["subject"]?.scalarText ?? ""
         guard exact != nil || !subject.isEmpty else { return failedEnvelope(integration: "mail", reason: "missing_subject") }
         let whereClause = exact.map { "id is \($0.id)" }
-            ?? Self.mailMatchWhereClause(subjectAS: escapeForAppleScript(subject), sender: inputString(input["sender"]))
+            ?? Self.mailMatchWhereClause(subjectAS: escapeForAppleScript(subject), sender: input["sender"]?.scalarText)
         let deadline = action == "deleted" ? "lookupDeadline" : nil
         let check = exact.map { mailIdentityCheck($0, list: "hits", fail: "-2", deadline: deadline) }
             ?? (single ? "if n > 1 then return \"-3|\" & (n as text)" : "")
@@ -568,7 +566,7 @@ extension MacAppleScriptBridge {
         let result = try await (input["to"] != nil ? mailCompose(input: input, send: false) : mailRespond(input: input, send: false))
         guard case .object(var row) = result else { return result }
         if row["effects"] == .string("none") { row["created"] = .bool(false); return .object(row) }
-        guard ["completed", "outcome_unknown", "unknown"].contains(inputString(row["status"]) ?? "") else { return result }
+        guard ["completed", "outcome_unknown", "unknown"].contains(row["status"]?.scalarText ?? "") else { return result }
         row["next_call"] = .object(["tool": .string("app"), "input": .object([
             "action": .string("mail.recent"), "args": .object(["mailbox": .string("drafts")])])])
         return .object(row)
@@ -610,14 +608,14 @@ extension MacAppleScriptBridge {
     private static func mailRespond(input: [String: JSONValue], send: Bool) async throws -> JSONValue {
         let exact = MailReadLocator.parse(input)
         if (input["message_id"] != nil || input["expected_message_id"] != nil) && exact == nil { return failedEnvelope(integration: "mail", reason: "invalid_message_locator") }
-        let subject = inputString(input["subject"]) ?? ""
+        let subject = input["subject"]?.scalarText ?? ""
         guard exact != nil || !subject.isEmpty else {
             return failedEnvelope(integration: "mail", reason: "missing_subject")
         }
-        guard let body = inputString(input["body"]), !body.isEmpty else {
+        guard let body = input["body"]?.scalarText, !body.isEmpty else {
             return failedEnvelope(integration: "mail", reason: "missing_body")
         }
-        let sender = inputString(input["sender"])
+        let sender = input["sender"]?.scalarText
         let replyAll: Bool
         switch input["reply_all"] {
         case .bool(let b): replyAll = b

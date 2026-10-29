@@ -1,244 +1,30 @@
 import Foundation
+import NativeAgentShared
 import Experiences
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 import Transcripts
 import ProviderRouting
-// Blueprint: | `ChatSessionAutocompactor.swift` | `ChatSessionAutocompactor` struct; `compactIfNeeded`, `pruneCompactBackups`; ContactThread writes transcript and original-history bytes; `ChatSessionAutocompactionConfig` owns `effectiveWindowTokens` and the read-only `contextWindowReadout` used by page reads and runtime introspection. |
-
-public struct ChatSessionAutocompactionConfig: Sendable, Equatable {
-    /// Settings › Context window › Custom size (N tokens). The key keeps its
-    /// old name so a size saved as the compaction threshold carries over.
-    public static let defaultsKey = "nativeagent.compactionThresholdTokens"
-    /// Settings › Context window mode: "model" or "custom".
-    public static let contextWindowModeKey = "nativeagent.contextWindowMode"
-    public static let agingEnabledKey = "nativeagent.compactionAgingEnabled"
-    public static let defaultThresholdTokens = 200_000
-    public static let defaultKeepCount = 20
-    public static let maximumContextWindowFraction = 0.60 // User 2026-09-23: 300K or 60% of the window
-    /// Fraction of the threshold at which older turns start aging into
-    /// recollection — the continuous lane (NORTHSTAR clause 4, sweep item 45).
-    /// A quarter is deliberately far below the backstop: by the time a session
-    /// could reach the stop-the-world threshold, aging has already folded its
-    /// older turns away several times, so the synchronous check finds nothing.
-    public static let defaultAgingFraction = 0.25
-
-    /// Model's default window: 60% of the model's own window. Custom size:
-    /// `thresholdTokens`, never past 60% of the model's window.
-    public enum ContextWindowMode: String, Sendable {
-        case modelDefault = "model"
-        case custom
-    }
-
-    public var thresholdTokens: Int
-    public var contextWindowMode: ContextWindowMode
-    /// The continuous lane. When true, the append that crosses the aging
-    /// boundary schedules a background distillation of the session's older
-    /// turns. Off → the pre-turn threshold is the only lane, exactly as before.
-    public var agingEnabled: Bool
-
-    public init(
-        thresholdTokens: Int = Self.defaultThresholdTokens,
-        agingEnabled: Bool = true,
-        contextWindowMode: ContextWindowMode = .custom
-    ) {
-        self.thresholdTokens = max(1, thresholdTokens)
-        self.contextWindowMode = contextWindowMode
-        self.agingEnabled = agingEnabled
-    }
-
-    /// Reads the app preference at the production boundary.  The defaults
-    /// instance is injectable solely so callers can exercise the same reader
-    /// against an isolated persistent domain; production still uses `.standard`.
-    public static func productionDefault(
-        defaults: UserDefaults = .standard
-    ) -> ChatSessionAutocompactionConfig {
-        let stored = defaults.integer(forKey: defaultsKey)
-        // Absent key → aging on by default; explicit false → off (the pre-turn
-        // threshold then behaves exactly as it did before the aging lane).
-        let aging = defaults.object(forKey: agingEnabledKey) == nil
-            ? true
-            : defaults.bool(forKey: agingEnabledKey)
-        // Absent mode → Custom when a size is already saved (User's 300k carries
-        // over), otherwise the model's default window.
-        let mode = defaults.string(forKey: contextWindowModeKey)
-            .flatMap(ContextWindowMode.init(rawValue:))
-            ?? (stored > 0 ? .custom : .modelDefault)
-        return ChatSessionAutocompactionConfig(
-            thresholdTokens: stored > 0 ? stored : defaultThresholdTokens,
-            agingEnabled: aging,
-            contextWindowMode: mode
-        )
-    }
-
-    /// HER context window, the one source of truth (User 2026-09-24). She
-    /// compacts here, and every prompt budget, the in-turn trim, aging, and
-    /// the composer meter size against it instead of the model's raw window:
-    /// 60% of the model's window, capped by the Custom size. The 40% left over
-    /// covers persona, tool schemas, Fluid Context, a tool round, and output.
-    /// nil only when the model's window is unknown.
-    public func effectiveWindowTokens(nativeWindowTokens: Int?) -> Int? {
-        guard let native = nativeWindowTokens, native > 0 else { return nil }
-        let safe = max(1, Int(Double(native) * Self.maximumContextWindowFraction))
-        return contextWindowMode == .custom ? min(thresholdTokens, safe) : safe
-    }
-
-    public func effectiveWindowTokens(
-        forModel model: String,
-        providerID: String? = nil,
-        dataRoot: URL? = nil
-    ) -> Int? {
-        effectiveWindowTokens(nativeWindowTokens: ProviderRouting.verifiedContextLength(
-            forModel: model,
-            providerID: providerID,
-            dataRoot: dataRoot
-        ))
-    }
-
-    public func contextWindowReadout(forModel model: String, providerID: String?, dataRoot: URL) -> [String: JSONValue] {
-        let native = ProviderRouting.verifiedContextLength(forModel: model, providerID: providerID, dataRoot: dataRoot)
-        let effective = effectiveWindowTokens(nativeWindowTokens: native)
-        let custom = contextWindowMode == .custom ? thresholdTokens : nil
-        return [
-            "model": .string(model),
-            "effective_tokens": effective.map { .int(Int64($0)) } ?? .null,
-            "native_window_tokens": native.map { .int(Int64($0)) } ?? .null,
-            "custom_cap_tokens": custom.map { .int(Int64($0)) } ?? .null,
-            "summary": .string("Context window for \(model): effective \(effective.map(String.init) ?? "unknown") tokens; native \(native.map(String.init) ?? "unknown") tokens; Custom cap \(custom.map(String.init) ?? "none"). Effective context is 60% of the model's native window, capped by Custom when selected."),
-        ]
-    }
-
-    /// Where she compacts: her effective window. An unknown model falls back
-    /// to the saved size, the only number there is.
-    public func effectiveThresholdTokens(
-        forModel model: String,
-        providerID: String? = nil,
-        dataRoot: URL? = nil
-    ) -> Int {
-        effectiveWindowTokens(forModel: model, providerID: providerID, dataRoot: dataRoot)
-            ?? thresholdTokens
-    }
-
-    /// The boundary at which a session's OLDER turns start aging into
-    /// recollection, in the background. Always below the pre-turn threshold —
-    /// that one is the backstop.
-    public func effectiveAgingThresholdTokens(
-        forModel model: String,
-        providerID: String? = nil,
-        dataRoot: URL? = nil
-    ) -> Int {
-        let ceiling = effectiveThresholdTokens(
-            forModel: model,
-            providerID: providerID,
-            dataRoot: dataRoot
-        )
-        return max(1, min(ceiling, Int(Double(ceiling) * Self.defaultAgingFraction)))
-    }
-}
-
-public struct ChatSessionCompactionOutcome: Sendable, Equatable {
-    public let sessionId: String
-    public let compacted: Bool
-    public let reason: String
-    public let trigger: String
-    public let thresholdTokens: Int
-    public let estimatedTokensBefore: Int
-    public let transcriptCharsBefore: Int
-    public let messagesBefore: Int
-    public let messagesAfter: Int
-    public let messagesReplaced: Int
-    public let summaryChars: Int
-    public let sourceBytesBefore: Int64
-    public let sourceBytesAfter: Int64
-    /// Pending recollection for the caller to distill from its verified backup.
-    public let summaryRowId: String?
-    /// Filesystem path of the pre-compaction backup the distiller reads, present
-    /// under the same condition as `summaryRowId`.
-    public let backupPath: String?
-    /// The transcript's bytes as this pass left them, when it read them under
-    /// the lock: the turn's history selects from these instead of reading the
-    /// file a second time. nil when the pass never read the transcript.
-    public internal(set) var transcript: Data?
-
-    /// WHICH lane consolidated this session, derived from the trigger so the
-    /// receipt never has to be guessed at from a timestamp. `aging` is the
-    /// continuous background lane; `backstop` is the pre-turn threshold that
-    /// should now be rare; `manual` is an explicit user request.
-    /// (NORTHSTAR clause 2 — a receipt records what actually ran.)
-    public var lane: String { Self.lane(forTrigger: trigger) }
-
-    public static func lane(forTrigger trigger: String) -> String {
-        if trigger.hasPrefix("aging") { return "aging" }
-        if trigger.hasPrefix("manual") { return "manual" }
-        return "backstop"
-    }
-
-    public init(
-        sessionId: String,
-        compacted: Bool,
-        reason: String,
-        trigger: String,
-        thresholdTokens: Int,
-        estimatedTokensBefore: Int,
-        transcriptCharsBefore: Int,
-        messagesBefore: Int,
-        messagesAfter: Int,
-        messagesReplaced: Int,
-        summaryChars: Int,
-        sourceBytesBefore: Int64,
-        sourceBytesAfter: Int64,
-        summaryRowId: String? = nil,
-        backupPath: String? = nil
-    ) {
-        self.sessionId = sessionId
-        self.compacted = compacted
-        self.reason = reason
-        self.trigger = trigger
-        self.thresholdTokens = thresholdTokens
-        self.estimatedTokensBefore = estimatedTokensBefore
-        self.transcriptCharsBefore = transcriptCharsBefore
-        self.messagesBefore = messagesBefore
-        self.messagesAfter = messagesAfter
-        self.messagesReplaced = messagesReplaced
-        self.summaryChars = summaryChars
-        self.sourceBytesBefore = sourceBytesBefore
-        self.sourceBytesAfter = sourceBytesAfter
-        self.summaryRowId = summaryRowId
-        self.backupPath = backupPath
-    }
-
-    public func carrying(_ transcript: Data) -> Self {
-        var copy = self
-        copy.transcript = transcript
-        return copy
-    }
-}
-
-private struct ChatSessionCompactionTranscriptError: LocalizedError, Sendable {
-    let errorDescription: String?
-}
-
+// Blueprint: | `ChatSessionAutocompactor.swift` | Aging at 85% folds oldest raw history toward 55% of the effective threshold, retaining earlier blocks and live cards; rare dream-safe rollups above 10% of the effective window; ContactThread owns verified-backup replacements and original-history bytes; config owns `effectiveWindowTokens` and `contextWindowReadout` |
 public struct ChatSessionAutocompactor: Sendable {
     static let maximumCompactBackups = 5
-
+    /// Only a needed compaction pass may roll up earlier blocks. The floor
+    /// keeps tiny windows from repeatedly rewriting one already-short block.
+    static let recollectionWindowFraction = 0.10
+    static let minimumRollupSourceChars = 8_000
     let dataRoot: URL
     let config: ChatSessionAutocompactionConfig
-    let persistence: SwiftNativePersistenceCore
     let now: @Sendable () -> Date
-
     public init(
         dataRoot: URL,
         config: ChatSessionAutocompactionConfig = .productionDefault(),
-        persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore(),
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.dataRoot = dataRoot
         self.config = config
-        self.persistence = persistence
         self.now = now
     }
-
     public func compactIfNeeded(
         sessionId rawSessionId: String,
         model: String,
@@ -257,7 +43,7 @@ public struct ChatSessionAutocompactor: Sendable {
         case .skip(let outcome): return outcome
         case .pass(let begun): pass = begun
         }
-        return try await persistence.withFileLock(pass.messagesPath) {
+        return try await SwiftNativePersistenceCore.withFileLock(pass.messagesPath) {
             var (rows, transcript) = try await readJSONLHonest(pass.messagesPath)
             let pending = try await pendingDistillationOutcome(
                     sessionId: pass.sessionId, messagesPath: pass.messagesPath, rows: &rows, transcript: &transcript,
@@ -270,18 +56,17 @@ public struct ChatSessionAutocompactor: Sendable {
             if let below = belowFileThreshold(pass, trigger: trigger, force: force) {
                 return below.carrying(transcript)
             }
-            switch try select(pass, rows: rows, trigger: trigger, force: force, keepTailFixed: false) {
+            switch try select(pass, rows: rows, trigger: trigger, force: force) {
             case .skip(let outcome):
                 return outcome.carrying(transcript)
             case .fold(let fold):
                 return try await replace(
-                    fold, in: pass, rows: rows, trigger: trigger, model: model,
+                    fold, in: pass, rows: rows, sourceBytes: transcript, trigger: trigger, model: model,
                     surface: surface, runId: runId, recollection: nil
                 )
             }
         }
     }
-
     /// The aging lane's fold, chosen under the transcript lock but not yet
     /// written. Its recollection is distilled from `source` with the lock
     /// released and the live transcript untouched, so a turn arriving
@@ -291,11 +76,13 @@ public struct ChatSessionAutocompactor: Sendable {
     public struct AgingFold: Sendable {
         public let sessionId: String
         let thresholdTokens: Int
-        /// The replaced prefix exactly as read — what the recollection stands
-        /// for and what the replacement verifies before it writes.
+        /// Exactly what this block folds: ordinary passes exclude all earlier
+        /// blocks and retained cards/results. Replacement verifies the whole prefix.
         public let source: [JSONValue]
+        let replaced: [JSONValue]
+        let preservedCount: Int
+        let rollsUpRecollections: Bool
     }
-
     public enum AgingStart: Sendable {
         /// Below the boundary, or nothing worth folding.
         case nothing(ChatSessionCompactionOutcome)
@@ -303,7 +90,6 @@ public struct ChatSessionAutocompactor: Sendable {
         case pending(ChatSessionCompactionOutcome)
         case fold(AgingFold)
     }
-
     /// Choose what aging would fold. Never writes, except the same repair of
     /// a pending recollection's metadata every pass performs.
     public func startAging(
@@ -321,7 +107,7 @@ public struct ChatSessionAutocompactor: Sendable {
         case .skip(let outcome): return .nothing(outcome)
         case .pass(let begun): pass = begun
         }
-        return try await persistence.withFileLock(pass.messagesPath) {
+        return try await SwiftNativePersistenceCore.withFileLock(pass.messagesPath) {
             var (rows, transcript) = try await readJSONLHonest(pass.messagesPath)
             if let pending = try await pendingDistillationOutcome(
                 sessionId: pass.sessionId, messagesPath: pass.messagesPath, rows: &rows, transcript: &transcript,
@@ -332,39 +118,40 @@ public struct ChatSessionAutocompactor: Sendable {
             if let below = belowFileThreshold(pass, trigger: trigger, force: false) {
                 return .nothing(below)
             }
-            switch try select(pass, rows: rows, trigger: trigger, force: false, keepTailFixed: true) {
+            switch try select(pass, rows: rows, trigger: trigger, force: false) {
             case .skip(let outcome):
                 return .nothing(outcome)
             case .fold(let fold):
                 return .fold(AgingFold(
                     sessionId: pass.sessionId,
                     thresholdTokens: pass.thresholdTokens,
-                    source: fold.replaced
+                    source: fold.removableRows,
+                    replaced: fold.replaced,
+                    preservedCount: fold.preservedCount,
+                    rollsUpRecollections: fold.rollsUpRecollections
                 ))
             }
         }
     }
-
-    /// True while the transcript still opens with exactly the fold's source
-    /// and the dream's mark still lets it fold whole. Checked before each
+    /// True while the transcript still opens with exactly the replaced prefix
+    /// and the dream's mark still lets the new source fold whole. Checked before each
     /// distill pass, so a source that moved on stops costing completions.
     public func agingFoldIsCurrent(_ fold: AgingFold) async throws -> Bool {
         let path = messagesPath(sessionId: fold.sessionId)
-        return try await persistence.withFileLock(path) {
+        return try await SwiftNativePersistenceCore.withFileLock(path) {
             let (rows, _) = try await readJSONLHonest(path)
             return try isCurrent(fold, rows: rows)
         }
     }
-
     /// The durable half of an aging pass: under the lock, verify the replaced
     /// prefix is unchanged, then back up and replace it with the finished
     /// recollection. A prefix that changed while the model worked (a backstop
     /// or manual compaction, an answered card, a dream that moved its mark)
     /// drops the pass with nothing written; the next append past the boundary
     /// schedules a fresh one.
-    public func commitAging(
+    package func commitAging(
         _ fold: AgingFold,
-        recollection: String,
+        recollection: [ChatCompactionDistiller.Block],
         distillModel: String,
         model: String,
         surface: String,
@@ -377,10 +164,11 @@ public struct ChatSessionAutocompactor: Sendable {
             messagesPath: path,
             sourceBytesBefore: Self.fileSize(path),
             thresholdTokens: fold.thresholdTokens,
-            divisor: Self.tokenDivisor(forModel: model)
+            windowTokens: config.effectiveThresholdTokens(forModel: model, dataRoot: dataRoot),
+            divisor: ContextBudgetPolicy.transcriptCharactersPerToken
         )
-        return try await persistence.withFileLock(path) {
-            let (rows, _) = try await readJSONLHonest(path)
+        return try await SwiftNativePersistenceCore.withFileLock(path) {
+            let (rows, transcript) = try await readJSONLHonest(path)
             guard try isCurrent(fold, rows: rows) else {
                 return skipped(
                     sessionId: fold.sessionId,
@@ -393,33 +181,32 @@ public struct ChatSessionAutocompactor: Sendable {
                 )
             }
             return try await replace(
-                Fold(rows: rows, replaceCount: fold.source.count), in: pass, rows: rows,
+                Fold(rows: rows, replaceCount: fold.replaced.count, preserving: fold.preservedCount,
+                     rollsUpRecollections: fold.rollsUpRecollections), in: pass, rows: rows, sourceBytes: transcript,
                 trigger: trigger, model: model, surface: surface, runId: runId,
                 recollection: (recollection, distillModel)
             )
         }
     }
-
     private func isCurrent(_ fold: AgingFold, rows: [JSONValue]) throws -> Bool {
-        let count = fold.source.count
-        return try count > 0 && rows.count > count
-            && Array(rows.prefix(count)) == fold.source
+        let count = fold.replaced.count
+        return try count > 0 && rows.count >= count
+            && Array(rows.prefix(count)) == fold.replaced
             && Self.markSafeReplacementCount(
-                rows: rows,
-                replaceCount: count,
+                rows: fold.source,
+                replaceCount: fold.source.count,
                 mark: ChatSessionRecollections.dreamConsolidationMark(dataRoot: dataRoot)
-            ) == count
+            ) == fold.source.count
     }
-
     /// One pass's fixed facts, read before the transcript lock.
-    private struct Pass {
+    struct Pass {
         let sessionId: String
         let messagesPath: URL
         let sourceBytesBefore: Int64
         let thresholdTokens: Int
+        let windowTokens: Int
         let divisor: Double
     }
-
     /// The file-size prefilter: well under the boundary, nothing to measure.
     private func belowFileThreshold(_ pass: Pass, trigger: String, force: Bool) -> ChatSessionCompactionOutcome? {
         guard !force, Double(pass.sourceBytesBefore) < Double(pass.thresholdTokens) * pass.divisor else { return nil }
@@ -431,1081 +218,8 @@ public struct ChatSessionAutocompactor: Sendable {
             sourceBytesBefore: pass.sourceBytesBefore
         )
     }
-
-    private enum Begin {
+    enum Begin {
         case skip(ChatSessionCompactionOutcome)
         case pass(Pass)
-    }
-
-    private func begin(
-        rawSessionId: String,
-        model: String,
-        providerID: String?,
-        trigger: String,
-        thresholdTokensOverride: Int?,
-        force: Bool
-    ) -> Begin {
-        guard let sessionId = NativeAgentChatSessionID.normalizedPathComponent(rawSessionId) else {
-            return .skip(skipped(
-                sessionId: rawSessionId,
-                reason: "invalid session id",
-                trigger: trigger
-            ))
-        }
-
-        let messagesPath = messagesPath(sessionId: sessionId)
-        let sourceBytesBefore = Self.fileSize(messagesPath)
-        guard sourceBytesBefore > 0 else {
-            return .skip(skipped(
-                sessionId: sessionId,
-                reason: "missing or empty transcript",
-                trigger: trigger
-            ))
-        }
-        let modelThresholdTokens = config.effectiveThresholdTokens(
-            forModel: model,
-            providerID: providerID,
-            dataRoot: dataRoot
-        )
-        return .pass(Pass(
-            sessionId: sessionId,
-            messagesPath: messagesPath,
-            sourceBytesBefore: sourceBytesBefore,
-            thresholdTokens: thresholdTokensOverride
-                .map { max(1, min($0, modelThresholdTokens)) } ?? modelThresholdTokens,
-            divisor: Self.tokenDivisor(forModel: model)
-        ))
-    }
-
-    /// One prefix replacement, split the way the durable write needs it.
-    private struct Fold {
-        let replaced: [JSONValue]
-        let kept: [JSONValue]
-        let pendingRecollections: [JSONValue]
-        let foldingRows: [JSONValue]
-        let pendingResults: [JSONValue]
-        let preservedCards: [JSONValue]
-        let removableRows: [JSONValue]
-
-        init(rows: [JSONValue], replaceCount: Int) {
-            replaced = Array(rows.prefix(replaceCount))
-            kept = Array(rows.suffix(rows.count - replaceCount))
-            pendingRecollections = replaced.filter(ChatSessionAutocompactor.hasPendingDistillation)
-            foldingRows = replaced.filter { !ChatSessionAutocompactor.hasPendingDistillation($0) }
-            // An unanswered or retryable inline card, and any card whose
-            // continuation could still start a turn, is carried through
-            // verbatim instead of being folded into the summary. Losing one
-            // takes a person's open ask and an unresumable suspended request
-            // with it (Agent's 644D65F1, 2026-09-14: 223 rows replaced, 8 cards
-            // gone, 2 of them `failed` with a `waiting` continuation).
-            let (results, compactible) = InlineInteractionCompactionRetention.splitPendingResults(foldingRows)
-            let (cards, removable) = InlineInteractionCompactionRetention.split(compactible)
-            pendingResults = results
-            preservedCards = cards
-            removableRows = removable
-        }
-
-        /// Nothing left to fold once the cards are held back — or the only
-        /// removable row is a recollection, which would buy identical
-        /// coverage in new bytes on every pass.
-        var worthCompacting: Bool {
-            !removableRows.isEmpty
-                && (removableRows.count > 1 || ChatSessionAutocompactor.containsRawTurn(removableRows))
-        }
-    }
-
-    private enum Selection {
-        case skip(ChatSessionCompactionOutcome)
-        case fold(Fold)
-    }
-
-    /// What this pass would fold from `rows`, or why it folds nothing.
-    private func select(
-        _ pass: Pass,
-        rows: [JSONValue],
-        trigger: String,
-        force: Bool,
-        keepTailFixed: Bool
-    ) throws -> Selection {
-        let sessionId = pass.sessionId
-        let effectiveThresholdTokens = pass.thresholdTokens
-        let divisor = pass.divisor
-        let before = rows.count
-        let transcriptChars = Self.transcriptCharacterCount(rows)
-        let estimatedTokens = max(0, Int((Double(transcriptChars) / divisor).rounded()))
-        func skip(_ reason: String) -> Selection {
-            .skip(skipped(
-                sessionId: sessionId,
-                reason: reason,
-                trigger: trigger,
-                thresholdTokens: effectiveThresholdTokens,
-                estimatedTokensBefore: estimatedTokens,
-                transcriptCharsBefore: transcriptChars,
-                messagesBefore: before,
-                messagesAfter: before,
-                sourceBytesBefore: pass.sourceBytesBefore
-            ))
-        }
-        guard force || estimatedTokens >= effectiveThresholdTokens else {
-            return skip("below threshold")
-        }
-
-        // Aging folds everything older than the keep-tail and stops there. The
-        // backstop additionally shrinks the tail until the result fits under
-        // the threshold — correct when the alternative is a context-length
-        // failure, wrong for a routine background pass, which would otherwise
-        // strip a busy session down to a summary plus one message.
-        let candidateReplaceCount = keepTailFixed
-            ? Self.keepingLastUserRow(
-                rows: rows,
-                replaceCount: Self.fixedKeepTailReplacementCount(rows: rows, keepCount: ChatSessionAutocompactionConfig.defaultKeepCount)
-            )
-            : Self.replacementCount(
-                sessionId: sessionId,
-                rows: rows,
-                keepCount: ChatSessionAutocompactionConfig.defaultKeepCount,
-                thresholdTokens: effectiveThresholdTokens,
-                divisor: divisor
-            )
-        // A recollection must never STRADDLE the dream lane's high-water
-        // mark. The reader admits a row whose coverage ENDS after the mark,
-        // whole — so a row covering T1..T10 written after the dream already
-        // consumed T1..T6 raw gets T1..T6 dreamed a second time. Once the
-        // row exists the split is impossible (the raw turns are gone), so
-        // the fix belongs here: fold only what the dream has already passed
-        // and leave the post-mark turns raw for the next pass.
-        let replaceCount = Self.keepingLastUserRow(
-            rows: rows,
-            replaceCount: Self.markSafeReplacementCount(
-                rows: rows,
-                replaceCount: candidateReplaceCount,
-                mark: try ChatSessionRecollections.dreamConsolidationMark(dataRoot: dataRoot)
-            )
-        )
-        // Clamped to a prefix with no raw turn left in it → this pass would
-        // only rewrite an existing recollection into an identical-coverage
-        // one. Skip honestly instead of churning the transcript.
-        if replaceCount < candidateReplaceCount,
-           !Self.containsRawTurn(Array(rows.prefix(replaceCount))) {
-            return skip("clamped by dream consolidation mark")
-        }
-        guard replaceCount > 0 else {
-            return skip("not enough messages to compact")
-        }
-        let fold = Fold(rows: rows, replaceCount: replaceCount)
-        guard fold.worthCompacting else {
-            return skip("nothing compactible beside preserved inline cards")
-        }
-        return .fold(fold)
-    }
-
-    /// The durable replacement, under the caller's transcript lock. With no
-    /// `recollection` the summary row is written pending, for the caller to
-    /// distill from the verified backup; with one, it is written finished.
-    private func replace(
-        _ fold: Fold,
-        in pass: Pass,
-        rows: [JSONValue],
-        trigger: String,
-        model: String,
-        surface: String,
-        runId: String?,
-        recollection: (text: String, model: String)?
-    ) async throws -> ChatSessionCompactionOutcome {
-        let sessionId = pass.sessionId
-        let messagesPath = pass.messagesPath
-        let before = rows.count
-        let replaceCount = fold.replaced.count
-        let transcriptChars = Self.transcriptCharacterCount(rows)
-        let estimatedTokens = max(0, Int((Double(transcriptChars) / pass.divisor).rounded()))
-        let sourceNote = ChatCompactionRowRendering.receiptSourceNote(fold.removableRows, sessionId: sessionId)
-        let summary = recollection.map {
-            ChatCompactionDistiller.recollectionContent(
-                $0.text, sourceNote: sourceNote, preservedCards: fold.preservedCards.count
-            )
-        } ?? "Recollection pending; original messages are retained in the compaction backup."
-        let nowISO = ISO8601DateFormatter().string(from: now())
-        let summaryId = "compact-\(UUID().uuidString.lowercased())"
-        // A verified backup is mandatory before destructive compaction. It
-        // also gives the distiller the exact replaced source.
-        try Task.checkCancellation()
-        let backupURL = try backupCurrentMessages(sessionId: sessionId, messagesPath: messagesPath)
-        // WHICH stretch of life this recollection stands for. Recorded so a
-        // second consolidation owner (the dream lane) can tell whether it
-        // has already consumed this material, without re-reading the backup
-        // or re-summarizing the same turns. See ChatSessionRecollections.
-        let coverage = Self.coverageRange(fold.foldingRows)
-        var summaryMetadata: [String: JSONValue] = [
-            "kind": .string(ChatSessionRecollections.rowKind),
-            ChatSessionRecollections.continuityProvenanceKey:
-                ChatSessionRecollections.continuityProvenance(for: fold.foldingRows),
-            "messages_replaced": .int(Int64(replaceCount)),
-            "trigger": .string(trigger),
-            "lane": .string(ChatSessionCompactionOutcome.lane(forTrigger: trigger)),
-            "surface": .string(surface),
-            "receipt_source_note": .string(sourceNote),
-        ]
-        if let from = coverage.from {
-            summaryMetadata[ChatSessionRecollections.coversFromKey] = .string(from)
-        }
-        if let until = coverage.until {
-            summaryMetadata[ChatSessionRecollections.coversUntilKey] = .string(until)
-        }
-        if let recollection {
-            summaryMetadata["distill"] = .string("llm")
-            summaryMetadata["distill_model"] = .string(recollection.model)
-        } else {
-            summaryMetadata["distill"] = .string("pending")
-            summaryMetadata["distill_backup"] = .string(backupURL.lastPathComponent)
-        }
-        summaryMetadata["distill_preserved_pending_ids"] = .array(fold.pendingRecollections.compactMap {
-            guard case .object(let object) = $0 else { return nil }
-            return object["id"]
-        })
-        if !fold.preservedCards.isEmpty {
-            summaryMetadata[InlineInteractionCompactionRetention.preservedMetadataKey] =
-                .int(Int64(fold.preservedCards.count))
-        }
-        let summaryRow: JSONValue = .object([
-            "id": .string(summaryId),
-            "sessionId": .string(sessionId),
-            "role": .string("system"),
-            "content": .string(summary),
-            "createdAt": .string(nowISO),
-            "source": .string("native_autocompaction"),
-            "metadata": .object(summaryMetadata),
-        ])
-        // Summary first, then the preserved cards in their original order,
-        // then the untouched tail — so a still-open card stays where the
-        // reader and the resolver expect it, ahead of the recent turns.
-        let nextRows = fold.pendingRecollections + [summaryRow] + fold.pendingResults
-            + fold.preservedCards + fold.kept
-        try Task.checkCancellation()
-        let transcript = try ContactThread.replace(nextRows, to: messagesPath)
-        let sourceBytesAfter = Self.fileSize(messagesPath)
-        let outcome = ChatSessionCompactionOutcome(
-            sessionId: sessionId,
-            compacted: true,
-            reason: "swift-native-autocompaction",
-            trigger: trigger,
-            thresholdTokens: pass.thresholdTokens,
-            estimatedTokensBefore: estimatedTokens,
-            transcriptCharsBefore: transcriptChars,
-            messagesBefore: before,
-            messagesAfter: nextRows.count,
-            messagesReplaced: replaceCount,
-            summaryChars: summary.count,
-            sourceBytesBefore: pass.sourceBytesBefore,
-            sourceBytesAfter: sourceBytesAfter,
-            summaryRowId: recollection == nil ? summaryId : nil,
-            backupPath: recollection == nil ? backupURL.path : nil
-        )
-        await emitCompactionTrace(
-            outcome,
-            model: model,
-            surface: surface,
-            runId: runId,
-            status: "ok"
-        )
-        emitTurnTrace(outcome, model: model, surface: surface, runId: runId)
-        return outcome.carrying(transcript)
-    }
-
-    private func pendingDistillationOutcome(
-        sessionId: String, messagesPath: URL, rows: inout [JSONValue], transcript: inout Data,
-        trigger: String, sourceBytes: Int64
-    ) async throws -> ChatSessionCompactionOutcome? {
-        for row in rows where Self.hasPendingDistillation(row) {
-            guard case .object(var object) = row,
-                  case .string(let id)? = object["id"],
-                  case .object(var metadata)? = object["metadata"] else { continue }
-            guard case .int(let count)? = metadata["messages_replaced"], count > 0 else {
-                throw await pendingFailure(CocoaError(.fileReadCorruptFile), sessionId: sessionId, rowId: id)
-            }
-            let backup: String
-            if case .string(let recorded)? = metadata["distill_backup"],
-               recorded == URL(fileURLWithPath: recorded).lastPathComponent {
-                backup = recorded
-            } else {
-                do {
-                    backup = try await recoverDistillationBackup(
-                        sessionId: sessionId, metadata: metadata, messagesReplaced: Int(count)
-                    ).lastPathComponent
-                } catch {
-                    throw await pendingFailure(error, sessionId: sessionId, rowId: id)
-                }
-            }
-            if metadata["distill"] != .string("pending") || metadata["distill_backup"] != .string(backup) {
-                metadata["distill"] = .string("pending")
-                metadata["distill_backup"] = .string(backup)
-                metadata.removeValue(forKey: "distill_process")
-                object["metadata"] = .object(metadata)
-                var segments = String(decoding: transcript, as: UTF8.self).components(separatedBy: "\n")
-                if let index = segments.firstIndex(where: {
-                    guard let parsed = try? JSONValue.parse(Data($0.utf8)),
-                          case .object(let fields) = parsed else { return false }
-                    return fields["id"] == .string(id)
-                }) {
-                    segments[index] = try JSONValue.object(object).serialize(pretty: false)
-                    try Task.checkCancellation()
-                    let rewritten = Data(segments.joined(separator: "\n").utf8)
-                    try ContactThread.replace(rewritten, to: messagesPath)
-                    transcript = rewritten
-                    if let rowIndex = rows.firstIndex(where: { row in
-                        guard case .object(let fields) = row else { return false }
-                        return fields["id"] == .string(id)
-                    }) {
-                        rows[rowIndex] = .object(object)
-                    }
-                }
-            }
-            let backupPath = sessionDir(sessionId: sessionId).appendingPathComponent(backup)
-            do {
-                let source = try await readJSONLHonest(backupPath).rows
-                guard source.count >= Int(count) else { throw NSError(domain: "NativeAgent.ChatSessionAutocompactor", code: -7) }
-            } catch {
-                throw await pendingFailure(error, sessionId: sessionId, rowId: id)
-            }
-            return ChatSessionCompactionOutcome(
-                sessionId: sessionId, compacted: false, reason: "distillation pending",
-                trigger: trigger, thresholdTokens: config.thresholdTokens,
-                estimatedTokensBefore: 0, transcriptCharsBefore: Self.transcriptCharacterCount(rows),
-                messagesBefore: rows.count, messagesAfter: rows.count,
-                messagesReplaced: Int(count), summaryChars: 0,
-                sourceBytesBefore: sourceBytes, sourceBytesAfter: sourceBytes,
-                summaryRowId: id, backupPath: backupPath.path
-            )
-        }
-        return nil
-    }
-
-    private func pendingFailure(_ error: Error, sessionId: String, rowId: String) async -> ToolFailureError {
-        let owner = "chat/messages/\(sessionId).jsonl#\(rowId).distill_backup"
-        let words = "The retained recollection source is unavailable: \(error.localizedDescription). Repair its backup before compacting again."
-        let next = ToolFailureError.call("app", ["action": .string("chat.compact"), "args": .object(["session_id": .string(sessionId)])])
-        await RepairOwed.owe(dataRoot, id: UUID().uuidString, kind: .run, operation: "chat.compact:" + sessionId + ":" + rowId,
-            owner: owner, words: words, nextCall: next).value
-        return ToolFailureError(words, effects: .none, owner: owner, nextCall: next)
-    }
-
-    private func recoverDistillationBackup(
-        sessionId: String, metadata: [String: JSONValue], messagesReplaced: Int
-    ) async throws -> URL {
-        let entries = try FileManager.default.contentsOfDirectory(
-            at: sessionDir(sessionId: sessionId), includingPropertiesForKeys: nil
-        )
-        var matched: (url: URL, rows: [JSONValue])?
-        for candidate in entries where candidate.lastPathComponent.hasPrefix("messages.compact.")
-            && candidate.pathExtension == "jsonl" {
-            let rows: [JSONValue]
-            do {
-                rows = try await readJSONLHonest(candidate).rows
-            } catch {
-                FileHandle.standardError.write(Data(
-                    "ChatSessionAutocompactor: distillation backup recovery could not read \(candidate.lastPathComponent): \(error)\n".utf8
-                ))
-                continue
-            }
-            guard rows.count >= messagesReplaced else { continue }
-            let replaced = Array(rows.prefix(messagesReplaced))
-            let coverage = Self.coverageRange(replaced)
-            guard let from = coverage.from, let until = coverage.until,
-                  metadata[ChatSessionRecollections.coversFromKey] == .string(from),
-                  metadata[ChatSessionRecollections.coversUntilKey] == .string(until),
-                  metadata[ChatSessionRecollections.continuityProvenanceKey]
-                    == ChatSessionRecollections.continuityProvenance(for: replaced) else { continue }
-            if let matched, matched.rows != replaced {
-                throw NSError(domain: "NativeAgent.ChatSessionAutocompactor", code: -7, userInfo: [
-                    NSLocalizedDescriptionKey: "Pending recollection has ambiguous source backups; its source is retained for repair."
-                ])
-            }
-            matched = (candidate, replaced)
-        }
-        guard let matched else {
-            throw NSError(domain: "NativeAgent.ChatSessionAutocompactor", code: -7, userInfo: [
-                NSLocalizedDescriptionKey: "Pending recollection has no matching source backup; its source is retained for repair."
-            ])
-        }
-        return matched.url
-    }
-
-    private func skipped(
-        sessionId: String,
-        reason: String,
-        trigger: String,
-        thresholdTokens: Int? = nil,
-        estimatedTokensBefore: Int = 0,
-        transcriptCharsBefore: Int = 0,
-        messagesBefore: Int = 0,
-        messagesAfter: Int = 0,
-        sourceBytesBefore: Int64 = 0
-    ) -> ChatSessionCompactionOutcome {
-        ChatSessionCompactionOutcome(
-            sessionId: sessionId,
-            compacted: false,
-            reason: reason,
-            trigger: trigger,
-            thresholdTokens: thresholdTokens ?? config.thresholdTokens,
-            estimatedTokensBefore: estimatedTokensBefore,
-            transcriptCharsBefore: transcriptCharsBefore,
-            messagesBefore: messagesBefore,
-            messagesAfter: messagesAfter,
-            messagesReplaced: 0,
-            summaryChars: 0,
-            sourceBytesBefore: sourceBytesBefore,
-            sourceBytesAfter: sourceBytesBefore
-        )
-    }
-
-    private func messagesPath(sessionId: String) -> URL {
-        dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("messages", isDirectory: true)
-            .appendingPathComponent("\(sessionId).jsonl")
-    }
-
-    private func sessionDir(sessionId: String) -> URL {
-        dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions", isDirectory: true)
-            .appendingPathComponent(sessionId, isDirectory: true)
-    }
-
-    private func readJSONLHonest(_ path: URL) async throws -> (rows: [JSONValue], bytes: Data) {
-        let data: Data
-        do { data = try Data(contentsOf: path) } catch {
-            throw ChatSessionCompactionTranscriptError(
-                errorDescription: "transcript could not be read; nothing was rewritten"
-            )
-        }
-        // Whitespace-only lines are a legacy shape the distiller still writes
-        // back; skip them. Any other unreadable line, or a torn tail, refuses.
-        var rows: [JSONValue] = [], malformed = 0, torn = false
-        let lines = data.split(separator: 0x0A, omittingEmptySubsequences: false)
-        for (index, rawLine) in lines.enumerated() {
-            guard rawLine.contains(where: { $0 != 0x20 && $0 != 0x09 && $0 != 0x0D }) else { continue }
-            if let row = try? JSONValue.parse(Data(rawLine)), case .object = row {
-                rows.append(row)
-            } else if index == lines.count - 1 {
-                torn = true
-            } else {
-                malformed += 1
-            }
-        }
-        guard malformed == 0, !torn else {
-            throw ChatSessionCompactionTranscriptError(
-                errorDescription: "transcript has \(malformed) unreadable line(s)"
-                    + (torn ? " and a torn last line" : "")
-                    + "; refusing to compact until it is repaired"
-            )
-        }
-        return (rows, data)
-    }
-
-    /// Copies the live transcript aside and verifies it byte-for-byte before
-    /// permitting the destructive rewrite.
-    /// Storage: compaction copies are excluded from local backup, data export
-    /// and raw phone sync; included in off-disk backup and PrivacyMap/chat.
-    @discardableResult
-    private func backupCurrentMessages(sessionId: String, messagesPath: URL) throws -> URL {
-        guard FileManager.default.fileExists(atPath: messagesPath.path) else {
-            throw NSError(domain: "NativeAgent.ChatSessionAutocompactor", code: -5, userInfo: [
-                NSLocalizedDescriptionKey: "pre-compaction transcript disappeared; refusing to compact"
-            ])
-        }
-        let dir = sessionDir(sessionId: sessionId)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        // Unique suffix: two compactions in the same second must not collide —
-        // a copy failing onto an existing name would otherwise report the STALE
-        // backup as fresh and the distiller would distill the wrong prefix.
-        // Success = THIS copy succeeded, never "a file with that name exists".
-        let suffix = "\(Self.fileSafeTimestamp(now())).\(UUID().uuidString.lowercased().prefix(8))"
-        let backup = dir.appendingPathComponent("messages.compact.\(suffix).jsonl")
-        do {
-            try FileManager.default.copyItem(at: messagesPath, to: backup)
-            let sourceData = try Data(contentsOf: messagesPath)
-            let backupData = try Data(contentsOf: backup)
-            guard backupData == sourceData else {
-                throw NSError(domain: "NativeAgent.ChatSessionAutocompactor", code: -6, userInfo: [
-                    NSLocalizedDescriptionKey: "pre-compaction backup verification failed"
-                ])
-            }
-            Self.pruneCompactBackups(
-                in: dir,
-                keeping: Self.maximumCompactBackups,
-                originals: Self.originalsPath(dataRoot: dataRoot, sessionId: sessionId),
-                preserving: backup,
-                pendingRows: sourceData.split(separator: 0x0A).compactMap { try? JSONValue.parse(Data($0)) }
-            )
-        } catch {
-            try? FileManager.default.removeItem(at: backup)
-            throw NSError(domain: "NativeAgent.ChatSessionAutocompactor", code: -5, userInfo: [
-                NSLocalizedDescriptionKey: "could not create a verified pre-compaction backup; refusing to compact",
-                NSUnderlyingErrorKey: error,
-            ])
-        }
-        return backup
-    }
-
-    /// Keep a bounded recovery window without letting every compaction leave a
-    /// permanent full-transcript copy. Cleanup is best-effort: preserving an
-    /// extra old backup is safer than invalidating the verified fresh one.
-    @discardableResult
-    static func pruneCompactBackups(
-        in directory: URL,
-        keeping: Int,
-        originals: URL,
-        preserving protected: URL? = nil,
-        pendingRows: [JSONValue] = []
-    ) -> [URL] {
-        guard keeping >= 0,
-              let entries = try? FileManager.default.contentsOfDirectory(
-                  at: directory,
-                  includingPropertiesForKeys: nil
-              )
-        else { return [] }
-        guard let pendingBackups = protectedCompactBackupNames(in: pendingRows) else { return [] }
-        let backups = entries
-            .filter {
-                $0.lastPathComponent.hasPrefix("messages.compact.")
-                    && $0.pathExtension == "jsonl"
-            }
-            .sorted { lhs, rhs in
-                if lhs == protected { return true }
-                if rhs == protected { return false }
-                return lhs.lastPathComponent > rhs.lastPathComponent
-            }
-        var removed: [URL] = []
-        for stale in backups.dropFirst(keeping) {
-            guard !pendingBackups.contains(stale.lastPathComponent) else { continue }
-            do {
-                try preserveOriginalMessages(from: stale, at: originals)
-                try FileManager.default.removeItem(at: stale)
-                removed.append(stale)
-            } catch {
-                nativeLog("Chat compaction: recovery copy preserved after archive failure: %@", String(describing: error))
-            }
-        }
-        return removed
-    }
-
-    /// nil protects every copy when a legacy pending recollection cannot yet
-    /// identify its exact source. Protected overage is deferred, not failure.
-    static func protectedCompactBackupNames(in rows: [JSONValue]) -> Set<String>? {
-        var names: Set<String> = []
-        for row in rows where hasPendingDistillation(row) {
-            guard case .object(let object) = row,
-                  case .object(let metadata)? = object["metadata"],
-                  case .string(let name)? = metadata["distill_backup"] else { return nil }
-            names.insert(name)
-        }
-        return names
-    }
-
-    public static func originalsPath(dataRoot: URL, sessionId: String) -> URL {
-        dataRoot.appendingPathComponent("chat/archive/originals", isDirectory: true)
-            .appendingPathComponent("\(sessionId).jsonl")
-    }
-
-    /// Fold exact original lines into durable history before retiring a full
-    /// recovery copy. Deduplication is byte-exact, so edited versions of the
-    /// same message survive. Callers hold the session's transcript lock.
-    private static func preserveOriginalMessages(from backup: URL, at archive: URL) throws {
-        let dates = ISO8601DateFormatter()
-        dates.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let wholeSeconds = ISO8601DateFormatter()
-        func lines(_ bytes: Data) throws -> [(line: Data, stamp: String?)] {
-            try bytes.split(separator: 0x0A).map { line in
-                let data = Data(line)
-                guard case .object(let object) = try JSONValue.parse(data) else {
-                    throw NSError(domain: "NativeAgent.ChatCompactionArchive", code: 1)
-                }
-                let stamp: String? = if case .string(let raw)? = object["createdAt"] { raw } else { nil }
-                return (data, stamp)
-            }
-        }
-        let source = try lines(Data(contentsOf: backup))
-        let existing: Data
-        do { existing = try Data(contentsOf: archive) }
-        catch CocoaError.fileReadNoSuchFile { existing = Data() }
-        var merged = try lines(existing)
-        var known = Set(merged.map(\.line))
-        for line in source where known.insert(line.line).inserted {
-            merged.append(line)
-        }
-        // Backups retire newest first. Keep recent reply evidence at the tail
-        // even when an older copy contributes previously unseen lines.
-        var ordered = merged.enumerated().map { index, row in
-            (index: index, line: row.line,
-             at: row.stamp.flatMap { dates.date(from: $0) ?? wholeSeconds.date(from: $0) } ?? .distantPast)
-        }
-        ordered.sort { lhs, rhs in
-            if lhs.at == rhs.at { return lhs.index < rhs.index }
-            return lhs.at < rhs.at
-        }
-        var output = Data()
-        for (_, line, _) in ordered {
-            output.append(line)
-            output.append(0x0A)
-        }
-        if output != existing {
-            try FileManager.default.createDirectory(at: archive.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try ContactThread.replace(output, to: archive)
-        }
-        let verified = Set(try lines(Data(contentsOf: archive)).map(\.line))
-        guard source.allSatisfy({ verified.contains($0.line) }) else {
-            throw NSError(domain: "NativeAgent.ChatCompactionArchive", code: 2)
-        }
-    }
-
-    private func emitCompactionTrace(
-        _ outcome: ChatSessionCompactionOutcome,
-        model: String,
-        surface: String,
-        runId: String?,
-        status: String
-    ) async {
-        let tracesPath = dataRoot
-            .appendingPathComponent("traces", isDirectory: true)
-            .appendingPathComponent("events.jsonl")
-        var payload: [String: JSONValue] = [
-            "schema": .string("context.compact.v1"),
-            "sessionId": .string(outcome.sessionId),
-            "surface": .string(surface),
-            "trigger": .string(outcome.trigger),
-            "lane": .string(outcome.lane),
-            "reason": .string(outcome.reason),
-            "model": .string(model),
-            "thresholdTokens": .int(Int64(outcome.thresholdTokens)),
-            "estimatedTokensBefore": .int(Int64(outcome.estimatedTokensBefore)),
-            "transcriptCharsBefore": .int(Int64(outcome.transcriptCharsBefore)),
-            "messagesBefore": .int(Int64(outcome.messagesBefore)),
-            "messagesAfter": .int(Int64(outcome.messagesAfter)),
-            "messagesReplaced": .int(Int64(outcome.messagesReplaced)),
-            "summaryChars": .int(Int64(outcome.summaryChars)),
-            "sourceBytesBefore": .int(outcome.sourceBytesBefore),
-            "sourceBytesAfter": .int(outcome.sourceBytesAfter),
-        ]
-        if let runId, !runId.isEmpty {
-            payload["runId"] = .string(runId)
-        }
-        let row: JSONValue = .object([
-            "id": .string(UUID().uuidString.lowercased()),
-            "kind": .string("context.compact"),
-            "title": .string(outcome.sessionId),
-            "status": .string(status),
-            "payload": .object(payload),
-            "createdAt": .string(ISO8601DateFormatter().string(from: now())),
-        ])
-        do {
-            try await appendPathOwnedJSONL(
-                row,
-                to: tracesPath,
-                using: persistence,
-                logLabel: "ChatSessionAutocompactor"
-            )
-        } catch {
-            FileHandle.standardError.write(
-                Data("ChatSessionAutocompactor: trace append failed for \(outcome.sessionId): \(error)\n".utf8)
-            )
-        }
-    }
-
-    private func emitTurnTrace(
-        _ outcome: ChatSessionCompactionOutcome,
-        model: String,
-        surface: String,
-        runId: String?
-    ) {
-        var payload: [String: JSONValue] = [
-            "sessionId": .string(outcome.sessionId),
-            "trigger": .string(outcome.trigger),
-            "lane": .string(outcome.lane),
-            "model": .string(model),
-            "thresholdTokens": .int(Int64(outcome.thresholdTokens)),
-            "estimatedTokensBefore": .int(Int64(outcome.estimatedTokensBefore)),
-            "messagesBefore": .int(Int64(outcome.messagesBefore)),
-            "messagesAfter": .int(Int64(outcome.messagesAfter)),
-            "messagesReplaced": .int(Int64(outcome.messagesReplaced)),
-            "sourceBytesBefore": .int(outcome.sourceBytesBefore),
-            "sourceBytesAfter": .int(outcome.sourceBytesAfter),
-        ]
-        if let runId, !runId.isEmpty {
-            payload["runId"] = .string(runId)
-        }
-        TurnTraceBus.fireFromContext(
-            kind: "context.compact",
-            surface: surface,
-            payload: .object(payload)
-        )
-    }
-
-    private static func replacementCount(
-        sessionId: String,
-        rows: [JSONValue],
-        keepCount: Int,
-        thresholdTokens: Int,
-        divisor: Double
-    ) -> Int {
-        let messageCount = rows.count
-        guard messageCount > 1 else { return 0 }
-        let preferredTailCount = preferredTailCount(
-            messageCount: messageCount,
-            keepCount: keepCount
-        )
-        guard preferredTailCount < messageCount else { return 0 }
-
-        var tailCount = preferredTailCount
-        while tailCount > 1 {
-            // 2026-09-23: the tail reaches back to its run's user row when that
-            // still fits; otherwise the loop shrinks on as before.
-            let replaceCount = keepingLastUserRow(rows: rows, replaceCount: messageCount - tailCount)
-            // Preserved cards are REINSERTED after the summary, so their bytes
-            // stay in the session. Leaving them out of this sum made the search
-            // believe a pass would get under threshold when it could not, and a
-            // session whose cards alone exceed the budget never shrank at all.
-            let replaced = Array(rows.prefix(replaceCount))
-            let pendingRecollections = replaced.filter(Self.hasPendingDistillation)
-            let (pendingResults, compactible) = InlineInteractionCompactionRetention
-                .splitPendingResults(replaced.filter { !Self.hasPendingDistillation($0) })
-            let (preserved, removable) = InlineInteractionCompactionRetention.split(compactible)
-            let tail = Array(rows.suffix(messageCount - replaceCount))
-            let postCompactionChars = ChatCompactionDistiller.maxSummaryChars
-                + ChatCompactionRowRendering.receiptSourceNote(removable, sessionId: sessionId).count
-                + InlineInteractionCompactionRetention.summaryClause(preservedCount: preserved.count).count
-                + transcriptCharacterCount(pendingRecollections)
-                + transcriptCharacterCount(pendingResults)
-                + transcriptCharacterCount(preserved)
-                + transcriptCharacterCount(tail)
-            let postCompactionTokens = max(0, Int((Double(postCompactionChars) / divisor).rounded()))
-            if postCompactionTokens < thresholdTokens {
-                return replaceCount
-            }
-            tailCount -= 1
-        }
-
-        // If even the preferred tail would stay over threshold, compact as much
-        // as possible while preserving the newest raw message for continuity.
-        return keepingLastUserRow(rows: rows, replaceCount: messageCount - 1)
-    }
-
-    /// The aging lane's replacement count: everything older than the keep-tail,
-    /// and nothing more. No shrink loop — a background pass must never eat into
-    /// the recent stretch of a session just because that stretch is large.
-    static func fixedKeepTailReplacementCount(rows: [JSONValue], keepCount: Int) -> Int {
-        let messageCount = rows.count
-        guard messageCount > 1 else { return 0 }
-        let tail = preferredTailCount(messageCount: messageCount, keepCount: keepCount)
-        var count = max(0, messageCount - tail)
-        // User, 2026-09-06: aging must not eat a recollection the distiller is
-        // still writing. The backstop lane compacts, schedules aging, and hands
-        // the distiller a row id; with one summary plus the retained tail this
-        // count came back as 1 and selected that very summary, so aging
-        // replaced S1 with S2 and the in-flight distillation landed on
-        // `row_missing` — its whole pass thrown away. Stop the prefix before
-        // the first row still marked `distill: pending`.
-        if let pending = rows.prefix(count).firstIndex(where: hasPendingDistillation) {
-            count = pending
-        }
-        // And never rewrite a prefix that holds nothing but recollections:
-        // that pass buys identical coverage in new bytes. The threshold lane
-        // already refuses this when the dream mark clamps it; the background
-        // lane, which has no obligation to get under anything, refuses it
-        // always.
-        guard count > 0, containsRawTurn(Array(rows.prefix(count))) else { return 0 }
-        return count
-    }
-
-    /// Legacy mechanical recollections need their retained source distilled too.
-    static func hasPendingDistillation(_ row: JSONValue) -> Bool {
-        guard case .object(let obj) = row,
-              case .object(let metadata)? = obj["metadata"],
-              metadata["kind"] == .string(ChatSessionRecollections.rowKind)
-        else { return false }
-        return metadata["distill"] != .string("llm")
-    }
-
-    /// The ISO timestamps bounding the material a recollection stands for.
-    /// A replaced row that is ITSELF a recollection contributes its own
-    /// coverage, so a session consolidated repeatedly keeps an honest span
-    /// rather than collapsing to the last compaction's clock.
-    static func coverageRange(_ rows: [JSONValue]) -> (from: String?, until: String?) {
-        func createdAt(_ row: JSONValue) -> String? {
-            guard case .object(let obj) = row,
-                  case .string(let value)? = obj["createdAt"] else { return nil }
-            return value
-        }
-        func metadataString(_ row: JSONValue, _ key: String) -> String? {
-            guard case .object(let obj) = row,
-                  case .object(let metadata)? = obj["metadata"],
-                  case .string(let value)? = metadata[key] else { return nil }
-            return value
-        }
-        func isRecollection(_ row: JSONValue) -> Bool {
-            metadataString(row, "kind") == ChatSessionRecollections.rowKind
-        }
-        var until: String?
-        for row in rows.reversed() {
-            if let value = metadataString(row, ChatSessionRecollections.coversUntilKey)
-                ?? createdAt(row) {
-                until = value
-                break
-            }
-        }
-        // `from` must describe the WHOLE text this row will carry. A prior
-        // recollection at the head of the prefix is pinned into the summary in
-        // full (see `compactionSummary`), so the span starts where THAT row's
-        // coverage started — anything else understates the material and lets
-        // the dream lane re-admit turns it already consumed (Astra audit
-        // 2026-09-11, finding 2).
-        var from: String?
-        for row in rows {
-            if isRecollection(row),
-               let value = metadataString(row, ChatSessionRecollections.coversFromKey) {
-                from = value
-                break
-            }
-            if let value = createdAt(row) {
-                from = value
-                break
-            }
-        }
-        if from == nil {
-            for row in rows.reversed() {
-                if let value = metadataString(row, ChatSessionRecollections.coversUntilKey)
-                    ?? createdAt(row) {
-                    from = value
-                    break
-                }
-            }
-        }
-        // A prefix can end on a recollection whose covers_until predates the
-        // raw turn that opened the span; never hand out an inverted window.
-        if let fromValue = from, let untilValue = until,
-           let fromDate = ChatSessionRecollections.parseTimestamp(.string(fromValue)),
-           let untilDate = ChatSessionRecollections.parseTimestamp(.string(untilValue)),
-           fromDate > untilDate {
-            from = untilValue
-        }
-        return (from, until)
-    }
-
-    /// Shrink `replaceCount` so the recollection it produces never straddles
-    /// the dream lane's high-water mark. A span wholly at-or-before the mark is
-    /// already safe (the dream skips it); a span wholly after it is safe too
-    /// (the dream reads all of it, once). Only a straddling span is a double
-    /// count — clamp it to the leading rows whose material ENDS at or before
-    /// the mark and leave the rest raw. No mark → nothing to respect.
-    static func markSafeReplacementCount(
-        rows: [JSONValue],
-        replaceCount: Int,
-        mark: Date?
-    ) -> Int {
-        guard replaceCount > 0, let mark else { return replaceCount }
-        let replaced = Array(rows.prefix(replaceCount))
-        let span = coverageRange(replaced)
-        guard let until = ChatSessionRecollections.parseTimestamp(span.until.map { .string($0) }),
-              until > mark
-        else { return replaceCount }
-        guard let from = ChatSessionRecollections.parseTimestamp(span.from.map { .string($0) }),
-              from <= mark
-        else { return replaceCount }
-        var safe = 0
-        for row in replaced {
-            guard let rowUntil = ChatSessionRecollections.parseTimestamp(
-                      coverageRange([row]).until.map { .string($0) }
-                  ),
-                  rowUntil <= mark
-            else { break }
-            safe += 1
-        }
-        return safe
-    }
-
-    /// True when at least one row is an ordinary turn rather than a recollection
-    /// the earlier passes already folded.
-    static func containsRawTurn(_ rows: [JSONValue]) -> Bool {
-        rows.contains { row in
-            guard case .object(let obj) = row,
-                  case .object(let metadata)? = obj["metadata"],
-                  case .string(let kind)? = metadata["kind"]
-            else { return true }
-            return kind != ChatSessionRecollections.rowKind
-        }
-    }
-
-    /// 2026-09-23: the tail counts ROWS, so it could keep tool rows plus her
-    /// reply and fold away the user message that started that run — she then
-    /// replayed an answer to nothing. Pull the cut back to that user row;
-    /// skip when doing so would fold no raw turn.
-    static func keepingLastUserRow(rows: [JSONValue], replaceCount: Int) -> Int {
-        let replaceCount = min(replaceCount, rows.firstIndex {
-            guard case .object(let row) = $0, case .object(let metadata)? = row["metadata"] else { return false }
-            return metadata["awaitingConsumption"] == .bool(true)
-        } ?? rows.count)
-        func role(_ row: JSONValue) -> String? {
-            guard case .object(let obj) = row, case .string(let value)? = obj["role"] else { return nil }
-            return value
-        }
-        guard replaceCount > 0, replaceCount < rows.count,
-              ["assistant", "tool"].contains(role(rows[replaceCount]))
-        else { return replaceCount }
-        guard let lastUser = rows[..<replaceCount].lastIndex(where: { role($0) == "user" }) else { return 0 }
-        return lastUser > 0 && containsRawTurn(Array(rows.prefix(lastUser))) ? lastUser : 0
-    }
-
-    private static func preferredTailCount(messageCount: Int, keepCount: Int) -> Int {
-        if messageCount > keepCount {
-            return keepCount
-        }
-        return min(4, messageCount - 1)
-    }
-
-    private static func transcriptCharacterCount(_ rows: [JSONValue]) -> Int {
-        var total = 0
-        for row in rows {
-            guard case .object(let obj) = row else { continue }
-            total += ChatCompactionRowRendering.characterCount(obj)
-        }
-        return total
-    }
-
-    private static func tokenDivisor(forModel model: String) -> Double {
-        model.lowercased().contains("claude") ? 3.5 : 4.0
-    }
-
-    private static func fileSize(_ path: URL) -> Int64 {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path),
-              let size = attrs[.size] as? NSNumber else {
-            return 0
-        }
-        return size.int64Value
-    }
-
-    private static func fileSafeTimestamp(_ date: Date = Date()) -> String {
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
-        return formatter.string(from: date)
-    }
-
-}
-
-/// The one place that knows how to READ a tool row during compaction.
-///
-/// Tool rows persist with `content: ""` and their whole payload under
-/// `metadata` (see `ChatOrchestrationClient+MessagePersistence.swift`). Both
-/// compaction paths used to look only at `content`, which produced a matched
-/// pair of defects: a tool-heavy transcript measured as ~zero characters and so
-/// never reached the token threshold (the session died on a provider
-/// context-length error instead of compacting), and — once it did compact —
-/// every record of which tools ran was dropped from the summary and from the
-/// distiller prompt.
-enum ChatCompactionRowRendering {
-    static func receiptSourceNote(_ rows: [JSONValue], sessionId: String) -> String {
-        for row in rows.reversed() {
-            guard case .object(let object) = row, case .object(let metadata)? = object["metadata"] else { continue }
-            if case .string? = metadata["toolName"], case .string(let id)? = object["id"] {
-                let read: JSONValue = .object(["action": .string("chat.message"), "args": .object([
-                    "session_id": .string(sessionId), "message_id": .string(id),
-                ])])
-                if let call = try? read.serialize(pretty: false) {
-                    return "[Source: recollection, not a receipt. Latest stored tool receipt: app \(call). Stored results may be bounded/redacted; result.page handles expire at turn end.]"
-                }
-            }
-            if case .string(let note)? = metadata["receipt_source_note"] { return note }
-        }
-        return "[Source: recollection. Tool receipts record dispatches; assistant text records claims.]"
-    }
-
-    private static func contentValue(_ obj: [String: JSONValue]) -> JSONValue? {
-        if case .string? = obj["content"] { return obj["content"] }
-        if case .string? = obj["text"] { return obj["text"] }
-        return obj["content"]
-    }
-
-    /// Characters this row contributes to the transcript size estimate. When
-    /// `content` is empty the payload lives in `metadata`, so the serialized
-    /// metadata length stands in for it.
-    static func characterCount(_ obj: [String: JSONValue]) -> Int {
-        if let content = contentValue(obj) {
-            if case .string(let text) = content {
-                if !text.isEmpty { return text.count }
-            } else {
-                return ((try? content.serialize(pretty: false)) ?? "").count
-            }
-        }
-        guard let metadata = obj["metadata"] else { return 0 }
-        return ((try? metadata.serialize(pretty: false)) ?? "").count
-    }
-
-    /// The transcript line body for a row, or nil when the row carries nothing
-    /// worth preserving. A tool row (empty `content`, a `toolName` in metadata)
-    /// renders exactly as prompt history renders it — same status, projection,
-    /// and secret redaction — so post-compaction continuity keeps a record of
-    /// the tool activity.
-    static func summaryBody(
-        _ obj: [String: JSONValue],
-        collapseNewlines: Bool,
-        toolSummaryCap: Int? = nil
-    ) -> String? {
-        let content: String = {
-            if case .string(let text)? = contentValue(obj) { return text }
-            if let value = contentValue(obj) { return (try? value.serialize(pretty: false)) ?? "" }
-            return ""
-        }()
-        let normalized = normalize(content, collapseNewlines: collapseNewlines)
-        let metadata: [String: JSONValue]?
-        if case .object(let value)? = obj["metadata"] { metadata = value } else { metadata = nil }
-        var line = normalized
-        if line.isEmpty, case .string(let toolName)? = metadata?["toolName"],
-           !toolName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            line = SessionHistoryPromptRenderer.toolSummary(content: "", metadata: metadata, resultCap: toolSummaryCap)
-        }
-        if case .string? = metadata?["toolName"], case .string(let id)? = obj["id"] {
-            line = "[Recorded tool receipt; context.expand history:\(id)] " + line
-        }
-        let body = ChatTranscriptEvidenceRendering.contentIncludingAttachments(
-            line, attachments: metadata?["attachments"])
-        guard !body.isEmpty else { return nil }
-        let role: String
-        if case .string(let value)? = obj["role"] {
-            role = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        } else { role = "" }
-        let isCompactionSummary: Bool
-        if case .string("compaction_summary")? = metadata?["kind"] { isCompactionSummary = true }
-        else { isCompactionSummary = false }
-        return ChatTranscriptEvidenceRendering.displayContent(
-            body,
-            originLabel: role == "user" && !isCompactionSummary
-                ? ChatTranscriptEvidenceRendering.recordedOriginLabel(obj, role: role) : nil,
-            incompleteReplyLabel: role == "assistant" && !isCompactionSummary
-                ? ChatTranscriptEvidenceRendering.recordedIncompleteReplyLabel(extras: obj, metadata: metadata) : nil)
-    }
-
-    /// True when this row is a consolidated recollection a PRIOR compaction
-    /// wrote, rather than an ordinary turn. The one place that knows the shape
-    /// for both compaction paths (see `ChatSessionRecollections.rowKind`).
-    static func isRecollection(_ obj: [String: JSONValue]) -> Bool {
-        guard case .object(let metadata)? = obj["metadata"],
-              case .string(let kind)? = metadata["kind"]
-        else { return false }
-        return kind == ChatSessionRecollections.rowKind
-    }
-
-    /// 2026-09-23: the distiller writes her recollection from these rows; the
-    /// 160-char prompt projection left it guessing what each tool returned.
-    static let distillerToolResultSummaryMaximumCharacters = 1_000
-
-    private static func normalize(_ text: String, collapseNewlines: Bool) -> String {
-        // Same redactor prompt history applies, so a compaction summary can
-        // never carry a secret the live prompt would have masked.
-        let redacted = ChatSecretRedactor.redactText(text)
-        let flattened = collapseNewlines
-            ? redacted.replacingOccurrences(of: "\n", with: " ")
-            : redacted
-        return flattened.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

@@ -2,25 +2,39 @@ import Foundation
 import NativeAgentCore
 import Experiences
 import PersistenceCore
-// Blueprint: | `CognitiveSubstrate+Persistence.swift` | `CognitiveSubstrate`: `persistSnapshot`, `recordReceipt` |
+// Blueprint: | `CognitiveSubstrate+Persistence.swift` | `CognitiveSubstrate`: `persistAffectAndNodes`, `recordReceipt` |
 
 extension CognitiveSubstrate {
-    public func persistSnapshot() async throws {
+    /// Affect, consumed residue and node watermarks become durable together.
+    public func persistAffectAndNodes() async throws {
         guard configuration.enabled, configuration.persistenceEnabled else { return }
-        guard let store else { throw CognitivePersistenceError.storeUnavailable }
-        guard !persistenceWritesBlocked else {
+        guard store != nil else { throw CognitivePersistenceError.storeUnavailable }
+        // Reject before capturing a snapshot: capture decays and caps the field.
+        if forgettingInFlight {
+            forgettingDiscarded.append((kind: "snapshot", id: UUID()))
+            forgettingDiscarded.append(contentsOf: affectCheckpoint(at: dependencies.now()).map { (kind: $0.kind, id: $0.id) })
+            throw CognitiveWriteDiscarded()
+        }
+        guard !persistenceHealth.writesBlocked else {
             throw CognitivePersistenceError.writesBlocked(
-                status: persistenceHealth.status,
-                detail: persistenceHealth.failureDetail
-            )
+                status: persistenceHealth.status, detail: persistenceHealth.failureDetail)
         }
         let now = dependencies.now()
-        let nodes = field.snapshot(at: now, configuration: configuration)
-        try await store.saveNodes(nodes, at: now)
-        try await store.prune(
-            maxNodes: configuration.maximumActiveNodes,
-            maxArtifacts: artifactCap(configuration)
+        try await persistMaintenanceTransition(
+            nodes: field.snapshot(at: now, configuration: configuration),
+            artifacts: affectCheckpoint(at: now), deletedArtifactIDs: [], receipts: [], at: now
         )
+    }
+
+    func affectCheckpoint(at now: Date) -> [CognitiveArtifactWrite] {
+        [CognitiveArtifactWrite(
+            kind: "affect", id: stableArtifactID("affect"), status: "current",
+            score: affect.arousal, payload: affect.toJSON(
+                lastUserPresenceAt: lastUserPresenceAt, lastWarmPresenceAt: lastWarmPresenceAt)
+        ), CognitiveArtifactWrite(
+            kind: "dream_residue", id: stableArtifactID("dream_residue"), status: "current",
+            score: 0, payload: dreamResidueArtifactPayload(at: now)
+        )]
     }
 
     public func recordReceipt(kind: String, payload: JSONValue = .object([:])) async {
@@ -43,14 +57,22 @@ extension CognitiveSubstrate {
             guard unsavedStages.remove(stage) != nil else { return }
             RepairOwed.settle(Self.dataRoot(of: store), operation: "cognition.persist:" + stage,
                               evidence: .init(source: "cognition/cognition.sqlite", id: stage))
-            guard unsavedStages.isEmpty, persistenceHealth.failureStage == "unsaved", !persistenceWritesBlocked else { return }
+            guard unsavedStages.isEmpty, persistenceHealth.failureStage == "unsaved", !persistenceHealth.writesBlocked else { return }
             persistenceHealth = CognitivePersistenceHealth(
                 status: .healthy, writesBlocked: false,
                 lastRestoreAttemptAt: persistenceHealth.lastRestoreAttemptAt,
                 lastSuccessfulRestoreAt: persistenceHealth.lastSuccessfulRestoreAt)
         } catch {
+            // A write refused because writes are blocked (her mind not yet read,
+            // or a failed restore) is not a failed save: health already says
+            // writes are blocked, and no repair is owed for it.
+            if let refusal = error as? CognitivePersistenceError, case .writesBlocked = refusal { return }
+            // A write Clear's hold discarded is not durable and not a failure
+            // of its own: the failed Clear's one repair names it, and nothing
+            // it was saving is settled.
+            if error is CognitiveWriteDiscarded { return }
             oweUnsaved(stage, error, store: store)
-            guard !stage.hasPrefix("receipt."), !persistenceWritesBlocked else { return }
+            guard !stage.hasPrefix("receipt."), !persistenceHealth.writesBlocked else { return }
             unsavedStages.insert(stage)
             persistenceHealth = CognitivePersistenceHealth(
                 status: .degraded, writesBlocked: false,
@@ -66,6 +88,24 @@ extension CognitiveSubstrate {
         RepairOwed.owe(Self.dataRoot(of: store), id: "cognition-persist:" + UUID().uuidString.lowercased(), kind: .run,
                        operation: "cognition.persist:" + stage, owner: "cognition",
                        words: "Her \(stage) was not saved: \(error.localizedDescription)")
+    }
+
+    /// A failed Clear owes ONE repair, stage `clear`, naming the writes its hold
+    /// discarded (bounded). Nothing is written for them now: they land on
+    /// their next change.
+    func oweFailedClear(_ discarded: [(kind: String, id: UUID)], error: Error) {
+        guard let store, !discarded.isEmpty else { return }
+        var seen = Set<String>()
+        let names = discarded.compactMap { piece -> String? in
+            let name = piece.kind == "snapshot" ? "nodes" : "\(piece.kind) \(piece.id.uuidString.prefix(8))"
+            return seen.insert(name).inserted ? name : nil
+        }
+        let listed = names.prefix(12).joined(separator: ", ")
+            + (names.count > 12 ? " and \(names.count - 12) more" : "")
+        RepairOwed.owe(Self.dataRoot(of: store), id: "cognition-persist:" + UUID().uuidString.lowercased(), kind: .run,
+                       operation: "cognition.persist:clear", owner: "cognition",
+                       words: "A Clear failed (\(error.localizedDescription)); these writes made during it were not"
+                           + " saved and land on their next change: \(listed)")
     }
 
     private static func dataRoot(of store: CognitiveSQLiteStore) -> URL {
@@ -84,9 +124,11 @@ extension CognitiveSubstrate {
         }
     }
 
-    func persistArtifact(kind: String, id: UUID, status: String, score: Double, payload: JSONValue) async {
+    func persistArtifact(kind: String, id: UUID, status: String, score: Double, payload: JSONValue,
+                         mindEpoch expectedMindEpoch: UInt64? = nil) async {
         await notingPersistence("artifact.\(kind).\(id.uuidString)") {
-            try await persistArtifactChecked(kind: kind, id: id, status: status, score: score, payload: payload)
+            try await persistArtifactChecked(kind: kind, id: id, status: status, score: score, payload: payload,
+                                             mindEpoch: expectedMindEpoch)
         }
     }
 
@@ -95,22 +137,13 @@ extension CognitiveSubstrate {
         id: UUID,
         status: String,
         score: Double,
-        payload: JSONValue
+        payload: JSONValue,
+        mindEpoch expectedMindEpoch: UInt64? = nil
     ) async throws {
-        guard configuration.persistenceEnabled else { return }
-        guard let store else { throw CognitivePersistenceError.storeUnavailable }
-        guard !persistenceWritesBlocked else {
-            throw CognitivePersistenceError.writesBlocked(
-                status: persistenceHealth.status,
-                detail: persistenceHealth.failureDetail
-            )
-        }
-        try await store.upsertArtifact(
-            kind: kind,
-            id: id,
-            status: status,
-            score: score,
-            payload: payload,
+        if let expectedMindEpoch, expectedMindEpoch != mindEpoch { throw CognitiveWriteDiscarded() }
+        try await persistArtifactTransition(
+            artifacts: [CognitiveArtifactWrite(kind: kind, id: id, status: status, score: score, payload: payload)],
+            deletedArtifactIDs: [],
             at: dependencies.now()
         )
     }
@@ -122,7 +155,15 @@ extension CognitiveSubstrate {
     ) async throws {
         guard configuration.persistenceEnabled else { return }
         guard let store else { throw CognitivePersistenceError.storeUnavailable }
-        guard !persistenceWritesBlocked else {
+        // Clear holds the store under logical exclusion: a snapshot captured
+        // before it is discarded, never written after it (`forgetMind`), and
+        // the caller learns it is NOT durable.
+        if forgettingInFlight {
+            forgettingDiscarded.append(contentsOf: artifacts.map { (kind: $0.kind, id: $0.id) })
+            forgettingDiscarded.append(contentsOf: deletedArtifactIDs.map { (kind: "deleted", id: $0) })
+            throw CognitiveWriteDiscarded()
+        }
+        guard !persistenceHealth.writesBlocked else {
             throw CognitivePersistenceError.writesBlocked(
                 status: persistenceHealth.status, detail: persistenceHealth.failureDetail)
         }
@@ -139,7 +180,16 @@ extension CognitiveSubstrate {
     ) async throws {
         guard configuration.persistenceEnabled else { return }
         guard let store else { throw CognitivePersistenceError.storeUnavailable }
-        guard !persistenceWritesBlocked else {
+        // Clear holds the store under logical exclusion: a snapshot captured
+        // before it is discarded, never written after it (`forgetMind`), and
+        // the caller learns it is NOT durable.
+        if forgettingInFlight {
+            forgettingDiscarded.append((kind: "snapshot", id: UUID()))
+            forgettingDiscarded.append(contentsOf: artifacts.map { (kind: $0.kind, id: $0.id) })
+            forgettingDiscarded.append(contentsOf: deletedArtifactIDs.map { (kind: "deleted", id: $0) })
+            throw CognitiveWriteDiscarded()
+        }
+        guard !persistenceHealth.writesBlocked else {
             throw CognitivePersistenceError.writesBlocked(
                 status: persistenceHealth.status,
                 detail: persistenceHealth.failureDetail
@@ -157,12 +207,16 @@ extension CognitiveSubstrate {
     }
 
     func artifactCap(_ configuration: CognitiveConfiguration) -> Int {
-        max(
-            64,
-            configuration.maximumActiveNodes
-                + configuration.dailyReflectionCallBudget * 14
-                + 64
-        )
+        let nodes = max(0, configuration.maximumActiveNodes)
+        guard nodes <= Int.max - 64 else { return Int.max }
+        let budget = max(0, configuration.dailyReflectionCallBudget)
+        guard budget <= (Int.max - 64 - nodes) / 14 else { return Int.max }
+        return nodes + budget * 14 + 64
+    }
+
+    var reflectionReceiptCap: Int {
+        let budget = max(0, configuration.dailyReflectionCallBudget)
+        return budget > Int.max / 4 ? Int.max : max(40, budget * 4)
     }
 
 }
@@ -210,12 +264,8 @@ extension CognitiveSubstrate {
     func enforceReflectionReceiptCap() {
         evictOldest(
             from: &reflectionReceipts,
-            cap: max(40, configuration.dailyReflectionCallBudget * 4)
+            cap: reflectionReceiptCap
         ) { $0.createdAt }
-    }
-
-    func enforceExperimentResultCap() {
-        evictOldest(from: &experimentResults, cap: 40) { $0.generatedAt }
     }
 
     // `replayEvidenceIds` is a dedup guard with no per-entry timestamp and no disk
@@ -231,3 +281,8 @@ extension CognitiveSubstrate {
     }
 }
 
+/// A write Clear's hold discarded: not durable. Never a silent success, so a
+/// lived moment's part that hit one stays owed.
+public struct CognitiveWriteDiscarded: Error, CustomStringConvertible {
+    public var description: String { "the write was discarded by a Clear in progress and is not saved" }
+}

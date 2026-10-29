@@ -12,21 +12,17 @@ enum MobileNotificationRouting {
     static let reply = "nativeagent.mobile.reply"
 
     static func register() {
-        let authenticated: UNNotificationActionOptions = [.foreground, .authenticationRequired]
-        UNUserNotificationCenter.current().setNotificationCategories([
-            UNNotificationCategory(identifier: approvalCategory, actions: [
-                UNNotificationAction(identifier: approve, title: "Approve", options: authenticated),
-                UNNotificationAction(identifier: deny, title: "Deny", options: authenticated.union(.destructive)),
-            ], intentIdentifiers: [], options: []),
-            UNNotificationCategory(identifier: messageCategory, actions: [
-                UNTextInputNotificationAction(identifier: reply, title: "Reply", options: authenticated,
-                    textInputButtonTitle: "Send", textInputPlaceholder: "Message your agent"),
-            ], intentIdentifiers: [], options: []),
-        ])
+        UNUserNotificationCenter.current().setNotificationCategories(nativeAgentNotificationCategories(
+            approvalCategory: approvalCategory, messageCategory: messageCategory,
+            approve: approve, deny: deny, reply: reply, replyPlaceholder: "Message your agent"
+        ))
     }
 
-    static func categorized(_ content: UNNotificationContent) -> UNNotificationContent {
-        let copy = content.mutableCopy() as! UNMutableNotificationContent
+    static func categorized(_ content: UNNotificationContent) throws -> UNNotificationContent {
+        guard let copy = content.mutableCopy() as? UNMutableNotificationContent else {
+            throw NSError(domain: "NativeAgentNotification", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "Notification content could not be copied for routing."])
+        }
         // The Mac's router names the conversation a knock came from as
         // `originSessionId`. A knock with no screen of its own opens that
         // conversation, with Reply, instead of the Activity queue.
@@ -51,7 +47,7 @@ enum MobileNotificationRouting {
     /// selecting a different request by title/time.
     static func resolvingCloudKitRouting(_ content: UNNotificationContent) async throws -> UNNotificationContent {
         guard let query = CKNotification(fromRemoteNotificationDictionary: content.userInfo) as? CKQueryNotification,
-              let recordID = query.recordID else { return categorized(content) }
+              let recordID = query.recordID else { return try categorized(content) }
         guard let containerID = Bundle.main.object(forInfoDictionaryKey: "NativeAgentICloudContainerID") as? String,
               DeviceCloudKitPreflight.hasCloudKitEntitlement(),
               DeviceCloudKitPreflight.entitlementGrantsContainer(containerID) else {
@@ -66,11 +62,14 @@ enum MobileNotificationRouting {
             throw NSError(domain: "NativeAgentNotification", code: 2,
                 userInfo: [NSLocalizedDescriptionKey: "The notified record has no notification routing envelope."])
         }
-        let copy = content.mutableCopy() as! UNMutableNotificationContent
+        guard let copy = content.mutableCopy() as? UNMutableNotificationContent else {
+            throw NSError(domain: "NativeAgentNotification", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "Notification content could not be copied for routing."])
+        }
         for key in ["itemId", "approvalId", "sessionId", "originSessionId", "screen", "source", "eventId", "correlationId", "taskId"] {
             if let value = nonEmpty(metadata["userInfo.\(key)"]) { copy.userInfo[key] = value }
         }
-        return categorized(copy)
+        return try categorized(copy)
     }
 
     private static func nonEmpty(_ value: String?) -> String? {

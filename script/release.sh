@@ -1,34 +1,29 @@
 #!/usr/bin/env bash
-# RELEASE-2026-05-06: canonical production release script for NativeAgent
+# Production release script for NativeAgent.
 # Usage:
 #   ./script/release.sh               — full notarized release
 #   ./script/release.sh --dry-run     — sign only (ad-hoc fallback), skip notarization
-#   ./script/release.sh --artifact-only — build/sign/notarize without the full
-#                                            Mac+iOS eval gate; writes an honest
-#                                            artifact-only release receipt
+#   ./script/release.sh --artifact-only — accepted spelling for the release receipt path
 #   ./script/release.sh --appcast          — also generate+sign the Sparkle appcast
 #                                            locally (uploads nothing)
 #   ./script/release.sh --publish-appcast  — generate+sign AND publish the feed;
 #                                            only this mode lets the app claim that
-#                                            automatic updates work (A2.1)
+#                                            automatic updates work
 #   ./script/release.sh --notes FILE       — release notes for the Sparkle update
 #                                            dialog AND the GitHub release body.
 #                                            Defaults to docs/release-notes/<VERSION>.md
 #                                            when that file exists; with neither,
-#                                            the update dialog stays blank (C12).
+#                                            the update dialog stays blank.
 #   ./script/release.sh --self-test-gates dist/NativeAgent.app
-#                                          — run the A1.1 identity leak gate and the
-#                                            A1.5 bundle assertion against an existing
+#                                          — run the identity leak gate and the
+#                                            bundle assertion against an existing
 #                                            .app and exit. Builds/signs nothing.
 #   ./script/release.sh --print-env-surface — print the values-free external
 #                                            release configuration interface.
 #
-# PUBLIC LANE (A1.1-2026-08-02): any NATIVEAGENT_ICLOUD_BUILD other than
-# personal|1 is a PUBLIC release, and a public release is ALWAYS built from the
-# scrubbed export. Run it from the private tree as usual — this script produces
-# the export itself (script/make_public_export.sh) and re-runs inside it with
-# the private signing inputs, so scrubbed AND notarized is now one path instead
-# of two mutually exclusive ones.
+# Public releases (NATIVEAGENT_ICLOUD_BUILD other than personal|1) build only
+# from a scrubbed export; this script creates it and re-runs there with private
+# signing inputs supplied by absolute path.
 #   NATIVEAGENT_PUBLIC_EXPORT_DIR   — where to put the export (default: mktemp)
 #   NATIVEAGENT_REUSE_PUBLIC_EXPORT — 1 reuses an existing export; --dry-run only
 # For ad-hoc local proof (no Developer ID signing), explicitly set both aliases:
@@ -46,34 +41,28 @@ source "$ROOT/script/lib/provisioning_profile_contract.sh"
 source "$ROOT/script/lib/release_bundle_gates.sh"
 # shellcheck source=lib/release_symbols.sh
 source "$ROOT/script/lib/release_symbols.sh"
+source "$ROOT/script/lib/build_source_inventory.sh"
 APP_NAME="NativeAgent"
 PRODUCT="NativeAgentApp"
 DRY_RUN=false
-ARTIFACT_ONLY=false
-# A2.1-2026-07-24: appcast generation/publishing is opt-in. A normal release must
-# never try to upload anywhere, and — critically — must never stamp an app that
-# CLAIMS a working update feed when none was published. See UpdateController.swift.
+# Appcast generation and publication are opt-in.
 GENERATE_APPCAST=false
 PUBLISH_APPCAST=false
-# Sweep R4 C12: release notes for the Sparkle update dialog. Explicit --notes
-# FILE wins; otherwise docs/release-notes/<VERSION>.md is picked up if it
-# exists. No file, no notes — the dialog stays blank, honestly, rather than
-# inventing a changelog.
 RELEASE_NOTES_FILE=""
 PRINT_ENV_SURFACE=false
 
-# 2026-09-07: keep the large model out of Sparkle's app archive. MiniLM remains
-# in its SwiftPM resource bundle. No release packaging step downloads a model.
+# Package bge-large-en-v1.5 inside the app by default. No release packaging
+# step downloads a model; separate-download remains an explicit override.
 release_prepare_embedding() { # bundle, output directory, version
   local bundle="$1" out="$2" version="$3" work asset digest bytes url
   local source="${NATIVEAGENT_EMBEDDING_MODEL_DIR:-$ROOT/extras/embedding}"
-  local mode="${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-bundled}"  # 2026-09-08 (User): the model ships inside the DMG
+  local mode="${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-bundled}"
   case "$mode" in separate-download|bundled) ;; *) echo "ERROR: embedding distribution must be separate-download or bundled" >&2; return 1 ;; esac
   [[ -f "$source/embedding.json" && -d "$source/embedding.mlpackage" && -s "$source/vocab.txt" ]] \
     || { echo "ERROR: supply a complete local NATIVEAGENT_EMBEDDING_MODEL_DIR; release packaging never fetches it." >&2; return 1; }
   jq -e '.model == "embedding.mlpackage" and .vocab == "vocab.txt"
-    and (.model_id | type == "string" and length > 0)
-    and (.dimensions | type == "number" and . > 0 and floor == .)' \
+    and .model_id == "bge-large-en-v1.5"
+    and .dimensions == 1024' \
     "$source/embedding.json" >/dev/null || return 1
   # Package only the runtime resources, never arbitrary extras from the source.
   [[ -z "$(find "$source/embedding.mlpackage" -type l -print -quit)" && ! -L "$source/embedding.mlpackage" && ! -L "$source/embedding.json" && ! -L "$source/vocab.txt" ]] \
@@ -120,10 +109,7 @@ if [[ "${1:-}" == --prepare-embedding ]]; then
   exit 0
 fi
 
-# Release credentials historically accepted both NATIVE_AGENT_* and
-# NATIVEAGENT_* spellings. Normalize the pair before any child script can read
-# one spelling while this script uses the other. Conflicts are deliberately
-# fatal: a release must never silently choose one signing identity or feed URL.
+# Normalize both credential spellings before child scripts read them; conflicts fail.
 release_normalize_env_pair() { # canonical legacy
   local canonical="$1" legacy="$2"
   local canonical_value="${!canonical:-}" legacy_value="${!legacy:-}"
@@ -175,7 +161,6 @@ release_print_env_surface() {
   printf '%s\n' "${RELEASE_ENV_SURFACE[@]}"
 }
 
-# RELEASE-2026-05-06: parse flags
 SELF_TEST_GATES_TARGET=""
 _expect_self_test_target=false
 _expect_notes_file=false
@@ -192,7 +177,7 @@ for arg in "$@"; do
   fi
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
-    --artifact-only) ARTIFACT_ONLY=true ;;
+    --artifact-only) ;;
     --appcast) GENERATE_APPCAST=true ;;
     --publish-appcast) GENERATE_APPCAST=true; PUBLISH_APPCAST=true ;;
     --notes) _expect_notes_file=true ;;
@@ -216,24 +201,23 @@ if [[ "$_expect_self_test_target" == "true" ]]; then
   exit 1
 fi
 
+release_normalize_env_pair NATIVEAGENT_DEVELOPER_ID NATIVE_AGENT_DEVELOPER_ID || exit 1
+release_normalize_env_pair NATIVEAGENT_TEAM_ID NATIVE_AGENT_TEAM_ID || exit 1
+release_normalize_env_pair NATIVEAGENT_APPLE_ID NATIVE_AGENT_APPLE_ID || exit 1
+release_normalize_env_pair NATIVEAGENT_NOTARIZATION_PASSWORD NATIVE_AGENT_NOTARIZATION_PASSWORD || exit 1
+release_normalize_env_pair NATIVEAGENT_SPARKLE_ED_PRIV_KEY NATIVE_AGENT_SPARKLE_ED_PRIV_KEY || exit 1
+release_normalize_env_pair NATIVEAGENT_SPARKLE_PUBLIC_KEY NATIVE_AGENT_SPARKLE_PUBLIC_KEY || exit 1
+release_normalize_env_pair NATIVEAGENT_PROVISIONING_PROFILE NATIVE_AGENT_PROVISIONING_PROFILE || exit 1
+release_normalize_env_pair NATIVEAGENT_APPCAST_URL NATIVE_AGENT_APPCAST_URL || exit 1
+release_normalize_env_pair NATIVEAGENT_DMG_DOWNLOAD_URL NATIVE_AGENT_DMG_DOWNLOAD_URL || exit 1
+release_normalize_env_pair NATIVEAGENT_RELEASE_PAGE_URL NATIVE_AGENT_RELEASE_PAGE_URL || exit 1
+
 if [[ "$PRINT_ENV_SURFACE" == "true" ]]; then
-  release_normalize_env_pair NATIVEAGENT_DEVELOPER_ID NATIVE_AGENT_DEVELOPER_ID || exit 1
-  release_normalize_env_pair NATIVEAGENT_TEAM_ID NATIVE_AGENT_TEAM_ID || exit 1
-  release_normalize_env_pair NATIVEAGENT_APPLE_ID NATIVE_AGENT_APPLE_ID || exit 1
-  release_normalize_env_pair NATIVEAGENT_NOTARIZATION_PASSWORD NATIVE_AGENT_NOTARIZATION_PASSWORD || exit 1
-  release_normalize_env_pair NATIVEAGENT_SPARKLE_ED_PRIV_KEY NATIVE_AGENT_SPARKLE_ED_PRIV_KEY || exit 1
-  release_normalize_env_pair NATIVEAGENT_SPARKLE_PUBLIC_KEY NATIVE_AGENT_SPARKLE_PUBLIC_KEY || exit 1
-  release_normalize_env_pair NATIVEAGENT_PROVISIONING_PROFILE NATIVE_AGENT_PROVISIONING_PROFILE || exit 1
-  release_normalize_env_pair NATIVEAGENT_APPCAST_URL NATIVE_AGENT_APPCAST_URL || exit 1
-  release_normalize_env_pair NATIVEAGENT_DMG_DOWNLOAD_URL NATIVE_AGENT_DMG_DOWNLOAD_URL || exit 1
-  release_normalize_env_pair NATIVEAGENT_RELEASE_PAGE_URL NATIVE_AGENT_RELEASE_PAGE_URL || exit 1
   release_print_env_surface
   exit 0
 fi
 
-# A1.1/A1.5: run the shipped bundle gates against an EXISTING .app and exit.
-# Builds nothing, signs nothing, notarizes nothing — this exists so the gates
-# can be proven to fire (and to keep firing) without a 20-minute release.
+# Run the bundle gates against an existing app without building or signing.
 if [[ -n "$SELF_TEST_GATES_TARGET" ]]; then
   if [[ ! -d "$SELF_TEST_GATES_TARGET" ]]; then
     echo "ERROR: --self-test-gates target is not a directory: $SELF_TEST_GATES_TARGET" >&2
@@ -252,8 +236,7 @@ if [[ -n "$SELF_TEST_GATES_TARGET" ]]; then
   exit "$_self_test_rc"
 fi
 
-# --dry-run exits before the DMG exists, so an appcast flag there would be
-# silently ignored — the exact "looks like it worked" shape this wave removes.
+# --dry-run exits before the DMG exists, so appcast flags cannot apply.
 if [[ "$DRY_RUN" == "true" && "$GENERATE_APPCAST" == "true" ]]; then
   echo "ERROR: --dry-run stops before the DMG is built, so --appcast/--publish-appcast" >&2
   echo "       cannot run and would be silently ignored." >&2
@@ -262,7 +245,7 @@ if [[ "$DRY_RUN" == "true" && "$GENERATE_APPCAST" == "true" ]]; then
   exit 1
 fi
 
-# RELEASE-2026-05-06: version from single source of truth
+# VERSION is the source of the bare release version.
 VERSION_FILE="$ROOT/VERSION"
 if [[ ! -f "$VERSION_FILE" ]]; then
   echo "ERROR: $VERSION_FILE not found. Create it with a semver string (e.g. 0.2.0)." >&2
@@ -277,59 +260,17 @@ else
   NATIVEAGENT_SOURCE_DIRTY=false
 fi
 
-# ---------------------------------------------------------------------------
-# internal-build-seat-hygiene item 1 (2026-08-21). Aug 19 a local-lane build of
-# 0.4.1 was scp-installed onto the test VM over the shipped 0.4.1. The local
-# lane ships no updater config (by design), so the seat silently left the update
-# train — while the bundle still said "0.4.1", indistinguishable from the
-# release to a human, a dialog, or an audit.
-#
-# Non-publish lanes now suffix the HUMAN-visible CFBundleShortVersionString with
-# -dev.<short8sha>[.dirty]. CFBundleVersion stays BARE on every lane: it is the
-# string Sparkle's comparator reads, and suffixing it would corrupt update
-# ordering. The --publish-appcast lane stamps both bare, and generate_appcast.sh
-# refuses to publish a feed whose enclosure carries the -dev marker.
-#
-# Kept textually identical in build_and_run.sh and install_app.sh (guard-tested).
-# ---------------------------------------------------------------------------
-nativeagent_internal_version_suffix() { # $1 = repo root; echoes "-dev.<sha8>[.dirty]"
-  local root="$1" sha dirty=""
-  sha="$(git -C "$root" rev-parse --short=8 HEAD 2>/dev/null || true)"
-  [[ "$sha" =~ ^[0-9a-f]{8}$ ]] || sha="nogit"
-  if [[ -n "$(git -C "$root" status --porcelain --untracked-files=normal 2>/dev/null || true)" ]]; then
-    dirty=".dirty"
-  fi
-  printf '%s' "-dev.${sha}${dirty}"
-}
+# Internal short versions carry -dev.<sha8>[.dirty]; Sparkle's build version stays bare.
 INTERNAL_BUILD_STAMP="${NATIVEAGENT_INTERNAL_BUILD_STAMP:-1}"
 INTERNAL_VERSION_SUFFIX=""
 if [[ "$PUBLISH_APPCAST" != "true" && "$INTERNAL_BUILD_STAMP" != "0" ]]; then
-  INTERNAL_VERSION_SUFFIX="$(nativeagent_internal_version_suffix "$ROOT")"
+  short_revision="${NATIVEAGENT_SOURCE_REVISION:0:8}"
+  [[ "$short_revision" =~ ^[0-9a-f]{8}$ ]] || short_revision="nogit"
+  INTERNAL_VERSION_SUFFIX="-dev.$short_revision"
+  [[ "$NATIVEAGENT_SOURCE_DIRTY" != true ]] || INTERNAL_VERSION_SUFFIX+=".dirty"
 fi
 EFFECTIVE_SHORT_VERSION="$VERSION$INTERNAL_VERSION_SUFFIX"
-# Forward hook: verify_release_artifact.sh compares CFBundleShortVersionString
-# against the bare VERSION file. Until it honours this variable, a full
-# (notarized) internal build would abort deep inside dmg_builder/verification.
-# Refuse HERE instead — seconds in, with the remediation spelled out — rather
-# than silently reverting to a bundle that impersonates the release.
 export NATIVEAGENT_EXPECTED_SHORT_VERSION="$EFFECTIVE_SHORT_VERSION"
-if [[ -n "$INTERNAL_VERSION_SUFFIX" && "$DRY_RUN" == "false" ]] \
-   && ! grep -q 'NATIVEAGENT_EXPECTED_SHORT_VERSION' "$ROOT/script/verify_release_artifact.sh"; then
-  echo "ERROR: this non-publish lane stamps the internal marker" >&2
-  echo "         CFBundleShortVersionString=$EFFECTIVE_SHORT_VERSION" >&2
-  echo "       but script/verify_release_artifact.sh still requires that key to equal" >&2
-  echo "       the bare VERSION file, so the build would abort during verification." >&2
-  echo "" >&2
-  echo "REMEDIATION — one line in script/verify_release_artifact.sh:" >&2
-  echo "  replace:  require_plist_value \"\$INFO\" \"CFBundleShortVersionString\" \"\$VERSION\"" >&2
-  echo "  with:     require_plist_value \"\$INFO\" \"CFBundleShortVersionString\" \\" >&2
-  echo "              \"\${NATIVEAGENT_EXPECTED_SHORT_VERSION:-\$VERSION}\"" >&2
-  echo "  (CFBundleVersion stays pinned to \$VERSION — do not relax that one.)" >&2
-  echo "" >&2
-  echo "  Or, for this run only, build bare with NATIVEAGENT_INTERNAL_BUILD_STAMP=0" >&2
-  echo "  — accepting that the artifact is indistinguishable from the release." >&2
-  exit 1
-fi
 
 assert_full_release_source_unchanged() {
   [[ "$DRY_RUN" == "false" ]] || return 0
@@ -347,38 +288,15 @@ assert_full_release_source_unchanged() {
 assert_full_release_source_unchanged
 echo "==> NativeAgent release v$VERSION (dry-run=$DRY_RUN)"
 
-# Release-tooling credentials below kept as NATIVEAGENT_* for backward compat
-# (Apple signing creds are user-set; renaming them here would break CI pipelines).
-# Also accept NATIVE_AGENT_ aliases for the signing creds as a forward-compat bridge.
-release_normalize_env_pair NATIVEAGENT_DEVELOPER_ID NATIVE_AGENT_DEVELOPER_ID || exit 1
-release_normalize_env_pair NATIVEAGENT_TEAM_ID NATIVE_AGENT_TEAM_ID || exit 1
-release_normalize_env_pair NATIVEAGENT_APPLE_ID NATIVE_AGENT_APPLE_ID || exit 1
-release_normalize_env_pair NATIVEAGENT_NOTARIZATION_PASSWORD NATIVE_AGENT_NOTARIZATION_PASSWORD || exit 1
-release_normalize_env_pair NATIVEAGENT_SPARKLE_ED_PRIV_KEY NATIVE_AGENT_SPARKLE_ED_PRIV_KEY || exit 1
-release_normalize_env_pair NATIVEAGENT_SPARKLE_PUBLIC_KEY NATIVE_AGENT_SPARKLE_PUBLIC_KEY || exit 1
-release_normalize_env_pair NATIVEAGENT_PROVISIONING_PROFILE NATIVE_AGENT_PROVISIONING_PROFILE || exit 1
-release_normalize_env_pair NATIVEAGENT_APPCAST_URL NATIVE_AGENT_APPCAST_URL || exit 1
 NATIVEAGENT_MAC_BUNDLE_ID="${NATIVEAGENT_MAC_BUNDLE_ID:-io.github.embwl0x.nativeagent.mac}"
 NATIVEAGENT_ICLOUD_CONTAINER_ID="${NATIVEAGENT_ICLOUD_CONTAINER_ID:-iCloud.io.github.embwl0x.nativeagent}"
 NATIVEAGENT_MOBILE_SOURCE_KEY="${NATIVEAGENT_MOBILE_SOURCE_KEY:-mobile_app}"
 NATIVEAGENT_BACKGROUND_TASK_PREFIX="${NATIVEAGENT_BACKGROUND_TASK_PREFIX:-io.github.embwl0x.nativeagent}"
-release_normalize_env_pair NATIVEAGENT_DMG_DOWNLOAD_URL NATIVE_AGENT_DMG_DOWNLOAD_URL || exit 1
-release_normalize_env_pair NATIVEAGENT_RELEASE_PAGE_URL NATIVE_AGENT_RELEASE_PAGE_URL || exit 1
 NATIVEAGENT_RELEASE_PAGE_URL="${NATIVEAGENT_RELEASE_PAGE_URL:-https://github.com/embwl0x/native-agent/releases}"
 NATIVE_AGENT_RELEASE_PAGE_URL="$NATIVEAGENT_RELEASE_PAGE_URL"
 export NATIVEAGENT_RELEASE_PAGE_URL NATIVE_AGENT_RELEASE_PAGE_URL
 
-# A2.1-2026-07-24: the old dry-run fallback stamped
-# an example.com placeholder appcast URL into SUFeedURL. That placeholder
-# shipped in dist/NativeAgent-0.2.0.dmg (confirmed by mounting it), i.e. a real
-# distributed artifact carried a fake update feed. Never synthesize a feed URL.
-#
-# The one place the app's "updates work" claim is decided, and the ONLY place
-# SUFeedURL is stamped: a release that publishes a signed appcast in this same
-# run. --appcast alone is a rehearsal of the signing pipeline (it proves the key
-# and the tooling work) and deliberately produces an app identical to a plain
-# release — no feed URL, updater honestly off. The publish step below is fatal,
-# so a build that asserts the claim either publishes or never ships.
+# Stamp SUFeedURL and the updater claim only for publication in this run; never synthesize a URL.
 if [[ "$PUBLISH_APPCAST" == "true" ]]; then
   NATIVEAGENT_UPDATE_FEED_PUBLISHED=true
   SPARKLE_FEED_URL_STAMP="$NATIVEAGENT_APPCAST_URL"
@@ -450,24 +368,6 @@ if [[ "$DRY_RUN" == "false" ]]; then
     exit 1
   fi
 fi
-# A1.1-2026-08-02: the scrub is the ONLY path to a public DMG.
-#
-# Before: this line hard-FAILED when a public build was started from the private
-# working tree, and the scrubbed export (which has the marker) has no local/
-# directory — local/ is gitignored, so the maintainer entitlements and the
-# provisioning profile never leave the private repo. The notarizable path and
-# the scrubbed path were therefore mutually exclusive in practice, and the way
-# anyone actually got a DMG out was to run this script unscrubbed. 44 Claude
-# refs compiled straight into the public binary.
-#
-# After: a public build started from the private tree is no longer a refusal,
-# it is a two-stage release. This process produces the scrubbed export, then
-# re-runs THIS script inside it with the private signing inputs handed over as
-# absolute paths. The child sees the marker, passes the check below, and does
-# the ordinary sign/notarize/staple/DMG flow on scrubbed source.
-#
-# Private/dev lane (NATIVEAGENT_ICLOUD_BUILD=1|personal, and script/build_and_run.sh)
-# is untouched: it never enters this branch.
 NATIVEAGENT_NEEDS_PUBLIC_SCRUB=false
 if [[ "$NATIVEAGENT_RELEASE_SYNC_MODE" != "personal" ]]; then
   if [[ -f "$ROOT/.nativeagent-public-source" ]]; then
@@ -504,9 +404,7 @@ cleanup_generated_release_entitlements() {
 trap cleanup_generated_release_entitlements EXIT
 if [[ -z "$NATIVEAGENT_RELEASE_ENTITLEMENTS" ]]; then
   if [[ "$NATIVEAGENT_RELEASE_SYNC_MODE" == "personal" ]]; then
-    # Full build: prefer the real local entitlements (real container/team IDs)
-    # over the checked-in template, which carries only EXAMPLE iCloud values
-    # that would mismatch a real profile and get the app killed (gpt-5.5 MED).
+    # Local entitlements carry the real identities; template placeholders cannot match a real profile.
     if [[ -f "$ROOT/local/NativeAgent.entitlements" ]]; then
       NATIVEAGENT_RELEASE_ENTITLEMENTS="$ROOT/local/NativeAgent.entitlements"
     else
@@ -526,13 +424,7 @@ if [[ -z "$NATIVEAGENT_RELEASE_ENTITLEMENTS" ]]; then
   fi
 fi
 
-# A1.1-2026-08-02: stage 1 of the two-stage public release — produce the
-# scrubbed export and re-run this script inside it.
-#
-# Placed AFTER entitlements selection (so the child inherits the resolved,
-# private-tree file) and BEFORE entitlements validation / the Sparkle preflight
-# / the build (so nothing expensive or temp-file-generating has happened yet;
-# the child performs all of it exactly once, on scrubbed source).
+# Resolve private entitlements before export; validation and build run once in the child.
 if [[ "$NATIVEAGENT_NEEDS_PUBLIC_SCRUB" == "true" ]]; then
   _abs_release_path() {
     # Absolutize a path from the private tree so it still resolves after the
@@ -578,10 +470,6 @@ if [[ "$NATIVEAGENT_NEEDS_PUBLIC_SCRUB" == "true" ]]; then
   fi
   "$ROOT/script/check_public_release_source.sh" "$PUBLIC_EXPORT_DIR"
 
-  # The signing inputs live in the private tree (local/ is gitignored and is
-  # deliberately never exported). Handing them over as absolute paths is what
-  # makes the scrubbed source notarizable — the exact coupling whose absence
-  # made the two paths mutually exclusive.
   CHILD_ENTITLEMENTS="$(_abs_release_path "$NATIVEAGENT_RELEASE_ENTITLEMENTS")"
   CHILD_PROFILE="$(_abs_release_path "$NATIVEAGENT_PROVISIONING_PROFILE")"
   CHILD_SPARKLE_KEY="$(_abs_release_path "$NATIVEAGENT_SPARKLE_ED_PRIV_KEY")"
@@ -666,10 +554,7 @@ if [[ "$DRY_RUN" == "false" ]]; then
   assert_full_release_source_unchanged
 fi
 
-# Validate the chosen entitlements up front so a bad file fails BEFORE the slow
-# build+notarize, and enforce the public-build invariant on the ACTUAL file
-# contents, not the mode label (gpt-5.5 HIGH: an override could otherwise sign
-# iCloud entitlements into a profile-less public build → launch-killed app).
+# Validate actual entitlement contents before building; profile-less builds cannot carry iCloud grants.
 # Keep the supplied host profile for the widget gate even when the standalone
 # lane clears the profile used by the rest of the release pipeline.
 RELEASE_WIDGET_HOST_PROFILE="$NATIVEAGENT_PROVISIONING_PROFILE"
@@ -729,7 +614,7 @@ if [[ "$DRY_RUN" == "false" ]]; then
   fi
 fi
 
-# RELEASE-2026-05-06: require env vars; list all missing ones before aborting
+# List all missing release inputs before aborting.
 if [[ "$DRY_RUN" == "false" ]]; then
   REQUIRED_VARS=(
     NATIVEAGENT_DEVELOPER_ID
@@ -737,9 +622,7 @@ if [[ "$DRY_RUN" == "false" ]]; then
     NATIVEAGENT_SPARKLE_ED_PRIV_KEY
     NATIVEAGENT_SPARKLE_PUBLIC_KEY
   )
-  # A2.1: feed URLs are required only when a feed is actually being produced.
-  # A release that publishes nothing must not be forced to name a URL it will
-  # then bake into the app as a promise it cannot keep.
+  # Feed URLs are required only when producing a feed.
   if [[ "$GENERATE_APPCAST" == "true" ]]; then
     REQUIRED_VARS+=( NATIVEAGENT_APPCAST_URL NATIVEAGENT_DMG_DOWNLOAD_URL )
   fi
@@ -796,10 +679,7 @@ if [[ "$DRY_RUN" == "false" ]]; then
     echo "ERROR: NATIVEAGENT_SPARKLE_PUBLIC_KEY must decode to 32 bytes; got $SPARKLE_PUBLIC_KEY_BYTES." >&2
     exit 1
   fi
-  # A2.1 round 2: the public key stamped into the app and the private key the
-  # appcast is signed with are two separate env vars — nothing used to check they
-  # are two halves of ONE key. generate_appcast.sh now proves it, but only after a
-  # 20-minute build+notarize. Prove it here, in a second, before any of that.
+  # Prove the signing key matches the app's public key before building.
   if RELEASE_DERIVED_PUB="$(sparkle_ed_public_key_from_file "$NATIVEAGENT_SPARKLE_ED_PRIV_KEY" "$ROOT")"; then
     if [[ "$RELEASE_DERIVED_PUB" != "$NATIVEAGENT_SPARKLE_PUBLIC_KEY" ]]; then
       echo "ERROR: NATIVEAGENT_SPARKLE_PUBLIC_KEY is NOT the public half of" >&2
@@ -835,7 +715,7 @@ if [[ "$DRY_RUN" == "false" ]]; then
     GENERATED_PUBLIC_CLOUDKIT_ENTITLEMENTS="$(
       mktemp "${TMPDIR:-/tmp}/nativeagent-release-entitlements.XXXXXX"
     )"
-    if ! prepare_public_cloudkit_signing_entitlements \
+    if ! prepare_profile_signing_entitlements \
       "$NATIVEAGENT_RELEASE_ENTITLEMENTS" \
       "$PROFILE_PREFLIGHT" \
       "$GENERATED_PUBLIC_CLOUDKIT_ENTITLEMENTS"; then
@@ -850,9 +730,9 @@ if [[ "$DRY_RUN" == "false" ]]; then
   fi
 fi
 
-# Fail before the release build if the ignored-on-disk CoreML payload is absent,
-# truncated, or has drifted from the required resource manifest.
-echo "==> Verifying required MiniLM source resources..."
+# Verify assembly-declared resources before the build. bge assets are validated by
+# release_prepare_embedding when packaging the release.
+echo "==> Verifying assembly-declared source resources..."
 "$ROOT/script/verify_release_artifact.sh" --verify-resource-source "$ROOT"
 
 # Xcode owns the bundle, helpers, resource bundles, Sparkle and App Intents.
@@ -866,6 +746,7 @@ fi
 ruby "$ROOT/script/sync_build_declarations.rb"
 xcodegen --spec "$ROOT/project.yml"
 DERIVED_DATA="$ROOT/DerivedData/ReleaseBundle"
+BUILD_SOURCE_CONTENT_ID="$(nativeagent_source_content_id "$ROOT")"
 xcodebuild -quiet -jobs 6 \
   -project "$ROOT/$APP_NAME.xcodeproj" -scheme "$APP_NAME" -configuration Release \
   -destination "platform=macOS,arch=$(uname -m)" -derivedDataPath "$DERIVED_DATA" \
@@ -873,6 +754,7 @@ xcodebuild -quiet -jobs 6 \
   ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
   DEPLOYMENT_POSTPROCESSING=NO STRIP_INSTALLED_PRODUCT=NO COPY_PHASE_STRIP=NO \
   NATIVEAGENT_RELEASE_BUILD=YES NATIVEAGENT_STAMP_REPO_PATH=NO \
+  NATIVEAGENT_SOURCE_CONTENT_ID="$BUILD_SOURCE_CONTENT_ID" \
   NATIVEAGENT_MAC_BUNDLE_ID="$NATIVEAGENT_MAC_BUNDLE_ID" \
   NATIVEAGENT_MAC_WIDGET_BUNDLE_ID="$NATIVEAGENT_MAC_WIDGET_BUNDLE_ID" \
   NATIVEAGENT_MAC_APP_GROUP_ID="$NATIVEAGENT_MAC_APP_GROUP_ID" \
@@ -888,20 +770,11 @@ xcodebuild -quiet -jobs 6 \
   NATIVEAGENT_EMBEDDING_MODEL_DIR=/dev/null \
   build
 BUILT_APP="$DERIVED_DATA/Build/Products/Release/$APP_NAME.app"
+[[ "$(nativeagent_source_content_id "$ROOT")" == "$BUILD_SOURCE_CONTENT_ID" ]] \
+  || { echo 'ERROR: source content moved during compilation.' >&2; exit 1; }
 
-# A2.1 round 2 (gpt-5.5 BLOCKING — ordering, second pass): a --publish-appcast
-# build carries NativeAgentUpdateFeedPublished=true + SUFeedURL from the moment it
-# is staged, and stays signed/notarized/stapled for many minutes before the feed
-# can possibly be published (the enclosure signature has to cover the final
-# notarized bytes). Quarantining at the END of that window was not enough: an
-# abort during notarize/staple/verify left a signed, feed-claiming
-# dist/NativeAgent.app (+ .app.zip, + DMG) under its ship-ready name.
-#
-# So the artifacts are BORN in dist/.pending-publish/ and the ship-ready names
-# never exist until publication has been verified live. Quarantine is the resting
-# state; promotion is the only exit. That is why a `set -e` abort, a SIGINT, and a
-# SIGKILL/power loss mid-notarization all leave the same safe state with no
-# cleanup code needing to run. See script/lib/release_quarantine.sh.
+# Publishing artifacts start in quarantine so interruption needs no cleanup to keep them unshippable.
+# Ship-ready names stay absent until generate_appcast.sh verifies the live feed and DMG.
 STAGE_DIR="$ROOT/dist"
 QUARANTINE_DIR="$ROOT/dist/.pending-publish"
 if [[ "$PUBLISH_APPCAST" == "true" ]]; then
@@ -910,7 +783,6 @@ if [[ "$PUBLISH_APPCAST" == "true" ]]; then
   STAGE_DIR="$QUARANTINE_DIR"
 fi
 
-# RELEASE-2026-05-06: step 4 — stage dist/NativeAgent.app
 echo "==> Staging $APP_NAME.app..."
 BUNDLE="$STAGE_DIR/$APP_NAME.app"
 if [[ "$PUBLISH_APPCAST" == "true" ]]; then
@@ -938,20 +810,6 @@ ditto "$BUILT_APP" "$BUNDLE"
   || { echo "ERROR: release bundle contains a REPO_PATH stamp." >&2; exit 1; }
 [[ -s "$BUNDLE/Contents/Resources/Metadata.appintents/extract.actionsdata" ]] \
   || { echo "ERROR: Xcode did not produce Metadata.appintents." >&2; exit 1; }
-
-assert_no_python_artifacts() {
-  local bundle="$1" hit
-  hit="$(find "$bundle/Contents/Resources" \
-    \( -type d \( -name python -o -name __pycache__ -o -name daemon \) \
-       -o -type f \( -name '*.py' -o -name '*.pyc' -o -name '*.pyo' -o -name '*python*' -o -name 'native_agentd.py' \) \
-       -o -type l \( -name '*python*' -o -name 'native_agentd.py' \) \) \
-    -print -quit 2>/dev/null || true)"
-  if [[ -n "$hit" ]]; then
-    echo "[release] ERROR: Python artifact staged in app bundle: $hit" >&2
-    echo "[release] NativeAgent release artifacts must be Swift-native and zero-Python." >&2
-    exit 1
-  fi
-}
 
 # The widget is optional, but both the host and extension must have Developer
 # ID profiles granting their exact identity and shared App Group. Dry-run uses
@@ -1021,8 +879,7 @@ if [[ "${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-bundled}" == separate-download ]]; 
   export NATIVEAGENT_PUBLISH_MODEL_ASSET="$STAGE_DIR/$APP_NAME-$VERSION.embedding.zip"
 fi
 
-# Do not continue to signing when Xcode did not generate and stage the exact
-# MemoryV2 resource bundle expected by Bundle.module and the installed fallback.
+# Require declared source bytes at their assembly destinations before signing.
 "$ROOT/script/verify_release_artifact.sh" \
   --verify-resource-bundle "$BUNDLE/Contents/Resources"
 
@@ -1034,7 +891,7 @@ assert_full_release_source_unchanged
 plutil -lint "$BUNDLE/Contents/Info.plist" >/dev/null \
   || { echo "ERROR: Xcode Info.plist is malformed." >&2; exit 1; }
 
-# A2.1: the updater claim must match the mode this release actually ran in.
+# Verify the staged updater claim matches this release's publication mode.
 STAMPED_FEED_PUBLISHED="$(/usr/libexec/PlistBuddy -c "Print :NativeAgentUpdateFeedPublished" "$BUNDLE/Contents/Info.plist" 2>/dev/null || true)"
 [[ "$STAMPED_FEED_PUBLISHED" == "$NATIVEAGENT_UPDATE_FEED_PUBLISHED" ]] \
   || { echo "ERROR: NativeAgentUpdateFeedPublished stamped '$STAMPED_FEED_PUBLISHED', expected '$NATIVEAGENT_UPDATE_FEED_PUBLISHED'." >&2; exit 1; }
@@ -1045,10 +902,7 @@ if [[ "$PUBLISH_APPCAST" == "false" ]]; then
   fi
 fi
 
-# internal-build-seat-hygiene item 1: prove what was actually stamped, rather
-# than trusting the build settings. CFBundleVersion is Sparkle's comparator key and is
-# bare on EVERY lane; the publish lane must additionally carry a bare short
-# version, or a build that impersonates nothing would still ship as a release.
+# Verify staged versions: Sparkle's CFBundleVersion stays bare; only internal short versions carry a suffix.
 STAMPED_BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$BUNDLE/Contents/Info.plist" 2>/dev/null || true)"
 STAMPED_SHORT_VERSION="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$BUNDLE/Contents/Info.plist" 2>/dev/null || true)"
 [[ "$STAMPED_BUNDLE_VERSION" == "$VERSION" ]] \
@@ -1082,40 +936,17 @@ fi
 echo "==> Normalizing public bundle permissions..."
 chmod -R u+rwX,go+rX "$BUNDLE"
 chmod -R go-w "$BUNDLE"
-assert_no_python_artifacts "$BUNDLE"
+nativeagent_assert_no_python_artifacts "$BUNDLE" '[release]' staged release
 "$ROOT/script/verify_release_artifact.sh" \
   --verify-no-derived-context-state "$BUNDLE/Contents/Resources"
 
-# PUBLIC-RELEASE LEAK GUARD: a release bundle must contain ZERO developer
-# personal data, ZERO credential-looking values, ZERO live runtime state, and
-# ZERO local-agent identity defaults in app-owned resources. The guard itself
-# lives in script/lib/release_bundle_gates.sh (release_assert_no_leaked_data)
-# so `./script/release.sh --self-test-gates <app>` can prove it fires without
-# running a full release. Runs after ALL staging, before codesign — a
-# tampered/regressed persona step aborts the release instead of shipping the
-# developer's data.
+# Content leaks fail after all staging and before signing.
 release_assert_no_leaked_data "$BUNDLE" "$PRODUCT" "$ROOT" || exit 1
 
-# A1.1-2026-08-02 — COMPILED-BINARY LEAK GATE. The guard above only inspects the
-# executable using an ignored maintainer denylist. Public release preflight
-# requires that input, so the scan cannot silently degrade while public source
-# never embeds the private identities it rejects.
-#
-# A1.5-2026-08-02 — BUNDLE ASSERTION. The state check above is scoped to
-# Contents/Resources and stops at the first hit; this one walks the WHOLE
-# bundle and names every data/ dir, trust/policy.json, providers/surfaces.json
-# or user store it finds.
-#
-# Both run after ALL staging and before codesign, so a failure aborts the
-# release with nothing signed. See script/lib/release_bundle_gates.sh.
-#
-# SCOPE: the identity gate is a PUBLIC-lane gate. A `personal` build is the
-# maintainer's own instance, where these names are the product, not a leak —
-# failing it there would break the private release lane. Everything reaching
-# this point in a public lane was built from the scrubbed export (enforced
-# above), so the gate is asserting that the scrub actually worked. The A1.5
-# bundle assertion applies to EVERY lane: no build of any kind should carry a
-# writable store inside its signed bundle.
+# The compiled-binary identity gate requires the maintainer denylist in public
+# lanes; the personal lane keeps its own identity. The whole-bundle assertion
+# owns recursive store and top-level resource-path exclusion in every lane,
+# with the documented CoreML Data exemption.
 _gate_rc=0
 if [[ "$NATIVEAGENT_RELEASE_SYNC_MODE" != "personal" ]]; then
   release_assert_no_identity_strings "$BUNDLE" || _gate_rc=1
@@ -1139,13 +970,10 @@ release_archive_symbols_and_strip \
   "$RELEASE_SYMBOL_ARCHIVE_DIR" \
   "$PRODUCT"
 
-# RELEASE-2026-05-06: step 5 — codesign
 echo "==> Codesigning..."
 sign_nested_plain() {
   local identity="$1"
   local timestamp_arg="${2:---timestamp}"
-  codesign --force --sign "$identity" --options runtime "$timestamp_arg" \
-    "$BUNDLE/Contents/MacOS/codex"
   if [[ -d "$BUNDLE/Contents/PlugIns/NativeAgentWidget.appex" ]]; then
     codesign --force --sign "$identity" --options runtime "$timestamp_arg" \
       --generate-entitlement-der --entitlements "$RELEASE_WIDGET_WORK/widget.entitlements" \
@@ -1221,7 +1049,6 @@ codesign --sign "$NATIVEAGENT_DEVELOPER_ID" \
   --force --timestamp \
   "$BUNDLE"
 
-# RELEASE-2026-05-06: step 6 — create notarization zip
 echo "==> Creating notarization zip..."
 rm -f "$STAGE_DIR/$APP_NAME.app.zip"
 ditto -c -k --keepParent "$BUNDLE" "$STAGE_DIR/$APP_NAME.app.zip"
@@ -1233,38 +1060,25 @@ else
   NOTARY_AUTH=( --apple-id "$NATIVEAGENT_APPLE_ID" --password "$NATIVEAGENT_NOTARIZATION_PASSWORD" --team-id "$NATIVEAGENT_TEAM_ID" )
 fi
 
-# RELEASE-2026-05-06: step 7 — notarize
 echo "==> Submitting for notarization (this may take several minutes)..."
 xcrun notarytool submit "$STAGE_DIR/$APP_NAME.app.zip" \
   "${NOTARY_AUTH[@]}" \
   --wait
 
-# RELEASE-2026-05-06: step 8 — staple
 echo "==> Stapling notarization ticket..."
 xcrun stapler staple "$BUNDLE"
 
-# RELEASE-2026-05-06: step 9 — verify
 echo "==> Verifying..."
 spctl -a -vvv -t execute "$BUNDLE"
 stapler validate "$BUNDLE"
 
-# RELEASE-2026-05-06: step 10 — build DMG
-# A2.1 round 2: built into STAGE_DIR, which is the quarantine dir for a
-# --publish-appcast run, so the ship-ready dist/*.dmg name never exists before
-# the feed is verified live. (dmg_builder also removes its populated temp image
-# on every exit path, so no mountable leftover survives a failed convert.)
 echo "==> Building DMG..."
 NATIVEAGENT_DMG_BUNDLE="$BUNDLE" NATIVEAGENT_DMG_OUT_DIR="$STAGE_DIR" \
   "$ROOT/script/dmg_builder.sh"
 
 DMG_PATH="$STAGE_DIR/$APP_NAME-$VERSION.dmg"
 
-# CROSS-VERSION MOUNT FIX (2026-07-04): when the DMG is intentionally UNSIGNED
-# (NATIVEAGENT_SKIP_DMG_SIGN=1) so it mounts on older macOS, skip DMG-level
-# notarize/staple (an unsigned DMG can't be stapled, and doesn't need to be —
-# the APP inside is already notarized + stapled, which is what Gatekeeper checks
-# at launch). Still prove that the mounted app carries a valid notarization
-# ticket; only the unsigned wrapper is exempt from DMG-level validation.
+# An unsigned DMG supports older macOS and cannot be stapled; its mounted app still needs a valid ticket.
 if [[ "${NATIVEAGENT_SKIP_DMG_SIGN:-0}" == "1" ]]; then
   echo "==> Unsigned DMG (NATIVEAGENT_SKIP_DMG_SIGN=1) — skipping DMG notarize/staple."
   "$ROOT/script/verify_release_artifact.sh" \
@@ -1330,16 +1144,9 @@ fi
 export NATIVEAGENT_PUBLISH_ATTESTATION="$RELEASE_ATTESTATION"
 export NATIVEAGENT_PUBLISH_TEST_RECEIPT="$STAGED_TEST_RECEIPT"
 
-# A2.1-2026-07-24: step 10b — generate + EdDSA-sign the Sparkle appcast, and
-# publish it when asked. This runs AFTER notarize/staple so the enclosure length
-# and signature cover the exact bytes users download. It is fatal on failure:
-# the app in this DMG already claims NativeAgentUpdateFeedPublished=true when
-# --publish-appcast was passed, so a release that cannot publish must not ship.
+# Sign the appcast after notarizing and stapling so it covers the final download bytes.
 if [[ "$GENERATE_APPCAST" == "true" ]]; then
   APPCAST_ARGS=( --dmg "$DMG_PATH" --version "$VERSION" )
-  # Sweep R4 C12 — release notes seam. --notes wins; the conventional
-  # docs/release-notes/<version>.md is the zero-flag path. Nothing is
-  # synthesized: with no file the Sparkle dialog stays blank as before.
   if [[ -z "$RELEASE_NOTES_FILE" && -f "$ROOT/docs/release-notes/$VERSION.md" ]]; then
     RELEASE_NOTES_FILE="$ROOT/docs/release-notes/$VERSION.md"
     echo "==> Release notes: $RELEASE_NOTES_FILE (conventional path)"
@@ -1364,11 +1171,6 @@ if [[ "$GENERATE_APPCAST" == "true" ]]; then
   "$ROOT/script/generate_appcast.sh" "${APPCAST_ARGS[@]}"
 fi
 
-# A2.1 round 2 — step 10c: the ONLY exit from quarantine. Reached only when
-# generate_appcast.sh --publish confirmed (by fetching them) that the feed and the
-# DMG are live at the URLs stamped into this build. Anything that stops the script
-# before this line leaves the artifacts in dist/.pending-publish/, i.e. nothing
-# shippable and nothing named dist/*.dmg.
 if [[ "$PUBLISH_APPCAST" == "true" ]]; then
   echo "==> Feed verified live — promoting artifacts out of quarantine into dist/"
   release_quarantine_promote "$QUARANTINE_DIR" "$ROOT/dist"
@@ -1378,13 +1180,7 @@ if [[ "$PUBLISH_APPCAST" == "true" ]]; then
     || { echo "ERROR: promotion did not land $DMG_PATH; artifacts remain in $QUARANTINE_DIR." >&2; exit 1; }
 fi
 
-# RELEASE-2026-05-28: step 11 — refresh the shared local-test DMG so the
-# other macOS user account can install the latest build without a manual
-# copy. /Users/Shared is readable by every user account on the machine, so
-# this is the cross-user hand-off path. Naming matches the existing
-# convention the install flow already expects ($APP_NAME-$VERSION-local-test).
-# Guarded (if/else, not bare cp) so a copy failure can't abort an otherwise
-# successful, already-notarized release under `set -e`.
+# The cross-user DMG copy is best-effort; failure cannot abort a completed release.
 SHARED_DMG="/Users/Shared/$APP_NAME-$VERSION-local-test.dmg"
 echo "==> Refreshing shared DMG for cross-user install: $SHARED_DMG"
 if cp -f "$DMG_PATH" "$SHARED_DMG"; then

@@ -1,9 +1,10 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import Connectors
 import PersistenceCore
 import TrustCenter
-// Blueprint: | `EngineConnectors.swift` | ConnectorStatusProjection workspace/action reads publish through LatestRead; committed workspace additions publish their own checked result through write; native connector execution supplies its engine root and originating `ToolsFacade.withPartDoor` before calling the domain; no second connector facade or account snapshot. |
+// Blueprint: | `EngineConnectors.swift` | ConnectorReadiness workspace/action reads publish through LatestRead; committed workspace additions publish their own checked result through write; native connector execution supplies its engine root and originating `ToolsFacade.withPartDoor` before calling the domain; no second connector facade or account snapshot. |
 
 extension NativeAgentEngine {
     /// Native connector entry; turns already carry their own door.
@@ -18,7 +19,7 @@ extension NativeAgentEngine {
 
 /// Workspace and action reads share the engine's connector owner.
 @MainActor
-extension ConnectorStatusProjection {
+extension ConnectorReadiness {
     @discardableResult
     public func refreshWorkspaces() async throws -> [WorkspaceRecord] {
         let result: Result<[WorkspaceRecord], Error> = await workspacesRead.read({

@@ -11,11 +11,7 @@ import Senses
 
 extension SwiftToolDispatcher {
 
-    /// 2026-09-06: the same sensitive-subtree fence the Full Mac file tools
-    /// apply. Full Mac being OFF chose these basic readers instead, and they
-    /// checked nothing — `data/secrets`, `data/providers` and `data/trust` are
-    /// reachable through the repo sandbox because `data` is an allowed top
-    /// level. Turning a capability off must not open a subtree.
+    /// Basic reads retain the same sensitive-subtree fence as Full Mac reads.
     func requireNonSensitiveReadPath(_ url: URL, tool: String) throws {
         guard connectorPathIsSensitiveData(url, dataRoot: dataRoot) else { return }
         throw AutonomyGateError.toolDenied(
@@ -25,36 +21,47 @@ extension SwiftToolDispatcher {
         )
     }
 
-    func impl_read_file(input: [String: JSONValue]) async throws -> JSONValue {
-        let path = try requireString(input, "path")
-        let url = try await resolveTrustedFilePath(path)
-        try requireNonSensitiveReadPath(url, tool: "read_file")
-        var patchedInput = input
-        patchedInput["path"] = .string(url.path)
-        let ctx = ConnectorActionContext(repoRoot: url.deletingLastPathComponent().path, dataRoot: dataRoot.path)
-        let fileInput = patchedInput
-        if FileReadSourceMaterial.metadataOnly {
-            guard let result = LocalConnectorActions.fileSystemDefault.run("read_file", input: fileInput, ctx: ctx) else {
-                throw AutonomyGateError.toolDenied(reason: "read_file has no Swift local connector implementation")
-            }
-            return result
-        }
-        let nativeReadSupported = FileReadSourceMaterial.nativeReadSupported(path: url.path)
-        let result = try await SenseDoor.read(corner: .fileKind(url.pathExtension.lowercased()), address: url.path, input: input,
-            scope: ChatToolSessionContext.verifiedSessionId ?? "",
-            nativeReadSupported: nativeReadSupported,
-            fileAlreadyReadable: nativeReadSupported,
-            raw: {
+    func impl_read_file(input: [String: JSONValue], surface: String? = nil) async throws -> JSONValue {
+        let fullMac = if let surface { await fullMacToolAccess(surface: surface).fileOpsAllowed } else { false }
+        let path: String, address: String
+        let raw: @Sendable () async throws -> JSONValue
+        if fullMac, let surface {
+            path = input["path"]?.stringValue ?? ""
+            address = path
+            raw = { try await self.impl_local_connector_tool(tool: "read_file", input: input, surface: surface) }
+        } else {
+            path = try requireString(input, "path")
+            let url = try await resolveTrustedFilePath(path)
+            try requireNonSensitiveReadPath(url, tool: "read_file")
+            address = url.path
+            let fileInput = input.merging(["path": .string(url.path)]) { _, new in new }
+            let ctx = ConnectorActionContext(repoRoot: url.deletingLastPathComponent(), dataRoot: dataRoot)
+            raw = {
                 guard let result = LocalConnectorActions.fileSystemDefault.run("read_file", input: fileInput, ctx: ctx) else {
                     throw AutonomyGateError.toolDenied(reason: "read_file has no Swift local connector implementation")
                 }
                 return result
-            }, material: { try Self.senseFileMaterial($0) })
+            }
+        }
+        if FileReadSourceMaterial.metadataOnly { return try await raw() }
+        let nativeReadSupported = FileReadSourceMaterial.nativeReadSupported(path: address)
+        let result = try await SenseDoor.read(corner: .fileKind(URL(fileURLWithPath: address).pathExtension.lowercased()), address: address, input: input,
+            scope: ChatToolSessionContext.verifiedSessionId ?? "",
+            nativeReadSupported: nativeReadSupported,
+            fileAlreadyReadable: nativeReadSupported,
+            raw: raw, material: { try Self.senseFileMaterial($0) })
         if input["raw"] == .bool(true) || input["wrong"] == .bool(true) || SenseDoor.readingRaw { return result }
-        if case .object(let object) = result,
-           let pathMiss = await filePathMissEnvelope(tool: "read_file", input: input, resultObject: object) {
+        guard case .object(let object) = result else { return result }
+        if fullMac {
+            if object["ok"] == .bool(false), object["raw"] != nil, object["sense_provenance"] != nil { return result }
+            if case .string? = object["content"] { return Self.fileReadPresentation(result, callerPath: path) }
+            if case .string(let code)? = object["error_code"],
+               ["file_changed", "bad_input", "window_too_small", "continuation_unavailable", "read_failed", "unsupported_file_type"].contains(code) { return result }
+        }
+        if let pathMiss = filePathMissEnvelope(tool: "read_file", input: input, resultObject: object) {
             return pathMiss
         }
+        if fullMac, case .string(let error)? = object["error"] { throw AutonomyGateError.toolDenied(reason: error) }
         return Self.fileReadPresentation(result, callerPath: path)
     }
 
@@ -68,9 +75,7 @@ extension SwiftToolDispatcher {
         return .object(object)
     }
 
-    /// No path, or an empty one, lists the folder a relative path starts
-    /// from, exactly as "." does (2026-10-09: `{"path": ""}` was refused, then
-    /// `"."` listed). Reads and writes still refuse an empty path.
+    /// Missing or empty listing paths mean "."; reads and writes require nonempty paths.
     static func listDirInput(_ input: [String: JSONValue]) -> [String: JSONValue] {
         switch input["path"] {
         case nil, .null?: break
@@ -92,8 +97,8 @@ extension SwiftToolDispatcher {
         // fences. Share the bounded listing implementation without invoking
         // the Full Mac-only connector route or widening the approved roots.
         let ctx = ConnectorActionContext(
-            repoRoot: tool == "file_info" ? url.deletingLastPathComponent().path : url.path,
-            dataRoot: dataRoot.path
+            repoRoot: tool == "file_info" ? url.deletingLastPathComponent() : url,
+            dataRoot: dataRoot
         )
         guard let result = LocalConnectorActions.fileSystemDefault.run(
             tool, input: patchedInput, ctx: ctx
@@ -118,14 +123,15 @@ extension SwiftToolDispatcher {
         let input = tool == "list_dir" ? Self.listDirInput(input) : input
         do {
             let result = try await FileReadSourceMaterial.$metadataOnly.withValue(true) {
+                if tool == "read_file" { return try await self.impl_read_file(input: input, surface: surface) }
                 if await self.fullMacToolAccess(surface: surface).fileOpsAllowed || tool == "file_excerpt" {
                     return try await self.impl_local_connector_tool(tool: tool, input: input, surface: surface)
                 }
-                return tool == "read_file" ? try await self.impl_read_file(input: input) : try await self.impl_file_metadata(tool: tool, input: input)
+                return try await self.impl_file_metadata(tool: tool, input: input)
             }
             return ChatToolOutcome.outputLooksSuccessful(result) ? nil : ChatToolOutcome.normalizedFailure(result, tool: tool)
         } catch {
-            if let need = fileOpsNeedEnvelope(tool: tool, mode: .read, path: jsonString(input["path"]), error: error) { return need }
+            if let need = fileOpsNeedEnvelope(tool: tool, mode: .read, path: input["path"]?.stringValue, error: error) { return need }
             return ChatToolOutcome.failure(error: error, tool: tool)
         }
     }
@@ -133,30 +139,28 @@ extension SwiftToolDispatcher {
     func impl_trusted_file_mutation(tool: String, input: [String: JSONValue], attachment: (filename: String, data: Data)? = nil) async throws -> JSONValue {
         let path = try requireString(input, "path")
         if tool == "write_file" { _ = try requireString(input, "content") }
-        let url = try await resolveTrustedFilePath(path, includeRepoSandbox: false)
         let roots = await trustedWorkspaceRoots()
-        let workspaceRoot = NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
+        let url = try await resolveTrustedFilePath(path, includeRepoSandbox: false, trustedRoots: roots)
         if ["move_file", "copy_file"].contains(tool) {
-            _ = try await resolveTrustedFilePath(requireString(input, "destination"), includeRepoSandbox: false)
+            _ = try await resolveTrustedFilePath(requireString(input, "destination"), includeRepoSandbox: false, trustedRoots: roots)
         }
         let ctx = ConnectorActionContext(
-            repoRoot: "",
+            repoRoot: nil,
             fileAccess: [
                 "mode": .string("workspace"),
                 "sandbox": .string("workspace"),
             ],
-            dataRoot: dataRoot.path,
-            extraAllowedRoots: roots.map(\.path),
-            personaRoot: PersonaRootResolver.resolve().path,
-            workspaceRoot: workspaceRoot.path
+            dataRoot: dataRoot,
+            extraAllowedRoots: roots,
+            personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot),
+            workspaceRoot: NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
         )
         if let attachment {
             var attachmentInput = input
             attachmentInput["path"] = .string(url.path)
             return LocalConnectorActions.saveAttachment(attachment, input: attachmentInput, ctx: ctx)
         }
-        // Pass the original spelling: the I/O handler uses the same resolver
-        // as containment, without reinterpreting an already resolved alias.
+        // I/O keeps the caller's spelling and this operation's admitted roots.
         guard let result = LocalConnectorActions.fileSystemDefault.run(
             tool,
             input: input,

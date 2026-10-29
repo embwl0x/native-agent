@@ -1,25 +1,19 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 import CognitiveSubstrate
+import TrustCenter
+import Transcripts
 // Blueprint: | `DreamCycleRunner.swift` | `DreamCycleRunner` actor; `runNightlyDreamCycle`, `reconcileDreamMark` repairs the mark from saved section cutoffs under the run reservation; `integrateMood`, `retryMoodIntegration`, `affectJudgment(inDiaryMarkdown:)` |
 
-// DreamCycleRunner — Swift replacement for the retired daemon nightly
-// reflective-journal pass. Merges the recent stretch of user/assistant messages
-// across ALL chat sessions (chronological, capped, only what's NEW since the
-// last dream via the .dream_state.json high-water mark), asks the configured
-// LLM with selected persona context to write ONE one-paragraph episodic dream,
-// and writes it to
-// <dataRoot>/dream_diary/<YYYY-MM-DD>.md (one file per calendar day; a later
-// run with new material adds a section to it; replaced only on `force`). The
-// old one-dream-PER-SESSION scheme is gone (2026-06-16).
+// Writes cross-session dreams to <dataRoot>/dream_diary/<YYYY-MM-DD>.md.
 
 public actor DreamCycleRunner {
     let dataRoot: URL
     private let personaRoot: URL
     private let llm: any LLMClient
-    private let router: any ProviderRoutingProtocol
     private let now: @Sendable () -> Date
     private let recencyWindow: TimeInterval
     private let memoryDeltaProvider: DreamMemoryDeltaProvider
@@ -33,14 +27,13 @@ public actor DreamCycleRunner {
     private let gate: DreamREMGatePolicy?
     let fm = FileManager.default
 
-    // Dream feeding caps (mirror the daemon's `_DREAM_*_BUDGET` constants
-    // pinned by the vault skill). Newest-message-first; tool calls excluded.
+    // Dream feeding caps: newest-message-first; tool calls excluded.
     private static let deltaCharBudget: Int = 20_000
     private static let deltaCountLimit: Int = 150
     // Felt-tone section: the substrate already bounds its summary to 600 chars;
     // this is the runner-side belt-and-suspenders ceiling on that same section.
     private static let feltCharBudget: Int = 600
-    // Studio citation (desk 903 phase 2). The dream's felt line names the
+    // Studio citation. The dream's felt line names the
     // journal entries the feeling came from, so the causal chain runs from the
     // dream artifact back to the entry that caused it. Same node ceiling the
     // substrate's felt-day summary uses, and ids are bounded because they come
@@ -55,7 +48,6 @@ public actor DreamCycleRunner {
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         personaRoot: URL? = nil,
         llm: any LLMClient,
-        router: any ProviderRoutingProtocol = SwiftNativeProviderRouting(),
         recencyWindow: TimeInterval = 24 * 60 * 60,
         memoryDeltaProvider: @escaping DreamMemoryDeltaProvider = { _ in [] },
         feltSummaryProvider: @escaping DreamFeltSummaryProvider = { nil },
@@ -70,7 +62,6 @@ public actor DreamCycleRunner {
         self.personaRoot = personaRoot
             ?? PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
         self.llm = llm
-        self.router = router
         self.recencyWindow = recencyWindow
         self.memoryDeltaProvider = memoryDeltaProvider
         self.feltSummaryProvider = feltSummaryProvider
@@ -82,38 +73,8 @@ public actor DreamCycleRunner {
         self.now = now
     }
 
-    /// `force` re-dreams the recent window, re-reading the last
-    /// `recencyWindow` and ignoring the high-water mark, and replaces the
-    /// target day's entry whole. It does NOT bypass the trust gate — mirrors
-    /// how `runWeeklyREM(force:)` treats its weekly marker.
-    ///
-    /// MODEL (2026-06-16/17, the user): ONE dream per night at 03:30 Mac-local time,
-    /// written under the previous local calendar date and reflecting the
-    /// recent stretch of life — the last `convCountLimit` user/assistant
-    /// messages merged across ALL sessions in chronological order, bounded to
-    /// what's NEW since the last dream (the high-water mark in
-    /// `.dream_state.json`).
-    /// Replaces the old one-dream-PER-SESSION walk, which split a single day
-    /// into N entries (one per touched session, so a 9-line "three heys"
-    /// session produced its own full dream) AND re-dreamed stale sessions on
-    /// consecutive nights whenever their file mtime stayed inside the 24h
-    /// window — manufacturing fake multi-date "evidence" for REM.
-    ///
-    /// `trigger` records WHO woke this pass and picks the target day. The
-    /// scheduled 03:30 run writes the local day that just ended (unchanged).
-    /// A manual run happens mid-life, so it writes the day it is
-    /// dreaming ABOUT — the current local day — which is the same entry the
-    /// NEXT 03:30 job targets.
-    ///
-    /// Each saved section records its consumed cutoff; `.dream_state.json`
-    /// carries the high-water mark, repaired from those sections after a crash. A run
-    /// with new material since the mark always dreams it, whatever files
-    /// exist: when the target day's entry is already there, the new dream is
-    /// added to it as a further section and nothing in it is overwritten. The
-    /// old rule — the entry's existence is the dedupe, skip `already_dreamt` —
-    /// lost a whole day: a failed 03:30 run, then a manual pass writing the
-    /// current day, made the NEXT night's run for that day find the file and
-    /// skip with a day of new rows waiting past the mark.
+    /// Reflects new user/assistant messages across sessions in chronological order.
+    /// `force` rereads `recencyWindow` and replaces the target day's entry without bypassing Trust.
     public func runNightlyDreamCycle(
         force: Bool = false,
         trigger: DreamTrigger = .schedule
@@ -126,22 +87,12 @@ public actor DreamCycleRunner {
         let dateKey = entryDateKey(for: trigger)
         let outPath = diaryDir.appendingPathComponent("\(dateKey).md")
 
-        // 2026-09-06: when a previous run's mood sink reported the integration
-        // was not durable it RELEASED the day's claim so a later run could
-        // retry. The entry on disk carries the `_Affect: …_` line the sink was
-        // given, and the substrate's per-night claim makes a repeat harmless,
-        // so a run that finds the day's entry retries from it before dreaming on.
+        // Retry the saved affect before dreaming; per-night claims prevent duplicate effects.
         if !force, fm.fileExists(atPath: outPath.path) {
             await retryMoodIntegration(from: outPath, in: diaryDir, dateKey: dateKey)
         }
 
-        // ONE dream run at a time (2026-09-06). The mark is read and the model
-        // awaited minutes before the commit below, so two runs (the 03:30 job
-        // and a manual one, or two clients) would both dream the same material
-        // past the same mark, and the unlocked high-water read-modify-write
-        // could lose an advance. A run that cannot take the reservation exits
-        // here having written nothing; the reservation is released on every
-        // exit path, and a crashed run's flock is released by the kernel.
+        // One run holds the reservation from mark reconciliation through diary and mark commit.
         try? fm.createDirectory(at: diaryDir, withIntermediateDirectories: true)
         let reservation: DreamRunReservation?
         do {
@@ -173,7 +124,7 @@ public actor DreamCycleRunner {
                 + "repair the unreadable diary or high-water mark before retrying")
             return report
         }
-        let feltOrigins: [DreamFeltOrigin]
+        let feltOrigins: [CognitiveFeltOrigin]
         do {
             feltOrigins = try await feltOriginProvider()
         } catch {
@@ -229,11 +180,8 @@ public actor DreamCycleRunner {
         let careNight = await careNightProvider()
         let citedStudioEntryIDs = Self.studioEntryCitations(
             from: feltOrigins, feltSummary: feltSummary)
-        let dreamSystem = Self.dreamSystemPrompt(personaDocs: personaDocs)
-        // Use the lane preference, including its unattended default or explicit pin.
-        let pickedModel = await router.modelStringForSurface("dream")
-
-        let prompt = buildCombinedPrompt(
+        let dreamSystem = try Self.dreamSystemPrompt(personaDocs: personaDocs)
+        let prompt = try buildCombinedPrompt(
             dateKey: dateKey,
             messages: messages, memoryDeltas: memoryDeltas, feltSummary: feltSummary,
             careBlock: careNight?.block ?? "",
@@ -246,28 +194,13 @@ public actor DreamCycleRunner {
                 try await llm.complete(
                     prompt: prompt.text,
                     system: dreamSystem,
-                    model: pickedModel,
-                    surface: "dream", purpose: "dream"
+                    model: nil,
+                    surface: "dream", purpose: "dream", tools: nil
                 )
             }
         } catch {
             report.errors.append("llm error: \(error)")
-            if ProviderFailure.classify(error) == .authExpired {
-                let provider: String? = if case LLMError.authRejected(let provider, _) = error { provider }
-                    else { await llm.servingProviderID(model: pickedModel, surface: "dream") }
-                let account: String? = switch provider {
-                case "openai_oauth_direct", "codex": "ChatGPT"
-                case "anthropic_oauth_direct": "Claude"
-                case "xai_oauth_direct": "xAI Grok"
-                default: nil
-                }
-                if let account {
-                    let signedIn = NativeOAuthFlow.signInStatus(providerID: provider ?? "", dataRoot: dataRoot).isSignedIn
-                    let control = signedIn ? "Re-authenticate \(account)" : "Sign in with \(account)"
-                    report.repair = Repair.remedy(owner: (provider ?? "dream provider") + " authorization", nextCall: nil,
-                        tap: "Providers > Sign in, reconnect or add an account > \(account) > \(control)")
-                }
-            }
+            report.repair = (error as? ProviderFailure.Diagnostic)?.repair?.remedy()
             return report
         }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -284,8 +217,7 @@ public actor DreamCycleRunner {
         }
         // The day's entry as it stands. A non-force run adds its dream to it as
         // a further section, never touching what is there; `force` replaces it
-        // whole. Either way a later high-water failure restores exactly this
-        // rather than leaving a half-committed write.
+        // whole. Its committed footer is the recovery source for the mark.
         let previousDiary: Data?
         if fm.fileExists(atPath: outPath.path) {
             do {
@@ -308,43 +240,13 @@ public actor DreamCycleRunner {
         // Only the footer this writes is a cutoff: the same words in what the model wrote are defused.
         ).replacingOccurrences(of: Self.consumedFooter, with: "<!-- dream consumed through: ")
             + "\n" + Self.consumedFooter + "\(NativeTimestampFormat.fractionalZulu(newestIncluded)) -->\n"
-        // A timed-out scheduler body is cancel()ed and abandoned; the LLM call
-        // above honors cancellation, but a body that already got its response
-        // could still fall through to commit this diary artifact. Bail before
-        // any artifact write in this runner so a cancelled dream leaves no diary
-        // directory/file and does NOT advance the high-water mark below.
-        try Task.checkCancellation()
-        if !fm.fileExists(atPath: diaryDir.path) {
-            do {
-                try fm.createDirectory(at: diaryDir, withIntermediateDirectories: true)
-            } catch {
-                report.errors.append("dream_diary mkdir failed: \(error)")
-                return report
-            }
+        // Returned writing is settlement, even when Stop raced the response.
+        let saved = await settle {
+            await self.commitDream(markdown, at: outPath, previousDiary: previousDiary,
+                                   addsSection: addsSection, consumedThrough: newestIncluded)
         }
-
-        do {
-            let entry = addsSection ? previousDiary! + Data(("\n" + markdown).utf8) : Data(markdown.utf8)
-            try entry.write(to: outPath, options: [.atomic])
-        } catch {
-            report.errors.append("write error: \(error)")
-            return report
-        }
-        // Advance the mark forward-only to the newest message that fed this
-        // dream so the next run starts strictly after it. The diary and mark are
-        // one recoverable commit: the section's cutoff repairs a crash between
-        // writes. On a reported write error, restore the prior entry instead.
-        do {
-            try advanceDreamMark(to: newestIncluded)
-        } catch {
-            report.errors.append("high-water mark write error: \(error)")
-            do {
-                try rollbackDiary(at: outPath, previousDiary: previousDiary)
-            } catch {
-                report.errors.append("diary rollback error: \(error)")
-            }
-            return report
-        }
+        report.errors += saved.errors
+        guard saved.written else { return report }
         report.entriesWritten += 1
         report.reflectionMaterial = sourceMaterial
         report.reflectionMaterial["dream_diary/\(dateKey).md"] = CognitiveReflectionCause(
@@ -352,10 +254,7 @@ public actor DreamCycleRunner {
         report.careNight = careNight.map {
             CognitiveCareNight(block: $0.block, keys: $0.keys, answers: payload.cares, source: "dream_diary/\(dateKey).md")
         }
-        // Change-only: a dream whose feeling owes nothing to the journal emits
-        // NO receipt at all — the ordinary case must not become the loudest
-        // thing in the ledger. Fired after the entry committed, for the same
-        // reason the mood sink is: a dream that never happened cites nothing.
+        guard !Task.isCancelled else { return report }
         if !citedStudioEntryIDs.isEmpty {
             await receiptSink(Self.studioCitationReceiptKind, .object([
                 "date": .string(dateKey),
@@ -363,28 +262,33 @@ public actor DreamCycleRunner {
                 "entries": .array(citedStudioEntryIDs.map { .string($0) }),
             ]))
         }
-        // The dream's own felt tone flows back into her slow disposition layer —
-        // AFTER the entry committed, so a cancelled/failed/no-op dream can never
-        // move her. The optional affect value is her judgment from that same call;
-        // the mood phrase remains her prose and is never scored.
-        //
-        // At most ONE nudge per calendar day (gpt-5.5 review, 2026-07-09): the
-        // sink is gated on the day's claim, not on the entry's existence. A
-        // further section added to a day that already integrated its mood, and
-        // a forced rewrite, keep the FIRST dream's nudge — one night, one felt
-        // tone, however many sections or re-renders the day's entry holds.
-        //
-        // 2026-09-06: the claim is taken FIRST (it is the exclusion that makes
-        // the sink fire once) but RELEASED when the sink reports the
-        // integration did not land. It used to be write-and-forget: a disk
-        // full, a blocked substrate store, or an unavailable one left the day
-        // permanently marked as integrated while nothing had moved — the night
-        // was spent without ever being felt, and no retry could ever reclaim
-        // it. The dream's own date key goes to the sink so the residue is
-        // claimed against THIS night rather than whichever marker sorts last.
-        await integrateMood(
-            affect: payload.affect, in: diaryDir, dateKey: dateKey)
+        guard !Task.isCancelled else { return report }
+        await integrateMood(affect: payload.affect, in: diaryDir, dateKey: dateKey)
         return report
+    }
+
+    private func commitDream(
+        _ markdown: String, at outPath: URL, previousDiary: Data?,
+        addsSection: Bool, consumedThrough: Date
+    ) -> (written: Bool, errors: [String]) {
+        do {
+            let entry: Data
+            if addsSection, let previousDiary { entry = previousDiary + Data(("\n" + markdown).utf8) }
+            else { entry = Data(markdown.utf8) }
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(entry, to: outPath)
+        } catch {
+            return (false, ["write error: \(error)"])
+        }
+        // Advance the mark forward-only to the newest message that fed this
+        // dream so the next run starts strictly after it. The diary and mark are
+        // one recoverable commit: the section's cutoff repairs a failure between
+        // writes. A derived mark failure never removes completed writing.
+        do {
+            try advanceDreamMark(to: consumedThrough)
+        } catch {
+            return (true, ["high-water mark write error: \(error)"])
+        }
+        return (true, [])
     }
 
     /// The marker records a confirmed integration only: the substrate's own
@@ -402,9 +306,9 @@ public actor DreamCycleRunner {
                 "DreamCycleRunner: mood integration for \(dateKey) did not persist; a later run retries it\n".utf8))
             return
         }
-        do { try Data().write(to: integrated, options: .atomic) } catch {
+        do { try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(), to: integrated) } catch {
             FileHandle.standardError.write(Data(
-                "DreamCycleRunner: mood for \(dateKey) integrated, marker not written (\(error)); a later run re-delivers it harmlessly\n".utf8))
+                "DreamCycleRunner: mood for \(dateKey) integrated, marker durability unproven (\(error)); a later run can re-deliver it harmlessly\n".utf8))
         }
     }
 
@@ -437,13 +341,9 @@ public actor DreamCycleRunner {
     // MARK: - Helpers
 
     private func isDreamEnabled() -> Bool {
-        // One decision. When the caller resolved the gate from the NORMALIZED
-        // trust policy, re-reading the raw file here could only disagree with
-        // it — and did, on every fresh install. Without a gate, fall back to
-        // the module's single saved-authority predicate rather than a second
-        // hand-written copy of it.
+        // An injected gate keeps the caller's snapshot; otherwise read saved authority once.
         if let gate { return gate.dreamEnabled }
-        return DreamREMGatePolicy.fromSavedAuthority(dataRoot: dataRoot).dreamEnabled
+        return DreamREMGatePolicy(authority: .read(dataRoot: dataRoot)).dreamEnabled
     }
 
     // MARK: high-water mark (.dream_state.json)
@@ -453,25 +353,12 @@ public actor DreamCycleRunner {
             .appendingPathComponent(".dream_state.json")
     }
 
-    /// The createdAt of the newest message the last dream consumed. nil → no
-    /// dream has run yet (caller falls back to `now - recencyWindow`); a mark
-    /// that exists but cannot be read throws.
-    private func readDreamMark() throws -> Date? {
-        guard fm.fileExists(atPath: dreamMarkPath().path) else { return nil }
-        guard case .object(let o) = try JSONValue.parse(Data(contentsOf: dreamMarkPath())),
-              case .string(let s)? = o["lastDreamedAt"],
-              let mark = Self.parseDaemonISO(s) else {
-            throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: dreamMarkPath().path])
-        }
-        return mark
-    }
-
     static let consumedFooter = "<!-- dream-consumed-through: "
 
     /// Called under the run reservation, before gathering or spending a model
     /// call. Archival moves sections without changing their consumed cutoffs.
     private func reconcileDreamMark() throws -> Date? {
-        let saved = try readDreamMark()
+        let saved = try ChatSessionRecollections.dreamConsolidationMark(dataRoot: dataRoot)
         var committed = saved
         let diary = FileBackedDreamDiary(dataRoot: dataRoot).listEntriesChecked(limit: .max)
         guard diary.isComplete else { throw CocoaError(.fileReadUnknown) }
@@ -479,13 +366,13 @@ public actor DreamCycleRunner {
         for entry in diary.entries {
             for line in (entry.content ?? "").split(separator: "\n") where line.hasPrefix(prefix) {
                 guard line.hasSuffix(" -->"),
-                      let cutoff = Self.parseDaemonISO(String(line.dropFirst(prefix.count).dropLast(4))) else {
+                      let cutoff = ChatSessionRecollections.parseTimestamp(.string(String(line.dropFirst(prefix.count).dropLast(4)))) else {
                     throw CocoaError(.fileReadCorruptFile)
                 }
                 committed = committed.map { max($0, cutoff) } ?? cutoff
             }
         }
-        if let committed, saved == nil || committed > saved! {
+        if let committed, saved.map({ committed > $0 }) ?? true {
             try advanceDreamMark(to: committed)
         }
         return committed
@@ -496,20 +383,12 @@ public actor DreamCycleRunner {
     private func advanceDreamMark(to date: Date) throws {
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let existing = try readDreamMark()
+        let existing = try ChatSessionRecollections.dreamConsolidationMark(dataRoot: dataRoot)
         let mark = (existing.map { max($0, date) }) ?? date
         let body = JSONValue.object([
             "lastDreamedAt": .string(iso.string(from: mark)),
         ])
-        try body.serializedData(pretty: false).write(to: dreamMarkPath(), options: [.atomic])
-    }
-
-    private func rollbackDiary(at path: URL, previousDiary: Data?) throws {
-        if let previousDiary {
-            try previousDiary.write(to: path, options: [.atomic])
-        } else if fm.fileExists(atPath: path.path) {
-            try fm.removeItem(at: path)
-        }
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(body.serializedData(pretty: false), to: dreamMarkPath())
     }
 
     /// World half (the recent cross-session messages — already chronological +
@@ -525,7 +404,7 @@ public actor DreamCycleRunner {
         feltSummary: String? = nil,
         careBlock: String = "",
         sourcePeerIds: [String]?
-    ) -> (text: String, peerIds: [String]?) {
+    ) throws -> (text: String, peerIds: [String]?) {
         var convLines: [String] = []
         var lastSession: String? = nil
         for m in messages {
@@ -537,12 +416,8 @@ public actor DreamCycleRunner {
         }
         let worldHalf = convLines.joined()
 
-        // Self half — newest-first memory-delta walk, bounded by the daemon
-        // `_DREAM_DELTA_CHAR_BUDGET` / `_DREAM_DELTA_COUNT_LIMIT`. Empty
-        // input → empty section; we still emit the header so the prompt
-        // shape stays constant for the model. The provider hands us deltas
-        // already newest-first, so iterate directly and chronological print
-        // is `.reversed()` at output time only.
+        // Keep bounded newest-first deltas, then render them chronologically.
+        // Empty input keeps the Self header.
         var deltaLines: [String] = []
         var deltaUsed = 0
         var deltaCount = 0
@@ -568,11 +443,7 @@ public actor DreamCycleRunner {
         if let felt = feltSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
            !felt.isEmpty {
             let bounded = String(felt.prefix(Self.feltCharBudget))
-            feltBlock = """
-            --- HOW THE DAY FELT (your inner sense — let it color the dream's tone) ---
-            \(bounded)
-
-            """
+            feltBlock = try completionPolicy("nightly-dream", section: "felt", arguments: [bounded])
         } else {
             feltBlock = ""
         }
@@ -580,58 +451,20 @@ public actor DreamCycleRunner {
         // These prose-only providers carry no provenance attestation.
         let peers = CognitiveReflectionCause.unionPeerIds([sourcePeerIds]
             + (selfHalf.isEmpty && feltBlock.isEmpty && careBlock.isEmpty ? [] : [nil]))
-        return ("""
-        Date: \(dateKey)
-
-        --- WORLD HALF (what happened recently across the user's conversations) ---
-        \(worldHalf)
-        --- SELF HALF (what you've absorbed about yourself since the last dream) ---
-        \(selfBody)
-        \(feltBlock)\(careBlock)Reflect on BOTH halves at equal weight and produce the JSON dream \
-        entry described in the system prompt. The summary is YOUR reflective \
-        voice — neither a recap of the user's side nor a status report. If the \
-        recent stretch was user-heavy, the Self half is what keeps this from \
-        echoing the person.
-        """, peers)
+        return (try completionPolicy("nightly-dream", section: "prompt", arguments: [
+            dateKey,
+            worldHalf,
+            selfBody,
+            feltBlock,
+            careBlock
+        ]), peers)
     }
 
     // Private reflection keeps identity; only the activity and audience differ.
-    fileprivate static func dreamSystemPrompt(personaDocs: [String: String]) -> String {
-        func body(_ name: String) -> String {
-            let raw = personaDocs[name] ?? ""
-            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? "(empty)" : raw
-        }
-        return """
-        Write a private nightly dream-journal entry as yourself, with the same \
-        identity, voice and boundaries as in conversation. This is reflection, \
-        not a message to the person. Below are the selected SOUL, VOICE, GROWTH \
-        and AGENTS documents and the USER context selected for this pass.
-
-        --- SOUL.md ---
-        \(body("SOUL.md"))
-
-        --- VOICE.md ---
-        \(body("VOICE.md"))
-
-        --- GROWTH.md ---
-        \(body("GROWTH.md"))
-
-        --- USER.md ---
-        \(body("USER.md"))
-
-        --- AGENTS.md ---
-        \(body("AGENTS.md"))
-
-        --- OUTPUT CONTRACT ---
-        Return one JSON object only, no fences. Exact keys: title (string), \
-        summary (one-paragraph string), mood (string), affect (your felt judgment: \
-        number -1 to 1, or null when none), emerging_themes and surprising_moments \
-        (string arrays), claims (array of {quote: string, source_refs: string[]}). \
-        Copy each quote verbatim from your own summary, themes or moments, never \
-        the conversation. source_refs cites only supplied exchange source \
-        identities supporting that claim; use [] when none supports it.
-        """
+    fileprivate static func dreamSystemPrompt(personaDocs: [String: String]) throws -> String {
+        return try completionPolicy("nightly-dream", section: "system", arguments: [
+            renderDreamPersonaDocs(personaDocs)
+        ])
     }
 
     /// The journal entries the day's feeling actually came from, in the order
@@ -641,7 +474,7 @@ public actor DreamCycleRunner {
     /// feeling to attribute, and a citation with nothing to cite in would be an
     /// assertion the dream never made. Feeling-silence stays silence.
     static func studioEntryCitations(
-        from origins: [DreamFeltOrigin],
+        from origins: [CognitiveFeltOrigin],
         feltSummary: String?
     ) -> [String] {
         guard let felt = feltSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -728,11 +561,6 @@ public actor DreamCycleRunner {
     /// the entry the NEXT 03:30 job also targets. The mark, not this file, is
     /// the dedupe: that job dreams only what came after the manual pass and
     /// adds it to the same entry as a further section.
-    ///
-    /// 2026-09-17: a manual pass used to borrow the scheduled trigger, so an
-    /// evening "run now" filed itself under YESTERDAY's date — the previous-day
-    /// rule only makes sense for the 03:30 job, which wakes after the day it is
-    /// reflecting on has ended.
     private func entryDateKey(for trigger: DreamTrigger) -> String {
         switch trigger {
         case .schedule:

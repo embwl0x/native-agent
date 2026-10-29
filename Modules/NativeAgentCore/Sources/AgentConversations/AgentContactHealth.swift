@@ -1,6 +1,7 @@
 import AgentWorkspace
 import Desk
 import Foundation
+import NativeAgentShared
 import MacControl
 import NativeAgentCore
 import PersistenceCore
@@ -250,12 +251,10 @@ public actor AgentContactHealth {
                 return deadline
             }
             let failure = history.compactMap { row -> (AgentConversationRecord, Date)? in
-                guard row.stop == nil, case .object(var receipt)? = row.receipt else { return nil }
+                guard row.stop == nil else { return nil }
                 guard row.phase == "attention", !AgentConversationSession.awaitingApproval(row) else { return nil }
-                if case .array(let jobs)? = receipt["jobs"], jobs.count == 1, case .object(let job) = jobs[0] { receipt = job }
-                let status = receipt["status"].flatMap { if case .string(let s) = $0 { s } else { nil } } ?? ""
-                return receipt["error"] != nil || receipt["execution_error"] != nil || ["failed", "unavailable"].contains(status)
-                    || status == "outcome_unknown" && receipt["sent"] == .bool(false) ? (row, row.updatedAt) : nil
+                let receipt = row.sendEvidence
+                return row.sendFailed && receipt["status"] != .string("no_reply_expired") ? (row, row.updatedAt) : nil
             }.filter { (good ?? .distantPast) < $0.1 }.min { $0.1 < $1.1 }
             // Our own relaunch cut the last send off: not broken, nothing to repair.
             let interrupted = newest.flatMap { row -> Date? in
@@ -263,9 +262,7 @@ public actor AgentContactHealth {
                       receipt["status"] == .string("interrupted"), (good ?? .distantPast) < row.updatedAt else { return nil }
                 return row.updatedAt
             }
-            // A message that went and whose reply ended with its outcome unknown
-            // stalled; the send path did not fail (Hermes 10-19: called broken,
-            // its next message went fine).
+            // A sent message whose reply ended unknown stalled; its send path did not fail.
             let stalled = newest.flatMap { row -> Date? in
                 guard row.stop == nil, row.phase == "attention", case .object(let receipt)? = row.receipt,
                       receipt["status"] == .string("outcome_unknown"), receipt["sent"] != .bool(false) else { return nil }
@@ -273,12 +270,10 @@ public actor AgentContactHealth {
                 return (good ?? .distantPast) < at ? at : nil
             }
             let operation = failure?.0.operationID ?? (expired == nil ? nil : newest?.operationID)
-            let fractional = ISO8601DateFormatter()
-            fractional.formatOptions.insert(.withFractionalSeconds)
             // An inbound-only contact has no send path to be unavailable: a send
             // it refused is not a broken reply path (the transport lifts an older mark).
             let inboundOnly = peer.map { ChatGPTDotIPCTransport.owns($0) && ChatGPTDotIPCTransport.inboundOnly } == true
-            let unavailable = inboundOnly ? nil : peer?.unavailableAt.flatMap(fractional.date)
+            let unavailable = inboundOnly ? nil : peer?.unavailableAt.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst)
             let broken = inboundOnly ? nil : ([failure?.1, unavailable]
                 .compactMap { $0 }.filter { (good ?? .distantPast) < $0 }).min()
             let proof = peer?.roundTripProof ?? peer?.mcpReturnProof
@@ -468,7 +463,6 @@ public actor AgentContactHealth {
     private enum Probe: Hashable {
         case command(String, String?)
         case app([String])
-        case unavailable(String)
         case remote
         case bridge(live: Bool)
         case dot
@@ -498,7 +492,6 @@ public actor AgentContactHealth {
             return Self.bridgePresence(live)
         case .dot:
             return Self.dotPresence()
-        case .unavailable(let detail): return result("unavailable", detail)
         case .app(let bundles):
             // A stuck Launch Services lookup is retained, never multiplied by
             // subsequent samples, including the waiter on its task value.
@@ -538,7 +531,7 @@ public actor AgentContactHealth {
             guard name == "codex" else { return result("ready", "Program installed") }
             // `codex login status` answers from this file: signed in is a saved
             // ChatGPT token or API key in it. Only its presence is looked at.
-            let authPath = OpenAIOAuthDirectAdapter.preferredAuthPath(source: .commandCLI)
+            let authPath = ChatGPTTransport.preferredAuthPath(source: .commandCLI)
             func present(_ value: JSONValue?) -> Bool {
                 if case .string(let text)? = value { return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
                 return false

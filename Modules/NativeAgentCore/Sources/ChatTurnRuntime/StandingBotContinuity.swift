@@ -5,7 +5,8 @@ import ProviderRouting
 import PersistenceCore
 import Transcripts
 import NativeAgentShared
-// Blueprint: | `StandingBotContinuity.swift` | Helper ingress routes to StandingBots' own turn runner; checked session creation and legacy shelf import retain the existing transcript format |
+import TurnTrace
+// Blueprint: | `StandingBotContinuity.swift` | Helper ingress routes to StandingBots' own turn runner; session creation records agent kind and exact helper owner, correcting older rows; legacy shelf import retains the existing transcript format |
 
 /// Helper ingress and transcript adapters; the resident's turn engine is never called.
 public enum StandingBotContinuity {
@@ -37,25 +38,34 @@ public enum StandingBotContinuity {
     public static func openSession(for bot: BotDefinition, dataRoot: URL) async throws -> NativeAgentShared.ChatSession {
         let path = dataRoot.appendingPathComponent("chat/sessions.json")
         let row = try await ChatSessionIndexFile.mutate(at: path) { rows in
-            if let existing = rows.first(where: { row in
+            if !rows.contains(where: { $0["id"] == .string(bot.sessionID) }),
+               let restored = try await ChatSessionRetention.restoreArchivedRow(sessionId: bot.sessionID, dataRoot: dataRoot) {
+                rows.append(restored)
+            }
+            if let index = rows.firstIndex(where: { row in
                 guard case .string(let id)? = row["id"] else { return false }
                 return id == bot.sessionID
             }) {
-                return existing
+                rows[index]["threadKind"] = .string(ChatThreadKind.agent.rawValue)
+                rows[index]["helperID"] = .string(bot.id.uuidString)
+                return rows[index]
             }
-            rows.append([
+            let created: [String: JSONValue] = [
                 "id": .string(bot.sessionID), "title": .string(bot.name), "source": .string("bot"),
+                "threadKind": .string(ChatThreadKind.agent.rawValue),
+                "helperID": .string(bot.id.uuidString),
                 "createdAt": .string(ISO8601DateFormatter().string(from: bot.createdAt)),
                 "archived": .bool(false), "messageCount": .int(0)
-            ])
-            return rows[rows.count - 1]
+            ]
+            rows.append(created)
+            return created
         }
         return try NativeAgentShared.ChatSession(row: row)
     }
 
     public static func session(client: SwiftNativeChatOrchestrationClient, dataRoot: URL, admitted: Bool = false,
                                attachments: [MultimodalAttachment] = [], fileAccess: String = "auto",
-                               progress: ChatOrchestrationProgressHandler? = nil) -> BotRunnerSession {
+                               progress: TurnEventSink? = nil) -> BotRunnerSession {
         { bot, message in
             try await $currentBot.withValue(bot) {
             let run: @Sendable () async throws -> BotTurnReply = {
@@ -111,19 +121,19 @@ public enum StandingBotContinuity {
 
 extension SwiftNativeChatOrchestrationClient {
     func importBotHistory(bot: BotDefinition, dataRoot: URL) async throws {
+        _ = try await StandingBotContinuity.openSession(for: bot, dataRoot: dataRoot)
         let path = dataRoot.appendingPathComponent("chat/messages/" + bot.sessionID + ".jsonl")
+        var imported = await Self.completedAssistantRunIds(path: path)
         for item in try ShelfStore(dataRoot: dataRoot).legacyHistory(bot: bot.id, dataRoot: dataRoot) {
-            if await Self.sessionAlreadyHasAssistantMessage(path: path, runId: item.id) { continue }
+            try Task.checkCancellation()
+            guard !imported.contains(item.id) else { continue }
             try await appendMessage(sessionId: bot.sessionID, role: "assistant", content: item.text,
                 runId: item.id, attachments: item.artifacts.map {
                     MultimodalAttachment(type: "file", base64: "", mime: "application/json", name: $0.name, byteSize: 0, path: $0.path)
                 }, source: "bot",
-                // A BOT'S RECEIPT IS NOT HER MOMENT (Agent, item 5, 2026-09-14).
-                // These rows are the shelf's stored bot output replayed into a
-                // session verbatim — text a bot produced, on a past run, filed
-                // on her row. Importing history is bookkeeping; it is not a
-                // week's worth of things she just felt.
+                // Imported helper receipts are bookkeeping, not new lived experience.
                 mechanicalRow: .botReceipt)
+            imported.insert(item.id)
         }
     }
 }

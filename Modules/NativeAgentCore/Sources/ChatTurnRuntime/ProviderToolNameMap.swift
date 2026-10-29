@@ -12,11 +12,6 @@ import NativeAgentCore
 struct ProviderToolNameMap: Sendable {
     let schemas: [LLMToolSchema]
     private let providerToInternal: [String: String]
-    /// Reverse of `providerToInternal`. The mid-conversation tool-change
-    /// blocks reference tools by their PROVIDER name (the name in the request's
-    /// `tools` array), so the producer needs the exact alias this map minted —
-    /// recomputing it from `providerName(for:)` would miss the collision
-    /// suffix that `uniqueProviderName` adds.
     private let internalToProvider: [String: String]
 
     init(_ internalSchemas: [LLMToolSchema]) {
@@ -40,11 +35,7 @@ struct ProviderToolNameMap: Sendable {
                 toolClass: schema.toolClass, reach: schema.reach, capabilities: schema.capabilities,
                 effectInputPolicy: schema.effectInputPolicy,
                 description: description,
-                parametersJSON: schema.parametersJSON,
-                // The Anthropic `defer_loading` flag is a property of the
-                // DECLARATION, so it has to survive the alias rewrite or the
-                // whole tool-change lane silently offers everything.
-                deferLoading: schema.deferLoading
+                parametersJSON: schema.parametersJSON
             ))
         }
 
@@ -57,10 +48,6 @@ struct ProviderToolNameMap: Sendable {
         providerToInternal[providerName] ?? providerName
     }
 
-    /// The provider-visible alias this map minted for an internal tool name,
-    /// or nil when the name is not in this map at all — which is exactly the
-    /// "referencing a name not declared in `tools`" case a tool-change block
-    /// must never put on the wire.
     func providerName(forInternalName internalName: String) -> String? {
         internalToProvider[internalName]
     }
@@ -79,7 +66,7 @@ struct ProviderToolNameMap: Sendable {
         name = name.trimmingCharacters(in: CharacterSet(charactersIn: "_"))
         if name.isEmpty { name = "tool" }
         if name.count > 128 {
-            let suffix = stableSuffix(for: internalName)
+            let suffix = String(fnv1a64(internalName), radix: 16)
             let prefixLength = max(1, 128 - suffix.count - 1)
             name = "\(String(name.prefix(prefixLength)))_\(suffix)"
         }
@@ -93,7 +80,7 @@ struct ProviderToolNameMap: Sendable {
             return base
         }
 
-        let suffix = stableSuffix(for: internalName)
+        let suffix = String(fnv1a64(internalName), radix: 16)
         let prefixLength = max(1, 128 - suffix.count - 1)
         var candidate = "\(String(base.prefix(prefixLength)))_\(suffix)"
         var attempt = 2
@@ -114,14 +101,5 @@ struct ProviderToolNameMap: Sendable {
         default:
             return false
         }
-    }
-
-    private static func stableSuffix(for value: String) -> String {
-        var hash: UInt64 = 14_695_981_039_346_656_037
-        for byte in value.utf8 {
-            hash ^= UInt64(byte)
-            hash = hash &* 1_099_511_628_211
-        }
-        return String(hash, radix: 16)
     }
 }

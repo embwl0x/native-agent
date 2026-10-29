@@ -1,8 +1,4 @@
-// R15 (2026-07-02): ONE SSE framing decoder for the whole app. Replaces
-// seven hand-rolled `data:`-line parsers (six LLM streaming adapters +
-// MCPHTTPTransport) that had three different line-splitting strategies.
-// This layer does FRAMING ONLY — event-type routing, `[DONE]` sentinels,
-// telemetry, and error mapping are protocol semantics and stay in callers.
+// Shared SSE framing; event routing, sentinels and errors belong to callers.
 import Foundation
 // Blueprint: | `SSEEventStream.swift` | Shared SSE framing and `ProviderStreamContext`; transport opening and activity for every event/comment; optional round-scoped diagnostic event capture before provider decoding |
 
@@ -40,9 +36,7 @@ public struct SSEEvent: Sendable, Equatable {
 ///
 /// Framing rules:
 /// - Lines terminate on LF; one trailing CR is stripped (LF and CRLF
-///   streams both work — treating CR as its own terminator is the
-///   audit-#14 bug: it splits one CRLF event's `data:` lines with a
-///   phantom blank line).
+///   streams both work).
 /// - Lines starting `:` are comments (keep-alives) — skipped.
 /// - A field splits at the first `:`; one leading space is stripped from
 ///   the value, so `data:x` and `data: x` are equivalent.
@@ -99,22 +93,48 @@ where Bytes.Element == UInt8 {
     }
 }
 
-/// The line-level SSE state machine shared by the async stream above and
-/// the synchronous buffered parse below. Feed it lines (without their LF);
-/// it returns an `SSEEvent` whenever a blank line completes one.
+/// Shared SSE state machine; a blank line completes an event.
 public struct SSEEventParser: Sendable {
     private var dataLines: [String] = []
     private var eventName: String?
     private let onActivity: (@Sendable () -> Void)?
+    private var lineBytes: [UInt8] = []
+    private var afterCR = false
+    private var bufferedBytes = 0
+    private var invalidLine = false
 
     public init(onActivity: (@Sendable () -> Void)? = nil) {
         self.onActivity = onActivity
     }
 
+    /// Strict bounded byte framing for peers: CR, LF and CRLF end lines;
+    /// incomplete lines/events remain pending until a blank line, never EOF.
+    public mutating func consume(byte: UInt8, maximumBytes: Int) throws -> SSEEvent? {
+        if afterCR, byte == 0x0A {
+            afterCR = false
+            if bufferedBytes > 0 { bufferedBytes += 1 }
+            guard bufferedBytes <= maximumBytes else { throw CocoaError(.fileReadTooLarge) }
+            return nil
+        }
+        afterCR = false
+        guard bufferedBytes < maximumBytes else { throw CocoaError(.fileReadTooLarge) }
+        bufferedBytes += 1
+        guard byte == 0x0A || byte == 0x0D else { lineBytes.append(byte); return nil }
+        afterCR = byte == 0x0D
+        let line = String(bytes: lineBytes, encoding: .utf8)
+        lineBytes.removeAll(keepingCapacity: true)
+        guard let line else { invalidLine = true; return nil }
+        if line.isEmpty {
+            guard !invalidLine else { throw CocoaError(.fileReadInapplicableStringEncoding) }
+            bufferedBytes = 0
+        }
+        return consume(line: line)
+    }
+
     /// Consume one raw line (LF already stripped). Returns a completed
     /// event on the blank-line delimiter, nil otherwise. The single
     /// trailing-CR strip happens in `consume(line:)` — not here too, or a
-    /// payload legitimately ending in CR would lose two (review 2026-07-02).
+    /// payload legitimately ending in CR would lose two.
     public mutating func consume(lineBytes: [UInt8]) -> SSEEvent? {
         consume(line: String(decoding: lineBytes, as: UTF8.self))
     }

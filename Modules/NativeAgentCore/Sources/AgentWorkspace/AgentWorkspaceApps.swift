@@ -42,7 +42,7 @@ enum AgentWorkspaceApps {
         return nil
     }
 
-    static func project(tool: String, input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection? {
+    static func project(tool: String, input: [String: JSONValue], result: JSONValue) -> WorkspacePage? {
         switch tool {
         case "list_dir": return directory(input: input, result: result)
         case "browser.chrome_status":
@@ -64,7 +64,7 @@ enum AgentWorkspaceApps {
         return .record(tool: "screen", input: arguments, title: string(app["name"]) ?? identity)
     }
 
-    private static func computer(input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection {
+    private static func computer(input: [String: JSONValue], result: JSONValue) -> WorkspacePage {
         var row = object(result)
         var detail = object(row["detail"] ?? .null)
         var controls = object(detail["controls"] ?? .null)
@@ -129,7 +129,7 @@ enum AgentWorkspaceApps {
         return .init(title: string(app["name"]) ?? string(input["app"]) ?? "Computer", content: .object(row), items: items, actions: actions)
     }
 
-    private static func menu(result: JSONValue) -> AgentWorkspaceProjection {
+    private static func menu(result: JSONValue) -> WorkspacePage {
         let envelope = object(result)
         var output = object(envelope["output"] ?? .null)
         let app = object(output["app"] ?? .null)
@@ -153,7 +153,7 @@ enum AgentWorkspaceApps {
         ])
     }
 
-    private static func directory(input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection {
+    private static func directory(input: [String: JSONValue], result: JSONValue) -> WorkspacePage {
         let row = object(result)
         guard row["ok"] == .bool(true), row["status"] == .string("ok"),
               let path = string(row["path"]), path.hasPrefix("/"),
@@ -193,7 +193,7 @@ enum AgentWorkspaceApps {
         return .init(title: "Files: " + path, content: .object(metadata), items: items, actions: actions)
     }
 
-    private static func browser(input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection {
+    private static func browser(input: [String: JSONValue], result: JSONValue) -> WorkspacePage {
         let row = object(result)
         guard row["ok"] != .bool(false), row["error"] == nil,
               let snapshot = string(row["snapshotId"]),
@@ -254,7 +254,7 @@ enum AgentWorkspaceApps {
             readingActions.append(readButton("Read whole page", tool: "browser.chrome_snapshot", input: whole))
             metadata["workspace_reading"] = .string(reading["mainContentAvailable"] == .bool(true)
                 ? "Reading the visible main content. Page down continues through the rendered article; this is not a claim that offscreen content was read."
-                : "No semantic main/article region was found. Read whole page to see the current controls and content.")
+                : "No main region declared: reading the page without its navigation (Read whole page adds it).")
         } else if reading["mainContentAvailable"] == .bool(true) {
             var main = current; main["scope"] = .string("main_content")
             readingActions.append(readButton("Read main content", tool: "browser.chrome_snapshot", input: main))

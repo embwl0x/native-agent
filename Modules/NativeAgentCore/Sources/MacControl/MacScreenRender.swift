@@ -130,17 +130,6 @@ public enum MacScreenRender {
         public let label: MacScreenText
         /// The kind, in this renderer's fixed vocabulary (see `kindName`).
         public let kind: String
-        /// A one-based address within this visible role. Unlike content-row
-        /// ordinals, unnamed controls are numbered per role: `button 2`,
-        /// `tab 3`, and `text area 1` remain useful when AX supplied no name.
-        /// It is part of the one screen representation, not a side channel for
-        /// the act tool.
-        public let ordinal: Int?
-        /// What the control currently SHOWS, when that is different from its
-        /// name — the popup labelled "View" reading "List". Printed inline as
-        /// `popup = List`, because the pair is the fact she needs and a value
-        /// in a parallel object is a correlation step.
-        public let value: MacScreenText?
         public let states: [String]
         public let provenance: Provenance
         public let abstain: String?
@@ -148,8 +137,6 @@ public enum MacScreenRender {
         public init(
             label: MacScreenText,
             kind: String,
-            ordinal: Int? = nil,
-            value: MacScreenText? = nil,
             states: [String] = [],
             provenance: Provenance,
             abstain: String? = nil,
@@ -157,8 +144,6 @@ public enum MacScreenRender {
         ) {
             self.label = label
             self.kind = kind
-            self.ordinal = ordinal
-            self.value = value
             self.states = states
             self.provenance = provenance
             self.abstain = abstain
@@ -178,24 +163,9 @@ public enum MacScreenRender {
         }
     }
 
-    /// One step of WHERE — a path component, a selected tab, a breadcrumb, a
-    /// selected sidebar item.
-    public struct WhereStep: Sendable, Equatable {
-        public let label: MacScreenText
-        /// `selected`, `focused`, … printed in parentheses after the label.
-        public let note: String?
-        public let provenance: Provenance
-
-        public init(label: MacScreenText, note: String? = nil, provenance: Provenance) {
-            self.label = label
-            self.note = note
-            self.provenance = provenance
-        }
-    }
-
     // MARK: Content
 
-    /// The four content types. The section KEYWORD is the type, which is how a
+    /// The three content types. The section KEYWORD is the type, which is how a
     /// reader knows what kind of thing she is looking at before reading a row.
     ///
     /// `canvas` is the pixel surface. It distinguishes an unparsed extent from
@@ -203,16 +173,14 @@ public enum MacScreenRender {
     public enum ContentKind: String, Sendable, Equatable, CaseIterable {
         case list
         case grid
-        case text
         case canvas
 
         var keyword: String { rawValue.uppercased() }
-        /// The default noun for the row count when the caller does not name one.
-        var defaultNoun: String {
+        /// The noun for the retained row count.
+        var noun: String {
             switch self {
             case .list: return "items"
             case .grid: return "cells"
-            case .text: return "lines"
             case .canvas: return "regions"
             }
         }
@@ -244,90 +212,17 @@ public enum MacScreenRender {
 
     public struct Content: Sendable, Equatable {
         public let kind: ContentKind
-        /// What the rows ARE, for the count line. Defaults per kind.
-        public let noun: String
         public let rows: [Row]
-        /// How many rows EXIST, including any the source already dropped before
-        /// this renderer saw them. The elision line is computed from this, so an
-        /// upstream cap is spoken here too rather than silently disappearing.
-        public let totalRows: Int
-        public let scrollable: Bool
         public let canvas: Canvas?
 
         public init(
             kind: ContentKind,
-            noun: String? = nil,
             rows: [Row] = [],
-            totalRows: Int? = nil,
-            scrollable: Bool = false,
             canvas: Canvas? = nil
         ) {
             self.kind = kind
-            self.noun = noun ?? kind.defaultNoun
             self.rows = rows
-            self.totalRows = max(totalRows ?? rows.count, rows.count)
-            self.scrollable = scrollable
             self.canvas = canvas
-        }
-    }
-
-    // MARK: The screen
-
-    /// The source-agnostic input for native pages and pixel evidence.
-    public struct Screen: Sendable, Equatable {
-        public let appName: String?
-        public let windowTitle: MacScreenText?
-        public let isFront: Bool
-        /// OTHER windows of the same app — "how many others exist".
-        public let otherWindows: Int
-        public let provenance: Provenance
-        public let modal: MacScreenText?
-        public let whereSteps: [WhereStep]
-        public let contents: [Content]
-        public let controls: [Control]
-        /// How many actionable things EXIST, including any the source dropped
-        /// before this renderer saw them.
-        public let totalControls: Int
-        /// Interactive elements with NO label, by kind. Counted rather than
-        /// hidden: pretending they are not there is how "the third button"
-        /// becomes the wrong button.
-        public let unlabeledControls: [String: Int]
-        public let values: [Value]
-        public let totalValues: Int
-        /// Omitted AX affordances have no retained role or location evidence.
-        /// They must not be relabeled as extra files/rows below the viewport.
-        public let unclassifiedOmittedTargets: Int
-
-        public init(
-            appName: String?,
-            windowTitle: MacScreenText? = nil,
-            isFront: Bool = false,
-            otherWindows: Int = 0,
-            provenance: Provenance = .ax,
-            modal: MacScreenText? = nil,
-            whereSteps: [WhereStep] = [],
-            contents: [Content] = [],
-            controls: [Control] = [],
-            totalControls: Int? = nil,
-            unlabeledControls: [String: Int] = [:],
-            values: [Value] = [],
-            totalValues: Int? = nil,
-            unclassifiedOmittedTargets: Int = 0
-        ) {
-            self.appName = appName
-            self.windowTitle = windowTitle
-            self.isFront = isFront
-            self.otherWindows = max(0, otherWindows)
-            self.provenance = provenance
-            self.modal = modal
-            self.whereSteps = whereSteps
-            self.contents = contents
-            self.controls = controls
-            self.totalControls = max(totalControls ?? controls.count, controls.count)
-            self.unlabeledControls = unlabeledControls
-            self.values = values
-            self.totalValues = max(totalValues ?? values.count, values.count)
-            self.unclassifiedOmittedTargets = max(0, unclassifiedOmittedTargets)
         }
     }
 
@@ -336,9 +231,7 @@ public enum MacScreenRender {
     /// Section keyword column. Everything after it lines up, so a reader's eye
     /// finds SCREEN / WHERE / DO without parsing.
     static let keywordWidth = 8
-    /// Indent for a row line, including room for a right-aligned 2-digit
-    /// content ordinal. A role address such as `button 2` may exceed this
-    /// width and deliberately shifts the label rather than hiding the address.
+    /// Indent for a row line, including room for a right-aligned 2-digit ordinal.
     static let rowIndent = 6
     static let labelColumn = 24
     static let detailColumn = 22
@@ -351,20 +244,18 @@ public enum MacScreenRender {
 
     /// Add only independently recognized pixel evidence to the AX page. No
     /// second screen title, AX control census or repeated raw text channel.
-    static func pixelEvidence(_ screen: Screen) -> String {
+    static func pixelEvidence(contents: [Content] = [], controls: [Control] = [], values: [Value] = []) -> String {
         var lines: [String] = []
-        for content in screen.contents {
+        for content in contents {
             let rows = content.rows.filter { $0.provenance.isVision }
             guard !rows.isEmpty || content.kind == .canvas else { continue }
-            let onlyPixels = Content(kind: content.kind, noun: content.noun, rows: rows, totalRows: rows.count,
-                scrollable: content.scrollable, canvas: content.canvas)
+            let onlyPixels = Content(kind: content.kind, rows: rows, canvas: content.canvas)
             lines.append(contentsOf: contentBlock(onlyPixels))
         }
-        let controls = screen.controls.filter { $0.provenance.isVision }
-        let values = screen.values.filter { $0.provenance.isVision }
-        let onlyPixels = Screen(appName: nil, controls: controls, totalControls: controls.count, values: values, totalValues: values.count)
-        if !controls.isEmpty { lines.append(contentsOf: controlBlock(onlyPixels)) }
-        if !values.isEmpty { lines.append(contentsOf: valueBlock(onlyPixels)) }
+        let controls = controls.filter { $0.provenance.isVision }
+        let values = values.filter { $0.provenance.isVision }
+        if !controls.isEmpty { lines.append(contentsOf: controlBlock(controls)) }
+        if !values.isEmpty { lines.append(contentsOf: valueBlock(values)) }
         guard !lines.isEmpty else { return "" }
         return "\nraw view · on-device screen recognition · These regions are exposed as pixels, with the recognition confidence shown.\n"
             + lines.joined(separator: "\n")
@@ -398,41 +289,24 @@ public enum MacScreenRender {
             return lines
         }
 
-        let kept = content.rows
-        let hidden = content.totalRows - kept.count
+        lines.append(section(content.kind.keyword, "\(content.rows.count) \(content.kind.noun)"))
 
-        var header = "\(content.totalRows) \(content.noun)"
-        if hidden > 0 { header += ", showing \(kept.count)" }
-        lines.append(section(content.kind.keyword, header))
-
-        for (index, row) in kept.enumerated() {
+        for (index, row) in content.rows.enumerated() {
             lines.append(rowLine(ordinal: index + 1, row: row))
-        }
-        if hidden > 0 {
-            // Spoken, in place, with the recourse. A silent cap is the exact
-            // thing this renderer exists to stop.
-            let recourse = content.scrollable ? "scrollable" : "inspect this section using part or name the target"
-            lines.append(indentedNote("… \(hidden) more below (\(recourse))"))
         }
         return lines
     }
 
-    private static func controlBlock(_ screen: Screen) -> [String] {
+    private static func controlBlock(_ controls: [Control]) -> [String] {
         var lines: [String] = []
-        let kept = screen.controls
-        let hidden = screen.totalControls - kept.count
-        let abstained = kept.filter { $0.abstain != nil }.count
+        let abstained = controls.filter { $0.abstain != nil }.count
 
-        var header = "\(screen.totalControls) actionable"
-        if hidden > 0 { header += ", showing \(kept.count)" }
+        var header = "\(controls.count) actionable"
         if abstained > 0 { header += ", \(abstained) ABSTAINED" }
         lines.append(section("DO", header))
 
-        for control in kept {
+        for control in controls {
             var detail = control.kind
-            if let value = control.value {
-                detail += " = " + (value.display ?? redactedMarker)
-            }
             if !control.states.isEmpty, !control.provenance.isVision {
                 detail += " (" + control.states.joined(separator: ", ") + ")"
             }
@@ -441,7 +315,6 @@ public enum MacScreenRender {
                     ? control.states.map { MacScreenText($0, redacted: .string($0)) } : [])
             lines.append(rowLine(
                 ordinal: nil,
-                roleAddress: control.ordinal.map { "\(control.kind) \($0)" },
                 row: Row(
                     label: control.label,
                     detail: details,
@@ -450,44 +323,19 @@ public enum MacScreenRender {
                 )
             ))
         }
-        if hidden > 0 {
-            lines.append(indentedNote("… \(hidden) further controls outside this observation; inspect the relevant visible region"))
-        }
-        // The unlabeled census. Sorted by kind so the bytes are identical every
-        // run; counted rather than hidden, because an unnamed control she cannot
-        // address is still a control that exists.
-        let unlabeled = screen.unlabeledControls.filter { $0.value > 0 }
-        if !unlabeled.isEmpty {
-            let total = unlabeled.values.reduce(0, +)
-            let breakdown = unlabeled
-                .sorted { $0.key == $1.key ? false : $0.key < $1.key }
-                .map { "\($0.key) \($0.value)" }
-                .joined(separator: ", ")
-            lines.append(indentedNote(
-                "… \(total) unlabeled (\(breakdown)) — not addressable by name, point by region"
-            ))
-        }
         return lines
     }
 
-    private static func valueBlock(_ screen: Screen) -> [String] {
+    private static func valueBlock(_ values: [Value]) -> [String] {
         var lines: [String] = []
-        let kept = screen.values
-        let hidden = screen.totalValues - kept.count
+        lines.append(section("SAYS", "\(values.count) value\(values.count == 1 ? "" : "s")"))
 
-        var header = "\(screen.totalValues) value\(screen.totalValues == 1 ? "" : "s")"
-        if hidden > 0 { header += ", showing \(kept.count)" }
-        lines.append(section("SAYS", header))
-
-        for value in kept {
+        for value in values {
             let shown = value.text.display.map { "\"\($0)\"" }
                 ?? redactedMarker
             var line = pad(String(repeating: " ", count: rowIndent) + shown, to: rowIndent + labelColumn + detailColumn + 2)
             line += value.provenance.text
             lines.append(trimTrailing(line))
-        }
-        if hidden > 0 {
-            lines.append(indentedNote("… \(hidden) further values outside this observation; inspect the relevant visible region"))
         }
         return lines
     }
@@ -496,11 +344,9 @@ public enum MacScreenRender {
 
     private static func rowLine(
         ordinal: Int?,
-        roleAddress: String? = nil,
         row: Row
     ) -> String {
         var line = ordinal.map { pad("  \($0)", to: rowIndent) }
-            ?? roleAddress.map { pad($0, to: rowIndent) }
             ?? String(repeating: " ", count: rowIndent)
 
         let label: String
@@ -530,10 +376,6 @@ public enum MacScreenRender {
 
     private static func section(_ keyword: String, _ payload: String) -> String {
         trimTrailing(pad(keyword, to: keywordWidth) + payload)
-    }
-
-    private static func indentedNote(_ text: String) -> String {
-        String(repeating: " ", count: rowIndent - 4) + text
     }
 
     // MARK: - Formatting primitives
@@ -606,13 +448,7 @@ public enum MacScreenRender {
         ).lowercased()
     }
 
-    // MARK: - The AX adapter
-    //
-    // A `MacLookPercept` — whatever produced it — becomes a `Screen`. This is a
-    // TRANSLATION, not a second renderer: it fills the same neutral model the
-    // vision lane fills, and the output goes through the one `render` above.
-    // The vision lane's adapter, VisionFourVerbAdapter, shares this MacControl
-    // owner and fills this same model.
+    // MARK: - AX target classification
 
     /// Roles whose affordances are CONTENT rows rather than controls: the rows
     /// of a list, the cells of a table, the rename-in-place text field every
@@ -656,149 +492,4 @@ public enum MacScreenRender {
         return ordinals
     }
 
-    public static func screen(
-        from percept: MacLookPercept,
-        isFront: Bool = false,
-        otherWindows: Int = 0
-    ) -> Screen {
-        var controls: [Control] = []
-        var rows: [Row] = []
-
-        // The same two families the compiler already ranks by: a control ROLE,
-        // or anything sitting inside a control CONTAINER (a toolbar, a sheet).
-        // The container test is what keeps a toolbar's search field in DO
-        // instead of filing it as a list row — the field is a control because of
-        // where it lives, and the percept states where it lives.
-        let controlContainerPaths = percept.landmarks
-            .filter { controlContainerKinds.contains($0.kind) }
-            .map(\.path)
-        func insideControlContainer(_ path: [Int]) -> Bool {
-            controlContainerPaths.contains { container in
-                container.count < path.count && Array(path.prefix(container.count)) == container
-            }
-        }
-
-        func isControl(_ affordance: MacLookAffordance) -> Bool {
-            !contentRowRoles.contains(affordance.role)
-                && (MacPerceptionCompiler.controlRoles.contains(affordance.role)
-                    || insideControlContainer(affordance.path))
-        }
-        let controlOrdinals = controlRoleOrdinals(for: percept.affordances.filter(isControl))
-        for affordance in percept.affordances {
-            let label = MacScreenText(affordance.label, redacted: affordance.labelJSON)
-            if isControl(affordance) {
-                let kind = kindName(role: affordance.role)
-                let ordinal = controlOrdinals[affordance.handle]
-                var states: [String] = []
-                if !affordance.enabled { states.append("disabled") }
-                if affordance.selected == true { states.append("selected") }
-                if let state = affordance.state { states.append(state) }
-                if affordance.secret { states.append("secure") }
-                if isTextEntry(affordance.role), affordance.value == nil, affordance.labelSource != "value" {
-                    states.append("empty")
-                }
-                controls.append(Control(
-                    label: label,
-                    kind: kind,
-                    ordinal: ordinal,
-                    value: affordance.value.map { MacScreenText($0, redacted: affordance.valueJSON) },
-                    states: states,
-                    provenance: .ax,
-                    sourceAXPath: affordance.path
-                ))
-            } else {
-                var detail: [MacScreenText] = [
-                    MacScreenText(kindName(role: affordance.role),
-                                  redacted: .string(kindName(role: affordance.role))),
-                ]
-                if let value = affordance.value {
-                    detail.append(MacScreenText(value, redacted: affordance.valueJSON))
-                }
-                if affordance.selected == true {
-                    detail.append(MacScreenText("selected", redacted: .string("selected")))
-                }
-                rows.append(Row(label: label, detail: detail, provenance: .ax, sourceAXPath: affordance.path))
-            }
-        }
-
-        // The wire's omission count also includes byte-budget truncation and
-        // does not retain the omitted roles/locations. Report that limit once,
-        // without inventing extra rows or claiming they are below the viewport.
-        var contents: [Content] = []
-        if !rows.isEmpty {
-            let landmarkKinds = Set(percept.landmarks.map(\.kind))
-            contents.append(Content(
-                kind: landmarkKinds.contains("table") ? .grid : .list,
-                rows: rows,
-                totalRows: rows.count,
-                scrollable: landmarkKinds.contains("scrollarea")
-                    || landmarkKinds.contains("list")
-                    || landmarkKinds.contains("table")
-                    || landmarkKinds.contains("sidebar")
-            ))
-        }
-
-        return Screen(
-            appName: percept.app?.name,
-            windowTitle: percept.windowTitle.map {
-                MacScreenText($0, redacted: percept.windowTitleJSON)
-            },
-            isFront: isFront,
-            otherWindows: otherWindows,
-            provenance: .ax,
-            modal: percept.modal?.label.map { MacScreenText($0, redacted: percept.modal?.labelJSON) },
-            whereSteps: whereSteps(from: percept),
-            contents: contents,
-            controls: controls,
-            totalControls: controls.count,
-            // The compiler now retains unnamed interactive affordances so
-            // their role ordinals can be rendered and resolved. A census still
-            // exists for older/external percept producers that genuinely omit
-            // elements, but must not repeat controls already shown above.
-            unlabeledControls: [:],
-            values: percept.readouts.map {
-                Value(text: MacScreenText($0.text, redacted: $0.textJSON), provenance: .ax)
-            },
-            totalValues: percept.readouts.count + percept.readoutsOmitted,
-            unclassifiedOmittedTargets: percept.affordancesOmitted
-        )
-    }
-
-    /// WHERE, from the structure the percept actually has: the landmarks the
-    /// FOCUS sits inside, outermost first, then the focused element itself.
-    /// That is a real position in the app's own navigation, derived from data.
-    /// When there is no focus there is no position to state, and the section is
-    /// OMITTED rather than guessed at — a WHERE that invents a location is worse
-    /// than no WHERE at all.
-    static func whereSteps(from percept: MacLookPercept) -> [WhereStep] {
-        guard let focus = percept.focus else { return [] }
-        var steps: [WhereStep] = []
-        let ancestors = percept.landmarks
-            .filter { landmark in
-                landmark.path.count < focus.path.count
-                    && Array(focus.path.prefix(landmark.path.count)) == landmark.path
-            }
-            .sorted { $0.path.count < $1.path.count }
-        for landmark in ancestors {
-            let name = landmark.label.map { MacScreenText($0, redacted: landmark.labelJSON) }
-            steps.append(WhereStep(
-                label: name ?? MacScreenText(landmark.kind, redacted: .string(landmark.kind)),
-                note: name == nil ? nil : landmark.kind,
-                provenance: .ax
-            ))
-        }
-        if let label = focus.label {
-            steps.append(WhereStep(
-                label: MacScreenText(label, redacted: focus.labelJSON),
-                note: "focused",
-                provenance: .ax
-            ))
-        }
-        return steps
-    }
-
-    static func isTextEntry(_ role: String) -> Bool {
-        role == "AXTextField" || role == "AXTextArea" || role == "AXSecureTextField"
-            || role == "AXComboBox"
-    }
 }

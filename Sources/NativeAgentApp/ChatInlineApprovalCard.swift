@@ -6,7 +6,6 @@ import PersistenceCore
 import NativeAgentShared
 // Blueprint: | `ChatInlineApprovalCard.swift` | mounted approval card, transient interaction state and facade-owned decisions |
 
-// PATCH-2026-05-08: wave2-chat-ux — inline approval card for kind=approval_pending
 struct InlineApprovalCard: View {
     var message: ChatMessage
     @Environment(AppModel.self) private var appModel
@@ -29,12 +28,9 @@ struct InlineApprovalCard: View {
         appModel.engine.approvals.records.first(where: { $0.id == approvalId })
     }
 
-    private var state: InlineApprovalPresentation.State {
-        InlineApprovalPresentation.state(
-            approvalID: approvalId,
-            externalStatus: externalApproval?.status,
-            externalDecision: externalApproval?.decision
-        )
+    private var approval: ApprovalRequest? {
+        guard !approvalId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return externalApproval.map(ApprovalRequest.init(record:))
     }
 
     var body: some View {
@@ -50,13 +46,7 @@ struct InlineApprovalCard: View {
 
     // MARK: - The shell card
     //
-    // 0.4.12 cards round: the same component, in the shared inline-card
-    // grammar — symbol column, title, one sentence, primary + quiet secondary,
-    // and the consequence of declining. Teal is still reserved for exactly this
-    // (she is waiting on you) and now lives on the primary command rather than
-    // a second border colour. The message is shown ONCE: the title is its first
-    // line and the rest opens in place, never both in full. A click is not
-    // settlement, so an approved request reads "Approved", never "Done."
+    // A click is not settlement: an approved request reads "Approved", never "Done."
     private var shellBody: some View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
             InlineCardView(model: cardModel) { taken in
@@ -97,22 +87,21 @@ struct InlineApprovalCard: View {
             detailsLabel: primary == "Send it" ? ChatShellApprovalCopy.showDraft : "Details",
             detailsBody: ChatShellApprovalCopy.details(displayContent)
         )
-        switch state {
+        let approval = self.approval
+        switch approval?.outcome ?? .unresolved {
         case .pending:
-            model.state = resolving ? .running : .pending
+            model.state = resolving || appModel.engine.approvals.isResolving(id: approvalId) ? .running : .pending
             model.busyLabel = "Approving…"
             model.busyNote = "Sending your decision…"
-        case .resolved(let decision):
-            let rejected = decision == "denied" || decision == "rejected"
-            let approval = externalApproval.map(ApprovalRequest.init(record:))
-            model.state = approval?.isExpired == true ? .unknown
-                : (approval?.executionFailed == true ? .failed : (rejected ? .declined : .settled))
-            model.outcome = approval?.decisionSummary ?? (rejected ? "Denied" : (decision == "approved" ? "Approved" : "Resolved"))
+        case .approved, .denied, .expired:
+            model.state = approval?.outcome == .expired ? .unknown
+                : (approval?.executionFailed == true ? .failed : (approval?.outcome == .denied ? .declined : .settled))
+            model.outcome = approval?.decisionSummary
             model.outcomeMeta = approval?.expirationGuidance(agentName: appModel.agentDisplayName) ?? approval?.executionSummary ?? (why.isEmpty ? nil : why)
-        case .unavailable:
-            model.state = .unknown
+        case .unresolved:
+            model.state = approval?.executionFailed == true ? .failed : .unknown
             model.outcome = "I couldn't check this request"
-            model.outcomeMeta = "Nothing was decided"
+            model.outcomeMeta = approval?.executionSummary ?? "The decision is unavailable"
         }
         return model
     }
@@ -125,11 +114,7 @@ struct InlineApprovalCard: View {
         do {
             try await appModel.engine.approvals.settleInlineCard(
                 id: approvalId, decision: decision,
-                coordinator: .app(dataRootOverride: appModel.dataRootOverride),
-                resolutionChanged: { id, active in
-                    if active { appModel.approvalResolutionInFlightIDs.insert(id) }
-                    else { appModel.approvalResolutionInFlightIDs.remove(id) }
-                },
+                coordinator: .app(),
                 refreshHealth: { await appModel.loadHealthCard() }
             )
         } catch {
@@ -170,8 +155,8 @@ enum ChatShellApprovalCopy {
         return sendVerbs.contains(firstWord) ? "Send it" : "Go ahead"
     }
 
-    /// What taking the quiet option costs, in the request's own terms. Every
-    /// card says this (Agent): a decline that does not state its consequence
+    /// What taking the quiet option costs, in the request's own terms. A
+    /// decline that does not state its consequence
     /// makes the person guess what they just refused. "→" is used here and
     /// nowhere else in the card grammar.
     static func consequence(for content: String) -> String {

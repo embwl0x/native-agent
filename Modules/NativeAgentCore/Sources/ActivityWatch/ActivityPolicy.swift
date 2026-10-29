@@ -3,23 +3,14 @@ import PersistenceCore
 
 // Blueprint: | `ActivityPolicy.swift` | `ActivityPolicy` and `ActivityPolicyStore`: checked capture consent, exclusions, title permissions and policy persistence |
 
-/// W5 privacy policy for the ambient activity watcher.
-///
-/// Every field defaults to the SAFE value: the feature is off, titles are off,
-/// browser titles are off, and the exclusion list ships non-empty. A fresh
-/// install that never touches this file captures nothing.
-///
-/// This is a value type on purpose. It is read on the capture thread *before*
-/// any AX call (W5 layer 1), read again on every query path (W5 layer 2), and
-/// handed to the retro-delete path (W5 layer 3). A reference type shared across
-/// those three would be a race; a `Sendable` snapshot cannot be.
+/// Opt-in activity recording: capture, titles, browser titles and model access
+/// default off; exclusions start non-empty. Sendable policy snapshots gate AX
+/// reads, history queries and retroactive deletion without shared mutable state.
 public struct ActivityPolicy: Sendable, Codable, Equatable {
     /// Master switch. FALSE by default — the whole organ is opt-in.
     public var captureEnabled: Bool
     /// Whether the frontmost window's title is captured at all. FALSE by default.
-    /// Even when true, titles pass through `ActivityTitleRedaction` first and
-    /// the honest limit stated in the build plan (W5) applies: redaction catches
-    /// *shaped secrets*, it does not make a title private-safe.
+    /// `ActivityTitleRedaction` catches shaped secrets, not all private content.
     public var captureTitles: Bool
     /// Browser titles are their own decision, and their own default-off.
     /// Private-browsing state is not reliably detectable via AX across
@@ -35,7 +26,7 @@ public struct ActivityPolicy: Sendable, Codable, Equatable {
     /// User-editable exclusions. Ships with a starter list (see
     /// `defaultExcludedBundleIDs`) rather than empty.
     public var excludedBundleIDs: Set<String>
-    /// W10 retention, in days. Spans older than this are pruned + VACUUMed.
+    /// Retention in days; older spans are pruned and physically deleted.
     public var retentionDays: Int
 
     public init(
@@ -75,17 +66,8 @@ public struct ActivityPolicy: Sendable, Codable, Equatable {
 
     public static let defaultRetentionDays = 30
 
-    /// NON-OVERRIDABLE exclusions. These are unioned into every check and are
-    /// deliberately NOT part of `excludedBundleIDs` — a user (or a corrupt
-    /// policy file, or a future settings UI bug) must not be able to remove
-    /// them. The P0 spike caught NativeAgent's own window titled "Chat"; an
-    /// agent recording its own chat window is a feedback loop, not telemetry.
-    /// Self-exclusion resolves the HOST app's identity at runtime rather than
-    /// matching a hardcoded bundle id. The first draft hardcoded the developer's
-    /// personal id, which the repo's leak scanner caught — and which was a real
-    /// defect, not just a naming one: the public build ships under a different
-    /// identifier, so a hardcoded list would have silently failed to exclude
-    /// NativeAgent from its own recording for every public user.
+    /// Non-overridable exclusions join every check independently of user choices.
+    /// Resolve the host identity at runtime so every build excludes itself.
     public static var alwaysExcludedBundleIDs: Set<String> {
         var ids: Set<String> = [
             "com.apple.loginwindow",             // a lock signal, never a span
@@ -98,11 +80,8 @@ public struct ActivityPolicy: Sendable, Codable, Equatable {
         return ids
     }
 
-    /// Stand-in bundle id for "this is us". The capture layer knows its own PID
-    /// but a command-line probe has no bundle id at all, so the PID check feeds
-    /// this sentinel into the engine — which then takes the ordinary excluded
-    /// path (close what is open, open nothing) instead of needing a second,
-    /// separately-testable code path for self-exclusion.
+    /// Refused identities use this always-excluded sentinel to close the prior
+    /// span without opening another or reading AX content.
     public static let selfProcessBundleID = "nativeagent.activity-watch.self"
 
     /// Browsers, for the `browserTitlesEnabled` gate. Bundle ids only — we never
@@ -123,10 +102,8 @@ public struct ActivityPolicy: Sendable, Codable, Equatable {
         "com.microsoft.edgemac.Beta",
     ]
 
-    /// The starter exclusion list (W5 review finding I13). Redaction catches
-    /// *shaped* secrets; it does not make "Re: Q3 layoffs — Mail" private. So
-    /// v1 ships the obvious credential / health / finance surfaces excluded
-    /// outright — no title, no app name, no row at all.
+    /// Credential, health and finance defaults exclude the whole app: no title,
+    /// app name or row. Title redaction alone cannot protect private content.
     public static let defaultExcludedBundleIDs: Set<String> = [
         // --- password managers / credential stores ---
         "com.1password.1password",               // 1Password 8

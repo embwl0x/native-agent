@@ -14,12 +14,7 @@ enum ProviderErrorBodyDrain {
         try Task.checkCancellation()
         guard maxBytes > 0 else { return Data() }
         // Read on the caller's task; its progress writer wakes the sole deadline.
-        // 2026-09-06: `timeout` is an IDLE deadline, not an absolute one. The
-        // absolute two-second cut truncated a slowly delivered 400 body and
-        // dropped the phrase ("maximum context length", usage exhaustion) that
-        // classification turns into compaction or an actionable notice; the
-        // partial body then read as a generic terminal error. While bytes keep
-        // arriving the read continues, up to a longer absolute cap.
+        // `timeout` limits idle time; arriving bytes extend the read up to the absolute cap.
         let progress = ProviderErrorBodyDrainProgress()
         let absoluteCap = max(timeout * 5, 10)
         let watchdog = Task {

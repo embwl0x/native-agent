@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `NativeAgentWorkspaceRoot.swift` | Canonical workspace root; `resolveFileMutationPath` is the shared byte-preserving path resolver for file mutation execution and containment, including the workspace base for relative names |
+// Blueprint: | `NativeAgentWorkspaceRoot.swift` | Canonical workspace root, byte-preserving file spelling, target/entry canonicalization and byte-exact component-relative paths; callers select bases and retain admission authority |
 
 /// Canonical user-work root for every NativeAgent surface.
 ///
@@ -13,9 +13,16 @@ import Foundation
 /// File contents are task-defined, owned by the tool that creates them.
 /// This owns only path resolution and directory preparation. TrustCenter and
 /// each tool's execution boundary retain permission and effect authority.
-/// Caller-defined files, excluded from automatic backup/export/phone sync;
-/// PrivacyMap resolves this same workspace root, including checkout locations.
 public enum NativeAgentWorkspaceRoot {
+    /// Compare caller-selected lexical or resolved paths by filesystem bytes.
+    /// Equality has an empty tail; outside paths have no tail.
+    public static func relativePath(_ path: String, under root: String) -> String? {
+        if path.utf8.elementsEqual(root.utf8) { return "" }
+        let prefix = root.hasSuffix("/") ? root : root + "/"
+        guard path.utf8.starts(with: prefix.utf8) else { return nil }
+        return String(decoding: path.utf8.dropFirst(prefix.utf8.count), as: UTF8.self)
+    }
+
     public static func resolve(
         dataRoot: URL = defaultDataRoot(),
         environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -44,6 +51,49 @@ public enum NativeAgentWorkspaceRoot {
     /// Preserve whitespace; it is part of the file name.
     public static func resolveFileMutationPath(_ raw: String, dataRoot: URL) -> URL {
         let workspace = resolve(dataRoot: dataRoot)
+        return canonicalFileURL(fileCandidate(raw, relativeTo: workspace, workspaceRoot: workspace))
+    }
+
+    /// The entry a move or trash acts on: its folder's aliases resolved, the named
+    /// item kept, so a symlink is moved or trashed itself and never its target.
+    public static func resolveFileEntryPath(_ raw: String, dataRoot: URL) -> URL {
+        let workspace = resolve(dataRoot: dataRoot)
+        return canonicalFileURL(fileCandidate(raw, relativeTo: workspace, workspaceRoot: workspace), followFinalLink: false)
+    }
+
+    /// Resolve folder aliases, optionally keeping the final entry itself.
+    /// macOS firmlink spellings also canonicalize when the leaf does not exist.
+    public static func canonicalFileURL(_ candidate: URL, followFinalLink: Bool = true) -> URL {
+        let entry = candidate.standardizedFileURL
+        let resolved = followFinalLink || entry.path == "/" ? entry.resolvingSymlinksInPath()
+            : entry.deletingLastPathComponent().resolvingSymlinksInPath().appendingPathComponent(entry.lastPathComponent)
+        for prefix in ["/etc", "/tmp", "/var"] {
+            if (followFinalLink && resolved.path == prefix) || resolved.path.hasPrefix(prefix + "/") {
+                return URL(fileURLWithPath: "/private" + resolved.path)
+            }
+        }
+        return resolved
+    }
+
+    public static func normalizeWorkspaceAlias(_ path: String, workspaceRoot: URL) -> String {
+        if path == "workspace" || path == "workspace/" { return workspaceRoot.path }
+        return path.hasPrefix("workspace/")
+            ? workspaceRoot.appendingPathComponent(String(path.dropFirst("workspace/".count))).standardizedFileURL.path
+            : path
+    }
+
+    /// Spelling only; callers own containment, source selection and final links.
+    public static func fileCandidate(_ raw: String, relativeTo base: URL, workspaceRoot: URL? = nil) -> URL {
+        var path = fileSpelling(raw)
+        if let workspaceRoot { path = normalizeWorkspaceAlias(path, workspaceRoot: workspaceRoot) }
+        if path.lowercased() == "/documents" || path.lowercased().hasPrefix("/documents/") {
+            path = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents")
+                .appendingPathComponent(String(path.dropFirst("/documents".count))).path
+        }
+        return (path.hasPrefix("/") ? URL(fileURLWithPath: path) : base.appendingPathComponent(path)).standardizedFileURL
+    }
+
+    public static func fileSpelling(_ raw: String) -> String {
         let path: String
         if let address = URL(string: raw), address.isFileURL {
             path = address.path
@@ -52,22 +102,7 @@ public enum NativeAgentWorkspaceRoot {
         } else {
             path = raw
         }
-        let expanded = (path as NSString).expandingTildeInPath
-        let candidate: URL
-        if expanded == "workspace" || expanded == "workspace/" {
-            candidate = workspace
-        } else if expanded.hasPrefix("workspace/") {
-            candidate = workspace.appendingPathComponent(String(expanded.dropFirst("workspace/".count)))
-        } else if expanded.lowercased() == "/documents" || expanded.lowercased().hasPrefix("/documents/") {
-            // Keep the file tools' existing Full Mac Documents shorthand.
-            let documents = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents")
-            candidate = documents.appendingPathComponent(String(expanded.dropFirst("/documents".count)))
-        } else if expanded.hasPrefix("/") {
-            candidate = URL(fileURLWithPath: expanded)
-        } else {
-            candidate = workspace.appendingPathComponent(expanded)
-        }
-        return candidate.standardizedFileURL.resolvingSymlinksInPath()
+        return (path as NSString).expandingTildeInPath
     }
 
     @discardableResult

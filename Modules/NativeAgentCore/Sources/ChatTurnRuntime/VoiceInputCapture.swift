@@ -5,13 +5,6 @@ import AVFoundation
 import NativeAgentShared
 // Blueprint: | `VoiceInputCapture.swift` | consent-driven native microphone lifecycle; shared SpeechUtterance recognition and original audio travel through existing chat attachments |
 
-/// Recognition events enter the capture lifecycle through the native driver.
-public enum VoiceInputRecognitionEvent: Equatable, Sendable {
-    case partial(String)
-    case final(String)
-    case failed(String)
-}
-
 /// The terminal quality of a stopped voice capture.  A recognizer timeout is
 /// deliberately distinct from a completed transcription: callers can retain
 /// the partial text for visible recovery without ever submitting it as though
@@ -121,7 +114,6 @@ public final class VoiceInputCapture {
     public var errorMessage: String?
     public private(set) var attachment: MultimodalAttachment?
 
-    public private(set) var permissionGranted = false
     private var recognizer: SFSpeechRecognizer?
     private var audioEngine: AVAudioEngine?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
@@ -145,7 +137,7 @@ public final class VoiceInputCapture {
     // quality until the next capture starts, rather than reclassifying the
     // retained partial text as a new final result.
     private var latestStopResult: VoiceInputStopResult?
-    // The 2s fallback timer armed by stopListening(). Cancelled when the
+    // The stop timeout armed by stopListeningResult(). Cancelled when the
     // continuation resolves early (cleanupRecognition) — otherwise a previous
     // stop's stale timer could resume a LATER stop's continuation with a
     // truncated transcript.
@@ -181,23 +173,6 @@ public final class VoiceInputCapture {
         recognitionGeneration &+= 1
         isListening = true
         return recognitionGeneration
-    }
-
-    private func receive(
-        _ event: VoiceInputRecognitionEvent,
-        generation: UInt64
-    ) {
-        guard recognitionGeneration == generation else { return }
-        switch event {
-        case .partial(let text):
-            transcript = text
-        case .final(let text):
-            transcript = text
-            cleanupRecognition(result: .final(text))
-        case .failed(let detail):
-            errorMessage = detail
-            cleanupRecognition(result: .failed(detail))
-        }
     }
 
     /// Exposes whether a stop was final, incomplete, or failed. Composers
@@ -279,11 +254,10 @@ public final class VoiceInputCapture {
         }
     }
 
-    public func requestPermission() async -> Bool {
+    public func requestPermission() async -> VoiceInputPermissionResult {
         let result = await requestSystemPermission()
-        permissionGranted = result == .granted
         errorMessage = result.errorMessage
-        return permissionGranted
+        return result
     }
 
     private func requestSystemPermission() async -> VoiceInputPermissionResult {
@@ -308,33 +282,20 @@ public final class VoiceInputCapture {
     }
 
     nonisolated private static func requestMicrophoneAuthorization() async -> VoiceInputPermissionResult {
-        return await withCheckedContinuation { cont in
-            // If already authorized, this resumes immediately without prompting.
-            switch AVCaptureDevice.authorizationStatus(for: .audio) {
-            case .authorized:
-                cont.resume(returning: .granted)
-            case .notDetermined:
-                AVCaptureDevice.requestAccess(for: .audio) { _ in
-                    switch AVCaptureDevice.authorizationStatus(for: .audio) {
-                    case .authorized:
-                        cont.resume(returning: .granted)
-                    case .notDetermined:
-                        cont.resume(returning: .microphoneNotDetermined)
-                    case .denied:
-                        cont.resume(returning: .microphoneDenied)
-                    case .restricted:
-                        cont.resume(returning: .microphoneRestricted)
-                    @unknown default:
-                        cont.resume(returning: .microphoneRestricted)
-                    }
-                }
-            case .denied:
-                cont.resume(returning: .microphoneDenied)
-            case .restricted:
-                cont.resume(returning: .microphoneRestricted)
-            @unknown default:
-                cont.resume(returning: .microphoneRestricted)
-            }
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+            _ = await AVCaptureDevice.requestAccess(for: .audio)
+        }
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            return .granted
+        case .notDetermined:
+            return .microphoneNotDetermined
+        case .denied:
+            return .microphoneDenied
+        case .restricted:
+            return .microphoneRestricted
+        @unknown default:
+            return .microphoneRestricted
         }
     }
 
@@ -409,25 +370,16 @@ public final class VoiceInputCapture {
     ) {
         guard recognitionGeneration == generation else { return }
         self.utterance = utterance
-        receive(
-            utterance.isFinal ? .final(utterance.text) : .partial(utterance.text),
-            generation: generation
-        )
+        transcript = utterance.text
+        if utterance.isFinal {
+            cleanupRecognition(result: .final(utterance.text))
+        }
     }
 
     fileprivate func receiveNativeRecognitionFailure(message: String, generation: UInt64) {
-        receive(.failed(message), generation: generation)
-    }
-
-    /// Stops recording and returns the FINAL transcript. SFSpeechRecognizer's
-    /// `finish()` flushes asynchronously — the recognitionHandler may deliver
-    /// a final result after several hundred ms. We hold a continuation until
-    /// either `isFinal` arrives (resolved from cleanupRecognition) or a 2s
-    /// timeout fires. The compatibility string result is empty for every
-    /// non-final outcome, so composers restore their pre-voice draft rather
-    /// than sending a partial transcript as a completed utterance.
-    public func stopListening() async -> String {
-        await stopListeningResult().transcriptForSubmission
+        guard recognitionGeneration == generation else { return }
+        errorMessage = message
+        cleanupRecognition(result: .failed(message))
     }
 
     public func discardListening() {

@@ -17,7 +17,7 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
 
     init(_ appModel: AppModel) { self.appModel = appModel }
 
-    var dataRootOverride: URL? { appModel.dataRootOverride }
+    var dataRootOverride: URL? { appModel.engine.dataRoot }
     var trustPolicy: TrustPolicy? { appModel.engine.trust.policy }
     var personality: PersonalityProfile? { appModel.engine.persona.profile }
     var dreamError: String? { appModel.dreamError }
@@ -47,8 +47,8 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
     }
 
     func saveMacControlPolicy(
-        _ policy: TrustMacControlPolicy,
-        comparedTo baseline: TrustMacControlPolicy,
+        _ policy: MacControlPolicyWireSnapshot,
+        comparedTo baseline: MacControlPolicyWireSnapshot,
         guardedByLockedPolicy: (@Sendable ([String: JSONValue]) throws -> Void)?
     ) async throws -> TrustPolicy {
         try await appModel.saveMacControlPolicy(policy, comparedTo: baseline, guardedByLockedPolicy: guardedByLockedPolicy)
@@ -62,14 +62,14 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
         group: ProviderSurfaceGroup, providerID: String?, model: String?,
         reasoningEffort: String?, serviceTier: String?, clearOverride: Bool
     ) async throws -> ProviderGroupWriteResult {
-        try await appModel.saveProviderGroupSelection(
+        try await appModel.engine.saveProviderGroupSelection(
             group: group, providerID: providerID, model: model, reasoningEffort: reasoningEffort,
             serviceTier: serviceTier, clearOverride: clearOverride
         )
     }
 
     func listQuietProviderAccounts() async throws -> [QuietProviderAccount] {
-        try await appModel.engine.providers.list().map {
+        try await appModel.engine.providers.list().providers.map {
             QuietProviderAccount(providerID: $0.provider_id, authState: $0.auth_status.state,
                                  eligible: $0.auth_status.eligible, models: $0.models)
         }
@@ -80,7 +80,7 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
     }
 
     func applyTrustPreset(
-        _ preset: TrustPolicyPreset,
+        _ preset: MobileTrustAction.Preset,
         guardedByLockedPolicy: (@Sendable ([String: JSONValue]) throws -> Void)?
     ) async -> QuietTrustPresetOutcome {
         switch await TrustPolicyPresetAction.apply(
@@ -99,7 +99,7 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
         do {
             return try await TrustPolicyToolWriter.applyTrustPolicyPatch(
                 body: ["multimodalPolicy": [field: enabled]],
-                dataRoot: dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+                dataRoot: appModel.engine.dataRoot,
                 guardedByLockedPolicy: guardedByLockedPolicy)
         } catch {
             appModel.engine.trust.publishPolicy(nil)
@@ -114,15 +114,13 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
     func savePersonalityChecked(_ profile: PersonalityProfile) async throws {
         try await appModel.savePersonalityChecked(profile)
     }
-    func patchMemoryPolicy(knowledgeGraphEnabled: Bool?, adaptivePromotion: Bool?, hygieneEnabled: Bool?) async -> Bool {
+    func patchMemoryPolicy(knowledgeGraphEnabled: Bool?, adaptivePromotion: Bool?) async -> Bool {
         await appModel.patchMemoryPolicy(
             knowledgeGraphEnabled: knowledgeGraphEnabled,
-            adaptivePromotion: adaptivePromotion,
-            hygieneEnabled: hygieneEnabled)
+            adaptivePromotion: adaptivePromotion)
     }
-    func saveMemoryPolicy(consolidationEnabled: Bool, crossSessionRecall: Bool) async {
+    func saveMemoryPolicy(crossSessionRecall: Bool) async {
         await appModel.saveMemoryPolicy(
-            consolidationEnabled: consolidationEnabled,
             crossSessionRecall: crossSessionRecall)
     }
 
@@ -145,7 +143,7 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
     /// them (SetupRestRows.shortcutRow).
     func setGlobalHotkeyEnabled(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: "globalHotkeyEnabled")
-        GlobalHotkeyManager.shared.setEnabled(enabled)
+        GlobalHotkey.shared.setEnabled(enabled)
     }
 
     func savePersonalityName(_ name: String) async -> String? {
@@ -162,10 +160,7 @@ class AppQuietSettingsHost: QuietLowerOnlySettingsHost {
     }
     func findSearchService() async throws -> String {
         switch await appModel.autodetectSearXNG() {
-        // Find, then Save — the page's two buttons in the order a person
-        // presses them.
-        case .found(let url):
-            try await saveSearchServiceURL(url)
+        case .found:
             return appModel.searxngBaseURL
         case .notFound(let detail), .failed(let detail): throw QuietSettingError.unavailable(detail)
         }

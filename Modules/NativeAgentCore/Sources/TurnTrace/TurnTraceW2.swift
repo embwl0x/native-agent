@@ -1,25 +1,13 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
 // Blueprint: | `TurnTraceW2.swift` | `TurnTraceRedactor` and `InspectorThinkingLane`: shared trace redaction and per-surface summarized-thinking visibility gate |
 
-// MARK: - Turn Inspector W2 (turn-inspector build plan, ledger d6143561)
-//
-// W2 adds richer per-turn EMISSION points on top of the W1 spine
-// (TurnTrace.swift): assembly.stage, stream.tick, file.touch, and the gated
-// summarized-thinking lane (thinking.delta). The emission sites themselves live
-// next to the code they observe (ChatOrchestration + ProviderRouting); this
-// file holds the two cross-module primitives those sites need and that must
-// live in the LOWEST common module (PersistenceCore):
-//
-//   1. TurnTraceRedactor — a compact secret scrubber shared by the thinking
-//      lane and ChatOrchestration preview/trace boundaries so text is redacted
-//      BEFORE it is bounded and fired onto the bus. Same redaction-at-emission
-//      discipline as ChatToolDispatchTracer: redact, THEN truncate.
-//
-//   2. InspectorThinkingLane — the per-surface opt-in for displaying
-//      summarized thinking. Provider requests and liveness are independent.
+// Shared trace/preview redaction runs before bounding and bus emission.
+// Summarized thinking is a per-surface display opt-in; provider requests and
+// liveness are independent.
 
 // MARK: - TurnTraceRedactor
 
@@ -28,9 +16,8 @@ import PersistenceCore
 /// detection and omits match digests so diagnostics cannot correlate a
 /// credential across events.
 ///
-/// Used by the thinking lane in ProviderRouting. The bus already bounds every
-/// string leaf (TurnTraceEvent.boundString); this adds the redaction half so a
-/// token that slips under the length cap never lands in turn_traces verbatim.
+/// Local traces may retain bounded, credential-redacted content previews.
+/// Compact dispatch receipts and phone summaries carry narrower projections.
 public enum TurnTraceRedactor {
     public static func redactText(_ value: String) -> String {
         TurnSecretRedactor.redactText(value)
@@ -62,8 +49,7 @@ public enum InspectorThinkingLane {
     /// UserDefaults key for the per-surface opt-in (Mac chat only for now).
     public static let defaultsKey = "inspectorThinkingSummarized"
 
-    /// The ONLY surface eligible for the summarized-thinking lane in W2.
-    /// (W2 scope: Mac chat surface only — `surface == "chat"`.)
+    /// Only the Mac chat surface is eligible for summarized thinking.
     public static let eligibleSurface = "chat"
 
     /// Display gate inherited by the adapter's inner Task; it controls only

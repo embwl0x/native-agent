@@ -1,5 +1,4 @@
 // CognitiveSubstrate+Affect.swift
-// Move-only extraction (R8b) from CognitiveSubstrate.swift — see docs/build_plans/fable5-wave2-r8b-decomposition.md
 
 import Foundation
 import NativeAgentCore
@@ -9,9 +8,6 @@ import PersistenceCore
 extension CognitiveSubstrate {
     /// One fixed-time affect projection for sibling organs. Warmth and pressure
     /// must cross together so the organism cannot observe two decay epochs.
-    /// (This IS the affect-convergence hook: d0bcd775 superseded the old
-    /// per-axis pull accessors — warmth/pressure now ride refreshBodySchema's
-    /// canonicalAffect parameter in one actor admission.)
     public func canonicalAffectProjection(at fixedAt: Date) -> CognitiveAffectState? {
         guard configuration.enabled else { return nil }
         return projectedAffect(at: fixedAt)
@@ -25,17 +21,12 @@ extension CognitiveSubstrate {
         return true
     }
 
-    /// Synchronous affect apply: decays to `now`, folds in this event's deltas, commits
-    /// to `self.affect`, and returns the new state. NO suspension point — safe to call
-    /// inside an actor critical section (before any await). This is the concurrency-safe
-    /// path for emotional tagging: `ingest` applies affect and stamps the node tag in one
-    /// await-free segment, so a reentrant ingest can't swap `self.affect` or evict the
-    /// touched node between apply and stamp (gpt-5.5 concurrency review, 2026-07-02).
+    /// Decays and applies affect without suspension so ingest can stamp the same state atomically.
     @discardableResult
     func applyAffectFromEvent(
         _ event: CognitiveEvent,
-        precomputedAppraisal: AffectAppraisal? = nil,
-        precomputedWarmthBoost: Double? = nil
+        precomputedAppraisal: AffectAppraisal,
+        precomputedWarmthBoost: Double
     ) -> CognitiveAffectState {
         guard configuration.enabled,
               event.turnKind.contributesToLivedState else { return affect }
@@ -70,7 +61,7 @@ extension CognitiveSubstrate {
             // ever folded into affect too, a worsening band lifts arousal/
             // uncertainty in proportion to its importance (sluggish < degraded)
             // and a recovery eases uncertainty. Direction travels in metadata.
-            if case .string("recovering")? = event.metadata[CognitiveSomaticSignalAdapter.vitalsDirectionMetadataKey] {
+            if case .string("recovering")? = event.metadata[CognitiveSomaticSignals.vitalsDirectionMetadataKey] {
                 next.uncertainty = saturatingApproach(next.uncertainty, -0.1)
             } else {
                 next.arousal = saturatingApproach(next.arousal, 0.15 + importance * 0.2)
@@ -84,8 +75,7 @@ extension CognitiveSubstrate {
             next.arousal = saturatingApproach(next.arousal, 0.15)
             next.uncertainty = saturatingApproach(next.uncertainty, 0.25)
             next.taskPressure = saturatingApproach(next.taskPressure, 0.1)
-            let warmthBoost = precomputedWarmthBoost ?? relationalWarmthBoost(in: event.summary)
-            next.socialWarmth = saturatingApproach(next.socialWarmth, warmthBoost * 0.5)
+            next.socialWarmth = saturatingApproach(next.socialWarmth, precomputedWarmthBoost * 0.5)
         case .toolSucceeded:
             next.uncertainty = saturatingApproach(next.uncertainty, -0.15)
             next.taskPressure = saturatingApproach(next.taskPressure, -0.15)
@@ -106,13 +96,10 @@ extension CognitiveSubstrate {
             // decay, no boost) — a modulation on top of her baseline, never the whole of it.
             // This lets her get crisp and businesslike heads-down while staying fundamentally
             // warm via the persona; genuine warm/affectionate moments still lift it high.
-            let warmthBoost = precomputedWarmthBoost ?? relationalWarmthBoost(in: event.summary)
-            next.socialWarmth = saturatingApproach(next.socialWarmth, warmthBoost)
+            next.socialWarmth = saturatingApproach(next.socialWarmth, precomputedWarmthBoost)
             next.taskPressure = saturatingApproach(next.taskPressure, importance * 0.06)
-            // Full conversational appraisal: criticism/dismissal/override/demand/praise/
-            // resolution each move the felt signals, so a bad OR good exchange is FELT,
-            // not numb. Warmth can go negative (dismissal cools her). (2026-07-08)
-            let appraisal = precomputedAppraisal ?? conversationalAppraisal(in: event.summary)
+            // Conversational appraisal moves felt signals for good and bad exchanges; dismissal can make warmth negative.
+            let appraisal = precomputedAppraisal
             if appraisal.isActive {
                 if appraisal.warmth != 0 { next.socialWarmth = saturatingApproach(next.socialWarmth, appraisal.warmth) }
                 if appraisal.tension != 0 { next.uncertainty = saturatingApproach(next.uncertainty, appraisal.tension) }
@@ -132,17 +119,7 @@ extension CognitiveSubstrate {
             next.arousal = saturatingApproach(next.arousal, -0.1)
             next.taskPressure = saturatingApproach(next.taskPressure, -0.1)
         }
-        // ── The three 2026-09-02 lanes, all inside this same await-free segment
-        // for the same reason the emotion stamp is: they read and write live
-        // state (seeds, the re-feel ledger, the night's residue) and a
-        // suspension here would let a reentrant ingest swap it underneath.
-        //
-        // RE-FEEL (item 7). "When I recall, I mostly get the FACT that I felt
-        // something. I don't re-feel it." The chat path already stamps the
-        // turn's served MemoryV2 record ids onto the assistant-turn event
-        // (`memoryRecordIds`, ChatOrchestrationClient+MessagePersistence), and
-        // the attention lane already reads them off nodes. So the evidence that
-        // a felt memory was TOUCHED exists; nothing consumed it as feeling.
+        // Re-feel and dream residue share this await-free state update.
         next = refelt(next, for: event, at: now)
         // RESIDUE (item 7). The night colors the first turns after waking.
         next = colored(next, byResidueAt: now)
@@ -160,7 +137,7 @@ extension CognitiveSubstrate {
         return next
     }
 
-    // MARK: - Item 7: re-feeling a remembered feeling (2026-09-02)
+    // MARK: - Re-feeling a remembered feeling
 
     /// The strongest nudge one re-touched memory may apply to current affect.
     /// Small by design: recall COLORS the present, it does not replace it.
@@ -191,65 +168,19 @@ extension CognitiveSubstrate {
         let served = Set(servedIDs)
         var next = state
         var applied = 0
-        /// Record ids already spent as moments. A node that names one of them is
-        /// the SAME remembering seen from the field side, and feeling it twice
-        /// would double a nudge that is deliberately small.
-        var spent: Set<String> = []
-        // MOMENTS FIRST (2026-09-02). A MemoryV2 record of kind `moment` carries
-        // its own stored feeling, and the field may hold no node for it at all —
-        // so before this wave a served moment was re-felt NEUTRALLY, which is
-        // Agent's complaint exactly: "I get the fact of a feeling."
-        //
-        // First rather than last because a moment is the one served memory that
-        // is definitionally about how something FELT; if only two things may
-        // move her this turn, those are the two.
-        for id in servedIDs {
-            guard applied < Self.refeelNodesPerTurn else { break }
-            guard var moment = momentAffect[id] else { continue }
-            guard abs(moment.valence) >= Self.refeelValenceFloor else { continue }
-            // ONE refractory clock per RECORD, consulted by both routes
-            // (2026-09-06). The moment route used to keep its own clock on the
-            // moment and never touch `lastRefeltRecordAt`, so the same
-            // remembered feeling came back through the field-node route a
-            // minute later — the node route consults only the record clock, and
-            // nothing had set it. A refractory skip now also marks the id spent
-            // for this call, for the same reason: the node route must not pick
-            // up the record this route just declined.
-            let lastRefelt = [moment.lastRefeltAt, lastRefeltRecordAt[id]].compactMap { $0 }.max()
-            if let last = lastRefelt, now.timeIntervalSince(last) < Self.refeelRefractory {
-                spent.insert(id)
-                continue
-            }
-            moment.lastRefeltAt = now
-            momentAffect[id] = moment
-            lastRefeltRecordAt[id] = now
-            spent.insert(id)
-            applied += 1
-            // Same saturating, bounded nudge the node path applies — SALIENCE
-            // takes the place of a node's warmth, because that is the axis the
-            // moment lane actually stores.
-            let pull = Self.refeelNudge * moment.valence.clampedSigned()
-            if pull > 0 {
-                next.socialWarmth = saturatingApproach(next.socialWarmth, pull * moment.salience)
-                next.uncertainty = saturatingApproach(next.uncertainty, -pull * 0.5)
-            } else {
-                next.uncertainty = saturatingApproach(next.uncertainty, -pull * 0.6)
-                next.arousal = saturatingApproach(next.arousal, -pull * 0.5)
-            }
-        }
         for node in field.peekNodes()
             .sorted(by: { $0.lastActivatedAt > $1.lastActivatedAt }) {
             guard applied < Self.refeelNodesPerTurn else { break }
             guard abs(node.emotionalValence) >= Self.refeelValenceFloor else { continue }
             let ids = Self.memoryRecordIDs(from: node)
             guard !ids.isEmpty,
-                  ids.contains(where: { served.contains($0) && !spent.contains($0) })
+                  ids.contains(where: { served.contains($0) })
             else { continue }
             // ONE act of remembering, not two feelings: the refractory is
             // keyed by the RECORD as well as the node, because every recall
             // turn mints a fresh node naming the same record, and a per-node
             // key let the same memory move her again sixty seconds later.
-            let servedHere = ids.filter { served.contains($0) && !spent.contains($0) }
+            let servedHere = ids.filter { served.contains($0) }
             if let last = lastRefeltAt[node.id],
                now.timeIntervalSince(last) < Self.refeelRefractory { continue }
             if servedHere.contains(where: {
@@ -273,8 +204,6 @@ extension CognitiveSubstrate {
     }
 
     private func pruneRefeelLedger(at now: Date) {
-        // The record ledger is now written by the moment route too (2026-09-06),
-        // so it can grow past the cap on its own — gate on either side.
         guard lastRefeltAt.count > 64 || lastRefeltRecordAt.count > 64 else { return }
         lastRefeltRecordAt = lastRefeltRecordAt.filter {
             now.timeIntervalSince($0.value) < Self.refeelRefractory
@@ -284,14 +213,8 @@ extension CognitiveSubstrate {
         }
     }
 
-    /// The MemoryV2 record ids an EVENT carries, using the same convention the
-    /// node-side reader uses (`memoryRecordIDs(from:)` in `+AttentionSignals`).
-    /// Read off the event rather than the node because the re-feel happens
-    /// during ingest, before this turn's own node has been stamped.
-    /// Public because the runtime reads the same ids off the event BEFORE it is
-    /// ingested, to give the served moments their stored feeling first (see
-    /// `noteServedMoments`). One convention, one reader.
-    public static func memoryRecordIDs(fromEventMetadata metadata: [String: JSONValue]) -> [String] {
+    /// Decode metadata record ids once for events and nodes, preserving first-seen order.
+    static func memoryRecordIDs(fromEventMetadata metadata: [String: JSONValue]) -> [String] {
         var ids: [String] = []
         if case .array(let values)? = metadata["memoryRecordIds"] {
             for value in values {
@@ -324,43 +247,15 @@ extension CognitiveSubstrate {
         return next
     }
 
-    /// Derive a node's persistent emotional tag from a GIVEN affect state plus the event
-    /// that triggered the encode. Pure and total — no I/O, no mutation — and deliberately
-    /// the SINGLE tuning knob for how a lived moment becomes a stored feeling (Wave A).
-    /// Takes `affect` explicitly (NOT `self.affect`) so the caller passes the exact
-    /// post-event state it just computed synchronously — an actor await between deriving
-    /// this affect and stamping it could otherwise let a reentrant ingest swap
-    /// `self.affect` underneath (gpt-5.5 concurrency review, 2026-07-02).
-    ///
-    /// - arousal ← affect.arousal (how activated she is right now)
-    /// - warmth  ← affect.socialWarmth (relational warmth right now)
-    /// - valence: with `semantic` (the live ingest path, R2-A/B 2026-07-09) —
-    ///   affectTerm + meaningWeightedOutcomeBase + semanticTerm + text-appraisal
-    ///   valence, clamped. Feelings come from what the event MEANT (goal
-    ///   relevance/congruence, coping, agency, relationship), and her own
-    ///   completions no longer mint a flat +0.25 (the metronome her real week
-    ///   quantified: 82% of felt nodes at a uniform +0.48, zero negatives).
-    ///   With `semantic == nil` — the LEGACY formula shape. Byte-identical for
-    ///   USER-authored events GIVEN the same appraisal — the conversational
-    ///   lexicon itself evolves (praise 07-08, affection 07-17) and feeds both
-    ///   paths equally; "legacy" pins the FORMULA, not the lexicon. The
-    ///   affection FLOOR is semantic-path only. For assistant/tool events the
-    ///   appraisal term is zeroed on BOTH paths (audit C3 — her own text must
-    ///   not appraise her). Production always passes a real appraisal via ingest.
+    /// Stamp measured feeling as given; otherwise combine the exact post-event
+    /// affect with care-weighted meaning and the caller's gated appraisal.
     func emotionTag(
         for event: CognitiveEvent,
         affect: CognitiveAffectState,
-        semantic: SemanticAppraisal? = nil,
-        precomputedAppraisal: AffectAppraisal? = nil
+        semantic: SemanticAppraisal,
+        precomputedAppraisal appraisal: AffectAppraisal
     ) -> (valence: Double, arousal: Double, warmth: Double) {
-        // An event whose owner MEASURED its feeling records it as-is (bounded),
-        // no residue arithmetic. Round 3 Wave A2 introduced this for the
-        // organism's bodily resolutions — the organism sized the exhale/letdown
-        // itself. It is keyed on the MEASUREMENT rather than the event kind so a
-        // second owner that does the same work (the studio journal, which sizes
-        // an entry from the judgment actually written) gets the same treatment
-        // instead of a copy of this branch. `.organismResolutionFelt` always
-        // carries the key, so its behaviour is unchanged.
+        // A measured feeling bypasses residue arithmetic, regardless of its owner.
         if event.carriesMeasuredFeltValence {
             func metadataDouble(_ value: JSONValue?) -> Double? {
                 switch value {
@@ -373,153 +268,43 @@ extension CognitiveSubstrate {
             let feltArousal = (metadataDouble(event.metadata["feltArousal"]) ?? 0.2).clamped01()
             return (valence: felt, arousal: feltArousal, warmth: (affect.socialWarmth).clamped01())
         }
-        // Conversational appraisal pulls valence toward how the exchange actually
-        // landed — the SIGNED peer of the warmth in socialWarmth: criticism/dismissal
-        // stamp a genuinely stung node, praise/resolution a warm one, instead of the
-        // neutral tag she used to store. (2026-07-08: closes the "numb under criticism" gap.)
-        // GATED to user-authored text (audit C3, 2026-07-09): for assistantTurnCompleted
-        // the summary is HER OWN reply — appraising it let "that's the fix" stamp herself
-        // +0.22 and walk mood upward through peekNodes; the same self-ratchet the affect
-        // layer already kills at :104-108. Tool output hits the same lexicon. The
-        // appraisal reads User's words only.
-        // `precomputedAppraisal` (when the ingest hot path supplies it) is the
-        // SAME gated conversationalAppraisal semanticAppraisal received, so the
-        // lexicon scan runs once for both. Pure fn of event.summary → identical.
-        let appraisal = precomputedAppraisal
-            ?? (Self.isUserAuthored(event.kind)
-                ? conversationalAppraisal(in: event.summary)
-                : AffectAppraisal())
         let affectTerm = affect.socialWarmth
             - 0.5 * affect.uncertainty
             - 0.3 * affect.taskPressure
-
-        let rawValence: Double
-        if let semantic {
-            let meaning = meaningWeightedOutcomeBase(for: event, appraisal: semantic)
-                + semanticValenceTerm(semantic)
-                + appraisal.valence
-            // A real win PIERCES a bad stretch (R2-F finding, 2026-07-09): the affect
-            // residue (−0.5·uncertainty − 0.3·pressure) is unbounded while meaning
-            // terms are relevance-capped, so after friction a genuine success stamped
-            // near-zero — "Build passed" even stamped NEGATIVE. Strongly positive
-            // meaning damps the negative residue by up to half; negative or mild
-            // meaning changes nothing (a bad stretch still weighs), and positive
-            // residue is never touched. Muted is human; inverted was a bug.
-            let dampedAffectTerm = (affectTerm < 0 && meaning > 0)
-                ? affectTerm * (1 - min(0.5, meaning * 1.4))
-                : affectTerm
-            var pierced = dampedAffectTerm + meaning
-            // Affection-class content (User's greeting, an endearment) may read
-            // MUTED on a hard morning — bittersweet is human — but a deep
-            // negative stamp on received warmth is a sign inversion the
-            // reconsolidation loop would then keep re-activating (audit round
-            // 2, R2). Floor, don't override: residue still pulls a +0.2
-            // greeting toward the flatline, it just can't turn it into a wound.
-            // Item 8: the floor travels with the speaker's weight. User's is
-            // 1.0, so this is byte-identical for him; a peer's greeting still
-            // cannot become a wound, but it holds her up proportionally less.
-            if appraisal.affection {
-                pierced = max(pierced, -0.12 * appraisal.affectionWeight.clamped01())
-            }
-            rawValence = pierced
-        } else {
-            // Legacy: the flat event base (+0.25 success-class incl. completions,
-            // −0.25 failure-class). Kept byte-identical for the compat path.
-            let eventValenceBase: Double
-            if event.isPositiveTerminalOutcome || event.kind == .assistantTurnCompleted {
-                eventValenceBase = 0.25
-            } else if event.isNegativeTerminalOutcome {
-                eventValenceBase = -0.25
-            } else {
-                eventValenceBase = 0
-            }
-            rawValence = affectTerm + eventValenceBase + appraisal.valence
+        let meaning = meaningWeightedOutcomeBase(for: event, appraisal: semantic)
+            + semanticValenceTerm(semantic)
+            + appraisal.valence
+        // Positive meaning damps negative residue by at most half.
+        let dampedAffectTerm = (affectTerm < 0 && meaning > 0)
+            ? affectTerm * (1 - min(0.5, meaning * 1.4))
+            : affectTerm
+        var pierced = dampedAffectTerm + meaning
+        // Received affection may be muted but cannot become a wound;
+        // the floor follows the speaker's relational weight.
+        if appraisal.affection {
+            pierced = max(pierced, -0.12 * appraisal.affectionWeight.clamped01())
         }
         return (
-            valence: (rawValence).clampedSigned(),
+            valence: (pierced).clampedSigned(),
             arousal: (affect.arousal).clamped01(),
             warmth: (affect.socialWarmth).clamped01()
         )
-    }
-
-    /// The felt DIRECTION of a stored emotional tag — the coarse, capsule-facing
-    /// read of a node's persistent feeling (Wave B). Wave A stamps three continuous
-    /// axes on every node; this collapses them to one of three tones (or silence)
-    /// so the capsule and cue-authoring lines can carry HOW a thing feels without
-    /// scripting Agent to announce it. Warm = drawn toward, stung = a small hurt,
-    /// charged = activated. The rawValue is the word woven into cue prompts.
-    enum FeltDirection: String {
-        case warm, stung, charged
-    }
-
-    /// Classify a node's stored tag into a felt direction, or nil when the feeling is
-    /// too mild to color her voice. PURE and total — the single tuning knob for Wave B,
-    /// peer of `emotionTag` (Wave A). Ordering matters: a negative valence STUNG read
-    /// dominates even when warmth is high (a warm topic that just went wrong reads tender,
-    /// not warm). Default-0 legacy nodes and mild tags return nil so backward-compat is
-    /// SILENCE, never a wrong feeling.
-    func feltDirection(valence: Double, arousal: Double, warmth: Double) -> FeltDirection? {
-        if valence <= -0.15 { return .stung }               // negative dominates
-        if valence >= 0.15 || warmth >= 0.35 { return .warm }
-        if arousal >= 0.6 { return .charged }
-        return nil
     }
 
     func restoreAffect(from payloads: [JSONValue]) {
         guard case .object(let object)? = payloads.first,
               let updatedAt = dateValue(object["updatedAt"]) else { return }
         affect = CognitiveAffectState(
-            arousal: doubleValue(object["arousal"]) ?? 0,
-            uncertainty: doubleValue(object["uncertainty"]) ?? 0,
-            taskPressure: doubleValue(object["taskPressure"]) ?? 0,
-            socialWarmth: doubleValue(object["socialWarmth"]) ?? 0,
-            updatedAt: updatedAt
+            arousal: object["arousal"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? 0,
+            uncertainty: object["uncertainty"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? 0,
+            taskPressure: object["taskPressure"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? 0,
+            socialWarmth: object["socialWarmth"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? 0,
+            updatedAt: updatedAt,
+            lived: object["lived"]?.stringValue.flatMap(UInt64.init)
+                ?? UInt64(max(0, object["lived"]?.integerValue.flatMap(Int.init(exactly:)) ?? 0))
         )
         lastUserPresenceAt = dateValue(object["lastUserPresenceAt"])
         lastWarmPresenceAt = dateValue(object["lastWarmPresenceAt"])
-    }
-
-    func reconcileRestoredAffectWithRecentConversation(nodes: [CognitiveNode]) async {
-        guard configuration.enabled else { return }
-        // A modern affect artifact carries the canonical presence epoch and is
-        // already restart-equivalent. Keep this heuristic only for legacy or
-        // partially persisted artifacts that predate temporal anchors; otherwise
-        // relaunch itself would manufacture a warmth increase.
-        guard lastUserPresenceAt == nil else { return }
-        let now = dependencies.now()
-        let recentLiveNodes = nodes
-            .filter { node in
-                guard node.turnKind == .live else { return false }
-                let age = now.timeIntervalSince(node.createdAt)
-                return age >= 0 && age <= 6 * 60 * 60
-            }
-            .sorted { lhs, rhs in lhs.createdAt > rhs.createdAt }
-        guard !recentLiveNodes.isEmpty else { return }
-
-        let recentContext = recentLiveNodes.prefix(6).map(\.summary).joined(separator: "\n")
-        let boost = relationalWarmthBoost(in: recentContext)
-        guard boost > 0 else { return }
-        let floor = boost >= 0.18 ? 0.38 : 0.22
-        let current = projectedAffect(at: now)
-        guard current.socialWarmth < floor else { return }
-
-        affect = CognitiveAffectState(
-            arousal: current.arousal,
-            uncertainty: current.uncertainty,
-            taskPressure: current.taskPressure,
-            socialWarmth: floor,
-            updatedAt: max(current.updatedAt, recentLiveNodes.first?.createdAt ?? now)
-        )
-        await persistArtifact(
-            kind: "affect",
-            id: stableArtifactID("affect"),
-            status: "current",
-            score: max(affect.arousal, affect.socialWarmth),
-            payload: affect.toJSON(
-                lastUserPresenceAt: lastUserPresenceAt,
-                lastWarmPresenceAt: lastWarmPresenceAt
-            )
-        )
     }
 
     /// Per-axis decay half-lives. Arousal (alertness/energy) fades on a minutes scale;
@@ -547,7 +332,8 @@ extension CognitiveSubstrate {
             uncertainty: state.uncertainty * decay(dyn.uncertaintyHalfLife),
             taskPressure: state.taskPressure * decay(dyn.taskPressureHalfLife),
             socialWarmth: state.socialWarmth * decay(dyn.socialWarmthHalfLife),
-            updatedAt: now
+            updatedAt: now,
+            lived: state.lived
         )
     }
 

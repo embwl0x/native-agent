@@ -1,39 +1,9 @@
 import Foundation
-import EngineRuntime
-import Observation
-import Darwin
-import AppKit
-@preconcurrency import EventKit
-import SwiftUI
 import NativeAgentShared
-import PersistenceCore
-import NativeAgentCore
-import MemoryV2
-import ToolRegistry
-import ProviderRouting
-import BackgroundLoops
-import ApprovalInbox
-import ToolExecution
-import PersonaEngine
-import TrustCenter
-import DreamREMCycle
-import DoctorChecks
+import EngineRuntime
 import Research
-import MultimodalTTS
-import TriggerScheduler
-import WorkshopExecution
-import NotificationInbox
-import SystemOps
-import ScreenVision
-import TelegramBot
-import Dispatcher
-import MacControl
-import Onboarding
-import MacIntegration
-import WorkflowOrchestration
-import Connectors
-import Browser
-// Blueprint: | `AppModel+RoutingWorkflowMCP.swift` | `ResearchSearchFailure`; `AppModel`: research `search`, `resolveApproval`, `resolveApprovalOnce`, `isResolvingApproval` |
+import ApprovalInbox
+// Blueprint: | `AppModel+RoutingWorkflowMCP.swift` | `ResearchSearchFailure`; `AppModel`: research `search`, `resolveApproval`, `resolveApprovalOnce` |
 
 enum ResearchSearchFailure: Error, Equatable {
     case blankQuery
@@ -48,11 +18,6 @@ enum ResearchSearchFailure: Error, Equatable {
         }
     }
 }
-
-// 2026-09-01: `WorkflowLifecycleAction`, `WorkflowLifecycleActionOutcome`, and
-// `WorkflowLifecycleButtonPresentation` were retired with the workflow run
-// engine (User authorized). They existed only to drive Resume / Cancel /
-// Rollback on a run.
 
 @MainActor
 extension AppModel {
@@ -79,24 +44,6 @@ extension AppModel {
         }
     }
 
-
-    /// W3: returns true if an NSError thrown by an app action is a
-    /// `notImplemented` envelope (panelDisabled feature, unavailable Swift impl).
-    static func isNotImplemented(_ err: NSError) -> Bool {
-        return (err.userInfo["code"] as? String) == "not_implemented"
-            || (err.userInfo["panelDisabled"] as? Bool) == true
-    }
-
-    /// W3: format a user-facing "feature disabled" string from the
-    /// `notImplemented` envelope, including the followup link if present.
-    static func disabledBadge(for label: String, error err: NSError) -> String {
-        let reason = (err.userInfo["reason"] as? String) ?? "unavailable in the Swift runtime"
-        var msg = "\(label) disabled — \(reason)"
-        if let followup = err.userInfo["followup"] as? String, !followup.isEmpty {
-            msg += " (see: \(followup))"
-        }
-        return msg
-    }
 
     @MainActor
     func resolveApproval(_ approval: ApprovalRecord, decision: String) async {
@@ -128,9 +75,5 @@ extension AppModel {
         }
     }
 
-    @MainActor
-    func isResolvingApproval(id: String) -> Bool {
-        approvalResolutionInFlightIDs.contains(id)
-    }
 
 }

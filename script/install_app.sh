@@ -1,23 +1,14 @@
 #!/usr/bin/env bash
 # Swift-native NativeAgent.app installer.
 #
-# Replaces the old install_launch_agent.sh setup. There is no launchd plist
-# and no bundled external interpreter runtime; the macOS app owns the runtime in Swift and
-# uses SMAppService at first launch to register for login auto-start.
+# NativeAgent.app owns its Swift runtime and uses SMAppService for login startup.
 #
-# Steps (DOWNTIME GUARD 2026-07-02 — the running app is NOT touched until the
-# replacement bundle is fully built, signed, and codesign-verified; any failure
-# before the swap exits nonzero and leaves the current install running):
+# Build, sign and verify the replacement before stopping the running app:
 #   1. Build the Swift app bundle (build_and_run.sh --build-only: no kill,
 #      no launch).
-#   2. Copy dist/NativeAgent.app → temp bundle next to ~/Applications, stamp
-#      VERSION/SHA/REPO_PATH.
-#   3. Re-codesign the temp bundle with the dev certificate + iCloud
-#      entitlements when available, falling back to ad-hoc only when
-#      explicitly requested or when the signing identity/profile is missing;
-#      verify the signature (--deep --strict) — all fail-closed.
-#   4. ONLY NOW tear down any prior retired external-runtime agent + quit the
-#      running NativeAgent.app instance.
+#   2. Copy the signed dist/NativeAgent.app → temp bundle next to ~/Applications.
+#   3. Verify the transferred signature (--deep --strict).
+#   4. Remove the Python LaunchAgent and quit the running NativeAgent.app.
 #   5. Atomically swap the temp bundle into ~/Applications/NativeAgent.app.
 #   6. Launch and prove authenticated chat/source readiness; only then delete
 #      the previous bundle. Failed readiness restores the prior install.
@@ -26,7 +17,7 @@
 # app stays in the menu bar.
 
 set -euo pipefail
-# Say which line died: a silent exit 1 cost a debug loop (10-17).
+# Report the failing command and line.
 trap 'echo "[install_app.sh] FAILED line $LINENO: $BASH_COMMAND" >&2' ERR
 
 for arg in "$@"; do
@@ -59,31 +50,16 @@ USAGE
 done
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck source=lib/provisioning_profile_contract.sh
-source "$ROOT/script/lib/provisioning_profile_contract.sh"
-# shellcheck source=lib/development_bundle_signing.sh
-source "$ROOT/script/lib/development_bundle_signing.sh"
 source "$ROOT/script/lib/development_bundle_validation.sh"
 source "$ROOT/script/lib/release_symbols.sh"
+source "$ROOT/script/lib/build_source_inventory.sh"
 
-# Keep the installer's final signing identity aligned with build_and_run.sh.
-# That builder already loads this ignored, machine-local file before it stamps
-# the bundle. Without loading it here too, a private development build can be
-# created correctly and then rejected by the installer because its second
-# signing pass falls back to the public bundle identifier.
-LOCAL_ENV="$ROOT/local/nativeagent.local.env"
-if [[ -f "$LOCAL_ENV" ]]; then
-    # Local Apple/iCloud identifiers are intentionally gitignored.
-    # shellcheck source=/dev/null
-    source "$LOCAL_ENV"
-fi
 APP_NAME="NativeAgent"
 # The installed app is used for everyday conversations. Keep ordinary installs
 # optimized; an explicit debug override remains available for debugger work.
 export NATIVEAGENT_BUILD_CONFIG="${NATIVEAGENT_BUILD_CONFIG:-release}"
 APP_DEST="$HOME/Applications/$APP_NAME.app"
 FORCE_CHECKOUT_SWITCH="${FORCE_CHECKOUT_SWITCH:-0}"
-NATIVEAGENT_MAC_BUNDLE_ID="${NATIVEAGENT_MAC_BUNDLE_ID:-io.github.embwl0x.nativeagent.mac}"
 
 # Installing always checks the live bundle's checkout before building its replacement.
 nativeagent_require_installed_checkout "$APP_DEST" "$ROOT" "$FORCE_CHECKOUT_SWITCH" \
@@ -93,36 +69,14 @@ if [ "${NATIVE_AGENT_INSTALL_WITH_ST:-0}" = "1" ]; then
     echo "[install_app.sh] ERROR: NATIVE_AGENT_INSTALL_WITH_ST is retired. NativeAgent bundles zero Python; embeddings must use the Swift/CoreML path." >&2
     exit 2
 fi
-# Phase 11b: log rotation targets repo/data/logs/ (the authoritative live path).
-# The old DATA variable pointed at ~/Library/Application Support/NativeAgent which
-# is now only a legacy duplicate; rotating it was rotating empty/stale files.
+# Rotate logs in the checkout's live data directory.
 DATA="$ROOT/data"
 
-# 0. Phase 11: ensure persona/ and data/ are initialized for first-time cloners
+# 0. Initialize persona/ and data/ for first-time cloners.
 "$ROOT/script/init_persona.sh"
 
-# 1. Build the Swift app bundle. --build-only: build_and_run.sh must NOT kill
-# or launch anything — the running app stays alive until the replacement
-# bundle below is fully signed and verified (2026-07-02: a stale-SPM-plan
-# compile failure after the old pre-build pkill left the app dead with
-# nothing relaunched — live downtime until a manual rebuild).
-INSTALL_BUILD_HEAD="$(git -C "$ROOT" rev-parse HEAD)"
-INSTALL_BUILD_STATUS="$(git -C "$ROOT" status --porcelain --untracked-files=normal)"
-INSTALL_EMBEDDING_DISTRIBUTION="${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-bundled}"
-case "$INSTALL_EMBEDDING_DISTRIBUTION" in
-  separate-download)
-    # The app owns download/resume into its data root. Do not fetch or bake a
-    # machine-local model into an ordinary development install.
-    NATIVEAGENT_SKIP_EMBEDDING_FETCH=1 NATIVEAGENT_EMBEDDING_MODEL_DIR=/dev/null \
-      "$ROOT/script/build_and_run.sh" --build-only ;;
-  bundled) "$ROOT/script/build_and_run.sh" --build-only ;;
-  *) echo "[install_app.sh] ERROR: embedding distribution must be separate-download or bundled" >&2; exit 2 ;;
-esac
-if [[ "$(git -C "$ROOT" rev-parse HEAD)" != "$INSTALL_BUILD_HEAD" ]] || \
-   [[ "$(git -C "$ROOT" status --porcelain --untracked-files=normal)" != "$INSTALL_BUILD_STATUS" ]]; then
-    echo "[install_app.sh] ERROR: source moved during the build; refusing installation." >&2
-    exit 1
-fi
+# 1. Build without stopping or launching the app; keep it running until the replacement is signed and verified.
+"$ROOT/script/build_and_run.sh" --build-only
 
 # 2. Stage fresh bundle — copy to temp then mv for atomic swap
 mkdir -p "$HOME/Applications" "$DATA/logs"
@@ -140,7 +94,7 @@ TEMP_BUNDLE="$(dirname "$APP_DEST")/.NativeAgent.app.tmp.$$"
 APP_OLD="${APP_DEST}.old.$$"
 trap '
     # The previous bundle comes back before anything else is cleaned: a failed
-    # cleanup under set -e must never strand it at .old (Sol).
+    # cleanup under set -e must never strand it at .old.
     if [ -d "$APP_OLD" ] && [ ! -d "$APP_DEST" ]; then
         echo "[install_app.sh] mid-swap failure — restoring previous bundle"
         mv "$APP_OLD" "$APP_DEST"
@@ -151,37 +105,7 @@ trap '
 trap 'exit 1' INT TERM HUP
 rm -rf "$TEMP_BUNDLE"
 cp -R "$DIST_BUNDLE" "$TEMP_BUNDLE"
-if [[ "$INSTALL_EMBEDDING_DISTRIBUTION" == separate-download ]]; then
-    rm -rf "$TEMP_BUNDLE/Contents/Resources/embedding"
-fi
-# Optional signed-release descriptor for exercising the same model download in
-# a development install. Existing model caches belong to the app, never here.
-rm -f "$TEMP_BUNDLE/Contents/Resources/embedding-download.json"
-if [[ "$INSTALL_EMBEDDING_DISTRIBUTION" == separate-download && -n "${NATIVEAGENT_EMBEDDING_DOWNLOAD_MANIFEST:-}" ]]; then
-    jq -e '.schema_version == 1 and (.sha256 | test("^[0-9a-f]{64}$"))
-      and (.byte_length | type == "number" and . > 0)
-      and (.url | startswith("https://")) and .archive_root == "embedding"' \
-      "$NATIVEAGENT_EMBEDDING_DOWNLOAD_MANIFEST" >/dev/null
-    cp "$NATIVEAGENT_EMBEDDING_DOWNLOAD_MANIFEST" "$TEMP_BUNDLE/Contents/Resources/embedding-download.json"
-fi
 xattr -dr com.apple.quarantine "$TEMP_BUNDLE" 2>/dev/null || true
-
-# C.5: Bundle docs/data-bounds.md so AboutView can open it from the bundle
-if [ -f "$ROOT/docs/data-bounds.md" ]; then
-    DOCS_DEST="$TEMP_BUNDLE/Contents/Resources/docs"
-    mkdir -p "$DOCS_DEST"
-    cp "$ROOT/docs/data-bounds.md" "$DOCS_DEST/data-bounds.md"
-fi
-
-# U1: Bundle docs/release-notes/*.md so the agent can tell the person what
-# changed after an update without reaching the network. Same staging path as
-# data-bounds.md above; plain markdown, covered by the identity/secret scans.
-if [ -d "$ROOT/docs/release-notes" ]; then
-    NOTES_DEST="$TEMP_BUNDLE/Contents/Resources/docs/release-notes"
-    mkdir -p "$NOTES_DEST"
-    find "$ROOT/docs/release-notes" -maxdepth 1 -type f -name '*.md' \
-        -exec cp {} "$NOTES_DEST/" \;
-fi
 
 # Preserve the builder's version and provenance, including its internal-build
 # suffix. Readiness must compare against those bytes, never a later Git HEAD.
@@ -246,29 +170,17 @@ if [[ -f "$DSYM_ARCHIVE/$INSTALL_SOURCE_REVISION/manifest.tsv" ]]; then
 fi
 LC_ALL=C sort -u "$DSYM_MANIFEST" -o "$DSYM_MANIFEST"
 mv "$DSYM_MANIFEST" "$DSYM_ARCHIVE/$INSTALL_SOURCE_REVISION/manifest.tsv"
-INSTALL_SOURCE_DIRTY="$(/usr/libexec/PlistBuddy -c 'Print :NativeAgentSourceDirty' "$TEMP_BUNDLE/Contents/Info.plist")"
-EXPECTED_SOURCE_DIRTY=false
-[[ -z "$INSTALL_BUILD_STATUS" ]] || EXPECTED_SOURCE_DIRTY=true
-if [[ "$INSTALL_SOURCE_REVISION" != "$INSTALL_BUILD_HEAD" ]] || \
-   [[ "$(cat "$TEMP_BUNDLE/Contents/Resources/VERSION_SHA")" != "$INSTALL_SOURCE_REVISION" ]] || \
-   [[ "$INSTALL_SOURCE_DIRTY" != "$EXPECTED_SOURCE_DIRTY" ]]; then
+INSTALL_SOURCE_CONTENT_ID="$(/usr/libexec/PlistBuddy -c 'Print :NativeAgentSourceContentID' "$TEMP_BUNDLE/Contents/Info.plist")"
+if [[ "$INSTALL_SOURCE_CONTENT_ID" != "$(nativeagent_source_content_id "$ROOT")" ]] || \
+   [[ "$(cat "$TEMP_BUNDLE/Contents/Resources/VERSION_SHA")" != "$INSTALL_SOURCE_REVISION" ]]; then
     echo "[install_app.sh] ERROR: builder provenance does not match the captured source; refusing installation." >&2
     exit 1
 fi
 
-# Phase 11: Stamp the source-repo path into the bundle so the Swift app can
-# locate the source-tree persona/ directory at runtime.
-printf '%s\n' "$ROOT" > "$TEMP_BUNDLE/Contents/Resources/REPO_PATH"
-
 nativeagent_assert_no_python_artifacts "$TEMP_BUNDLE" "[install_app.sh]" present install
 
-# 3. Re-codesign with entitlements (on temp bundle before atomic swap). The
-# shared owner keeps this second pass identical to build_and_run.sh.
-nativeagent_sign_development_bundle \
-  "$TEMP_BUNDLE" \
-  "$ROOT" \
-  "$NATIVEAGENT_MAC_BUNDLE_ID" \
-  "[install_app.sh]"
+# 3. Verify the builder's sealed bundle before atomic swap.
+codesign --verify --deep --strict --verbose=2 "$TEMP_BUNDLE"
 
 # ─── POINT OF NO RETURN ────────────────────────────────────────────────────
 # Everything above operates on the temp bundle only; any failure up there
@@ -276,7 +188,7 @@ nativeagent_sign_development_bundle \
 # built, signed, and codesign-verified — only now is it safe to take the
 # running app down.
 
-# 4a. Tear down any prior retired external-runtime agent from old installs.
+# 4a. Remove the installed Python LaunchAgent.
 LABEL="local.nativeagent.NativeAgentDaemon"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
@@ -285,22 +197,11 @@ if [[ -f "$PLIST" ]]; then
   launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
   rm -f "$PLIST"
 fi
-# Kill any lingering retired external-runtime process from the prior setup. Old installs launched
-# it from the bundle (Contents/Resources/native_agentd.py); match that path.
-# A pkill -f on "$ROOT/daemon/native_agentd.py" can match a sibling checkout
-# that shares the repo-path prefix, so it's dropped here — the daemon this
-# installer is replacing always launches from $APP_DEST, not the source tree.
+# Match the installed bundle's Python process; source-path prefixes can select sibling checkouts.
 pkill -f "$APP_DEST/Contents/Resources/native_agentd.py" 2>/dev/null || true
 
 # 4b. Quit any running app
-# `applicationWillTerminate` owns a bounded three-second drain for cognition,
-# background loops, MCP children, Context Flow, and the installed-physiology
-# clean-stop receipt. Sending pkill immediately after AppleScript used to race
-# that drain and made an ordinary developer reinstall look like an unclean
-# restart. Give the app one bounded grace window; retain the force-stop only as
-# recovery for a wedged/ignored quit request. 30s, not 15: a quit mid-turn
-# first waits up to 20s for the turn to finish (applicationShouldTerminate),
-# then the 3s drain.
+# Allow 30s for the app's 20s turn wait and 3s shutdown drain before force-stop.
 APP_EXECUTABLE_PATTERN="$(printf '%s' "$APP_DEST/Contents/MacOS/NativeAgentApp" | sed 's/[][\.^$*+?(){}|]/\\&/g')"
 APP_PROCESS_PATTERN="$APP_EXECUTABLE_PATTERN([[:space:]].*)?"
 APP_HELPER_PATTERN="^[0-9]+[[:space:]]+$APP_EXECUTABLE_PATTERN[[:space:]]+--nativeagent-(install-helper|relaunch-after-exit)([[:space:]]|$)"
@@ -311,11 +212,7 @@ _nativeagent_app_pids() {
     | grep -Ev "$APP_HELPER_PATTERN" \
     | awk '{ print $1 }'
 }
-# Quit the running process itself, by pid. A quit addressed by name or bundle
-# path goes through LaunchServices, which can resolve it to another copy
-# (/Applications/NativeAgent.app) or to the dead unit a bundle swap leaves, so
-# the quit reached nothing and the app was force-stopped (2026-10-18: every
-# rollback SIGTERMed the replacement after a quit by name).
+# Quit by PID so LaunchServices cannot resolve the request to a different bundle.
 _quit_nativeagent() {
   local pid
   for pid in $(_nativeagent_app_pids); do
@@ -335,14 +232,10 @@ while _nativeagent_app_pids >/dev/null 2>&1 && (( SECONDS < quit_deadline )); do
 done
 if _nativeagent_app_pids >/dev/null 2>&1; then
   echo "[install_app.sh] graceful quit exceeded 30s; forcing NativeAgentApp stop"
-  # Path-scoped: a bare `pkill -x` killed every NativeAgent on the Mac,
-  # including the public test install and scratch walks (2026-09-15).
+  # Stop only this bundle's app-mode processes.
   _stop_nativeagent
 fi
-# 2026-09-14: the new instance refuses to start while the old pid is still
-# exiting ("another NativeAgent instance is already running … exiting
-# duplicate"), and the readiness probe then times out and rolls back a good
-# build. Wait until the old process is actually gone before the swap/launch.
+# Wait for app-mode processes to exit before swapping bundles or launching a new instance.
 gone_deadline=$((SECONDS + 15))
 while _nativeagent_app_pids >/dev/null 2>&1 && (( SECONDS < gone_deadline )); do
   sleep 0.2
@@ -361,8 +254,7 @@ mv "$TEMP_BUNDLE" "$APP_DEST"
 # the replacement proves its authenticated runtime identity and chat readiness.
 trap - EXIT ERR INT TERM HUP
 
-# N37: rotate legacy runtime log files if they exceed 5 MB. Keep up to 3 rotated copies
-# (.1, .2, .3) so a single install can never destroy the previous two logs.
+# Rotate logs over 5 MB, keeping three copies.
 _rotate_log() {
   local log="$1"
   if [[ -f "$log" ]] && [[ $(stat -f%z "$log" 2>/dev/null || echo 0) -gt $((5 * 1024 * 1024)) ]]; then
@@ -376,40 +268,13 @@ _rotate_log "$DATA/logs/daemon.err.log"
 _rotate_log "$DATA/logs/daemon.out.log"
 
 # 6. Launch
-# Readiness is proven through the authenticated local bridge and the exact
-# build identity stamped above. A process existing is necessary but not a
-# usable runtime: chat must be ready and the running revision/dirty bit must
-# match the replacement bundle.
-#
-# HOTFIX 2026-06-03 launchd-163: `/usr/bin/open` exits 1 on launchd-163
-# ("Launchd job spawn failed", RBSRequestErrorDomain=5) which is an OS-level
-# launchd-cache issue independent of the bundle (bundle IS in place + valid).
-# `set -e` was killing the script there, never reaching the pgrep fallback,
-# so installs reported exit 1 even when the bundle landed cleanly. Make `open`
-# non-fatal; if launchd refuses to spawn, exec the binary directly as fallback.
-#
-# HOTFIX 2026-08-14 stale-LS-unit: `open` can also exit ZERO and launch
-# NOTHING. The atomic mv in step 5 invalidates the LaunchServices unit for
-# $APP_DEST; `open` then resolves the path to the dead unit, logs
-# "Failed to get unit NNNNN from store" + "LAUNCH: Asking CSUI to launch 0
-# items", and returns success. Observed 2026-08-14 16:18:06 — runningboardd
-# recorded ZERO launch jobs for the bundle in the following 20s, so readiness
-# failed on "installed executable is not running" and a perfectly good build
-# was rolled back. Exit status of `open` is therefore NOT proof of a launch:
-# re-register the swapped-in bundle first, then prove a process appeared and
-# fall back to direct exec if it did not.
+# Register the bundle, launch through LaunchServices, and retry once with open -n.
+# Bundle launches preserve macOS Accessibility/TCC attribution.
+# Authenticated bridge readiness must prove chat is ready and the running
+# content identity matches the replacement bundle.
 INSTALL_VERIFY_STARTED="$(date +%s)"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 
-# Launching the Mach-O directly is not equivalent to launching its app bundle.
-# In particular, macOS can attribute Accessibility/TCC checks differently for
-# that process even when the on-disk bundle has the same valid designated
-# requirement. A 2026-09-01 install took the old direct-exec fallback, passed
-# bridge readiness, and then returned accessibility_not_trusted until the same
-# bundle was relaunched through LaunchServices. Keep every successful install
-# on the bundle launch path: retry once with `open -n` after re-registration,
-# then fail into the ordinary rollback instead of reporting a crippled app as
-# ready.
 _wait_for_nativeagent_launch() { # $1 = bounded seconds
   local deadline=$((SECONDS + $1))
   while ! pgrep -fx "$APP_DEST/Contents/MacOS/NativeAgentApp" >/dev/null 2>&1 \
@@ -443,30 +308,20 @@ fi
 echo "Swift runtime install — verifying authenticated readiness and source identity..."
 _verify_ready() {
   [[ "$INSTALL_LAUNCH_OK" == "1" ]] && "$ROOT/script/verify_installed_runtime_ready.sh" \
-    "$APP_DEST" "$INSTALL_SOURCE_REVISION" "$INSTALL_SOURCE_DIRTY" 45
+    "$APP_DEST" "$INSTALL_SOURCE_CONTENT_ID" 45
 }
-# A replacement that dies at launch is a failed build and rolls back. The
-# 2026-10-01 RenderBox aborts were the app's own fd exhaustion (5b687f19a,
-# 404571e4b), not macOS, so there is no relaunch-once retry to hide one.
+# Failed readiness restores the previous bundle without another replacement launch attempt.
 INSTALL_READY=0
 if _verify_ready; then INSTALL_READY=1; fi
 if [[ "$INSTALL_READY" == "1" ]]; then
   APP_PID="$(pgrep -fxn "$APP_DEST/Contents/MacOS/NativeAgentApp" || true)"
   echo "OK — NativeAgentApp ready (pid=$APP_PID)."
-  # Agent, 2026-09-02: a bridge note is not a receipt. The install itself
-  # tells her which build is running, after the app is ready, so a note can
-  # never describe a build that is not there.
-  # User, 2026-09-04: off by default. Ten installs in one afternoon were ten
-  # full model turns in her main session answering "Received: installer
-  # reports build ...". She reads the running build from buildIdentity when
-  # she needs it. Set NA_INSTALL_RECEIPT=1 to post one.
-  # The address and token come from the bridge's descriptor (each install
-  # has its own port); an unreadable one is said, not guessed around.
+  # Install receipts are opt-in via NA_INSTALL_RECEIPT and sent only after readiness.
+  # Resolve the authenticated bridge address and token from its descriptor.
   if [ -n "${NA_INSTALL_RECEIPT:-}" ] && command -v jq >/dev/null 2>&1 \
       && source "$ROOT/script/lib/nativeagent_bridge.sh" && nativeagent_bridge_resolve; then
     _na_sha=$(git -C "$(cd "$(dirname "$0")/.." && pwd)" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
-    # Synchronous on purpose: a backgrounded curl did not survive the
-    # script's exit, so the receipt never arrived.
+    # Send the receipt synchronously before the installer exits.
     curl -sS --max-time 30 -X POST "$BASE_URL/claude/message" \
       -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
       -d "$(jq -n --arg t "[install_app.sh] Install receipt, posted by the install script itself, not by a person: build $_na_sha is running as pid $APP_PID." --arg s install_app.sh '{text:$t,sender:$s}')" \
@@ -491,9 +346,7 @@ if [[ -d "$APP_OLD" ]]; then
   FAILED_APP="${APP_DEST}.failed.$(date +%Y%m%d-%H%M%S)"
   mv "$APP_DEST" "$FAILED_APP"
   mv "$APP_OLD" "$APP_DEST"
-  # The restored bundle follows the same TCC-preserving LaunchServices path.
-  # If that cannot launch, report it honestly; do not revive the app with the
-  # same direct-exec path that caused the failed replacement's permission loss.
+  # The restored bundle uses the same LaunchServices rule; report launch failure.
   if ! _launch_nativeagent_bundle; then
     echo "[install_app.sh] WARNING: restored the previous bundle, but LaunchServices could not start it." >&2
   fi

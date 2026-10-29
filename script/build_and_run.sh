@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Say which line died: a silent exit 1 cost a debug loop (10-17).
+# Report the failing command and line.
 trap 'echo "[build_and_run.sh] FAILED line $LINENO: $BASH_COMMAND" >&2' ERR
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,6 +9,7 @@ source "$ROOT/script/lib/provisioning_profile_contract.sh"
 # shellcheck source=lib/development_bundle_signing.sh
 source "$ROOT/script/lib/development_bundle_signing.sh"
 source "$ROOT/script/lib/development_bundle_validation.sh"
+source "$ROOT/script/lib/build_source_inventory.sh"
 APP_NAME="NativeAgent"
 PRODUCT="NativeAgentApp"
 APP_LOG="$ROOT/.runtime/nativeagent-app.log"
@@ -82,12 +83,17 @@ NATIVEAGENT_RELEASE_PAGE_URL="${NATIVE_AGENT_RELEASE_PAGE_URL:-${NATIVEAGENT_REL
 
 mkdir -p "$ROOT/.runtime" "$ROOT/dist"
 
-# Large embedding model (2026-09-05). The bundled MiniLM is the floor; a
-# stronger model is too big for git, so the build copies it from
+# bge-large-en-v1.5 is the one embedding model. It is too big for git,
+# so the build copies it from
 # extras/embedding/ in the checkout (gitignored; embedding.json + the model +
-# vocab it names) into Contents/Resources/embedding/. The runtime prefers it
-# over MiniLM and re-embeds the store on first launch.
+# vocab it names) into Contents/Resources/embedding/. The runtime re-embeds
+# an older vector space through the existing epoch mechanism.
 EMBEDDING_MODEL_DIR="${NATIVEAGENT_EMBEDDING_MODEL_DIR:-$ROOT/extras/embedding}"
+case "${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-bundled}" in
+  separate-download) EMBEDDING_MODEL_DIR=/dev/null; NATIVEAGENT_SKIP_EMBEDDING_FETCH=1 ;;
+  bundled) ;;
+  *) echo '[build_and_run.sh] ERROR: embedding distribution must be separate-download or bundled' >&2; exit 2 ;;
+esac
 # This dev bundle's data root is $ROOT/data (REPO_PATH stamp). A model already
 # installed there (data/extras/coreml) outranks any bundle copy at runtime, so
 # a second 600+ MB copy in the bundle would never load: leave it out. Same
@@ -104,9 +110,9 @@ if [[ -z "${NATIVEAGENT_EMBEDDING_MODEL_DIR:-}" ]] &&
   echo "[embedding] data/extras/coreml holds the model this install loads; not copying it into the bundle"
   EMBEDDING_MODEL_DIR=/dev/null
 # First build on a fresh checkout: fetch the model from the repository's model
-# release unless told not to. A failed fetch is not fatal; MiniLM remains.
+# release unless told not to. A failed fetch leaves semantic search fail-closed.
 elif [[ ! -f "$EMBEDDING_MODEL_DIR/embedding.json" && "${NATIVEAGENT_SKIP_EMBEDDING_FETCH:-0}" != "1" ]]; then
-  "$ROOT/script/fetch_embedding_model.sh" || echo "[embedding] fetch failed; building with the bundled MiniLM"
+  "$ROOT/script/fetch_embedding_model.sh" || echo "[embedding] bge-large-en-v1.5 fetch failed; memory search will fail closed unless the data root already has bge"
 fi
 
 # NATIVEAGENT_BUILD_CONFIG=release installs an optimized binary (the speed of the
@@ -120,7 +126,7 @@ case "${NATIVEAGENT_BUILD_CONFIG:-debug}" in
     ;;
 esac
 
-# S13b: the bundle is Xcode's (project.yml): Info.plist, resources, the Chrome
+# The bundle is Xcode's (project.yml): Info.plist, resources, the Chrome
 # payload, helpers in Contents/MacOS, Sparkle in Contents/Frameworks and the
 # generated Metadata.appintents. Its stamp phase writes VERSION, the source
 # identity and, for this dev path only, REPO_PATH. The local identity
@@ -132,6 +138,7 @@ esac
 # belong in an explicit package-update workflow. The running app is not
 # touched until the POINT OF NO RETURN below (DOWNTIME GUARD 2026-07-02).
 DERIVED_DATA="$ROOT/DerivedData"
+BUILD_SOURCE_CONTENT_ID="$(nativeagent_source_content_id "$ROOT")"
 xcodebuild -quiet \
   -project "$ROOT/$APP_NAME.xcodeproj" -scheme "$APP_NAME" -configuration "$XCODE_CONFIG" \
   -destination "platform=macOS,arch=$(uname -m)" -derivedDataPath "$DERIVED_DATA" \
@@ -145,9 +152,14 @@ xcodebuild -quiet \
   NATIVEAGENT_DEVICE_SYNC="$NATIVEAGENT_DEVICE_SYNC" \
   NATIVEAGENT_RELEASE_PAGE_URL="$NATIVEAGENT_RELEASE_PAGE_URL" \
   NATIVEAGENT_EMBEDDING_MODEL_DIR="$EMBEDDING_MODEL_DIR" \
+  NATIVEAGENT_EMBEDDING_DISTRIBUTION="${NATIVEAGENT_EMBEDDING_DISTRIBUTION:-bundled}" \
+  NATIVEAGENT_EMBEDDING_DOWNLOAD_MANIFEST="${NATIVEAGENT_EMBEDDING_DOWNLOAD_MANIFEST:-}" \
   NATIVEAGENT_STAMP_REPO_PATH=YES \
+  NATIVEAGENT_SOURCE_CONTENT_ID="$BUILD_SOURCE_CONTENT_ID" \
   build
 BUILT_APP="$DERIVED_DATA/Build/Products/$XCODE_CONFIG/$APP_NAME.app"
+[[ "$(nativeagent_source_content_id "$ROOT")" == "$BUILD_SOURCE_CONTENT_ID" ]] \
+  || { echo '[build_and_run.sh] ERROR: source content moved during compilation.' >&2; exit 1; }
 
 # Stage + sign into a TEMP bundle and only swap it into dist/NativeAgent.app
 # after the shared signing owner passes deep verification. Every fallible step
@@ -170,8 +182,7 @@ xattr -dr com.apple.quarantine "$BUNDLE" 2>/dev/null || true
 
 nativeagent_assert_no_python_artifacts "$BUNDLE" "[swift-native]" staged app
 
-# Mac app signing. One shared owner keeps build and install on the exact same
-# identity/profile/entitlement decision tree.
+# Sign the finished development bundle before either launch or installation.
 nativeagent_sign_development_bundle "$BUNDLE" "$ROOT" "$NATIVEAGENT_MAC_BUNDLE_ID" "[sign]"
 
 # ─── POINT OF NO RETURN ─────────────────────────────────────────────────────
@@ -202,8 +213,8 @@ JAVASCRIPT
   done
   # A running dist-launched instance must not have its bundle swapped
   # underneath it, and the launch below needs the old instance gone.
-  # Skipped in --build-only: install_app.sh re-signs its own copy and quits
-  # the app itself only after that copy passes codesign verification.
+  # Skipped in --build-only: install_app.sh verifies its transferred copy
+  # before quitting the app.
   pkill -fx "$APP_PROCESS_PATTERN" 2>/dev/null || true
   # Wait (up to ~5s) for the app to exit before touching the bundle, then
   # hard-kill any survivor.

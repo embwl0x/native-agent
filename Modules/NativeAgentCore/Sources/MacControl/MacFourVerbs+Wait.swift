@@ -91,13 +91,7 @@ extension MacFourVerbs {
                 remaining,
                 signals.isObserving && !waitingForText ? Self.settleQuietSeconds : Self.fallbackPollSeconds
             )
-            // THE CAPTURE-RATE FLOOR. A screen that fires notifications
-            // continuously (a progress bar, a live log) would otherwise wake
-            // this loop on every one and render as fast as the machine can walk
-            // and capture — a hot loop, strictly worse than the poll it
-            // replaced. So a signal never causes a render sooner than
-            // `settleQuietSeconds` after the last one: the old poll's cadence
-            // becomes the WORST case instead of the only case.
+            // Rate-limit signal-driven renders to `settleQuietSeconds`, within the deadline.
             let fired = await awaitSignal(
                 signals,
                 window: window,
@@ -106,8 +100,7 @@ extension MacFourVerbs {
             guard !Task.isCancelled else { return cancelled() }
             // The budget ran out inside a short final window.
             if !fired, signals.isObserving, !waitingForText, window < Self.settleQuietSeconds { break }
-            // 3 — render ONCE: a signal fired, a quiet window passed (quiet is
-            // only settled by a read that matches), or the fallback said look.
+            // Refresh after a signal or the quiet/coarse polling interval.
             switch await sight(part: nil) {
             case .blind(let reply): return await refusal(reply)
             case .seen(let seen): last = seen
@@ -118,8 +111,7 @@ extension MacFourVerbs {
             if let needle, !needle.isEmpty, last.effectRender.lowercased().contains(needle) {
                 return matched(last, elapsed)
             }
-            // A new app needs its own subscription and a fresh baseline
-            // before two reads can settle.
+            // An app switch replaces observation and resets the settling baseline.
             let needsReconciliation = last.pid != observedPID
             if needsReconciliation {
                 signals.stop()
@@ -161,10 +153,9 @@ extension MacFourVerbs {
 
     static let defaultWaitSeconds: Double = 10
     static let maxWaitSeconds: Double = 60
-    /// Silence this long, with a live subscription, earns the settling read:
-    /// "two identical renders 500 ms apart", read only when nothing fired.
+    /// Capture-rate floor and quiet interval before a settling read.
     static let settleQuietSeconds: Double = 0.5
-    /// The SAFETY NET cadence, used only when no observer could be installed.
+    /// Coarse recheck interval for text waits or unavailable AX observation.
     static let fallbackPollSeconds: Double = 5.0
 
 }

@@ -2,7 +2,7 @@ import Foundation
 import MacControl
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SwiftToolDispatcher+RemoteNodes.swift` | `SwiftToolDispatcher`: `impl_remote_node_list`, `impl_remote_node_execute` |
+// Blueprint: | `SwiftToolDispatcher+RemoteNodes.swift` | `SwiftToolDispatcher`: remote node listing and execution; admission refusals stay distinct from cancellation and transport failures with unknown effects |
 
 extension SwiftToolDispatcher {
     func impl_remote_node_list() async throws -> JSONValue {
@@ -66,8 +66,15 @@ extension SwiftToolDispatcher {
                 "started_at": .string(receipt.startedAt),
                 "finished_at": .string(receipt.finishedAt),
             ])
-        } catch {
-            throw AutonomyGateError.toolDenied(reason: error.localizedDescription)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as TrustedRemoteEffectError {
+            switch error {
+            case .transport:
+                throw ToolFailureError(error.localizedDescription, effects: .unknown)
+            default:
+                throw AutonomyGateError.toolDenied(reason: error.localizedDescription)
+            }
         }
     }
 }

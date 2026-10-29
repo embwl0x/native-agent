@@ -32,13 +32,7 @@ enum MacActReceiptRendering {
         return nil
     }
 
-    /// Redacted before/after snapshot of the element the verb acted on.
-    /// - Parameters:
-    ///   - labelJSON/valueJSON: gpt-5.5 round-2 B4 — the text as a COMPILE saw
-    ///     it, with the enclosing-caption context (the group titled "CVV" two
-    ///     rows up) that a re-redaction of the stored string cannot recover.
-    ///     `acted_element` is the third way a hidden value could leave, after
-    ///     `changed` and `affordances_removed`.
+    /// Redacted before/after snapshot; label/value JSON retains each compile's enclosing-caption context.
     static func actedElementJSON(
         _ target: MacAXActTarget,
         redactingValue: Bool,
@@ -66,12 +60,7 @@ enum MacActReceiptRendering {
         return .object(object)
     }
 
-    /// Agent round 2 — the semantic summary of a BULK change.
-    ///
-    /// Alongside (never instead of) the capped lists: counts by role, so "44
-    /// added" is legible as "40 AXRow, 3 AXButton, 1 AXImage", and the container
-    /// the focus now sits in with its first children named, which is what
-    /// "Finder switched to list view" actually looks like from the inside.
+    /// Summarize bulk changes with role counts and focus context alongside the capped row lists.
     static func denseEffectSummaryJSON(
         diff: MacActClosedLoop.EffectDiff,
         after: MacLookPercept,
@@ -85,14 +74,7 @@ enum MacActReceiptRendering {
             "added_by_role": census(diff.addedByRole),
             "removed_by_role": census(diff.removedByRole),
         ]
-        // gpt-5.5 round-3 B4 — the summary describes nodes the percept does not
-        // carry as affordances (the focus container, its first children), and
-        // it was redacting their RAW attributes with the standalone shape test
-        // only. That test cannot see the group titled "CVV" two rows up, so a
-        // child labeled with a card code sailed through `first_children` while
-        // the affordance list correctly withheld it. This is the SAME
-        // full-context pass the compile ran, over the same snapshot: the
-        // summary can no longer disagree with the percept it summarizes.
+        // Summary nodes use the same full-context redaction as the percept, including enclosing captions.
         let redactedText = MacPerceptionCompiler.redactedNodeTextMap(snapshot)
         if let focusPath = after.focus?.path, !focusPath.isEmpty {
             let containerPath = Array(focusPath.dropLast())
@@ -133,43 +115,38 @@ enum MacActReceiptRendering {
         valueChars: Int
     ) -> [String: JSONValue] {
         var out: [String: JSONValue] = [
-            "affordances_added": .array(diff.added.map { $0.toJSON(valueChars: valueChars) }),
-            "affordances_removed": .array(diff.removed.map { entry in
+            "affordances_added": .array(diff.added.prefix(MacActClosedLoop.maxDiffRows).map { $0.toJSON(valueChars: valueChars) }),
+            "affordances_removed": .array(diff.removed.prefix(MacActClosedLoop.maxDiffRows).map { entry in
                 .object([
                     "handle": .string(entry.handle),
                     "role": .string(entry.role),
-                    // B4: the entry's COMPILE-TIME redaction, not a fresh
-                    // context-free pass over the stored string.
+                    // Use the entry's compile-time redaction; the stored string has no enclosing context.
                     "label": entry.labelJSON ?? entry.label.map {
                         MacScreenViewTextRedaction.redactedLegendString($0, valueChars: valueChars)
                     } ?? .null,
                 ])
             }),
-            "changed": .array(diff.changed.map { $0.toJSON(valueChars: valueChars) }),
+            "changed": .array(diff.changed.prefix(MacActClosedLoop.maxDiffRows).map { $0.toJSON(valueChars: valueChars) }),
             "affordances_added_total": .int(Int64(diff.addedTotal)),
             "affordances_removed_total": .int(Int64(diff.removedTotal)),
             "changed_total": .int(Int64(diff.changedTotal)),
             "focus_changed": .bool(diff.focusChanged),
-            // `window_changed` NAMES ITS EVIDENCE (Agent round 2). It is exactly
-            // `!change_reasons.isEmpty`, so a true with nothing behind it cannot
-            // be emitted.
+            // `window_changed` is backed by the emitted `change_reasons`.
             "window_changed": .bool(diff.windowChanged),
             "change_reasons": .array(diff.changeReasons.map { .string($0) }),
             // …and when the two compiles ran under different bounds, the
             // added/removed census is EXCLUDED from those reasons and the
             // payload says so rather than dropping it silently.
             "diff_comparable": .bool(diff.diffComparable),
-            // Agent acceptance round 1, finding A — the READ-ONLY values that
-            // moved. Pressing Equals changes no affordance label; without this
-            // the answer she acted for was nowhere in the result.
-            "readouts_changed": .array(diff.readoutsChanged.map { $0.toJSON(valueChars: valueChars) }),
+            // Include changed read-only values, even when affordances are unchanged.
+            "readouts_changed": .array(diff.readoutsChanged.prefix(MacActClosedLoop.maxDiffRows).map { $0.toJSON(valueChars: valueChars) }),
             "readouts_changed_total": .int(Int64(diff.readoutsChangedTotal)),
             "readouts_added_total": .int(Int64(diff.readoutsAddedTotal)),
             "readouts_removed_total": .int(Int64(diff.readoutsRemovedTotal)),
             // The ROWS, not just the totals: `readouts_added_total: 2` does not
             // contain "42", and that number was the whole reason she acted.
-            "readouts_added": .array(diff.readoutsAdded.map { $0.toJSON(valueChars: valueChars) }),
-            "readouts_removed": .array(diff.readoutsRemoved.map { $0.toJSON(valueChars: valueChars) }),
+            "readouts_added": .array(diff.readoutsAdded.prefix(MacActClosedLoop.maxDiffRows).map { $0.toJSON(valueChars: valueChars) }),
+            "readouts_removed": .array(diff.readoutsRemoved.prefix(MacActClosedLoop.maxDiffRows).map { $0.toJSON(valueChars: valueChars) }),
         ]
         if let reason = diff.diffIncomparableReason {
             out["diff_incomparable_reason"] = .string(reason)

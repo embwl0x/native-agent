@@ -1,13 +1,15 @@
 # NativeAgent Internal Workings
 
-> One structure (docs/NORTHSTAR.md, first law): this doc is part of one whole. A change here is molded into every doc that states the same thing, in the same commit, with what comes out named; a contradiction is a defect.
+NativeAgent is one Mac-owned runtime. `NativeAgentEngine` in `EngineRuntime` assembles clients, stores and app ports.
+Launch joins seed installation and housekeeping after recovery, before constructing the engine.
+`ChatTurnRuntime` owns the turn engine. Conversation surfaces share that core
+while retaining their own admission and delivery boundaries.
+Background notifications call the supplied `AttentionRouter` directly; Trust's
+checked connector statuses use the same supplied connector platform.
+Needs-you counts and kinds derive from `DeskFacade`'s retained overview and are
+unavailable when any overview source is unavailable; AppModel stores no copies.
 
-NativeAgent is one Mac-owned runtime. `NativeAgentEngine` in
-`EngineRuntime` assembles its clients, stores and app ports;
-`ChatTurnRuntime` owns the turn engine. Conversation surfaces share that
-core while retaining their own admission and delivery boundaries.
-
-Agent reaches the system through one always-on `app` tool. `app {}` is
+The agent reaches the system through one always-on `app` tool. `app {}` is
 home—where they left off. Pages, home items, discovery, actions and scripts
 reach the rest of the app. [Tool loading](TOOL_LOADING.md) defines that contract.
 
@@ -31,8 +33,8 @@ flowchart TD
 
 The Context module compiles and selects derived material; it does not own the
 underlying facts. `NativeContextFlowRuntime` coordinates publication and turn
-preparation. An immutable generation and bounded RAM arena provide reusable
-entries and required-document mirrors.
+preparation. An immutable generation holds typed atoms; the bounded RAM arena
+holds budget/eviction descriptors, lexical indexes and required-document mirrors.
 
 Persona, MemoryV2, Desk and skills retain their own authority. Conversation
 history is read separately from the transcript store. The optional cognitive
@@ -42,12 +44,15 @@ provider request from them.
 ## 1. Anatomy of resident context and a turn
 
 A turn combines a checked provider route, selected Context atoms, bounded
-history and optional inner state. Turn plans feed tracing and result settlement
-without being appended to model context. The prepared Context
-turn leases one generation through the model/action loop; a later source
+history and optional inner state. The resident turn part decides the work;
+see [Anatomy of a Turn](ANATOMY_OF_A_TURN.md) for its execution and settlement
+from the request and actual tool activity. The prepared Context turn leases
+one generation through the model/action loop; a later source
 change belongs to a later generation.
 
-Stable persona material precedes changing turn context in the system segments.
+Stable persona material leads the provider prefix, followed by cursor-pinned
+history. `ConversationPrefixSeeding.seed` applies the
+[sent-context contract](conversation-context-history.md) before provider dispatch.
 The `app` schema stays fixed while action discovery travels in results.
 Documents and skill bodies are retrieved when needed. There is no tool preload
 or session tool-loading lifecycle.
@@ -69,49 +74,37 @@ dispatch and settlement, including
 ### How information enters MemoryV2
 
 An explicit `memory.commit` action reaches the canonical memory write path.
-After a conversation, the adaptive promoter can also stage candidates.
+After a conversation, the adaptive promoter keeps or stages candidates.
 
-`memory.commit` accepts optional `provenance` (`verified|told|inferred`)
-and `provenance_by` (≤40 characters; letters, digits, spaces and `. - '`).
-Recall returns a display `provenance` field; absent provenance stays absent.
+[Memory system map](MEMORY_SYSTEM_MAP.md) owns mutation and read contracts:
+provenance, kinds, counted reads, trusted acceptance, untrusted review,
+care movements, atomic replacement and rejection protection.
 
-The current after-turn path uses one model interpretation for facts, moments
-and semantic appraisal. `MindMemoryManager` uses the memory route when
-configured, otherwise the chat route. It is not an on-device-only extraction
-lane. Peer conversations identify their speaker so a peer's words are not
+The current after-turn path uses one model interpretation for facts, cares
+and semantic appraisal; routing follows [cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation).
+Before this pass the agent's own labelled record predicts whether the
+interpretation would be a complete no-op; a turn predicted so with standing
+is left owed and judged later with other owed turns in one batch call.
+Details, the cost law and its assumptions are in
+[cognition wiring](COGNITION_WIRING.md#shared-after-turn-interpretation).
+Peer conversations identify their speaker so a peer's words are not
 mistaken for facts about the human.
-
-Candidate facts are checked for confidence, shape, duplication and rejection
-history, then staged for human review. The moments lane stages at most one
-candidate from an exchange, subject to its switch, daily cap, salience,
-grounding and a verified quote. A staged moment is still a proposal.
-
-Moment extraction treats transcripts as untrusted data. Independent staging
-validation requires first-person narrative and rejects role labels,
-agent-directed instructions, tool identifiers, markup, links and oversized
-content.
 
 ### When the work happens
 
-For a completed answer, the assistant row becomes durable before its deferred
-memory-promotion ticket starts. The reply path does not await that work.
+After the assistant row is durable, its `AfterReply` follows the
+[owed-recording contract](SUBCONSCIOUS.md#lived-moments), then releases private work.
 A process exit can interrupt unfinished promotion without losing the already
 written transcript.
 
 ### Acceptance, correction and recall
 
-Proposal acceptance rechecks memory quality and rejection tombstones.
-A replacement proposal carries the target's fingerprint; acceptance and
-demotion of the old fact occur together or the proposal remains pending.
-
-Superseding a pending proposal is distinct from rejecting it: supersession
-records the replacement relationship without creating a rejection tombstone.
-That permits a correction without treating its similar wording as forbidden.
-
 Canonical changes trigger derived-memory refreshes. The generated `USER.md`
 is a projection of eligible active memories, not a place to repair facts by
 hand; the generator excludes Workshop execution records by source.
 Knowledge Graph and Context projections do not replace MemoryV2's authority.
+
+Retirement and retention follow the [memory contract](MEMORY_SYSTEM_MAP.md#consolidation-and-hygiene).
 
 Relevant memories can arrive through resident selection. `memory.recall`
 supports deeper retrieval, while `chat.search` and `chat.message` recover
@@ -122,6 +115,8 @@ ability, saved with `ability.save` and run as `authored.<id>`, with `ability.ena
 grant no new authority.
 
 Source owners: `MemoryV2/MemoryV2+AdaptivePromoter.swift`,
+`AdaptiveMemoryPromoter+Recovery.swift`, `AdaptiveMemoryPromoter+Migrations.swift`,
+`MemoryStorage+Projections.swift`,
 `MemoryV2+Proposals.swift`, `MemoryV2+UserMDGen.swift`,
 `MemoryV2+Recall.swift` and `ChatTurnRuntime/MindMemoryManager.swift`.
 See [Memory system map](MEMORY_SYSTEM_MAP.md) for the store-level map.
@@ -133,12 +128,14 @@ Folded actions re-enter the dispatcher under their underlying identity so
 saved Trust decisions and domain checks still bind. A page read or discovery
 result grants no authority.
 
-Full Mac gives Agent autonomy, including actions otherwise marked the owner's.
+Full Mac gives the agent autonomy, including actions otherwise marked the owner's.
+The Capabilities autonomy summary uses that same effective unattended-work
+verdict; its saved autonomy switch remains labeled separately, including
+when that switch is off under Full Mac.
+
 Checked policy, explicit blocks, actual macOS grants and connector
 authentication still govern execution. macOS privacy permission resets always
-ask the owner. A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing.
-Agents enabled in Trust → Connected agents carry the owner's authority on
-authenticated turns; ordinary Trust and domain checks still apply.
+ask the owner. Peer turns follow the [authority contract](TOOL_LOADING.md#authority-and-receipts).
 
 Approval-gated effects consume a durable single-use claim immediately before
 dispatch. Replay validates the exact tool, input, surface and payload digest;
@@ -161,7 +158,7 @@ Different kinds of growth return through different owners:
 
 | Mechanism | Durable destination or influence |
 |---|---|
-| After-turn memory candidates | Reviewed MemoryV2 records |
+| After-turn memory candidates | Kept MemoryV2 records with their source; an untrusted peer's reviewed |
 | Cognitive capsule and organism posture | Optional advisory input to a turn |
 | Dream synthesis | Dream diary |
 | REM consolidation | Reviewable lessons targeting `GROWTH.md` |
@@ -169,7 +166,7 @@ Different kinds of growth return through different owners:
 | Authored abilities | Kept executable parts exposed as `authored.<id>` |
 
 Dream and REM use `DreamREMCycle`. REM stages growth proposals;
-`ApprovalTransactionCoordinator` applies an approved lesson through
+`ApprovalExecution` applies an approved lesson through
 `REMGrowthWriter` and its prompt pin. A diary entry alone does not approve a
 persona change.
 
@@ -183,7 +180,7 @@ memory or permission stores. See [Cognition Wiring](COGNITION_WIRING.md),
 
 ## 5. One persistent mind, specialist hands
 
-`agent.message` to a coding contact (Codex, Claude Code, OMP) connects Agent
+`agent.message` to a coding contact (Codex, Claude Code, OMP) connects the agent
 to a specialist harness; on an install that set those lanes up, `codex.message`,
 `omp.message` and home's `claude.say` are the same doors by their older names. The returned conversation identity
 supports a contextual follow-up using `conversation_mode=resume` and
@@ -204,10 +201,35 @@ See [Agent conversations](agent-communication.md).
 
 ## 6. One agent across every surface
 
+Readout preparation binds the existing or newly created part-face owner
+directly. Today binds source bounds and returned faces without forced unwraps;
+missing permission, secret-metadata or Desk-overview evidence uses the existing
+unavailable projection. A bodyless root refreshes no absent cognition owner;
+phone reply recovery reports an absent delivery owner as a failure.
+
 The Mac app hosts the engine. Mac chat and detached windows present its
 sessions; Telegram, Slack and local bridges adapt their incoming messages and
 outgoing replies to the shared conversation runtime. Their origin and
 conversation identities remain attached to the work.
+Slack DMs keep their own bindings: an allowlisted sender alone does not prove
+ownership and never moves the shared owner conversation anchor.
+
+Inline requests and trigger cards retain an outstanding knock in the inbox's
+existing held-delivery state. Inserting the card and getting a transport to
+accept its knock are separate commits. Failed knocks stay available to the
+held-delivery release path after refresh or relaunch; only acceptance retires
+that transport, without inserting another card.
+
+Telegram downloads and transcribes media inside the destination's tracked
+turn. Its poller continues admitting Stop and approval controls while media
+is being prepared; Stop cancels preparation and settles that update. Shutdown
+returns an interrupted, unstarted media update to pending for recovery in
+the conversation pinned when it was admitted.
+
+Approval transactions own receipts and reporting turns for current and legacy
+Telegram cards. Telegram acknowledges decisions and carries replies through
+its send driver; already-produced legacy answers retain transport recovery
+without a second model-turn runner or continuation queue.
 
 The mobile companion uses DeviceSync. The Mac verifies signed incoming
 commands, executes them and publishes progress, results and snapshots.
@@ -232,7 +254,7 @@ See [Mobile companion](mobile_companion.md).
 | May this action run? | TrustCenter and the domain's gates |
 | Did it take effect? | The executing domain's evidence |
 | What work remains? | Desk |
-| What runs in the background? | BackgroundLoopsManager and its registered owners |
+| What runs in the background? | BackgroundLoopLifetimes and its registered owners |
 
 One shared engine coordinates these owners. It does not turn a projection,
 approval or transport acknowledgment into a different kind of truth.

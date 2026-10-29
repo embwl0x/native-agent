@@ -19,16 +19,13 @@ import PersistenceCore
 
 public actor SwiftNativeTrustCenter {
     let dataRoot: URL
-    let persistence: any PersistenceCoreProtocol
     let clock: @Sendable () -> Date
 
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
         clock: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.dataRoot = dataRoot
-        self.persistence = persistence
         self.clock = clock
     }
 
@@ -40,9 +37,9 @@ public actor SwiftNativeTrustCenter {
     /// damaged authority before explicitly reauthorizing the Safe posture.
     public func reauthorizeSafePolicy() async throws -> TrustPolicy {
         let path = trustPolicyPath, defaults = defaultTrustPolicy()
-        let saved = try await persistence.withFileLock(path) { [persistence] in
+        let saved = try await SwiftNativePersistenceCore.withFileLock(path) {
             do {
-                _ = try Self.loadSavedPolicyChecked(at: path, defaults: defaults)
+                _ = try Self.loadRawPolicyChecked(at: path, defaults: defaults)
                 throw TrustCenterError.invalidRequest
             } catch TrustCenterError.invalidRequest { throw TrustCenterError.invalidRequest }
             catch {
@@ -53,9 +50,8 @@ public actor SwiftNativeTrustCenter {
                 safe["permissionLevel"] = .string("strict")
                 safe["enableAutonomy"] = .bool(false)
                 safe["developerMode"] = .bool(false)
-                try Self.validateAuthorityPolicyShape(safe)
                 try Self.validateKnownAuthorityPolicyTypes(safe, against: defaults)
-                try await persistence.writeJSON(.object(safe), to: path)
+                try await SwiftNativePersistenceCore.writeJSON(.object(safe), to: path)
                 return safe
             }
         }
@@ -79,19 +75,10 @@ public actor SwiftNativeTrustCenter {
     ) async throws -> [String: JSONValue] {
         let path = trustPolicyPath
         let defaults = defaultTrustPolicy()
-        let merged = try await persistence.withFileLock(path) {
-            // Wave 4 read-both (phase A): BOTH the caller's patch and the
-            // current on-disk object may carry the future `workshopPolicy`
-            // spelling (the patch from a future caller; the disk from a write
-            // that slipped through before the fold existed). Fold BOTH onto
-            // the WIRE key before validation and merge, so every write leaves
-            // the file with exactly one spelling — the old one — and a
-            // stray future key is normalized away instead of rewritten
-            // forever. Folding current BEFORE type validation also gives a
-            // future-spelled block the same nested type checks the legacy
-            // spelling gets (review 2026-08-06 blocking #2/#3).
+        let merged = try await SwiftNativePersistenceCore.withFileLock(path) {
+            // Validate both Workshop spellings before folding to the wire key.
             let current = WorkshopPolicyBlockVocabulary.foldToWireKey(
-                try Self.loadRawPolicyChecked(at: path))
+                try Self.loadRawPolicyChecked(at: path, defaults: defaults))
             // Fresh exactly as the canonical read defines it: no file, or a
             // file with nothing in it (setup writes `{}`). Keying this off
             // file existence alone let the first settings write land on that
@@ -99,8 +86,8 @@ public actor SwiftNativeTrustCenter {
             // additions — so `autonomyDefault` fell back to "supervised" and
             // the Trust preset stopped matching.
             let bootstrapWrite = current.isEmpty
-            try Self.validateKnownAuthorityPolicyTypes(current, against: defaults)
             try guardedByLockedPolicy?(current)
+            try Self.validateKnownAuthorityPolicyTypes(patch, against: defaults)
             var patch = WorkshopPolicyBlockVocabulary.foldToWireKey(patch)
             // The first write on a fresh root persists what that root already
             // reads (Self.freshInstallTrustPolicyAdditions); without this the
@@ -111,9 +98,8 @@ public actor SwiftNativeTrustCenter {
                 }
             }
             let merged = Self.deepMerge(current, patch)
-            try Self.validateAuthorityPolicyShape(merged)
             try Self.validateKnownAuthorityPolicyTypes(merged, against: defaults)
-            try await persistence.writeJSON(.object(merged), to: path)
+            try await SwiftNativePersistenceCore.writeJSON(.object(merged), to: path)
             return merged
         }
         return normalizedTrustPolicy(saved: merged, defaults: defaults)

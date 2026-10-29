@@ -1,6 +1,5 @@
 import Foundation
 import ChatTurnContracts
-import Darwin
 import NativeAgentCore
 import PersistenceCore
 import Desk
@@ -25,14 +24,8 @@ public actor WorkshopArtifactCollector {
         paths.append(written.relativePath)
         return written.relativePath
     }
-    public func written() -> [String] { paths }
-    /// User, 2026-09-06: seal the session's artifact set and hand back what it
-    /// wrote, in one hop. The deadline racer cancels the turn but cannot stop
-    /// a detached executor that ignores cancellation, so an uncancelled tool
-    /// loop kept writing artifacts after the terminal receipt was built and
-    /// saved — the receipt's `artifactPaths` then described a folder that had
-    /// since grown. Once closed, `workshop_artifact_write` is refused, so the
-    /// receipt stays the truth about what the session produced.
+    /// After the worker settles, seal and return its artifact set in one hop.
+    /// This is the collector's only read; later writes are refused.
     public func close() -> [String] {
         closed = true
         return paths
@@ -50,8 +43,7 @@ public actor WorkshopProgressCollector {
     func record(disposition: DeskWorkDisposition, summary: String) {
         let clean = summary.trimmingCharacters(in: .whitespacesAndNewlines)
         report = Report(disposition: disposition, summary: String(clean.prefix(600)))
-        // A valid report supersedes earlier recording failures: the session
-        // recovered and said its outcome (GPT-5.6 review of lane1 #2).
+        // A valid report supersedes earlier recording failures.
         failures.removeAll()
     }
     /// Only the RECORDING channel's failures are evidence about the report; a
@@ -61,9 +53,7 @@ public actor WorkshopProgressCollector {
         WorkshopToolProfile.artifactToolName,
         "desk_work_log",
     ]
-    /// Tool-outcome evidence (lane1 finding 2): a receipt must be able to say
-    /// that the recording channel itself failed, instead of an empty result
-    /// reading as a deliberately artifact-free observation.
+    /// Retain recording failures so a receipt can distinguish them from no output.
     func recordFailure(tool: String, reason: String) {
         guard Self.recordingToolNames.contains(tool), failures.count < 8 else { return }
         failures.append("\(tool): \(String(reason.prefix(160)))")
@@ -83,11 +73,7 @@ public struct WorkshopToolProfile: ToolDispatchClient {
     let artifactWriter: WorkshopArtifactWriter
     let collector: WorkshopArtifactCollector
     let progressCollector: WorkshopProgressCollector
-    /// `desk_work_log`'s store method refuses every non-pursuit target
-    /// (DeskStore.appendWorkReceipt), so an owner-cadence job used to be handed
-    /// a progress tool that could only fail on the very item it was given
-    /// (lane1 finding 3). The tool is exposed only where it can accept the
-    /// admitted handle; `workshop_progress` is the route for both.
+    /// desk_work_log accepts only pursuits; workshop_progress accepts both lanes.
     let allowsDeskWorkLog: Bool
 
     public init(
@@ -135,13 +121,7 @@ public struct WorkshopToolProfile: ToolDispatchClient {
     }
 
     private func route(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        // 2026-09-11: the harness always injects `__session_id`
-        // (ChatOrchestrationClient+DispatchWrappers.swift:682), and the three
-        // local handlers guard exact key-set equality — so every workshop
-        // dispatch failed on an argument the model never sent. Only the key the
-        // harness is known to inject is dropped (Agent's ruling: trusted harness
-        // metadata, never arbitrary unknown keys); anything else the caller
-        // sends still faces the guards.
+        // Drop only trusted dispatch session metadata before exact-key validation.
         let args = input.filter { $0.key != "__session_id" }
         if tool == Self.artifactToolName {
             return try await handleArtifactWrite(args)
@@ -258,8 +238,7 @@ public struct WorkshopToolProfile: ToolDispatchClient {
         guard case .string(let content)? = input["content"] else {
             throw WorkshopMembraneError.badArtifactArgs("'content' (string) is required")
         }
-        // User, 2026-09-06: the session's receipt is already written once the
-        // deadline passes; a write accepted after that would not be on it.
+        // The sealed collector refuses writes after the session receipt is filed.
         let path = try await collector.write(relativePath: rawPath, content: content, using: artifactWriter)
         return .object([
             "status": .string("ok"),
@@ -318,261 +297,5 @@ public enum WorkshopMembraneError: Error, LocalizedError, Equatable {
         case .unsafeComponent(let p):
             return "workshop_artifact_write: path '\(p)' contains an unsafe segment (.., separator, NUL, or control char)"
         }
-    }
-}
-
-/// Containment-checked writer for a single pursuit's workshop folder
-/// (`data/workshop/<handle>/`). Mirrors the execution-checkpoint path guard
-/// (Executions+Checkpoints.swift:143): reject `..`, path separators, NUL, and
-/// control characters, then assert the canonicalized target stays under the
-/// handle root. Belt-and-suspenders — the component check AND the resolved-path
-/// prefix check both have to pass.
-/// UTF-8 artifacts: local backup/export include workshop/; no phone content sync;
-/// PrivacyMap lists Workshop.
-public struct WorkshopArtifactWriter: Sendable {
-    /// The app data root (e.g. `.../data`); artifacts live under
-    /// `<dataRoot>/workshop/<handle>/`.
-    let dataRoot: URL
-    let handle: String
-
-    public init(dataRoot: URL, handle: String) {
-        self.dataRoot = dataRoot
-        self.handle = handle
-    }
-
-    /// The absolute root for this pursuit's artifacts. The handle is validated
-    /// as a safe single component so it can never itself traverse.
-    public func rootURL() throws -> URL {
-        let safeHandle = try Self.validateSafeComponent(handle)
-        return dataRoot
-            .appendingPathComponent("workshop", isDirectory: true)
-            .appendingPathComponent(safeHandle, isDirectory: true)
-    }
-
-    public struct Written: Equatable { public let relativePath: String; public let url: URL }
-    public struct Read: Equatable {
-        public let relativePath: String
-        public let content: String
-        public let bytes: Int
-        public let truncated: Bool
-    }
-
-    @discardableResult
-    public func write(relativePath: String, content: String) throws -> Written {
-        let components = try Self.validatedPathComponents(relativePath)
-        let root = try rootURL()
-        let target = Written(
-            relativePath: components.joined(separator: "/"),
-            url: components.reduce(root) { $0.appendingPathComponent($1) }
-        )
-
-        // Anchor the whole operation at an O_NOFOLLOW descriptor for dataRoot,
-        // then walk/create every directory with openat/mkdirat. The final file
-        // is written to an O_EXCL temporary sibling and renameat'd within the
-        // already-open parent. No path component is resolved a second time, so
-        // a parent symlink cannot be swapped in between validation and write.
-        let dataFD = Darwin.open(
-            dataRoot.path,
-            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
-        )
-        guard dataFD >= 0 else { throw Self.posixError("open data root") }
-        defer { Darwin.close(dataFD) }
-
-        var directoryFD = try Self.openDirectoryComponent("workshop", parentFD: dataFD, create: true)
-        defer { Darwin.close(directoryFD) }
-        let safeHandle = try Self.validateSafeComponent(handle)
-        let handleFD = try Self.openDirectoryComponent(safeHandle, parentFD: directoryFD, create: true)
-        Darwin.close(directoryFD)
-        directoryFD = handleFD
-
-        for component in components.dropLast() {
-            let next = try Self.openDirectoryComponent(component, parentFD: directoryFD, create: true)
-            Darwin.close(directoryFD)
-            directoryFD = next
-        }
-
-        let leaf = components[components.count - 1]
-        let temporary = ".workshop-write-\(UUID().uuidString.lowercased()).tmp"
-        let fileFD = temporary.withCString { name in
-            Darwin.openat(
-                directoryFD,
-                name,
-                O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
-                0o600
-            )
-        }
-        guard fileFD >= 0 else { throw Self.posixError("open artifact temp") }
-        var fileIsOpen = true
-        var temporaryExists = true
-        defer {
-            if fileIsOpen { Darwin.close(fileFD) }
-            if temporaryExists {
-                temporary.withCString { _ = Darwin.unlinkat(directoryFD, $0, 0) }
-            }
-        }
-
-        let bytes = Data(content.utf8)
-        try bytes.withUnsafeBytes { raw in
-            guard var pointer = raw.baseAddress else { return }
-            var remaining = raw.count
-            while remaining > 0 {
-                let count = Darwin.write(fileFD, pointer, remaining)
-                if count < 0 {
-                    if errno == EINTR { continue }
-                    throw Self.posixError("write artifact temp")
-                }
-                pointer = pointer.advanced(by: count)
-                remaining -= count
-            }
-        }
-        guard Darwin.fsync(fileFD) == 0 else { throw Self.posixError("fsync artifact temp") }
-        guard Darwin.close(fileFD) == 0 else { throw Self.posixError("close artifact temp") }
-        fileIsOpen = false
-
-        let renameResult = temporary.withCString { temporaryName in
-            leaf.withCString { leafName in
-                Darwin.renameat(directoryFD, temporaryName, directoryFD, leafName)
-            }
-        }
-        guard renameResult == 0 else { throw Self.posixError("rename artifact") }
-        temporaryExists = false
-        guard Darwin.fsync(directoryFD) == 0 else { throw Self.posixError("fsync artifact directory") }
-        return target
-    }
-
-    /// Check bounded byte access without interpreting a partial UTF-8 scalar.
-    public func isReadable(relativePath: String) -> Bool {
-        (try? readBytes(relativePath: relativePath, maximumBytes: 1)) != nil
-    }
-
-    public func read(relativePath: String, maximumBytes: Int = 65_536) throws -> Read {
-        let result = try readBytes(relativePath: relativePath, maximumBytes: maximumBytes)
-        guard let content = String(data: result.data, encoding: .utf8) else {
-            throw WorkshopMembraneError.badArtifactArgs("artifact is not UTF-8 text")
-        }
-        return Read(relativePath: result.relativePath, content: content, bytes: result.data.count, truncated: result.truncated)
-    }
-
-    private func readBytes(relativePath: String, maximumBytes: Int) throws -> (relativePath: String, data: Data, truncated: Bool) {
-        let components = try Self.validatedPathComponents(relativePath)
-        let dataFD = Darwin.open(dataRoot.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-        guard dataFD >= 0 else { throw Self.posixError("open data root") }
-        defer { Darwin.close(dataFD) }
-        var directoryFD = try Self.openDirectoryComponent("workshop", parentFD: dataFD, create: false)
-        defer { Darwin.close(directoryFD) }
-        let handleFD = try Self.openDirectoryComponent(try Self.validateSafeComponent(handle), parentFD: directoryFD, create: false)
-        Darwin.close(directoryFD)
-        directoryFD = handleFD
-        for component in components.dropLast() {
-            let next = try Self.openDirectoryComponent(component, parentFD: directoryFD, create: false)
-            Darwin.close(directoryFD)
-            directoryFD = next
-        }
-        let leaf = components[components.count - 1]
-        let fileFD = leaf.withCString { Darwin.openat(directoryFD, $0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
-        guard fileFD >= 0 else { throw Self.posixError("open artifact") }
-        defer { Darwin.close(fileFD) }
-        var statValue = stat()
-        guard Darwin.fstat(fileFD, &statValue) == 0, (statValue.st_mode & S_IFMT) == S_IFREG else {
-            throw WorkshopMembraneError.badArtifactArgs("artifact is not a regular file")
-        }
-        let limit = max(1, maximumBytes)
-        var data = Data()
-        var buffer = [UInt8](repeating: 0, count: min(8192, limit + 1))
-        while data.count <= limit {
-            let requested = min(buffer.count, limit + 1 - data.count)
-            let count = buffer.withUnsafeMutableBytes { raw in
-                Darwin.read(fileFD, raw.baseAddress, requested)
-            }
-            if count < 0 {
-                if errno == EINTR { continue }
-                throw Self.posixError("read artifact")
-            }
-            if count == 0 { break }
-            data.append(contentsOf: buffer.prefix(count))
-        }
-        let truncated = data.count > limit
-        if truncated {
-            data = data.prefix(limit)
-            // Remove only a scalar cut by the byte limit; invalid text elsewhere
-            // still fails the UTF-8 decode at the artifact boundary.
-            var start = data.count - 1
-            while start > 0, data[start] & 0xC0 == 0x80 { start -= 1 }
-            let lead = data[start]
-            let width = lead < 0x80 ? 1
-                : (0xC2...0xDF).contains(lead) ? 2
-                : (0xE0...0xEF).contains(lead) ? 3
-                : (0xF0...0xF4).contains(lead) ? 4 : 0
-            if width > data.count - start { data = data.prefix(start) }
-        }
-        return (relativePath: components.joined(separator: "/"), data: data, truncated: truncated)
-    }
-
-    private static func validatedPathComponents(_ rawPath: String) throws -> [String] {
-        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            throw WorkshopMembraneError.badArtifactArgs("'path' must be non-empty")
-        }
-        if trimmed.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F }) {
-            throw WorkshopMembraneError.unsafeComponent(rawPath)
-        }
-        if trimmed.hasPrefix("/") || trimmed.contains("\\") {
-            throw WorkshopMembraneError.pathEscapesRoot(rawPath)
-        }
-        let components = trimmed
-            .split(separator: "/", omittingEmptySubsequences: false)
-            .map(String.init)
-        for component in components where component.isEmpty || component == "." || component == ".." {
-            throw WorkshopMembraneError.unsafeComponent(rawPath)
-        }
-        return components
-    }
-
-    /// Descriptor-anchored directory walk shared with the reservation-claim
-    /// ledger. Keeping both Workshop writers on `openat` + `O_NOFOLLOW` avoids
-    /// reintroducing a path-based symlink parent between the two boundaries.
-    static func openDirectoryComponent(
-        _ component: String,
-        parentFD: Int32,
-        create: Bool
-    ) throws -> Int32 {
-        func openDirectory() -> Int32 {
-            component.withCString {
-                Darwin.openat(parentFD, $0, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-            }
-        }
-        var fd = openDirectory()
-        if fd < 0, create, errno == ENOENT {
-            let made = component.withCString { Darwin.mkdirat(parentFD, $0, 0o700) }
-            if made != 0, errno != EEXIST {
-                throw posixError("mkdir artifact component")
-            }
-            fd = openDirectory()
-        }
-        guard fd >= 0 else { throw posixError("open artifact component") }
-        return fd
-    }
-
-    private static func posixError(_ operation: String) -> Error {
-        let code = errno
-        return NSError(
-            domain: "WorkshopArtifactWriter",
-            code: Int(code),
-            userInfo: [NSLocalizedDescriptionKey: "\(operation) failed: \(String(cString: strerror(code)))"]
-        )
-    }
-
-    /// The membrane's single-component path-safety guard.
-    public static func validateSafeComponent(_ raw: String) throws -> String {
-        let id = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !id.isEmpty else { throw WorkshopMembraneError.unsafeComponent(raw) }
-        if id == "." || id == ".." { throw WorkshopMembraneError.unsafeComponent(raw) }
-        if id.contains("/") || id.contains("\\") || id.contains("\0") {
-            throw WorkshopMembraneError.unsafeComponent(raw)
-        }
-        if id.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F }) {
-            throw WorkshopMembraneError.unsafeComponent(raw)
-        }
-        return id
     }
 }

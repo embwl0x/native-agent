@@ -3,22 +3,6 @@ import os
 
 // Blueprint: | `LifecyclePrimitives.swift` | `ScopedWaiter`, `OnceByKey` and `BoundedWait`: lifecycle-safe waiter release, keyed single execution and bounded waits |
 
-// Lifecycle primitives — Track C of docs/build_plans/lifecycle-prevention-design.md.
-//
-// 99 of 272 logged NativeAgent bugs (36%) are ONE shape: something was
-// acquired, registered, or parked, and the release path missed an exit — a
-// throw, a cancel, a guard-return, or a `defer` scoped to an inner closure.
-// Reviews catch those one at a time, forever. These types make the release
-// un-skippable BY CONSTRUCTION instead:
-//
-//   * `ScopedWaiter`      — a parked continuation that resumes EXACTLY once,
-//                           race-free against a resume that beats the park.
-//   * `OnceByKey`         — run-at-most-once-per-key that does not retain the
-//                           in-flight Task (or its captures) after completion.
-//   * `BoundedWait`       — every await gets a deadline; expiry throws a TYPED,
-//                           LOGGED timeout naming the reason. Never a silent
-//                           hang, never a bare `catch {}` that erases the class.
-
 // MARK: - ScopedWaiter
 
 /// One parked `withCheckedContinuation` that resumes EXACTLY once.
@@ -63,13 +47,6 @@ public final class ScopedWaiter: @unchecked Sendable {
 
     /// Parks until someone calls `resume()`, or until THIS parker's
     /// task is cancelled. Returns immediately if the waiter already resolved.
-    ///
-    /// fix-park-cancellation (2026-08-02): a bare
-    /// `withCheckedContinuation(Void, Never)` ignores cancellation entirely
-    /// (empirically confirmed), so a parker whose task was cancelled with no
-    /// later `resume` stayed in `parked` forever — the exact leak this
-    /// type claims to prevent. The guarantee now lives INSIDE the primitive
-    /// instead of in whichever caller remembered to add its own handler.
     ///
     /// Cancellation unparks only the cancelled waiter: the waiter itself stays
     /// unresolved, so a sibling parker and the producer are untouched.
@@ -187,16 +164,13 @@ public struct BoundedWaitTimeout: Error, LocalizedError, Sendable, Equatable {
     }
 
     public var errorDescription: String? {
-        "Timed out after \(Int(seconds.rounded()))s waiting for \(reason)."
+        "Timed out after \(seconds.rounded())s waiting for \(reason)."
     }
 }
 
 /// Every unbounded await gets a deadline by construction.
 ///
-/// Companion rule (design doc C-2): **no unbounded wait may be held under a
-/// file lock.** A hang under a cross-process flock turns one wedged caller into
-/// a system-wide wedge — every other process blocks on the same lock. There is
-/// deliberately no "wait forever" option here.
+/// No unbounded wait may be held under a file lock.
 public enum BoundedWait {
     public static let logger = Logger(subsystem: "com.nativeagent.core", category: "bounded-wait")
 
@@ -210,14 +184,6 @@ public enum BoundedWait {
     /// Runs `operation` with a deadline that holds even when `operation` does
     /// NOT cooperate with cancellation. On expiry a LOGGED `BoundedWaitTimeout`
     /// naming `reason` is thrown and this call returns immediately.
-    ///
-    /// fix-bounded-wait-hard-deadline (2026-08-02): this used to be a
-    /// `withThrowingTaskGroup`. A task group AWAITS its children at scope exit
-    /// and `cancelAll()` is only a request, so any operation that ignores
-    /// cancellation (a raw `withCheckedContinuation`, a blocking syscall on a
-    /// detached queue, a semaphore) hung forever DESPITE the bound — the
-    /// overclaim that makes a safety primitive dangerous, because callers reach
-    /// for it precisely when they do not trust the wait.
     ///
     /// WHAT LEAKS ON EXPIRY: the operation runs in an unstructured `Task` that
     /// is CANCELLED and then ABANDONED. Cooperative work stops promptly.
@@ -240,7 +206,7 @@ public enum BoundedWait {
         }
         let deadline = clampedDeadline(seconds, reason: reason)
         do {
-            let value = try await TurnDeadline.withThrowingDeadline(seconds: deadline, operation)
+            let value = try await TurnDeadline.withThrowingDeadline(seconds: deadline, clock: .wallClock, operation)
             try Task.checkCancellation()
             return value
         } catch is TurnDeadline.DeadlineExceeded {

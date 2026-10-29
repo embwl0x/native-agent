@@ -1,5 +1,6 @@
 import NativeAgentCore
 import Foundation
+import NativeAgentShared
 import PersistenceCore
 import Studio
 // Blueprint: | `StudioWanderLane.swift` | `StudioWanderLane` enum; installation, eligibility, carried-hour state and prompt for studio wandering |
@@ -114,9 +115,7 @@ public enum StudioWanderLane {
 
     // MARK: What she did with it
 
-    /// The outcome of one hour, as SHE ended it. Nothing here is inferred from
-    /// how the call went — each value corresponds to something she did or could
-    /// not do, and every one of them is a legitimate ending.
+    /// The terminal outcome of one admitted hour, including interrupted work.
     public enum Outcome: String, Sendable, Equatable, CaseIterable {
         /// She chose something and received the actual artifact.
         case chose
@@ -126,14 +125,18 @@ public enum StudioWanderLane {
         /// She chose something and the artifact could NOT be obtained, so the
         /// encounter did not happen. Her veto: honest encounters only.
         case noArtifact = "no_artifact"
+        case stopped
+        case failed
 
-        /// The substrate receipt kind for this outcome. Change-only at the call
-        /// site — a run of identical refusals is not news.
+        /// Each admitted hour records one terminal receipt, even when it ends
+        /// the same way as an earlier hour.
         public var receiptKind: String {
             switch self {
             case .chose: return "studio.wander_chose"
             case .declined: return "studio.wander_declined"
             case .noArtifact: return "studio.wander_no_artifact"
+            case .stopped: return "studio.wander_stopped"
+            case .failed: return "studio.wander_failed"
             }
         }
     }
@@ -211,8 +214,7 @@ public enum StudioWanderLane {
     }
 
     public static func loadState(
-        dataRoot: URL,
-        persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore()
+        dataRoot: URL
     ) async throws -> State {
         let bytes: Data
         do { bytes = try Data(contentsOf: statePath(dataRoot: dataRoot)) }
@@ -241,16 +243,15 @@ public enum StudioWanderLane {
 
     /// Reserve the existing durable refractory BEFORE any provider/tool effect.
     /// A crash or failed final trace cannot authorize replay on the next launch.
-    public static func beginHour(dataRoot: URL, at: Date,
-                                 persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore()) async throws {
+    public static func beginHour(dataRoot: URL, at: Date) async throws {
         let path = statePath(dataRoot: dataRoot)
         try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try await persistence.withFileLock(path) {
-            let existing = try await loadState(dataRoot: dataRoot, persistence: persistence)
+        try await SwiftNativePersistenceCore.withFileLock(path) {
+            let existing = try await loadState(dataRoot: dataRoot)
             if let last = existing.lastWanderAt, at.timeIntervalSince(last) < refractoryInterval {
                 throw StateError.refractory
             }
-            try await persistence.writeJSON(.object([
+            try await SwiftNativePersistenceCore.writeJSON(.object([
                 "last_wander_at": .string(NativeTimestampFormat.sixDigitUTCOffset(at)),
                 "trace": .array(existing.trace.map { $0.toJSON() }),
             ]), to: path)
@@ -264,17 +265,16 @@ public enum StudioWanderLane {
     public static func recordEndedHour(
         dataRoot: URL,
         entry: TraceEntry,
-        at: Date,
-        persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore()
+        at: Date
     ) async throws {
         let path = statePath(dataRoot: dataRoot)
         try FileManager.default.createDirectory(
             at: path.deletingLastPathComponent(), withIntermediateDirectories: true
         )
-        try await persistence.withFileLock(path) {
-            let existing = try await loadState(dataRoot: dataRoot, persistence: persistence)
+        try await SwiftNativePersistenceCore.withFileLock(path) {
+            let existing = try await loadState(dataRoot: dataRoot)
             let trace = (existing.trace + [entry]).suffix(maximumTraceLines)
-            try await persistence.writeJSON(
+            try await SwiftNativePersistenceCore.writeJSON(
                 .object([
                     "last_wander_at": .string(NativeTimestampFormat.sixDigitUTCOffset(at)),
                     "trace": .array(trace.map { $0.toJSON() }),
@@ -286,14 +286,9 @@ public enum StudioWanderLane {
 
     // MARK: Her own material
 
-    /// What is put in front of her, and it is all HERS: her open questions, the
-    /// invitations User left on the table, works the graph holds that she has
-    /// never written about, and what she has been writing lately.
-    ///
-    /// Nothing is invented, nothing is recommended, and nothing is ranked. An
-    /// empty field is an honest empty field — see `isEmpty`, which is what lets
-    /// the lane decline to even ask rather than manufacture a prompt out of
-    /// nothing.
+    /// Her cares, invitations and recent writing; nothing is invented,
+    /// recommended or ranked. Empty material still lets her explore,
+    /// return a question or decline.
     public struct Material: Sendable, Equatable {
         /// The studio-intake part's invitation for what is in reach.
         public var invitations: [String]
@@ -301,25 +296,21 @@ public enum StudioWanderLane {
         /// so anything avoids one for her.
         public var recentJournalTitles: [String]
         /// Her own open cares, most pressing first.
-        /// ("topic — her question"). Offered ahead of everything else, never assigned.
+        /// ("[w1] topic — her question"; the key lets her say which one a
+        /// question carries on). Offered ahead of everything else, never assigned.
         public var cares: [String]
-        /// The hour may end with the question she would come back with.
-        public var asksForQuestion: Bool
 
         public init(
             invitations: [String] = [],
             recentJournalTitles: [String] = [],
-            cares: [String] = [],
-            asksForQuestion: Bool = false
+            cares: [String] = []
         ) {
             self.invitations = invitations
             self.recentJournalTitles = recentJournalTitles
             self.cares = cares
-            self.asksForQuestion = asksForQuestion
         }
 
-        /// Nothing of her own to look at. The hour still happened; she simply
-        /// had nothing in reach, which is a decline and not a failure.
+        /// No invitations or open cares; the hour still reaches her for judgment.
         public var isEmpty: Bool {
             invitations.isEmpty && cares.isEmpty
         }
@@ -347,53 +338,23 @@ public enum StudioWanderLane {
     /// streak and no quota puts both words in front of her and invites her to
     /// wonder what is being counted; saying nothing about counting is the only
     /// way to mean it.
-    public static func prompt(_ material: Material) -> String {
+    public static func prompt(_ material: Material) throws -> String {
         var sections: [String] = [
-            """
-            This hour is yours. Nobody asked you for anything and nothing is waiting on \
-            the result.
-
-            Below is your own material — questions you left open, things sitting on the \
-            table, and what you have been writing about lately. Pick ONE thing to spend \
-            the hour on, or decline. Deciding not to look at anything is a full answer, \
-            complete in itself, and it leaves nothing owed.
-
-            If you choose to spend it on a work, meeting it has to be HONEST — get the \
-            actual thing in front of you first:
-            - a page: app {action:"web.read", args:{url:"…"}}; to see it, \
-            app {action:"browser.open", args:{url:"…"}}, then app {action:"browser.screenshot"}
-            - a document or a local file: app {action:"mac.read"}, or \
-            app {action:"files.read", args:{path:"…"}}
-            - something on the table: app {action:"studio.consult_read", args:{consult_id:"…"}} \
-            with the consult_id in the line; it shows you the real artifact refs to go and open
-            If you cannot actually receive it, say so and stop; do not write about a work \
-            you did not meet. Meeting one does not owe a verdict either — "not enough to \
-            judge yet" is a real ending.
-
-            Nothing is written down unless you write it. If, and only if, you want this in \
-            your journal, file it yourself with app action studio.journal. Otherwise the hour simply happened.
-
-            End with one short line saying what you did with it.
-            """,
+            try completionPolicy("her-hour", section: "prompt"),
         ]
-        if material.asksForQuestion {
-            sections[0] += "\n\nIf what you met left you with a question you would want to come back to, "
-                + "put it on its own line beginning \"still wondering:\" just before that last line. "
-                + "Leave it out otherwise."
-        }
+        sections[0] += try completionPolicy("her-hour", section: "question")
         if material.isEmpty {
-            sections.append("Nothing is on the table today. The hour is still yours: anything you are "
-                + "curious about is fair, or decline.")
+            sections.append(try completionPolicy("her-hour", section: "empty"))
         }
         if !material.cares.isEmpty {
-            sections.append("# You were wondering\n" + Material.bullets(material.cares))
+            sections.append(try completionPolicy("her-hour", section: "cares") + Material.bullets(material.cares))
         }
         if !material.invitations.isEmpty {
-            sections.append("# In reach\n" + Material.bullets(material.invitations))
+            sections.append(try completionPolicy("her-hour", section: "invitations") + Material.bullets(material.invitations))
         }
         if !material.recentJournalTitles.isEmpty {
             sections.append(
-                "# Lately in your journal\n" + Material.bullets(material.recentJournalTitles)
+                try completionPolicy("her-hour", section: "journal") + Material.bullets(material.recentJournalTitles)
             )
         }
         return sections.joined(separator: "\n\n")

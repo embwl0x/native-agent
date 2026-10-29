@@ -1,4 +1,6 @@
 import Foundation
+import Synchronization
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `DeskClock.swift` | `DeskClock` enum; `nowISO`, `commitStamp` |
@@ -7,39 +9,13 @@ import PersistenceCore
 // days are the Mac's current zone (law 7); monotonic issuance belongs to Desk.
 
 public enum DeskClock {
-    private final class FormatterCache: @unchecked Sendable {
-        private let lock = NSLock()
-        private let dayFormatter: DateFormatter
-
-        init() {
-            let day = DateFormatter()
-            day.locale = Locale(identifier: "en_US_POSIX")
-            day.timeZone = .autoupdatingCurrent
-            day.dateFormat = "yyyy-MM-dd"
-            dayFormatter = day
-        }
-
-        func day(from date: Date) -> String {
-            lock.lock(); defer { lock.unlock() }
-            return dayFormatter.string(from: date)
-        }
-
-        func dayDate(from value: String) -> Date? {
-            lock.lock(); defer { lock.unlock() }
-            return dayFormatter.date(from: value)
-        }
-    }
-
-    private static let formatters = FormatterCache()
     // DateFormatter's SSSSSS only resolves to the millisecond (the trailing
     // three digits are always zeros), so two "now" stamps in the same
     // millisecond come out byte-identical — which lets the updatedAt CAS in
     // markNotifiedIfUnchanged false-succeed and swallow a same-millisecond
     // change. Guard: quantize to integer milliseconds and never re-issue a
     // value <= the last one, so in-process nowISO() is strictly monotonic.
-    // nonisolated(unsafe): every access is guarded by monotonicLock.
-    private static let monotonicLock = NSLock()
-    nonisolated(unsafe) private static var lastIssuedMs: Int64 = 0
+    private static let lastIssuedMs = Mutex<Int64>(0)
 
     /// Strictly monotonic "now" stamp: if the wall clock hasn't advanced past
     /// the last issued millisecond (or stepped backwards), bump by 1ms.
@@ -67,11 +43,10 @@ public enum DeskClock {
 
     private static func issueMs(floorMs: Int64) -> Int64 {
         let wallMs = Int64((Date().timeIntervalSince1970 * 1000.0).rounded(.down))
-        monotonicLock.lock()
-        let ms = max(wallMs, max(lastIssuedMs, floorMs) + 1)
-        lastIssuedMs = ms
-        monotonicLock.unlock()
-        return ms
+        return lastIssuedMs.withLock {
+            $0 = max(wallMs, max($0, floorMs) + 1)
+            return $0
+        }
     }
 
     private static func isoFromMs(_ ms: Int64) -> String {
@@ -81,10 +56,7 @@ public enum DeskClock {
         nowISO(Date(timeIntervalSince1970: (Double(ms) + 0.1) / 1000.0))
     }
 
-    /// Pure formatter for an explicit Date (tests, replay) — no monotonic
-    /// bump. ISO-8601 UTC, microsecond precision — byte-identical format to
-    /// TaskLedgerClock.nowISO so Desk timestamps sort lexicographically and
-    /// align with the other Swift-native event feeds.
+    /// Pure UTC formatter for an explicit Date, without monotonic issuance.
     public static func nowISO(_ date: Date) -> String {
         NativeTimestampFormat.sixDigitUTCOffset(date)
     }
@@ -97,7 +69,7 @@ public enum DeskClock {
 
     /// Parse a bare `yyyy-MM-dd` day stamp: its midnight in the Mac's zone.
     public static func parseDay(_ s: String) -> Date? {
-        formatters.dayDate(from: s)
+        NativeTimestampFormat.parseCalendarDay(s)
     }
 
     /// True when `s` parses as a calendar date — either a bare `yyyy-MM-dd` day
@@ -107,7 +79,7 @@ public enum DeskClock {
     public static func isParseableDate(_ s: String) -> Bool {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
         if t.isEmpty { return false }
-        if formatters.dayDate(from: t) != nil { return true }
+        if NativeTimestampFormat.parseCalendarDay(t) != nil { return true }
         return parseISO(t) != nil
     }
 
@@ -116,7 +88,7 @@ public enum DeskClock {
     /// bare day vs its midnight ISO form. nil for an unparseable string.
     public static func normalizedDay(_ s: String) -> String? {
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        if formatters.dayDate(from: t) != nil { return t }   // already a bare day
+        if NativeTimestampFormat.parseCalendarDay(t) != nil { return t }   // already a bare day
         if let d = parseISO(t) { return dayStamp(d) }
         return nil
     }
@@ -134,12 +106,13 @@ public enum DeskClock {
     }
 
     public static func workAttemptId(handle: String, lane: DeskWorkAttempt.Lane, day: String, slot: String) -> String {
-        "wattempt_\(lane.rawValue)_\(reservationId(handle: handle, day: day, slot: slot).dropFirst(5))"
+        lane == .pursuit ? reservationId(handle: handle, day: day, slot: slot)
+            : "wattempt_\(lane.rawValue)_\(reservationId(handle: handle, day: day, slot: slot).dropFirst(5))"
     }
 
     /// The `yyyy-MM-dd` day, in the Mac's zone, for a timestamp — the reservation/day bucket.
     public static func dayStamp(_ date: Date) -> String {
-        formatters.day(from: date)
+        NativeTimestampFormat.calendarDay(date)
     }
 
     /// New stable item handle.

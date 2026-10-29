@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `ContextFeedback.swift` | `ContextFeedbackReducer`: deterministic rebuildable utility projection from explicit-bucket feedback and canonical seeds |
+// Blueprint: | `ContextFeedback.swift` | `ContextFeedbackReducer`: deterministic rebuildable utility and use-reachability projection from explicit-bucket feedback and canonical seeds |
 
 // FC7 feedback is deliberately a pure, rebuildable projection. This file has
 // no persistence or owning-system dependencies: authority/privacy arrive from
@@ -19,6 +19,7 @@ public enum ContextTurnOutcome: String, Codable, Sendable {
 }
 
 public enum ContextFeedbackSignal: Codable, Equatable, Sendable {
+    /// Historical wire name: emitted once at confirmed delivery, not preparation.
     case selection
     case expansion
     case correction(ContextCorrectionEffect)
@@ -34,28 +35,28 @@ public struct ContextFeedbackEvent: Codable, Equatable, Sendable {
     public let signal: ContextFeedbackSignal
     public let timeBucket: Int64
     public let evidenceIDs: [String]
+    public let sessionID: String?
+    public let historyMessageFingerprint: String?
 
     public init(
         id: String,
         atomIDs: [ContextAtomID],
         signal: ContextFeedbackSignal,
         timeBucket: Int64,
-        evidenceIDs: [String] = []
+        evidenceIDs: [String] = [],
+        sessionID: String? = nil,
+        historyMessageFingerprint: String? = nil
     ) {
         self.id = id
         self.atomIDs = Array(Set(atomIDs)).sorted()
         self.signal = signal
         self.timeBucket = timeBucket
         self.evidenceIDs = Array(Set(evidenceIDs)).sorted()
+        self.sessionID = sessionID
+        self.historyMessageFingerprint = historyMessageFingerprint
     }
 
-    fileprivate var deterministicFingerprint: String {
-        ContextStableID.digest(parts: [
-            id,
-            String(timeBucket),
-            String(describing: signal),
-        ] + atomIDs.map(\.rawValue) + evidenceIDs)
-    }
+
 }
 
 /// Canonical scoring inputs rebuilt from the current generation.
@@ -64,14 +65,18 @@ public struct ContextFeedbackSeed: Codable, Equatable, Sendable {
     public let baseUtility: Double
     public let baseActivation: Double
     public let baseDecay: Double
+    /// When the atom's content came to be: its first use (encoding counts).
+    public let createdBucket: Int64?
 
     public init(
         atomID: ContextAtomID,
         baseUtility: Double = 0,
         baseActivation: Double = 0,
-        baseDecay: Double = 1
+        baseDecay: Double = 1,
+        createdBucket: Int64? = nil
     ) {
         self.atomID = atomID
+        self.createdBucket = createdBucket
         self.baseUtility = Self.clamp(baseUtility, to: -1 ... 1)
         self.baseActivation = Self.clamp(baseActivation, to: -1 ... 1)
         self.baseDecay = Self.clamp(baseDecay, to: 0 ... 1)
@@ -90,6 +95,10 @@ private struct ContextFeedbackConfiguration: Sendable {
     public let utilityRetentionPerBucket: Double = 0.995
     public let activationRetentionPerBucket: Double = 0.82
     public let decayRetentionPerBucket: Double = 0.997
+    /// Buckets are five minutes (`ContextPreparation.feedbackTimeBucket`).
+    public let bucketsPerDay: Double = 288
+    /// ACT-R's base-level decay (Anderson & Schooler 1991; d near 0.5).
+    public let useDecay: Double = 0.5
 }
 
 public struct ContextFeedbackAtomState: Equatable, Sendable {
@@ -97,6 +106,11 @@ public struct ContextFeedbackAtomState: Equatable, Sendable {
     public let utility: Double
     public let temporaryActivation: Double
     public let decay: Double
+    /// How reachable her history of use keeps it, 0...1: the power-law sum
+    /// over its uses (each served turn, and its creation), Σ age_days^-0.5,
+    /// read as odds of need, odds / (1 + odds). Recent, frequent and spaced
+    /// use keep it high; disuse lets it fade, never to zero, never deleted.
+    public let reachability: Double
 }
 
 public struct ContextFeedbackSnapshot: Equatable, Sendable {
@@ -113,6 +127,7 @@ public enum ContextFeedbackError: Error, Equatable, Sendable {
     case emptyEvent(String)
     case unknownAtom(ContextAtomID)
     case timeBeforeSeed(atomID: ContextAtomID, eventBucket: Int64, stateBucket: Int64)
+    case elapsedOverflow(ContextAtomID)
 }
 
 /// Deterministic FC7 utility reducer. Expansion contributes only to the
@@ -136,11 +151,12 @@ public struct ContextFeedbackReducer: Sendable {
             working[seed.atomID] = MutableState(seed: seed, configuration: configuration)
         }
 
-        let ordered = events.sorted {
-            if $0.timeBucket != $1.timeBucket { return $0.timeBucket < $1.timeBucket }
-            if $0.id != $1.id { return $0.id < $1.id }
-            return $0.deterministicFingerprint < $1.deterministicFingerprint
-        }
+        // SQLite supplies append sequence. Keep it within a bucket: IDs are
+        // digests and cannot tell which turn most recently served a memory.
+        let ordered = events.enumerated().sorted {
+            if $0.element.timeBucket != $1.element.timeBucket { return $0.element.timeBucket < $1.element.timeBucket }
+            return $0.offset < $1.offset
+        }.map(\.element)
         var eventByID: [String: ContextFeedbackEvent] = [:]
         for event in ordered {
             guard !event.atomIDs.isEmpty else { throw ContextFeedbackError.emptyEvent(event.id) }
@@ -154,6 +170,9 @@ public struct ContextFeedbackReducer: Sendable {
                     throw ContextFeedbackError.unknownAtom(atomID)
                 }
                 try state.apply(event, configuration: configuration)
+                if event.signal == .selection {
+                    state.uses.append(event.timeBucket)
+                }
                 working[atomID] = state
             }
         }
@@ -167,7 +186,9 @@ public struct ContextFeedbackReducer: Sendable {
             }
         }
         return ContextFeedbackSnapshot(
-            states: working.values.map { $0.frozen(configuration: configuration) }
+            states: try working.values.map {
+                try $0.frozen(configuration: configuration, at: finalBucket)
+            }
         )
     }
 }
@@ -180,9 +201,12 @@ private extension ContextFeedbackReducer {
         var temporaryActivation: Double
         var decay: Double
         var lastTimeBucket: Int64?
+        /// Buckets of its uses: creation, then every turn that served it.
+        var uses: [Int64]
 
         init(seed: ContextFeedbackSeed, configuration: ContextFeedbackConfiguration) {
             atomID = seed.atomID
+            uses = seed.createdBucket.map { [$0] } ?? []
             outcomeUtility = Self.clamp(
                 seed.baseUtility,
                 configuration.minimumUtility ... configuration.maximumUtility
@@ -206,7 +230,8 @@ private extension ContextFeedbackReducer {
                     stateBucket: lastTimeBucket
                 )
             }
-            let elapsed = bucket - lastTimeBucket
+            let (elapsed, overflow) = bucket.subtractingReportingOverflow(lastTimeBucket)
+            guard !overflow else { throw ContextFeedbackError.elapsedOverflow(atomID) }
             guard elapsed > 0 else { return }
             outcomeUtility *= pow(configuration.utilityRetentionPerBucket, Double(elapsed))
             retrievalUtility *= pow(configuration.utilityRetentionPerBucket, Double(elapsed))
@@ -266,15 +291,24 @@ private extension ContextFeedbackReducer {
             decay = Self.clamp(decay, 0 ... 1)
         }
 
-        func frozen(configuration: ContextFeedbackConfiguration) -> ContextFeedbackAtomState {
-            ContextFeedbackAtomState(
+        func frozen(
+            configuration: ContextFeedbackConfiguration, at bucket: Int64?
+        ) throws -> ContextFeedbackAtomState {
+            let now = bucket ?? uses.max() ?? 0
+            let odds = try uses.reduce(0.0) { sum, use in
+                let (elapsed, overflow) = now.subtractingReportingOverflow(use)
+                guard !overflow else { throw ContextFeedbackError.elapsedOverflow(atomID) }
+                return sum + pow(Double(max(1, elapsed)) / configuration.bucketsPerDay, -configuration.useDecay)
+            }
+            return ContextFeedbackAtomState(
                 atomID: atomID,
                 utility: Self.clamp(
                     outcomeUtility + retrievalUtility,
                     configuration.minimumUtility ... configuration.maximumUtility
                 ),
                 temporaryActivation: temporaryActivation,
-                decay: decay
+                decay: decay,
+                reachability: odds / (1 + odds)
             )
         }
 

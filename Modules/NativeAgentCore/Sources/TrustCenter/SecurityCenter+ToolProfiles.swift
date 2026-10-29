@@ -3,12 +3,52 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ToolRegistry
-// Blueprint: | `SecurityCenter+ToolProfiles.swift` | canonicalToolRisk and declared effect projection; app-call read treatment delegates to PermissionLaw.toolClass, with argument policy and display severity |
+// Blueprint: | `SecurityCenter+ToolProfiles.swift` | AuthoredToolEffects.shellReadOnlyWords certifies literal shell reads for gates, receipts and fixed-argv read confinement; canonicalToolRisk and declared effect projection; app-call read treatment delegates to PermissionLaw.toolClass, with argument policy and display severity |
 
 /// Primitive effects retain the authored envelope and the turn's ordinary gates.
 public enum AuthoredToolEffects {
     @TaskLocal public static var admissionOnly = false
     @TaskLocal public static var call: (tool: String, perform: @Sendable () async throws -> JSONValue)?
+
+    /// Certify only a single, literal read command. Shell syntax, expansion,
+    /// unknown programs and unknown flags retain write authority. The launch
+    /// owner binds these words to system executables under read confinement.
+    public static func shellReadOnlyWords(_ input: [String: JSONValue]) -> [String]? {
+        let literal = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 /._-:=@%,+")
+        guard case .string(let command)? = input["cmd"], !command.isEmpty,
+              command.unicodeScalars.allSatisfy(literal.contains) else { return nil }
+        var words = command.split(separator: " ").map(String.init)
+        guard let first = words.first else { return nil }
+        let paths = ["pwd": "/bin/pwd", "df": "/bin/df", "uname": "/usr/bin/uname",
+                     "whoami": "/usr/bin/whoami", "uptime": "/usr/bin/uptime", "git": "/usr/bin/git"]
+        let name = URL(fileURLWithPath: first).lastPathComponent
+        guard let path = paths[name], first == name || first == path else { return nil }
+        words[0] = path
+        let args = Array(words.dropFirst())
+        switch name {
+        case "pwd": return args.allSatisfy { ["-L", "-P"].contains($0) } ? words : nil
+        case "whoami", "uptime": return args.isEmpty ? words : nil
+        case "df", "uname": return words // These programs have no mutating operation.
+        case "git":
+            guard let operation = args.first, ["log", "status", "diff", "show"].contains(operation) else { return nil }
+            let flags: Set<String> = ["--oneline", "--stat", "--name-only", "--name-status", "--short", "--branch",
+                "--porcelain", "--porcelain=v1", "--porcelain=v2", "--no-pager", "--no-ext-diff", "--no-textconv",
+                "--staged", "--cached", "--patch", "--no-patch", "--all", "--decorate", "--no-decorate",
+                "--reverse", "--no-merges", "--first-parent", "--", "-n", "-p", "-s", "-b"]
+            guard args.dropFirst().allSatisfy({ arg in
+                !arg.hasPrefix("-") || flags.contains(arg)
+                    || arg.dropFirst().allSatisfy(\.isNumber) && arg.count > 1
+                    || arg.hasPrefix("-n") && arg.count > 2 && arg.dropFirst(2).allSatisfy(\.isNumber)
+                    || ["--max-count=", "--since=", "--until=", "--format=", "--pretty="].contains(where: arg.hasPrefix)
+            }) else { return nil }
+            return words
+        default: return nil
+        }
+    }
+
+    public static func shellReadOnly(_ tool: String, input: [String: JSONValue]) -> Bool {
+        ["shell", "bash"].contains(ToolNameAliases.canonical(tool)) && shellReadOnlyWords(input) != nil
+    }
 
     /// A watching part's hands on the window it watches (MacScreenWatch): act's effects.
     public static let handOperations: Set<String> = ["hand.click", "hand.double_click", "hand.right_click", "hand.move",
@@ -58,17 +98,30 @@ public enum AuthoredToolEffects {
 /// Read-only projection of SecurityCenter's canonical tool profile risk.
 /// Consumers may use this metadata for advisory behavior, but it grants no
 /// authority and does not replace effect-time SecurityCenter evaluation.
-public enum CanonicalToolRisk: String, Sendable, Codable, Equatable {
+public enum CanonicalToolRisk: String, Sendable, Codable, Comparable {
     case low
     case medium
     case high
     case critical
+
+    private var rank: Int {
+        switch self {
+        case .low: 0
+        case .medium: 1
+        case .high: 2
+        case .critical: 3
+        }
+    }
+
+    public static func < (lhs: Self, rhs: Self) -> Bool {
+        lhs.rank < rhs.rank
+    }
 }
 
 extension SwiftNativeSecurityCenter {
     struct ToolProfile: Sendable {
         var capabilities: Set<String>
-        var risk: SecurityRisk
+        var risk: CanonicalToolRisk
     }
 
     /// Classify a tool through the same profile owner used by authorization.
@@ -80,18 +133,12 @@ extension SwiftNativeSecurityCenter {
         dataRoot: URL,
         trustedWorkspaceRoots: [URL] = []
     ) -> CanonicalToolRisk {
-        let risk = profile(
+        profile(
             tool: policyToolName(tool),
             input: input,
             dataRoot: dataRoot,
             trustedWorkspaceRoots: trustedWorkspaceRoots
         ).risk
-        switch risk {
-        case .low: return .low
-        case .medium: return .medium
-        case .high: return .high
-        case .critical: return .critical
-        }
     }
 
     /// Project the declaration; argument policy only narrows the declared effects.
@@ -113,6 +160,9 @@ extension SwiftNativeSecurityCenter {
                 ?? AppActionBinding.binding(ToolNameAliases.authoredAction(name)) }
             else { nil }
         var capabilities = schema?.capabilities ?? binding?.descriptor?.schema.capabilities ?? binding?.capabilities ?? ["tool_call"]
+        if AuthoredToolEffects.shellReadOnly(name, input: input) {
+            capabilities = ["tool_call", "safe_read"]
+        }
         if tool == "app" {
             if PermissionLaw.toolClass(name, input: input) == .read {
                 capabilities = ["tool_call", "safe_read"]
@@ -140,9 +190,9 @@ extension SwiftNativeSecurityCenter {
             toolClass: schema?.toolClass ?? binding?.toolClass ?? .write, capabilities: capabilities))
     }
 
-    /// Display metadata only. Authority continues to use PermissionLaw.judge.
-    private static func displayRisk(toolClass: ToolClass, capabilities: Set<String>) -> SecurityRisk {
-        let severity: [String: SecurityRisk] = [
+    /// Display metadata only. PermissionLaw.answer owns authority.
+    private static func displayRisk(toolClass: ToolClass, capabilities: Set<String>) -> CanonicalToolRisk {
+        let severity: [String: CanonicalToolRisk] = [
             "shell": .critical, "filesystem_delete": .critical, "destructive": .critical,
             "system_control": .critical, "money": .critical, "remote_effect": .critical,
             "process_spawn": .high, "credential_write": .high, "other_app_settings_write": .high,
@@ -168,7 +218,7 @@ extension SwiftNativeSecurityCenter {
     /// Anything unreadable is not shell-class: the run itself is gated again at
     /// dispatch, and a guess here would only misprice the card.
     static func messagesAnAgentHostByCommand(_ handle: JSONValue?, dataRoot: URL) -> Bool {
-        guard let raw = string(handle), raw.hasPrefix("peer:") else { return false }
+        guard let raw = handle?.scalarText, raw.hasPrefix("peer:") else { return false }
         let id = String(raw.dropFirst("peer:".count)).lowercased()
         guard UUID(uuidString: id)?.uuidString.lowercased() == id,
               let data = try? Data(contentsOf: dataRoot.appendingPathComponent("agents/peers.json")),

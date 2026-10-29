@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `ImprovementGauntletReadModels.swift` | `ImprovementGauntletStatus`: `ImprovementGauntletRun`, `GauntletCheck` |
+// Blueprint: | `ImprovementGauntletReadModels.swift` | `ImprovementGauntletRun` is the stored run schema, typed history reader and manual check runner; `GauntletCheck` |
 
 public struct ImprovementGauntletRun: Identifiable, Codable, Hashable, Sendable {
     public var id: String
@@ -35,28 +35,19 @@ public struct GauntletCheck: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
-extension ImprovementGauntletStatus {
-    public var latestDisplayRun: ImprovementGauntletRun? {
-        get throws {
-            guard let latestRun else { return nil }
-            do {
-                let decoder = JSONDecoder()
-                decoder.dateDecodingStrategy = .iso8601
-                return try decoder.decode(
-                    ImprovementGauntletRun.self, from: latestRun.serializedData(pretty: false)
-                )
-            } catch {
-                throw NSError(domain: "ImprovementGauntlet", code: 1, userInfo: [
-                    NSLocalizedDescriptionKey: "Malformed latest gauntlet run: \(error)"
-                ])
-            }
-        }
-    }
-}
-
 extension ImprovementGauntletRun {
+    static func readHistory(dataRoot: URL) async throws -> [ImprovementGauntletRun] {
+        try await Task.detached(priority: .utility) {
+            let path = dataRoot.appendingPathComponent("improvements/gauntlet/runs.json")
+            let data: Data
+            do { data = try Data(contentsOf: path) }
+            catch CocoaError.fileReadNoSuchFile { return [] }
+            return try JSONDecoder().decode([ImprovementGauntletRun].self, from: data)
+        }.value
+    }
+
     /// The manual Swift-native promotion gauntlet: a validated checkout's
-    /// build and smoke sweep plus the installed app's signature, recorded in
+    /// static checks and installed runtime proof plus its signature, recorded in
     /// the improvements/gauntlet/runs.json contract the gauntlet panel reads.
     /// A check this Mac cannot run is reported unavailable, never passed.
     public static func run(
@@ -80,10 +71,6 @@ extension ImprovementGauntletRun {
                 detail: result.detail
             )
         }
-        // Swift-only manual gauntlet. This keeps the existing
-        // improvements/gauntlet/runs.json contract that getImprovementGauntlet()
-        // reads, but executes the "swift" promotion class checks locally instead
-        // of routing through the retired daemon endpoint.
         let startedAt = Date()
         let repoRoot = PersistenceCore.resolveSandboxRepoRoot(dataRoot: dataRoot)
         let appPath = Bundle.main.bundleURL
@@ -97,30 +84,21 @@ extension ImprovementGauntletRun {
         }
 
         if let repoRoot {
-            checks.append(try await runGauntletProcessCheck(
-                id: "swift_build",
-                title: "Swift package builds",
-                executable: "/usr/bin/swift",
-                arguments: ["build"],
-                currentDirectory: repoRoot,
-                timeout: 180
-            ))
             let smokeScript = repoRoot.appendingPathComponent("script/smoke_all.sh")
             if FileManager.default.fileExists(atPath: smokeScript.path) {
                 checks.append(try await runGauntletProcessCheck(
                     id: "isolated_smoke",
-                    title: "Native smoke sweep passes",
-                    executable: "/bin/zsh",
-                    arguments: [smokeScript.path],
+                    title: "Static checks and installed runtime pass",
+                    executable: "/usr/bin/env",
+                    arguments: ["NATIVE_AGENT_INSTALLED_APP=\(appPath.path)", "/bin/bash", smokeScript.path, "--live"],
                     currentDirectory: repoRoot,
                     timeout: 240
                 ))
             } else {
-                unavailable("isolated_smoke", "Native smoke sweep passes", "The checkout has no smoke check script.")
+                unavailable("isolated_smoke", "Static checks and installed runtime pass", "The checkout has no smoke check script.")
             }
         } else {
-            unavailable("swift_build", "Swift package builds", "No validated NativeAgent checkout is available.")
-            unavailable("isolated_smoke", "Native smoke sweep passes", "No validated NativeAgent checkout is available.")
+            unavailable("isolated_smoke", "Static checks and installed runtime pass", "No validated NativeAgent checkout is available.")
         }
         if appPath.pathExtension == "app" {
             checks.append(try await runGauntletProcessCheck(

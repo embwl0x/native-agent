@@ -5,7 +5,7 @@
 //
 //   * MemoryV2 (`UserMDGenerator`)      — writes them
 //   * Context  (`ContextMarkdownCompiler`) — cuts per-fact atoms inside them
-//   * Context  (`ContextFlowCoordinator`)  — decides precoverage from them
+//   * Context  (`ContextPreparation`)  — decides precoverage from them
 //
 // They used to be three independent literals. A literal that drifts here does
 // not fail loudly: the generator keeps writing, the compiler silently stops
@@ -16,7 +16,7 @@
 
 import Foundation
 
-// Blueprint: | `UserMDAutogenMarkers.swift` | `UserMDAutogenMarkers`: one USER.md section marker vocabulary and shared prompt/pinned-section handling |
+// Blueprint: | `UserMDAutogenMarkers.swift` | `UserMDAutogenMarkers`: one USER.md section marker vocabulary and shared prompt/pinned-section handling; `promptByteCap`, the person picture's bound (one floor turn's recall memory) |
 
 public enum UserMDAutogenMarkers {
     /// Opens the human-edited preamble that generation must preserve.
@@ -28,9 +28,21 @@ public enum UserMDAutogenMarkers {
     /// Closes the machine-generated fact body.
     public static let bodyEnd = "<!-- USER_MD_AUTOGEN_END -->"
 
-    /// Includes the renderer's `# USER\n` heading. Nil core preserves the
-    /// whole document until the first pin; an empty core carries only prose.
-    public static let promptByteCap = 3_500
+    /// THE BOUND on the person picture, in UTF-8 bytes, including the
+    /// renderer's `# USER\n` heading. The picture rides every turn, so it takes
+    /// what one turn carries of memory at the floor window every model clears:
+    /// recall's floor of 5 rows of 1,200 characters
+    /// (`ContextBudgetPolicy.floorRecallRowLimit` × `floorMemoryRowChars`,
+    /// which this base target cannot import; change them together). Bytes,
+    /// not characters, so it never exceeds that allowance. Was 3,500 (no
+    /// stated derivation); 10-27 the picture admits every person kind, and
+    /// her person facts (about 3.7 KB once her generic saves are classified)
+    /// no longer fit it, newest first, so the oldest (the email preference)
+    /// would have fallen out. Facts past the bound are not lost: they stay
+    /// in the memory lane (`ContextPreparation` precovers only the facts
+    /// carried). Nil core preserves the whole document until the first pin;
+    /// an empty core carries only prose.
+    public static let promptByteCap = 5 * 1_200
 
     public static func promptText(_ document: String, pinnedCore: [String]?) -> String {
         guard let pinnedCore else { return document }

@@ -111,7 +111,7 @@ public extension NativeAgentEngine {
     @MainActor
     func refreshResidentMindAfterOnboardingTransition() async {
         async let contextFlow: Void = self.contextFlow.reloadConfiguration()
-        async let cognition = self.cognition!.refreshAfterOnboardingTransition()
+        async let cognition = self.cognition?.refreshAfterOnboardingTransition()
         _ = await (contextFlow, cognition)
     }
 }

@@ -1,4 +1,5 @@
 import PersistenceCore
+import NativeAgentShared
 import Foundation
 import NativeAgentCore
 // Blueprint: | `NativeAppSecretRedactor.swift` | NativeAppSecretRedactor: redactText and string-only redactValue; redactArguments withholds secret-named fields; redactedRemoteErrorDetail owns phone error path projection |
@@ -21,8 +22,9 @@ public enum NativeAppSecretRedactor {
     }()
 
     public static func redactText(_ value: String) -> String {
-        NativeAgentSecretRedactor.redactText(
-            NativeAgentSecretRedactor.redactText(value), patterns: appOnlyPatterns
+        TurnSecretRedactor.redactText(
+            NativeAgentSecretRedactor.redactText(value), patterns: appOnlyPatterns,
+            replacement: NativeAgentSecretRedactor.digestReplacement
         )
     }
 

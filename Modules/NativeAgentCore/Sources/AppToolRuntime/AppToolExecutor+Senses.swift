@@ -17,7 +17,7 @@ extension AppActions {
     }
 
     /// A sense's offered verbs use the same action vocabulary as every page.
-    static func senses(records: [SenseRecord]? = nil) -> [AppAction] {
+    static func senses(records: [SenseRecord]? = nil, catalog: [AppAction]? = nil) -> [AppAction] {
         guard SensesHub.shared.registry != nil else { return [] }
         let scope = ChatToolSessionContext.verifiedSessionId ?? ""
         var seen: Set<String> = []
@@ -35,7 +35,7 @@ extension AppActions {
             case .site(let host): id = "web.read"; input = ["url": .string("https://\(host)/<path>")]
             default: id = "sense.versions"; input = ["sense_id": .string(record.id)]
             }
-            let reader = all.first { $0.id == id }!
+            let reader = (catalog ?? all).first { $0.id == id }!
             return AppAction(id, record.corner.key, "Read \(record.id) · \(record.corner.key)", reader.args,
                 toolClass: .read, warn: reader.warn, tool: reader.tool, input: reader.input.merging(input) { _, bound in bound },
                 read: true,
@@ -95,8 +95,8 @@ extension AppToolExecutor {
         } else if case .site(let host) = corner, item.hasPrefix("site:\(host)/"), item.contains("?read=more") {
             let continuation = try SenseNativePages.chromeContinuationArguments(item, scope: scope, tab: Self.inputInt(args["tab_id"]))
             args.merge(continuation) { _, saved in saved }
-            guard let more = Self.inputString(continuation["more"]), case .object(let cursor) = try JSONValue.parse(Data(more.utf8)),
-                  let url = Self.inputString(cursor["url"]), URL(string: url)?.host?.lowercased() == host else {
+            guard let more = continuation["more"]?.scalarText, case .object(let cursor) = try JSONValue.parse(Data(more.utf8)),
+                  let url = cursor["url"]?.scalarText, URL(string: url)?.host?.lowercased() == host else {
                 return Self.failure("invalid_address", "Read this corner with a URL on its host.", extra: siteFailureEvidence)
             }
             siteURL = url
@@ -111,23 +111,23 @@ extension AppToolExecutor {
                 let status = await chrome().conversationTabStatus(ChatToolSessionContext.verifiedSessionId)
                 let matches: [[String: JSONValue]] = if case .array(let tabs)? = status["tabs"] {
                     tabs.compactMap { value in
-                        guard case .object(let tab) = value, let url = Self.inputString(tab["url"]),
+                        guard case .object(let tab) = value, let url = tab["url"]?.scalarText,
                               SenseNativePages.chromeAddress(host: host, url: url) == item,
                               Self.inputInt(args["tab_id"]).map({ tab["tab_id"] == .int($0) }) ?? true else { return nil }
                         return tab
                     }
                 } else { [] }
-                guard matches.count == 1, let tab = matches.first, let url = Self.inputString(tab["url"]) else {
+                guard matches.count == 1, let tab = matches.first, let url = tab["url"]?.scalarText else {
                     return Self.failure("invalid_address", "This site place has not been read in this conversation; read its held tab first.", extra: siteFailureEvidence)
                 }
                 args["tab_id"] = tab["tab_id"]
                 siteURL = url
             }
-        } else if case .site(let host) = corner, let more = Self.inputString(args["more"]),
+        } else if case .site(let host) = corner, let more = args["more"]?.scalarText,
                   case .object(let cursor) = try JSONValue.parse(Data(more.utf8)),
-                  let url = Self.inputString(cursor["url"]), URL(string: url)?.host?.lowercased() == host {
+                  let url = cursor["url"]?.scalarText, URL(string: url)?.host?.lowercased() == host {
             // Independent control continuations are not the page's single
-            // `more` pointer. Their exact cursor owns the URL and element.
+            // `more` pointer. Their cursor owns the URL and reading position.
             siteURL = url
         } else { siteURL = nil }
         let view = independentSiteRead ? servedView : SenseDoorViews.shared.latest.reversed().first {
@@ -142,14 +142,13 @@ extension AppToolExecutor {
         case .fileKind:
             action = "files.read"
             let named = item.isEmpty || item.hasPrefix("{") ? Self.doorText(args["path"]) : item
-            let path = view?.materialRef ?? (URL(string: named)?.isFileURL == true ? URL(string: named)!.path : named)
-            args["path"] = .string(path)
+            args["path"] = .string(view?.materialRef ?? named)
         case .site(let host):
             let url = siteURL ?? view?.materialRef ?? (item.isEmpty ? Self.doorText(args["url"]) : item)
             guard item.isEmpty || URL(string: url)?.host?.lowercased() == host else {
                 return Self.failure("invalid_address", "Read this corner with a URL on its host.", extra: siteFailureEvidence)
             }
-            if let view, let reader = Self.inputString(view.readInput["__sense_action"]), let entry = AppActions.action(reader) {
+            if let view, let reader = view.readInput["__sense_action"]?.scalarText, let entry = AppActions.action(reader) {
                 action = reader
                 let names = Set(entry.argSpecs.flatMap(\.names))
                 args = view.readInput.filter { names.contains($0.key) }.merging(args) { _, new in new }
@@ -166,19 +165,33 @@ extension AppToolExecutor {
                case .pageSnapshot(.object(let captured))? = view.capturedMaterial,
                case .array(let nodes)? = captured["nodes"],
                case .object(let node)? = nodes.first(where: { value in
-                   guard case .object(let node) = value, let fragment = Self.inputString(node["addressFragment"]) else { return false }
+                   guard case .object(let node) = value, let fragment = node["addressFragment"]?.scalarText else { return false }
                    return thing.address == SenseNativePages.chromeAddress(host: host, url: url, fragment: fragment)
-               }), let path = Self.inputString(node["elementPath"]), case .int(let frame)? = node["frameId"] {
-                let framePrefix = "frame/\(frame)/"
-                guard path.hasPrefix(framePrefix) else { return Self.failure("invalid_address", "This site place has no captured frame route; read its held tab again.", extra: siteFailureEvidence) }
+               }), case .int(let frame)? = node["frameId"] {
+                var readingNode = node
+                // Inline link proofs travel with the prose that renders them.
+                // Its captured position also brings the link back into the read.
+                if node["inlineProof"] == .bool(true), let path = node["elementPath"]?.scalarText,
+                   case .object(let prose)? = nodes.first(where: { value in
+                       guard case .object(let row) = value, row["frameId"] == .int(frame),
+                             case .object? = row["readPosition"], case .array(let parts)? = row["inlineText"] else { return false }
+                       return parts.contains { if case .object(let part) = $0 { return part["elementPath"] == .string(path) }; return false }
+                   }) { readingNode = prose }
+                guard case .object(let position)? = readingNode["readPosition"] else {
+                    return Self.failure("invalid_address", "This site place has no captured reading position; read its held tab again.", extra: siteFailureEvidence)
+                }
                 let frameURL: JSONValue? = if case .array(let frames)? = captured["frames"] {
                     frames.first { if case .object(let row) = $0 { return row["frameId"] == .int(frame) }; return false }
                         .flatMap { if case .object(let row) = $0 { return row["url"] }; return nil }
                 } else { nil }
-                let cursor: [String: JSONValue] = ["url": .string(url), "frameURL": frameURL ?? .string(url),
-                    "frameId": .int(frame), "elementPath": .string(String(path.dropFirst(framePrefix.count))),
-                    "addressFragment": node["addressFragment"] ?? .null, "textOffset": node["textOffset"] ?? .int(0),
-                    "name": node["sectionName"] ?? node["name"] ?? .string(thing.name)]
+                var cursor: [String: JSONValue] = ["url": .string(url), "frameURL": frameURL ?? .string(url),
+                    "frameId": .int(frame), "position": .object(position), "textOffset": readingNode["textOffset"] ?? .int(0),
+                    "name": readingNode["sectionName"] ?? readingNode["name"] ?? .string(thing.name)]
+                if case .object(let select)? = readingNode["select"] { cursor["optionOffset"] = select["optionOffset"] }
+                if case .object(let reading)? = captured["reading"], case .object(let previous)? = reading["cursor"],
+                   previous["frameId"] == .int(frame), let observation = reading["viewportObservationId"]?.scalarText {
+                    cursor["viewportObservationId"] = .string(observation)
+                }
                 args["tab_id"] = captured["tabId"]
                 args["more"] = .string(try JSONValue.object(cursor).serialize(pretty: false))
             }
@@ -187,7 +200,7 @@ extension AppToolExecutor {
             if let view { args = view.readInput.filter { !$0.key.hasPrefix("__") }.merging(args) { _, new in new } }
             if !item.isEmpty, !item.hasPrefix("{"), view == nil { args["url"] = .string(item) }
         case .stream(let id) where id == "browser":
-            action = view.flatMap { Self.inputString($0.readInput["__sense_action"]) } == "browser.links" ? "browser.links" : "browser.text"
+            action = view.flatMap { ($0.readInput["__sense_action"])?.scalarText } == "browser.links" ? "browser.links" : "browser.text"
             if let view { args = view.readInput.filter { !$0.key.hasPrefix("__") }.merging(args) { _, new in new } }
         case .stream(let id) where id == "mac.read":
             action = "mac.read"
@@ -202,8 +215,8 @@ extension AppToolExecutor {
         }
         call["__session_id"] = input["__session_id"]
         if case .site = corner {
-            // Page URL and structural element paths survive fresh captures;
-            // focus and folded cursors resolve in the current page's material.
+            // The page URL scopes the request; captured items and folded
+            // continuations resume by position in the current page's material.
             if siteURL != nil || view != nil { call["__sense_address"] = .string(item) }
         } else if view != nil || item.hasPrefix("{") { call["__sense_address"] = .string(item) }
         return try await perform("app", call)
@@ -370,11 +383,9 @@ extension AppToolExecutor {
             case .object(let fields): fields.values.forEach(inspect)
             case .array(let values): values.forEach(inspect)
             case .string(let text):
-                var path = NSString(string: text).expandingTildeInPath
-                if path.hasPrefix("file:"), let decoded = path.dropFirst(5).split(separator: "#", maxSplits: 1).first {
-                    path = String(decoded).removingPercentEncoding ?? String(decoded)
-                    if path.hasPrefix("//"), let url = URL(string: text), url.isFileURL { path = url.path }
-                }
+                let address = URL(string: text)
+                if let address, address.scheme != nil, !address.isFileURL { break }
+                var path = NativeAgentWorkspaceRoot.fileSpelling(text)
                 if !path.isEmpty, !path.hasPrefix("/") {
                     path = dataRoot.deletingLastPathComponent().appendingPathComponent(path).path
                 }

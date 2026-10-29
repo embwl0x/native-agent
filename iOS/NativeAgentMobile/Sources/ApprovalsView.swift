@@ -1,46 +1,13 @@
-// ApprovalsView.swift — iOS Approvals surface for risky action gates.
-//
-// Reads the iCloud approvals snapshot while visible; approve/deny decisions are
-// signed iCloud bridge messages that the Mac app applies through the in-process
-// Swift runtime. The hot path reads only approvals.json so the tab does not
-// repeatedly hydrate every Mac snapshot while visible.
-
 import SwiftUI
 import NativeAgentShared
 import UserNotifications
-// Blueprint: | `ApprovalsView.swift` | Approval presentation and submission state; rows read the shared sync projection, including Mac-resolved decision and time |
+// Blueprint: | `ApprovalsView.swift` | Approval list, cards and history read the shared sync projection, including Mac-resolved decision and time |
 
 // MARK: - Model
 
 /// Approval snapshot shape shared with the Mac app.
 /// `ApprovalRequest` in Models.swift covers most fields; this alias reuses it.
 typealias PendingApproval = ApprovalRequest
-
-/// Closed translation from visible card verbs to the signed Mac action.
-/// Unknown input must fail before a card can accidentally take a privileged
-/// affirmative path.
-enum ApprovalDecisionRoute: Equatable {
-    case approve
-    case reject
-    case cancel
-
-    var action: String {
-        switch self {
-        case .approve: return "approve"
-        case .reject: return "reject"
-        case .cancel: return "cancel"
-        }
-    }
-
-    static func resolve(_ value: String) -> ApprovalDecisionRoute? {
-        switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "approve", "approved": return .approve
-        case "deny", "denied", "reject", "rejected": return .reject
-        case "cancel", "canceled": return .cancel
-        default: return nil
-        }
-    }
-}
 
 /// An approval in plain words on the phone: the kind of ask instead of its
 /// dotted action id, and the reason without internal tags or raw markdown.
@@ -91,225 +58,19 @@ enum ApprovalText {
     }
 }
 
-/// The warning slot is reserved for a real asynchronous handoff. A healthy
-/// snapshot does not need a persistent warning just because it arrived through
-/// iCloud.
-enum ApprovalBannerPresentation {
-    static let pendingDecisionMessage =
-        "Decision unconfirmed. Reconnect, then refresh to check the result. If still pending, retry the decision."
-
-}
-
-/// Pure notification policy for approval snapshots. Keeping the policy apart
-/// from `UNUserNotificationCenter` makes the cold-load, visibility, and burst
-/// rules executable without asking the system to present a notification.
-enum ApprovalPendingNotificationPresentation {
-    static let individualNotificationLimit = 3
-
-    struct Plan: Equatable {
-        let individualApprovalIDs: [String]
-        let summaryCount: Int?
-
-        static let none = Plan(individualApprovalIDs: [], summaryCount: nil)
-    }
-
-    static func plan(
-        hasLoadedApprovals: Bool,
-        isVisible: Bool,
-        pendingIDs: [String],
-        notifiedIDs: Set<String>
-    ) -> Plan {
-        guard hasLoadedApprovals, !isVisible else { return .none }
-
-        var newIDs: [String] = []
-        var seenIDs = Set<String>()
-        for id in pendingIDs where !notifiedIDs.contains(id) && seenIDs.insert(id).inserted {
-            newIDs.append(id)
-        }
-
-        guard !newIDs.isEmpty else { return .none }
-        if newIDs.count > individualNotificationLimit {
-            return Plan(individualApprovalIDs: [], summaryCount: newIDs.count)
-        }
-        return Plan(individualApprovalIDs: newIDs, summaryCount: nil)
-    }
-}
-
-// MARK: - Store
-
-@MainActor
-final class ApprovalsStore: ObservableObject {
-    var approvals: [PendingApproval] { iCloudSyncEngine.shared.approvals }
-    var hasLoadedSnapshot: Bool { iCloudSyncEngine.shared.approvalsSnapshotLoaded }
-    @Published var isLoading = false
-    @Published var bannerError: String? = nil
-    @Published var bannerWarning: String? = nil
-    /// Distinct approval decisions may be sent together. The former single id
-    /// made every other card look tappable while silently discarding its tap.
-    @Published private(set) var decidingApprovalIDs = Set<String>()
-    var isVisible = false
-    private var hasLoadedApprovals = false
-    private var notifiedPendingIDs = Set<String>()
-
-    // MARK: - Fetch
-
-    func refresh(client: MacBridgeClient, pairingStore: PairingStore) async {
-        guard pairingStore.usesICloudTransport else {
-            bannerWarning = nil
-            bannerError = "Pair to view"
-            return
-        }
-        await iCloudSyncEngine.shared.refreshApprovalsSnapshot()
-        applySyncedApprovalsFromSnapshot()
-    }
-
-    func applySyncedApprovalsFromSnapshot(animated: Bool = true, notifyNewPending: Bool = true) {
-        if notifyNewPending {
-            notifyForNewPendingApprovals(approvals)
-        } else {
-            rememberPendingApprovals(approvals)
-        }
-        bannerWarning = nil
-        bannerError = nil
-    }
-
-    // MARK: - Decide
-
-    func decide(id: String, decision: String, client: MacBridgeClient, pairingStore: PairingStore) async {
-        guard beginDecision(id: id) else { return }
-        defer { finishDecision(id: id) }
-        guard pairingStore.usesICloudTransport else {
-            bannerError = "Pair to view"
-            return
-        }
-        do {
-            guard let route = ApprovalDecisionRoute.resolve(decision) else {
-                bannerError = "Unsupported approval decision."
-                return
-            }
-            if route == .approve {
-                _ = try await iCloudSyncEngine.shared.approveApproval(id: id)
-            } else if route == .cancel {
-                _ = try await iCloudSyncEngine.shared.cancelApproval(id: id)
-            } else {
-                _ = try await iCloudSyncEngine.shared.rejectApproval(id: id)
-            }
-            applySyncedApprovalsFromSnapshot()
-        } catch {
-            if iCloudSyncEngine.isMacResponseTimeout(error) {
-                await refresh(client: client, pairingStore: pairingStore)
-                bannerWarning = ApprovalBannerPresentation.pendingDecisionMessage
-                bannerError = nil
-            } else {
-                bannerWarning = nil
-                bannerError = error.localizedDescription
-            }
-        }
-    }
-
-    @discardableResult
-    func beginDecision(id: String) -> Bool {
-        let clean = id.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty, !decidingApprovalIDs.contains(clean) else { return false }
-        decidingApprovalIDs.insert(clean)
-        return true
-    }
-
-    func finishDecision(id: String) {
-        decidingApprovalIDs.remove(id.trimmingCharacters(in: .whitespacesAndNewlines))
-    }
-
-    private func rememberPendingApprovals(_ next: [PendingApproval]) {
-        let pendingIDs = Set(next.filter { $0.status.lowercased() == "pending" }.map(\.id))
-        notifiedPendingIDs.formUnion(pendingIDs)
-        hasLoadedApprovals = true
-    }
-
-    private func notifyForNewPendingApprovals(_ next: [PendingApproval]) {
-        let pending = next.filter { $0.status.lowercased() == "pending" }
-        let pendingIDs = pending.map(\.id)
-        defer {
-            notifiedPendingIDs.formUnion(pendingIDs)
-            hasLoadedApprovals = true
-        }
-
-        let plan = ApprovalPendingNotificationPresentation.plan(
-            hasLoadedApprovals: hasLoadedApprovals,
-            isVisible: isVisible,
-            pendingIDs: pendingIDs,
-            notifiedIDs: notifiedPendingIDs
-        )
-        for id in plan.individualApprovalIDs {
-            guard let approval = pending.first(where: { $0.id == id }) else { continue }
-            fireApprovalNotification(approval)
-        }
-        if let summaryCount = plan.summaryCount {
-            fireApprovalSummaryNotification(count: summaryCount)
-        }
-    }
-
-    private func fireApprovalNotification(_ approval: PendingApproval) {
-        Task.detached {
-            let center = UNUserNotificationCenter.current()
-            _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
-            let content = UNMutableNotificationContent()
-            content.title = "NativeAgent approval needed"
-            content.body = ApprovalText.title(approval)
-            content.sound = .default
-            var userInfo = ["screen": "activity", "source": "approval", "approvalId": approval.id]
-            let eventID = NativeAgentDeviceEventIdentity.notification(userInfo: userInfo)
-            userInfo["eventId"] = eventID
-            content.userInfo = userInfo
-            _ = try? await NativeAgentNotificationEventGate.add(
-                content: content, eventID: eventID, trigger: nil, center: center
-            )
-        }
-    }
-
-    private func fireApprovalSummaryNotification(count: Int) {
-        Task.detached {
-            let center = UNUserNotificationCenter.current()
-            _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
-            let content = UNMutableNotificationContent()
-            content.title = "NativeAgent approvals needed"
-            content.body = "\(count) new actions are waiting for review."
-            content.sound = .default
-            content.userInfo = ["screen": "activity", "source": "approval_summary"]
-            do {
-                let request = UNNotificationRequest(identifier: "nativeagent.approval.summary.\(UUID().uuidString)",
-                    content: try await CommunicationNotification.decorate(content), trigger: nil)
-                try await center.add(request)
-            } catch {
-                NSLog("[NativeAgentMobile] Approval summary notification failed: %@", error.localizedDescription)
-            }
-        }
-    }
-}
-
 // MARK: - Top-level view
 
 struct ApprovalsView: View {
     @State private var resolvedLimit = 10
     @EnvironmentObject private var pairingStore: PairingStore
-    @EnvironmentObject private var bridgeClient: MacBridgeClient
     @EnvironmentObject private var store: ApprovalsStore
 
-    /// `false` when pushed as a navigationDestination from another
-    /// NavigationStack (e.g. ActivityView). Nesting NavigationStacks causes
-    /// the destination to render and immediately pop back. Default `true`
-    /// keeps the tab-root call site working.
-    let embedInNavigationStack: Bool
-
-    init(embedInNavigationStack: Bool = true) {
-        self.embedInNavigationStack = embedInNavigationStack
-    }
-
     private var pending: [PendingApproval] {
-        MobileDesignSamples.rows(store.approvals).filter { $0.status.lowercased() == "pending" }
+        MobileDesignSamples.rows(store.approvals).filter { $0.outcome == .pending }
     }
 
     private var resolved: [PendingApproval] {
-        MobileDesignSamples.rows(store.approvals).filter { $0.status.lowercased() != "pending" }
+        MobileDesignSamples.rows(store.approvals).filter { $0.outcome != .pending }
     }
 
     private var headerLine: String {
@@ -324,21 +85,13 @@ struct ApprovalsView: View {
     }
 
     var body: some View {
-        Group {
-            if embedInNavigationStack {
-                NavigationStack { approvalsContent }
-            } else {
-                approvalsContent
-            }
-        }
+        approvalsContent
     }
 
     @ViewBuilder
     private var approvalsContent: some View {
-        // E6: a stale queue must not read as a measured-empty one.
+        // A stale queue must not read as a measured-empty one.
         AlivePage(title: "Approvals", line: headerLine, freshnessGroup: "approvals") {
-            if store.isLoading { ProgressView().controlSize(.small) }
-        } content: {
             // "Pair to view" is already said by the header and its Pair with Mac.
             let bannerError = store.bannerError == "Pair to view" ? nil : store.bannerError
             if store.bannerWarning != nil || bannerError != nil {
@@ -357,18 +110,17 @@ struct ApprovalsView: View {
         }
         .animation(AppMotion.snappy, value: store.bannerError)
         .animation(AppMotion.snappy, value: store.bannerWarning)
-        // Sweep R4 C11.3: an approval decision made against a stale snapshot is
-        // exactly the case where a silent sync failure hurts most.
+        // Keep sync failures visible while deciding an approval.
         .macSyncErrorBanner()
         .refreshable {
-            await store.refresh(client: bridgeClient, pairingStore: pairingStore)
+            await store.refresh(pairingStore: pairingStore)
         }
         .task {
-            await store.refresh(client: bridgeClient, pairingStore: pairingStore)
+            await store.refresh(pairingStore: pairingStore)
         }
         .onChange(of: iCloudSyncEngine.shared.approvals, initial: true) { _, _ in
             guard pairingStore.usesICloudTransport, store.isVisible else { return }
-            store.applySyncedApprovalsFromSnapshot(animated: false, notifyNewPending: false)
+            store.applySyncedApprovalsFromSnapshot(notifyNewPending: false)
         }
         .onAppear { store.isVisible = true }
         .onDisappear { store.isVisible = false }
@@ -376,13 +128,7 @@ struct ApprovalsView: View {
 
     @ViewBuilder
     private var approvalsList: some View {
-        if store.isLoading && MobileDesignSamples.rows(store.approvals).isEmpty {
-            ProgressView("Checking with your Mac…")
-                .tint(AlivePalette.secondary)
-                .foregroundStyle(AlivePalette.secondary)
-                .frame(maxWidth: .infinity)
-                .padding(.top, 48)
-        } else if MobileDesignSamples.rows(store.approvals).isEmpty && store.bannerWarning == nil {
+        if MobileDesignSamples.rows(store.approvals).isEmpty && store.bannerWarning == nil {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Nothing is waiting on you.")
                     .font(.system(.title3, design: .serif))
@@ -392,7 +138,7 @@ struct ApprovalsView: View {
                     .foregroundStyle(AlivePalette.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 Button("Check again") {
-                    Task { await store.refresh(client: bridgeClient, pairingStore: pairingStore) }
+                    Task { await store.refresh(pairingStore: pairingStore) }
                 }
                 .aliveSecondaryButton()
                 .font(.subheadline.weight(.semibold))
@@ -401,7 +147,7 @@ struct ApprovalsView: View {
             .padding(20)
             .aliveCard()
         } else {
-            // Native sections, one row per approval (User 09-27: all native).
+            // Native sections, one row per approval.
             if !pending.isEmpty {
                 Section("Waiting for you") {
                     ForEach(pending) { approval in
@@ -413,7 +159,6 @@ struct ApprovalsView: View {
                                 await store.decide(
                                     id: approval.id,
                                     decision: decision,
-                                    client: bridgeClient,
                                     pairingStore: pairingStore
                                 )
                             }
@@ -446,10 +191,10 @@ struct ApprovalCard: View {
     @ObservedObject private var bridge = iCloudBridge.shared
     let approval: PendingApproval
     var isDeciding = false
-    let onDecide: (String) -> Void
+    let onDecide: (ApprovalDecisionRoute) -> Void
 
     private var canSendDecision: Bool {
-        pairingStore.isICloudSigned && bridge.available && bridgeClient.bridgeStatus != .deviceOffline
+        pairingStore.isICloudSigned && bridge.available && bridgeClient.deviceIsOffline != true
     }
 
     private var isAgentDecision: Bool {
@@ -462,7 +207,7 @@ struct ApprovalCard: View {
         let risk = approval.risk.trimmingCharacters(in: .whitespacesAndNewlines)
         if !risk.isEmpty { parts.append("\(risk.capitalized) risk") }
         if let createdAtStr = approval.createdAt,
-           let date = ISO8601DateFormatter().date(from: createdAtStr) {
+           let date = UserDisplayFormatters.parseISOTimestamp(createdAtStr) {
             parts.append(relativeTime(from: date))
         }
         return parts.joined(separator: " · ")
@@ -516,7 +261,7 @@ struct ApprovalCard: View {
                 }
                 HStack(spacing: 10) {
                     Button {
-                        withAnimation(AppMotion.snappy) { onDecide("deny") }
+                        withAnimation(AppMotion.snappy) { onDecide(.reject) }
                     } label: {
                         Text("Deny").frame(maxWidth: .infinity, minHeight: 30)
                     }
@@ -524,7 +269,7 @@ struct ApprovalCard: View {
                     .disabled(isDeciding || !canSendDecision)
 
                     Button {
-                        withAnimation(AppMotion.snappy) { onDecide("approve") }
+                        withAnimation(AppMotion.snappy) { onDecide(.approve) }
                     } label: {
                         Text(isDeciding ? "Approving…" : "Approve").frame(maxWidth: .infinity, minHeight: 30)
                     }
@@ -546,179 +291,6 @@ struct ApprovalCard: View {
         if interval < 3600 { return "\(Int(interval / 60))m ago" }
         if interval < 86_400 { return "\(Int(interval / 3600))h ago" }
         return date.formatted(.dateTime.month(.abbreviated).day())
-    }
-}
-
-// MARK: - Payload preview
-
-/// What will be sent, said on the card in plain lines ("To: Sam", "Message:
-/// …") above Approve: nobody says yes to something they cannot see, and
-/// nobody reads JSON. Keys become words; braces, quotes and ids never show.
-/// The full raw view stays one tap away in "Details". When the Mac sent
-/// nothing, one plain line says so; nothing is ever synthesized.
-struct PayloadPreview: View {
-    let approval: PendingApproval
-    /// Chat's inline card is shorter: fewer lines before "Details".
-    var maxLines = 6
-    @State private var showsDetails = false
-    @State private var lines: [Line]?
-
-    static let missingLine = "Full details appear once your Mac sends them."
-
-    /// The Mac's own payload, or nil.
-    var payload: String? {
-        guard let preview = approval.payloadPreview?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !preview.isEmpty else { return nil }
-        return preview
-    }
-
-    var body: some View {
-        Group {
-        if let payload {
-            VStack(alignment: .leading, spacing: 6) {
-                if let lines {
-                    ForEach(Array(lines.prefix(maxLines).enumerated()), id: \.offset) { _, line in
-                        (Text(line.label + ": ").foregroundStyle(AlivePalette.secondary)
-                            + Text(line.value).foregroundStyle(AlivePalette.text))
-                            .font(.subheadline)
-                            .lineLimit(3)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                } else {
-                    // The Mac wrote a sentence, not a payload: its first
-                    // paragraph in plain words; the rest stays in Details.
-                    Text(ApprovalText.readable(payload).components(separatedBy: "\n\n").first ?? payload)
-                        .font(.subheadline)
-                        .foregroundStyle(AlivePalette.text)
-                        .lineLimit(4)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                let hidden = max(0, (lines?.count ?? 0) - maxLines)
-                Button(hidden > 0 ? "Details \u{00b7} \(hidden) more" : "Details") { showsDetails = true }
-                    .font(.footnote.weight(.semibold))
-                    .foregroundStyle(AlivePalette.secondary)
-                    .buttonStyle(.plain)
-                    .frame(minHeight: 44)
-                    .contentShape(Rectangle())
-                    .accessibilityHint("Shows everything your Mac sent for this request")
-            }
-            .sheet(isPresented: $showsDetails) {
-                ApprovalDetailsSheet(title: ApprovalText.title(approval),
-                                     payload: payload) { showsDetails = false }
-            }
-        } else {
-            Text(Self.missingLine)
-                .font(.footnote)
-                .foregroundStyle(AlivePalette.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        }
-        .onChange(of: payload, initial: true) { _, payload in
-            lines = payload.flatMap(Self.readableLines)
-        }
-    }
-
-    struct Line: Equatable {
-        let label: String
-        let value: String
-    }
-
-    /// A JSON payload as readable lines, or nil when it is not a JSON object
-    /// (the Mac's own human preview). A connector call's `input` (or
-    /// arguments) is what will be sent, so it leads.
-    static func readableLines(_ payload: String) -> [Line]? {
-        guard let data = payload.data(using: .utf8),
-              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
-        var body = object
-        for key in ["input", "arguments", "args", "params", "parameters"] {
-            if let inner = object[key] as? [String: Any], !inner.isEmpty { body = inner; break }
-        }
-        var lines: [Line] = []
-        for key in readingOrder(body.keys) where !isID(key) {
-            if let nested = body[key] as? [String: Any] {
-                for inner in readingOrder(nested.keys) where !isID(inner) {
-                    if let value = words(nested[inner]) { lines.append(Line(label: label(inner), value: value)) }
-                }
-            } else if let value = words(body[key]) {
-                lines.append(Line(label: label(key), value: value))
-            }
-        }
-        return lines
-    }
-
-    /// Who and where first, then what, then the message, then the rest:
-    /// the order a person reads an envelope, not the alphabet.
-    private static func readingOrder<S: Sequence>(_ keys: S) -> [String] where S.Element == String {
-        let lead = ["to", "recipient", "recipients", "channel", "chat", "calendar", "list", "account",
-                    "cc", "bcc", "subject", "title", "name", "when", "date", "start", "start_date",
-                    "startdate", "end", "end_date", "enddate", "message", "text", "body", "content", "notes"]
-        func rank(_ key: String) -> Int {
-            let flat = key.lowercased().replacingOccurrences(of: "-", with: "_")
-            return lead.firstIndex(of: flat) ?? lead.firstIndex(of: flat.replacingOccurrences(of: "_", with: "")) ?? lead.count
-        }
-        return keys.sorted { (rank($0), $0) < (rank($1), $1) }
-    }
-
-    private static func isID(_ key: String) -> Bool {
-        let lower = key.lowercased()
-        return lower == "id" || lower.hasSuffix("_id") || lower.hasSuffix("-id") || lower.hasSuffix("uuid")
-            || (key.hasSuffix("Id") || key.hasSuffix("ID")) && key.count > 2
-    }
-
-    /// "startDate" / "start_date" → "Start date".
-    private static func label(_ key: String) -> String {
-        var spaced = ""
-        for (index, char) in key.enumerated() {
-            if index > 0, char.isUppercase, let last = spaced.last, last.isLowercase { spaced.append(" ") }
-            spaced.append(char)
-        }
-        let words = AliveWords.humanized(spaced.lowercased())
-        return words.prefix(1).uppercased() + words.dropFirst()
-    }
-
-    /// A value as words: strings as they are (dates readable), numbers,
-    /// Yes/No, short lists joined. Nested structures stay in Details.
-    private static func words(_ value: Any?) -> String? {
-        let text: String
-        switch value {
-        case let string as String:
-            let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return nil }
-            text = AliveWords.date(trimmed) != nil ? AliveWords.readable(trimmed) : trimmed
-        case let number as NSNumber:
-            text = CFGetTypeID(number) == CFBooleanGetTypeID() ? (number.boolValue ? "Yes" : "No") : number.stringValue
-        case let list as [Any]:
-            let items = list.compactMap { $0 is [String: Any] || $0 is [Any] ? nil : words($0) }
-            guard !items.isEmpty else { return nil }
-            text = items.count > 4 ? items.prefix(4).joined(separator: ", ") + ", +\(items.count - 4) more"
-                : items.joined(separator: ", ")
-        default:
-            return nil
-        }
-        let flat = text.replacingOccurrences(of: "\n", with: " ")
-        return flat.count > 160 ? String(flat.prefix(159)) + "\u{2026}" : flat
-    }
-}
-
-/// The approval's details: exactly what the Mac sent, off the card.
-private struct ApprovalDetailsSheet: View {
-    let title: String
-    let payload: String
-    let onDone: () -> Void
-
-    var body: some View {
-        NavigationStack {
-            AlivePage(title: title, line: "What your Mac sent for this request.", style: .pushed) {
-                Section {
-                    Text(payload)
-                        .font(.system(.footnote, design: .monospaced))
-                        .foregroundStyle(AlivePalette.secondary)
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
-            .toolbar { Button("Done", action: onDone) }
-        }
     }
 }
 

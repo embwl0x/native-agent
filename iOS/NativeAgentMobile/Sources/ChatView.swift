@@ -1,191 +1,73 @@
-// PATCH-2026-05-06: ios-companion chat interface
-// PATCH-2026-05-09: voice-io — push-to-talk input + TTS output
-// PATCH-2026-05-30: streaming wired via text_delta BridgeMessage path
-//                   (see ChatStore text_delta handling lines ~434-525).
 import SwiftUI
-
 import UIKit
 import Speech
 import PhotosUI
 import NativeAgentShared
 import UniformTypeIdentifiers
-// Blueprint: | `ChatView.swift` | Main reads the conversation anchor; Mac-projected other-room events interleave by time and open the Agents thread; history selection and drafts remain local |
+// Blueprint: | `ChatView.swift` | Conversation state, session navigation and anchor reconciliation; composes thread, composer, choices and notices |
 
 // MARK: - View
 
 struct ChatView: View {
-    @EnvironmentObject private var bridgeClient: MacBridgeClient
-    @EnvironmentObject private var pairingStore: PairingStore
-    @Environment(VoiceInputController.self) private var voiceInput
-    @EnvironmentObject private var voiceOutput: VoiceOutputController
-    @Environment(\.scenePhase) private var scenePhase
-    // chat-smoothness phase 6: respect Reduce Motion on the bubble entrance.
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(ChatStore.self) private var store
-    private let sync = iCloudSyncEngine.shared
-    @AppStorage(HazeColor.key) private var hazeColorRaw = HazeColor.defaultValue.rawValue
-    // Every model control reads the shared Mac-owned tuple, including receipts.
-    private var selectedModel: String { sync.surfaceModels["ios"]?.model ?? "" }
-    private var selectedReasoningEffort: String { sync.surfaceModels["ios"]?.reasoningEffort ?? "high" }
-    private var selectedFastMode: Bool { sync.surfaceModels["ios"]?.serviceTier == "priority" }
-    private var selectedProviderId: String { sync.surfaceModels["ios"]?.providerId ?? "" }
-    @AppStorage("chatFileAccess") private var selectedFileAccess = "auto"
-    @State private var draft = MobileChatDraft()
-    @State private var showsChatSetup = false
+    @Binding var notifiedSessionID: String?
+
+    init(notifiedSessionID: Binding<String?> = .constant(nil)) { _notifiedSessionID = notifiedSessionID }
+
+    @EnvironmentObject var bridgeClient: MacBridgeClient
+    @EnvironmentObject var pairingStore: PairingStore
+    @Environment(VoiceInputController.self) var voiceInput
+    @EnvironmentObject var voiceOutput: VoiceOutputController
+    @Environment(\.scenePhase) var scenePhase
+    // Respect Reduce Motion on bubble entrance.
+    @Environment(\.accessibilityReduceMotion) var reduceMotion
+    @Environment(ChatStore.self) var store
+    let sync = iCloudSyncEngine.shared
+    @AppStorage(HazeColor.key) var hazeColorRaw = HazeColor.defaultValue.rawValue
+    @AppStorage("chatFileAccess") var selectedFileAccess = "auto"
+    @State var draft = MobileChatDraft()
+    @State var sessionComposers: [String: SessionComposer] = [:]
+    @State var composerSessionKey: String?
+    @State var showsChatSetup = false
     @State private var historyLimit = ChatView.historyPage
-    @State private var showsConfiguration = false
-    @State private var inboxDetailID: String?
-    @State private var inboxGroup: InboxRelatedGroup?
-    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @State var showsConfiguration = false
+    @State var inboxDetailID: String?
+    @State var inboxGroup: InboxRelatedGroup?
+    @Environment(\.dynamicTypeSize) var dynamicTypeSize
     @ScaledMetric(relativeTo: .footnote) private var sessionTabWidth: CGFloat = 156
-    @FocusState private var composerIsFocused: Bool
-    @State private var scrollScheduler = ChatScrollScheduler()
-    @State private var lastScrollAt = Date.distantPast
-    @State private var autoFollowChat = true
-    @State private var showLatestButton = false
-    @State private var dismissedSyncError: String?
-    @State private var showsSyncConnection = false
-    @State private var iCloudReplyObserverID: UUID?
-    @State private var iCloudRejectionObserverID: UUID?
-    @State private var iCloudResyncObserverID: UUID?
-    @State private var selectedPhotoItems: [PhotosPickerItem] = []
-    @State private var pendingPhotos: [PendingPhotoAttachment] = []
-    @State private var pendingFiles: [MultimodalAttachment] = []
-    @State private var showsFileImporter = false
-    @State private var isLoadingPhotos = false
-    @State private var fileLoadTask: Task<Void, Never>?
-    @State private var fileLoadID: UUID?
-    @State private var photoLoadTask: Task<Void, Never>?
-    @State private var photoLoadGeneration = 0
-    @State private var suppressNextEmptyPhotoSelection = false
+    @FocusState var composerIsFocused: Bool
+    @State var scrollScheduler = ChatScrollScheduler()
+    @State var lastScrollAt = Date.distantPast
+    @State var autoFollowChat = true
+    var showLatestButton: Bool { !autoFollowChat }
+    @State var dismissedSyncError: String?
+    @State var showsSyncConnection = false
+    @State var iCloudReplyObserverID: UUID?
+    @State var iCloudRejectionObserverID: UUID?
+    @State var iCloudResyncObserverID: UUID?
+    @State var selectedPhotoItems: [PhotosPickerItem] = []
+    @State var pendingPhotos: [PendingPhotoAttachment] = []
+    @State var pendingFiles: [MultimodalAttachment] = []
+    @State var showsFileImporter = false
+    @State var isLoadingPhotos = false
+    @State var fileLoadTask: Task<Void, Never>?
+    @State var fileLoadID: UUID?
+    @State var photoLoadTask: Task<Void, Never>?
+    @State var photoLoadGeneration = 0
+    @State var suppressNextEmptyPhotoSelection = false
     @State private var closingPinnedSessionIDs: Set<String> = []
-    /// 2026-09-06: the session dictation was started in (nil = not dictating).
-    /// The recognizer keeps running across a session switch and its final
-    /// transcript used to land in whatever composer was selected when the user
-    /// let go, i.e. in the wrong conversation. A switch ends dictation and
-    /// drops what it heard. Keyed, not the raw id, so the main session's nil id
-    /// is still distinguishable from "no dictation in flight".
-    @State private var dictationSessionKey: String?
+    /// Dictation belongs to its keyed session; switching ends and discards it.
+    @State var dictationSessionKey: String?
     /// Send was tapped while dictating: the send happens when the words land.
-    @State private var sendWhenDictationLands = false
+    @State var sendWhenDictationLands = false
 
-    private let maxPendingPhotos = 4
-    // CloudKitDeviceTransport caps the complete encoded BridgeMessage at
-    // 800 KiB. Base64 expands image bytes by roughly one third, so reserve
-    // ample room for JSON, text, signatures, and controls and keep the
-    // aggregate raw photo payload below 520 KiB.
-    static let cloudKitPhotoPayloadBudgetBytes = MobileChatAttachmentPreparation.payloadBudgetBytes
+    let maxPendingPhotos = 4
 
-    private var agentDisplayName: String {
+    var agentDisplayName: String {
         sync.agentDisplayName
     }
 
-    private var otherRoomRows: [String: [OtherRoomExchange]] {
-        guard let session = store.selectedSessionID ?? store.mainSessionID,
-              let transcript = sync.chatTranscripts[session] else { return [:] }
-        let shown = Set(visibleMessages.map { $0.id.uuidString.lowercased() })
-        return OtherRoomExchange.anchored(transcript.otherRooms, to: transcript.records.compactMap { row in
-            guard shown.contains(row.id.lowercased()), let at = UserDisplayFormatters.parseISOTimestamp(row.createdAt) else { return nil }
-            return (id: row.id.lowercased(), at: at)
-        })
-    }
-
-    private func exchangeRows(_ events: [OtherRoomExchange]) -> some View {
-        ForEach(events) { event in
-            NavigationLink { MobileAgentThreadView(id: event.contactID) } label: {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(event.title)
-                    Text(event.subtitle).foregroundStyle(.secondary)
-                }.font(.callout).lineLimit(1)
-            }.buttonStyle(.plain).id("other-room:" + event.id)
-        }
-    }
-
-    private var composerPlaceholder: String {
-        // Before any name is known the fallback is the product, not the agent.
-        return agentDisplayName == NativeAgentIdentity.displayName(nil) ? "Message…" : "Message \(agentDisplayName)…"
-    }
-
-
-    // Process-local visual fixture: no transcript/cache writes and no transport sends.
-    private var isChatSample: Bool {
-        #if DEBUG
-        ProcessInfo.processInfo.arguments.contains("-chatSample")
-        #else
-        false
-        #endif
-    }
-
-    private var visibleMessages: [ChatMessage] {
-        #if DEBUG
-        if isChatSample {
-            var messages = [
-                ChatMessage(id: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!, role: .user,
-                            text: "Can we keep tomorrow's plan simple?"),
-                ChatMessage(id: UUID(uuidString: "00000000-0000-0000-0000-000000000002")!, role: .assistant,
-                            text: "Start with a quiet morning and one focused task. Leave the afternoon open for a walk."),
-                ChatMessage(id: UUID(uuidString: "00000000-0000-0000-0000-000000000003")!, role: .user,
-                            text: "A walk after lunch sounds good."),
-                ChatMessage(id: UUID(uuidString: "00000000-0000-0000-0000-000000000004")!, role: .assistant,
-                            text: "That leaves room to breathe. What would you like to focus on first?"),
-                ChatMessage(id: UUID(uuidString: "00000000-0000-0000-0000-000000000005")!, role: .user,
-                            text: "I'll finish the outline in the morning, then take the afternoon outside.")
-            ]
-            let extras = ProcessInfo.processInfo.arguments.contains("-chatSampleExtras")
-            if extras {
-                messages[3] = ChatMessage(id: messages[3].id, role: .assistant, text: messages[3].text,
-                                          toolEvents: [ToolEvent(name: "mac_calendar_list_upcoming", seq: 1),
-                                                       ToolEvent(name: "weather_forecast", seq: 2),
-                                                       ToolEvent(name: "read_skill", seq: 3)])
-            }
-            if ProcessInfo.processInfo.arguments.contains("-chatSampleStreaming") {
-                messages.append(ChatMessage(id: UUID(uuidString: "00000000-0000-0000-0000-000000000006")!,
-                                            role: .assistant, text: extras ? "" : "Writing the next step…", isStreaming: true,
-                                            toolEvents: extras ? [ToolEvent(name: "mac_calendar_list_upcoming", seq: 1)] : []))
-            }
-            return messages
-        }
-        #endif
-        return store.messages
-    }
-
-    /// A quiet door, in the agent's own voice: one serif line, one sentence,
-    /// and one action only when there is something to do.
-    private var chatEmptyState: some View {
-        let copy: (title: String, line: String) = transcriptNotSynced
-            ? ("Not here yet", "This conversation is still on your Mac. I'll bring it over when it syncs.")
-            : !pairingStore.isPaired ? ("I live on your Mac", "Connect this iPhone and I can talk with you from anywhere.")
-            : bridgeClient.bridgeStatus == .offline ? ("Out of reach for now", AliveConnection.noICloud + ". When it's back, so am I.")
-            : ("I'm here", "Ask me anything, or tell me what you're working on.")
-        return VStack(spacing: 12) {
-            Text(copy.title)
-                .font(.system(.title, design: .serif))
-                .foregroundStyle(AlivePalette.text)
-                .accessibilityAddTraits(.isHeader)
-            Text(copy.line)
-                .font(.body)
-                .foregroundStyle(AlivePalette.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            if !pairingStore.isPaired {
-                Button { showsChatSetup = true } label: {
-                    Text("Connect this iPhone")
-                        .font(.body.weight(.semibold))
-                        .padding(.horizontal, 8)
-                        .frame(minHeight: 36)
-                }
-                .alivePrimaryButton()
-                .padding(.top, 10)
-            }
-        }
-        .multilineTextAlignment(.center)
-        .frame(maxWidth: 320)
-        .padding(24)
-        .padding(.bottom, 60)
-        .frame(maxWidth: .infinity)
-    }
-
     private var chatSessionTabs: [ChatSessionTab] {
-        ChatSessionTabProjection.make(
+        ChatSessionTabs.make(
             mainSessionID: effectiveMainSessionID,
             mainTitle: mainSessionTitle,
             navigationRows: sync.sessionNavigation?.rows ?? [],
@@ -202,29 +84,11 @@ struct ChatView: View {
         return sync.sessions.first(where: { $0.id == selectedID && $0.archived != true })
     }
 
-    /// The pinned ids the strip actually shows: the Mac's pinned snapshot plus
-    /// the derived anchor tab. The externally-removed-pin reconciler judges
-    /// against this, not the raw snapshot, or it would bounce an anchor
-    /// selection straight back to the main tab.
-    private var visiblePinnedSessionIDs: Set<String> {
+    /// Pin reconciliation uses the displayed IDs, including the derived anchor tab.
+    var visiblePinnedSessionIDs: Set<String> {
         var ids = Set(sync.sessionNavigation?.rows.map { $0.session.id } ?? [])
         if let anchorSession { ids.insert(anchorSession.id) }
         return ids
-    }
-
-    /// 2026-09-06: the Mac publishes a bounded set of transcripts. A session the
-    /// phone can select that falls outside that set has a session row carrying a
-    /// message count but no transcript, and rendering it as "No messages yet"
-    /// claimed a conversation was empty when the phone simply never received it.
-    private var transcriptNotSynced: Bool {
-        guard let sessionID = store.selectedSessionID ?? effectiveMainSessionID,
-              sync.transcriptRead(for: sessionID) == .unavailable else { return false }
-        return (sync.sessions.first { $0.id == sessionID }?.messageCount ?? 0) > 0
-    }
-
-    private var transcriptReadError: String? {
-        let sessionID = store.selectedSessionID ?? effectiveMainSessionID
-        return sessionID.flatMap { sync.chatTranscripts[$0]?.readError }
     }
 
     /// History is User's own conversations that have something in them, newest
@@ -241,76 +105,9 @@ struct ChatView: View {
 
     static let historyPage = 50
 
-    private var showsChatSessionTabs: Bool {
+    var showsChatSessionTabs: Bool {
         store.selectedSessionID != effectiveMainSessionID
             || anchorSession != nil || sync.pinnedChatSessions.contains(where: { $0.archived != true })
-    }
-
-    /// Sweep 2026-09-01 item 36 — the pending approvals raised by the chat on
-    /// screen, rendered inline on the turn that raised them. Pure read of the
-    /// approvals `iCloudSyncEngine` already publishes for the Activity tab; no
-    /// second store, no second refresh loop.
-    private var inlineChatApprovals: [ApprovalRequest] {
-        #if DEBUG
-        if isChatSample && ProcessInfo.processInfo.arguments.contains("-chatSampleExtras") {
-            return [ApprovalRequest(id: "sample-approval", title: "Add a calendar block",
-                                    action: "calendar_create", risk: "medium",
-                                    reason: "Tomorrow 9–11 AM, “Outline”, on your personal calendar.",
-                                    status: "pending",
-                                    payloadPreview: #"{"input":{"calendar":"Personal","title":"Outline","eventId":"evt_77"}}"#,
-                                    localOnly: false, remoteResolvable: true),
-                    ApprovalRequest(id: "sample-approval-hygiene", title: "",
-                                    action: "self_improvement.apply", risk: "medium",
-                                    reason: "[run_memory_hygiene] Run memory hygiene to consolidate duplicates and clear test-derived noise before it settles into long-term memory.",
-                                    status: "pending", localOnly: true, remoteResolvable: false)]
-        }
-        #endif
-        return MobileChatApprovalProjection.pendingApprovals(
-            sessionId: store.selectedSessionID,
-            approvals: sync.approvals
-        )
-    }
-
-    /// Cards raised in another thread and mirrored into this conversation for
-    /// User; their buttons answer the original through the signed inbox action.
-    private var inlineChatCards: [InboxItemRecord] {
-        guard let session = store.selectedSessionID, !session.isEmpty else { return [] }
-        let interactions = Set(visibleMessages.compactMap { $0.interaction.map { "interaction:\($0.id)" } })
-        return sync.inboxItems.filter { item in
-            item.source == "interaction" && item.chat_session_id == session
-                && !["archived", "dismissed"].contains(item.status)
-                && !interactions.contains(item.id)
-        }
-    }
-
-    @ViewBuilder
-    private func inlinePendingCards(approvals: [ApprovalRequest], cards: [InboxItemRecord]) -> some View {
-        ForEach(approvals) { approval in
-            InlineChatApprovalCard(approval: approval)
-        }
-        ForEach(cards) { item in
-            InboxCardRow(item: item, onAction: { action in
-                Task {
-                    do {
-                        _ = try await sync.inboxAction(itemId: item.id, actionId: action)
-                    } catch {
-                        store.errorBanner = error.localizedDescription
-                    }
-                }
-            }, onView: { inboxDetailID = item.id })
-        }
-    }
-
-    private var queuedTurns: [QueuedChatSend] {
-        #if DEBUG
-        if isChatSample && ProcessInfo.processInfo.arguments.contains("-chatSampleExtras") {
-            return ["Also remind me to call Sam", "And pick a walking route"].map {
-                QueuedChatSend(id: UUID(), sessionID: nil, text: $0, controls: runtimeControls,
-                               attachments: [], createdAt: Date())
-            }
-        }
-        #endif
-        return store.queuedSendsForSelectedSession
     }
 
     private var selectedChatSessionTabID: String {
@@ -319,7 +116,7 @@ struct ChatView: View {
         return selected
     }
 
-    private var effectiveMainSessionID: String? {
+    var effectiveMainSessionID: String? {
         sync.chatAnchor?.cleanSessionId
     }
 
@@ -331,22 +128,9 @@ struct ChatView: View {
         return cleanTabTitle(session.displayTitle, fallback: "iPhone")
     }
 
-    private var runtimeControls: ChatRuntimeControls {
-        ChatRuntimeControls(
-            model: selectedModel,
-            reasoningEffort: selectedReasoningEffort,
-            serviceTier: selectedFastMode ? "priority" : "default",
-            fileAccess: ChatRuntimeControlPresentation.normalizedFileAccessID(selectedFileAccess),
-            providerId: selectedProviderId
-        )
-    }
-
     var body: some View {
         chatBody
-            // 2026-09-06: this fires on a version change as well as a row
-            // change, because both live in the one published value. A cleared
-            // chat republished with a newer version but the same (empty) rows
-            // is a real delivery, and it used to be invisible here.
+            // Versions and rows in the published transcript both count as delivery.
             .onChange(of: sync.chatTranscripts) { _, _ in
                 applyPublishedTranscriptToVisibleSession()
             }
@@ -358,7 +142,7 @@ struct ChatView: View {
             }
             // Main follows the conversation User is in, including while already open.
             .onChange(of: sync.chatAnchor) { _, _ in
-                adoptConversationAnchorIfNeeded()
+                adoptMainSessionFromSnapshots()
             }
             .onChange(of: hasComposerDraft) { _, hasDraft in
                 if !hasDraft { adoptMainSessionFromSnapshots(afterClearingDraft: true) }
@@ -375,770 +159,15 @@ struct ChatView: View {
                 }
             }
             .onChange(of: store.sessionSwitchGeneration) { _, _ in
-                fileLoadTask?.cancel()
-                fileLoadTask = nil
-                fileLoadID = nil
+                invalidateAttachmentPreparation()
+                restoreSessionComposer()
+            }
+            .onChange(of: store.selectedSessionID) { _, _ in
+                restoreSessionComposer()
             }
     }
 
-    /// Every notice the chat can raise, for the one banner lane. E8: an
-    /// outage on THIS phone gets named as such; without it every local
-    /// failure funnelled into a Mac-blaming message. Sweep R4 C11.3: the
-    /// sync error is render-only — no retry, no new sync work.
-    private var chatBanners: [MobileChatBanner] {
-        var banners: [MobileChatBanner] = []
-        if let offline = bridgeClient.offlineBannerMessage {
-            banners.append(MobileChatBanner(id: "offline", message: offline, systemImage: "wifi.slash", tint: .orange))
-        }
-        if let syncError = MacSyncErrorBannerPresentation.visibleMessage(
-            syncError: sync.syncError, dismissedMessage: dismissedSyncError
-        ) {
-            banners.append(MobileChatBanner(
-                id: "sync", message: syncError, systemImage: "exclamationmark.icloud", tint: .orange,
-                dismissLabel: "Dismiss sync warning",
-                action: ("Connection", { showsSyncConnection = true }),
-                onDismiss: { dismissedSyncError = syncError }
-            ))
-        }
-        if let error = store.errorBanner {
-            banners.append(MobileChatBanner(
-                id: "chat", message: error, systemImage: "exclamationmark.triangle.fill", tint: .red,
-                dismissLabel: "Dismiss chat error",
-                onDismiss: { store.dismissErrorBanner() }
-            ))
-        }
-        if let voiceErr = voiceInput.error {
-            banners.append(MobileChatBanner(
-                id: "voice", message: voiceErr, systemImage: "mic.slash.fill", tint: .orange,
-                dismissLabel: "Dismiss voice input error",
-                action: voiceErr.localizedCaseInsensitiveContains("permission")
-                    || voiceErr.localizedCaseInsensitiveContains("settings")
-                    ? ("Open Settings", { voiceInput.openSettings() })
-                    : nil,
-                onDismiss: { voiceInput.error = nil }
-            ))
-        }
-        if let speechErr = voiceOutput.error {
-            banners.append(MobileChatBanner(
-                id: "speech", message: speechErr, systemImage: "speaker.slash.fill", tint: .orange,
-                dismissLabel: "Dismiss spoken reply error",
-                onDismiss: { voiceOutput.error = nil }
-            ))
-        }
-        return banners
-    }
-
-    private var chatBody: some View {
-        let approvals = inlineChatApprovals
-        let cards = inlineChatCards
-        let cardAnchor = cards.isEmpty ? nil : visibleMessages.last(where: { $0.role == .assistant })?.id ?? visibleMessages.last?.id
-        let exchanges = otherRoomRows
-        return NavigationStack {
-            VStack(spacing: 0) {
-                // One banner lane: the newest notice shows, the rest wait
-                // behind a count instead of stacking down the screen.
-                MobileChatBannerLane(banners: chatBanners)
-                if let reason = transcriptReadError {
-                    Text(reason).font(.caption).foregroundStyle(.red).textSelection(.enabled)
-                }
-
-                runtimeControlsBar
-                if showsChatSessionTabs {
-                    chatSessionTabsBar
-                }
-
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        if visibleMessages.isEmpty && approvals.isEmpty && cards.isEmpty {
-                            chatEmptyState
-                                .containerRelativeFrame(.vertical)
-                        } else {
-                            // Eager on purpose: the transcript is paged (newest 50, then
-                            // older on request), and exact row heights are what let the
-                            // bottom anchor hold when a streamed reply is replaced by its
-                            // settled self. A lazy stack estimated that row and the anchored
-                            // view landed past the content (blank chat after a reply).
-                            VStack(alignment: .leading, spacing: 26) {
-                                if store.canLoadOlderHistory {
-                                    Button(store.isLoadingHistory ? "Loading earlier messages…" : "Load earlier messages") {
-                                        Task { await store.loadOlderHistory() }
-                                    }
-                                    .disabled(store.isLoadingHistory)
-                                    .frame(maxWidth: .infinity)
-                                }
-	                                ForEach(visibleMessages) { msg in
-                                        exchangeRows(exchanges[msg.id.uuidString.lowercased()] ?? [])
-	                                    BubbleView(
-	                                        message: msg,
-	                                        streamingHint: store.streamingHint(for: msg),
-	                                        isTimedOut: store.isTimedOut(msg),
-	                                        onRetry: { store.retry(messageId: msg.id, client: bridgeClient) },
-	                                        isLiveTurn: store.liveTurnBubbles.values.contains(msg.id),
-                                            cardsAvailable: transcriptReadError == nil
-	                                    )
-                                        .equatable()
-	                                    .id(msg.id.uuidString)
-	                                    // phase 6: entrance animates ONLY when the
-	                                    // append seam (ChatStore.send) supplies a
-	                                    // transaction; removals and wholesale
-	                                    // replaces (snapshot merge, session switch)
-	                                    // are .identity → instant.
-	                                    .transition(.asymmetric(
-	                                        insertion: .opacity.combined(with: .offset(y: 8)),
-	                                        removal: .identity))
-                                        // 2026-09-13 (first-failure pass): an
-                                        // aged-out request was never started,
-                                        // so the honest offer is to send it —
-                                        // and only on this tap.
-                                        if store.isExpiredRequest(msg) {
-                                            Button("Send now") {
-                                                store.sendNow(messageId: msg.id, client: bridgeClient)
-                                            }
-                                            .disabled(store.isLoading || store.isSwitchingSession)
-                                        }
-                                        if msg.text.hasSuffix(ChatStore.snapshotTruncationMarker) {
-                                            Button("Show the whole message") {
-                                                Task { await store.loadWholeMessage(msg.id) }
-                                            }
-                                            .disabled(store.isLoadingHistory)
-                                        }
-                                        if !msg.isStreaming,
-                                           let failed = store.queuedSendsForSelectedSession.first(where: { $0.placeholderID == msg.id }) {
-                                            Button("Retry send") {
-                                                store.sendQueuedNow(failed.id, client: bridgeClient)
-                                            }
-                                            .disabled(store.isLoading || store.isSwitchingSession)
-                                        }
-	                                    // Sweep 2026-09-01 item 36: the approval
-	                                    // this turn is waiting on renders right
-	                                    // here instead of only in the Activity
-	                                    // tab. Activity stays canonical.
-                                        inlinePendingCards(
-                                            approvals: approvals.filter { MobileChatApprovalProjection.anchorMessageID(for: $0, in: visibleMessages) == msg.id },
-                                            cards: msg.id == cardAnchor ? cards : [])
-	                                }
-                                exchangeRows(exchanges[""] ?? [])
-                                inlinePendingCards(
-                                    approvals: approvals.filter { MobileChatApprovalProjection.anchorMessageID(for: $0, in: visibleMessages) == nil },
-                                    cards: cardAnchor == nil ? cards : [])
-                                // Reaching the bottom by hand is following again:
-                                // the Latest button goes away on its own.
-                                Color.clear.frame(height: 1)
-                                    .id(Self.chatBottomID)
-                                    .onAppear {
-                                        let follow = ChatFollowPresentation.followLatest()
-                                        autoFollowChat = follow.autoFollow
-                                        showLatestButton = follow.showsLatest
-                                    }
-                            }
-                            .frame(maxWidth: NativeAgentMobileTheme.Layout.roomColumn)
-                            .frame(maxWidth: .infinity)
-                            .padding(.horizontal, 20).padding(.vertical, 12)
-                        }
-                    }
-                    // One follow: the scroll view itself keeps the bottom in place while
-                    // her reply streams, settles and grows, and while the composer changes
-                    // height. Scrolled up, the reading position stays put instead.
-                    // Explicit scrolls remain only for what the person does (send,
-                    // switch chats, Latest, the keyboard).
-                    .defaultScrollAnchor(autoFollowChat ? .bottom : .top)
-                    // The transcript softens out under the composer and the tab bar.
-                    .aliveBottomFade(room: AliveChatRoom(store: store))
-                    // The scroll view owns the inset: SwiftUI measures every composer
-                    // row and subtracts it from the keyboard-adjusted viewport.
-                    .safeAreaInset(edge: .bottom, spacing: NativeAgentMobileTheme.Spacing.md) {
-                        VStack(alignment: .trailing, spacing: 8) {
-                            // Only while scrolled up, and above the composer, never on it.
-                            if showLatestButton {
-                                Button {
-                                    let follow = ChatFollowPresentation.followLatest()
-                                    autoFollowChat = follow.autoFollow
-                                    showLatestButton = follow.showsLatest
-                                    scheduleScrollToBottom(proxy, animated: true, delayMilliseconds: 0, force: true)
-                                } label: {
-                                    Label("Latest", systemImage: "arrow.down")
-                                        .font(.footnote.weight(.semibold))
-                                        .foregroundStyle(AlivePalette.text)
-                                        .padding(.horizontal, 14)
-                                        .frame(minHeight: 44)
-                                        .aliveGlass(in: Capsule(), interactive: true)
-                                }
-                                .buttonStyle(.plain)
-                                .padding(.trailing, NativeAgentMobileTheme.Spacing.lg)
-                                .transition(.opacity)
-                            }
-                            MobileGlassContainer { composerBar }
-                                .padding(.horizontal, NativeAgentMobileTheme.Spacing.lg)
-                                .padding(.bottom, NativeAgentMobileTheme.Spacing.sm)
-                        }
-                        .animation(.easeOut(duration: 0.18), value: showLatestButton)
-                    }
-                    // 2026-05-09 fix: keyboard would not dismiss when the user tapped
-                    // off the textfield.  scrollDismissesKeyboard(.interactively)
-                    // makes the keyboard slide down as the scroll view drags it
-                    // off-screen (matches Messages.app feel); the tap-anywhere
-                    // gesture below is the explicit dismiss-on-tap fallback.
-                    .scrollDismissesKeyboard(.interactively)
-                    .contentShape(Rectangle())
-	                    .onTapGesture {
-                        // Resign first responder on the focused TextField.
-                        UIApplication.shared.sendAction(
-                            #selector(UIResponder.resignFirstResponder),
-                            to: nil, from: nil, for: nil
-                        )
-                    }
-                    .simultaneousGesture(
-                        DragGesture(minimumDistance: 8).onChanged { drag in
-                            if drag.translation.height > 0, store.isLoading || !store.messages.isEmpty {
-                                let follow = ChatFollowPresentation.userScrolledAway()
-                                autoFollowChat = follow.autoFollow
-                                showLatestButton = follow.showsLatest
-                            }
-                        }
-                    )
-                    .onAppear {
-                        let follow = ChatFollowPresentation.followLatest()
-                        autoFollowChat = follow.autoFollow
-                        showLatestButton = follow.showsLatest
-                        scheduleScrollToBottom(proxy, animated: false, delayMilliseconds: 120, force: true)
-                    }
-                    .onChange(of: store.messages.count) {
-                        scheduleScrollToBottom(proxy, animated: false)
-                    }
-                    // B2: a straggler reply landed after its bubble timed out —
-                    // force-scroll to it even if the user had scrolled away.
-                    .onChange(of: store.scrollToBottomTick) {
-                        scheduleScrollToBottom(proxy, animated: true, delayMilliseconds: 0, force: true)
-                    }
-                    // session-switch scroll fix 2026-05-23: parity with Mac.
-                    // selectedSessionID flips on tab tap (user-intent moment)
-                    // — reset autoFollow + scroll so the new session lands at
-                    // bottom instead of leaving a blank chrome / stale scroll
-                    // position. The blank symptom was: tap pinned tab,
-                    // ScrollView empties + retains old scroll offset, new
-                    // session's messages load async and arrive below the
-                    // visible area; user has to manually scroll.
-                    .onChange(of: store.selectedSessionID) {
-                        let follow = ChatFollowPresentation.followLatest()
-                        autoFollowChat = follow.autoFollow
-                        showLatestButton = follow.showsLatest
-                        scheduleScrollToBottom(proxy, animated: false, delayMilliseconds: 80, force: true)
-                    }
-                    // Belt-and-suspenders: when the first message id changes
-                    // the messages array has actually swapped (post-load),
-                    // not just been emptied. Force one more scroll with
-                    // enough delay for the LazyVStack to lay out the new
-                    // content so we land on the real bottom.
-                    .onChange(of: store.messages.first?.id) {
-                        scheduleScrollToBottom(proxy, animated: false, delayMilliseconds: 120, force: true)
-                    }
-                    .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
-                        scheduleScrollToBottom(proxy, animated: false, force: true)
-                    }
-                    .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidShowNotification)) { _ in
-                        scheduleScrollToBottom(proxy, animated: false, force: true)
-                    }
-                }
-
-            }
-            .background { AliveChatRoom(store: store) }
-            // The serif header carries the name and every chat action, so the
-            // bar has nothing left to draw. The title stays for VoiceOver and
-            // the app switcher.
-            .navigationTitle(agentDisplayName)
-            .toolbar(.hidden, for: .navigationBar)
-            .tint(AlivePalette.text)
-            .animation(AppMotion.snappy, value: voiceInput.isListening)
-            // A new sync error un-dismisses itself; the latch lasts only as
-            // long as the condition does (MacSyncErrorBanner's rule).
-            .onChange(of: sync.syncError) { _, newValue in
-                if MacSyncErrorBannerPresentation.normalizedMessage(newValue) == nil {
-                    dismissedSyncError = nil
-                }
-            }
-            .sheet(isPresented: Binding(get: { inboxDetailID != nil }, set: { if !$0 { inboxDetailID = nil } }), onDismiss: { inboxGroup = nil }) {
-                if let inboxGroup {
-                    InboxView(initialGroup: inboxGroup)
-                } else {
-                    InboxDetailSheet(itemID: inboxDetailID ?? "", onOpenGroup: { group in
-                        inboxGroup = group
-                    }) {
-                        inboxDetailID = nil
-                    }
-                }
-            }
-            .sheet(isPresented: $showsChatSetup) {
-                PairingView(onSkip: { showsChatSetup = false }, onPaired: { showsChatSetup = false })
-            }
-            .sheet(isPresented: $showsSyncConnection) {
-                NavigationStack { SettingsViewFull(opensConnection: true) }
-            }
-            .fileImporter(isPresented: $showsFileImporter, allowedContentTypes: [.pdf, .plainText, .init(filenameExtension: "md") ?? .plainText], allowsMultipleSelection: true) { result in
-                loadFileAttachments(result)
-            }
-            .sheet(isPresented: $showsConfiguration) {
-                NavigationStack {
-                    ScrollView { configurationControls }
-                        .mobileReadingScreen()
-                        .navigationTitle("Chat options")
-                        .navigationBarTitleDisplayMode(.inline)
-                        .toolbar { Button("Done") { showsConfiguration = false } }
-                        .hazeTinted()
-                }
-                // Five rows: a half sheet, where the room's haze fills the view.
-                .presentationDetents([.medium, .large])
-            }
-            .task {
-                await store.restorationTask?.value
-                guard !Task.isCancelled else { return }
-                store.resumeObservingPendingExchanges(using: bridgeClient)
-                #if DEBUG
-                if isChatSample && ProcessInfo.processInfo.arguments.contains("-chatSampleModel") {
-                    showsConfiguration = true
-                }
-                if isChatSample && ProcessInfo.processInfo.arguments.contains("-chatSampleToast") {
-                    iOSSystemToastCenter.shared.push(success: "Approved. I'll add it now.", autoDismissAfter: nil)
-                }
-                if isChatSample && ProcessInfo.processInfo.arguments.contains("-chatSampleKeyboard") {
-                    if let index = ProcessInfo.processInfo.arguments.firstIndex(of: "-chatSampleDraft"),
-                       ProcessInfo.processInfo.arguments.indices.contains(index + 1) {
-                        draft.text = ProcessInfo.processInfo.arguments[index + 1]
-                    }
-                    await Task.yield()
-                    composerIsFocused = true
-                }
-                #endif
-            }
-            // N5 fix (R18): subscribe to iCloud replies so assistant messages
-            // arrive asynchronously when in iCloud pairing mode.
-            // observeICloudReplies is a no-op in HTTP mode (useICloud=false guard).
-            .onAppear {
-                // 2026-09-06: a reply push must not alert on top of an answer
-                // the user is already reading. This is the only place that
-                // knows a chat surface is on screen.
-                ChatStore.visibleStore = store
-                adoptMainSessionFromSnapshots()
-                if MobileQuickAskRoute.consume() { composerIsFocused = true }
-                consumeNotifiedChatSessionIfNeeded()
-                importSharedItems()
-                // Wire TTS callback into store
-                store.onReply = { [voiceOutput] text in
-                    voiceOutput.speak(text)
-                }
-                // 2026-09-06: every session change ends dictation, wired once
-                // here instead of at each switch call site — New Chat, a
-                // removed pin and the conversation anchor all bypassed the
-                // per-call-site stop and delivered the transcript into the
-                // wrong conversation.
-                store.onSessionChange = { [voiceInput, origin = $dictationSessionKey] in
-                    guard voiceInput.isListening || voiceInput.isStarting
-                        || origin.wrappedValue != nil else { return }
-                    origin.wrappedValue = nil
-                    voiceInput.stop()
-                }
-                if iCloudReplyObserverID == nil {
-                    iCloudReplyObserverID = bridgeClient.observeICloudReplies { msg in
-                        Task { @MainActor in
-                            await store.receiveICloudReply(msg)
-                        }
-                    }
-                }
-                if iCloudRejectionObserverID == nil {
-                    iCloudRejectionObserverID = bridgeClient.observeICloudReplyRejections { rejection in
-                        Task { @MainActor in
-                            store.receiveICloudRejection(rejection)
-                        }
-                    }
-                }
-                // Phase 14e-iCloud HMAC self-heal: subscribe to signature_invalid_resync
-                // hints so a stale-secret event triggers a refresh + replay instead
-                // of the silent-drop behavior the action channel already avoids.
-                store.pendingRetryClient = bridgeClient
-                store.pairingStoreRef = pairingStore
-                if iCloudResyncObserverID == nil {
-                    iCloudResyncObserverID = bridgeClient.observeICloudResyncHints { hint in
-                        Task { @MainActor in
-                            store.receiveICloudResyncHint(hint, client: bridgeClient)
-                        }
-                    }
-                }
-                // 2026-09-13: an unfinished exchange from a previous launch
-                // goes back to being watched here. Observation only — the
-                // signed request already crossed the bridge and is never sent
-                // a second time.
-                store.resumeObservingPendingExchanges(using: bridgeClient)
-                _ = NativeAgentDeepLinkSendHook.deliverPending(
-                    to: store,
-                    client: bridgeClient,
-                    controls: runtimeControls
-                )
-                Task {
-                    await store.restorationTask?.value
-                    await iCloudBridge.shared.deviceIncomingSetupTask?.value
-                    await iCloudBridge.shared.setupTask?.value
-                    await bridgeClient.pollICloudRepliesNow()
-                    if !sync.refreshInFlight {
-                        await sync.refreshProviderControlsSnapshot()
-                        await sync.refreshChatSessionListSnapshot()
-                    }
-                    adoptMainSessionFromSnapshots()
-                    reconcileExternallyRemovedPinnedSession(
-                        afterPinnedIDs: visiblePinnedSessionIDs
-                    )
-                    adoptConversationAnchorIfNeeded()
-                    if !sync.refreshInFlight { store.refresh(using: bridgeClient) }
-                }
-                // PATCH-2026-05-11: foreground-refresh — pull latest history on appear.
-            }
-            // PATCH-2026-05-11: foreground-refresh — pull latest history when app foregrounds.
-            .onChange(of: scenePhase) { _, newPhase in
-                if newPhase == .active {
-                    if MobileQuickAskRoute.consume() { composerIsFocused = true }
-                    importSharedItems()
-                    store.resumeObservingPendingExchanges(using: bridgeClient)
-                    Task {
-                        await bridgeClient.pollICloudRepliesNow()
-                        await sync.refreshChatSessionListSnapshot()
-                        adoptMainSessionFromSnapshots()
-                        reconcileExternallyRemovedPinnedSession(
-                            afterPinnedIDs: visiblePinnedSessionIDs
-                        )
-                        adoptConversationAnchorIfNeeded()
-                        store.refresh(using: bridgeClient)
-                    }
-                }
-            }
-            .onDisappear {
-                if ChatStore.visibleStore === store { ChatStore.visibleStore = nil }
-                guard !store.hasPendingICloudReplies && !store.isLoading else { return }
-                bridgeClient.removeICloudReplyObserver(iCloudReplyObserverID)
-                bridgeClient.removeICloudReplyRejectionObserver(iCloudRejectionObserverID)
-                bridgeClient.removeICloudResyncHintObserver(iCloudResyncObserverID)
-                iCloudReplyObserverID = nil
-                iCloudRejectionObserverID = nil
-                iCloudResyncObserverID = nil
-            }
-            .onChange(of: store.isSwitchingSession) { _, switching in
-                if !switching { importSharedItems() }
-            }
-            // 2026-09-06: a reply notification names the conversation it came
-            // from. Consume it here too — onAppear only fires when the chat
-            // surface was not already mounted.
-            .onReceive(NotificationCenter.default.publisher(for: .nativeagentOpenActivity)) { _ in
-                consumeNotifiedChatSessionIfNeeded()
-            }
-            .onReceive(NotificationCenter.default.publisher(for: MobileQuickAskRoute.notification)) { _ in
-                if MobileQuickAskRoute.consume() { composerIsFocused = true }
-            }
-            // 2026-09-06: a notification that arrived mid-load kept its intent
-            // rather than losing it. Retry the moment the load releases.
-            .onChange(of: store.isSwitchingSession) { _, switching in
-                guard !switching else { return }
-                consumeNotifiedChatSessionIfNeeded()
-                adoptMainSessionFromSnapshots()
-            }
-            // Simulator/process-argument test hook. The release target exposes
-            // no URL scheme that can inject a real agent turn.
-            .onReceive(NotificationCenter.default.publisher(for: .nativeagentDeepLinkSend)) { _ in
-                _ = NativeAgentDeepLinkSendHook.deliverPending(
-                    to: store,
-                    client: bridgeClient,
-                    controls: runtimeControls
-                )
-            }
-            // Append transcript to input field when user releases mic button
-            .onChange(of: voiceInput.lastFinalTranscript) { _, newValue in
-                // A pending one-tap send belongs to this dictation only.
-                let sendNow = sendWhenDictationLands
-                sendWhenDictationLands = false
-                guard !newValue.isEmpty else { return }
-                // 2026-09-06: only the conversation the user dictated into
-                // receives the words.
-                guard let origin = dictationSessionKey,
-                      origin == store.queueSessionKey(store.selectedSessionID) else { return }
-                if let attachment = voiceInput.lastAttachment { pendingFiles.append(attachment) }
-                if draft.text.isEmpty {
-                    draft.text = newValue
-                } else {
-                    draft.text += " " + newValue
-                }
-                if sendNow { DispatchQueue.main.async { submitMessage() } }
-            }
-            // No words came back (the error says why): nothing to send.
-            .onChange(of: voiceInput.error) { _, error in
-                if error != nil { sendWhenDictationLands = false }
-            }
-            .onChange(of: selectedPhotoItems) { previousItems, items in
-                if items.isEmpty && suppressNextEmptyPhotoSelection {
-                    suppressNextEmptyPhotoSelection = false
-                    return
-                }
-                loadPhotoAttachments(items, previousItems: previousItems)
-            }
-        }
-    }
-
-    // MARK: - Composer
-
-    private var composerBar: some View {
-        VStack(spacing: 8) {
-            if voiceInput.isListening || voiceInput.isStarting {
-                HStack(spacing: 8) {
-                    Image(systemName: "mic.fill")
-                        .foregroundStyle(NativeAgentPalette.agentAccent)
-                    // Every word as it is heard: the line grows with the talk, and a
-                    // long one keeps its newest words in view.
-                    Text(voiceInput.transcript.isEmpty ? (voiceInput.statusText ?? "Listening") : voiceInput.transcript)
-                        .font(AppFont.body.italic())
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1...8)
-                        .truncationMode(.head)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer()
-                }
-                .frame(minHeight: 28)
-                .padding(.horizontal, 4)
-            }
-            if !pendingPhotos.isEmpty || !pendingFiles.isEmpty || isLoadingPhotos {
-                pendingPhotoStrip
-            }
-            if !queuedTurns.isEmpty {
-                queuedSendStrip
-            }
-
-            let a11y = dynamicTypeSize.isAccessibilitySize
-            let layout = a11y
-                ? AnyLayout(VStackLayout(alignment: .leading, spacing: 4))
-                : AnyLayout(HStackLayout(alignment: .bottom, spacing: 2))
-            layout {
-                if !a11y { photosPickerButton }
-                MobileChatComposerField(draft: draft, placeholder: composerPlaceholder,
-                    focused: $composerIsFocused, accessibilitySize: a11y,
-                    isSwitchingSession: store.isSwitchingSession, onSubmit: submitMessage)
-
-            HStack(spacing: 2) {
-                if a11y { photosPickerButton; Spacer(minLength: 8) }
-                micButton
-                    .disabled(store.isSwitchingSession)
-
-                if !store.activeTurnRunIDs.isEmpty || (isChatSample && visibleMessages.last?.isStreaming == true) {
-                    Button {
-                        guard !isChatSample else { return }
-                        store.stop(client: bridgeClient)
-                    } label: {
-                        Image(systemName: "stop.fill")
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(AlivePalette.text)
-                            .frame(width: 36, height: 36)
-                            .background(NativeAgentMobileTheme.Colors.softFill, in: Circle())
-                            .frame(width: 44, height: 44)
-                    }
-                    .accessibilityLabel("Stop generation")
-                } else {
-
-                Button {
-                    if voiceInput.isListening || voiceInput.isStarting {
-                        // One tap: stop listening, and send once the words land.
-                        sendWhenDictationLands = true
-                        voiceInput.stop()
-                    } else {
-                        submitMessage()
-                    }
-                } label: {
-                    let active = (canSend || voiceInput.isListening || voiceInput.isStarting) && !store.isSwitchingSession
-                    Image(systemName: "arrow.up")
-                        .font(.system(size: 15, weight: .bold))
-                        .foregroundStyle(active ? Color.white : AlivePalette.secondary)
-                        .frame(width: 36, height: 36)
-                        .background {
-                            Circle().fill(active
-                                ? HazeColor(stored: hazeColorRaw).control(dark: true, labelled: true)
-                                : NativeAgentMobileTheme.Colors.softFill)
-                            // phase 6: send-control micro-feedback — fade the
-                            // enabled/sending fills instead of popping. Bound to
-                            // the two discrete state flags (canSend/isLoading),
-                            // not content. reduceMotion → nil (instant swap).
-                            .animation(
-                                AppMotion.respecting(AppMotion.snappy, reduceMotion: reduceMotion),
-                                value: active)
-                        }
-                        .frame(width: 44, height: 44)
-                }
-                .disabled(!(canSend || voiceInput.isListening || voiceInput.isStarting) || store.isSwitchingSession)
-                .accessibilityLabel("Send message")
-                }
-            }
-            }
-        }
-        .foregroundStyle(AlivePalette.text)
-        .hazeTinted()
-        // One floating glass capsule: the functional layer, over the thread.
-        .padding(.horizontal, 6)
-        .padding(.vertical, 4)
-        .aliveGlass(in: RoundedRectangle(cornerRadius: 26, style: .continuous), interactive: true)
-        .overlay {
-            PhoneThinkingLight(correlationIDs: Set(store.pendingICloudPlaceholders.keys))
-        }
-        .frame(maxWidth: NativeAgentMobileTheme.Layout.roomColumn)
-    }
-
-    private var canSend: Bool {
-        fileLoadID == nil && (draft.hasText
-            || !pendingPhotos.isEmpty || !pendingFiles.isEmpty)
-    }
-
-    private var hasComposerDraft: Bool {
-        !draft.isEmpty || !pendingPhotos.isEmpty || !pendingFiles.isEmpty
-            || !selectedPhotoItems.isEmpty || isLoadingPhotos || fileLoadID != nil
-    }
-
-    private var queuedSendStrip: some View {
-        let turns = queuedTurns
-        let next = turns[0]
-        let primaryAction = QueuedSendStripAction.resolve(
-            id: next.id,
-            isLoading: store.isLoading
-        )
-        // One line: what waits, its preview, and ONE menu for what to do with
-        // it (send, remove, and the rest of the queue when there is more).
-        return HStack(spacing: 10) {
-            Text(store.isSelectedQueuePaused ? "Paused" : turns.count > 1 ? "Next of \(turns.count)" : "Next")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(AlivePalette.secondary)
-                .fixedSize()
-
-            Text(next.preview)
-                .font(.footnote)
-                .foregroundStyle(AlivePalette.text)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-            Menu {
-                Button {
-                    primaryAction.apply(
-                        onSteer: { store.sendQueuedNow($0, client: bridgeClient) },
-                        onSend: { store.resumeQueuedSends(startingWith: $0) }
-                    )
-                } label: {
-                    Label(primaryAction.primaryTitle, systemImage: "arrow.up")
-                }
-                Button(role: .destructive) {
-                    store.removeQueuedSend(next.id)
-                } label: {
-                    Label("Remove", systemImage: "xmark")
-                }
-                if turns.count > 1 {
-                    Section(AliveWords.count(turns.count, "message") + " waiting") {
-                        ForEach(Array(turns.enumerated().dropFirst()), id: \.element.id) { index, queued in
-                            let action = QueuedSendStripAction.resolve(
-                                id: queued.id,
-                                isLoading: store.isLoading
-                            )
-                            Button {
-                                action.apply(
-                                    onSteer: { store.sendQueuedNow($0, client: bridgeClient) },
-                                    onSend: { store.resumeQueuedSends(startingWith: $0) }
-                                )
-                            } label: {
-                                Label(action.menuTitle(position: index + 1, preview: queued.preview), systemImage: "arrow.up")
-                            }
-                            Button(role: .destructive) {
-                                store.removeQueuedSend(queued.id)
-                            } label: {
-                                Label("Remove \(index + 1): \(queued.preview)", systemImage: "xmark")
-                            }
-                        }
-                    }
-                }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(AlivePalette.text)
-                    .frame(width: 30, height: 30)
-                    .background(AlivePalette.fill, in: Circle())
-                    .overlay(Circle().strokeBorder(AlivePalette.rim, lineWidth: 1))
-                    .frame(width: 44, height: 44)
-                    .contentShape(Rectangle())
-            }
-            .accessibilityLabel("Queued message actions")
-        }
-        .padding(.leading, 12)
-        .padding(.trailing, 0)
-        .overlay(alignment: .bottom) {
-            Rectangle().fill(AlivePalette.divider).frame(height: 1).padding(.horizontal, 8)
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Send-next queue, \(turns.count) queued")
-    }
-
-    private var pendingPhotoStrip: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(pendingFiles) { file in
-                    HStack {
-                        Label(file.name ?? "Document", systemImage: "doc")
-                            .lineLimit(1)
-                        Button { pendingFiles.removeAll { $0.id == file.id } } label: {
-                            Image(systemName: "xmark.circle.fill")
-                        }
-                        .accessibilityLabel("Remove attached document")
-                    }
-                    .font(.footnote)
-                    .padding(10)
-                    .background(AlivePalette.fill, in: Capsule())
-                }
-                if isLoadingPhotos {
-                    Label("Loading photos", systemImage: "photo")
-                        .font(AppFont.tag)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 8)
-                        .background(AlivePalette.fill, in: Capsule())
-                }
-                ForEach(pendingPhotos) { photo in
-                    ZStack(alignment: .topTrailing) {
-                        Image(uiImage: photo.thumbnail)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: 58, height: 58)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                            .overlay {
-                                RoundedRectangle(cornerRadius: 10)
-                                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
-                            }
-                            .accessibilityLabel("Attached photo")
-                        Button {
-                            photoLoadTask?.cancel()
-                            photoLoadGeneration += 1
-                            isLoadingPhotos = false
-                            let removal = PendingPhotoPresentation.removing(photo.id, from: pendingPhotos)
-                            pendingPhotos = removal.photos
-                            if removal.clearsPicker {
-                                selectedPhotoItems = []
-                            }
-                            suppressNextEmptyPhotoSelection = removal.suppressesNextEmptySelection
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 18, weight: .semibold))
-                                .symbolRenderingMode(.palette)
-                                .foregroundStyle(.white, .black.opacity(0.58))
-                                .frame(width: 44, height: 44, alignment: .topTrailing)
-                                .contentShape(Rectangle())
-                        }
-                        .offset(x: 6, y: -6)
-                        .accessibilityLabel("Remove attached photo")
-                    }
-                    .accessibilityElement(children: .contain)
-                }
-            }
-            .padding(.horizontal, 2)
-        }
-    }
-
-    // MARK: - Runtime controls
-
-    private var chatSessionTabsBar: some View {
+    var chatSessionTabsBar: some View {
         let accessibilitySize = dynamicTypeSize.isAccessibilitySize
         return ScrollView(.horizontal, showsIndicators: false) {
             HStack(alignment: .bottom, spacing: 5) {
@@ -1210,319 +239,20 @@ struct ChatView: View {
         .fixedSize(horizontal: false, vertical: true)
     }
 
-    /// PhotosPicker's label is an escaping @Sendable closure, so it cannot
-    /// reference the MainActor-isolated `isLoadingPhotos` directly. Reading it
-    /// into a local `Bool` (a Sendable value) before building the label means
-    /// the closure captures the value, not `self`.
-    private var photosPickerButton: some View {
-        let loading = isLoadingPhotos
-        let retainedOutsidePicker = pendingPhotos.filter { photo in
-            !selectedPhotoItems.contains { $0 == photo.pickerItem }
-        }.count
-        return HStack(spacing: 0) {
-        PhotosPicker(
-            selection: $selectedPhotoItems,
-            maxSelectionCount: max(1, maxPendingPhotos - pendingFiles.count - retainedOutsidePicker),
-            matching: .images
-        ) {
-            Image(systemName: loading ? "hourglass" : "plus")
-                .font(.system(size: 18, weight: .regular))
-                .foregroundStyle(AlivePalette.secondary)
-                .frame(width: 44, height: 44)
-                .contentShape(Circle())
-        }
-        .disabled(store.isLoading || store.isSwitchingSession || loading || fileLoadID != nil || pendingPhotos.count + pendingFiles.count == maxPendingPhotos)
-        .accessibilityLabel("Add photos")
-        Button { showsFileImporter = true } label: {
-            Image(systemName: "doc.badge.plus")
-                .font(.system(size: 18, weight: .regular))
-                .foregroundStyle(AlivePalette.secondary)
-                .frame(width: 44, height: 44)
-        }
-        .disabled(store.isLoading || store.isSwitchingSession || fileLoadID != nil || pendingFiles.count + pendingPhotos.count >= maxPendingPhotos)
-        .accessibilityLabel("Add PDF or text files")
-        }
-    }
-
-    /// The Mac Simple header: the agent's name in serif with its light, and
-    /// one line under it saying what it is doing (or why the Mac is away).
-    private var runtimeControlsBar: some View {
-        let online = isChatSample || bridgeClient.bridgeStatus == .online
-        // The kit's door, at the same height as every tab: when the Mac is
-        // away the line under the name becomes its status (the chip keeps its
-        // full 44pt target).
-        return AlivePageHeader(title: agentDisplayName, line: agentDoing.text,
-                               dot: online ? agentDoing.dot : .away, showsStatus: !isChatSample) {
-            chatActionsMenu
-        }
-        .padding(.horizontal, AliveMetrics.pageInset + 4)
-        .padding(.top, AliveMetrics.rootTop)
-        .padding(.bottom, 6)
-    }
-
-    /// What the agent is doing, in the Mac's words.
-    private var agentDoing: (text: String, dot: AliveStatusDot.State) {
-        if let heard = store.activeTurnHeardByMac ?? (isChatSample && visibleMessages.last?.isStreaming == true ? true : nil) {
-            guard heard else { return ("Sending…", .working) }
-            let replying = visibleMessages.last.map { $0.role == .assistant && $0.isStreaming && !$0.text.isEmpty } ?? false
-            return (replying ? "Replying…" : "Received by Mac", replying ? .working : .waiting)
-        }
-        if !inlineChatApprovals.isEmpty { return ("Waiting on you", .waiting) }
-        return ("Here", .here)
-    }
-
-    private var configurationControls: some View {
-            VStack(alignment: .leading, spacing: 0) {
-                Menu {
-                    ForEach(selectableProviders) { provider in
-                        Section(provider.display_name) {
-                            ForEach(selectableModelIDs(for: provider), id: \.self) { model in
-                                Button {
-                                    selectModel(model, providerID: provider.provider_id)
-                                } label: {
-                                    let title = provider.models.first(where: { $0.id == model }).map(ProviderWords.modelName) ?? modelLabel(model)
-                                    if selectedProviderId == provider.provider_id && selectedModel == model {
-                                        Label(title, systemImage: "checkmark")
-                                    } else {
-                                        Text(title)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Divider()
-                    Button {
-                        Task {
-                            await ChatRuntimeControlPresentation.refreshModels(
-                                refresh: { await sync.refreshProviderControlsSnapshot() },
-                                presentError: { iOSSystemToastCenter.shared.push(error: $0) }
-                            )
-                        }
-                    } label: {
-                        Label("Refresh Models", systemImage: "arrow.clockwise")
-                    }
-                } label: {
-                    controlPill("Model", title: isChatSample ? "Claude Fable 5.1 · extended context" : modelLabel(selectedModel))
-                }
-
-                AliveDivider()
-                Menu {
-                    ForEach(reasoningOptions, id: \.id) { option in
-                        Button {
-                            let requestedModel = selectedModel
-                            let requestedProvider = selectedProviderId
-                            let requestedServiceTier = selectedFastMode ? "priority" : "default"
-                            Task {
-                                do {
-                                    try await sync.configureSurfaceSelection(
-                                        surface: "ios",
-                                        providerId: requestedProvider,
-                                        model: requestedModel,
-                                        reasoningEffort: option.id,
-                                        serviceTier: requestedServiceTier
-                                    )
-                                } catch {
-                                    iOSSystemToastCenter.shared.push(
-                                        error: "Couldn't set reasoning to \(option.label): \(error.localizedDescription)"
-                                    )
-                                }
-                            }
-                        } label: {
-                            Label(option.label, systemImage: selectedReasoningEffort == option.id ? "checkmark" : "brain")
-                        }
-                    }
-                } label: {
-                    controlPill("Thinking", title: reasoningLabel(selectedReasoningEffort))
-                }
-
-                AliveDivider()
-                Menu {
-                    Button { setFastMode(false) } label: {
-                        Label("Normal", systemImage: selectedFastMode ? "circle" : "checkmark")
-                    }
-                    Button { setFastMode(true) } label: {
-                        Label("Fast", systemImage: selectedFastMode ? "checkmark" : "bolt.fill")
-                    }
-                    .disabled(!selectedModelSupportsFast)
-                } label: {
-                    controlPill(
-                        "Speed",
-                        title: ChatRuntimeControlPresentation.processingModeTitle(fastMode: selectedFastMode)
-                    )
-                }
-                .accessibilityLabel("Processing mode: \(selectedFastMode ? "Fast" : "Normal")")
-
-                AliveDivider()
-                Menu {
-                    ForEach(fileAccessOptions, id: \.id) { option in
-                        Button {
-                            selectedFileAccess = option.id
-                        } label: {
-                            Label(option.label, systemImage: selectedFileAccess == option.id ? "checkmark" : option.icon)
-                        }
-                    }
-                } label: {
-                    controlPill("File access", title: fileAccessLabel(selectedFileAccess))
-                }
-            }
-            .aliveCard()
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-        .tint(AlivePalette.text)
-    }
-
-    /// One row of the options card: what it is on the left, the current
-    /// choice on the right. The whole row opens its menu.
-    private func controlPill(_ label: String, title: String) -> some View {
-        HStack(spacing: 12) {
-            Text(label)
-                .font(.body)
-                .foregroundStyle(AlivePalette.text)
-            Spacer(minLength: 8)
-            Text(title)
-                .font(.body)
-                .foregroundStyle(AlivePalette.secondary)
-                .multilineTextAlignment(.trailing)
-                .fixedSize(horizontal: false, vertical: true)
-            Image(systemName: "chevron.up.chevron.down")
-                .font(.caption2.weight(.semibold))
-                .foregroundStyle(AlivePalette.secondary)
-        }
-        .aliveRow()
-        .frame(minHeight: 44)
-        .contentShape(Rectangle())
-    }
-
-    private var selectableProviders: [ProviderInfo] {
-        sync.providers
-            .filter { $0.auth_status.eligible }
-            .sorted { $0.display_name.localizedCaseInsensitiveCompare($1.display_name) == .orderedAscending }
-    }
-
-    private func selectableModelIDs(for provider: ProviderInfo) -> [String] {
-        var ids = Set(provider.models.map(\.id).filter { !$0.isEmpty })
-        if provider.provider_id == selectedProviderId, !selectedModel.isEmpty {
-            ids.insert(selectedModel)
-        }
-        return ids.sorted { lhs, rhs in
-            if lhs == selectedModel { return true }
-            if rhs == selectedModel { return false }
-            return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
-        }
-    }
-
-    private func selectModel(_ model: String, providerID: String) {
-        let effort = selectedReasoningEffort
-        let tier = selectedFastMode ? "priority" : "default"
-        Task {
-            do {
-                try await sync.configureSurfaceSelection(
-                    surface: "ios", providerId: providerID, model: model,
-                    reasoningEffort: effort, serviceTier: tier
-                )
-            } catch {
-                iOSSystemToastCenter.shared.push(
-                    error: "Couldn't switch to \(modelLabel(model)): \(error.localizedDescription)"
-                )
-            }
-        }
-    }
-
-    private func setFastMode(_ enabled: Bool) {
-        guard enabled != selectedFastMode else { return }
-        guard !enabled || selectedModelSupportsFast else {
-            iOSSystemToastCenter.shared.push(error: "Fast mode is not available for \(modelLabel(selectedModel)).")
-            return
-        }
-        let providerID = selectedProviderId
-        let model = selectedModel
-        let effort = selectedReasoningEffort
-        Task {
-            do {
-                try await sync.configureSurfaceSelection(
-                    surface: "ios", providerId: providerID, model: model,
-                    reasoningEffort: effort, serviceTier: enabled ? "priority" : "default"
-                )
-            } catch {
-                iOSSystemToastCenter.shared.push(
-                    error: "Couldn't change processing mode: \(error.localizedDescription)"
-                )
-            }
-        }
-    }
-
-    private var reasoningOptions: [(id: String, label: String)] {
-        let all = [
-            ("none", "None"),
-            ("low", "Low"),
-            ("medium", "Medium"),
-            ("high", "High"),
-            ("xhigh", "XHigh"),
-            ("max", "Max"),
-            ("ultra", "Ultra")
-        ]
-        guard let supported = selectedModelInfo?.supported_reasoning_efforts,
-              !supported.isEmpty else { return Array(all.prefix(4)) }
-        return all.filter { supported.contains($0.0) }
-    }
-
-    private var selectedModelInfo: ProviderModelInfo? {
-        sync.providers
-            .first(where: { $0.provider_id == selectedProviderId })?
-            .models
-            .first(where: { $0.id == selectedModel })
-    }
-
-    private var selectedModelSupportsFast: Bool {
-        selectedModelInfo?.supports_fast == true
-    }
-
-    private var fileAccessOptions: [(id: String, label: String, icon: String)] {
-        [
-            ("auto", "Auto", "wand.and.stars"),
-            ("read_only", "Read only", "eye"),
-            ("workspace", "Workspace", "folder"),
-            ("full", "Full Mac", "bolt.trianglebadge.exclamationmark")
-        ]
-    }
-
-    private func modelLabel(_ id: String) -> String {
-        guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            // No pick of its own yet: the Mac's Chat choice is what this turn
-            // will run on, and the phone says so rather than naming a model.
-            return sync.providers.isEmpty ? "Waiting for the Mac's choice" : "Same as Mac"
-        }
-        return sync.providers
-            .flatMap(\.models)
-            .first(where: { $0.id == id })?
-            .name ?? id
-    }
-
     private func cleanTabTitle(_ title: String, fallback: String) -> String {
         let clean = title.trimmingCharacters(in: .whitespacesAndNewlines)
         return clean.isEmpty ? fallback : clean
     }
 
-    /// 2026-09-06: a tapped reply notification carries the session that
-    /// answered. Open that conversation instead of leaving the user on
-    /// whichever chat happened to be selected.
-    private func consumeNotifiedChatSessionIfNeeded() {
-        // 2026-09-06: `switchSession` refuses silently while another session
-        // load is in flight, and the intent had already been consumed by then
-        // — the tap landed on whichever chat happened to be selected. Hold the
-        // intent until the load finishes; the isSwitchingSession watcher below
-        // calls back in.
-        guard !store.isSwitchingSession else { return }
-        guard let sessionID = MobileNotifiedChatSessionIntent.consume() else { return }
-        // 2026-09-06: the notification chose this conversation even when it was
-        // already the selected one, and the note is what stops the
-        // externally-removed-pin reconciler from reading its absence from the
-        // pinned snapshot as a pin the Mac took away and bouncing the user back
-        // to the main chat. Note first; only the redundant load is skipped.
+    /// Hold a notification's conversation until the current session load finishes.
+    func consumeNotifiedChatSessionIfNeeded() {
+        guard !store.isSwitchingSession, let sessionID = notifiedSessionID else { return }
+        notifiedSessionID = nil
+        // Record the choice before skipping a redundant session load.
         if sessionID == effectiveMainSessionID {
             MobileChatSelectionIntent.followMain()
         } else {
-            MobileChatSelectionIntent.noteNotifiedSelection(sessionID)
+            MobileChatSelectionIntent.selectSession(sessionID)
         }
         guard sessionID != store.selectedSessionID else { return }
         store.switchSession(
@@ -1531,13 +261,14 @@ struct ChatView: View {
         )
     }
 
-    private func adoptMainSessionFromSnapshots(afterClearingDraft: Bool = false) {
+    /// History is an explicit destination; main continuously follows the Mac.
+    func adoptMainSessionFromSnapshots(afterClearingDraft: Bool = false) {
         let isInitialBinding = store.selectedSessionID == nil
-            && !MobileChatSelectionIntent.userChoseThisLaunch
+            && MobileChatSelectionIntent.explicitlySelectedSessionID == nil
         guard !store.isSwitchingSession,
               !hasComposerDraft || isInitialBinding,
               !composerIsFocused || afterClearingDraft || isInitialBinding,
-              !isInitialBinding || (!store.isLoading && store.pendingSendArgs.isEmpty),
+              !isInitialBinding || (!store.isLoading && !store.pendingExchanges.values.contains { $0.sessionID == store.selectedSessionID && $0.request != nil }),
               // Switching cancels the send task. Keep accepted drafts here
               // until their exact-session handoff has crossed the transport.
               !store.queuedSends.contains(where: {
@@ -1546,7 +277,7 @@ struct ChatView: View {
               }),
               let anchorID = sync.chatAnchor?.cleanSessionId,
               sync.sessions.contains(where: { $0.id == anchorID && $0.archived != true }) else { return }
-        guard !MobileChatSelectionIntent.userChoseThisLaunch,
+        guard MobileChatSelectionIntent.explicitlySelectedSessionID == nil,
               store.selectedSessionID != anchorID else { return }
         if isInitialBinding {
             store.migrateQueuedSends(from: nil, to: anchorID)
@@ -1568,28 +299,21 @@ struct ChatView: View {
         store.applyMacTranscriptRead(sync.transcriptRead(for: sessionID), sessionID: sessionID)
     }
 
-    private func reconcileExternallyRemovedPinnedSession(afterPinnedIDs: Set<String>) {
+    func reconcileExternallyRemovedPinnedSession(afterPinnedIDs: Set<String>) {
         guard ChatStore.shouldReturnToMainSession(
             selectedSessionID: store.selectedSessionID,
             mainSessionID: effectiveMainSessionID,
             availablePinnedSessionIDs: afterPinnedIDs,
             locallyCreatedSessionID: store.locallyCreatedSessionID,
-            explicitlySelectedSessionID: MobileChatSelectionIntent.notifiedSessionID
+            explicitlySelectedSessionID: MobileChatSelectionIntent.explicitlySelectedSessionID
         ) else { return }
         store.switchToMainSession(
             using: bridgeClient
         )
     }
 
-    /// History is an explicit destination; main continuously follows the Mac.
-    private func adoptConversationAnchorIfNeeded() {
-        adoptMainSessionFromSnapshots()
-    }
-
     private func selectChatSessionTab(_ tab: ChatSessionTab) {
-        let follow = ChatFollowPresentation.followLatest()
-        autoFollowChat = follow.autoFollow
-        showLatestButton = follow.showsLatest
+        autoFollowChat = true
         switch tab.kind {
         case .main:
             MobileChatSelectionIntent.followMain()
@@ -1597,7 +321,7 @@ struct ChatView: View {
             store.switchToMainSession(using: bridgeClient)
         case .pinned, .anchor:
             guard let sessionID = tab.sessionID else { return }
-            MobileChatSelectionIntent.noteNotifiedSelection(sessionID)
+            MobileChatSelectionIntent.selectSession(sessionID)
             store.switchSession(to: sessionID, using: bridgeClient)
         }
     }
@@ -1609,7 +333,7 @@ struct ChatView: View {
             do {
                 do {
                     _ = try await sync.unpinChatSession(sessionId: sessionID)
-                } catch SyncError.timeout {
+                } catch SyncError.responseUnconfirmed {
                     // Unconfirmed, not failed: the Mac may not have picked it
                     // up yet. The same request (same message ID) re-checks or
                     // resends, and closing a tab twice is harmless.
@@ -1624,7 +348,7 @@ struct ChatView: View {
                         using: bridgeClient
                     )
                 }
-            } catch SyncError.timeout {
+            } catch SyncError.responseUnconfirmed {
                 // Still unconfirmed. The request stays queued for the Mac and
                 // the next pinned-list snapshot drops the tab once it lands;
                 // there is nothing for the person to do yet.
@@ -1634,70 +358,16 @@ struct ChatView: View {
         }
     }
 
-    private func reasoningLabel(_ id: String) -> String {
-        reasoningOptions.first(where: { $0.id == id })?.label ?? "Thinking"
-    }
-
-    private func fileAccessLabel(_ id: String) -> String {
-        let normalized = ChatRuntimeControlPresentation.normalizedFileAccessID(id)
-        return fileAccessOptions.first(where: { $0.id == normalized })?.label ?? "Auto"
-    }
-
-    // MARK: - Mic button
-
-    private var micButton: some View {
-        let micActive = voiceInput.isListening || voiceInput.isStarting
-        return Button {
-            if micActive {
-                voiceInput.stop()
-            } else {
-                // Starting to talk ends her talking: playback stops before the
-                // microphone opens, so she is not speaking into her own input
-                // (2026-09-13).
-                voiceOutput.stop()
-                dictationSessionKey = store.queueSessionKey(store.selectedSessionID)
-                Task { await voiceInput.start() }
-            }
-        } label: {
-            let haze = HazeColor(stored: hazeColorRaw).control(dark: true, labelled: true)
-            ZStack {
-                if micActive {
-                    Circle()
-                        .strokeBorder(haze.opacity(0.5), lineWidth: 2)
-                        .frame(width: 42, height: 42)
-                        .scaleEffect(1.08)
-                        .animation(AppMotion.pulse, value: micActive)
-                }
-
-                Circle()
-                    .fill(micActive ? haze : Color.clear)
-                    .frame(width: 36, height: 36)
-                    .overlay {
-                        Image(systemName: "mic")
-                            .font(.system(size: 17, weight: micActive ? .semibold : .regular))
-                            .symbolVariant(micActive ? .fill : .none)
-                            .foregroundStyle(micActive ? Color.white : AlivePalette.secondary)
-                    }
-                    .animation(AppMotion.snappy, value: micActive)
-            }
-            .frame(width: 44, height: 44)
-            .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(micActive ? "Stop dictation" : "Start dictation")
-    }
-
     // MARK: - Chat actions
 
     /// One glass control for everything the chat can do besides talk: a new
     /// conversation, another answer, spoken replies and the options sheet.
-    /// Sweep R4 C11.4's connection state lives in the status line beside it.
-    private var chatActionsMenu: some View {
+    var chatActionsMenu: some View {
         Menu {
             Menu("History", systemImage: "clock") {
                 ForEach(historySessions.prefix(historyLimit)) { session in
                     Button {
-                        MobileChatSelectionIntent.noteNotifiedSelection(session.id)
+                        MobileChatSelectionIntent.selectSession(session.id)
                         store.switchSession(to: session.id, using: bridgeClient)
                     } label: {
                         if session.id == store.selectedSessionID {
@@ -1716,10 +386,7 @@ struct ChatView: View {
             }
             .disabled(store.isSwitchingSession)
 
-            // A new-session action must never be blocked by an in-flight turn
-            // on the session we're leaving: a stuck "working" turn would also
-            // freeze the one control that recovers it. startNewSession()
-            // cancels the in-flight send and resets isLoading.
+            // New chat stays available during a turn; the store cancels its local send and releases loading.
             Button {
                 store.startNewSession()
             } label: {
@@ -1763,322 +430,4 @@ struct ChatView: View {
         .accessibilityHint("New chat, answer again, spoken replies and chat options")
     }
 
-    // MARK: - Send
-
-    private func submitMessage() {
-        guard !isChatSample, canSend, !store.isSwitchingSession else { return }
-        let text = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let attachments = pendingPhotos.map(\.attachment) + pendingFiles
-        let sendText = text.isEmpty
-            ? (attachments.count == 1 ? "Look at this attachment." : "Look at these attachments.")
-            : text
-        let disposition = store.send(text: sendText, client: bridgeClient, controls: runtimeControls, attachments: attachments)
-        guard disposition != .rejected else { return }
-        let follow = ChatFollowPresentation.followLatest()
-        autoFollowChat = follow.autoFollow
-        showLatestButton = follow.showsLatest
-        draft.text = ""
-        pendingPhotos = []
-        pendingFiles = []
-        selectedPhotoItems = []
-    }
-
-    private func loadFileAttachments(_ result: Result<[URL], Error>) {
-        do {
-            let urls = try result.get()
-            guard urls.count + pendingFiles.count + pendingPhotos.count <= maxPendingPhotos else {
-                store.errorBanner = "Attach up to four photos or documents at a time."
-                return
-            }
-            let generation = store.sessionSwitchGeneration
-            fileLoadTask?.cancel()
-            let loadID = UUID()
-            fileLoadID = loadID
-            fileLoadTask = Task {
-                defer {
-                    if fileLoadID == loadID { fileLoadID = nil; fileLoadTask = nil }
-                }
-                do {
-                    let files = try await Task.detached(priority: .userInitiated) {
-                        try urls.map { try MobileChatAttachmentPreparation.fileAttachment(from: $0) }
-                    }.value
-                    guard !Task.isCancelled, fileLoadID == loadID, generation == store.sessionSwitchGeneration else { return }
-                    guard files.count + pendingFiles.count + pendingPhotos.count <= maxPendingPhotos else {
-                        store.errorBanner = "Attach up to four photos or documents at a time."
-                        return
-                    }
-                    pendingFiles.append(contentsOf: files)
-                } catch {
-                    guard !Task.isCancelled, fileLoadID == loadID, generation == store.sessionSwitchGeneration else { return }
-                    let failure = error as NSError
-                    store.errorBanner = failure.domain == "ChatAttachment" ? failure.localizedDescription
-                        : "File could not be loaded: \(error.localizedDescription)"
-                }
-            }
-        } catch { store.errorBanner = "File could not be loaded: \(error.localizedDescription)" }
-    }
-
-    private func loadPhotoAttachments(_ items: [PhotosPickerItem], previousItems: [PhotosPickerItem]) {
-        photoLoadTask?.cancel()
-        photoLoadGeneration += 1
-        let generation = photoLoadGeneration
-        pendingPhotos.removeAll { photo in
-            previousItems.contains { $0 == photo.pickerItem }
-                && !items.contains { $0 == photo.pickerItem }
-        }
-        guard !items.isEmpty else {
-            isLoadingPhotos = false
-            return
-        }
-        isLoadingPhotos = true
-        let existingPhotoBytes = pendingPhotos.reduce(0) { $0 + $1.attachment.byteSize }
-        let newItems = items.filter { item in !pendingPhotos.contains { $0.pickerItem == item } }
-        guard !newItems.isEmpty else {
-            isLoadingPhotos = false
-            return
-        }
-        let selectedItems = Array(newItems.prefix(max(0, maxPendingPhotos - pendingPhotos.count - pendingFiles.count)))
-        photoLoadTask = Task {
-            var loaded: [PendingPhotoAttachment] = []
-            var skippedCount = newItems.count - selectedItems.count
-            var remainingBudget = max(0, Self.cloudKitPhotoPayloadBudgetBytes - existingPhotoBytes)
-            for (index, item) in selectedItems.enumerated() {
-                if Task.isCancelled { return }
-                do {
-                    let remainingCount = selectedItems.count - index
-                    let photoBudget = Self.perPhotoBudget(
-                        remainingBytes: remainingBudget,
-                        remainingCount: remainingCount
-                    )
-                    guard let sourceData = try await item.loadTransferable(type: Data.self), photoBudget > 0,
-                          let prepared = await Task.detached(priority: .userInitiated, operation: {
-                              guard let jpeg = MobileChatAttachmentPreparation.preparedJPEGData(from: sourceData, maxBytes: photoBudget),
-                                    let thumbnail = MobileChatAttachmentPreparation.thumbnail(from: jpeg, maxDimension: 240) else { return nil as (MultimodalAttachment, UIImage)? }
-                              let attachment = MultimodalAttachment(id: UUID().uuidString, type: "image",
-                                  base64: jpeg.base64EncodedString(), mime: "image/jpeg",
-                                  name: "iphone-photo-\(index + 1).jpg", byteSize: jpeg.count)
-                              return (attachment, thumbnail)
-                          }).value else {
-                        skippedCount += 1
-                        continue
-                    }
-                    let (attachment, thumbnail) = prepared
-                    remainingBudget -= attachment.byteSize
-                    let id = attachment.id
-                    loaded.append(PendingPhotoAttachment(id: id, attachment: attachment, thumbnail: thumbnail, pickerItem: item))
-                } catch {
-                    await MainActor.run {
-                        store.errorBanner = "Photo could not be loaded: \(error.localizedDescription)"
-                    }
-                }
-            }
-            await MainActor.run {
-                guard generation == photoLoadGeneration, !Task.isCancelled else { return }
-                pendingPhotos.append(contentsOf: loaded)
-                isLoadingPhotos = false
-                if let message = PhotosPickerLoadPresentation.message(
-                    loadedCount: loaded.count,
-                    skippedCount: skippedCount
-                ) {
-                    store.errorBanner = message
-                }
-                if loaded.isEmpty {
-                    suppressNextEmptyPhotoSelection = !selectedPhotoItems.isEmpty
-                    selectedPhotoItems = []
-                }
-            }
-        }
-    }
-
-    static func perPhotoBudget(remainingBytes: Int, remainingCount: Int) -> Int {
-        guard remainingBytes > 0, remainingCount > 0 else { return 0 }
-        return remainingBytes / remainingCount
-    }
-
-
-
-    private func importSharedItems() {
-        store.importSharedItems(controls: runtimeControls)
-    }
-
-    static let chatBottomID = "chat-bottom"
-
-    private func scheduleScrollToBottom(
-        _ proxy: ScrollViewProxy,
-        animated: Bool = false,
-        delayMilliseconds: Int = 30,
-        force: Bool = false
-    ) {
-        guard !visibleMessages.isEmpty else { return }
-        guard force || autoFollowChat else { return }
-        // The true bottom: below the last reply and whatever follows it
-        // (other-room rows, cards, approvals), not the last reply's own edge.
-        guard let serial = scrollScheduler.schedule(
-            targetID: Self.chatBottomID,
-            animated: animated,
-            force: force
-        ) else { return }
-        let elapsed = Date().timeIntervalSince(lastScrollAt)
-        let minimumInterval = animated ? 0.12 : 0.09
-        let effectiveDelayMs = max(delayMilliseconds, Int(max(0, minimumInterval - elapsed) * 1000))
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(effectiveDelayMs)) {
-            guard let currentTargetID = scrollScheduler.complete(
-                serial: serial,
-                messagesAreAvailable: !visibleMessages.isEmpty
-            ) else { return }
-            lastScrollAt = Date()
-            if animated {
-                withAnimation(.easeOut(duration: 0.18)) {
-                    proxy.scrollTo(currentTargetID, anchor: .bottom)
-                }
-            } else {
-                proxy.scrollTo(currentTargetID, anchor: .bottom)
-            }
-        }
-    }
-}
-
-private struct MobileChatBanner: Identifiable {
-    let id: String
-    let message: String
-    let systemImage: String
-    let tint: Color
-    /// Nil for a notice that lasts as long as its condition (offline).
-    var dismissLabel: String? = nil
-    var action: (title: String, handler: () -> Void)? = nil
-    var onDismiss: (() -> Void)? = nil
-
-    /// A new message in the same slot counts as a new notice.
-    var key: String { id + "\u{1F}" + message }
-}
-
-/// One banner at a time over the chat. The newest notice wins; the others
-/// wait behind "N more", which brings the next one forward. Dismissing the
-/// one on show reveals the next.
-private struct MobileChatBannerLane: View {
-    let banners: [MobileChatBanner]
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    /// Banner keys by arrival, newest last.
-    @State private var order: [String] = []
-
-    private var shown: MobileChatBanner? {
-        banners.first { $0.key == order.last } ?? banners.last
-    }
-
-    var body: some View {
-        ZStack(alignment: .top) {
-            if let shown {
-                MobileChatIssueBanner(banner: shown, moreCount: banners.count - 1) {
-                    // Next one forward: the shown banner goes to the back.
-                    order.removeAll { $0 == shown.key }
-                    order.insert(shown.key, at: 0)
-                }
-                .id(shown.key)
-                .transition(.opacity)
-            }
-        }
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: shown?.key)
-        .onChange(of: banners.map(\.key), initial: true) { _, keys in
-            order = order.filter(keys.contains) + keys.filter { !order.contains($0) }
-        }
-    }
-}
-
-/// One readable, reachable presentation for transient chat failures. Error
-/// copy can be much longer than the happy-path composer controls (especially
-/// permission guidance), so actions sit on their own row instead of competing
-/// with the message for horizontal space on compact iPhones or at large text
-/// sizes. The close control keeps the platform's minimum touch target and an
-/// outcome-specific VoiceOver label.
-private struct MobileChatIssueBanner: View {
-    let banner: MobileChatBanner
-    let moreCount: Int
-    let onMore: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .top, spacing: 8) {
-                Image(systemName: banner.systemImage)
-                    .foregroundStyle(banner.tint)
-                    .padding(.top, 3)
-                    .accessibilityHidden(true)
-                Text(banner.message)
-                    .font(.callout)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.vertical, banner.onDismiss == nil ? 6 : 0)
-                if let onDismiss = banner.onDismiss {
-                    Button(action: onDismiss) {
-                        Image(systemName: "xmark")
-                            .font(.caption.weight(.semibold))
-                            .frame(width: 44, height: 44)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(banner.dismissLabel ?? "Dismiss")
-                }
-            }
-
-            if banner.action != nil || moreCount > 0 {
-                HStack(spacing: 16) {
-                    if let action = banner.action {
-                        Button(action.title, action: action.handler)
-                            .font(.callout.weight(.semibold))
-                    }
-                    Spacer(minLength: 0)
-                    if moreCount > 0 {
-                        Button("\(moreCount) more", action: onMore)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                            .frame(minHeight: 44)
-                            .contentShape(Rectangle())
-                            .accessibilityHint("Shows the next notice")
-                    }
-                }
-                .padding(.leading, 28)
-                .padding(.trailing, 12)
-            }
-        }
-        .padding(.leading, 10)
-        .padding(.trailing, 4)
-        .padding(.vertical, 4)
-        .background(banner.tint.opacity(0.14))
-        .accessibilityElement(children: .contain)
-    }
-}
-
-@Observable
-private final class MobileChatDraft {
-    var text = "" {
-        didSet {
-            if isEmpty != text.isEmpty { isEmpty = text.isEmpty }
-            let hasText = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            if self.hasText != hasText { self.hasText = hasText }
-        }
-    }
-    private(set) var isEmpty = true
-    private(set) var hasText = false
-}
-
-private struct MobileChatComposerField: View {
-    @Bindable var draft: MobileChatDraft
-    let placeholder: String
-    let focused: FocusState<Bool>.Binding
-    let accessibilitySize: Bool
-    let isSwitchingSession: Bool
-    let onSubmit: () -> Void
-
-    var body: some View {
-        TextField(placeholder, text: $draft.text,
-            prompt: Text(placeholder).foregroundStyle(AlivePalette.secondary), axis: .vertical)
-            .textFieldStyle(.plain)
-            .focused(focused)
-            .mobileTypography(.body)
-            .lineLimit(accessibilitySize ? 1...8 : 1...5)
-            .padding(.vertical, 11)
-            .frame(minHeight: 44)
-            .submitLabel(.send)
-            .onSubmit(onSubmit)
-            .disabled(isSwitchingSession)
-    }
 }

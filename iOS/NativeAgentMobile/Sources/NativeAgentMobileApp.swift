@@ -1,4 +1,3 @@
-// PATCH-2026-05-07: icloud-bridge app entry — iCloud-first transport wiring
 import SwiftUI
 import AppIntents
 import CryptoKit
@@ -15,21 +14,6 @@ extension Notification.Name {
     /// only explicit process launch arguments reach it.
     static let nativeagentDeepLinkSend = Notification.Name("nativeagent.chat.send")
     static let nativeagentOpenActivity = Notification.Name("nativeagent.open.activity")
-}
-
-/// Skipping initial pairing admits the user to the main app, but it must never
-/// remove the path back to pairing. The More tab owns that recovery action.
-enum PairingSkipPresentation {
-    enum MainAppState: Equatable {
-        case pairingRequired
-        case skipped
-        case paired
-    }
-
-    static func mainAppState(isPaired: Bool, pairingSkipped: Bool) -> MainAppState {
-        if isPaired { return .paired }
-        return pairingSkipped ? .skipped : .pairingRequired
-    }
 }
 
 /// Process-local simulator hook for a single launch-injected chat turn. The
@@ -64,16 +48,15 @@ enum NativeAgentDeepLinkSendHook {
         notificationCenter.post(name: .nativeagentDeepLinkSend, object: nil)
     }
 
-    @discardableResult
     static func deliverPending(
         to store: ChatStore,
         client: MacBridgeClient,
         controls: ChatRuntimeControls,
         emitHaptic: Bool = true
-    ) -> ChatSendDisposition? {
-        guard let text = pendingText else { return nil }
+    ) {
+        guard let text = pendingText else { return }
         pendingText = nil
-        return store.send(
+        store.send(
             text: text,
             client: client,
             controls: controls,
@@ -114,86 +97,36 @@ enum NativeAgentLaunchArgumentPresentation {
     }
 }
 
-enum NativeAgentNotificationLaunchIntent {
-    private static let openActivityKey = "NativeAgentMobile.pendingOpenActivityFromNotification"
-    private static let pendingScreenKey = "NativeAgentMobile.pendingNotificationScreen"
-
-    /// Allowed screen values that route to a top-level tab.
-    static let allowedScreens: Set<String> = [
-        "activity", "approvals", "inbox", "chat", "memories", "desk", "skills", "more",
+struct NativeAgentNotificationLaunchIntent: Codable, Identifiable, Hashable {
+    var id = UUID()
+    let screen: String
+    let sessionID: String?
+    let taskID: String?
+    private static let key = "NativeAgentMobile.pendingNotificationDestination"
+    private static let allowedScreens: Set<String> = [
+        "activity", "approvals", "inbox", "chat", "memories", "desk", "skills", "more", "workshop",
         "mac_integration", "macintegration", "mac-integration",
     ]
 
-    static var hasPendingOpenActivity: Bool {
-        UserDefaults.standard.bool(forKey: openActivityKey)
+    static var isPending: Bool { UserDefaults.standard.data(forKey: key) != nil }
+
+    static func stage(screen: String?, sessionID: String? = nil, taskID: String? = nil) {
+        let raw = screen?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) ?? "activity"
+        let screen = raw == "missions" ? "workshop" : allowedScreens.contains(raw) ? raw : "activity"
+        let session = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let intent = Self(screen: screen, sessionID: screen == "chat" ? session.flatMap { $0.isEmpty ? nil : $0 } : nil,
+                          taskID: ["desk", "workshop"].contains(screen) ? taskID.flatMap { $0.isEmpty ? nil : $0 } : nil)
+        UserDefaults.standard.set(try? JSONEncoder().encode(intent), forKey: key)
     }
 
-    /// F7: returns whichever screen the notification asked for, or nil if no
-    /// pending notification launch.  Defaults to "activity" when a launch is
-    /// queued but no screen field was set.
-    static var pendingScreen: String? {
-        guard UserDefaults.standard.bool(forKey: openActivityKey) else { return nil }
-        let raw = UserDefaults.standard.string(forKey: pendingScreenKey)?
-            .lowercased()
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if let raw, allowedScreens.contains(raw) { return raw }
-        return "activity"
-    }
-
-    static func markOpenActivityPending(screen: String? = nil) {
-        UserDefaults.standard.set(true, forKey: openActivityKey)
-        let cleaned = screen?.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        if let cleaned, allowedScreens.contains(cleaned) {
-            UserDefaults.standard.set(cleaned, forKey: pendingScreenKey)
-        } else {
-            UserDefaults.standard.removeObject(forKey: pendingScreenKey)
-        }
-    }
-
-    static func consumeOpenActivityPending() -> Bool {
-        guard UserDefaults.standard.bool(forKey: openActivityKey) else { return false }
-        UserDefaults.standard.removeObject(forKey: openActivityKey)
-        UserDefaults.standard.removeObject(forKey: pendingScreenKey)
-        return true
-    }
-
-    /// F7: returns the screen requested (defaulting to "activity") and clears
-    /// the pending flag in one step.
-    static func consumePendingScreen() -> String? {
-        guard let screen = pendingScreen else { return nil }
-        UserDefaults.standard.removeObject(forKey: openActivityKey)
-        UserDefaults.standard.removeObject(forKey: pendingScreenKey)
-        return screen
+    static func consume() -> Self? {
+        defer { UserDefaults.standard.removeObject(forKey: key) }
+        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(Self.self, from: data)
     }
 }
 
-/// 2026-09-06: the conversation a tapped reply notification came from. Stored
-/// the same way as the screen intent so a cold launch still routes: the view
-/// tree that consumes it may not exist when the tap is handled.
-enum MobileNotifiedChatSessionIntent {
-    private static let key = "NativeAgentMobile.pendingNotificationChatSession"
-
-    static func stage(_ sessionID: String?) {
-        let clean = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let clean, !clean.isEmpty else {
-            UserDefaults.standard.removeObject(forKey: key)
-            return
-        }
-        UserDefaults.standard.set(clean, forKey: key)
-    }
-
-    static func consume() -> String? {
-        guard let value = UserDefaults.standard.string(forKey: key)?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return nil }
-        UserDefaults.standard.removeObject(forKey: key)
-        return value
-    }
-}
-
-/// 2026-09-06: a chat-reply push whose answer is already on screen is noise.
-/// `willPresent` has no other way to know, so it asks the chat surface.
-/// The three strings the presentation check needs, extracted before any actor
-/// hop so the non-Sendable notification dictionary never crosses isolation.
+/// Extract Sendable reply keys before actor hops; the notification dictionary never crosses isolation.
 struct ChatReplyNotificationKeys: Sendable {
     let source: String?
     let correlationID: String?
@@ -236,15 +169,13 @@ struct NativeAgentMobileApp: App {
     @StateObject private var pairingStore = PairingStore()
     @StateObject private var bridgeClient = MacBridgeClient()
     @State private var chatStore = ChatStore.shared
-    // PERF-2026-08-05: `@Observable` controller — `@State`/`.environment` is the
-    // Observation idiom (`@StateObject`/`.environmentObject` require ObservableObject).
+    // Observation controllers use @State and .environment.
     @State private var voiceInput = VoiceInputController()
     @StateObject private var voiceOutput = VoiceOutputController()
     private let notificationDelegate = NativeAgentNotificationDelegate()
-    @State private var bridgeNotificationObserverID: UUID?
     @State private var didApplyPairingSecretLaunchArgument = false
     @State private var didScheduleTestNotificationLaunchArgument = false
-    /// Fix-A: persisted flag so users can skip the pairing screen and return later.
+    /// Skipping pairing persists across launches and leaves the pairing path available.
     @AppStorage("NativeAgentMobile.pairingSkipped") private var pairingSkipped = false
     @AppStorage(NativeAgentAppearance.storageKey) private var appearanceRawValue = NativeAgentAppearance.system.rawValue
 
@@ -258,18 +189,13 @@ struct NativeAgentMobileApp: App {
         iCloudBridge.shared.pairingStore = pairing
         iCloudSyncEngine.shared.pairingStore = pairing
         // Location relaunches need their observer even without a visible scene.
-        if PhonePlaces.shared.places.contains(where: \.enabled) {
-            iCloudBridge.shared.setup()
-            PhonePlaces.shared.resume()
-        }
+        if pairing.usesICloudTransport { iCloudBridge.shared.setup() }
+        PhonePlaces.shared.resume()
     }
 
-    /// True when the user has either paired OR explicitly skipped the pairing screen.
+    /// Pairing, an explicit skip or pending repair admits the main app; More retains the pairing action.
     private var shouldShowMainApp: Bool {
-        PairingSkipPresentation.mainAppState(
-            isPaired: pairingStore.isPaired,
-            pairingSkipped: pairingSkipped || pairingStore.connectionRepairPending
-        ) != .pairingRequired
+        pairingStore.isPaired || pairingSkipped || pairingStore.connectionRepairPending
     }
 
     @Environment(\.scenePhase) private var scenePhase
@@ -289,7 +215,7 @@ struct NativeAgentMobileApp: App {
         // The Mac's beat is re-read on activation (iCloudBridge); until it
         // lands, an old sighting reads as finding the Mac, not losing it.
         bridgeClient.connectingStartedAt = Date()
-        bridgeClient.refreshBridgeStatus()
+        bridgeClient.refreshConnection()
         PhonePlaces.shared.resume()
         foregroundRefreshTask = Task { @MainActor in
             defer { if foregroundRefreshID == generation { foregroundRefreshTask = nil } }
@@ -316,9 +242,7 @@ struct NativeAgentMobileApp: App {
                         .environment(voiceInput)
                         .environmentObject(voiceOutput)
                         .onAppear {
-                            // E8: durable queued sends resume themselves when
-                            // the phone's network path returns, instead of
-                            // waiting for the user to notice and retry.
+                            // Resume durable queued sends when the phone's network path returns.
                             bridgeClient.onNetworkPathRestored = { [weak chatStore = chatStore] in
                                 chatStore?.recoverQueuedSendTransport()
                                 PhoneTurnActivity.shared.resumeWorkActivities()
@@ -346,7 +270,6 @@ struct NativeAgentMobileApp: App {
                             configureNotifications()
                             refreshOnForeground()
                         }
-                        // 2026-07-04 foreground-refresh fix (see refreshOnForeground).
                         .onChange(of: scenePhase) { _, newPhase in
                             if newPhase != .active {
                                 Task {
@@ -358,8 +281,7 @@ struct NativeAgentMobileApp: App {
                         }
                 } else {
                     PairingView(onSkip: {
-                        // Fix-A: user tapped Skip — persist the flag and show the main app.
-                        // Does NOT clear any existing pairing credentials.
+                        // Persist skipping without clearing pairing credentials.
                         pairingSkipped = true
                         configureTransport()
                     }, onPaired: {
@@ -383,10 +305,7 @@ struct NativeAgentMobileApp: App {
                     }
                 }
             }
-            // 2026-09-22: automatic pairing never taps Connect, so the Mac
-            // never listed this phone and the first approve failed. Announce
-            // on launch and whenever the key changes; the Mac treats repeats
-            // as a no-op and re-lists a removed phone as pending.
+            // Announce on launch and key changes; the Mac ignores repeats and re-lists removed phones as pending.
             .task { announcePhoneToMac() }
             .onChange(of: pairingStore.iCloudPairingSecret) { _, _ in announcePhoneToMac() }
             .preferredColorScheme(NativeAgentAppearance.resolved(appearanceRawValue).colorScheme)
@@ -444,12 +363,7 @@ struct NativeAgentMobileApp: App {
         }
     }
 
-    // PATCH-2026-05-07: icloud-bridge route to iCloud based on pairing type
-    // PATCH-2026-05-11: fix-skip-icloud — also use iCloud when the HMAC secret is
-    // present but isICloudPaired is false (e.g. user tapped Skip on pairing screen
-    // after a previous iCloud pairing stored the Keychain secret, or if the flag
-    // was cleared by a migration).  iCloudPairingSecret presence is sufficient to
-    // route to iCloud; isICloudPaired is a convenience flag that can fall behind.
+    // HMAC secret presence permits iCloud routing independently of the paired flag.
     private func configureTransport() {
         guard !pairingStore.isRepairingConnection else { return }
         // Inject pairingStore into both iCloud surfaces so they can sign messages:
@@ -457,8 +371,7 @@ struct NativeAgentMobileApp: App {
         //   - iCloudBridge:     chat channel (BridgeMessage)
         iCloudSyncEngine.shared.pairingStore = pairingStore
         iCloudBridge.shared.pairingStore = pairingStore
-        // F4: bridgeClient needs pairingStore so it can pick the `.macUnreachable`
-        // status when paired but the bridge has been offline for >30 s.
+        // Pairing lets the client distinguish an unreachable Mac from an unpaired bridge.
         bridgeClient.pairingStore = pairingStore
         PhonePlaces.shared.resume()
         PhoneTurnActivity.shared.resumeWorkActivities()
@@ -466,25 +379,11 @@ struct NativeAgentMobileApp: App {
         // (the secret survives app reinstalls and Skip flows via Keychain).
         if pairingStore.usesICloudTransport {
             bridgeClient.configureICloud()
-            startBridgeNotificationObserver()
         } else if pairingStore.connectionRepairPending {
             iCloudBridge.shared.setup()
         } else {
-            stopBridgeNotificationObserver()
             bridgeClient.disconnect()
         }
-    }
-
-    private func startBridgeNotificationObserver() {
-        guard bridgeNotificationObserverID == nil else { return }
-        bridgeNotificationObserverID = iCloudBridge.shared.observeNotifications { msg in
-            await NativeAgentBridgeNotificationScheduler.schedule(msg)
-        }
-    }
-
-    private func stopBridgeNotificationObserver() {
-        iCloudBridge.shared.removeNotificationObserver(bridgeNotificationObserverID)
-        bridgeNotificationObserverID = nil
     }
 
     /// Explicit process-argument test hook. Pass

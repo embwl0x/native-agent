@@ -5,36 +5,25 @@ import NativeAgentCore
 import PersistenceCore
 import ApprovalTransactions
 import NotificationInbox
-import BackgroundWork
 import ChatTurnRuntime
+import BackgroundWork
 // Blueprint: | `InboxCardActions.swift` | `AppInboxCardActionEffects`: mounted navigation and injected engine inbox; callers use the core inbox transaction directly |
 
 /// Mounted presentation and live app bindings for the core inbox transaction.
 struct AppInboxCardActionEffects: InboxCardActionEffects {
     let inbox: InboxFacade
-    var heartbeatActionIDs: Set<String> { HeartbeatCardAction.ids }
-    var heartbeatOpenApprovalsActionID: String { HeartbeatCardAction.openApprovals.rawValue }
-    var heartbeatRepairActionID: String { HeartbeatCardAction.repair.rawValue }
 
     func interactionAction(id: String, action: String, dataRoot: URL, quiet: Bool) async throws {
         try await InteractionCardDelivery.act(id: id, action: action, dataRoot: dataRoot, quiet: quiet)
     }
 
     func resolveApproval(id: String, decision: String, dataRootOverride: URL?) async throws {
-        _ = try await ApprovalTransactionCoordinator.app(dataRootOverride: dataRootOverride)
+        _ = try await ApprovalExecution.app()
             .resolveApproval(id: id, decision: decision)
     }
 
     func inboxItems(dataRoot: URL) async throws -> [InboxItemRecord] {
         try await inbox.list()
-    }
-
-    func primaryActionProjection(for item: InboxItemRecord) -> (opensApprovals: Bool, isProactive: Bool) {
-        (item.fallbackPrimaryAction?.id == "open_approvals" || item.hasLinkedApproval, item.isProactiveCard)
-    }
-
-    func repairHeartbeatInboxItem(id: String, dataRoot: URL) async throws -> String {
-        try await NativeAgentEngine.repairHeartbeatInboxItem(id: id, dataRoot: dataRoot)
     }
 
     func cleanUpDiskHygiene(dataRoot: URL) async throws -> String {
@@ -45,27 +34,19 @@ struct AppInboxCardActionEffects: InboxCardActionEffects {
         NativeAgentEngine.forRoot(dataRoot).chatClient(profile: .background)
     }
 
-    func openApprovals() async {
-        await MainActor.run {
-            NotificationCenter.default.post(name: .openApprovalsRequest, object: nil)
-        }
+    @MainActor func openApprovals() async {
+        NotificationCenter.default.post(name: .openApprovalsRequest, object: nil)
     }
 
-    func openDesk() async {
-        await MainActor.run {
-            NotificationCenter.default.post(name: .openCommandRouteRequest, object: "desk")
-        }
+    @MainActor func openDesk() async {
+        NotificationCenter.default.post(name: .openCommandRouteRequest, object: "desk")
     }
 
-    func openChatDraft(_ draft: String) async {
-        await MainActor.run {
-            NotificationCenter.default.post(name: .openChatDraftRequest, object: draft)
-        }
+    @MainActor func openChatDraft(_ draft: String) async {
+        NotificationCenter.default.post(name: .openChatDraftRequest, object: draft)
     }
 
-    func openSpokenChat(_ sessionID: String) async {
-        await MainActor.run {
-            NotificationCenter.default.post(name: .openSpokenChatRequest, object: sessionID)
-        }
+    @MainActor func openSpokenChat(_ sessionID: String) async {
+        NotificationCenter.default.post(name: .openSpokenChatRequest, object: sessionID)
     }
 }

@@ -83,12 +83,14 @@ public enum ProviderStateValidation {
                     }
                     continue
                 }
+                let raw: Any
                 switch value {
-                case .int: break
-                case .double(let number) where number.isFinite: break
-                case .string(let string) where SwiftNativeProviderRouting.parseAuthExpiresAt(string)?.timeIntervalSince1970.isFinite == true: break
+                case .int(let number): raw = number
+                case .double(let number): raw = number
+                case .string(let string): raw = string
                 default: throw invalid("provider \(key) must be a valid expiry")
                 }
+                guard parseExpiresAt(raw) != nil else { throw invalid("provider \(key) must be a representable expiry") }
             }
         }
         for key in ["tokens", "discovery", "user_info"] {

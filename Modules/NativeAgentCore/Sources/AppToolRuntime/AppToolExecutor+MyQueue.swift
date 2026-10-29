@@ -11,9 +11,9 @@ import TrustCenter
 extension AppToolExecutor {
     @MainActor
     func runHouseFile(input: [String: JSONValue], surface: String) async -> JSONValue {
-        guard let title = Self.inputString(input["title"])?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty,
-              let summary = Self.inputString(input["summary"])?.trimmingCharacters(in: .whitespacesAndNewlines), !summary.isEmpty,
-              let owner = ["me": HarnessFinding.Owner.agent, "builder": .builder, "user": .owner][Self.inputString(input["owner"]) ?? ""] else {
+        guard let title = input["title"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty,
+              let summary = input["summary"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines), !summary.isEmpty,
+              let owner = ["me": HarnessFinding.Owner.agent, "builder": .builder, "user": .owner][input["owner"]?.scalarText ?? ""] else {
             return Self.doorRefusal("invalid_input", "Nothing was filed.", remedy: "fix_args",
                                     "Pass title, summary and owner: me, builder or user.")
         }
@@ -61,7 +61,7 @@ extension AppToolExecutor {
     func runMyQueue(verb: String, input: [String: JSONValue], surface: String) async -> JSONValue {
         let store = SwiftNativeDeskStore(dataRoot: quietHost()?.dataRootOverride ?? PersistenceCore.defaultDataRoot())
         func text(_ key: String) -> String? {
-            Self.inputString(input[key]).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
+            input[key]?.scalarText.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
         }
         func receipt(_ entry: MyQueue.Entry, _ change: String) -> JSONValue {
             .object(["status": .string("ok"), "id": .string(entry.name), "queue": .string(change), "owner": .string("hers"),

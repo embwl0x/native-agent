@@ -1,6 +1,7 @@
 import Foundation
+import NativeAgentShared
 
-// Blueprint: | `DerivedStateInvalidation.swift` | `DerivedStateInvalidationCenter`: post-write canonical-source invalidations and coalesced sink delivery; derived owners must reread truth |
+// Blueprint: | `DerivedStateInvalidation.swift` | `DerivedStateInvalidationCenter`: post-write canonical-source invalidations through StoreReloadDebouncer.Timer and coalesced sink delivery; derived owners must reread truth |
 
 /// Dependency-neutral source invalidation emitted only after a canonical write
 /// succeeds. Derived systems use this as a wake-up signal and must reread the
@@ -69,29 +70,25 @@ public actor DerivedStateInvalidationCenter {
         let canonicalLocator: String?
     }
 
-    private let coalescingNanoseconds: UInt64
+    private let coalescingDelay: Duration
     private var sink: (any DerivedStateInvalidationSink)?
     private var pending: [ChangeKey: DerivedSourceChange] = [:]
-    private var debounceTask: Task<Void, Never>?
+    private var timer = StoreReloadDebouncer.Timer()
     private var activeDelivery: Task<Void, Never>?
-    private var activeGeneration: UInt64?
-    private var deliveryGeneration: UInt64 = 0
 
     public init(coalescingNanoseconds: UInt64 = 150_000_000) {
-        self.coalescingNanoseconds = coalescingNanoseconds
+        self.coalescingDelay = .nanoseconds(coalescingNanoseconds)
     }
 
     public func install(_ sink: (any DerivedStateInvalidationSink)?) {
         self.sink = sink
-        deliveryGeneration &+= 1
-        debounceTask?.cancel()
-        debounceTask = nil
+        timer.cancel()
         activeDelivery?.cancel()
         if sink == nil { pending.removeAll(keepingCapacity: true) }
         schedulePendingDelivery()
     }
 
-    deinit { debounceTask?.cancel(); activeDelivery?.cancel() }
+    deinit { timer.cancel(); activeDelivery?.cancel() }
 
     public func publish(_ change: DerivedSourceChange) async {
         await publish([change])
@@ -112,32 +109,20 @@ public actor DerivedStateInvalidationCenter {
     }
 
     private func schedulePendingDelivery() {
-        guard sink != nil, !pending.isEmpty, debounceTask == nil, activeDelivery == nil else { return }
-        deliveryGeneration &+= 1
-        let expectedGeneration = deliveryGeneration
-        let delay = coalescingNanoseconds
-        debounceTask = Task { [weak self] in
-            if delay > 0 {
-                do {
-                    try await Task.sleep(nanoseconds: delay)
-                } catch {
-                    return
-                }
-            }
-            guard !Task.isCancelled else { return }
-            await self?.scheduledDeliveryFired(expectedGeneration)
+        guard sink != nil, !pending.isEmpty, !timer.isPending, activeDelivery == nil else { return }
+        timer.schedule(delay: coalescingDelay) { [weak self] expected in
+            await self?.scheduledDeliveryFired(expected)
         }
     }
 
     /// Nobody joins a delivery: writers publish and return, and derived
     /// owners rebuild on their own.
     private func scheduledDeliveryFired(_ expectedGeneration: UInt64) {
-        guard expectedGeneration == deliveryGeneration else { return }
-        debounceTask = nil
-        startPendingDelivery(expectedGeneration)
+        guard timer.take(expectedGeneration) else { return }
+        startPendingDelivery()
     }
 
-    private func startPendingDelivery(_ expectedGeneration: UInt64) {
+    private func startPendingDelivery() {
         guard let sink, !pending.isEmpty, activeDelivery == nil else { return }
         let changes = pending.values.sorted {
             if $0.namespace != $1.namespace { return $0.namespace < $1.namespace }
@@ -151,17 +136,14 @@ public actor DerivedStateInvalidationCenter {
         // The debounce timer and entered delivery have separate lifetimes.
         // Sink replacement requests cancellation but retains exclusion until
         // the old sink actually returns; writers never join that execution.
-        activeGeneration = expectedGeneration
         activeDelivery = Task { [weak self] in
             if !Task.isCancelled { await sink.sourceDidChange(changes) }
-            await self?.deliveryFinished(expectedGeneration)
+            await self?.deliveryFinished()
         }
     }
 
-    private func deliveryFinished(_ expectedGeneration: UInt64) {
-        guard activeGeneration == expectedGeneration else { return }
+    private func deliveryFinished() {
         activeDelivery = nil
-        activeGeneration = nil
         schedulePendingDelivery()
     }
 }

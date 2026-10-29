@@ -7,8 +7,6 @@ import Foundation
 // screen/target adapter.
 
 public struct VisionAffordanceRow: Sendable, Equatable {
-    public let handle: String
-    public let handleAmbiguity: String?
     public let roleGuess: String
     /// The OCR label, already redacted. nil when the region carried no text.
     public let label: VisionRedactedText?
@@ -33,8 +31,6 @@ public struct VisionAffordanceRow: Sendable, Equatable {
     public let visualShape: String?
 
     public init(
-        handle: String,
-        handleAmbiguity: String?,
         roleGuess: String,
         label: VisionRedactedText?,
         rect: VisionRect,
@@ -48,8 +44,6 @@ public struct VisionAffordanceRow: Sendable, Equatable {
         visualColor: String? = nil,
         visualShape: String? = nil
     ) {
-        self.handle = handle
-        self.handleAmbiguity = handleAmbiguity
         self.roleGuess = roleGuess
         self.label = label
         self.rect = rect
@@ -75,13 +69,13 @@ public struct VisionReadoutRow: Sendable, Equatable {
     public let handle: String
     public let text: VisionRedactedText
     public let rect: VisionRect
-    public let confidence: VisionConfidence
+    public let confidence: Double
 
-    public init(handle: String, text: VisionRedactedText, rect: VisionRect, confidence: VisionConfidence) {
+    public init(handle: String, text: VisionRedactedText, rect: VisionRect, confidence: Double) {
         self.handle = handle
         self.text = text
         self.rect = rect
-        self.confidence = confidence
+        self.confidence = VisionConfidence.clamp(confidence)
     }
 }
 
@@ -96,7 +90,7 @@ public struct VisionRecognizedText: Sendable, Equatable {
 
     public init(text: VisionRedactedText, confidence: Double, rect: VisionRect? = nil) {
         self.text = text
-        self.confidence = VisionConfidence.clamp(confidence)
+        self.confidence = confidence
         self.rect = rect
     }
 }
@@ -104,8 +98,6 @@ public struct VisionRecognizedText: Sendable, Equatable {
 public struct VisionPercept: Sendable, Equatable {
     public let rows: [VisionAffordanceRow]
     public let readouts: [VisionReadoutRow]
-    /// Candidates beyond the affordance cap, retained for total-row reporting.
-    public let droppedBeyondCap: Int
     public let frameSize: VisionSize
     /// Did the conditional tiling pass fire, and why / why not.
     public let textTiled: Bool
@@ -120,7 +112,6 @@ public struct VisionPercept: Sendable, Equatable {
     public init(
         rows: [VisionAffordanceRow],
         readouts: [VisionReadoutRow],
-        droppedBeyondCap: Int,
         frameSize: VisionSize,
         textTiled: Bool,
         textTilingReason: String,
@@ -130,7 +121,6 @@ public struct VisionPercept: Sendable, Equatable {
     ) {
         self.rows = rows
         self.readouts = readouts
-        self.droppedBeyondCap = droppedBeyondCap
         self.frameSize = frameSize
         self.textTiled = textTiled
         self.textTilingReason = textTilingReason

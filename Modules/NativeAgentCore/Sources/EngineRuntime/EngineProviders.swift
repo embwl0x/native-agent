@@ -1,3 +1,4 @@
+import StandingBots
 import Foundation
 import Observation
 import NativeAgentCore
@@ -7,9 +8,9 @@ import ProviderRouting
 import Cognition
 import DeviceSync
 import ChatToolRuntime
-// Blueprint: | `EngineProviders.swift` | ProvidersFacade.settings owns routing, connections, catalog and derived readiness for every Mac picker and phone publication; provider/account invalidations refresh this snapshot. LatestRead orders settings and per-session route/context reads, returning each caller its own result; committed routing publishes through write. ProviderRouting owns persistence, discovery and eligibility; editors hold pending choices only. Catalog rows come only from the live catalog owners; the unwritten providers/models.json compatibility input is retired. |
+// Blueprint: | `EngineProviders.swift` | ProvidersFacade.settings owns routing, connections, catalog and derived readiness for every Mac picker and phone publication; provider/account invalidations refresh this snapshot. LatestRead orders settings and per-session route/context reads, returning each caller its own result; committed routing publishes through write. ProviderRouting owns persistence, discovery and eligibility; editors hold pending choices only. Catalog rows come only from the live catalog owners; independent ChatGPT, OpenRouter and Moonshot refreshes run concurrently with their existing error/freshness results; the unwritten providers/models.json compatibility input is retired. |
 
-/// `NativeAgentEngine.providers` (S10): provider routing for one data root.
+/// `NativeAgentEngine.providers`: provider routing for one data root.
 /// The chat picker, Setup, Telegram and the Providers page render
 /// `connections` (each provider's auth state and models) and `catalog` (the
 /// selectable models plus each surface's saved pick), derived from `settings`.
@@ -44,11 +45,24 @@ public final class ProvidersFacade {
         try await codexAuthRead.read({ try await codexAuthStatus() }, publish: { codexAuth = $0 })
     }
     /// One effective route and context readout per conversation, shared by every surface.
-    public struct SessionPresentation {
+    @MainActor public struct SessionPresentation {
         public let contract: BotChatContract?
-        public let choice: ProviderTurnChoice?
+        public var choice: ProviderTurnChoice?
         public let context: SessionContextStatus?
         public let error: String?
+        fileprivate var settings: SettingsSnapshot?
+        public var providerGroups: [ChatComposerModelGroup] {
+            ChatComposerModelGroup.groups(connections: settings?.providers ?? [], catalog: settings?.catalog,
+                                          providerID: choice?.provider ?? "")
+        }
+        public var selectedModel: ModelCatalogItem? {
+            providerGroups.first { $0.id == choice?.provider }?.models.first { $0.id == choice?.model }
+        }
+        public var efforts: [ReasoningEffortOption] {
+            ProvidersFacade.reasoningOptions(from: settings?.catalog, selectedModel: selectedModel)
+        }
+        public var supportsFast: Bool { selectedModel?.supportsFast == true }
+        public var fastIsOn: Bool { choice?.fast == true && (contract != nil || supportsFast) }
     }
     public private(set) var sessions: [String: SessionPresentation] = [:]
     @ObservationIgnored private var sessionReads: [String: LatestRead] = [:]
@@ -57,7 +71,7 @@ public final class ProvidersFacade {
     public func observeSession(_ sessionID: String) async {
         var paths = ["providers/surfaces.json", "providers/active.json", "providers",
                      "chat/messages/\(sessionID).jsonl", "chat/session_state/\(sessionID)/provider_usage.json"]
-        if sessionID.hasPrefix("bot-"), let id = UUID(uuidString: String(sessionID.dropFirst(4))) {
+        if let id = BotDefinition.id(forSession: sessionID) {
             paths.append("bots/definitions/\(id.uuidString).json")
         }
         let changes = FileChangeEvents(paths: paths.map { dataRoot.appendingPathComponent($0) }, emitInitial: false)
@@ -70,7 +84,6 @@ public final class ProvidersFacade {
 
     @discardableResult
     public func refreshSession(_ sessionID: String) async -> SessionPresentation {
-        guard !sessionID.isEmpty else { return SessionPresentation(contract: nil, choice: nil, context: nil, error: nil) }
         let read = sessionReads[sessionID] ?? LatestRead()
         sessionReads[sessionID] = read
         return await read.read({ await self.readSession(sessionID) }, publish: { sessions[sessionID] = $0 })
@@ -89,14 +102,14 @@ public final class ProvidersFacade {
             }
             let context: SessionContextStatus?
             // A helper never uses the resident's context preparation or compaction.
-            if contract == nil, let choice {
-                context = try await RuntimeReadProjection.getSessionContext(sessionId: sessionID,
+            if !sessionID.isEmpty, contract == nil, let choice {
+                context = try await RuntimeReadouts.getSessionContext(sessionId: sessionID,
                     model: choice.model, providerID: choice.provider, dataRoot: dataRoot, configuredThresholdTokens: nil)
             } else { context = nil }
-            let read = SessionPresentation(contract: contract, choice: choice, context: context, error: contract?.modelChoiceProblem)
+            let read = SessionPresentation(contract: contract, choice: choice, context: context, error: contract?.modelChoiceProblem, settings: settings)
             return read
         } catch {
-            let read = SessionPresentation(contract: contract, choice: choice, context: nil, error: error.localizedDescription)
+            let read = SessionPresentation(contract: contract, choice: choice, context: nil, error: error.localizedDescription, settings: settings)
             return read
         }
     }
@@ -112,35 +125,23 @@ public final class ProvidersFacade {
     private var accountModelRefreshTask: Task<Void, Never>?
     @ObservationIgnored private var accountModelUpdatesTask: Task<Void, Never>?
 
-    public struct ChatBrainSelection: Equatable, Sendable {
-        public var model: String
-        public var reasoningEffort: String
-        public var fastMode: Bool
-
-        public init(model: String, reasoningEffort: String, fastMode: Bool) {
-            self.model = model
-            self.reasoningEffort = reasoningEffort
-            self.fastMode = fastMode
-        }
-    }
-
     public enum ChatBrainSaveResult: Equatable, Sendable {
-        case unchanged(ChatBrainSelection)
-        case saved(ChatBrainSelection)
+        case unchanged(ProviderTurnChoice)
+        case saved(ProviderTurnChoice)
         case failed(message: String, cause: String? = nil)
     }
 
-    public var isSavingChatBrain = false
-    public var chatBrainCanonicalSelection: ChatBrainSelection? {
+    public internal(set) var isSavingChatBrain = false
+    public var chatBrainCanonicalSelection: ProviderTurnChoice? {
         settings.flatMap { $0.preferences["chat"] }.map {
-            ChatBrainSelection(model: $0.model, reasoningEffort: $0.reasoningEffort,
-                fastMode: $0.serviceTier == "priority")
+            ProviderTurnChoice(provider: settings?.activeProviders["chat"] ?? "",
+                model: $0.model, reasoningEffort: $0.reasoningEffort, fast: $0.serviceTier == "priority")
         }
     }
-    @ObservationIgnored var chatBrainPendingSave: (generation: UInt64, selection: ChatBrainSelection)?
-    @ObservationIgnored public var chatBrainSaveGeneration: UInt64 = 0
+    @ObservationIgnored var chatBrainPendingSave: (generation: UInt64, selection: ProviderTurnChoice)?
+    @ObservationIgnored var chatBrainSaveGeneration: UInt64 = 0
     @ObservationIgnored var chatBrainLastSaveResult: (generation: UInt64, result: ChatBrainSaveResult)?
-    @ObservationIgnored public internal(set) var chatBrainSaveTask: Task<Void, Never>?
+    @ObservationIgnored var chatBrainSaveTask: Task<Void, Never>?
 
     public nonisolated init(dataRoot: URL) {
         self.dataRoot = dataRoot
@@ -162,6 +163,7 @@ public final class ProvidersFacade {
 
     func publishSettings(_ snapshot: SettingsSnapshot) {
         settings = snapshot
+        sessions = sessions.mapValues { var value = $0; value.settings = snapshot; return value }
         settingsError = nil
     }
 
@@ -175,12 +177,6 @@ public final class ProvidersFacade {
     /// the Providers page's row set.
     public nonisolated var routing: SwiftNativeProviderRouting {
         SwiftNativeProviderRouting(dataRoot: dataRoot)
-    }
-
-    /// `<dataRoot>/providers/active.json` (surface → provider). Missing is
-    /// empty; damaged existing state throws.
-    public nonisolated func activeProviders() async throws -> [String: String] {
-        try await routing.readActiveProvidersChecked()
     }
 
     /// UI maintenance returns immediately; no turn waits for account discovery.
@@ -202,10 +198,9 @@ public final class ProvidersFacade {
 // MARK: - Connections
 
 extension ProvidersFacade {
-    public nonisolated func disconnectProvider(
-        _ id: String, clearProvider: @Sendable () async throws -> Void
-    ) async throws -> (ok: Bool, detail: String) {
-        try await clearProvider()
+    public nonisolated func disconnectProvider(_ id: String) async throws -> (ok: Bool, detail: String) {
+        try await clearProvider(id)
+        Task { _ = await NativeAgentEngine.liveDeviceSync.bridge.publishProviderCatalogStatus() }
         // OAuth credentials have their own store; removing the registry row
         // alone must never claim the account was disconnected.
         let clearedOAuth = NativeOAuthFlow.clearTokens(providerId: id, dataRoot: dataRoot)
@@ -222,9 +217,9 @@ extension ProvidersFacade {
         return (true, detail)
     }
 
-    public func list() async throws -> [ProviderInfo] {
+    public func list() async throws -> (providers: [ProviderInfo], routing: ProviderRoutingSnapshot) {
         switch await refreshSettings(refreshCatalog: false, cause: { error, _ in error.localizedDescription }) {
-        case .loaded(let snapshot): return snapshot.providers
+        case .loaded(let snapshot): return (snapshot.providers, snapshot.routing)
         case .failed(let detail): throw ProviderRoutingError.underlying(detail)
         }
     }
@@ -268,7 +263,7 @@ extension ProvidersFacade {
                 NSLocalizedDescriptionKey: "provider id is required"
             ])
         }
-        let providers = try await list()
+        let providers = try await list().providers
         if let exact = providers.first(where: { $0.provider_id == trimmed }) {
             return exact
         }
@@ -286,19 +281,14 @@ public extension NativeAgentEngine {
     @MainActor
     func clearSurfaceOverride(surface: String) async throws {
         guard let group = ProviderSurfaceGroups.group(for: surface) else { throw ProviderRoutingError.invalidRequest }
-        let result = try await providers.routing.saveGroupSelection(group: group, clearOverride: true)
-        try providers.publishCommittedRouting(result.snapshot)
-        await providers.refreshSessionsAfterRoutingWrite()
-        if surface == "cognition_reflection" {
-            await Self.liveCognition.refreshConfiguration()
-        }
-        Task { _ = await Self.liveDeviceSync.bridge.publishProviderCatalogStatus() }
+        _ = try await saveProviderGroupSelection(group: group, providerID: nil, model: nil,
+            reasoningEffort: nil, serviceTier: nil, clearOverride: true)
     }
 
     @MainActor
     func saveProviderGroupSelection(
-        group: ProviderSurfaceGroup, providerID: String?, model: String?,
-        reasoningEffort: String?, serviceTier: String?, clearOverride: Bool
+        group: ProviderSurfaceGroup, providerID: String? = nil, model: String? = nil,
+        reasoningEffort: String? = nil, serviceTier: String? = nil, clearOverride: Bool = false
     ) async throws -> ProviderGroupWriteResult {
         let result = try await providers.routing.saveGroupSelection(
             group: group, providerID: providerID, model: model, reasoningEffort: reasoningEffort,
@@ -317,17 +307,13 @@ public extension NativeAgentEngine {
     @MainActor
     func configureSurfaceSelection(
         surface: String, providerID: String, model: String, reasoningEffort: String, serviceTier: String?
-    ) async throws -> ModelCatalogResponse {
-        let response = try await providers.saveSurfaceSelection(
-            surface: surface, model: model, reasoningEffort: reasoningEffort,
-            serviceTier: serviceTier, providerID: providerID
+    ) async throws -> ProviderRoutingSnapshot {
+        guard let group = ProviderSurfaceGroups.group(for: surface) else { throw ProviderRoutingError.invalidRequest }
+        let result = try await saveProviderGroupSelection(
+            group: group, providerID: providerID, model: model, reasoningEffort: reasoningEffort,
+            serviceTier: serviceTier, clearOverride: false
         )
-        _ = await providers.refreshSettings(refreshCatalog: false) { error, _ in error.localizedDescription }
-        if surface == "cognition_reflection" {
-            await Self.liveCognition.refreshConfiguration()
-        }
-        Task { _ = await Self.liveDeviceSync.bridge.publishProviderCatalogStatus() }
-        return response
+        return result.snapshot
     }
 
     @MainActor
@@ -336,57 +322,39 @@ public extension NativeAgentEngine {
         Task { _ = await Self.liveDeviceSync.bridge.publishProviderCatalogStatus() }
     }
 
-    @MainActor
-    func clearProvider(_ id: String) async throws {
-        try await providers.clearProvider(id)
-        Task { _ = await Self.liveDeviceSync.bridge.publishProviderCatalogStatus() }
-    }
 }
 
 // MARK: - Catalog
 
 extension ProvidersFacade {
-    /// The provider-neutral model catalog with every surface's current pick
-    /// (`current`) from one recovered routing snapshot.
+    /// Available models and their capabilities, independent of saved selections.
     public nonisolated func modelCatalog(
         refresh: Bool,
-        codexCacheURL: URL? = nil,
-        routingSnapshot suppliedSnapshot: ProviderRoutingSnapshot? = nil
+        codexCacheURL: URL? = nil
     ) async throws -> ModelCatalogResponse {
         let dataRoot = self.dataRoot
-        // Catalog owners supply the rows; the checked routing snapshot supplies picks.
-        var accountRefreshError: Error?
-        if refresh {
+        async let accountRefresh: Error? = {
+            guard refresh else { return nil }
             do {
                 _ = try await ChatGPTAccountModelRefresh.shared.refresh(dataRoot: dataRoot, force: true)
+                return nil
             } catch {
-                accountRefreshError = error
+                return error
             }
-        }
+        }()
+        async let openRouterRefresh = OpenRouterModelCatalog.modelsWithFreshness(dataRoot: dataRoot, refresh: refresh)
+        async let moonshotRefresh: Void = {
+            if refresh { _ = await MoonshotModelCatalog.models(dataRoot: dataRoot, refresh: true) }
+        }()
+        let accountRefreshError = await accountRefresh
         let firstPartyModels = (
             FirstPartyModelCatalog.publicOpenAIModels
             + FirstPartyModelCatalog.anthropicModels
             + FirstPartyModelCatalog.xAIModels
         ).enumerated().map { index, model in
-            ModelCatalogItem(
-                id: model.id,
-                displayName: model.name,
-                description: nil,
-                defaultReasoningEffort: model.defaultReasoningEffort,
-                supportedReasoningEfforts: model.supportedReasoningEfforts,
-                supportsFast: model.supportsFast,
-                priority: 100 + index
-            )
+            ModelCatalogItem(model, priority: 100 + index)
         }
-        let openRouterRead = await OpenRouterModelCatalog.modelsWithFreshness(
-            dataRoot: dataRoot, refresh: refresh
-        )
-        // S12a: Refresh reaches Moonshot's fetched list too, so the Providers
-        // page's "couldn't load models" line has a real retry behind it; the
-        // provider rows (`list()`) read the result from its cache.
-        if refresh {
-            _ = await MoonshotModelCatalog.models(dataRoot: dataRoot, refresh: true)
-        }
+        let (openRouterRead, _) = await (openRouterRefresh, moonshotRefresh)
         // Discovery failure is catalog status, not a failed routing read:
         // callers must still publish the other providers' refreshed lists.
         let catalogFreshness = accountRefreshError == nil
@@ -408,48 +376,12 @@ extension ProvidersFacade {
                     priority: 1_000 + index
                 )
             }
-        let routingSnapshot: ProviderRoutingSnapshot
-        if let suppliedSnapshot { routingSnapshot = suppliedSnapshot }
-        else { routingSnapshot = try await routing.checkedRoutingSnapshot() }
         let resolvedCodexCacheURL = codexCacheURL
             ?? CodexSelectableModelCatalog.chatGPTOAuthCacheCandidate(dataRoot: dataRoot)
         let codexSelectableModels = CodexSelectableModelCatalog.modelCatalogItems(
             cacheURL: resolvedCodexCacheURL,
             useDefaultCacheWhenNil: false
         )
-        func projectedPreference(_ surface: String) -> ModelSurfacePreference? {
-            guard let preference = routingSnapshot.preferences[surface] else { return nil }
-            return ModelSurfacePreference(
-                surface: preference.surface,
-                model: preference.model,
-                reasoningEffort: preference.reasoningEffort,
-                serviceTier: preference.serviceTier,
-                source: nil,
-                modelKnown: preference.modelKnown
-            )
-        }
-        guard let chatPreference = projectedPreference("chat"),
-              let telegramPreference = projectedPreference("telegram") else {
-            throw NSError(
-                domain: "NativeAgentProviderRouting",
-                code: 500,
-                userInfo: [NSLocalizedDescriptionKey: "canonical routing snapshot is incomplete"]
-            )
-        }
-        let canonicalCurrent = ModelRoutingCurrent(
-            chat: chatPreference,
-            telegram: telegramPreference,
-            ios: projectedPreference("ios"),
-            executions: projectedPreference(WorkshopSurfaceVocabulary.canonical),
-            autonomy: projectedPreference("autonomy"),
-            swarms: projectedPreference("swarms"),
-            dream: projectedPreference("dream"),
-            training: projectedPreference("training")
-        )
-        // 2026-09-13: the catalog does not name a model of its own. Its default
-        // is the person's saved Chat choice — empty when nothing is set up yet,
-        // which the picker shows as "Choose".
-        let defaultModel = canonicalCurrent.chat.model
         var seenBaseline = Set<String>()
         let baseline = (codexSelectableModels + firstPartyModels + openRouterCatalogModels)
             .filter { seenBaseline.insert($0.id).inserted }
@@ -458,11 +390,8 @@ extension ProvidersFacade {
         return ModelCatalogResponse(
             status: "ok",
             source: "first_party_capabilities_plus_signed_codex_and_openrouter",
-            defaultModel: defaultModel,
-            fallbackModels: [],
             models: baseline,
             reasoningEfforts: efforts,
-            current: canonicalCurrent,
             updatedAt: nil,
             catalogFreshness: catalogFreshness.rawValue,
             catalogNote: catalogNote
@@ -476,15 +405,15 @@ extension ProvidersFacade {
         allowEnvironmentOverride: Bool = true
     ) async throws -> CodexAuthStatus {
         let dataRoot = self.dataRoot
-        let path = OpenAIOAuthDirectAdapter.preferredAuthPath(
+        let path = ChatGPTTransport.preferredAuthPath(
             dataRoot: dataRoot, environment: allowEnvironmentOverride ? environment : [:]
         )
         let object = (try? Data(contentsOf: path)).flatMap {
             (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any]
         }
-        let status = OpenAIOAuthDirectAdapter.credentialStatus(object, path: path)
+        let status = ChatGPTTransport.credentialStatus(object, path: path)
         let loggedIn = status.usable
-        let appOwned = OpenAIOAuthDirectAdapter.codexChildHome(mirroring: path) != nil
+        let appOwned = ChatGPTTransport.codexChildHome(mirroring: path) != nil
         return CodexAuthStatus(
             active: loggedIn ? "oauth" : "none",
             appOwnedLoggedIn: loggedIn && appOwned,
@@ -530,11 +459,11 @@ extension ProvidersFacade {
 
     /// Save one surface's pick, admitted by the same served catalog the Mac
     /// and phone pickers show (the routing owner checks it inside its
-    /// transaction lock), and return the fresh catalog. A nil `providerID`
+    /// transaction lock), and return the committed routing. A nil `providerID`
     /// leaves the surface's active-provider pin alone.
     public func saveSurfaceSelection(
         surface: String, model: String, reasoningEffort: String?, serviceTier: String?, providerID: String?
-    ) async throws -> ModelCatalogResponse {
+    ) async throws -> ProviderRoutingSnapshot {
         guard let group = ProviderSurfaceGroups.group(for: surface) else { throw ProviderRoutingError.invalidRequest }
         let result = try await routing.saveGroupSelection(
             group: group,
@@ -545,6 +474,6 @@ extension ProvidersFacade {
         )
         try publishCommittedRouting(result.snapshot)
         await refreshSessionsAfterRoutingWrite()
-        return try await modelCatalog(refresh: false, routingSnapshot: result.snapshot)
+        return result.snapshot
     }
 }

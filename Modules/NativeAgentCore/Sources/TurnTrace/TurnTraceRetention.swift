@@ -1,19 +1,11 @@
 import Foundation
+import Darwin
 import NativeAgentCore
 import PersistenceCore
 
 // Blueprint: | `TurnTraceRetention.swift` | `TurnTraceRetention.enforce`: date-based expiry of trace artifacts and their lock sidecars with retention receipts |
 
-/// M7 (honesty sweep, 2026-07-09): `<dataRoot>/turn_traces/` accumulated one
-/// `<yyyy-MM-dd>.jsonl` plus one orphaned `<yyyy-MM-dd>.jsonl.lock` per day and
-/// nothing ever removed them (~236MB/yr). `ChatSessionRetention` bounded the
-/// chat index but only the chat index. This is the date-keyed sibling.
-///
-/// Deliberately simple and destructive-by-date rather than by size: a trace day
-/// is a debugging artifact with a natural expiry, unlike a conversation, so
-/// there is nothing to archive. Only files whose NAME parses as a day older than
-/// the cutoff are touched — an unparseable filename is left alone rather than
-/// guessed at.
+/// Expire trace days older than the cutoff; preserve unparseable filenames.
 public struct TurnTraceRetentionReport: Sendable, Equatable {
     public var keptDays: Int
     public var removedDays: Int
@@ -56,8 +48,7 @@ public enum TurnTraceRetention {
         // Cutoff is the START of the (keepDays - 1)-days-ago day, so keepDays=14
         // keeps today plus the previous 13 days. Day boundaries use the same
         // local calendar the writer's `dayFormatter` uses.
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TurnTracePersistLane.dayTimeZone
+        let calendar = TurnTracePersistLane.dayCalendar
         let today = calendar.startOfDay(for: now)
         guard let cutoff = calendar.date(byAdding: .day, value: -(max(1, keepDays) - 1), to: today) else {
             return TurnTraceRetentionReport()
@@ -74,9 +65,10 @@ public enum TurnTraceRetention {
                 report.keptDays += 1
                 continue
             }
-            let removedPath = try await SwiftNativePersistenceCore().withFileLock(entry) {
-                guard FileManager.default.fileExists(atPath: entry.path) else { return nil as String? }
-                let auditPath = relativePath(entry, from: dataRoot)
+            guard try isRegularFile(entry) else { continue }
+            let removedPath = try await SwiftNativePersistenceCore.withFileLock(entry) {
+                guard try isRegularFile(entry) else { return nil as String? }
+                let auditPath = try relativePath(entry, from: dataRoot)
                 try FileManager.default.removeItem(at: entry)
                 return auditPath
             }
@@ -88,10 +80,24 @@ public enum TurnTraceRetention {
         return report
     }
 
-    private static func relativePath(_ artifact: URL, from dataRoot: URL) -> String {
+    private static func isRegularFile(_ path: URL) throws -> Bool {
+        var entry = stat()
+        if lstat(path.path, &entry) != 0 {
+            if errno == ENOENT { return false }
+            throw PersistenceCoreError.ioFailure("Cannot inspect trace artifact \(path.path): \(String(cString: strerror(errno)))")
+        }
+        guard entry.st_mode & S_IFMT == S_IFREG else {
+            throw PersistenceCoreError.ioFailure("Unsupported trace artifact preserved: \(path.path)")
+        }
+        return true
+    }
+
+    private static func relativePath(_ artifact: URL, from dataRoot: URL) throws -> String {
         let root = dataRoot.standardizedFileURL.resolvingSymlinksInPath().path
         let path = artifact.standardizedFileURL.resolvingSymlinksInPath().path
-        precondition(path.hasPrefix(root + "/"), "turn trace artifact escaped its data root")
-        return String(path.dropFirst(root.count + 1))
+        guard let tail = NativeAgentWorkspaceRoot.relativePath(path, under: root), !tail.isEmpty else {
+            throw PersistenceCoreError.ioFailure("Trace artifact escaped its data root: \(artifact.path)")
+        }
+        return tail
     }
 }

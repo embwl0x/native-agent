@@ -1,7 +1,7 @@
 import Foundation
-// Blueprint: | `NativeActionRouteSupport.swift` | `NativeActionRouteSupport` enum; `jsonValueBody`, `notImplemented` |
+// Blueprint: | `NativeActionRouteSupport.swift` | `NativeActionWire` enum; `jsonValueBody`, `notImplemented` |
 
-public enum NativeActionRouteSupport {
+public enum NativeActionWire {
     public static func jsonValueBody(_ body: [String: Any]) throws -> [String: JSONValue] {
         let data = try JSONSerialization.data(withJSONObject: body, options: [])
         let parsed = try JSONValue.parse(data)

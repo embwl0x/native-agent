@@ -1,6 +1,7 @@
 import Foundation
 import PersistenceCore
 import NativeAgentCore
+import ChatToolParsing
 // Blueprint: | `AgentWorkspaceEnvironment.swift` | `AgentWorkspaceEnvironment` enum; `isStatusReader`, `title` |
 
 /// A small destination card, not a second capability registry. The actual
@@ -33,8 +34,7 @@ package enum AgentWorkspaceEnvironment {
             .union(AgentWorkspaceLife.readTools).union(HerScreen.coreReadTools)
             .union(["work_context", "artifact_find", "read_chat_message", "chat_conversations", "read_file", "agent_contacts", "agent_read", "inner_state", "agent_introspect", "context_lookup", "time_now", "search_chat_history"])
 
-    /// A status check reads and changes nothing: it opens as a reading, never
-    /// as a form to fill (desk walk 09-24: a status check left a form open).
+    /// A status check opens as a reading, never a form.
     static func isStatusReader(_ tool: String) -> Bool {
         tool.hasSuffix("_status") && !tool.contains("set_")
     }
@@ -56,9 +56,7 @@ package enum AgentWorkspaceEnvironment {
     }
 
     static func outcome(_ value: JSONValue) -> JSONValue {
-        guard case .object(let row) = value else { return .string("ok") }
-        if row["ok"] == .bool(false) || row["error"] != nil || row["error_code"] != nil { return .string("failed") }
-        return row["status"] ?? row["state"] ?? .string("ok")
+        .string(ChatToolOutcome.exactResultClass(value).receipt.status)
     }
 
     static func retained(_ result: JSONValue) -> JSONValue {
@@ -99,8 +97,24 @@ package enum AgentWorkspaceEnvironment {
         return .record(tool: "read_file", input: ["path": .string(path), "max_bytes": .int(12000)], title: "File: " + path)
     }
 
+    static func read(location: AgentWorkspaceLocation, dataRoot: URL, perform: AgentWorkspace.Perform) async throws -> JSONValue {
+        switch location {
+        case .work(let query): return try await perform("work_context", ["query": .string(query)])
+        case .documents(let query): return try await perform("artifact_find", ["query": .string(query), "limit": .int(6)])
+        case .people: return try await perform("agent_contacts", [:])
+        case .record(let tool, var input, _):
+            let appRead = tool == "app" && input["action"] == nil && input["script"] == nil
+            guard appRead || readTools.contains(tool) || isStatusReader(tool) else {
+                throw AgentWorkspaceFailure(message: "This item has no supported workspace reader.")
+            }
+            if tool == "desk_read" { input["structured"] = .bool(true) }
+            return tool == "chat_conversations" ? try await HumanConversationRead.read(input, dataRoot: dataRoot) : try await perform(tool, input)
+        default: throw AgentWorkspaceFailure(message: "This view is unavailable. Return to Workspace home.")
+        }
+    }
+
     static func view(location: AgentWorkspaceLocation, dataRoot: URL, catalog: AgentWorkspace.Catalog,
-                     perform: AgentWorkspace.Perform) async throws -> AgentWorkspaceProjection? {
+                     perform: AgentWorkspace.Perform) async throws -> WorkspacePage? {
         switch location {
         case .browserBookmark(let url, let title, let tabID):
             var actions: [AgentWorkspaceButton] = [
@@ -121,13 +135,14 @@ package enum AgentWorkspaceEnvironment {
             if id == "files", input["path"] == .string("$workspace") {
                 input["path"] = .string(NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot).path)
             }
-            var projection = AgentWorkspaceProjection(title: place.title, content: .object([
+            var projection = WorkspacePage(title: place.title, content: .object([
                 "status": .string("ok"), "about": .string(place.summary)]), items: [], actions: [])
             if let tool = place.tool, names.contains(tool) {
                 if let field = place.searchField {
                     projection.actions.append(.init(label: place.searchLabel ?? "Search " + place.title, action: .perform(tool: tool, input: input, title: place.title, textField: field, isEffect: !readTools.contains(tool)), needsText: true))
                 } else if readTools.contains(tool) {
-                    projection = await .project(location: .record(tool: tool, input: input, title: place.title), result: try await perform(tool, input), dataRoot: dataRoot)
+                    let location = AgentWorkspaceLocation.record(tool: tool, input: input, title: place.title), value = try await perform(tool, input)
+                    projection = await .project(location: location, result: value, dataRoot: dataRoot, evidence: AgentWorkspaceDocument.evidence(location: location, value: value))
                 }
             } else if place.tool != nil {
                 projection.content = .object(["status": .string("unavailable"), "message": .string("This place's reader is not advertised in this session. Available actions are shown below.")])
@@ -193,7 +208,8 @@ package enum AgentWorkspaceEnvironment {
                 items: items, actions: [])
         case .form(let form): return form.projection
         case .receipt(let tool, let title, let value, let readback):
-            var projection = await AgentWorkspaceProjection.project(location: .record(tool: tool, input: [:], title: title), result: value, dataRoot: dataRoot)
+            let location = AgentWorkspaceLocation.record(tool: tool, input: [:], title: title)
+            var projection = await WorkspacePage.project(location: location, result: value, dataRoot: dataRoot, evidence: AgentWorkspaceDocument.evidence(location: location, value: value))
             projection.title = title
             projection.content = .object(["status": outcome(value), "result": projection.content,
                 "evidence": .string("Retained result of the selected action. Refresh does not execute it again and does not verify that an external state is still current.")])
@@ -215,25 +231,6 @@ package enum AgentWorkspaceEnvironment {
                receipt["tabClosed"] != .bool(true), case .int(let tab)? = receipt["tabId"] {
                 projection.actions.insert(.init(label: "Read this browser page", action: .open(.record(tool: "browser.chrome_snapshot", input: ["tab_id": .int(tab), "max_nodes": .int(80), "max_text_chars": .int(10_000)], title: "Browser page"))), at: 0)
             }
-            return projection
-        case .page(let source, let page):
-            var projection: AgentWorkspaceProjection
-            if let view = try await view(location: source, dataRoot: dataRoot, catalog: catalog, perform: perform) { projection = view }
-            else {
-                let value: JSONValue
-                switch source {
-                case .record(let tool, var input, _):
-                    guard readTools.contains(tool) || (tool == "app" && input["action"] == nil && input["script"] == nil) else { return nil }
-                    if tool == "desk_read" { input["structured"] = .bool(true) }
-                    value = try await perform(tool, input)
-                case .work(let query): value = try await perform("work_context", ["query": .string(query)])
-                case .documents(let query): value = try await perform("artifact_find", ["query": .string(query), "limit": .int(6)])
-                case .people: value = try await perform("agent_contacts", [:])
-                default: return nil
-                }
-                projection = await .project(location: source, result: value, dataRoot: dataRoot)
-            }
-            projection.page = max(0, page)
             return projection
         default: return nil
         }

@@ -1,6 +1,7 @@
 import BackgroundLoops
 import DoctorChecks
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Privacy
@@ -15,7 +16,7 @@ public enum DoctorLoopRecovery {
     static let retired = ["github_tracking": "GitHub tracking was retired with the GitHub connector; nothing runs it."]
 
     public static func checks(
-        manager: BackgroundLoops.BackgroundLoopsManager,
+        manager: BackgroundLoops.BackgroundLoopLifetimes,
         dataRoot: URL,
         friendlyLoopName: (String) -> String
     ) async -> [CheckResult] {
@@ -40,12 +41,14 @@ public enum DoctorLoopRecovery {
             for id in loopIDs.union(retired.keys) {
                 let owed = open.filter { $0.owes["repair"]?.phase.isSettled == false
                     && $0.claims.contains { $0.claim == "operation: doctor.check:" + checkPrefix + id } }
-                let format = ISO8601DateFormatter()
-                format.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
                 if owed.contains(where: { experience in
-                    guard let at = format.date(from: experience.at) ?? ISO8601DateFormatter().date(from: experience.at),
-                          let success = byID[id]?.lastSuccessfulWorkAt else { return true }
-                    return success <= at
+                    // A clean tick after the obligation (completed, or a legitimate
+                    // "nothing to do") proves the loop runs again; a loop whose
+                    // work is to find nothing would otherwise owe forever.
+                    guard let at = NativeTimestampFormat.parseISO8601FractionalFirst(experience.at),
+                          let status = byID[id],
+                          let clean = status.lastError == nil ? status.lastRun : status.lastSuccessfulWorkAt else { return true }
+                    return clean <= at
                 }) { pending.insert(id) }
             }
         } catch {
@@ -70,7 +73,7 @@ public enum DoctorLoopRecovery {
             let waiting = pending.contains(id) && !off
             let state = (verdict?.detail ?? "The app-owned loop is absent from the live manager.")
                 .trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines))
-                + (waiting ? "; repair remains owed until this loop completes successful work" : "")
+                + (waiting ? "; repair remains owed until this loop completes a clean tick" : "")
             let lastFailure = status?.lastError.map {
                 "; last failure: \(NativeAppSecretRedactor.redactText(String($0.prefix(500))).trimmingCharacters(in: CharacterSet(charactersIn: ".").union(.whitespacesAndNewlines)))"
             } ?? ""
@@ -101,7 +104,7 @@ public enum DoctorLoopRecovery {
 
     public static func repair(
         checkID: String,
-        manager: BackgroundLoops.BackgroundLoopsManager,
+        manager: BackgroundLoops.BackgroundLoopLifetimes,
         dataRoot: URL,
         restart: @escaping @Sendable (String) async -> LoopRestartOutcome
     ) async -> DoctorExecutableRepair? {

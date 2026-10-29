@@ -1,9 +1,3 @@
-// PATCH-2026-05-07: ios-sync MacSyncEngine — SnapshotWriter + InboxWatcher (Mac side)
-// SnapshotWriter: source mutations write app-owned Swift runtime state to iCloud Drive `snapshots/`.
-//   Touches KVS key `snapshot_updated` so iOS observes immediately.
-// InboxWatcher: NSMetadataQuery on `inbox/`. When iOS drops an action JSON, dispatch to
-//   the in-process Swift runtime, write response to `responses/<msg_id>.json`, touch KVS `inbox_response_<msg_id>`.
-
 import CommonCrypto
 import CognitiveSubstrate
 import CryptoKit
@@ -59,16 +53,12 @@ public final class MacSyncEngine: ObservableObject {
     var workActivities: [String: MobileWorkActivity] = [:]
     /// Relays turns another door started in the anchored conversation.
     var liveTurnRelayTask: Task<Void, Never>?
-    var workActivityVersion: UInt64 = 0
     /// Existing chat completion notifications drive one bounded transcript
     /// projection pass. The short coalescer absorbs completion fan-out (for
     /// example a bridge delivery plus its local refresh) without polling or
     /// rebuilding the transcript for every notification.
     var chatTurnCompletedObserver: NSObjectProtocol?
-    /// 2026-09-06: transcripts are also rewritten outside a turn — the
-    /// compaction distiller swaps its recollection into the summary row long
-    /// after the turn that triggered it finished. That write posts its own
-    /// edge, and it feeds the same coalescer.
+    /// Transcript rewrites outside turns feed the same snapshot coalescer as turn completions.
     var chatTranscriptDidChangeObserver: NSObjectProtocol?
     var chatTranscriptSnapshotPublicationTask: Task<Void, Never>?
     var chatSnapshotCoalescer = MacSyncChatSnapshotCoalescerState()
@@ -81,12 +71,11 @@ public final class MacSyncEngine: ObservableObject {
     var connectorHealthState: JSONValue?
     var activeDocsURL: URL?
     var snapshotWriteInFlight = false
-    var snapshotWriteQueued = false
+    var snapshotWriteQueuedScope: SnapshotWriteScope?
     var snapshotWriteQueuedNeedsHeavy = false
     var snapshotWriteQueuedNeedsRepublish = false
     var snapshotWriteQueuedNeedsMemories = false
     var snapshotWriteQueuedNeedsChatTranscripts = false
-    var snapshotWriteQueuedNeedsStandardPass = false
     /// Invalidates any snapshot pass suspended across stop/restart. A late pass
     /// must never publish into a newly selected cache/container generation.
     var snapshotLifecycleGeneration: UInt64 = 0
@@ -94,45 +83,24 @@ public final class MacSyncEngine: ObservableObject {
     var inboxProcessingTask: Task<Void, Never>?
     var inboxProcessingQueued = false
     var snapshotFileDigests: [String: SnapshotFileDigest] = [:]
-    // fix-R9-9 Maintain insertion order so oldest are evicted first (not random).
+    // Maintain insertion order so oldest are evicted first.
     var processedMsgIds: Set<String> = []
     var processedMsgIdsOrdered: [String] = []
-    /// Sweep R4 item 1: the last `restoreState` found the file present but
-    /// unreadable, so the in-memory window may be missing ids that really were
-    /// processed. Distinct from "no file yet", which is ordinary genesis.
-    var processedIdsUnreadable = false
 
-    // F7 P0 #3: in-flight chat stream tasks keyed by sessionID, registered by
-    // forwardToSwiftRuntime and cancelled by the iOS "cancelChat" inbox action. The
-    // cancelled.flag file (NativeClient.cancelChatSession) is still written by
-    // the existing api.cancelChatSession() call as a secondary signal that the
-    // streaming chat path also polls — Task.cancel() is the primary mechanism.
+    // Phone Stop cancels the registered task; the turn also reads its disk cancel flag.
     /// What a remote Stop actually did to the session's in-flight chat task.
     public enum MacSyncChatCancelOutcome: String, Equatable {
         case cancelled
-        /// A different run holds this session now — nothing was cancelled and
-        /// no cancel marker belongs on disk either. 2026-09-06: the named run
-        /// is not necessarily over. Another turn holding the session is also
-        /// exactly what a Stop that overtook its own turn's handoff sees, so
-        /// the id is held as stop-requested here too and the turn dies at
-        /// registration; a run that really was over never registers again and
-        /// its hold is pruned by the TTL.
+        /// Leave the current run and disk markers untouched; retain Stop for the named run's registration.
         case runMismatch
-        /// 2026-09-06: a scoped Stop arrived before its run registered — the
-        /// turn is still in handoff. The run id is held as stop-requested and
-        /// the turn dies the moment it registers. No cancel marker belongs on
-        /// disk: turn acceptance deletes the session's cancelled.flag before
-        /// the stream starts, so an unscoped marker would be wiped and the
-        /// stopped turn would run to completion anyway.
+        /// Hold an early scoped Stop until its run registers, without writing a session cancel marker.
         case stopRecorded
         case noActiveTask
     }
 
-    /// 2026-09-06: the run id (the iOS correlation id of the turn) is stored
-    /// with the task so a Stop that names its run cannot cancel a later turn
-    /// that took the same session in the meantime.
+    /// The turn's iOS correlation ID binds scoped Stop to its task within the session.
     struct ActiveChatTask {
-        let task: Task<(text: String, deltaSeq: Int, error: String?, toolEvents: Int), Never>
+        let task: Task<(text: String, deltaSeq: Int, error: String?, toolEvents: Int, attachments: [NativeAgentShared.MultimodalAttachment], cause: Error?), Never>
         let runID: String?
     }
 
@@ -141,12 +109,7 @@ public final class MacSyncEngine: ObservableObject {
     // registered until their forwarder settles and unregisters the exact task.
     // Remote Stop remains the separate explicit cancellation path.
 
-    /// 2026-09-06: run ids a scoped Stop named while the run was still in
-    /// handoff (minted on the phone, not yet registered here), with the moment
-    /// each stops counting. Keyed by session and run so a Stop can only ever
-    /// kill the turn it named. Entries are consumed at registration and swept
-    /// on the next write; the TTL only bounds the memory of a run that never
-    /// arrives at all.
+    /// Early Stops are keyed by session and run, consumed at registration, and bounded by TTL and cap.
     var stopRequestedChatRuns: [String: Date] = [:]
     static let stopRequestedRunTTL: TimeInterval = 300
     static let stopRequestedRunCap = 64
@@ -187,7 +150,7 @@ public final class MacSyncEngine: ObservableObject {
     }
 
     public func registerActiveChatTask(
-        _ task: Task<(text: String, deltaSeq: Int, error: String?, toolEvents: Int), Never>,
+        _ task: Task<(text: String, deltaSeq: Int, error: String?, toolEvents: Int, attachments: [NativeAgentShared.MultimodalAttachment], cause: Error?), Never>,
         for sessionID: String,
         runID: String? = nil
     ) {
@@ -197,8 +160,7 @@ public final class MacSyncEngine: ObservableObject {
             existing.task.cancel()
         }
         activeChatTasks[trimmed] = ActiveChatTask(task: task, runID: runID)
-        // 2026-09-06: the Stop for this run beat its registration. Honour it
-        // now — it is still the turn the user pressed Stop on.
+        // Registration honors any Stop already recorded for this exact run.
         if consumeStopRequestedChatRun(for: trimmed, runID: runID) {
             task.cancel()
         }
@@ -206,7 +168,7 @@ public final class MacSyncEngine: ObservableObject {
 
     public func unregisterActiveChatTask(
         for sessionID: String,
-        expecting task: Task<(text: String, deltaSeq: Int, error: String?, toolEvents: Int), Never>
+        expecting task: Task<(text: String, deltaSeq: Int, error: String?, toolEvents: Int, attachments: [NativeAgentShared.MultimodalAttachment], cause: Error?), Never>
     ) {
         let trimmed = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -227,19 +189,13 @@ public final class MacSyncEngine: ObservableObject {
         let trimmed = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .noActiveTask }
         guard let entry = activeChatTasks[trimmed] else {
-            // 2026-09-06: a NAMED run with nothing registered yet is a Stop
-            // that overtook its own turn's handoff. Hold the id so
-            // registration cancels it; an unscoped marker here would be
-            // deleted by turn acceptance and the turn would run anyway.
+            // Retain a named Stop until registration; turn acceptance clears unscoped disk markers.
             guard !runIDs.isEmpty else { return .noActiveTask }
             recordStopRequestedChatRuns(for: trimmed, runIDs: runIDs)
             return .stopRecorded
         }
         if !runIDs.isEmpty, let runID = entry.runID, !runIDs.contains(runID) {
-            // 2026-09-06: the named run may still be crossing from the phone
-            // while an older run holds the session. Hold the Stop against its
-            // run id — registration consumes it — or the stopped turn starts
-            // and runs to completion right after this returns.
+            // Hold Stop for the named run's registration while leaving the current run untouched.
             recordStopRequestedChatRuns(for: trimmed, runIDs: runIDs)
             return .runMismatch
         }
@@ -247,39 +203,9 @@ public final class MacSyncEngine: ObservableObject {
         return .cancelled
     }
 
-    struct ChatTranscriptSnapshot: Encodable, Sendable {
-        var sessionId: String
-        var messages: [DeviceSyncTranscriptRow]
-        /// 2026-09-06: the session's transcript version at publication (see
-        /// `ChatSessionIndexFile.transcriptGenerationKey`). A row with
-        /// `messages: []` is the Mac SAYING the transcript is empty (cleared),
-        /// which is different from publishing no row at all; the phone only
-        /// lets an empty row clear its copy when this counter is strictly
-        /// greater than the last one it applied for that session, so an
-        /// out-of-order read cannot wipe a rebuilt transcript. A counter, not
-        /// a clock — `updatedAt` moves for reasons that are not transcript
-        /// writes and can step backwards. `nil` (older Mac builds, or a row
-        /// never written since this shipped) is never authority to clear.
-        var transcriptGeneration: Int?
-        /// The Mac holds rows older than this window (`chat_history_page`).
-        var hasOlder = false
-        var readError: String? = nil
-        var otherRooms: [OtherRoomExchange]? = nil
-
-        func omittingAttachmentPreviews() -> Self {
-            var copy = self
-            for index in copy.messages.indices { copy.messages[index].message.omitAttachmentPreviews() }
-            return copy
-        }
-    }
-
     let processedIdsCap = 5000
     var _pairingSecret: Data?
     var pairingSecretRotationInProgress = false
-    /// The production CloudKit response route. Kept as one seam so the inbox
-    /// owner can prove durable-before-send and restart resend behavior without
-    /// substituting a second action processor or a hand-built envelope.
-    var cloudKitActionResponseSender: (@Sendable ([String: String], String) async throws -> Void)?
     enum KVSKey {
         static let snapshotUpdated = "snapshot_updated"
         static let inboxPending = "inbox_pending"

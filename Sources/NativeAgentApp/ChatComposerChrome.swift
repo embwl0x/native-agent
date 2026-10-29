@@ -2,34 +2,28 @@ import EngineRuntime
 import SwiftUI
 import AppKit
 import CoreGraphics
-import ScreenCaptureKit
 import ScreenVision
-import Speech
-import AVFoundation
 import UniformTypeIdentifiers
 import NativeAgentShared
 import MemoryV2
 import PersistenceCore
-#if canImport(CoreSpotlight)
-import CoreSpotlight
-#endif
-#if canImport(CloudKit)
-import CloudKit
-// Blueprint: | `ChatComposerChrome.swift` | `ComposerTabKeyHandler` struct; `makeNSView`, `updateNSView` |
-#endif
+
+// Blueprint: | `ChatComposerChrome.swift` | `ComposerKeys`: editor-scoped Tab, slash, Shift-Return and attachment paste interception; shared composer chrome |
 
 /// Intercept Tab and open slash suggestions while this draft owns the editor.
 /// Other typing and modified Return retain their existing dispatch.
-struct ComposerTabKeyHandler: NSViewRepresentable {
+struct ComposerKeys: NSViewRepresentable {
     var active: Bool
     var move: (Bool) -> Bool
     var suggestionKey: ((UInt16) -> Bool)? = nil
+    var onPaste: (([NSItemProvider]) -> Void)? = nil
 
     func makeNSView(context: Context) -> TabView { TabView() }
     func updateNSView(_ view: TabView, context: Context) {
         view.active = active
         view.move = move
         view.suggestionKey = suggestionKey
+        view.onPaste = onPaste
     }
 
     static func dismantleNSView(_ view: TabView, coordinator: ()) { view.stop() }
@@ -38,6 +32,7 @@ struct ComposerTabKeyHandler: NSViewRepresentable {
         var active = false
         var move: ((Bool) -> Bool)?
         var suggestionKey: ((UInt16) -> Bool)?
+        var onPaste: (([NSItemProvider]) -> Void)?
         private var monitor: Any?
 
         override func viewDidMoveToWindow() {
@@ -46,9 +41,17 @@ struct ComposerTabKeyHandler: NSViewRepresentable {
             guard window != nil else { return }
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
                 guard let self, active, !isHiddenOrHasHiddenAncestor, event.window === window,
-                      !event.modifierFlags.contains(.command),
-                      !event.modifierFlags.contains(.control),
                       let editor = window?.firstResponder as? NSTextView else { return event }
+                if let onPaste,
+                   event.charactersIgnoringModifiers?.lowercased() == "v",
+                   event.modifierFlags.intersection([.command, .control, .option, .shift]) == .command {
+                    let providers = ChatAttachmentTypeResolver.clipboardAttachmentProviders()
+                    guard !providers.isEmpty else { return event }
+                    onPaste(providers)
+                    return nil
+                }
+                guard !event.modifierFlags.contains(.command),
+                      !event.modifierFlags.contains(.control) else { return event }
                 if event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
                    !editor.hasMarkedText(), suggestionKey?(event.keyCode) == true {
                     return nil
@@ -126,8 +129,7 @@ struct ChatProviderConnectEmptyState: View {
         VStack(spacing: NativeAgentSpacing.xl) {
             NativeEmptyState(
                 title: Self.title,
-                detail: Self.detail,
-                systemImage: "server.rack"
+                detail: Self.detail
             )
 
             Button(Self.actionTitle, action: onConnect)
@@ -217,8 +219,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
 
-    /// Which settings card is open. Shared with the card layer that draws it
-    /// above the transcript; absent in the detached panel and the snapshots.
+    /// The native settings menu or context receipt; absent in detached chat.
     @Environment(ComposerShellState.self) private var composerCardState: ComposerShellState?
 
 
@@ -236,15 +237,9 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
     let onAttach: () -> Void
     let onStop: () -> Void
     let onSend: () -> Void
-    /// User 2026-08-20: the visible composer box is taller than the single-line
-    /// text field's own hit area, so clicks in the upper region did nothing.
-    /// The whole card is now a focus target; interactive children (menu,
-    /// stop/send) keep winning inside their own bounds.
+    /// The whole card requests focus; interactive children retain their own hit areas.
     var onFocusRequest: (() -> Void)?
-    /// Agent, 2026-09-03: the composer must not look identical with the
-    /// keyboard in it as it does at rest. The view cannot own the focus —
-    /// the `@FocusState` belongs to the chat that owns the text field — so
-    /// the owner reports it here, including the detached panel.
+    /// The text field's owner reports focus so the composer can distinguish its active state.
     var isFocused: Bool = false
     var sessionId: String? = nil
     var showsConversationSettings: Bool = false
@@ -376,13 +371,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                     Spacer(minLength: 0)
                 }
 
-                // Alive glass, 2026-09-23: Stop takes Send's slot while a turn
-                // runs — same place, same size — so nothing on the row moves
-                // when a turn starts. A calm circle in the send button's fill,
-                // the glyph in the text colour; red was the loudest thing on
-                // screen. Return still queues a draft during a turn.
-                // Wave 3 (after Grok): one circle; only the glyph changes,
-                // scaling from half size as it fades, 200ms quint-out.
+                // Stop and Send share one slot; Return still queues drafts during a turn.
                 let lit = isRunning || canSend
                 Button(action: isRunning ? onStop : onSend) {
                     ZStack {
@@ -413,24 +402,11 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                 .accessibilityHint(isRunning ? "" : sendAction.hint)
             }
         }
-        // The room's gutter, inside the glass: the field's first character
-        // lands on the first character of her replies and the box's inner
-        // right edge on their last (708 + 2 x 16 = the 740 column).
-        // Agent, 2026-09-03: the box was 87,360px of fill against 76,291px of
-        // ink in a full screen of her reply — the emptiest object on screen
-        // was also the heaviest. Three of those points come back off the
-        // vertical padding (91 -> 88).
+        // The inner gutter aligns the field with the transcript's text edges.
         .padding(.horizontal, NativeAgentShellLayout.roomGutter)
         .padding(.top, 12)
         .padding(.bottom, 11)
-        // User, 2026-09-03: the composer floats over content — the functional
-        // layer — so it is real glass now, not a painted slab. Glass carries
-        // its own lensing and shadow, so the hairline and the hand shadow are
-        // gone with it. Reduce transparency still gets the opaque fill: that
-        // setting asks for more opacity, never less.
-        // A quiet screenshot draws that opaque fill too: tinted glass drawn
-        // into a bitmap blanks the WHOLE capture, not just itself, so the
-        // chat page came back as an empty (black) image.
+        // Floating glass uses an opaque fill for reduced transparency and quiet bitmap captures.
         .background {
             // A click on the card's padding focuses the field. Only the padding:
             // a click in the field is the field's own, and focusing it again
@@ -457,11 +433,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
                     .strokeBorder(NativeAgentShell.hairline, lineWidth: 1)
                 }
             }
-            // User, 2026-09-23 ("alive glass"): a faint inner glow of the haze
-            // along the bottom edge, and while she thinks before replying, a
-            // caustic shimmer drifting through the glass. Both sit between the
-            // glass and the words, so neither washes the draft. Leaves only:
-            // see ThinkingGlow.swift.
+            // Glow and shimmer sit between the glass and the draft text.
             HazeBottomGlow(cornerRadius: NativeAgentShellLayout.composerRadius)
             ThinkingGlow(kind: .shimmer, cornerRadius: NativeAgentShellLayout.composerRadius, sessionId: sessionId)
         }
@@ -492,10 +464,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
         .onAppear {
             if showsConversationSettings, let card = composerCardRequestedForCapture(),
                let state = composerCardState {
-                state.activePane = .opening(
-                    card,
-                    provider: ProcessInfo.processInfo.environment["COMPOSER_FLYOUT_PROVIDER"] ?? ""
-                )
+                state.open(card)
             }
         }
         #endif
@@ -510,46 +479,7 @@ struct MacChatComposerControlStrip<InputContent: View>: View {
 
 }
 
-// PATCH-2026-05-09: nextgen-surface — Horizontal row of suggested NextGen action chips above composer
-enum NextGenActionChipsPresentation {
-    static let maxVisible = 4
-
-    static func normalizedID(_ actionID: String) -> String {
-        actionID.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    static func isTracked(_ actionID: String, in ids: Set<String>) -> Bool {
-        ids.contains(actionID) || ids.contains(normalizedID(actionID))
-    }
-
-    static func visibleActions(snapshot: NextGenStatusProjection.Snapshot?) -> [NextGenAction] {
-        Array((snapshot?.eligibleActions ?? []).prefix(maxVisible))
-    }
-
-    static func hasMore(snapshot: NextGenStatusProjection.Snapshot?) -> Bool {
-        (snapshot?.eligibleActions.count ?? 0) > maxVisible
-    }
-
-    static func canRun(
-        actionID: String,
-        runningIDs: Set<String>,
-        completedIDs: Set<String>,
-        isGlobalActionRunning: Bool
-    ) -> Bool {
-        !isGlobalActionRunning
-            && !isTracked(actionID, in: runningIDs)
-            && !isTracked(actionID, in: completedIDs)
-    }
-}
-
-/// Fluid glass A2: what waits above the composer — queued sends, pending
-/// attachments, chats running elsewhere, suggested actions — is ONE tray of
-/// the composer's own glass, fused to its top edge. It used to be four rows,
-/// each at its own width (760 against the room's 740), stacked over the
-/// composer and pushing the transcript as they came and went. The caller puts
-/// this and the composer in one `GlassEffectContainer`, so the two read as a
-/// single object; the tray materializes, grows and shrinks on a smooth spring.
-/// Glass is the tray's alone: nothing inside it wears glass of its own.
+/// Pending items share one tray and glass container with the composer, without glass on inner rows.
 struct ChatComposerTray: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -578,9 +508,8 @@ struct ChatComposerTray: View {
         var queued: [String]
         var attachments: [String]
         var others: [String]
-        var actions: [String]
         var isEmpty: Bool {
-            queued.isEmpty && attachments.isEmpty && others.isEmpty && actions.isEmpty
+            queued.isEmpty && attachments.isEmpty && others.isEmpty
         }
     }
 
@@ -589,9 +518,7 @@ struct ChatComposerTray: View {
             queued: ChatQueuePresentation.visibleTurns(
                 appModel.engine.turns.queued(for: sessionId)).map(\.id),
             attachments: attachments.map(\.id),
-            others: otherRunning,
-            actions: NextGenActionChipsPresentation.visibleActions(
-                snapshot: appModel.engine.nextGen.current).map(\.id)
+            others: otherRunning
         )
     }
 
@@ -659,162 +586,6 @@ struct ChatComposerTray: View {
                     onStop: onStop
                 )
             }
-            if !contents.actions.isEmpty {
-                NextGenActionChipsRow(appModel: appModel)
-                    .transition(.opacity)
-            }
         }
     }
 }
-
-struct NextGenActionChipsRow: View {
-    var appModel: AppModel
-    /// Test-only injection remains behind the row's production tap gate. A
-    /// nil runner always dispatches through the real app model.
-    var actionRunner: (@MainActor (String) async -> Bool)? = nil
-
-    // Per-chip running state (actionId -> true while running)
-    @State private var runningIds: Set<String> = []
-    // Per-chip completed state (actionId -> timestamp) for checkmark flash
-    @State private var completedIds: Set<String> = []
-
-    private var visibleActions: [NextGenAction] {
-        NextGenActionChipsPresentation.visibleActions(snapshot: appModel.engine.nextGen.current)
-    }
-
-    private var hasMore: Bool {
-        NextGenActionChipsPresentation.hasMore(snapshot: appModel.engine.nextGen.current)
-    }
-
-    var body: some View {
-        let visible = visibleActions
-        guard !visible.isEmpty else { return AnyView(EmptyView()) }
-        return AnyView(
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: NativeAgentSpacing.sm) {
-                    ForEach(visible) { action in
-                        NextGenChip(
-                            action: action,
-                            isRunning: NextGenActionChipsPresentation.isTracked(
-                                action.id, in: runningIds
-                            ),
-                            isCompleted: NextGenActionChipsPresentation.isTracked(
-                                action.id, in: completedIds
-                            ),
-                            isGlobalActionRunning: appModel.isRunningNextGenAction
-                        ) {
-                            guard NextGenActionChipsPresentation.canRun(
-                                actionID: action.id,
-                                runningIDs: runningIds,
-                                completedIDs: completedIds,
-                                isGlobalActionRunning: appModel.isRunningNextGenAction
-                            ) else { return }
-                            let actionID = NextGenActionChipsPresentation.normalizedID(action.id)
-                            runningIds.insert(actionID)
-                            Task { @MainActor in
-                                let succeeded: Bool
-                                if let actionRunner {
-                                    succeeded = await actionRunner(actionID)
-                                } else {
-                                    succeeded = await appModel.runNextGenAction(id: actionID, dryRun: true)
-                                }
-                                runningIds.remove(actionID)
-                                if succeeded {
-                                    completedIds.insert(actionID)
-                                    // Flash checkmark for 2s then clear.
-                                    Task {
-                                        try? await Task.sleep(for: .seconds(2))
-                                        completedIds.remove(actionID)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if hasMore {
-                        Button {
-                            NotificationCenter.default.post(name: .openNextGenRequest, object: nil)
-                        } label: {
-                            Text("More\u{2026}")
-                                .font(NativeAgentFont.tag)
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, NativeAgentSpacing.sm)
-                                .padding(.vertical, NativeAgentSpacing.xs)
-                                .background(.quaternary, in: Capsule())
-                        }
-                        .buttonStyle(.borderless)
-                        .accessibilityIdentifier("chat.nextgen-more-actions")
-                        .help("View all NextGen actions in Capabilities")
-                    }
-                }
-            }
-            .animation(NativeAgentMotion.standard, value: visible.map { $0.id })
-        )
-    }
-}
-
-struct NextGenChip: View {
-    var action: NextGenAction
-    var isRunning: Bool
-    var isCompleted: Bool
-    var isGlobalActionRunning: Bool
-    var onTap: () -> Void
-
-    private var chipIcon: String {
-        switch action.kind?.lowercased() {
-        case let k where k?.contains("build") == true || k?.contains("repair") == true:
-            return "wrench.and.screwdriver"
-        case let k where k?.contains("audit") == true || k?.contains("check") == true:
-            return "doc.text.magnifyingglass"
-        case let k where k?.contains("generate") == true || k?.contains("gen") == true:
-            return "sparkles"
-        default:
-            return "play.fill"
-        }
-    }
-
-    var body: some View {
-        Button(action: onTap) {
-            HStack(spacing: NativeAgentSpacing.xs) {
-                if isCompleted {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(NativeAgentFont.tag)
-                        .foregroundStyle(.green)
-                        .transition(NativeAgentMotion.reveal())
-                } else if isRunning {
-                    PulsingDot(color: NativeAgentShell.secondary, size: 6, animates: true)
-                } else {
-                    Image(systemName: chipIcon)
-                        .font(NativeAgentFont.tag)
-                        .foregroundStyle(.secondary)
-                }
-                Text(action.displayName.prefix(30))
-                    .font(NativeAgentFont.tag)
-                    .foregroundStyle(isCompleted ? .green : .primary)
-                    .lineLimit(1)
-            }
-            .padding(.horizontal, NativeAgentSpacing.sm)
-            .padding(.vertical, NativeAgentSpacing.xs)
-            // Fluid glass A2: the chips ride in the composer tray's glass, so
-            // they take a fill, not glass of their own (never glass on glass).
-            .background(NativeAgentShell.softFill, in: Capsule())
-            .overlay(
-                Capsule()
-                    .strokeBorder(
-                        isCompleted ? Color.green.opacity(0.45) :
-                        isRunning   ? NativeAgentShell.secondary.opacity(0.45) :
-                                      Color.primary.opacity(0.10),
-                        lineWidth: 0.8
-                    )
-            )
-            .shadow(color: isCompleted ? .green.opacity(0.15) : .clear, radius: 4)
-        }
-        .buttonStyle(.borderless)
-        .disabled(isRunning || isCompleted || isGlobalActionRunning)
-        .accessibilityIdentifier("chat.nextgen-action.\(action.id)")
-        .help(action.displayDetail)
-        .animation(NativeAgentMotion.quick, value: isRunning)
-        .animation(NativeAgentMotion.quick, value: isCompleted)
-    }
-}
-
-// PATCH-2026-05-06: multimodal-ui Sprint 3.4/3.5 — macOS NSView drop zone overlay for drag-drop

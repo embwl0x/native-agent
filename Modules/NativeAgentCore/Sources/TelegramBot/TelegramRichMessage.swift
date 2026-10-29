@@ -234,7 +234,7 @@ enum TelegramRichMessageRenderer {
     }
 
     static func sanitize(_ raw: String) -> String {
-        TelegramPollLoop._tgRedactToken(TurnTraceRedactor.redactText(raw))
+        TurnTraceRedactor.redactText(raw)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -246,11 +246,7 @@ enum TelegramRichMessageRenderer {
     )
     private static let linkExpression = try? NSRegularExpression(pattern: #"\[([^\]\n]+)\]\(([^)\s]+)\)"#)
 
-    /// 2026-09-22: rich blocks and ordinary sends carry plain text (no
-    /// parse_mode, no entities), so markdown showed raw. Outside code fences:
-    /// drop `**bold**` and `*italic*` markers, turn `[text](url)` into
-    /// "text (url)", and drop the backticks around inline code (its contents
-    /// stay untouched). Bullets ("* ") and math (2*3*4) are left alone.
+    /// Strip display markdown outside code while preserving bullets, math and code contents.
     static func stripBoldMarkers(_ text: String) -> String {
         guard text.contains("*") || text.contains("`") || text.contains("]("),
               let bold = boldExpression,

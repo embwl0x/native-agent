@@ -1,16 +1,37 @@
 #!/usr/bin/env bash
-# A2.1-2026-07-24: shared discovery for Sparkle's CLI tools.
-#
-# Sparkle ships generate_keys / sign_update / generate_appcast inside the SwiftPM
-# checkout + binary artifact, at paths that move between Sparkle versions. This
-# was already duplicated in script/sparkle_keygen.sh; the appcast pipeline needs
-# the same lookup, so it lives here once.
+# Shared Sparkle CLI discovery across version-dependent SwiftPM checkout and artifact paths.
 #
 # Usage:  source script/lib/sparkle_tools.sh
 #         path="$(sparkle_tool_path generate_appcast)" || <handle missing>
 
 # shellcheck disable=SC2034
 SPARKLE_TOOLS_LIB_LOADED=1
+
+# Validate feed-declared deltas and retain their exact paths for publication.
+sparkle_validate_deltas() { # feed, release URL prefix, private key, optional sign_update
+  local feed="$1" prefix="$2" key="$3" sign_tool="${4:-}" index node url name path signature length
+  SPARKLE_DELTA_PATHS=()
+  SPARKLE_DELTA_COUNT="$(xmllint --xpath 'count(//*[local-name()="deltas"]/*[local-name()="enclosure"])' "$feed")" || return 1
+  [[ "$SPARKLE_DELTA_COUNT" != 0 ]] || return 0
+  [[ -f "$key" ]] || { echo "ERROR: Sparkle key for delta verification is missing: $key" >&2; return 1; }
+  [[ -n "$sign_tool" ]] || sign_tool="$(sparkle_tool_path_or_die sign_update)" || return 1
+  for ((index=1; index<=SPARKLE_DELTA_COUNT; index++)); do
+    node="(//*[local-name()='deltas']/*[local-name()='enclosure'])[$index]"
+    url="$(xmllint --xpath "string($node/@url)" "$feed")" || return 1
+    name="${url##*/}"
+    [[ "$name" =~ ^[A-Za-z0-9_.-]+\.delta$ && "$url" == "$prefix$name" ]] \
+      || { echo "ERROR: delta URL does not name a local release asset: $url" >&2; return 1; }
+    path="$(dirname "$feed")/$name"
+    [[ -s "$path" ]] || { echo "ERROR: delta asset is missing: $name" >&2; return 1; }
+    length="$(xmllint --xpath "string($node/@length)" "$feed")" || return 1
+    [[ "$length" == "$(stat -f%z "$path")" ]] || { echo "ERROR: delta size mismatch: $name" >&2; return 1; }
+    signature="$(xmllint --xpath "string($node/@*[local-name()='edSignature'])" "$feed")" || return 1
+    [[ -n "$signature" ]] || { echo "ERROR: unsigned delta: $name" >&2; return 1; }
+    "$sign_tool" --verify --ed-key-file "$key" "$path" "$signature" >/dev/null \
+      || { echo "ERROR: delta signature does not verify: $name" >&2; return 1; }
+    SPARKLE_DELTA_PATHS+=("$path")
+  done
+}
 
 # Echoes the absolute path to a Sparkle CLI tool, or returns 1 if not found.
 # $1 — tool name (generate_keys | sign_update | generate_appcast)
@@ -57,10 +78,7 @@ sparkle_tool_path() {
 # Echoes the base64 Ed25519 PUBLIC key derived from a Sparkle private key file.
 # Returns 1 (with a reason on stderr) if it cannot be derived.
 #
-# A2.1 round 2: this is what makes the "signing with the wrong key" guard
-# independent of Sparkle's warning prose — see script/sparkle_ed_public_key.swift.
-# Swift (CryptoKit), not a scripting-language helper: this repo is under a
-# zero-Python source mandate enforced by NoPythonRegressionTests.
+# CryptoKit key derivation is independent of Sparkle's warning prose.
 # $1 — private key file path, $2 — repo root (optional)
 sparkle_ed_public_key_from_file() {
   local key_file="$1"

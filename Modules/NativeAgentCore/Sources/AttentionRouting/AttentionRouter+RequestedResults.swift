@@ -39,7 +39,7 @@ extension AttentionRouter {
                 continue
             }
             let rows: [JSONValue]
-            do { rows = try await SwiftNativePersistenceCore().readJSONL(path) }
+            do { rows = try await SwiftNativePersistenceCore.readJSONL(path) }
             catch {
                 nativeLog("requested_result: transcript unavailable, retained for retry: %@", error.localizedDescription)
                 storageFailure = storageFailure ?? error
@@ -120,7 +120,7 @@ extension AttentionRouter {
                           userInfo: [NSLocalizedDescriptionKey: "Result delivery has no valid conversation."])
         }
         let path = dataRoot.appendingPathComponent("chat/messages/\(safe).jsonl")
-        let rows = try await SwiftNativePersistenceCore().readJSONL(path)
+        let rows = try await SwiftNativePersistenceCore.readJSONL(path)
         let eventID = "requested-result:" + deliveryID
         for row in rows.reversed() {
             guard case .object(let fields) = row, case .object(let metadata)? = fields["metadata"],
@@ -186,8 +186,7 @@ extension AttentionRouter {
     }
 
     private static func acknowledgeResults(_ intents: [[String: JSONValue]], at path: URL) async throws {
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
+        try await SwiftNativePersistenceCore.withFileLock(path) {
             let raw = try String(contentsOf: path, encoding: .utf8)
             var lines = raw.components(separatedBy: "\n")
             var changed = false

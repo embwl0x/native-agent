@@ -1,7 +1,9 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Transcripts
+import TurnTrace
 // Blueprint: | `SlackSessionStore.swift` | `SlackSessionStore` struct; `activeSessionId`, `ensureSessionRow` |
 
 enum SlackSessionStorageError: Error, LocalizedError {
@@ -20,8 +22,8 @@ struct SlackSessionStore: Sendable {
     }
 
     func activeSessionId(for inbound: SlackInboundMessage) async throws -> String {
-        // Mint/adopt and publish the reply anchor in one locked transaction.
-        let resolved = try await Self.persistence.withFileLock(sessionMapPath) {
+        // Mint/adopt this Slack conversation's binding in one locked transaction.
+        let resolved = try await SwiftNativePersistenceCore.withFileLock(sessionMapPath) {
             var root = try loadSessionMap()
             guard case .object(var sessions)? = root["sessions"] else {
                 throw SlackSessionStorageError.unavailable
@@ -65,17 +67,10 @@ struct SlackSessionStore: Sendable {
             Self.retainThreadBindings(sessions: &sessions, archived: &archivedThreads, currentKeys: currentKeys, now: now)
             root["sessions"] = .object(sessions)
             root["archivedThreads"] = .object(archivedThreads)
-            try await Self.persistence.writeJSON(.object(root), to: sessionMapPath)
+            try await SwiftNativePersistenceCore.writeJSON(.object(root), to: sessionMapPath)
             return resolved
         }
         try await ensureSessionRow(id: resolved, inbound: inbound)
-        // A DM is User's own conversation (inbound is allowlisted); a channel
-        // is a shared room and never becomes the anchor.
-        if inbound.isDirectMessage {
-            _ = try? await ConversationAnchor.publish(
-                sessionId: resolved, source: "slack", conversationKind: .direct, dataRoot: dataRoot
-            )
-        }
         return resolved
     }
 
@@ -174,54 +169,17 @@ struct SlackSessionStore: Sendable {
         } else {
             title = "Slack \(inbound.channelId)"
         }
-        try await Self.ensureSessionRow(
+        // The adapter declares what the conversation is: a DM is a direct
+        // conversation, a channel, thread or group has other people in it.
+        try await ChatSessionIndexFile.ensureSession(
             id: id,
             title: title,
+            source: "slack",
             sourceKey: inbound.sessionKey,
-            dataRoot: dataRoot
+            kind: inbound.isDirectMessage ? .direct : .channel,
+            dataRoot: dataRoot,
+            context: "SlackSocketModeLoop.ensureSessionRow"
         )
-    }
-
-    static func ensureSessionRow(
-        id: String,
-        title: String,
-        sourceKey: String,
-        dataRoot: URL
-    ) async throws {
-        let sessionsPath = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions.json")
-        try await persistence.withFileLock(sessionsPath) {
-            var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
-            if rows.contains(where: { row in
-                guard case .string(let rowId)? = row["id"] else { return false }
-                return rowId == id
-            }) {
-                return
-            }
-            let now = SlackSocketModeLoop.nowString()
-            // A channel still bound to a session retention archived picks its
-            // conversation back up instead of starting an empty one.
-            let row: [String: JSONValue] = try await ChatSessionRetention.restoreArchivedRow(
-                sessionId: id, dataRoot: dataRoot
-            ) ?? [
-                "id": .string(id),
-                "title": .string(title),
-                "source": .string("slack"),
-                "sourceKey": .string(sourceKey),
-                "createdAt": .string(now),
-                "updatedAt": .string(now),
-                "archived": .bool(false),
-                "messageCount": .int(0),
-            ]
-            rows.insert(row, at: 0)
-            try ChatSessionIndexFile.write(rows, to: sessionsPath)
-            ChatSessionRetention.enforceBestEffort(
-                dataRoot: dataRoot,
-                now: Date(),
-                context: "SlackSocketModeLoop.ensureSessionRow"
-            )
-        }
     }
 
     private var sessionMapPath: URL {
@@ -230,5 +188,4 @@ struct SlackSessionStore: Sendable {
             .appendingPathComponent("session_map.json")
     }
 
-    private static let persistence = SwiftNativePersistenceCore()
 }

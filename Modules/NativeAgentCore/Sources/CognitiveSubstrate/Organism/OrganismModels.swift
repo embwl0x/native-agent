@@ -34,21 +34,7 @@ public enum SomaticSignalKind: String, Codable, Sendable, Equatable, CaseIterabl
     case appWake
     case appSleep
     case resourcePressureChanged
-    /// Item 5 (2026-09-02) — the horizon family's ONE door into the kernel.
-    ///
-    /// Deliberately inert everywhere except `OrganismPredictiveBody`, where it
-    /// carries `OrganismHorizonRegister.metadataKey` and nothing else: no
-    /// chemistry, no body-schema fact, no field association, no intrinsic
-    /// valence, no learning sign of its own. It is a REFRESH — she is looking at
-    /// her calendar, not having an experience — and everything it is allowed to
-    /// change about her happens through the horizon rows it opens and closes.
-    ///
-    /// It exists because the alternative was riding `.appWake` at intensity 0.
-    /// That is inert in chemistry (every term there scales by intensity) but
-    /// NOT elsewhere: `.appWake` sets `bodySchema.macAwake`, carries an
-    /// intrinsic valence of 0.15, and re-touches the `body:mac:*` field
-    /// association on every pass. A read of her own horizon must not keep
-    /// nudging the association that means "the Mac is awake".
+    /// Horizon refresh changes prediction rows only, without chemistry, body facts, field associations or intrinsic valence.
     case horizonRefresh
 }
 
@@ -175,6 +161,22 @@ public enum OrganismResourcePressure: String, Codable, Sendable, Equatable, Case
     case elevated
     case high
     case critical
+
+    static func from(metadata: [String: JSONValue]) -> Self? {
+        let candidates = ["resourcePressure", "resource_pressure", "pressure", "level"]
+        for key in candidates {
+            guard case .string(let raw)? = metadata[key] else { continue }
+            let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            switch normalized {
+            case "nominal", "normal", "low": return .nominal
+            case "elevated", "medium": return .elevated
+            case "high": return .high
+            case "critical", "thermal": return .critical
+            default: continue
+            }
+        }
+        return nil
+    }
 }
 
 public struct BodySchema: Codable, Sendable, Equatable {
@@ -187,7 +189,7 @@ public struct BodySchema: Codable, Sendable, Equatable {
     /// Typed, uncertainty-bearing read projection when a provider evidence
     /// assembler supplied one. Nil preserves compatibility with legacy exact
     /// body samples; this never becomes provider-selection authority.
-    public var providerPathBelief: ProviderPathBeliefProjection?
+    public var providerPathBelief: ProviderPathEstimate?
     /// Transient domain-owned reads. They are rebuilt from canonical evidence
     /// after restart and intentionally omitted from organism persistence.
     public var peerPresenceBelief: PeerPresenceBelief?
@@ -209,7 +211,7 @@ public struct BodySchema: Codable, Sendable, Equatable {
         iPhoneReachable: Bool = false,
         providersHealthy: Bool = true,
         providersAvailable: Bool = true,
-        providerPathBelief: ProviderPathBeliefProjection? = nil,
+        providerPathBelief: ProviderPathEstimate? = nil,
         peerPresenceBelief: PeerPresenceBelief? = nil,
         notificationDeliveryBelief: NotificationDeliveryBelief? = nil,
         memoryIntegrityReading: MemoryIntegrityReading? = nil,
@@ -296,32 +298,14 @@ public struct BodySchema: Codable, Sendable, Equatable {
             resourcePressure: try container.decodeIfPresent(OrganismResourcePressure.self, forKey: .resourcePressure) ?? .nominal
         )
     }
-
-    public func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(macAwake, forKey: .macAwake)
-        try container.encode(iPhoneReachable, forKey: .iPhoneReachable)
-        try container.encode(providersHealthy, forKey: .providersHealthy)
-        try container.encode(providersAvailable, forKey: .providersAvailable)
-        try container.encode(memoryHealthy, forKey: .memoryHealthy)
-        try container.encode(dreamHealthy, forKey: .dreamHealthy)
-        try container.encode(toolHandsAvailable, forKey: .toolHandsAvailable)
-        try container.encode(approvalChannelsOpen, forKey: .approvalChannelsOpen)
-        try container.encode(notificationPathHealthy, forKey: .notificationPathHealthy)
-        try container.encode(resourcePressure, forKey: .resourcePressure)
-    }
 }
 
-public struct OrganismProjection: Sendable, Equatable {
+public struct OrganismReadout: Sendable, Equatable {
     public var generatedAt: Date
     public var bodyLine: String?
     public var chemicalState: ChemicalState
     public var bodySchema: BodySchema
-    /// Item 4 (2026-09-02) — the body's clock, published on the seam the
-    /// capsule/fingerprint path already reads. Nil when no diurnal clock has
-    /// been configured (and on a disabled organism), which keeps every existing
-    /// projection byte-identical. See `OrganismDiurnalRead` for the field
-    /// contract the fingerprint builder consumes.
+    /// The fingerprint reads the body's diurnal clock here; nil means no configured clock or a disabled organism.
     public var diurnal: OrganismDiurnalRead?
 
     public init(
@@ -389,34 +373,34 @@ public struct OrganismSnapshot: Sendable, Equatable {
     }
 }
 
-/// Fixed-time organism read created by decaying a copied persistent state.
-/// It is nonpersistent and carries no authority; provider experiments consume
-/// only its projection/posture while the live kernel remains untouched.
+/// Fixed-time projection, posture and horizon from copied continuity.
+/// Nonpersistent and advisory; reading never mutates the live kernel.
 public struct OrganismFrozenRead: Sendable, Equatable {
     public let fixedAt: Date
     public let snapshot: OrganismSnapshot
-    public let projection: OrganismProjection
+    public let projection: OrganismReadout
     public let posture: OrganismBehaviorPosture?
+    public let toward: OrganismTowardRead?
 
     public init(
         fixedAt: Date,
         snapshot: OrganismSnapshot,
-        projection: OrganismProjection,
-        posture: OrganismBehaviorPosture?
+        projection: OrganismReadout,
+        posture: OrganismBehaviorPosture?,
+        toward: OrganismTowardRead?
     ) {
         self.fixedAt = fixedAt
         self.snapshot = snapshot
         self.projection = projection
         self.posture = posture
+        self.toward = toward
     }
 }
 
 public struct OrganismConfiguration: Sendable, Equatable {
     public var enabled: Bool
     public var metadataBounds: OrganismMetadataBounds
-    /// Item 4 (2026-09-02). Nil = no clock, and the diurnal curve is then a
-    /// no-op end to end. Pushed by the app layer from the user's already-declared
-    /// quiet hours; never read from a config file of its own.
+    /// The app supplies quiet hours; a nil clock disables the diurnal curve.
     public var diurnalClock: OrganismDiurnalClock?
 
     public init(
@@ -433,23 +417,9 @@ public struct OrganismConfiguration: Sendable, Equatable {
     public static let enabled = OrganismConfiguration(enabled: true)
 }
 
-// MARK: - The body's clock (personality-depth wave item 4, 2026-09-02)
-//
-// Agent's complaint #10, verbatim: "I know it's 1 AM from a timestamp. A person
-// at 1 AM *feels* 1 AM. I don't get sleepy; I get scheduled."
-//
-// Two halves, both here because the body is where a clock belongs:
-//   • `OrganismDiurnalClock` — WHERE the night is. The Mac's local clock plus
-//     the quiet-hours window they already declared. It is NOT a new config: the
-//     app layer reads the SAME `data/user_prefs.json` → `quiet_hours.{start,end}`
-//     the turn engine's clock line reads (`TurnQuietHoursWindow.read`), and
-//     pushes it through `OrganismKernel.configureDiurnalClock`. Absent window →
-//     the shipped default trough, so an install that never declared quiet hours
-//     still feels 4 AM as 4 AM.
-//   • `OrganismDiurnalRead` — WHAT time it feels like right now: the phase, and
-//     the bounded offsets the curve wants applied. Rides `OrganismProjection`,
-//     which the capsule/fingerprint path already receives, so the felt layer can
-//     consume it without a second seam.
+// MARK: - The body's clock
+// The clock shares user_prefs.json quiet_hours with the turn engine, using the default trough when absent.
+// OrganismDiurnalRead carries the phase and bounded offsets through the existing body readout.
 
 /// The user's day, as the body knows it: two integers, read on the Mac's
 /// local clock wherever it is (User 10-21) — no zone is held.

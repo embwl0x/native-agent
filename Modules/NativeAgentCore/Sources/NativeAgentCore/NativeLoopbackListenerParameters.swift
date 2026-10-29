@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import Darwin
 import Network
 // Blueprint: | `NativeLoopbackListenerParameters.swift` | Loopback listener construction, generation and rebind lifecycle; one retained, cancellable two-second port diagnostic, with admission held through process exit and stale generations excluded from publication |

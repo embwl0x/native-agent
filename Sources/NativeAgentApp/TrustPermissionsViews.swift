@@ -9,8 +9,7 @@ import TrustCenter
 
 struct ChromeControlPermissionsView: View {
     @Environment(AppModel.self) private var appModel
-    @State private var enabled = false
-    @State private var isSaving = false
+    @State private var pendingEnabled: Bool?
     @State private var chromeSetupMessage: String?
     @State private var connectionState: ChromeControlConnectionState = .extensionNotLoaded
 
@@ -18,7 +17,9 @@ struct ChromeControlPermissionsView: View {
         appModel.engine.trust.policy.map(TrustAccessModeCapabilityCatalog.fullMacGrantIsActive) ?? false
     }
 
-    private var isOn: Bool { enabled || fullMacActive }
+    private var isOn: Bool {
+        (pendingEnabled ?? (appModel.engine.trust.policy?.chromeControlPolicy?.enabled == true)) || fullMacActive
+    }
 
     /// The row's one status line: permission, then connection, each said
     /// once. Full Mac and the switch both read "Allowed"; the switch (or the
@@ -58,30 +59,25 @@ struct ChromeControlPermissionsView: View {
                     Toggle("Chrome control", isOn: Binding(
                         get: { isOn },
                         set: { newValue in
-                            enabled = newValue
+                            guard pendingEnabled == nil else { return }
+                            pendingEnabled = newValue
                             Task {
-                                isSaving = true
                                 await appModel.saveChromeControlEnabled(newValue)
-                                isSaving = false
-                                syncFromPolicy()
+                                pendingEnabled = nil
                             }
                         }
                     ))
                     .labelsHidden()
                     .toggleStyle(.switch)
                     .hazeTinted()
-                    .disabled(isSaving)
+                    .disabled(pendingEnabled != nil)
                     .help("The Chrome extension must still be installed.")
                 }
             }
             .task {
-                syncFromPolicy()
                 for await state in await appModel.engine.chrome.connectionStates() {
                     connectionState = state
                 }
-            }
-            .onChange(of: appModel.engine.trust.policy) { _, _ in
-                if !isSaving { syncFromPolicy() }
             }
 
             if isOn && connectionState == .connected {
@@ -115,15 +111,11 @@ struct ChromeControlPermissionsView: View {
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if isSaving {
+            if pendingEnabled != nil {
                 ProgressView("Updating Chrome control…")
                     .controlSize(.small)
             }
         }
-    }
-
-    private func syncFromPolicy() {
-        enabled = appModel.engine.trust.policy?.chromeControlPolicy?.enabled ?? false
     }
 
     private func setUpChrome() {
@@ -136,15 +128,14 @@ struct ChromeControlPermissionsView: View {
     }
 }
 
-// PATCH-2026-05-06: multimodal-ui Sprint 3 — multimodal permission toggles.
 struct MultimodalPermissionsView: View {
     @Environment(AppModel.self) private var appModel
     @AppStorage("voiceAutoRead") private var voiceAutoRead = false
-    @State private var draftPolicy: TrustMultimodalPolicy?
-    @State private var isSaving = false
+    @State private var pendingPolicy: TrustMultimodalPolicy?
+    private var policy: TrustMultimodalPolicy? { pendingPolicy ?? appModel.engine.trust.policy?.multimodalPolicy }
+    private var isSaving: Bool { pendingPolicy != nil }
 
-    /// Alive glass (2026-09-23): one group card of switch rows. Every change
-    /// here applies at once; Trust's feature footnote says so.
+    /// Permission changes apply immediately, as stated in the feature footnote.
     var body: some View {
         AliveGroupCard {
             FeatureSwitchRow(
@@ -152,26 +143,26 @@ struct MultimodalPermissionsView: View {
                 detail: "I capture your screen when you click the camera button in Chat.",
                 isOn: policyBinding(\.screen_capture)
             )
-            .disabled(isSaving || draftPolicy == nil)
+            .disabled(isSaving || policy == nil)
             FeatureSwitchRow(
                 title: "Allow image understanding",
                 detail: "I send images you attach to your AI provider so I can read them. This counts toward your subscription usage.",
                 isOn: policyBinding(\.vision_api_calls)
             )
-            .disabled(isSaving || draftPolicy == nil)
+            .disabled(isSaving || policy == nil)
             FeatureSwitchRow(
                 title: "Allow reading PDFs",
                 detail: "I read the text of a PDF you attach into the conversation. With this off, I skip the attachment and I'm told I did, so I never guess at what it says. A PDF that is only pictures of pages has no text to read.",
                 isOn: policyBinding(\.file_ingestion_pdf)
             )
-            .disabled(isSaving || draftPolicy == nil)
+            .disabled(isSaving || policy == nil)
             FeatureSwitchRow(
                 title: "Allow image generation",
                 detail: "I make images when you ask for one.",
                 isOn: policyBinding(\.image_generation_openai)
             )
-            .disabled(isSaving || draftPolicy == nil)
-            if draftPolicy == nil {
+            .disabled(isSaving || policy == nil)
+            if policy == nil {
                 FeatureNote("Permissions unavailable. Reload Trust to check your saved settings.")
             }
             FeatureSwitchRow(
@@ -181,33 +172,23 @@ struct MultimodalPermissionsView: View {
                 isOn: $voiceAutoRead
             )
         }
-        .task { syncDraftPolicy() }
-        .onChange(of: appModel.engine.trust.policy) { _, _ in
-            if !isSaving { syncDraftPolicy() }
-        }
     }
 
     private func policyBinding(_ keyPath: WritableKeyPath<TrustMultimodalPolicy, Bool>) -> Binding<Bool> {
         Binding(
-            get: { draftPolicy?[keyPath: keyPath] ?? false },
+            get: { policy?[keyPath: keyPath] ?? false },
             set: { newValue in savePolicy(keyPath, value: newValue) }
         )
     }
 
     private func savePolicy(_ keyPath: WritableKeyPath<TrustMultimodalPolicy, Bool>, value: Bool) {
-        guard !isSaving, var next = draftPolicy else { return }
+        guard !isSaving, var next = policy else { return }
         next[keyPath: keyPath] = value
-        draftPolicy = next
-        isSaving = true
+        pendingPolicy = next
         Task {
             _ = await appModel.saveMultimodalPolicy(next)
-            isSaving = false
-            syncDraftPolicy()
+            pendingPolicy = nil
         }
-    }
-
-    private func syncDraftPolicy() {
-        draftPolicy = appModel.engine.trust.policy?.multimodalPolicy
     }
 }
 
@@ -222,8 +203,6 @@ struct TrainingPermissionsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
             AliveGroupCard {
-                // Sweep R4 C9 — COPY ONLY. "improvement kernel" named an
-                // internal component, not a thing the user grants.
                 FeatureSwitchRow(
                     title: "Let me work unattended",
                     detail: unattendedForced
@@ -252,7 +231,6 @@ struct TrainingPermissionsView: View {
     }
 }
 
-// PATCH-2026-05-07: executions-b Permissions panel for autonomous executions
 struct WorkshopPermissionsView: View {
     @Environment(AppModel.self) private var appModel
     @State private var isSaving = false
@@ -260,7 +238,6 @@ struct WorkshopPermissionsView: View {
     private var verdict: TrustFacade.FeatureVerdict? { appModel.engine.trust.deskTasks }
     private var deskTasksForced: Bool { verdict?.forced == true }
 
-    /// Alive glass (2026-09-23): one group card of switch rows.
     var body: some View {
         AliveGroupCard {
             FeatureSwitchRow(
@@ -290,7 +267,6 @@ struct WorkshopPermissionsView: View {
     }
 }
 
-// PATCH-2026-05-07: living-memory Permissions panel for living memory system
 struct LivingMemoryPermissionsView: View {
     @Environment(AppModel.self) private var appModel
     private var policy: TrustMemoryPolicy? { appModel.engine.trust.memoryPermissions }
@@ -300,13 +276,13 @@ struct LivingMemoryPermissionsView: View {
         appModel.engine.memory.proposals.filter { $0.status == "pending" }.count
     }
 
-    /// Alive glass (2026-09-23): one group card of switch rows. Titles match
-    /// the same switches on Setup (SetupFeatureRows.swift).
+    /// Shared memory controls; the containing page supplies the group card.
     var body: some View {
-        AliveGroupCard(waiting: pendingCount > 0) {
+        Group {
             FeatureSwitchRow(
                 title: "Remember across conversations",
                 detail: "Each time you write, I look through all our past conversations for what is relevant. Read only; on by default.",
+                identifier: "setup.feature.cross_session_recall",
                 isOn: Binding(
                     get: { policy?.cross_session_recall == true },
                     set: { v in
@@ -317,20 +293,9 @@ struct LivingMemoryPermissionsView: View {
                 )
             )
             FeatureSwitchRow(
-                title: "Nightly memory consolidation",
-                detail: MemoryPolicyHelpCopy.nightlyConsolidation,
-                isOn: Binding(
-                    get: { policy?.consolidation_enabled == true },
-                    set: { v in
-                        guard var next = policy else { return }
-                        next.consolidation_enabled = v
-                        Task { await saveMemoryPolicy(next) }
-                    }
-                )
-            )
-            FeatureSwitchRow(
                 title: "Knowledge graph",
                 detail: "I join up the people, places and things your conversations keep mentioning, and draw them in Memory → Graph.",
+                identifier: "setup.feature.knowledge_graph_enabled",
                 isOn: Binding(
                     get: { policy?.knowledge_graph_enabled == true },
                     set: { v in
@@ -341,20 +306,11 @@ struct LivingMemoryPermissionsView: View {
             FeatureSwitchRow(
                 title: "Recurring memories are proposed as facts",
                 detail: "When something useful keeps coming back, I suggest keeping it as a lasting fact, without loading all my memory into every reply.",
+                identifier: "setup.feature.adaptive_promotion",
                 isOn: Binding(
                     get: { policy?.adaptive_promotion == true },
                     set: { v in
                         Task { await patchMemoryPolicy(adaptivePromotion: v) }
-                    }
-                )
-            )
-            FeatureSwitchRow(
-                title: "Memory hygiene",
-                detail: "I regularly clear out old, noisy, duplicate and low-value memories so they don't pile up.",
-                isOn: Binding(
-                    get: { policy?.hygiene_enabled == true },
-                    set: { v in
-                        Task { await patchMemoryPolicy(hygiene: v) }
                     }
                 )
             )
@@ -369,9 +325,7 @@ struct LivingMemoryPermissionsView: View {
                         .foregroundStyle(NativeAgentShell.text)
                 }
             }
-            // Sweep R4 C9 — COPY ONLY. "harness and promotion proposals"
-            // named machinery; the user is being told which page to look on.
-            FeatureNote("What I remember, how I recall it, and how I tidy myself up are all set here. Suggested memory changes wait for you in Memory; suggested changes to how I behave wait in Self-Improvement.")
+            FeatureNote("What I remember and how I recall it are set here. Suggested memory changes wait for you in Memory; suggested changes to how I behave wait in Self-Improvement.")
         }
         .disabled(isSaving || policy == nil)
     }
@@ -379,28 +333,26 @@ struct LivingMemoryPermissionsView: View {
     private func saveMemoryPolicy(_ policy: TrustMemoryPolicy) async {
         isSaving = true
         await appModel.saveMemoryPolicy(
-            consolidationEnabled: policy.consolidation_enabled,
             crossSessionRecall: policy.cross_session_recall
         )
         isSaving = false
     }
 
-    private func patchMemoryPolicy(knowledgeGraph: Bool? = nil, adaptivePromotion: Bool? = nil, hygiene: Bool? = nil) async {
+    private func patchMemoryPolicy(knowledgeGraph: Bool? = nil, adaptivePromotion: Bool? = nil) async {
         isSaving = true
         await appModel.patchMemoryPolicy(
             knowledgeGraphEnabled: knowledgeGraph,
-            adaptivePromotion: adaptivePromotion,
-            hygieneEnabled: hygiene
+            adaptivePromotion: adaptivePromotion
         )
         isSaving = false
     }
 }
 
-/// A switch row on Trust's feature cards (Alive glass): the words on the
-/// left, the haze switch on the right. Same shape as the Mac control rows.
-private struct FeatureSwitchRow: View {
+/// A permission row with wrapping detail and a trailing haze switch.
+struct FeatureSwitchRow: View {
     let title: String
     var detail: String? = nil
+    var note: String? = nil
     var identifier: String? = nil
     @Binding var isOn: Bool
 
@@ -415,6 +367,11 @@ private struct FeatureSwitchRow: View {
                         .font(ShellType.rowDetail)
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                }
+                if let note {
+                    Text(note)
+                        .font(ShellType.rowDetail)
+                        .foregroundStyle(NativeAgentShell.secondary)
                 }
             }
             Spacer(minLength: 12)
@@ -438,55 +395,4 @@ private struct FeatureNote: View {
             .foregroundStyle(NativeAgentShell.secondary)
             .fixedSize(horizontal: false, vertical: true)
     }
-}
-
-struct TrustBoundaryRow: View {
-    var title: String
-    var detail: String
-    var systemImage: String
-    var tone: TrustSafetyBoundaryTone = .neutral
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: systemImage)
-                .foregroundStyle(tint)
-                .frame(width: 22)
-            // The privacy map's row type, so the two Advanced cards read at
-            // one size.
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(ShellType.bodySemibold)
-                    .foregroundStyle(NativeAgentShell.text)
-                Text(detail)
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .textSelection(.enabled)
-    }
-
-    private var tint: Color {
-        switch tone {
-        case .neutral:
-            .secondary
-        case .caution:
-            .orange
-        case .danger:
-            .red
-        case .unavailable:
-            .orange
-        }
-    }
-}
-
-// MARK: - Plain-English memory policy help copy
-//
-// UI-6 (2026-08-01, public era): these tooltips named USER.md, a file a public
-// user never opens and has no reason to know about. They describe the same
-// thing the Memory page calls a long-term memory profile. Pure values so the
-// wording is pinnable in PublicHonestyCopyTests.
-enum MemoryPolicyHelpCopy {
-    static let nightlyConsolidation =
-        "Once a week, I look for things that keep coming up in your conversations and suggest them for your long-term memory profile."
 }

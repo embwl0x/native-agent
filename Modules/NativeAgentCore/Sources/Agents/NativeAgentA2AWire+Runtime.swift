@@ -1,4 +1,5 @@
 import Foundation
+import AgentLinkTransport
 import ToolRegistry
 import Network
 import ChatTurnRuntime
@@ -9,7 +10,7 @@ import PersistenceCore
 import ProviderRouting
 import StandingBots
 
-// Blueprint: | `NativeAgentA2AWire+Runtime.swift` | Contact task admission, runtime dispatch and reply/event framing; the same contact runtime revalidates a local helper against this install's definition, without granting peer elevation |
+// Blueprint: | `NativeAgentA2AWire+Runtime.swift` | Contact task admission, runtime dispatch and reply/event framing; an authenticated text reply to a delivered held message enters its active inline waiter before turn admission; the same contact runtime revalidates a local helper against this install's definition, without granting peer elevation |
 
 public struct AgentContactA2AEndpoint: Sendable {
     public enum Response: @unchecked Sendable {
@@ -24,27 +25,24 @@ public struct AgentContactA2AEndpoint: Sendable {
         self.tasks = tasks; self.port = port; self.grpcPort = grpcPort
     }
 
-    public func handle(_ body: Data, principal: AgentBridgePrincipal, version: String? = nil) async -> Response {
-        let envelope = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
+    public func handle(_ decoded: Any?, byteCount: Int, principal: AgentBridgePrincipal, version: String? = nil) async -> Response {
+        let envelope = decoded as? [String: Any]
         let method = envelope?["method"] as? String ?? ""
         let wireVersion = method.contains("/") ? "0.3" : "1.0"
         if let version, !version.isEmpty {
-            let components = version.split(separator: ".", omittingEmptySubsequences: false)
-            let pair = components.prefix(2).joined(separator: ".")
-            guard (2...3).contains(components.count), components.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isNumber) }),
-                  ["1.0", "0.3"].contains(pair) else {
+            guard let pair = AgentA2AWire.canonicalVersion(version) else {
                 return .json(NativeAgentA2AWire.error(envelope?["id"] ?? NSNull(), -32009, "Supported versions: 1.0, 0.3"))
             }
             if pair != wireVersion {
                 return .json(NativeAgentA2AWire.error(envelope?["id"] ?? NSNull(), -32601, "Method does not belong to the requested A2A version"))
             }
         }
-        let action = NativeAgentA2AWire.parse(body, defaultContext: principal.conversationID(protocolName: "a2a"))
+        let action = NativeAgentA2AWire.parse(decoded, byteCount: byteCount, defaultContext: principal.conversationID(protocolName: "a2a"))
         let id: Any
         switch action {
         case .response(let response): return .json(response)
         case .send(let send): id = send.rpcID
-        case .get(let rpc, _, _, _), .subscribe(let rpc, _), .cancel(let rpc, _), .list(let rpc, _), .push(let rpc, _, _), .extended(let rpc): id = rpc
+        case .get(let rpc, _), .subscribe(let rpc, _), .cancel(let rpc, _), .list(let rpc, _), .push(let rpc, _, _), .extended(let rpc): id = rpc
         }
         do {
             switch action {
@@ -52,15 +50,12 @@ public struct AgentContactA2AEndpoint: Sendable {
             case .extended:
                 return .json(NativeAgentA2AWire.result(id, NativeAgentA2AWire.card(port: port, version: wireVersion, extended: true, grpcPort: grpcPort)))
             case .push(_, let operation, let params):
-                let parameters = try JSONDecoder().decode(JSONValue.self, from: JSONSerialization.data(withJSONObject: params))
-                let value = try await tasks.push(operation: operation, owner: principal.id, parameters: parameters)
-                return .json(NativeAgentA2AWire.result(id, AgentContactPart.object(value) as! [String: Any]))
+                let value = try await tasks.push(operation: operation, owner: principal.id, parameters: JSONValue(fromFoundation: params))
+                return .json(NativeAgentA2AWire.result(id, value.foundationObject as! [String: Any]))
             case .send(let send):
                 // Method and params, not the envelope: a client retrying the same
                 // messageId mints a new JSON-RPC id.
-                let replayObject: [String: Any] = ["method": method, "params": envelope?["params"] ?? NSNull()]
-                let replayBytes = JSONSerialization.isValidJSONObject(replayObject)
-                    ? (try? JSONSerialization.data(withJSONObject: replayObject, options: .sortedKeys)) ?? body : body
+                let replayBytes = try JSONSerialization.data(withJSONObject: ["method": method, "params": envelope?["params"] ?? NSNull()], options: .sortedKeys)
                 let task = try await tasks.send(send, principal: principal, digest: AgentPeerReplayClaimStore.digest(replayBytes))
                 if send.streaming {
                     return .stream(id: id, events: try await tasks.subscribe(task.id, owner: principal.id), version: wireVersion)
@@ -69,7 +64,7 @@ public struct AgentContactA2AEndpoint: Sendable {
                 let projected = try NativeAgentA2AWire.project(returned, version: wireVersion)
                 return .json(NativeAgentA2AWire.result(id, wireVersion == "1.0" ? ["task": projected] : projected),
                              onSent: replyAcknowledgement(returned))
-            case .get(_, let task, _, _):
+            case .get(_, let task):
                 let returned = try await tasks.get(task, owner: principal.id)
                 let projected = try NativeAgentA2AWire.project(returned, version: wireVersion)
                 return .json(NativeAgentA2AWire.result(id, projected), onSent: replyAcknowledgement(returned))
@@ -81,9 +76,8 @@ public struct AgentContactA2AEndpoint: Sendable {
             case .cancel(_, let task):
                 return .json(NativeAgentA2AWire.result(id, try NativeAgentA2AWire.project(try await tasks.cancel(task, owner: principal.id), version: wireVersion)))
             case .list(_, let params):
-                let parameters = try JSONDecoder().decode(JSONValue.self, from: JSONSerialization.data(withJSONObject: params))
-                let listed = try await tasks.list(owner: principal.id, parameters: parameters)
-                return .json(NativeAgentA2AWire.result(id, AgentContactPart.object(listed) as! [String: Any]))
+                let listed = try await tasks.list(owner: principal.id, parameters: JSONValue(fromFoundation: params))
+                return .json(NativeAgentA2AWire.result(id, listed.foundationObject as! [String: Any]))
             }
         } catch let failure as AgentContactFailure {
             return .json(NativeAgentA2AWire.error(id, failure.code, failure.message))
@@ -125,6 +119,20 @@ enum AgentContactRuntime {
         let attachments = turn.parts.compactMap(\.attachment)
         let plain = turn.parts.compactMap { if case .text(let text) = $0 { return text }; return nil }.joined(separator: "\n")
         let acceptedMessage = acceptedMessage ?? turn.accepted
+        if acceptedMessage == nil, turn.parts.allSatisfy({ if case .text = $0 { true } else { false } }),
+           let peerID = try revalidated(principal, dataRoot: dataRoot).peerID {
+            let from = "peer:" + peerID
+            let offered = await settle {
+                Result {
+                    try AgentConversationStore(dataRoot: dataRoot).offerBridgeReplyToInlineWait(
+                        agent: from, conversationID: turn.context, text: plain, from: from, steeredBy: [from])
+                }
+            }
+            if try offered.get() {
+                return AgentContactOutcome(state: .completed,
+                    parts: [.text("Your reply was returned to the waiting conversation.")])
+            }
+        }
         // The run is minted here and the request pins it, so the enqueued row is that same run.
         let runID = acceptedMessage?.runId ?? UUID().uuidString
         let enqueued: EnqueuedUserMessage
@@ -261,7 +269,7 @@ public enum AgentContactSSE {
                 try await send(Data("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n".utf8), on: connection)
                 for await event in events {
                     try Task.checkCancellation()
-                    try await send(frame(event, id: AgentContactPart.object(rpcID), version: version, rest: rest), on: connection)
+                    try await send(frame(event, id: rpcID.foundationObject, version: version, rest: rest), on: connection)
                     if version == "1.0" {
                         switch event {
                         case .snapshot(let task), .status(let task, _):
@@ -289,7 +297,7 @@ public enum AgentContactSSE {
         }
     }
 
-    private static func send(_ data: Data, on connection: NWConnection) async throws {
+    static func send(_ data: Data, on connection: NWConnection) async throws {
         // finish is idempotent: cancellation and Network completion claim the
         // same send, including cancellation before the operation starts.
         let completion = AsyncThrowingStream<Void, Error>.makeStream()

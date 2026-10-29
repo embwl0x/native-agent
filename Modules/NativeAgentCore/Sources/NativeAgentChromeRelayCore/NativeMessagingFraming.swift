@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 // Blueprint: | `NativeMessagingFraming.swift` | `NativeMessagingFramer`: bounded little-endian JSON framing shared by Chrome pipes and private relay socket, with exact fragmented reads |
@@ -75,16 +76,62 @@ public struct NativeMessagingFramer: Sendable {
         try handle.write(contentsOf: encode(payload))
     }
 
-    public func validateJSONObject(_ payload: Data) throws {
+    /// Borrows the descriptor for a bounded complete frame and restores its timeout.
+    public func readMessage(fromSocket descriptor: Int32, timeout: TimeInterval) throws -> Data? {
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        defer { var none = timeval(); setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &none, socklen_t(MemoryLayout<timeval>.size)) }
+        return try readMessage { count in
+            var buffer = [UInt8](repeating: 0, count: count)
+            while true {
+                try socketWindow(descriptor, option: SO_RCVTIMEO, deadline: deadline)
+                let received = buffer.withUnsafeMutableBytes { Darwin.recv(descriptor, $0.baseAddress, count, 0) }
+                if received < 0, errno == EINTR { continue }
+                guard received >= 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                return Data(buffer.prefix(received))
+            }
+        }
+    }
+
+    public func writeMessage(_ payload: Data, toSocket descriptor: Int32, timeout: TimeInterval) throws {
+        let frame = try encode(payload)
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        var noSignal: Int32 = 1
+        guard setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { var none = timeval(); setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &none, socklen_t(MemoryLayout<timeval>.size)) }
+        try frame.withUnsafeBytes { raw in
+            var sent = 0
+            while sent < raw.count {
+                try socketWindow(descriptor, option: SO_SNDTIMEO, deadline: deadline)
+                let written = Darwin.send(descriptor, raw.baseAddress!.advanced(by: sent), raw.count - sent, 0)
+                if written < 0, errno == EINTR { continue }
+                guard written > 0 else { throw POSIXError(POSIXErrorCode(rawValue: written == 0 ? EPIPE : errno) ?? .EIO) }
+                sent += written
+            }
+        }
+    }
+
+    private func socketWindow(_ descriptor: Int32, option: Int32, deadline: TimeInterval) throws {
+        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+        guard remaining > 0.001 else { throw POSIXError(.ETIMEDOUT) }
+        var window = timeval(tv_sec: Int(remaining), tv_usec: Int32((remaining - Double(Int(remaining))) * 1_000_000))
+        guard setsockopt(descriptor, SOL_SOCKET, option, &window, socklen_t(MemoryLayout<timeval>.size)) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
+
+    public func validateJSONObject(_ payload: Data) throws -> [String: Any] {
         let value: Any
         do {
             value = try JSONSerialization.jsonObject(with: payload)
         } catch {
             throw NativeMessagingFramingError.invalidJSON
         }
-        guard value is [String: Any] else {
+        guard let object = value as? [String: Any] else {
             throw NativeMessagingFramingError.topLevelJSONMustBeObject
         }
+        return object
     }
 
     private func validateSize(_ payload: Data) throws {

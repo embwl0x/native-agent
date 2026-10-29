@@ -62,18 +62,14 @@ extension AppQuietToolHost {
     /// The connections pages' buttons.
     func connections(verb: String, input: [String: JSONValue]) async -> JSONValue {
         func text(_ key: String) -> String {
-            AppToolExecutor.inputString(input[key])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            input[key]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         }
-        func outcome(_ line: String, _ extra: [String: JSONValue] = [:]) -> JSONValue {
-            let failed = line.localizedCaseInsensitiveContains("failed") || line.localizedCaseInsensitiveContains("disabled")
-            var body = extra
-            body["status"] = .string(failed ? "failed" : "ok")
-            body["detail"] = .string(line)
-            return .object(body)
+        func outcome(_ result: AppMutationResult) -> JSONValue {
+            .object(["status": .string(result.succeeded ? "ok" : "failed"), "detail": .string(result.agentMessage)])
         }
         func decided(_ tool: String) {
-            HarnessDecidedRow.post(requester: "Full Mac", tool: tool, sessionID: AppToolExecutor.inputString(input["__session_id"]),
-                                   dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+            HarnessDecidedRow.post(requester: "Full Mac", tool: tool, sessionID: input["__session_id"]?.scalarText,
+                                   dataRoot: appModel.engine.dataRoot)
         }
         switch verb {
         case "connector_off", "connector_on":
@@ -96,8 +92,8 @@ extension AppQuietToolHost {
             case .verified:
                 if on {
                     HarnessDecidedRow.post(requester: "Full Mac", tool: "connector.on \(connector.id)",
-                                           sessionID: AppToolExecutor.inputString(input["__session_id"]),
-                                           dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
+                                           sessionID: input["__session_id"]?.scalarText,
+                                           dataRoot: appModel.engine.dataRoot)
                 }
                 return .object(["status": .string("ok"), "changed": .bool(true), "id": .string(connector.id),
                                 "detail": .string(on ? "\(connector.name) is on."
@@ -137,15 +133,14 @@ extension AppQuietToolHost {
             guard await appModel.refreshTelegram() else {
                 return AppToolExecutor.failure("telegram_disconnect_failed", "Telegram didn't read; nothing was removed.")
             }
-            await appModel.clearTelegramToken(restartPollLoop: false)
+            let result = await appModel.clearTelegramToken(restartPollLoop: false)
             let loops = appModel.backgroundLoopsManager
             Task.detached {
-                await TelegramTurnCoordinator.shared.waitUntilAllIdle()
+                await TelegramTurns.shared.waitUntilAllIdle()
                 _ = await NativeAgentEngine.restartBackgroundLoop(id: "telegram_poll", manager: loops)
             }
-            let result = outcome(appModel.statusForAgent)
-            if case .object(let body) = result, body["status"] == .string("ok") { decided("telegram.disconnect") }
-            return result
+            if result.succeeded { decided("telegram.disconnect") }
+            return outcome(result)
         case "pairing_remove":
             // Connectors → iPhone → Remove.
             guard let store = appModel.engine.sync.owner?.pairedPhones else {
@@ -172,8 +167,7 @@ extension AppQuietToolHost {
                 return ChatToolOutcome.failure(error: error, tool: "app")
             }
         case "telegram_test":
-            await appModel.testTelegram()
-            return outcome(appModel.statusForAgent)
+            return outcome(await appModel.testTelegram())
         default: // telegram_clear_logs
             await appModel.clearTelegramLogs()
             switch appModel.telegramClearLogsOutcome {

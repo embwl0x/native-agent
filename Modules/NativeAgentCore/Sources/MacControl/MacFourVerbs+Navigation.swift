@@ -80,7 +80,7 @@ extension MacFourVerbs {
                     landingApp = verificationDestination
                     moved = front ? "Switched to \(trimmed)."
                         : out["launched"] == .bool(true) ? "Launched \(trimmed) without activating it."
-                        : "Reopened \(trimmed) without activating it."
+                        : "\(trimmed) is already running; its windows were left as they were."
                     settlesAsynchronously = true
                 } else {
                     // Search folders only when no such app exists. An app that
@@ -238,10 +238,7 @@ extension MacFourVerbs {
 
     static func filePath(_ text: String) -> URL? {
         if let url = URL(string: text), url.scheme?.lowercased() == "file" { return url }
-        var path = text
-        if path.hasPrefix("~") {
-            path = NSHomeDirectory() + String(path.dropFirst())
-        }
+        let path = NativeAgentWorkspaceRoot.fileSpelling(text)
         guard path.hasPrefix("/") else { return nil }
         return URL(fileURLWithPath: path)
     }

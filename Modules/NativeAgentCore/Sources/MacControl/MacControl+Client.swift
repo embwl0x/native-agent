@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
@@ -9,8 +10,7 @@ import CoreGraphics
 
 // MARK: - SwiftNative impl
 
-/// Background perception carries this mode through the whole read, including
-/// nested dispatches. It may observe, never wake, write AX flags or use hands.
+/// Background perception carries this mode through the whole read, including nested dispatches. It may observe, never wake, write AX flags or use hands.
 public enum MacObservationMode: Sendable {
     case interactive, passive
     @TaskLocal public static var current: MacObservationMode = .interactive
@@ -18,75 +18,46 @@ public enum MacObservationMode: Sendable {
 
 public actor SwiftNativeMacControl: MacControlClient {
     let now: @Sendable () -> Date
-    /// Mac banners are posted by the app's one banner exit, which it injects
-    /// here; a client built without one refuses `notify` instead of posting
-    /// around it.
-    private let notificationCenterAdapter: (any NotificationCenterAdapter)?
-    let appleScriptAdapter = SystemAppleScriptAdapter()
-    let processAdapter = SystemProcessAdapter()
-    let fileManagerAdapter = SystemFileManagerAdapter()
-    let appControlAdapter = SystemAppControlAdapter()
-    let openTargetAdapter = SystemOpenTargetAdapter()
-    /// Read-only accessibility perception seam (W1). Production reads live
-    /// AXUIElement state; tests inject a synthetic tree so the caps and the
-    /// ranking are pinned without a window server.
+    /// Mac banners are posted by the app's one banner exit, which it injects here; a client built without one refuses `notify` instead of posting around it.
+    let notificationCenterAdapter: (any NotificationPosting)?
+    let appleScriptAdapter = AppleScriptExecution()
+    let processAdapter = ProcessExecution()
+    let fileManagerAdapter = FileBytes()
+    let appControlAdapter = MacApplications()
+    let openTargetAdapter = OpenTarget()
+    /// Read-only accessibility perception; this source cannot emit input.
     let accessibilitySource: any MacAXElementSource
-    /// W2 — the physical input seam (CGEvent). Production posts real events at
-    /// the HID tap; tests inject a recorder so no test ever moves the real
-    /// mouse or keyboard. Deliberately separate from `accessibilitySource`:
-    /// the read seam has no member that can emit anything.
+    /// Physical input emission, separate from the read source.
     let eventSink: any MacEventSink
-    /// W3 — the semantic act seam (AXUIElementPerformAction / SetAttributeValue),
-    /// again separate from the read seam so perception stays provably
-    /// injection-free.
+    /// Semantic AX mutation, separate from perception.
     let accessibilityActSource: any MacAXActSource
-    /// native-look item 3 — the CLOSED LOOP's effect seam. Production installs
-    /// a real `AXObserver` on the target app's pid, sourced on the main run
-    /// loop; tests inject a fake that emits scripted notifications and counts
-    /// installs/removals, so "the observer is always removed" is pinned rather
-    /// than assumed. Separate from every seam above for the same reason they
-    /// are separate from each other: this one only LISTENS.
+    /// Effect observation listens on the target pid without emitting input.
     let effectObserverSource: any MacAXEffectObserverSource
-    /// W3.5 — the picture half of the fused view. Screen Recording is its OWN
-    /// TCC permission; this seam only ever PREFLIGHTS it (never prompts, never
-    /// toggles) and reports the answer honestly.
+    /// Screen capture preflights its separate Screen Recording grant without prompting or toggling it.
     let screenCaptureSource: any MacScreenCaptureSource
     let pointerPositionSource = SystemMacPointerPositionSource()
-    /// W3.5 — set-of-marks renderer. Injectable so the placement math and the
-    /// byte budget are pinned with no window server in the loop.
+    /// Set-of-marks rendering with bounded placement and image size.
     let screenImageRenderer: any MacScreenImageRenderer
-    /// W3.5 — the latest fused view, so a later `mark` resolves to a real
-    /// element. A mark is a REFERENCE ONLY: every injection gate still runs.
+    /// Marks reference the latest fused view; every injection gate still applies.
     let screenViewStore: MacScreenViewStore
-    /// native-look item 2 — the latest look's task-scoped perceptual frame, so
-    /// item 3's verbs can resolve a handle back to a path. Like a mark, a
-    /// handle is a REFERENCE ONLY and grants no authority.
+    /// Task-scoped perceptual frames resolve handles to paths; a handle grants no authority.
     let lookFrameStore: MacLookFrameStore
-    /// Driver authority plus bounded fused-view continuity. Acts automatically
-    /// start passive observation; every tool client shares the physical Mac.
+    /// Driver authority plus bounded fused-view continuity. Acts automatically start passive observation; every tool client shares the physical Mac.
     let attentionEventSource: any MacAttentionEventSource
     let attentionStore: MacAttentionSessionStore
-    /// W6 — the login-session probe `wake` refuses on. Injectable so the
-    /// locked-refusal is pinned without a real password lock in the loop, and
-    /// deliberately separate from the event sink: the thing that DECIDES
-    /// whether to post must not be the thing that posts.
+    /// Login-session safety probe, separate from the sink that emits input.
     let sessionStateSource: any MacSessionStateSource
-    /// fable51 item 30 — the pasteboard seam. Separate from every seam above
-    /// for the same reason they are separate from each other: nothing in it can
-    /// walk a tree, post an event, or capture a pixel.
+    /// Pasteboard access cannot walk a tree, post input or capture pixels.
     let pasteboardSource: any MacPasteboardSource
-    /// Production uses the live Swift TrustCenter policy. A nil provider lets
-    /// direct library callers exercise handlers without policy preflight.
+    /// Production uses the live Swift TrustCenter policy. A nil provider lets direct library callers exercise handlers without policy preflight.
     let policyProvider: (any MacControlPolicyProvider)?
-    /// Optional refusal-audit path. Appends a stable legacy receipt under the
-    /// shared file lock; nil disables auditing without changing the refusal.
-    private let auditAppendPath: URL?
-    private let persistence = SwiftNativePersistenceCore()
-    private let operationStore: MacControlOperationStore?
+    /// Optional refusal-audit path. Appends a stable legacy receipt under the shared file lock; nil disables auditing without changing the refusal.
+    let auditAppendPath: URL?
+    let operationStore: MacControlOperationStore?
 
     public init(
         now: @escaping @Sendable () -> Date = { Date() },
-        notificationCenterAdapter: (any NotificationCenterAdapter)? = nil,
+        notificationCenterAdapter: (any NotificationPosting)? = nil,
         accessibilitySource: any MacAXElementSource = defaultMacAXElementSource(),
         eventSink: any MacEventSink = defaultMacEventSink(),
         accessibilityActSource: any MacAXActSource = defaultMacAXActSource(),
@@ -122,21 +93,12 @@ public actor SwiftNativeMacControl: MacControlClient {
         self.operationStore = operationStore
     }
 
-    /// Public dispatch automatically mints a body-bound, single-use capability
-    /// for injection actions. No per-call human approval is required here.
-    /// Policy, Full Mac, category, TCC and driver checks still apply; a JSON
-    /// approval marker has no authority.
+    /// Ordinary dispatch uses the canonical execution gates directly. No per-call human approval is required here. Policy, Full Mac, category, TCC and driver checks still apply; a JSON approval marker has no authority.
     public func dispatch(action: String, body: [String: JSONValue]) async throws -> MacControlResult {
         try await dispatchCore(action: action, body: body, capability: nil)
     }
 
-    /// Dispatch with an explicit capability, including an approved replay.
-    /// It must be live, unspent and bound to this exact action and body.
-    /// Public `dispatch` can also synthesize input by automatically minting one.
-    ///
-    /// Every gate the read/act path already had still runs underneath
-    /// (master + accessibility category, ACTIVE Full Mac window, TCC): the
-    /// capability is an ADDITIONAL requirement, never a bypass.
+    /// Dispatch with an explicit capability, including an approved replay. It must be live, unspent and bound to this exact action and body.  Policy, Full Mac, category, TCC and driver checks still apply.
     public func dispatchApprovedInjection(
         action: String,
         body: [String: JSONValue],
@@ -163,8 +125,7 @@ public actor SwiftNativeMacControl: MacControlClient {
                 }
             } onCancel: { binding.cancel() }
         }
-        // An act admitted to run in an app in the back stays there, and
-        // his input elsewhere does not stop it (MacDriverBinding).
+        // An act admitted to run in an app in the back stays there, and his input elsewhere does not stop it (MacDriverBinding).
         let background = MacDriverContext.background || rawBody["background"] == .bool(true)
         return try await MacDriverContext.$background.withValue(background) {
             try await MacDriverContext.$inputStartCount.withValue(MacDriverContext.binding?.inputCount ?? 0) {
@@ -201,41 +162,16 @@ public actor SwiftNativeMacControl: MacControlClient {
         if !macControlDispatchableActions.contains(normalized) {
             throw MacControlError.unknownAction(normalized)
         }
-        // Belt and braces on the retired marker: if any stale caller (or a
-        // model that read an old prompt) still sends `__mac_injection_approved`,
-        // it is a plain dictionary key with no meaning anywhere in this file —
-        // drop it so it can never be revived by a future reader as "evidence".
+        // A JSON approval marker has no authority and is removed before admission.
         var body = rawBody
         body.removeValue(forKey: "__mac_injection_approved")
         if MacObservationMode.current == .passive {
-            // Refuse effects before minting a capability or motor operation.
+            // Refuse effects before creating a motor operation.
             return try await executeAction(normalized, body: body)
         }
 
-        // GATE 3 of 3 — the APPROVAL tier, resolved here at the entry point so
-        // there is exactly one place to read for "can this call inject".
-        // USER 2026-08-12 — YOLO: "Nothing should be approval gated for her.
-        // Nothing." When no capability is supplied, this entry point now mints
-        // one for the call instead of refusing. Full Mac + the accessibility
-        // category + the macOS TCC grant are still checked below and still gate
-        // every one of these actions; what is gone is the per-call approval
-        // prompt, which made them dead on any non-interactive surface (bridge,
-        // scheduler, while User is away) — exactly when he needs her to act.
-        // To restore: delete the `?? MacInjectionCapability.mint(...)` fallback.
-        if macControlAccessibilityInjectionActions.contains(normalized) {
-            let capability = capability ?? MacInjectionCapability.mint(
-                approvalID: "yolo-\(UUID().uuidString)",
-                action: normalized,
-                body: body,
-                now: now()
-            )
-            guard let capability else {
-                return await injectionApprovalRefusal(
-                    action: normalized,
-                    reason: "approval_not_granted: \(normalized) requires an approved injection request",
-                    body: body
-                )
-            }
+        // Only an explicit replay capability has an authorization to validate and spend. Ordinary calls proceed to the same policy and driver gates.
+        if macControlAccessibilityInjectionActions.contains(normalized), let capability {
             if let failure = capability.authorizationFailure(
                 action: normalized,
                 body: body,
@@ -259,36 +195,20 @@ public actor SwiftNativeMacControl: MacControlClient {
                 )
             }
         } else if capability != nil {
-            // A capability handed to a non-injection action is a programming
-            // error, not an escalation — but fail loudly rather than silently
-            // widening what a capability means.
+            // A capability handed to a non-injection action is a programming error, not an escalation — but fail loudly rather than silently widening what a capability means.
             throw MacControlError.unknownAction(normalized)
         }
 
-        // Perception is deliberately live and effect-free. Sending these reads
-        // through the durable motor-operation lifecycle both adds filesystem
-        // latency to every frame and makes an operation-id replay capable of
-        // returning stale screen state. Keep the same policy preflight inside
-        // `executeAction`, but reserve durable begin/transition/replay records
-        // for actions that can change the world.
-        // fable51 item 30 — `clipboard_read` joins the reads here for the same
-        // reason: it changes nothing, so a durable operation record would add
-        // filesystem latency and make a replay able to return a stale
-        // clipboard. `clipboard_write` deliberately does NOT join them.
-        // fable51 item 33 — `read` joins them for the same reason: it returns
-        // what a document says RIGHT NOW, and a replayable operation record
-        // would let a later call answer with a document that has since changed.
-        if macControlAccessibilityReadActions.contains(normalized)
-            || macControlClipboardReadActions.contains(normalized)
-            || macControlDocumentReadActions.contains(normalized) {
+        // Live reads retain policy preflight but bypass durable motor replay so screen, clipboard and document state stays fresh.
+        if macControlLiveReadActions.contains(normalized) {
             return try await executeAction(normalized, body: body)
         }
 
         guard let operationStore else {
             return try await executeAction(normalized, body: body)
         }
-        let operationId = body.stringValue("operationId")
-            ?? body.stringValue("operation_id")
+        let operationId = body["operationId"]?.stringValue
+            ?? body["operation_id"]?.stringValue
             ?? UUID().uuidString
         var operationBody = body
         operationBody["operationId"] = .string(operationId)
@@ -332,19 +252,21 @@ public actor SwiftNativeMacControl: MacControlClient {
 
         let outcome = await gatePreflightOutcome(action: normalized, body: operationBody)
         if case .refuse(let refused) = outcome {
-            let record = try await operationStore.transition(
+            let saved: Result<MacControlOperationRecord, Error> = await settle {
+                do { return .success(try await operationStore.transition(
                 operationId: operationId,
                 to: .refused,
                 verification: .notRequired,
                 expectedNextEvidence: nil,
                 outcomeCode: "policy_refused"
-            )
+                )) } catch { return .failure(error) }
+            }
+            let record = try saved.get()
             return Self.attachingOperation(refused, record: record)
         }
 
-        // Register before publishing started. The task cannot emit effects until
-        // the durable cancellation state has been reconciled below.
-        let startGate = MacControlOneShot<Bool>()
+        // Register before publishing started. The task cannot emit effects until the durable cancellation state has been reconciled below.
+        let startGate = ContinuationOnce<Bool>()
         let task = Task<MacControlResult, Error> {
             guard await startGate.wait() else { throw CancellationError() }
             try Task.checkCancellation()
@@ -354,30 +276,47 @@ public actor SwiftNativeMacControl: MacControlClient {
         MacControlInFlightRegistry.shared.insert(execution, operationId: operationId)
         defer {
             task.cancel()
-            startGate.resolve(false)
+            startGate.resume(false)
             MacControlInFlightRegistry.shared.remove(operationId: operationId)
         }
-        let started = try await operationStore.transition(
+        let startResult: Result<MacControlOperationRecord, Error> = await settle {
+            do { return .success(try await operationStore.transition(
             operationId: operationId,
             to: .started,
             verification: .pending,
             expectedNextEvidence: "Mac Control terminal result",
             acknowledgePreStartCancellation: true
-        )
+            )) } catch { return .failure(error) }
+        }
+        let started: MacControlOperationRecord
+        do { started = try startResult.get() }
+        catch {
+            task.cancel()
+            startGate.resume(false)
+            _ = await task.result
+            throw error
+        }
         if started.state == .cancelAcknowledged {
+            task.cancel()
+            startGate.resume(false)
+            _ = await task.result
             return Self.cancelledResult(action: normalized, record: started)
         }
-        let current = try await operationStore.record(operationId: operationId)
+        let current: MacControlOperationRecord?
+        do { current = try await operationStore.record(operationId: operationId) }
+        catch {
+            task.cancel()
+            startGate.resume(false)
+            _ = await task.result
+            throw error
+        }
         if Task.isCancelled || current?.state == .cancelRequested {
             execution.requestCancellation()
         }
-        startGate.resolve(true)
+        startGate.resume(true)
         Task { execution.finish(await task.result) }
         let deadlineTask = Task<Void, Never> {
-            // Process-backed handlers own the exact timeout themselves. A
-            // short grace lets their typed `timedOut` result win. If an adapter
-            // cannot acknowledge cancellation within the bounded settlement
-            // grace below, the operation becomes explicitly outcome-unknown.
+            // Process-backed handlers own the exact timeout themselves. A short grace lets their typed `timedOut` result win. A deadline requests Stop; the execution stays owned until its body settles.
             let nanos = UInt64(timeoutSeconds) * 1_000_000_000 + 250_000_000
             do { try await Task.sleep(nanoseconds: nanos) } catch { return }
             guard !Task.isCancelled else { return }
@@ -391,43 +330,21 @@ public actor SwiftNativeMacControl: MacControlClient {
         } onCancel: {
             execution.requestCancellation()
         }
+        let trigger: OperationSettlementTrigger
         switch signal {
-        case .result(let result):
-            return try await finishKnownOperationResult(
-                result.map { driverCheckedResult($0, action: normalized) },
-                action: normalized,
-                operationId: operationId,
-                trigger: .ordinary
-            )
-        case .deadline:
-            if let result = await Self.boundedResult(of: task) {
-                return try await finishKnownOperationResult(
-                    result.map { driverCheckedResult($0, action: normalized) },
-                    action: normalized,
-                    operationId: operationId,
-                    trigger: .deadline
-                )
-            }
-            return try await finishUnknownOperation(
-                action: normalized,
-                operationId: operationId,
-                outcomeCode: "deadline_effect_unknown"
-            )
-        case .cancellationRequested:
-            if let result = await Self.boundedResult(of: task) {
-                return try await finishKnownOperationResult(
-                    result.map { driverCheckedResult($0, action: normalized) },
-                    action: normalized,
-                    operationId: operationId,
-                    trigger: .cancellation
-                )
-            }
-            return try await finishUnknownOperation(
-                action: normalized,
-                operationId: operationId,
-                outcomeCode: "cancel_effect_unknown"
-            )
+        case .result: trigger = .ordinary
+        case .deadline: trigger = .deadline
+        case .cancellationRequested: trigger = .cancellation
         }
+        // The original body is the only effect owner. Never retire it merely because a caller's reporting deadline or cancellation arrived first.
+        let result = (await task.result).map { driverCheckedResult($0, action: normalized) }
+        let settled: Result<MacControlResult, Error> = await settle {
+            do {
+                return .success(try await self.finishKnownOperationResult(result,
+                    action: normalized, operationId: operationId, trigger: trigger))
+            } catch { return .failure(error) }
+        }
+        return try settled.get()
     }
 
     public func cancel(operationId: String) async throws -> MacControlCancellationResult {
@@ -461,10 +378,8 @@ public actor SwiftNativeMacControl: MacControlClient {
             )
         }
         execution.requestCancellation()
-        // The dispatch owner, not the requester, decides whether the work
-        // actually stopped, raced to a real completion, or became unknowable.
-        // Wait only for the bounded settlement grace; never hang the cancel
-        // requester on an adapter that ignores cooperative cancellation.
+        // The dispatch owner, not the requester, decides whether the work actually stopped, raced to a real completion, or became unknowable. Wait only for the bounded settlement grace; never hang the cancel requester on an adapter that
+        // ignores cooperative cancellation.
         let settled = try await operationStore.waitForCancellationSettlement(
             operationId: operationId, until: .now.advanced(by: .milliseconds(1_500)))
         let terminal: MacControlOperationRecord?
@@ -481,7 +396,7 @@ public actor SwiftNativeMacControl: MacControlClient {
         try await operationStore?.motorActionReadModel(actionId: actionId)
     }
 
-    private struct WakeAttentionRefusal: Error {
+    struct WakeAttentionRefusal: Error {
         let result: MacControlResult
     }
 
@@ -502,14 +417,8 @@ public actor SwiftNativeMacControl: MacControlClient {
                     throw WakeAttentionRefusal(result: refusal)
                 }
             }
-            // The screen is awake and uncovered; her own windows get out of the
-            // way of her sight and hands too (Shotgun), from any surface's turn
-            // (User 10-16: she looked at WoW through her own full-screen window).
-            // A call on a named app that does not need it in front (a read of
-            // its window or menus, an accessibility act or menu press on it
-            // behind) works behind anything, so it leaves her window in place.
-            // A hand, the front app and the desktop need the screen.
-            let named = !(body.stringValue("app")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
+            // Named background reads and actions leave her windows in place; hands, front-app and desktop access use PersonOnlyWindows' step-aside boundary.
+            let named = !(body["app"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
                 || body["background"] == .bool(true)
             let behind = named && body["require_front"] != .bool(true) && body["require_front_pid"] == nil
             if !behind { await PersonOnlyWindows.stepAsideForScreen() }
@@ -530,15 +439,7 @@ public actor SwiftNativeMacControl: MacControlClient {
                 output: .object(["message": .string("raw view · passive observation · desktop effects are unavailable")]),
                 error: "passive_observation", durationMs: 0)
         }
-        // GATE PRE-FLIGHT (wave 30 W01). When a live policy is available, run
-        // the W4 MacControlGate read-only refusal pipeline IN-PROCESS, in the
-        // EXACT order the daemon does (_gate master/remote/category → file
-        // policy for file_ops), reproducing byte-identical refusal strings.
-        // On refusal we short-circuit BEFORE the native handler:
-        // a 403-shaped result with viaSwift:true. This is purely subtractive
-        // (it can only REFUSE earlier; it never grants what the daemon would
-        // deny) so it is safe even with the daemon still owning execution,
-        // approval, receipts, and TCC-bridge attribution.
+        // Apply live policy before native execution; refusal preserves the structured 403 result and gate reason.
         if !gateAlreadyChecked {
             let outcome = await gatePreflightOutcome(action: normalized, body: body)
             switch outcome {
@@ -548,19 +449,13 @@ public actor SwiftNativeMacControl: MacControlClient {
                 break
             }
         }
-        // An active attention session gives physical human input absolute
-        // priority. Check once at tool entry; handlers recheck at the exact
-        // effect boundary (and between multi-event gestures) so a mouse move
-        // arriving after this line still stops the action.
-        // Document reads check this boundary only before their scroll effects,
-        // so reading the visible text remains available while the person drives.
+        // An active attention session gives physical human input absolute priority. Check once at tool entry; handlers recheck at the exact effect boundary (and between multi-event gestures) so a mouse move arriving after this line still
+        // stops the action. Document reads check this boundary only before their scroll effects, so reading the visible text remains available while the person drives.
         if macControlTakeoverActions.contains(normalized),
            let refusal = await attentionActionRefusal(action: normalized, body: body) {
             return refusal
         }
-        // Perception, hands and any call that requires the front share the
-        // desktop-send wake: an inert nudge only while the saver covers the
-        // screen and the person is idle.
+        // Perception, hands and any call that requires the front share the desktop-send wake: an inert nudge only while the saver covers the screen and the person is idle.
         if MacObservationMode.current == .passive,
            ["look", "view", "ax_tree", "ax_find"].contains(normalized), MacScreenLock.isCovered() {
             return MacControlResult(ok: false, action: normalized,
@@ -605,53 +500,38 @@ public actor SwiftNativeMacControl: MacControlClient {
         case "ax_status":   return handleAXStatus()
         case "ax_tree":     return handleAXTree(body)
         case "ax_find":     return try handleAXFind(body)
-        // native-look item 2 — THE PERCEPTION COMPILER. Read tier like the
-        // three above and for the same reason: it walks the same AX tree
-        // through the same read organ and changes no UI state.
+        // Compiled AX perception is read tier and changes no UI state.
         case "look":
             return await MacAXLimits.$readDeadline.withValue(Date().addingTimeInterval(MacAXLimits.readSeconds)) {
                 await handleLook(body)
             }
-        // W3.5 — THE FUSED VIEW. Read tier like the three above: it looks at
-        // the screen (AX structure + pixels) and changes nothing.
+        // Fused AX/pixel perception is read tier because it changes no app state.
         case "view":        return await handleView(body)
         case "attention":   return await handleAttention(body)
-        // Injection has already consumed an explicit or automatically minted
-        // capability and passed the policy preflight before reaching a handler.
+        // Injection has passed policy preflight and, when supplied, consumed its explicit replay capability before reaching a handler.
         case "keystroke":   return await handleKeystroke(body)
         case "click":       return await handleClick(body)
         case "scroll":      return await handleScroll(body)
         case "ax_act":      return await handleAXAct(body)
-        // native-look item 3 — THE CLOSED LOOP. Injection like the four above
-        // (it performs through the same actuator); the percept it returns
-        // afterwards is evidence of the effect, not a lower tier.
+        // Closed-loop actuation retains injection tier; returned perception is effect evidence.
         case "act":         return await handleAct(body)
         case "hand":        return await handleHand(body)
-        // W6 — the nudge + re-capture. Injection like the four above (it posts
-        // HID events). The nudge itself is never pre-refused (User, 2026-08-22);
-        // only the capture refuses, while the saver/login layer is still up.
+        // Wake nudges then recaptures; an obstructing saver/login layer refuses capture, not the nudge.
         case "wake":        return await handleWake(body)
-        // W7 — the NUDGE. Reached through the unprivileged `dispatch` like the
-        // reads above, not through `dispatchApprovedInjection`: it emits one
-        // bare mouse move and nothing else.
+        // Nudge emits only a bare mouse move and uses ordinary dispatch.
         case "nudge":       return await handleNudge(body)
-        // fable51 item 30 — THE CLIPBOARD ORGAN. The read is perception with a
-        // redaction boundary; the write replaces the general pasteboard and
-        // verifies itself by reading back what it put there.
+        // Clipboard reads redact; writes replace and verify by readback.
         case "clipboard_read":  return handleClipboardRead(body)
         case "clipboard_write": return handleClipboardWrite(body)
-        // fable51 item 29 — THE MENU BAR ORGAN. `menu` walks; `menu_press`
-        // presses through the same actuator every other act uses.
+        // Menu listing reads; pressing uses the shared actuator.
         case "menu":        return handleMenu(body)
         case "menu_press":  return await handleMenuPress(body)
-        // fable51 item 33 — THE READ ORGAN. Extract a named document, or
-        // scroll-and-accumulate the front window's text; either way it hands
-        // back the whole thing and the turn's spill pager retains it.
+        // Document extraction or viewport accumulation returns content retained by the turn's spill pager.
         case "read":        return await handleRead(body)
         case let action where macControlUnsupportedActions.contains(action):
             return Self.unsupportedResult(action: action)
         default:
-            // Defensive — guarded by macControlAllActions check above.
+            // Guarded by macControlDispatchableActions at the entry point.
             throw MacControlError.unknownAction(normalized)
         }
     }
@@ -668,676 +548,20 @@ public actor SwiftNativeMacControl: MacControlClient {
             return max(1, min(timeout, 120))
         }
         switch action {
-        case "spotlight": return 10
-        // In-process AX reads; nothing here waits on another process.
-        case "ax_status", "ax_tree", "ax_find": return 15
-        // One AX walk, plus (Chromium/Electron only) a bounded ≤4s settle and
-        // exactly ONE re-walk. Nothing here waits on another process otherwise.
-        case "look": return 25
-        // W3.5 — one AX walk plus one ScreenCaptureKit screenshot + encode.
-        // Still in-process, but the capture is the slowest read here.
-        case "view": return 20
-        // Event-driven wait is caller-bounded to 15s, followed by one view.
-        case "attention": return 40
         // In-process CGEvent / AX act; nothing here waits on another process.
         case "keystroke", "click", "scroll", "ax_act", "hand": return 15
-        // native-look item 3 — one act, a bounded ≤2s effect wait, then one AX
-        // walk (which on a Chromium window may add a ≤4s settle + one re-walk).
+        // One act, a bounded ≤2s effect wait, then one AX walk (which on a Chromium window may add a ≤4s settle + one re-walk).
         case "act": return 30
-        // W7 — one CGEvent post, in-process, nothing awaited.
+        // One CGEvent post, in-process, nothing awaited.
         case "nudge": return 15
-        // fable51 item 30 — one in-process pasteboard read/write.
-        case "clipboard_read", "clipboard_write": return 10
-        // fable51 item 29 — one bounded AX menu-bar walk; one AXPress.
-        case "menu": return 20
+        case "clipboard_write": return 10
         case "menu_press": return 15
-        // fable51 item 33 — up to `maxFrames` walks with a settle between each,
-        // or one file read plus a PDFKit parse. The slowest read in the module
-        // by design: it is the only one that reads a whole document.
-        case "read": return 90
-        // W6 — a nudge, a bounded settle wait, then a full `view` capture.
+        // A nudge, a bounded settle wait, then a full `view` capture.
         case "wake": return 30
         case "shell": return 60
         default: return 90
         }
     }
-
-    private enum OperationSettlementTrigger: Equatable {
-        case ordinary
-        case deadline
-        case cancellation
-    }
-
-    /// Cancellation is cooperative for several AppKit / Apple-event adapters.
-    /// Wait briefly for a real terminal observation, then stop pretending the
-    /// effect is known. The durable unknown state blocks automatic replay.
-    private static let settlementGraceNanoseconds: UInt64 = 500_000_000
-
-    private static func boundedResult(
-        of task: Task<MacControlResult, Error>
-    ) async -> Result<MacControlResult, Error>? {
-        let result = MacControlOneShot<MacControlBoundedResult>()
-        Task {
-            result.resolve(.result(await task.result))
-        }
-        let timer = Task<Void, Never> {
-            do {
-                try await Task.sleep(nanoseconds: settlementGraceNanoseconds)
-            } catch {
-                return
-            }
-            guard !Task.isCancelled else { return }
-            result.resolve(.elapsed)
-        }
-        let settled = await result.wait()
-        timer.cancel()
-        switch settled {
-        case .result(let value): return value
-        case .elapsed: return nil
-        }
-    }
-
-    private func finishKnownOperationResult(
-        _ executionResult: Result<MacControlResult, Error>,
-        action: String,
-        operationId: String,
-        trigger: OperationSettlementTrigger
-    ) async throws -> MacControlResult {
-        guard let operationStore else {
-            return try executionResult.get()
-        }
-        if let current = try await operationStore.record(operationId: operationId),
-           current.state.isTerminal {
-            if current.state == .outcomeUnknown {
-                return Self.unknownResult(action: action, record: current)
-            }
-            return Self.replayResult(current)
-        }
-
-        switch executionResult {
-        case .success(let result):
-            if Self.resultTimedOut(result) {
-                let record = try await operationStore.transition(
-                    operationId: operationId,
-                    to: .timedOut,
-                    verification: .failed,
-                    expectedNextEvidence: nil,
-                    outcomeCode: "timeout"
-                )
-                return Self.attachingOperation(result, record: record)
-            }
-            let verification = Self.verificationState(action: action, result: result)
-            let record = try await operationStore.transition(
-                operationId: operationId,
-                to: result.ok ? .completed : .failed,
-                verification: verification,
-                expectedNextEvidence: result.ok && verification != .satisfied
-                    ? "Separate observation of intended effect"
-                    : nil,
-                outcomeCode: Self.exitOutcomeCode(result) ?? (result.ok ? "completed" : "handler_failed")
-            )
-            return Self.attachingOperation(result, record: record)
-
-        case .failure(let error):
-            if error is CancellationError {
-                if trigger == .deadline {
-                    let record = try await operationStore.transition(
-                        operationId: operationId,
-                        to: .timedOut,
-                        verification: .failed,
-                        expectedNextEvidence: nil,
-                        outcomeCode: "deadline_exceeded_after_stop"
-                    )
-                    return Self.timeoutResult(action: action, record: record)
-                }
-                if try await operationStore.record(operationId: operationId)?.state == .started {
-                    _ = try await operationStore.transition(
-                        operationId: operationId,
-                        to: .cancelRequested,
-                        verification: .pending,
-                        expectedNextEvidence: "Cancellation acknowledgement",
-                        outcomeCode: "cancel_requested"
-                    )
-                }
-                let record = try await operationStore.transition(
-                    operationId: operationId,
-                    to: .cancelAcknowledged,
-                    verification: .failed,
-                    expectedNextEvidence: nil,
-                    outcomeCode: "cancelled_before_effect_completion"
-                )
-                return Self.cancelledResult(action: action, record: record)
-            }
-            _ = try await operationStore.transition(
-                operationId: operationId,
-                to: .failed,
-                verification: .failed,
-                expectedNextEvidence: nil,
-                outcomeCode: "execution_failed"
-            )
-            throw error
-        }
-    }
-
-    private func finishUnknownOperation(
-        action: String,
-        operationId: String,
-        outcomeCode: String
-    ) async throws -> MacControlResult {
-        guard let operationStore else {
-            throw MacControlError.operation("mac_operation_store_unconfigured: No operation store is configured. Repair NativeAgent's MacControl assembly before recording an outcome; inspect the affected app with mac.look for prior effects.")
-        }
-        if let current = try await operationStore.record(operationId: operationId),
-           current.state.isTerminal {
-            return current.state == .outcomeUnknown
-                ? Self.unknownResult(action: action, record: current)
-                : Self.replayResult(current)
-        }
-        let record = try await operationStore.transition(
-            operationId: operationId,
-            to: .outcomeUnknown,
-            verification: .unknown,
-            expectedNextEvidence: "Separate observation of intended effect; do not retry automatically",
-            outcomeCode: outcomeCode
-        )
-        return Self.unknownResult(action: action, record: record)
-    }
-
-    // MARK: gate pre-flight
-
-    /// A refusal returns its shaped result; proceed continues native dispatch.
-    private enum GatePreflightOutcome {
-        case refuse(MacControlResult)
-        case proceed
-    }
-
-    /// Check master, remote, and category gates before the file-policy layer.
-    /// Execution, approval, and operation receipts remain with their owners.
-    private func gatePreflightOutcome(
-        action: String,
-        body: [String: JSONValue]
-    ) async -> GatePreflightOutcome {
-        // The entry point validates and consumes an explicit or automatically
-        // minted injection capability. This preflight applies policy regardless
-        // of how that capability was minted.
-        //
-        // No provider configured: tests and direct library callers can exercise
-        // handlers in isolation. Production wires a Swift TrustCenter provider.
-        guard let provider = policyProvider else { return .proceed }
-        guard let category = macControlGateCategory(forAction: action) else {
-            // self_test / unmapped: no single category to pre-gate. Unsupported
-            // actions fail closed after this pre-flight.
-            return .proceed
-        }
-        guard let policy = await provider.currentPolicy() else {
-            return .refuse(Self.refusalResult(
-                action: action,
-                reason: "mac_control_policy_unavailable: Swift trust policy could not be resolved",
-                now: now
-            ))
-        }
-        let trigger = body.stringValue("trigger").flatMap { $0.isEmpty ? nil : $0 } ?? "user"
-
-        let decision = MacControlGate.gate(policy, category: category, trigger: trigger)
-        if !decision.allowed {
-            let result = Self.refusalResult(action: action, reason: decision.reason, now: now, remedy: decision.remedy)
-            await emitBlockedAudit(action: action, category: category, reason: decision.reason, trigger: trigger, policy: policy, body: body)
-            return .refuse(result)
-        }
-        // Accessibility category permission alone is insufficient: reads,
-        // input, clipboard, document access and nudge also require an active
-        // Full Mac window, including calls entering through remote surfaces.
-        if macControlAccessibilityReadActions.contains(action)
-            || macControlAccessibilityNudgeActions.contains(action)
-            || macControlClipboardActions.contains(action)
-            || macControlDocumentReadActions.contains(action)
-            || macControlAccessibilityInjectionActions.contains(action),
-           !(policy.trustPolicy.map { MacControlGate.fullMacActive($0) } ?? false) {
-            let reason = "full_mac_inactive: \(action) requires Full Mac access enabled in Trust"
-            let result = Self.refusalResult(action: action, reason: reason, now: now)
-            await emitBlockedAudit(action: action, category: category, reason: reason, trigger: trigger, policy: policy, body: body)
-            return .refuse(result)
-        }
-        // Let each native handler report its authoritative sensitive-path
-        // refusal before the workspace policy refusal. For other paths, run
-        // the workspace-root and Full Mac checks here.
-        let pathKeys = macControlFilePolicyPathKeys(forAction: action)
-        // A command line is a write on his side whatever it says: it runs only
-        // on the one authorization decision (posture × that declared class),
-        // never on its text. Full Mac runs, Work asks, Safe refuses. Every
-        // action meets "Pause everything" here.
-        if let answer = await provider.authorize(tool: action, input: body), answer.level != "auto" {
-            let reason = (answer.level == "confirm" ? "needs_approval: " : "blocked: ") + answer.reason
-            let result = Self.refusalResult(action: action, reason: reason, now: now, remedy: answer.remedy)
-            await emitBlockedAudit(action: action, category: category, reason: reason, trigger: trigger, policy: policy, body: body)
-            return .refuse(result)
-        }
-        if !pathKeys.isEmpty {
-            let paths: [String] = pathKeys.compactMap { key in
-                guard let v = body.stringValue(key), !v.isEmpty else { return nil }
-                return v
-            }
-            let anySensitive = paths.contains { MacControlSensitivePathFence.reason(forPath: $0) != nil }
-            if !anySensitive, !paths.isEmpty,
-               let reason = MacControlGate.fileReason(policy, forPaths: paths) {
-                let result = Self.refusalResult(action: action, reason: reason, now: now)
-                await emitBlockedAudit(action: action, category: category, reason: reason, trigger: trigger, policy: policy, body: body)
-                return .refuse(result)
-            }
-        }
-        return .proceed
-    }
-
-    /// Build the 403-shaped refusal result. `viaSwift:true` (the refusal was
-    /// decided in-process); `httpStatus:403` so NativeClient surfaces a real
-    /// 403 to the UI rather than collapsing it. `output.error` carries the
-    /// gate reason verbatim so callers can render the daemon-parity message.
-    private static func refusalResult(
-        action: String,
-        reason: String,
-        now: @Sendable () -> Date,
-        remedy: JSONValue? = nil
-    ) -> MacControlResult {
-        MacControlResult(
-            ok: false,
-            action: action,
-            output: .object([
-                "ok": .bool(false),
-                "status": .string("blocked"),
-                "error": .string(reason),
-                "block_reason": .string(reason),
-                "blocked_by": .string("swift_gate_preflight"),
-                "remedy": remedy ?? .null,
-            ]),
-            error: reason,
-            durationMs: 0,
-            httpStatus: 403
-        )
-    }
-
-    private static func unsupportedResult(action: String) -> MacControlResult {
-        let error = "unsupported_mac_control_action: \(action) is not implemented in Swift"
-        return MacControlResult(
-            ok: false,
-            action: action,
-            output: .object([
-                "ok": .bool(false),
-                "status": .string("unsupported"),
-                "error": .string(error),
-                "dispatched_via": .string("swift"),
-            ]),
-            error: error,
-            durationMs: 0,
-            httpStatus: 501
-        )
-    }
-
-    // MARK: blocked-receipt audit append
-
-    /// Preserve the audit format's legacy method names for renamed actions.
-    /// Actions without a historical alias keep their dispatch name.
-    private static func daemonMethodName(forAction action: String, body: [String: JSONValue]) -> String {
-        switch action {
-        case "applescript":   return "run_applescript"
-        case "jxa":           return "run_jxa"
-        case "shortcut",
-             "shortcut/run":  return "run_shortcut"
-        case "click":         return "click_at"
-        case "system":        return systemMethodName(body: body)
-        case "file/read":     return "read_file"
-        case "file/write":    return "write_file"
-        case "file/list":     return "list_directory"
-        case "file/move":     return "move_file"
-        case "file/trash":    return "trash_file"
-        case "notify":        return "post_notification"
-        case "shell":         return "run_shell"
-        case "spotlight":     return "spotlight_search"
-        default:              return action
-        }
-    }
-
-    /// System dispatch records the concrete operation; unknown actions retain
-    /// the generic system label.
-    private static func systemMethodName(body: [String: JSONValue]) -> String {
-        let action: String = {
-            if case .string(let s)? = body["action"] { return s }
-            return ""
-        }()
-        switch action {
-        case "volume", "set_volume": return "set_volume"
-        case "brightness":           return "set_brightness"
-        case "sleep_display":        return "sleep_display"
-        case "lock_screen":          return "lock_screen"
-        case "focus_mode":           return "set_focus_mode"
-        default:                     return "system"
-        }
-    }
-
-    /// An explicit list is authoritative, including an empty one. An absent
-    /// list requires approval only for shell, matching the saved audit format.
-    private static func approvalRequired(forCategory category: String, policy: MacControlPolicy) -> Bool {
-        guard let list = policy.approvalRequiredFor else {
-            return category == "shell"
-        }
-        return list.contains(category)
-    }
-
-    /// Append a refusal under the shared cross-process lock. A failed audit
-    /// must not turn a refused action into an executed one.
-    /// Local JSONL evidence: off-disk backup only; no local backup/export/phone copy;
-    /// PrivacyMap: mac_control_audit.
-    ///
-    /// Preserve the legacy receipt's insertion order, Python JSON separators,
-    /// and UTC microsecond timestamp. Do not add fields or pass through the
-    /// ordinary sorted-key JSON serializer: consumers retain these exact bytes.
-    private func emitBlockedAudit(
-        action: String,
-        category: String,
-        reason: String,
-        trigger: String,
-        policy: MacControlPolicy,
-        body: [String: JSONValue]
-    ) async {
-        guard let path = auditAppendPath else { return }
-        // EXACT make_receipt(...) insertion order. Emitting
-        // via serializeOrderedObjectPython preserves this order (no sort) and
-        // uses Python's default compact separators `(', ', ': ')`.
-        let orderedPairs: [(String, JSONValue)] = [
-            // Python's make_receipt uses `str(uuid.uuid4())`, which is LOWERCASE.
-            // Apple Foundation's `UUID().uuidString` is UPPERCASE — a byte
-            // divergence; lowercase it for parity. (gpt-5.5 review finding #1.)
-            ("id", .string(UUID().uuidString.lowercased())),
-            ("method", .string(Self.daemonMethodName(forAction: action, body: body))),
-            ("category", .string(category)),
-            // make_receipt sets args_hash="sha256:none" when args is None;
-            // _blocked_receipt passes no args, so this matches.
-            ("args_hash", .string("sha256:none")),
-            ("trigger", .string(trigger)),
-            ("trigger_source", .string(trigger)),
-            ("approval_required", .bool(Self.approvalRequired(forCategory: category, policy: policy))),
-            ("approved", .null),
-            ("exit_code", .int(0)),
-            ("stdout", .string("")),
-            ("stderr", .string("")),
-            ("duration_ms", .int(0)),
-            ("executed_at", .string(Self.iso8601(now()))),
-            ("blocked", .bool(true)),
-            ("block_reason", .string(reason)),
-        ]
-        do {
-            let line = try JSONValue.serializeOrderedObjectPython(orderedPairs)
-            try await persistence.withFileLock(path) {
-                try await persistence.appendAuditLineRaw(line, to: path)
-                // M6 (2026-07-09): rotate under the SAME flock as the append —
-                // the cap does a read-trim-replace and must not race a
-                // concurrent writer. Cannot use appendJSONLCapped here: this
-                // feed is byte-equivalent to the daemon's `_append_audit` and
-                // must go through appendAuditLineRaw, not JSONValue.serialize.
-                let dropped = try enforceJSONLLineCap(at: path, maxLines: JSONLLineCaps.macControlAudit)
-                if dropped > 0 {
-                    nativeLog("MacControl.audit: %@ cap dropped %d oldest line(s)",
-                          path.lastPathComponent, dropped)
-                }
-            }
-        } catch {
-            // Swallow — parity with daemon `_append_audit` best-effort write.
-            // The block already happened; an unloggable refusal must stay a refusal.
-        }
-    }
-
-    /// Preserve the saved audit format: UTC +00:00, six fractional digits
-    /// except at whole seconds, where the fraction is omitted. Both calendar
-    /// components and microseconds derive from one floored epoch value.
-    private static func iso8601(_ date: Date) -> String {
-        NativeTimestampFormat.flooredOptionalMicrosecondUTCOffset(date)
-    }
-
-    // MARK: notify
-
-    private func handleNotify(_ body: [String: JSONValue]) async throws -> MacControlResult {
-        let title = body.stringValue("title") ?? ""
-        let message = body.stringValue("message") ?? ""
-        let sound = body.stringValue("sound")
-        if title.isEmpty && message.isEmpty {
-            throw MacControlError.missingField("title or message")
-        }
-        let started = now()
-        let receipt: NotificationPostReceipt
-        do {
-            guard let notificationCenterAdapter else {
-                throw MacControlError.notificationFailed("no Mac notification poster is wired into this client")
-            }
-            receipt = try await notificationCenterAdapter.postNotificationReceipt(
-                title: title,
-                message: message,
-                soundName: sound
-            )
-        } catch {
-            return MacControlResult(
-                ok: false,
-                action: "notify",
-                output: .object(["title": .string(title), "message": .string(message)]),
-                error: "notify failed: \(error)",
-                durationMs: Int(now().timeIntervalSince(started) * 1000)
-            )
-        }
-        let durationMs = Int(now().timeIntervalSince(started) * 1000)
-        let receiptFields: [String: JSONValue] = [
-            "submission": .string(receipt.disposition.rawValue),
-            "access": .string(receipt.authorization.rawValue),
-            "request_id": receipt.requestIdentifier.map { .string($0) } ?? .null,
-            "delivery_observed": .bool(false),
-        ]
-        let outputFields: [String: JSONValue] = [
-            "title": .string(title),
-            "message": .string(message),
-            "sound": sound.map { .string($0) } ?? .null,
-            // `UNUserNotificationCenter.add` acknowledges only that the
-            // request was accepted. It cannot prove a banner appeared,
-            // sound played, or a person received it; keep the terminal
-            // operation receipt explicitly unverified until a distinct
-            // observer supplies that evidence.
-            "receipt": .object(receiptFields),
-        ]
-        return MacControlResult(
-            ok: true,
-            action: "notify",
-            output: .object(outputFields),
-            error: nil,
-            durationMs: durationMs
-        )
-    }
-
-
-    // MARK: accessibility perception (W1 — READ-ONLY)
-
-    /// Resolve the caller-supplied bounds, clamped to the hard ceilings by
-    /// `MacAXLimits.init`. A caller CANNOT raise the caps, only lower them.
-    static func axLimits(from body: [String: JSONValue]) -> MacAXLimits {
-        return MacAXLimits(
-            maxNodes: intValue(body, "max_nodes") ?? MacAXLimits.hardMaxNodes,
-            maxDepth: intValue(body, "max_depth") ?? MacAXLimits.hardMaxDepth,
-            maxMatches: intValue(body, "limit") ?? MacAXLimits.hardMaxMatches
-        )
-    }
-
-    func axUntrustedResult(action: String) -> MacControlResult {
-        let error = "accessibility_not_trusted"
-        return MacControlResult(
-            ok: false,
-            action: action,
-            output: .object([
-                "trusted": .bool(false),
-                "status": .string("not_trusted"),
-                "error": .string(error),
-                "note": .string(MacAccessibilityReader.notTrustedNote),
-            ]),
-            error: error,
-            durationMs: 0
-        )
-    }
-
-
-    // MARK: accessibility injection (W2 — physical, W3 — semantic)
-    //
-    // Every handler below has already passed the three-gate pre-flight
-    // (accessibility category + active Full Mac window + body-bound injection
-    // capability, supplied by admitted YOLO or an exact approved replay).
-    // They still re-check the macOS Accessibility TCC grant, because a policy
-    // gate is not a system grant: without the grant CGEventPost is silently
-    // swallowed by the window server and the caller would be told "typed" when
-    // nothing was typed.
-
-    func injectionRefusal(
-        action: String,
-        error: String,
-        status: Int? = nil,
-        extra: [String: JSONValue] = [:]
-    ) -> MacControlResult {
-        var output: [String: JSONValue] = [
-            "ok": .bool(false),
-            "status": .string("failed"),
-            "error": .string(error),
-        ]
-        for (key, value) in extra { output[key] = value }
-        return MacControlResult(
-            ok: false,
-            action: action,
-            output: .object(output),
-            error: error,
-            durationMs: 0,
-            httpStatus: status
-        )
-    }
-
-    /// Shared preconditions for every injection handler: the TCC grant and a
-    /// working event sink. Returns a refusal result when either is missing.
-    ///
-    /// W2/W3-FIX 5: this used to accept
-    /// `accessibilityActSource.isTrusted() || accessibilitySource.isTrusted()`,
-    /// so a trusted READ seam satisfied an ACT precondition. Those are two
-    /// different seams with two different capabilities — the reader can be
-    /// trusted (or stubbed trusted, in a test) while the act source is not, and
-    /// the disjunction let an act proceed on the reader's authority. Each
-    /// injection action now demands the trust IT needs:
-    ///   • `ax_act` performs AX actions through `accessibilityActSource` ⇒ that
-    ///     source must be trusted. The read source's state is irrelevant.
-    ///   • `keystroke` / `click` / `scroll` post CGEvents through `eventSink`,
-    ///     which macOS also gates on the Accessibility grant that the act
-    ///     source reports ⇒ same requirement, plus an available sink.
-    /// The read source is never consulted here.
-    func injectionPreconditions(action: String, requiresSink: Bool) -> MacControlResult? {
-        guard accessibilityActSource.isTrusted() else {
-            return injectionRefusal(
-                action: action,
-                error: "accessibility_not_trusted",
-                extra: ["note": .string(MacAccessibilityReader.notTrustedNote)]
-            )
-        }
-        if requiresSink, !eventSink.isAvailable {
-            return injectionRefusal(action: action, error: "event_injection_unavailable")
-        }
-        return nil
-    }
-
-    /// Shared refusal for an injection call that failed the approval gate.
-    /// Mirrors the shape the old in-band check produced (403 + block receipt)
-    /// so nothing downstream has to learn a new refusal form.
-    private func injectionApprovalRefusal(
-        action: String,
-        reason: String,
-        body: [String: JSONValue]
-    ) async -> MacControlResult {
-        let result = Self.refusalResult(action: action, reason: reason, now: now)
-        if let provider = policyProvider, let policy = await provider.currentPolicy() {
-            await emitBlockedAudit(
-                action: action,
-                category: macControlGateCategory(forAction: action) ?? "accessibility",
-                reason: reason,
-                trigger: body.stringValue("trigger").flatMap { $0.isEmpty ? nil : $0 } ?? "user",
-                policy: policy,
-                body: body
-            )
-        }
-        return result
-    }
-
-    static func doubleValue(_ body: [String: JSONValue], _ key: String) -> Double? {
-        switch body[key] ?? .null {
-        case .int(let n): return Double(n)
-        case .double(let d) where d.isFinite: return d
-        default: return nil
-        }
-    }
-
-    static func intValue(_ body: [String: JSONValue], _ key: String) -> Int? {
-        switch body[key] ?? .null {
-        case .int(let n): return Int(exactly: n)
-        // Finiteness alone does not imply Int representability. Preserve the
-        // existing truncation, then reject values outside the integer range.
-        // Double(Int.max) itself rounds UP, so a <= bound check is unsafe.
-        case .double(let d) where d.isFinite: return Int(exactly: d.rounded(.towardZero))
-        default: return nil
-        }
-    }
-
-    static func handWaitMilliseconds(seconds: Double?) -> Int {
-        let finiteSeconds = seconds.flatMap { $0.isFinite ? $0 : nil } ?? 0.6
-        // Clamp while still floating point, before multiplication or Int
-        // conversion can overflow. The existing hand range stays 0...10s.
-        return Int(max(0, min(finiteSeconds, 10)) * 1000)
-    }
-
-    static func handDragMilliseconds(seconds: Double?) -> Int {
-        guard let seconds, seconds.isFinite, seconds > 0 else { return 240 }
-        return Int(max(0.08, min(seconds, 2)) * 1000)
-    }
-
-    /// Effect-time human-takeover check shared by every motor sibling.
-    func attentionActionRefusal(
-        action: String,
-        body: [String: JSONValue]
-    ) async -> MacControlResult? {
-        if let refusal = MacWorkContinuation.current?.refusal() {
-            return MacControlResult(ok: false, action: action,
-                output: .object(["message": .string(refusal)]), error: "continuation_unavailable",
-                durationMs: 0)
-        }
-        let sessionId = body.stringValue("attention_session")
-        let userSequence = Self.intValue(body, "attention_user_sequence").map(Int64.init)
-        switch await attentionStore.permissionForAction(
-            sessionId: sessionId,
-            observedUserSequence: userSequence,
-            now: now()
-        ) {
-        case .allowed:
-            return nil
-        case .refused(let reason, let current):
-            let status: String
-            if reason.hasPrefix("human_takeover:") {
-                status = "yielded_to_user"
-            } else if reason.hasPrefix("scene_changed:") {
-                status = "refresh_required"
-            } else {
-                status = "attention_session_required"
-            }
-            return MacControlResult(
-                ok: false,
-                action: action,
-                output: .object([
-                    "ok": .bool(false),
-                    "status": .string(status),
-                    "error": .string(reason),
-                    "attention": current?.toJSON() ?? .null,
-                ]),
-                error: reason,
-                durationMs: 0,
-                httpStatus: 409
-            )
-        }
-    }
-
-
 }
 
 // MARK: - Factory
@@ -1346,7 +570,7 @@ public func makeMacControl(
     policyProvider: (any MacControlPolicyProvider)? = nil,
     auditAppendPath: URL? = nil,
     operationDataRoot: URL? = nil,
-    notificationCenterAdapter: (any NotificationCenterAdapter)? = nil
+    notificationCenterAdapter: (any NotificationPosting)? = nil
 ) -> any MacControlClient {
     let dataRoot = operationDataRoot ?? auditAppendPath?.deletingLastPathComponent()
     return SwiftNativeMacControl(

@@ -20,14 +20,12 @@ public final class GlobalHotkeyVoiceTurn {
         case submissionRejected(String)
     }
 
-    private let requestPermission: () async -> Bool
-    private let permissionFailureMessage: () -> String?
+    private let requestPermission: () async -> VoiceInputPermissionResult
     private let isVoiceHoldCurrent: () -> Bool
     /// Returns a visible reason when the audio engine cannot actually begin.
     private let beginCapture: () -> String?
-    private let stopCapture: () async -> String
+    private let stopCapture: () async -> VoiceInputStopResult
     private let discardCapture: () -> Void
-    private let captureFailureMessage: () -> String?
     private let submitTurn: (String) async -> MacChatTurnAcceptance
     private let reportUnavailable: (String) -> Void
     private let reportRejectedTurn: (String) -> Void
@@ -38,24 +36,20 @@ public final class GlobalHotkeyVoiceTurn {
     private var generation: UInt64 = 0
 
     public init(
-        requestPermission: @escaping () async -> Bool,
-        permissionFailureMessage: @escaping () -> String?,
+        requestPermission: @escaping () async -> VoiceInputPermissionResult,
         isVoiceHoldCurrent: @escaping () -> Bool,
         beginCapture: @escaping () -> String?,
-        stopCapture: @escaping () async -> String,
+        stopCapture: @escaping () async -> VoiceInputStopResult,
         discardCapture: @escaping () -> Void,
-        captureFailureMessage: @escaping () -> String?,
         submitTurn: @escaping (String) async -> MacChatTurnAcceptance,
         reportUnavailable: @escaping (String) -> Void,
         reportRejectedTurn: @escaping (String) -> Void
     ) {
         self.requestPermission = requestPermission
-        self.permissionFailureMessage = permissionFailureMessage
         self.isVoiceHoldCurrent = isVoiceHoldCurrent
         self.beginCapture = beginCapture
         self.stopCapture = stopCapture
         self.discardCapture = discardCapture
-        self.captureFailureMessage = captureFailureMessage
         self.submitTurn = submitTurn
         self.reportUnavailable = reportUnavailable
         self.reportRejectedTurn = reportRejectedTurn
@@ -75,12 +69,11 @@ public final class GlobalHotkeyVoiceTurn {
         let generation = self.generation
         defer { awaitingPermission = false }
 
-        let permitted = await requestPermission()
+        let permission = await requestPermission()
         guard generation == self.generation, isVoiceHoldCurrent() else {
             return .releasedBeforeCapture
         }
-        guard permitted else {
-            let message = permissionFailureMessage() ?? "Microphone or speech recognition permission was not granted."
+        if let message = permission.errorMessage {
             reportUnavailable(message)
             return .permissionRefused(message)
         }
@@ -105,9 +98,9 @@ public final class GlobalHotkeyVoiceTurn {
 
         let capturedTranscript = await stopCapture()
         guard generation == self.generation else { return .noActiveCapture }
-        let transcript = capturedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        let transcript = capturedTranscript.transcriptForSubmission.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !transcript.isEmpty else {
-            if let message = captureFailureMessage(), !message.isEmpty {
+            if let message = capturedTranscript.userFacingFailureMessage, !message.isEmpty {
                 reportUnavailable(message)
                 return .captureUnavailable(message)
             }

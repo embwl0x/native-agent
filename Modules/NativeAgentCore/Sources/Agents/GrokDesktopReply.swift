@@ -1,3 +1,4 @@
+import NativeAgentShared
 import AppKit
 import ApplicationServices
 import AgentConversations
@@ -11,17 +12,12 @@ import Vision
 /// Grok's answer to a desktop send, read back from the same chat it was pasted
 /// into, after the send has returned (the exchange waits; this settles it).
 ///
-/// Two reads, never an action: with Grok in front, its accessibility tree
-/// (exact text; Grok builds it only while in front); behind other windows, a
-/// capture of Grok's window alone, cropped to the transcript, read with Vision.
+/// Two reads, never an action: first its accessibility tree for exact text;
+/// when unavailable, a capture of Grok's window alone, cropped to the
+/// transcript, read with Vision. Pixels retain partial text, not completion.
 /// Grok is never brought forward for this.
 ///
-/// Seen on the installed app (0.57.1, 09-26): the chat is an AXApplicationLog
-/// "Conversation transcript" holding one AXDocumentArticle per turn; each
-/// message's body is an AXApplicationGroup described "Your message" or
-/// "<chat> message"; the open chat's name is its AXHeading. On screen, Grok's
-/// lines start at the transcript's left edge, the person's bubbles sit right of
-/// a third of its width, and day/time separators are centred.
+/// The transcript's AXDocumentArticle rows contain message groups; the AXHeading names the chat.
 @MainActor public enum GrokDesktopReply {
     typealias AX = GrokRoutineAccessibility
     struct Turn: Sendable { let user: Bool; let text: String }
@@ -74,16 +70,12 @@ import Vision
         }
     }
 
-    /// At send time: user turns already carrying exactly this text, and the
-    /// transcript's place in the window (above the message box).
-    static func outgoingOccurrences(_ message: String, chat: String) throws -> Int? {
+    static func submission(_ message: String, chat: String) throws -> (baseline: Int, layout: Layout?)? {
+        guard let scan = try scan(chat: chat) else { return nil }
         func normalized(_ text: String) -> String { text.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
-        return try scan(chat: chat).map { $0.turns.filter { $0.user && normalized($0.text) == normalized(message) }.count }
-    }
-
-    static func layout(_ message: String, chat: String) throws -> Layout? {
-        guard let scan = try scan(chat: chat), let window = MacAXAttributeRead.frame(scan.window), var transcript = MacAXAttributeRead.frame(scan.log),
-              let pid = NSRunningApplication.runningApplications(withBundleIdentifier: GrokBotRoute.bundleID).first?.processIdentifier else { return nil }
+        let baseline = scan.turns.filter { $0.user && normalized($0.text) == normalized(message) }.count
+        guard let window = MacAXAttributeRead.frame(scan.window), var transcript = MacAXAttributeRead.frame(scan.log),
+              let pid = NSRunningApplication.runningApplications(withBundleIdentifier: GrokBotRoute.bundleID).first?.processIdentifier else { return (baseline, nil) }
         // The window the message went into, by its id: the passive read looks at that one only.
         let ids = ((CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]]) ?? []).compactMap { info -> CGWindowID? in
             guard info[kCGWindowOwnerPID as String] as? pid_t == pid, info[kCGWindowLayer as String] as? Int == 0,
@@ -92,12 +84,14 @@ import Vision
                   abs(bounds.width - window.width) < 1, abs(bounds.height - window.height) < 1 else { return nil }
             return info[kCGWindowNumber as String] as? CGWindowID
         }
-        guard ids.count == 1 else { return nil }
+        guard ids.count == 1 else { return (baseline, nil) }
         if let composer = scan.composer.flatMap(MacAXAttributeRead.frame), composer.minY > transcript.minY {
             transcript.size.height = min(transcript.height, composer.minY - transcript.minY)
         }
-        return Layout(baseline: scan.turns.filter { $0.user && same($0.text, message) }.count,
-                      transcript: transcript.offsetBy(dx: -window.minX, dy: -window.minY), window: window.size, windowID: ids[0])
+        transcript = transcript.intersection(window)
+        guard !transcript.isNull, !transcript.isEmpty else { return (baseline, nil) }
+        return (baseline, Layout(baseline: scan.turns.filter { $0.user && same($0.text, message) }.count,
+                      transcript: transcript.offsetBy(dx: -window.minX, dy: -window.minY), window: window.size, windowID: ids[0]))
     }
 
     /// The answer by accessibility: Grok's turns after the user turn that is
@@ -130,9 +124,13 @@ import Vision
         let configuration = SCStreamConfiguration()
         let scale = max(1, min(Double(filter.pointPixelScale), 4))
         let area = CGRect(x: layout.transcript.minX, y: 0, width: layout.transcript.width, height: layout.transcript.maxY)
+            .intersection(CGRect(origin: .zero, size: window.frame.size))
+        guard !area.isNull, !area.isEmpty,
+              let width = Int(exactly: (Double(area.width) * scale).rounded()), width > 0,
+              let height = Int(exactly: (Double(area.height) * scale).rounded()), height > 0 else { return .unreadable }
         configuration.sourceRect = area
-        configuration.width = max(1, Int((area.width * scale).rounded()))
-        configuration.height = max(1, Int((area.height * scale).rounded()))
+        configuration.width = width
+        configuration.height = height
         configuration.ignoreShadowsSingleWindow = true
         configuration.showsCursor = false
         guard let image = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration) else { return .unreadable }
@@ -258,9 +256,9 @@ import Vision
                 let previousIdleSince = idleSince
                 idleText = nil
                 idleSince = nil
-                if NSWorkspace.shared.frontmostApplication?.bundleIdentifier == GrokBotRoute.bundleID {
+                do {
                     // A failed read is no evidence this tick (never completion); the deadline still ends the watch.
-                    if let scan = try? await passiveRead(chat: chat), let found = axReply(scan, message: message, baseline: layout.baseline) {
+                    if let scan = try await passiveRead(chat: chat), let found = axReply(scan, message: message, baseline: layout.baseline) {
                         if found.last { awaited = true }
                         reply = (found.text, found.active)
                         readBy = "accessibility"
@@ -278,23 +276,27 @@ import Vision
                             blocker = "Grok's reply is visible, but it is not yet stable across two consecutive idle scans. The visible text is a partial reply, not a confirmed finished answer."
                         }
                     } else {
-                        blocker = "Grok is in front, but its accessibility tree could not be read (Accessibility is off for NativeAgent, Grok has more than one window, or chat \u{201C}\(chat)\u{201D} is not the open chat), so its answer could not be read. Open that chat in a single Grok window; any answer stays in that chat."
+                        blocker = "Grok's exact chat and submitted turn were not available through Accessibility. Open chat \u{201C}\(chat)\u{201D} in a single Grok window."
                     }
-                } else {
+                } catch {
+                    blocker = "Grok's Accessibility read failed: \(error.localizedDescription)."
+                }
+                if reply == nil {
+                    let axBlocker = blocker.map { $0 + " " } ?? ""
                     switch await screenLines(layout, chat: chat) {
                     case .lines(let lines):
                         if let seen = screenReply(lines, width: layout.transcript.width, message: message, seen: text), seen.last {
                             if seen.text.isEmpty { awaited = true }
                             if awaited { reply = (seen.text, !seen.text.isEmpty); readBy = "screen_text" }
                         }
-                        blocker = "Grok is behind other windows. Its visible text can be read on desktop wakes, but the window's pixels do not prove that the answer is finished. Open this chat in Grok to observe its completion signal."
+                        blocker = axBlocker + "Its visible text can be read on desktop wakes, but the window's pixels do not prove that the answer is finished. Open this chat in Grok to observe its completion signal."
                     case .noPermission:
-                        blocker = "Screen Recording is off for NativeAgent, so Grok's window could not be read while it was behind other windows. Grant NativeAgent Screen Recording in System Settings (Privacy & Security), or bring Grok to the front so its text can be read."
+                        blocker = axBlocker + "Screen Recording is off for NativeAgent, so Grok's window could not be read. Grant NativeAgent Screen Recording in System Settings (Privacy & Security), or bring Grok to the front so its text can be read."
                     case .windowGone:
                         observation.outcome = .unanswered(partial: text, blocker: windowGone)
                         return observation.outcome
                     case .unreadable:
-                        blocker = "Grok's window text could not be read on this desktop wake. Open this chat in a single Grok window to observe its reply."
+                        blocker = axBlocker + "Grok's window text could not be read on this desktop wake. Open this chat in a single Grok window to observe its reply."
                     }
                 }
                 let changed = reply.map { $0.text != text } ?? false
@@ -354,7 +356,7 @@ import Vision
             fields["detail"] = .string("Grok's reply observation was not retained. The message was sent; any answer stays in that chat.")
             return .object(fields)
         }
-        fields["reply_deadline"] = .string(ISO8601DateFormatter().string(from: pending.observation.deadline))
+        fields["reply_deadline"] = .string(NativeTimestampFormat.plainZulu(pending.observation.deadline))
         let base = fields
         fields["status"] = .string("running")
         fields["reply_observation"] = .string("running")
@@ -382,11 +384,9 @@ import Vision
             var answer: String?, stop: String?
             switch outcome {
             case .answered(let reply, let at, let by):
-                let iso = ISO8601DateFormatter()
-                iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
                 answer = reply
                 terminal["status"] = .string("answered")
-                terminal["reply"] = .string(reply); terminal["replied_at"] = .string(iso.string(from: at))
+                terminal["reply"] = .string(reply); terminal["replied_at"] = .string(NativeTimestampFormat.fractionalZulu(at))
                 terminal["read_by"] = .string(by); terminal["untrusted_remote_data"] = .bool(true)
                 terminal["detail"] = .string("Pasted into \(place), and read \(name)'s answer back from that same chat after its last message stayed unchanged across two idle Accessibility reads at least 300 ms apart, with no answering control present." + other)
             case .unanswered(let partial, let blocker):
@@ -446,20 +446,7 @@ import Vision
         let seen = Array(bare(bubble).lowercased()), sent = Array(bare(message).lowercased())
         let n = min(60, seen.count, sent.count)
         guard n >= min(8, sent.count), n > 0 else { return false }
-        return distance(Array(seen.suffix(n)), Array(sent.suffix(n))) <= max(2, n / 10)
-    }
-
-    static func distance(_ a: [Character], _ b: [Character]) -> Int {
-        var row = Array(0...b.count)
-        for i in 1...max(1, a.count) where !a.isEmpty {
-            var previous = row[0]; row[0] = i
-            for j in stride(from: 1, through: b.count, by: 1) {
-                let current = row[j]
-                row[j] = min(row[j] + 1, row[j - 1] + 1, previous + (a[i - 1] == b[j - 1] ? 0 : 1))
-                previous = current
-            }
-        }
-        return a.isEmpty ? b.count : row[b.count]
+        return characterEditDistance(Array(seen.suffix(n)), Array(sent.suffix(n))) <= max(2, n / 10)
     }
 
     /// Day and time separators ("Today 11:09 PM", "10:56 AM", "Tue, Sep 22 5:17 PM").

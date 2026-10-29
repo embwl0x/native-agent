@@ -3,7 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import SlackBot
 import TrustCenter
-// Blueprint: | `ConnectorRegistryActions.swift` | connector/workspace registry operations and ordered workspace readback verification; Slack socket-mode metadata writes delegate to SlackCredentials |
+// Blueprint: | `ConnectorRegistryActions.swift` | connector/workspace registry operations and ordered workspace readback verification; Slack disconnect records the person’s decision before credential removal; socket-mode metadata writes delegate to SlackCredentials |
 
 /// Checked status projection supplied by the higher-level status owner.
 public struct ConnectorRegistryProjectionPort: Sendable {
@@ -19,15 +19,30 @@ public struct ConnectorRegistryProjectionPort: Sendable {
 }
 
 public enum ConnectorRegistryActions {
+    public static func disconnectSlack(root: URL) async throws {
+        try SlackCredentials.recoverPendingSave(dataRoot: root)
+        // A credential effect alone is not confirmation of the registry change.
+        _ = try await ConnectorOAuthRegistry.mutateConnectorRegistryEntry(
+            root: root, provider: "slack", createIfMissing: false,
+            publish: { _, write in
+                try await SlackCredentials.revoke(dataRoot: root, publishRegistry: write)
+            }) { entry in
+            entry[ConnectorOAuthRegistry.decisionField] = ConnectorOAuthRegistry.ConnectionDecision.disconnected.value
+            entry["enabled"] = .bool(false)
+            entry["authState"] = .string("not_connected")
+            entry[SlackCredentials.generationField] = .string(UUID().uuidString)
+            entry["healthStatus"] = .string("planned")
+            entry["updatedAt"] = .string(SwiftNativeManifestSigner.isoTimestamp(Date()))
+        }
+    }
+
     public static func updateConnector(
         id: String,
         enabled: Bool,
         root: URL,
         projection: ConnectorRegistryProjectionPort
     ) async throws -> JSONValue {
-        // DAEMON-DEAD PORT (2026-06-03): registry.json is canonically an array
-        // of connector rows. Preserve that shape and update the matching row
-        // under flock; older object-shaped files are still supported.
+        // registry.json uses an array of rows; flock-protected updates also support object-shaped files.
         let normalizedID = ConnectorOAuthRegistry.normalizedConnectorID(id)
         guard let currentEntry = try await ConnectorOAuthRegistry.readConnectorRegistryEntry(
             root: root,
@@ -93,7 +108,6 @@ public enum ConnectorRegistryActions {
         }
 
         let wsPath = root.appendingPathComponent("connectors/workspaces.json")
-        let core = SwiftNativePersistenceCore()
         let now = ISO8601DateFormatter().string(from: Date())
         let record = WorkspaceRecord(
             id: UUID().uuidString,
@@ -102,7 +116,7 @@ public enum ConnectorRegistryActions {
             permissions: permissions,
             createdAt: now
         )
-        let added = try await core.withFileLock(wsPath) {
+        let added = try await SwiftNativePersistenceCore.withFileLock(wsPath) {
             let fm = FileManager.default
             try fm.createDirectory(at: wsPath.deletingLastPathComponent(), withIntermediateDirectories: true)
             var rows: [[String: Any]] = []
@@ -125,10 +139,11 @@ public enum ConnectorRegistryActions {
                 let existingURL = URL(fileURLWithPath: existingPath).standardizedFileURL
                 let candidate = requestedURL.path
                 let prior = existingURL.path
-                if candidate == prior {
+                let tail = NativeAgentWorkspaceRoot.relativePath(candidate, under: prior)
+                if tail == "" {
                     throw workspaceValidationError("That workspace is already registered.")
                 }
-                if candidate.hasPrefix(prior + "/") || prior.hasPrefix(candidate + "/") {
+                if tail != nil || NativeAgentWorkspaceRoot.relativePath(prior, under: candidate) != nil {
                     throw workspaceValidationError("Workspace folders cannot overlap.")
                 }
             }
@@ -153,10 +168,7 @@ public enum ConnectorRegistryActions {
     }
 
     public static func searchWorkspace(query: String, root: URL) async throws -> WorkspaceSearchResponse {
-        let impl = SwiftNativeConnectorsClient(root: root)
-        let envelope = try await impl.searchWorkspaces(query: query)
-            ?? .object(["query": .string(query), "results": .array([])])
-        return try JSONDecoder().decode(WorkspaceSearchResponse.self, from: envelope.serializedData(pretty: false))
+        try await SwiftNativeConnectorsClient(root: root).searchWorkspaces(query: query)
     }
 }
 

@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 import GRDB
-// Blueprint: | `MemoryStorage+Integrity.swift` | `MemoryStorage`: `requireSemanticIntegrity`, `spotlightGenerationFingerprint` hashes only eligible exported payload; `createConsistentBackup` |
+// Blueprint: | `MemoryStorage+Integrity.swift` | `MemoryStorage`: `requireSemanticIntegrity`, `spotlightSnapshot` returns eligible exported items and their fingerprint; `createConsistentBackup` |
 
 extension MemoryStorage {
     /// Validate the semantic payloads SQLite itself cannot type-check. SQLite's
@@ -23,6 +23,44 @@ extension MemoryStorage {
         let proposals = try Row.fetchCursor(db, sql: "SELECT * FROM proposals")
         while let row = try proposals.next() {
             _ = try decodeProposal(row)
+        }
+        let tombstones = try Row.fetchCursor(db, sql: "SELECT content_hash, content, rejected_at FROM tombstones")
+        while let row = try tombstones.next() {
+            let _: String = try row.decode(forColumn: "content_hash")
+            let _: String = try row.decode(forColumn: "content")
+            let _: String = try row.decode(forColumn: "rejected_at")
+        }
+        let entities = try Row.fetchCursor(db, sql: "SELECT rowid, id, name, type, mention_count FROM kg_entities")
+        while let row = try entities.next() {
+            do {
+                let _: String = try row.decode(forColumn: "id")
+                let _: String = try row.decode(forColumn: "name")
+                let _: String = try row.decode(forColumn: "type")
+                let _: Int64? = try row.decode(forColumn: "mention_count")
+            } catch {
+                let rowID: Int64 = try row.decode(forColumn: "rowid")
+                throw MemoryStorageError.databaseUnavailable("semantic integrity failed: kg_entities row \(rowID): \(error)")
+            }
+        }
+        let relationships = try Row.fetchCursor(db, sql: "SELECT id, from_id, to_id, type, mention_count FROM kg_relationships")
+        while let row = try relationships.next() {
+            let id: Int64 = try row.decode(forColumn: "id")
+            do {
+                let _: String = try row.decode(forColumn: "from_id")
+                let _: String = try row.decode(forColumn: "to_id")
+                let _: String = try row.decode(forColumn: "type")
+                let _: Int64? = try row.decode(forColumn: "mention_count")
+            } catch {
+                throw MemoryStorageError.databaseUnavailable("semantic integrity failed: kg_relationships row \(id): \(error)")
+            }
+        }
+        for table in ["kg_entities", "kg_relationships"] {
+            if let rowID = try Int64.fetchOne(db, sql: """
+                SELECT rowid FROM \(table) WHERE mention_count IS NOT NULL
+                    AND typeof(mention_count) != 'integer' LIMIT 1
+                """) {
+                throw MemoryStorageError.databaseUnavailable("semantic integrity failed: \(table) row \(rowID) has a noninteger mention_count")
+            }
         }
         let jsonColumns: [(table: String, id: String, column: String)] = [
             ("memories", "id", "metadata_json"),
@@ -101,11 +139,11 @@ extension MemoryStorage {
         }
     }
 
-    /// Identity of the exact exported Spotlight items. Eligibility
-    /// matches its active-memory read; proposals and vector state are unrelated.
-    public func spotlightGenerationFingerprint() async throws -> String {
+    /// The exact exported Spotlight items and their ID-ordered fingerprint.
+    public func spotlightSnapshot() async throws -> (items: [SpotlightItem], fingerprint: String) {
         try await dbPool.read { db in
             var hasher = SHA256()
+            var items: [SpotlightItem] = []
             let rows = try Row.fetchCursor(db, sql: """
                 SELECT id, content, status FROM memories
                 WHERE status = 'active' AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
@@ -120,8 +158,9 @@ extension MemoryStorage {
                     text: try row.decode(forColumn: "content"),
                     kind: try row.decode(forColumn: "status"))
                 hasher.update(data: try encoder.encode(item))
+                items.append(item)
             }
-            return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+            return (items, hasher.finalize().map { String(format: "%02x", $0) }.joined())
         }
     }
 

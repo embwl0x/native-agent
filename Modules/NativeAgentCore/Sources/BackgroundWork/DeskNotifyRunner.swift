@@ -6,7 +6,9 @@ import Cognition
 import NotificationInbox
 import PersistenceCore
 import Desk
-// Blueprint: | `DeskNotifyRunner.swift` | `DeskNotifyRunner`: calls the desk-notify part through the scheduled owner's originating app door; revision-checked native commit before notification delivery, quiet hours, stamps and exact-deadline scheduling; already-committed held deliveries retain their native release path even when a new proposal fails |
+import NativeAgentCore
+import NativeAgentShared
+// Blueprint: | `DeskNotifyRunner.swift` | `DeskNotifyRunner`: calls the desk-notify part through the scheduled owner's originating app door; revision-checked native preparation, quiet hours and exact-deadline scheduling; direct stamps and nag consumption follow channel acceptance or durable hold, leaving failed occurrences retryable; already-held deliveries retain their native release path even when a new proposal fails |
 
 // The part proposes; this native owner commits bookkeeping and delivers.
 public struct DeskNotifyRunner: EventDeadlineLoopRunner {
@@ -94,7 +96,7 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         let decisions = proposal.notifications
         var failures: [String] = []
         var notified = 0
-        let nagCount = quietHours ? 0 : await publishNags(proposal, failures: &failures)
+        let nagCount = quietHours ? 0 : await publishNags(proposal, read: read, failures: &failures)
         if decisions.isEmpty && nagCount == 0 && released == 0 && failures.isEmpty {
             return .skipped(reason: "no Desk notification due")
         }
@@ -102,11 +104,8 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         // push. Nothing is stamped, so it still lands on the first tick after
         // the window. An urgent item is never held: it posts and routes now.
         for decision in decisions where !quietHours || decision.level == "urgent" {
-            // Dual delivery: Mac banner + paired-device push (the same backends
-            // mac_notify / mobile_notify use). Best-effort; outcomes logged so a
-            // failure isn't silent. v1 marks after attempting; success-gated retry
-            // with backoff is a noted refinement (failures here are near-always a
-            // permanent notification-setup issue, where retry only spams).
+            guard !Task.isCancelled else { break }
+            // Dual delivery: retain a failed occurrence for the next pass.
             let macOK = await postMacNotification(decision.title, decision.body, [:], nil)
             // Derive identity from the same immutable state evaluated
             // above, never from prose or a second read after delivery.
@@ -117,17 +116,18 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
             // A non-throwing return is not a delivery: the router can
             // return normally having chosen no channel at all. Read its own
             // projection instead.
-            let outcome = try? await attention.route(
+            var outcome: AttentionOutcome?
+            if !Task.isCancelled { outcome = try? await attention.route(
                 eventId: "desk_notify:\(decision.handle):\(revision)",
                 importance: decision.level == "urgent" ? .adverse : .ownerWaiting,
                 title: decision.title,
                 body: decision.body,
                 userInfo: ["screen": "inbox", "source": "desk"]
-            )
+            ) }
             let projection = outcome?.deliveryProjection ?? .failed
-            let mobileOK = projection != .failed
+            let mobileOK = projection.reachedAChannel || projection == .deferred || projection == .previouslyHandled
             let mobileReached = projection.reachedAChannel
-            // Log BOTH channel outcomes so no failure is silent (Agent review).
+            // Log both channel outcomes so no failure is silent.
             if !macOK {
                 nativeLog("desk_notify: Mac banner failed for \(decision.handle)")
                 failures.append("\(decision.handle) Mac banner")
@@ -137,23 +137,25 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
                 failures.append("\(decision.handle) paired-device push")
             }
             if macOK || mobileReached { notified += 1 }
+            guard macOK || mobileOK else { continue }
             // Stamp lastNotifiedAt via CAS on the NOTIFIED version: if a content
             // change landed during this tick, skip the stamp so the next tick
             // pings the newer state (no lost ping). markNotified does NOT bump
             // updatedAt, so it can never re-trigger itself.
-            // EXCEPT one-time announcements: those stamp unconditionally —
-            // the announcement fired, and a mid-tick content change must not
-            // leave lastNotifiedAt nil and resurrect it as a fresh first ping
-            // (gpt-5.5 review 2026-08-08, the self-pursuit push storm).
-            do {
-                if decision.oneTimeAnnouncement {
-                    _ = try await store.markNotified(decision.handle)
-                } else {
-                    _ = try await store.markNotifiedIfUnchanged(decision.handle, expectedUpdatedAt: decision.observedUpdatedAt)
-                }
-            } catch {
-                nativeLog("desk_notify: stamp failed for \(decision.handle): \(error) — may re-ping next tick")
-                failures.append("\(decision.handle) notification stamp: \(error)")
+            // One-time announcements stamp unconditionally to prevent repeat delivery.
+            let stampError: String? = await settle {
+                do {
+                    if decision.oneTimeAnnouncement {
+                        _ = try await store.markNotified(decision.handle)
+                    } else {
+                        _ = try await store.markNotifiedIfUnchanged(decision.handle, expectedUpdatedAt: decision.observedUpdatedAt)
+                    }
+                    return nil
+                } catch { return "\(decision.handle) notification stamp: \(error)" }
+            }
+            if let stampError {
+                nativeLog("desk_notify: %@ — may re-ping next tick", stampError)
+                failures.append(stampError)
             }
         }
         if !failures.isEmpty {
@@ -166,21 +168,39 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
             + (nagCount > 0 ? " + \(nagCount) nag(s)" : ""))
     }
 
-    /// Ledger and baseline transitions have committed before publication.
     /// A digest never travels alone, except for the mute-expiry drift report.
-    private func publishNags(_ proposal: DeskNotificationProposal, failures: inout [String]) async -> Int {
+    private func publishNags(_ proposal: DeskNotificationProposal, read: DeskNotificationRead, failures: inout [String]) async -> Int {
+        guard !Task.isCancelled else { return 0 }
         if proposal.openWindow {
             if !proposal.digest.isEmpty {
-                await deliverNag(title: proposal.digestTitle, body: proposal.digestBody,
-                    label: "unmute digest", failures: &failures)
+                if await deliverNag(title: proposal.digestTitle, body: proposal.digestBody,
+                    label: "unmute digest", failures: &failures) {
+                    let error: String? = await settle {
+                        do {
+                            _ = try await read.commit(proposal, dataRoot: dataRoot, digestAccepted: true)
+                            return nil
+                        } catch { return "unmute digest stamp: \(error)" }
+                    }
+                    if let error { failures.append(error) }
+                    return 1
+                }
             }
             return 0
         }
+        var delivered = 0
         for nag in proposal.nags {
-            await deliverNag(title: nag.title, body: nag.body, label: nag.handle,
-                deskHandle: nag.handle, failures: &failures)
+            guard !Task.isCancelled else { break }
+            if await deliverNag(title: nag.title, body: nag.body, label: nag.handle,
+                deskHandle: nag.handle, failures: &failures) {
+                delivered += 1
+                let error: String? = await settle {
+                    do { try await read.recordNagDelivery(nag, dataRoot: dataRoot); return nil }
+                    catch { return "\(nag.handle) nag stamp: \(error)" }
+                }
+                if let error { failures.append(error) }
+            }
         }
-        return proposal.nags.count
+        return delivered
     }
 
     /// Same dual delivery as the notify pass (Mac banner + paired-device push),
@@ -191,7 +211,8 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
         label: String,
         deskHandle: String? = nil,
         failures: inout [String]
-    ) async {
+    ) async -> Bool {
+        guard !Task.isCancelled else { return false }
         // The banner carries the handle it is about, so a click lands on that
         // item instead of on the app's front page. The unmute digest is about
         // no single item and carries nothing.
@@ -202,12 +223,14 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
             body: body,
             userInfo: ["screen": "inbox", "source": "desk"]
         )
-        let mobileOK = mobileOutcome.map { $0.deliveryProjection != .failed } ?? false
+        let projection = mobileOutcome?.deliveryProjection ?? .failed
+        let mobileOK = projection.reachedAChannel || projection == .deferred || projection == .previouslyHandled
         // The banner obeys the router's quiet hours, like the push.
-        let macPosted = await AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot)
-            ? true
-            : postNagNotification(title, body, deskHandle)
-        if !macPosted {
+        let macHeld = await AttentionRouter.holdsMacBanner(.ownerWaiting, dataRoot: dataRoot)
+        let macPosted = macHeld || Task.isCancelled
+            ? false
+            : await postNagNotification(title, body, deskHandle)
+        if !macPosted && !macHeld {
             nativeLog("desk_notify: nag Mac banner failed for \(label)")
             failures.append("\(label) nag Mac banner")
         }
@@ -215,5 +238,6 @@ public struct DeskNotifyRunner: EventDeadlineLoopRunner {
             nativeLog("desk_notify: nag paired-device push failed for \(label)")
             failures.append("\(label) nag paired-device push")
         }
+        return macPosted || mobileOK
     }
 }

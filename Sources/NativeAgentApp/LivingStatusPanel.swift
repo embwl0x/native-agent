@@ -18,19 +18,8 @@ struct LivingStatusPanel: View {
 
     private var isRefreshing: Bool { cognition.livingRefreshCoalescer.isRefreshing }
 
-    private var dataRoot: URL {
-        appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-    }
-
     private var refreshPresentation: AppModel.CompactReadPresentationState {
         AppModel.compactReadPresentationState(hasContent: snapshot != nil, status: refreshStatus)
-    }
-
-    private var livingRefreshPresentation: LivingStatusRefreshPresentation {
-        LivingStatusRefreshPresentation.resolve(
-            hasSnapshot: snapshot != nil,
-            status: refreshStatus
-        )
     }
 
     var body: some View {
@@ -88,8 +77,8 @@ struct LivingStatusPanel: View {
                     livingRow("Approvals", snapshot.approvalsSummary, icon: "checkmark.shield")
                     livingRow("Dream", snapshot.lastDreamSummary, icon: "moon.stars")
                 }
-                if livingRefreshPresentation == .retainedFailure,
-                   let message = livingRefreshPresentation.adverseMessage {
+                if refreshPresentation == .stale,
+                   let message = refreshPresentation.livingStatusAdverseMessage {
                     // Endpoint names are internal vocabulary — plain headline,
                     // technical detail demoted to a tooltip (same pattern as
                     // DetachedChatLoadFailureCopy).
@@ -100,7 +89,7 @@ struct LivingStatusPanel: View {
                             ? "Did not respond: " + (refreshStatus?.failedEndpoints.joined(separator: ", ") ?? "")
                             : "The status sources did not respond.")
                 }
-            } else if let message = livingRefreshPresentation.adverseMessage {
+            } else if let message = refreshPresentation.livingStatusAdverseMessage {
                 Label(message, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.yellow)
@@ -127,7 +116,7 @@ struct LivingStatusPanel: View {
                 fileWatchAvailability = nil
                 return
             }
-            await LivingStatusFileWatch.observe(dataRoot: dataRoot, availabilityDidChange: { availability in
+            await LivingStatusFileWatch.observe(dataRoot: appModel.engine.dataRoot, availabilityDidChange: { availability in
                 fileWatchAvailability = availability
             }) {
                 await refresh()
@@ -169,7 +158,6 @@ struct LivingStatusPanel: View {
     private func refresh() async {
         await cognition.refreshLivingStatus(
             desk: appModel.engine.desk,
-            approvals: appModel.engine.approvals,
             agentDisplayName: { appModel.agentDisplayName },
             dreamErrorDidChange: { appModel.dreamError = $0 }
         )
@@ -184,20 +172,25 @@ extension LivingStatusFileWatch {
         availabilityDidChange: @escaping @MainActor (Availability) -> Void = { _ in },
         refresh: @escaping @MainActor @Sendable () async -> Void
     ) async {
-        let availability = availability(dataRoot: dataRoot)
-        availabilityDidChange(availability)
-        guard case .watching = availability else {
-            // Preserve the one canonical read even when live observation cannot
-            // be armed; the card will report both the read result and the lost
-            // live-update capability instead of quietly retaining stale data.
-            await refresh()
-            return
+        let paths = watchedPaths(dataRoot: dataRoot)
+        let events = FileChangeEvents(paths: paths, emitInitial: false)
+        defer { events.cancel() }
+        let armed = await events.waitUntilArmed()
+        guard !Task.isCancelled else { return }
+        let unavailable = Availability.unavailable("status files could not be observed")
+        availabilityDidChange(armed ? .watching(inputCount: paths.count) : unavailable)
+        await refresh()
+        guard armed, !Task.isCancelled else { return }
+        let debouncer = StoreReloadDebouncer(delay: debounceDelay, reload: refresh)
+        await debouncer.setVisible(true)
+        for await _ in events.stream {
+            guard !Task.isCancelled else { break }
+            await debouncer.signal()
         }
-        await EventDeadlinePhysiology.refreshOnChanges(
-            paths: watchedPaths(dataRoot: dataRoot),
-            debounceDelay: debounceDelay,
-            refresh: refresh
-        )
+        await debouncer.cancel()
+        if !Task.isCancelled {
+            availabilityDidChange(unavailable)
+        }
     }
 }
 
@@ -210,31 +203,16 @@ extension LivingStatusFileWatch.Availability {
 
 /// A completed refresh is not silent: an unavailable read and retained last
 /// known snapshot each have distinct, user-visible feedback.
-enum LivingStatusRefreshPresentation: Equatable {
-    case loading
-    case current
-    case retainedFailure
-    case unavailable
-    case empty
-
-    static func resolve(
-        hasSnapshot: Bool,
-        status: AppModel.PanelRefreshStatus?
-    ) -> Self {
-        if status?.isStale == true { return hasSnapshot ? .retainedFailure : .unavailable }
-        guard status != nil else { return .loading }
-        return hasSnapshot ? .current : .empty
-    }
-
-    var adverseMessage: String? {
+private extension AppModel.CompactReadPresentationState {
+    var livingStatusAdverseMessage: String? {
         switch self {
-        case .retainedFailure:
+        case .stale:
             return "Refresh couldn't complete — showing the last known state."
         case .unavailable:
             return "Refresh couldn't complete — current state is unavailable; no calm or needs-nothing state was inferred."
         case .empty:
             return "Refresh completed, but no current state was available."
-        case .loading, .current:
+        case .loading, .content:
             return nil
         }
     }

@@ -1,22 +1,13 @@
 import MacIntegration
 import EngineRuntime
+import NativeAgentCore
 import SwiftUI
 import AppKit
-import CoreGraphics
-import ScreenCaptureKit
-import ScreenVision
-import Speech
 import TelegramBot
-import AVFoundation
-import UniformTypeIdentifiers
 import NativeAgentShared
-import MemoryV2
 import PersistenceCore
-#if canImport(CoreSpotlight)
-import CoreSpotlight
-#endif
 
-// Blueprint: | `TelegramView.swift` | `TelegramView`: credential-free settings/status projections and save/test/log controls; outbound success never proves inbound poller health |
+// Blueprint: | `TelegramView.swift` | `TelegramView`: credential-free settings/status projections, access confirmation and save/test/log controls; outbound success never proves inbound poller health |
 
 enum TelegramPanelPresentation {
     enum ReadState: Equatable {
@@ -67,9 +58,6 @@ enum TelegramSettingsPresentation {
             )
     }
 
-    static func tokenStatusLabel(tokenConfigured: Bool) -> String {
-        tokenStatus(tokenConfigured: tokenConfigured).label
-    }
 }
 
 enum TelegramSettingsSaveOutcome: Equatable {
@@ -114,7 +102,6 @@ enum TelegramBotTokenPresentation {
         let canSave: Bool
         let validationMessage: String?
         let helperText: String
-        let tokenStatus: String
     }
 
     static func canSave(draft: String, tokenConfigured: Bool) -> Bool {
@@ -128,8 +115,7 @@ enum TelegramBotTokenPresentation {
             validationMessage: TelegramFacade.tokenValidationMessage(for: draft),
             helperText: tokenConfigured
                 ? "Paste a new token only when replacing the saved bot token. The field clears after saving."
-                : "Paste a BotFather token here. The field clears after saving.",
-            tokenStatus: TelegramSettingsPresentation.tokenStatusLabel(tokenConfigured: tokenConfigured)
+                : "Paste a BotFather token here. The field clears after saving."
         )
     }
 }
@@ -163,6 +149,7 @@ enum TelegramTestReplyPresentation {
     }
 }
 #if canImport(CloudKit)
+import CloudKit
 import CloudKit
 #endif
 
@@ -242,7 +229,7 @@ struct TelegramView: View {
                 } else if settingsLoading {
                     ProgressView("Reading Telegram settings…")
                 } else {
-                    TelegramNote(text: "Telegram settings are unavailable. \(appModel.telegramStatusRefreshError ?? "Try refreshing again.")", tone: .trouble)
+                    ProviderNote(text: "Telegram settings are unavailable. \(appModel.telegramStatusRefreshError ?? "Try refreshing again.")", color: NativeAgentShell.trouble)
                     Button("Retry") { Task { await loadSettings() } }
                 }
             }
@@ -252,16 +239,16 @@ struct TelegramView: View {
         .navigationTitle("Telegram")
         .quietReadTask { await loadSettings() }
         .confirmationDialog(
-            TelegramAccessConfirmation.title,
+            "Allow more Telegram replies?" as String,
             isPresented: $showAccessConfirm,
             titleVisibility: .visible
         ) {
-            Button(TelegramAccessConfirmation.action) {
+            Button("Allow replies" as String) {
                 Task { await appModel.saveTelegram() }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text(TelegramAccessConfirmation.message)
+            Text(verbatim: "Telegram can reply to allowed chats and users when enabled. If group mentions are not required, it can reply in allowed groups without being mentioned.")
         }
         .confirmationDialog(
             "Clear Telegram diagnostics?",
@@ -281,7 +268,7 @@ struct TelegramView: View {
             titleVisibility: .visible
         ) {
             Button("Disconnect", role: .destructive) {
-                Task { await appModel.clearTelegramToken() }
+                Task { _ = await appModel.clearTelegramToken() }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
@@ -305,8 +292,8 @@ struct TelegramView: View {
             chats: $0.configuration.allowedChatIds.joined(separator: ","),
             users: $0.configuration.allowedUserIds.joined(separator: ",")) }
         let configured = savedAllowlist?.isValidAndConfigured == true
-        TelegramSection(label: "Connection") {
-            TelegramCard {
+        AdvancedSection(title: "Connection", card: .bare) {
+            ProviderCard {
                 VStack(alignment: .leading, spacing: 12) {
                     TelegramStatusLine(
                         text: tokenStatusPresentation.label,
@@ -352,7 +339,7 @@ struct TelegramView: View {
                                         switch permission {
                                         case .granted:
                                             voicePermissionMessage = "Speech recognition is ready for Telegram voice messages."
-                                            await NativeAgentEngine.retireSystemPermissionCardIfGranted(dataRoot: PersistenceCore.defaultDataRoot())
+                                            await NativeAgentEngine.retireSystemPermissionCardIfGranted(dataRoot: appModel.engine.dataRoot)
                                         case .denied:
                                             voicePermissionMessage = "Enable NativeAgent in System Settings → Privacy & Security → Speech Recognition."
                                         case .restricted:
@@ -369,12 +356,12 @@ struct TelegramView: View {
                             }
                         }
                         if let message = status.pollStatusMessage {
-                            TelegramNote(text: message, tone: status.isTransientPollInterruption ? .quiet : .trouble)
+                            ProviderNote(text: message, color: status.isTransientPollInterruption ? NativeAgentShell.secondary : NativeAgentShell.trouble)
                         }
                     } else {
-                        TelegramNote(
+                        ProviderNote(
                             text: "Telegram has not reported yet. Refresh to read the bot's current state.",
-                            tone: .quiet
+                            color: NativeAgentShell.secondary
                         )
                     }
                 }
@@ -386,19 +373,19 @@ struct TelegramView: View {
 
     @ViewBuilder
     private var botTokenSection: some View {
-        TelegramSection(label: "Bot token") {
-            TelegramCard {
+        AdvancedSection(title: "Bot token", card: .bare) {
+            ProviderCard {
                 VStack(alignment: .leading, spacing: 12) {
                     SecureField("Bot token", text: Bindable(appModel).telegramToken)
                         .textFieldStyle(.roundedBorder)
                         .font(ShellType.label)
                         .accessibilityIdentifier(botTokenFieldState.accessibilityIdentifier)
-                    TelegramNote(text: botTokenFieldState.helperText, tone: .quiet)
+                    ProviderNote(text: botTokenFieldState.helperText, color: NativeAgentShell.secondary)
                     if let validationMessage = botTokenFieldState.validationMessage {
-                        TelegramNote(text: validationMessage, tone: .trouble)
+                        ProviderNote(text: validationMessage, color: NativeAgentShell.trouble)
                     } else if !tokenConfigured
                                 && appModel.telegramToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        TelegramNote(text: "A bot token is needed before Telegram settings can be saved.", tone: .trouble)
+                        ProviderNote(text: "A bot token is needed before Telegram settings can be saved.", color: NativeAgentShell.trouble)
                     }
                     if tokenConfigured {
                         Button("Disconnect Telegram") {
@@ -417,8 +404,8 @@ struct TelegramView: View {
 
     @ViewBuilder
     private var authorizationSection: some View {
-        TelegramSection(label: "Who can reach me") {
-            TelegramCard {
+        AdvancedSection(title: "Who can reach me", card: .bare) {
+            ProviderCard {
                 VStack(alignment: .leading, spacing: 12) {
                     Toggle("Telegram is on", isOn: Bindable(appModel).telegramEnabled)
                         .font(ShellType.label)
@@ -432,7 +419,7 @@ struct TelegramView: View {
                             .textFieldStyle(.roundedBorder)
                             .font(ShellType.label)
                     }
-                    TelegramNote(text: "To find your ID, leave Telegram off, save the bot token, then send the bot a message in Telegram. Check sender shows its numeric chat ID below. Admit only a sender you recognize, then save with Telegram on.", tone: .quiet)
+                    ProviderNote(text: "To find your ID, leave Telegram off, save the bot token, then send the bot a message in Telegram. Check sender shows its numeric chat ID below. Admit only a sender you recognize, then save with Telegram on.", color: NativeAgentShell.secondary)
                     Button(checkingSender ? "Checking…" : "Check sender") {
                         checkingSender = true
                         Task {
@@ -442,22 +429,23 @@ struct TelegramView: View {
                                 await appModel.refreshTelegram()
                                 senderCheckMessage = count == 0 ? "No messages found. Send your bot a message, then check again." : "Sender IDs are in Blocked and ignored below. Choose your chat ID and save to admit it."
                             } catch {
-                                senderCheckMessage = "Could not check senders. Check your bot token and keep Telegram off while checking."
+                                senderCheckMessage = "Could not check senders: "
+                                    + TurnSecretRedactor.redactText(error.localizedDescription)
                             }
                         }
                     }
                     .disabled(checkingSender || appModel.isSavingTelegram || appModel.engine.telegram.status?.enabled == true)
-                    if let senderCheckMessage { TelegramNote(text: senderCheckMessage, tone: .quiet) }
+                    if let senderCheckMessage { ProviderNote(text: senderCheckMessage, color: NativeAgentShell.secondary) }
                     if !invalidAllowlistTokens.isEmpty {
-                        TelegramNote(
+                        ProviderNote(
                             text: "These are not usable IDs: \(invalidAllowlistTokens.joined(separator: ", ")). Use the numeric chat or user ID.",
-                            tone: .trouble
+                            color: NativeAgentShell.trouble
                         )
                     }
                     Toggle("Only answer when mentioned in a group", isOn: Bindable(appModel).telegramRequireMention)
                         .font(ShellType.label)
                     if hasUnsavedAuthorizationChanges {
-                        TelegramNote(text: "These changes are not saved yet. Save before Telegram uses them.", tone: .trouble)
+                        ProviderNote(text: "These changes are not saved yet. Save before Telegram uses them.", color: NativeAgentShell.trouble)
                     }
                 }
             }
@@ -468,8 +456,8 @@ struct TelegramView: View {
 
     @ViewBuilder
     private var modelSection: some View {
-        TelegramSection(label: "Model") {
-            TelegramCard {
+        AdvancedSection(title: "Model", card: .bare) {
+            ProviderCard {
                 VStack(alignment: .leading, spacing: 12) {
                     TelegramField(title: "Model") {
                         Picker("Model", selection: Bindable(appModel).telegramModel) {
@@ -486,9 +474,9 @@ struct TelegramView: View {
                             .textFieldStyle(.roundedBorder)
                             .font(ShellType.label)
                     }
-                    TelegramNote(
+                    ProviderNote(
                         text: "The list stays short so it opens fast. Paste any provider's model ID here if it is not listed.",
-                        tone: .quiet
+                        color: NativeAgentShell.secondary
                     )
                     TelegramField(title: "How hard it thinks") {
                         Picker("Think level", selection: Bindable(appModel).telegramReasoningEffort) {
@@ -513,7 +501,7 @@ struct TelegramView: View {
                         model: appModel.telegramModel,
                         selected: appModel.telegramReasoningEffort
                     ) {
-                        TelegramNote(text: mismatch, tone: .trouble)
+                        ProviderNote(text: mismatch, color: NativeAgentShell.trouble)
                     }
                     TelegramMetaRow(label: "Commands in the chat", value: "/model, /think, /fast, /brain")
                 }
@@ -525,7 +513,7 @@ struct TelegramView: View {
 
     @ViewBuilder
     private var actionsSection: some View {
-        TelegramSection(label: "Actions") {
+        AdvancedSection(title: "Actions", card: .bare) {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 8) {
                     Button(appModel.isSavingTelegram ? "Saving…" : "Save") {
@@ -549,7 +537,7 @@ struct TelegramView: View {
                     .disabled(appModel.isClearingTelegramLogs)
 
                     Button(appModel.isTestingTelegram ? "Sending…" : "Send a test reply") {
-                        Task { await appModel.testTelegram() }
+                        Task { _ = await appModel.testTelegram() }
                     }
                     .disabled(
                         appModel.isTestingTelegram
@@ -599,29 +587,28 @@ struct TelegramView: View {
                 status: status,
                 refreshError: appModel.telegramStatusRefreshError
             ) {
-                TelegramSection(label: "These readings may be old") {
-                    TelegramCard {
-                        TelegramNote(
+                AdvancedSection(title: "These readings may be old", card: .bare) {
+                    ProviderCard {
+                        ProviderNote(
                             text: "Showing the last readable snapshot. The newest refresh failed: \(detail)",
-                            tone: .trouble
+                            color: NativeAgentShell.trouble
                         )
                     }
                 }
             }
 
-            TelegramSection(label: "Recent replies") {
-                // Alive glass (2026-09-23): one group card, a row per event.
+            AdvancedSection(title: "Recent replies", card: .bare) {
                 AliveGroupCard {
                     Group {
                         if let issue = status.receiptsIssue {
-                            TelegramNote(text: issue, tone: .trouble)
+                            ProviderNote(text: issue, color: NativeAgentShell.trouble)
                         }
                         if status.receipts.isEmpty {
-                            TelegramNote(
+                            ProviderNote(
                                 text: status.receiptsIssue == nil
                                     ? "Replies I send over Telegram will be listed here."
                                     : "No readable reply records are available.",
-                                tone: .quiet
+                                color: NativeAgentShell.secondary
                             )
                         } else {
                             ForEach(status.receipts.prefix(6)) { receipt in
@@ -633,26 +620,25 @@ struct TelegramView: View {
                             }
                             let hidden = TelegramPanelPresentation.hiddenCount(total: status.receipts.count, visibleLimit: 6)
                             if hidden > 0 {
-                                TelegramNote(text: "\(hidden) older replies are not shown.", tone: .quiet)
+                                ProviderNote(text: "\(hidden) older replies are not shown.", color: NativeAgentShell.secondary)
                             }
                         }
                     }
                 }
             }
 
-            TelegramSection(label: "Blocked and ignored") {
-                // Alive glass (2026-09-23): one group card, a row per event.
+            AdvancedSection(title: "Blocked and ignored", card: .bare) {
                 AliveGroupCard {
                     Group {
                         if let issue = status.blockedIssue {
-                            TelegramNote(text: issue, tone: .trouble)
+                            ProviderNote(text: issue, color: NativeAgentShell.trouble)
                         }
                         if status.blocked.isEmpty {
-                            TelegramNote(
+                            ProviderNote(
                                 text: status.blockedIssue == nil
                                     ? "Messages turned away by the allowlist will be listed here."
                                     : "No readable blocked-message records are available.",
-                                tone: .quiet
+                                color: NativeAgentShell.secondary
                             )
                         } else {
                             ForEach(status.blocked.prefix(6)) { event in
@@ -671,7 +657,7 @@ struct TelegramView: View {
                             }
                             let hidden = TelegramPanelPresentation.hiddenCount(total: status.blocked.count, visibleLimit: 6)
                             if hidden > 0 {
-                                TelegramNote(text: "\(hidden) older blocked messages are not shown.", tone: .quiet)
+                                ProviderNote(text: "\(hidden) older blocked messages are not shown.", color: NativeAgentShell.secondary)
                             }
                         }
                     }
@@ -679,14 +665,14 @@ struct TelegramView: View {
             }
 
             if status.errorsIssue != nil || !status.errors.isEmpty {
-                TelegramSection(label: "Recent errors") {
+                AdvancedSection(title: "Recent errors", card: .bare) {
                     AliveGroupCard {
                         Group {
                             if let issue = status.errorsIssue {
-                                TelegramNote(text: issue, tone: .trouble)
+                                ProviderNote(text: issue, color: NativeAgentShell.trouble)
                             }
                             if status.errors.isEmpty {
-                                TelegramNote(text: "No readable Telegram errors are available.", tone: .quiet)
+                                ProviderNote(text: "No readable Telegram errors are available.", color: NativeAgentShell.secondary)
                             } else {
                                 ForEach(status.errors.prefix(4)) { event in
                                     TelegramEventRow(
@@ -697,7 +683,7 @@ struct TelegramView: View {
                                 }
                                 let hidden = TelegramPanelPresentation.hiddenCount(total: status.errors.count, visibleLimit: 4)
                                 if hidden > 0 {
-                                    TelegramNote(text: "\(hidden) older errors are not shown.", tone: .quiet)
+                                    ProviderNote(text: "\(hidden) older errors are not shown.", color: NativeAgentShell.secondary)
                                 }
                             }
                         }
@@ -709,17 +695,17 @@ struct TelegramView: View {
                 status: nil,
                 refreshError: appModel.telegramStatusRefreshError
             )
-            TelegramSection(label: "What Telegram has been doing") {
-                TelegramCard {
+            AdvancedSection(title: "What Telegram has been doing", card: .bare) {
+                ProviderCard {
                     switch readState {
                     case .loading:
-                        TelegramNote(text: "Reading what Telegram has been doing…", tone: .quiet)
+                        ProviderNote(text: "Reading what Telegram has been doing…", color: NativeAgentShell.secondary)
                     case .unavailable(let detail):
-                        TelegramNote(text: "Telegram's records could not be read: \(detail)", tone: .trouble)
+                        ProviderNote(text: "Telegram's records could not be read: \(detail)", color: NativeAgentShell.trouble)
                     case .current, .stale:
-                        TelegramNote(
+                        ProviderNote(
                             text: "Replies, blocked messages and errors will be listed here.",
-                            tone: .quiet
+                            color: NativeAgentShell.secondary
                         )
                     }
                 }
@@ -733,49 +719,10 @@ struct TelegramView: View {
 // The page's own small vocabulary: an eyebrow over a run, the card the
 // controls sit in, and the three shapes of line inside one.
 
-private struct TelegramSection<Content: View>: View {
-    let label: String
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-            AliveEyebrow(label)
-            content
-        }
-    }
-}
-
-private struct TelegramCard<Content: View>: View {
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        content
-            .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .aliveCard()
-            .accessibilityElement(children: .contain)
-    }
-}
-
-/// The three tones a line on this page can carry. Nothing else is tinted.
-private enum TelegramTone {
-    case calm
-    case trouble
-    case quiet
-
-    var color: Color {
-        switch self {
-        case .calm: NativeAgentShell.calm
-        case .trouble: NativeAgentShell.trouble
-        case .quiet: NativeAgentShell.secondary
-        }
-    }
-}
-
 private struct TelegramStatusLine: View {
     let text: String
     let systemImage: String
-    let tone: TelegramTone
+    let tone: TrustTone
 
     var body: some View {
         // The mark carries the tone; the words stay in text colour, since
@@ -790,19 +737,6 @@ private struct TelegramStatusLine: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
         }
-    }
-}
-
-private struct TelegramNote: View {
-    let text: String
-    let tone: TelegramTone
-
-    var body: some View {
-        Text(text)
-            .font(ShellType.caption)
-            .foregroundStyle(tone.color)
-            .fixedSize(horizontal: false, vertical: true)
-            .textSelection(.enabled)
     }
 }
 

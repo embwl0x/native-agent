@@ -1,14 +1,5 @@
-// U3 wave-1 item 1/2 (2026-06-10): sentence/word-safe text clipping.
-//
-// The felt "memory truncation" was READ-side: recall surfaced only
-// `prefix(200)` previews that chopped mid-word, and the extraction regexes
-// capped captures mid-phrase. This file owns the shared clipping helpers and
-// the caps so every producer clips CLEANLY (sentence boundary first, then
-// word boundary, hard cap only when a single token exceeds the cap).
-//
-// HARD CONSTRAINT (u3-memory-quality plan): these helpers shape how much
-// text is RETURNED/STORED — they must never change ranking, which rows
-// recall returns, or any decay/threshold semantics.
+// Clip at a sentence boundary, then a word boundary; hard-cap only a token longer than the cap.
+// Clipping changes text length only, never ranking, row selection, decay or thresholds.
 
 import Foundation
 import NativeAgentCore
@@ -17,17 +8,10 @@ import NativeAgentCore
 
 // MARK: - Caps
 
-/// Max characters of full memory `content` returned per recall hit
-/// (impl_recall_memory and the MemoryV2 recall surface). Generous on
-/// purpose: the live store's median row is well under 300 chars, and the
-/// daemon-era 200-char preview was the felt truncation. 2000 chars is
-/// ~500 tokens worst-case per hit; at the default k=5 that is ~2.5k tokens
-/// upper bound, paid only when rows are actually that long.
+/// Max characters of full memory `content` returned per recall hit.
 public let memoryRecallContentCap = 2000
 
-/// Max characters of the compact `preview` field on a recall hit. Same
-/// budget as the daemon-era prefix(200), but sentence-clipped instead of a
-/// mid-word chop.
+/// Max characters of the sentence-clipped `preview` field on a recall hit.
 public let memoryRecallPreviewCap = 200
 
 
@@ -39,10 +23,7 @@ public enum MemoryTextClip {
     /// tool output. Durable storage may keep timestamps for sorting and audit,
     /// but ordinary memory prose should not start with machine chronology.
     ///
-    /// The implementation moved to `MemoryDisplayText` in the base target
-    /// (2026-07-24) so the USER.md producer and the ContextFlow precoverage
-    /// join share ONE renderer instead of two that could drift. This stays as
-    /// the MemoryV2-facing spelling; it must remain a pure forwarder.
+    /// Forward to `MemoryDisplayText` so USER.md, ContextFlow and MemoryV2 share one renderer.
     public static func memoryDisplayText(_ text: String, kind: String? = nil) -> String {
         MemoryDisplayText.display(text, kind: kind)
     }
@@ -98,14 +79,7 @@ public enum MemoryTextClip {
     /// character is whitespace or true end-of-text. Decimal points ("0.92")
     /// don't qualify because the following character is alphanumeric.
     ///
-    /// REVIEW BLOCKER FIX (gpt-5.5, 2026-06-10): the boundary scan runs over
-    /// the FULL text, not the clipped prefix. The earlier prefix-only scan
-    /// treated the prefix's end as end-of-string, so a cap landing right
-    /// after the "0." of "threshold is 0.92…" minted a fake sentence
-    /// boundary and the clip ended "…is 0.". The prefix-end pseudo-boundary
-    /// must validate exactly like an interior one — against the character
-    /// the ORIGINAL text carries at that position — else the caller falls
-    /// back to a word boundary.
+    /// Validate boundaries against the full text so clipping cannot turn a decimal point into a terminator.
     private static func lastSentenceBoundary(
         in text: String, upTo limit: String.Index
     ) -> String.Index? {

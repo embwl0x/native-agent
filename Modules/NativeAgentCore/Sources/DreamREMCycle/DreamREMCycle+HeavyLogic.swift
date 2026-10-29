@@ -1,18 +1,13 @@
 import Foundation
-import CommonCrypto
+import CryptoKit
 import PersistenceCore
 import PersonaEngine
 import NativeAgentCore
+import MemoryV2
 
-// Blueprint: | `DreamREMCycle+HeavyLogic.swift` | REM stateless helpers: persona reads, durable denial tombstones and old-diary archival; caller retains proposal persistence and approval gating |
+// Blueprint: | `DreamREMCycle+HeavyLogic.swift` | REM stateless helpers: persona reads and rendering, durable denial tombstones and old-diary archival; caller retains proposal persistence and approval gating |
 
-// Heavy logic for the REM consolidation pipeline:
-//   - .rem_tombstones exclusion of denied proposals
-//   - 14-day archival of old dream_diary entries
-//
-// Mirrors the retired daemon behaviors (_REM_MAX_PROPOSALS gate, .rem_tombstones
-// denylist, GROWTH cap eviction-to-KG, 14-day archive). Persistence + approval
-// gating remain with the caller — these are stateless helpers / file actors.
+// REM tombstones and diary archival retain their persisted formats.
 
 /// Use the live compiler's checked active-persona selection while preserving
 /// Dream/REM's selected SOUL, VOICE, GROWTH and AGENTS documents and USER projection.
@@ -23,10 +18,10 @@ func readDreamPersonaDocs(
         engine: SwiftNativePersonaEngine(root: personaRoot, dataRoot: dataRoot)
     )
     let snapshot = try await compiler.contextSourceSnapshot(surface: surface)
-    // Phase 5A: USER rides as the pinned core (the same projection chat and
-    // reflection use), not the ~25 KB generated body. The dream's delta is the
-    // memory-delta channel it already gets; REM reads the diaries that carry it.
-    let userCore = await DreamUserCore.provider?(dataRoot)
+    // USER carries the pinned core; dreams receive new memories separately.
+    let userCore = MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot)
+        ? await SwiftNativeMemoryV2.userCoreForBackground(dataRoot: dataRoot)
+        : []
     var docs: [String: String] = [:]
     for id in ["SOUL", "VOICE", "GROWTH", "USER", "AGENTS"] {
         let raw = snapshot.packet.activeDocs[id] ?? ""
@@ -38,28 +33,18 @@ func readDreamPersonaDocs(
     return docs
 }
 
-/// The pinned USER core for Dream/REM. MemoryV2 owns it and this module cannot
-/// import MemoryV2, so the app installs the reader at cognition bootstrap. Nil
-/// (never installed) keeps the whole document, exactly as before.
-public enum DreamUserCore {
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var storedProvider: (@Sendable (URL) async -> [String]?)?
-
-    /// Copy under the lock; callers invoke the copy after the getter releases it.
-    public static var provider: (@Sendable (URL) async -> [String]?)? {
-        get { lock.withLock { storedProvider } }
-        set { lock.withLock { storedProvider = newValue } }
-    }
+/// The selected persona documents in their shared dream/REM order.
+func renderDreamPersonaDocs(_ docs: [String: String]) -> String {
+    ["SOUL.md", "VOICE.md", "GROWTH.md", "USER.md", "AGENTS.md"].map { name in
+        let raw = docs[name] ?? ""
+        let body = raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "(empty)" : raw
+        return "--- \(name) ---\n\(body)"
+    }.joined(separator: "\n\n")
 }
 
 // MARK: - REMTombstoneStore
 
-/// Byte-compatible port of daemon `_tombstone_fp(text)` (the retired daemon
-/// L76-81 — `" ".join(text.lower().split())` then sha256 hex first-16).
-/// Python's `str.split()` with no args splits on runs of ANY whitespace and
-/// discards empties; the Swift equivalent is `split(whereSeparator: { $0.isWhitespace })`
-/// (which also drops zero-length runs by default). Anything that diverges from
-/// this exact pipeline silently desyncs Swift and daemon dedup.
+/// Persisted fingerprint: lowercase, collapse whitespace, then the first 16 SHA256 hex characters.
 public func _tombstone_fp(_ text: String) -> String {
     let pieces = text.lowercased()
         .split(whereSeparator: { $0.isWhitespace })
@@ -69,21 +54,12 @@ public func _tombstone_fp(_ text: String) -> String {
     return String(digest.prefix(16))
 }
 
-/// SHA256 → lowercase hex string. CryptoKit unavailable to keep the
-/// PersistenceCore-only dep graph clean; CommonCrypto is in the SDK and
-/// produces the same byte-compat digest Python's hashlib does.
+/// SHA256 without narrowing the input byte count.
 private func sha256Hex(_ s: String) -> String {
-    let bytes = Array(s.utf8)
-    var hash = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
-    bytes.withUnsafeBufferPointer { buf in
-        _ = CC_SHA256(buf.baseAddress, CC_LONG(buf.count), &hash)
-    }
-    return hash.map { String(format: "%02x", $0) }.joined()
+    SHA256.hash(data: Data(s.utf8)).map { String(format: "%02x", $0) }.joined()
 }
 
-/// Daemon tombstone value shape — mirrors the retired daemon
-/// (`tombstones[fp] = {rejected_at, target_doc, reason, preview}`). The dict
-/// keys are snake_case to match daemon's JSON-on-disk format byte-for-byte.
+/// Persisted tombstone fields retain their snake_case JSON keys.
 public struct REMTombstoneRecord: Codable, Sendable, Equatable {
     public let rejected_at: String
     public let target_doc: String
@@ -118,31 +94,15 @@ public enum REMTombstoneStoreError: Error, LocalizedError, Equatable, Sendable {
 public actor REMTombstoneStore {
     private let path: URL
     private let fm = FileManager.default
-    private let lockCore = SwiftNativePersistenceCore()
 
-    /// BUG-A FIX: daemon writes tombstones as a SINGLE JSON dict
-    /// (`{fp: {...}}`) at `<data_root>/harness/.rem_tombstones.json`
-    ///. Swift previously wrote JSONL (one
-    /// record per line) at the same path — the path was right but the
-    /// FORMAT was wrong, so each side's writes were meaningless to the
-    /// other. Rewrite to read/write the daemon dict format keyed by the
-    /// SHA256-first-16 fingerprint of `_tombstone_fp(proposed_text)`.
+    /// Tombstones are a JSON dictionary keyed by the first 16 SHA256 fingerprint characters.
     public init(dataRoot: URL = PersistenceCore.defaultDataRoot()) {
         let dir = dataRoot.appendingPathComponent("harness", isDirectory: true)
         self.path = dir.appendingPathComponent(".rem_tombstones.json")
     }
 
-    private func ensureDir() throws {
-        let dir = path.deletingLastPathComponent()
-        if !fm.fileExists(atPath: dir.path) {
-            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        }
-    }
-
-    /// Daemon-shape loader: file content is a JSON dict keyed by fingerprint.
-    /// Backward-compat: if the file looks like JSONL (older Swift writes from
-    /// before this fix), parse complete legacy records and upgrade on the NEXT
-    /// mutation. Missing or empty state means no tombstones. A nonempty state
+    /// Read the fingerprint dictionary or complete legacy JSONL records, upgraded
+    /// on the next mutation. Missing or empty state means no tombstones. A nonempty state
     /// that cannot be decoded in either supported format fails closed.
     public func loadAll() throws -> [String: REMTombstoneRecord] {
         guard fm.fileExists(atPath: path.path) else { return [:] }
@@ -158,14 +118,11 @@ public actor REMTombstoneStore {
             throw REMTombstoneStoreError.unreadable(path: path.path)
         }
         guard !data.isEmpty else { return [:] }
-        // Try daemon dict shape first.
+        // The canonical shape is a fingerprint dictionary.
         if let dict = try? JSONDecoder().decode([String: REMTombstoneRecord].self, from: data) {
             return dict
         }
-        // Legacy JSONL fall-through. Parse each line, synthesize a fingerprint
-        // from the legacy `normText` (which was already lowered + whitespace-
-        // collapsed — same as `_tombstone_fp` minus the hash), then rebuild a
-        // daemon record so the next write upgrades the file on disk.
+        // Legacy normText is already lowercase and whitespace-collapsed; hash it unchanged.
         struct LegacyEntry: Decodable {
             let targetDoc: String
             let normText: String
@@ -184,10 +141,6 @@ public actor REMTombstoneStore {
             guard let legacy = try? JSONDecoder().decode(LegacyEntry.self, from: Data(line.utf8)) else {
                 throw REMTombstoneStoreError.malformed(path: path.path)
             }
-            // Compute fingerprint from the already-normalized legacy normText.
-            // Re-normalizing is a no-op (lower + collapse is idempotent), so this
-            // matches `_tombstone_fp` exactly even though we don't have the raw
-            // pre-normalization text.
             let normText = legacy.normText
             let fp = _tombstone_fp(normText)
             migrated[fp] = REMTombstoneRecord(
@@ -201,17 +154,13 @@ public actor REMTombstoneStore {
     }
 
     private func saveAll(_ dict: [String: REMTombstoneRecord]) throws {
-        try ensureDir()
         let enc = JSONEncoder()
         enc.outputFormatting = [.sortedKeys, .prettyPrinted]
         let data = try enc.encode(dict)
-        // Atomic write via tmp + rename — matches daemon's `write_text` which
-        // CPython implements atomically on POSIX. `.atomic` write option on
-        // Data does the equivalent dance.
-        try data.write(to: path, options: .atomic)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: path)
     }
 
-    public func record(_ proposal: REMProposal, reason: String) async throws {
+    public func record(_ proposal: REMProposalRow, reason: String) async throws {
         let proposedText = proposal.proposalText
         let fp = _tombstone_fp(proposedText)
         let isoNow = ISO8601DateFormatter().string(from: Date())
@@ -221,36 +170,17 @@ public actor REMTombstoneStore {
             reason: reason,
             preview: String(proposedText.prefix(200))
         )
-        // BUG-A FIX: wrap the read-modify-write under withFileLock so
-        // concurrent daemon writes can't lose updates. flock convention:
-        // `<path>.lock` sibling file, matches the retired daemon.
-        try await lockCore.withFileLock(path) {
-            var dict = try await self.loadAllInsideLock()
+        // The sibling <path>.lock covers the whole read-modify-write.
+        try await SwiftNativePersistenceCore.withFileLock(path) {
+            var dict = try await self.loadAll()
             dict[fp] = record
-            try await self.saveAllInsideLock(dict)
+            try await self.saveAll(dict)
         }
-    }
-
-    /// Worker that runs inside the actor while file lock is held by the
-    /// withFileLock closure. Needed because withFileLock's body is non-actor
-    /// (@Sendable closure) — we hop back into the actor via `await self.x()`.
-    private func loadAllInsideLock() async throws -> [String: REMTombstoneRecord] {
-        return try loadAll()
-    }
-
-    private func saveAllInsideLock(_ dict: [String: REMTombstoneRecord]) async throws {
-        try saveAll(dict)
-    }
-
-    public func isTombstoned(_ proposal: REMProposal) async throws -> Bool {
-        let fp = _tombstone_fp(proposal.proposalText)
-        let dict = try loadAll()
-        return dict[fp] != nil
     }
 
     /// Reload after distillation so denials committed during the LLM call apply
     /// to the whole batch; never reuse the pre-run authority validation.
-    public func filterTombstoned(_ proposals: [REMProposal]) throws -> [REMProposal] {
+    public func filterTombstoned(_ proposals: [REMProposalRow]) throws -> [REMProposalRow] {
         guard !proposals.isEmpty else { return [] }
         let dict = try loadAll()
         return proposals.filter { dict[_tombstone_fp($0.proposalText)] == nil }
@@ -269,16 +199,20 @@ public actor DreamArchiver {
 
     public func archiveOlderThan(daysOld: Int = 14, now: Date = Date()) async throws -> Int {
         let diary = dataRoot.appendingPathComponent("dream_diary", isDirectory: true)
-        guard fm.fileExists(atPath: diary.path) else { return 0 }
-        let cutoff = now.addingTimeInterval(TimeInterval(-daysOld * 86_400))
-        let files = (try? FileBackedDreamDiary(dataRoot: dataRoot).discover(in: .active, matching: .dated)) ?? []
+        guard daysOld >= 0,
+              let cutoff = DreamREMSchedule.localCalendar().date(byAdding: .day, value: -daysOld, to: now),
+              cutoff.timeIntervalSinceReferenceDate.isFinite else {
+            throw NSError(domain: "DreamArchiver", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Dream archive age must be a representable nonnegative day count."])
+        }
+        let files = try FileBackedDreamDiary(dataRoot: dataRoot).discover(in: .active, matching: .dated)
         let dateFmt = ISO8601DateFormatter()
         dateFmt.formatOptions = [.withFullDate]
         var moved = 0
         for file in files where file.name.hasSuffix(".md") {
             let name = file.name
             let stem = file.stem
-            let dateStr = file.day!
+            guard let dateStr = file.day else { continue }
             guard let parsed = dateFmt.date(from: dateStr) else { continue }
             if parsed >= cutoff { continue }
             let year = String(dateStr.prefix(4))

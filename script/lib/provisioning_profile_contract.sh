@@ -24,6 +24,11 @@ decode_provisioning_profile() {
     echo "provisioning profile is not a regular file: $profile" >&2
     return 1
   }
+  if [[ -n "${3:-}" ]]; then
+    cp "$profile" "$3" || return 1
+    profile="$3"
+    chmod 0644 "$profile" || return 1
+  fi
   security cms -D -i "$profile" > "$output" 2>/dev/null || {
     echo "unable to decode provisioning profile: $profile" >&2
     return 1
@@ -61,14 +66,9 @@ verify_profile_identity_contract() {
 
 verify_public_cloudkit_profile_contract() {
   local plist="$1" expected_team="$2" expected_bundle="$3" expected_container="$4"
-  local expected_app_id profile_app_id profile_team aps_environment
+  local profile_team aps_environment
   local container_environment provisions_all_devices
 
-  expected_app_id="$expected_team.$expected_bundle"
-  profile_app_id="$(
-    provisioning_profile_value "$plist" \
-      "Entitlements:com.apple.application-identifier"
-  )"
   profile_team="$(provisioning_profile_value "$plist" "TeamIdentifier:0")"
   aps_environment="$(
     provisioning_profile_value "$plist" \
@@ -87,10 +87,6 @@ verify_public_cloudkit_profile_contract() {
     return 1
   }
   verify_profile_identity_contract "$plist" "$expected_bundle" || return 1
-  [[ "$profile_app_id" == "$expected_app_id" ]] || {
-    echo "profile application identifier '$profile_app_id' does not match '$expected_app_id'" >&2
-    return 1
-  }
   provisioning_profile_array_contains \
     "$plist" \
     "Entitlements:com.apple.developer.icloud-container-identifiers" \
@@ -132,6 +128,7 @@ verify_public_cloudkit_profile_contract() {
 # Derive the two signing-identity entitlements from a provisioning profile.
 # A checked-in template should remain team-neutral, and codesign does not copy
 # these grants from the embedded profile into an explicit entitlement payload.
+# CloudKit requires both identity grants in the signed payload.
 prepare_profile_signing_entitlements() {
   local template="$1" profile_plist="$2" output="$3"
   local application_identifier team_identifier
@@ -171,7 +168,6 @@ prepare_profile_signing_entitlements() {
     "$output" || return 1
   plutil -lint "$output" >/dev/null
 }
-
 verify_signed_bundle_profile_identity() {
   local bundle="$1" profile_plist="$2" expected_bundle="$3"
   local signed_entitlements expected_app_id expected_team signed_app_id signed_team
@@ -213,17 +209,4 @@ verify_signed_bundle_profile_identity() {
     echo "signed team identifier '$signed_team' does not match profile '$expected_team'" >&2
     return 1
   }
-}
-
-# A Developer ID provisioning profile grants the application/team identifiers,
-# but codesign does not copy those grants into an explicit entitlement plist.
-# CloudKit requires both identifiers in the app's signed entitlement payload;
-# omitting them produces CKError 8 ("Trying to initialize a container without
-# an application ID") even though the embedded profile, container grant,
-# signature, and notarization are otherwise valid.
-#
-# Keep the checked-in template team-neutral. Derive only these two identity
-# values from the already-validated profile into a temporary signing plist.
-prepare_public_cloudkit_signing_entitlements() {
-  prepare_profile_signing_entitlements "$1" "$2" "$3"
 }

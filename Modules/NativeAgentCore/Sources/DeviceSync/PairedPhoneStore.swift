@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import NativeAgentShared
+import NativeAgentCore
 import PersistenceCore
 import TrustCenter
 // Blueprint: | `PairedPhoneStore.swift` | Paired-phone array mutations using PairedPhoneAuthority's one Phone schema; local backup/export/phone exclusions and Paired Phones privacy scope are declared here |
@@ -18,7 +19,7 @@ public final class PairedPhoneStore: ObservableObject {
     private let url: URL
     private let storage: DeviceSyncStorage
     private var observationTask: Task<Void, Never>?
-    private var revision: UInt64 = 0
+    private let latest = LatestRead()
 
     init(url: URL, storage: DeviceSyncStorage) {
         self.url = url
@@ -51,29 +52,28 @@ public final class PairedPhoneStore: ObservableObject {
     }
 
     public func reload() async {
-        revision &+= 1
-        let revision = revision
         let url = url
-        do {
-            let rows = try await storage.perform { try Self.read(at: url) }
-            guard revision == self.revision else { return }
-            if !phones.elementsEqual(rows, by: { $0.id == $1.id && $0.publicKey == $1.publicKey && $0.status == $1.status }) {
-                phones = rows
+        _ = await latest.read {
+            await storage.perform { Result { try Self.read(at: url) } }
+        } publish: { result in
+            switch result {
+            case .success(let rows):
+                if !phones.elementsEqual(rows, by: { $0.id == $1.id && $0.publicKey == $1.publicKey && $0.status == $1.status }) {
+                    phones = rows
+                }
+                message = nil
+            case .failure:
+                message = StoreError.unavailable.localizedDescription
             }
-        } catch {
-            if revision == self.revision { message = StoreError.unavailable.localizedDescription }
         }
     }
 
     nonisolated private static func save(_ rows: [Phone], to url: URL) throws {
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try JSONEncoder().encode(rows).write(to: url, options: .atomic)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(rows), to: url)
     }
 
     @discardableResult
     public func setStatus(_ status: Phone.Status, id: String) async -> Bool {
-        revision &+= 1
-        let revision = revision
         let url = url
         do {
             let rows = try await storage.perform {
@@ -83,23 +83,22 @@ public final class PairedPhoneStore: ObservableObject {
                 try Self.save(rows, to: url)
                 return rows
             }
-            if revision == self.revision {
+            latest.write {
                 phones = rows
                 message = nil
             }
             return true
         } catch {
-            if revision == self.revision { message = StoreError.unavailable.localizedDescription }
+            message = StoreError.unavailable.localizedDescription
             return false
         }
     }
 
     /// Called only after transport authentication. A key holder may request
     /// pairing, but only the local Pair button can grant approval authority.
-    func authorize(_ action: InboxAction, requiresPairing: Bool) async -> String? {
+    func authorize(_ action: InboxAction) async -> String? {
         let url = url
         do {
-            if action.deviceSignature == nil && !requiresPairing { return nil }
             let notice: String? = try await storage.perform {
                 let identity = try DeviceApprovalSignature.verify(JSONEncoder().encode(action))
                 var rows = try Self.read(at: url)

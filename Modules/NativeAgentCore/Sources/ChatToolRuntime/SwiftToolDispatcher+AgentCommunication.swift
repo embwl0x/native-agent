@@ -1,10 +1,10 @@
 import AgentWorkspace
 import AuthoredCapabilities
-import GrokLink
 #if canImport(AppKit)
 import AppKit
 #endif
 import Foundation
+import NativeAgentShared
 import TrustCenter
 import ApprovalInbox
 import NativeAgentCore
@@ -12,23 +12,12 @@ import PersistenceCore
 import PersonaEngine
 import StandingBots
 import ProviderRouting
-// Blueprint: | `SwiftToolDispatcher+AgentCommunication.swift` | `SwiftToolDispatcher`: `closeACPConnections`, `builtInAgentLaneUsable`, `impl_agentCommunication`; command settlement joins its output consumer before reading replies and releasing its directory/probe |
-
-public protocol BuiltInAgentLaneProviding: Sendable {
-    func builtInAgentLaneUsable(_ name: String) -> Bool
-}
-
-extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
+// Blueprint: | `SwiftToolDispatcher+AgentCommunication.swift` | `SwiftToolDispatcher`: `closeACPConnections`, `builtInAgentLaneUsable`, `impl_agentCommunication`; command settlement joins its output consumer before reading replies and releasing its directory/probe; physical launch, exit success and proven delivery remain separate, launched unanswered commands retain unknown delivery |
+extension SwiftToolDispatcher {
     public static func closeACPConnections() async { await AgentACPConnections.shared.closeAll() }
-
-    public func builtInAgentLaneUsable(_ name: String) -> Bool {
-        Self.builtInAgentLaneUsable(name, dataRoot: dataRoot, configRoot: agentBridgeConfigRoot)
-    }
-
     static func builtInAgentLaneUsable(_ name: String, dataRoot: URL, configRoot: URL?) -> Bool {
         AgentConversationDelivery.lane(for: name, dataRoot: dataRoot, bridgeConfigRoot: configRoot) != nil
     }
-
     func impl_agentCommunication(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let optional: Set<String> = ["endpoint", "app_bundle_id", "conversation_label", "transport", "bearer_token", "conversation_id", "message_id", "task_id", "options", "limit", "offset", "max_chars", "details", "disconnect", "ability"]
         let args = input.filter {
@@ -44,7 +33,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         let store = AgentPeerStore(dataRoot: dataRoot)
         if tool == "agent_message", let reply = try await HelperContact.message(input) { return reply }
         if tool == "agent_contacts" {
-            try Self.peerKeys(args, allowed: ["discover"])
+            try Self.peerKeys(args, allowed: ["discover", "details"])
             // A name in discover ("Grok Bot") means "find this one": filter to it.
             var named: String?
             var refresh = false
@@ -77,7 +66,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             var contacts = Self.agentLaneContacts(peers: allPeers, selectedPeers: peers)
             if let door = HelperContact.door, matches(door.name, door.name) {
                 contacts.append(.object(["agent": .string(door.name), "name": .string(door.name),
-                    "state": .string("connected"), "conversation_id": .string(door.conversationID)]))
+                    "state": .string("available"), "conversation_id": .string(door.conversationID)]))
             }
             let health = AgentContactHealth.read(dataRoot: dataRoot)
             contacts = contacts.map { value in
@@ -109,6 +98,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             }
             contacts += bots.map {
                 .object(["agent": .string("bot:" + $0.id.uuidString.lowercased()), "name": .string($0.name),
+                         "state": .string($0.paused ? "paused" : "not_checked"),
                          "kind": .string("bot"), "paused": .bool($0.paused), "readiness": .string("not_checked"),
                          "capabilities": .array([.string("message"), .string("read")]), "read_inputs": .array([])])
             }
@@ -120,7 +110,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                 if usesCanonicalBody, await fullMacToolAccess(surface: surface).fileOpsAllowed {
                     let origin = SecurityOriginContext.currentTurn(verifiedSessionId: ChatToolSessionContext.verifiedSessionId, surface: surface)
                     launch = await agentProgramLaunch(SwiftNativeSecurityCenter(dataRoot: dataRoot)
-                        .drivenAgentLaunchPermission(tool: tool, origin: origin)).launch
+                        .drivenAgentLaunchPermission(origin: origin)).launch
                 }
             }
             let found = savedMatch ? [] : await AgentDiscoverySession.shared.candidates(refresh: refresh, launch: launch, dataRoot: dataRoot)
@@ -148,11 +138,46 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                 }
                 if hits.isEmpty { note = "No contact matches '\(named)'; all \(contacts.count) below." } else { contacts = hits }
             }
-            if named == nil || note != nil { contacts = contacts.map(Self.compactContact) }
+            let identity = AgentContactIdentity(dataRoot: dataRoot)
+            let botHistory: Result<[UUID: [ShelfEntry]], Error> = Result {
+                if bots.isEmpty { return [:] }
+                return try ShelfStore(dataRoot: dataRoot).entriesByBot()
+            }
+            contacts = contacts.map { value in
+                guard case .object(var row) = value else { return value }
+                let agent = row["agent"]?.stringValue ?? ""
+                row.removeValue(forKey: "last_reply_in")
+                do {
+                    let answered: Date?
+                    if agent.hasPrefix("peer:") {
+                        let lines = try ContactThread.mergedLines(dataRoot: dataRoot, owner: String(agent.dropFirst(5)), identity: identity)
+                        answered = lines.last(where: { !$0.mine })?.at
+                    } else if agent.hasPrefix("bot:"), let id = UUID(uuidString: String(agent.dropFirst(4))) {
+                        answered = try botHistory.get()[id]?.last(where: {
+                            !$0.actualReply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        })?.runAt
+                    } else { answered = nil }
+                    row["last_answered"] = answered.map { .string(NativeTimestampFormat.plainZulu($0)) } ?? .null
+                    if agent.hasPrefix("peer:") {
+                        row["last_reply_in"] = row["last_answered"]
+                        if row["state"] == .string("connected") {
+                            row["state"] = .string(answered == nil ? "set up" : "answered")
+                            row["state_detail"] = .string(answered.map { "Last answered " + NativeTimestampFormat.plainZulu($0) + ". Availability now is not proven." }
+                                ?? "No answer in this contact's thread.")
+                        }
+                    }
+                } catch {
+                    row["last_answered"] = .null
+                    row["state"] = .string("history_unavailable")
+                    row["state_detail"] = .string(error.localizedDescription)
+                }
+                if case .object(let presence)? = row["presence"], presence["status"] == .string("waiting") {
+                    row["state"] = .string("waiting")
+                }
+                return args["details"] == .bool(true) ? .object(row) : Self.compactContact(.object(row))
+            }
             var listed: [String: JSONValue] = ["status": .string("ok"), "contacts": .array(contacts),
-                            "states": .array([AgentPeerContactState.listed, .setUp, .connected, .sendOnly]
-                                .map { .string($0.rawValue + " — " + $0.detail) }),
-                            "detail": .string("Configuration is not evidence of availability or permission to send. Connected means a real message arrived through the connection, or a message and reply crossed it. Each route shows its own proof.")]
+                            "detail": .string("Last answered is read from the contact's thread; it does not prove availability now. Use details:true for doors and connection evidence.")]
             if let note { listed["note"] = .string(note) }
             if !savedMatch {
                 // What this listing read and what it ran, in words.
@@ -349,11 +374,10 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             guard args["task_id"] == nil else { throw AgentCommunicationError.invalid("Grok uses message_id") }
             if !sending {
                 let id = try Self.peerString(args, "message_id", max: 36)!
-                // 2026-09-22: her workspace window reads a Grok thread from any of
-                // her chats (User's product rule); only replies stay scoped to the asker.
+                // Grok threads are readable across chats; replies stay scoped to the asker.
                 return GrokBotRoute.projection(try GrokRequestStore(dataRoot: dataRoot).read(id, peer: peer.id))
             }
-            let session = ChatToolSessionContext.verifiedSessionId ?? Self.extractSessionId(from: input)
+            let session = ChatToolSessionContext.verifiedSessionId ?? ChatToolSessionInjection.explicitSessionId(in: input)
             guard !session.isEmpty else { throw AgentCommunicationError.invalid("Send from a chat so Grok's reply can return there") }
             if let requested = try Self.peerString(args, "conversation_id", max: 128, required: false), requested != session {
                 throw AgentCommunicationError.invalid("Grok replies return to the conversation asking")
@@ -604,7 +628,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             if let interface = a2aInterface {
                 let result: AgentA2AWire.Result
                 if request.isStreaming {
-                    let receipt = try response.receipt?.get()
+                    let receipt = response.receipt
                     envelope["interrupted"] = .bool(response.interrupted || receipt?.interrupted != false)
                     guard let receipt, let value = receipt.result else { throw AgentCommunicationError.invalid("No answer arrived. The work may still be running; do not resend automatically.") }
                     result = value
@@ -664,8 +688,7 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                 // shape, when it sent no detail; what is promoted is peer text.
                 let gaveDetail = if case .string(let given)? = row["detail"] {
                     !given.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } else { false }
-                // The effective status: a receipt may say ok and carry original_status failed.
-                let failed = row["original_status"].map { $0 != .string("ok") } ?? !ChatToolOutcome.outputLooksSuccessful(payload)
+                let failed = ChatToolOutcome.ExactResultClass(rawValue: row["execution_result_class"]?.stringValue ?? "")?.isFailure == true
                 var promoted = false
                 if !gaveDetail, failed,
                    case .object(let failure) = ChatToolOutcome.normalizedFailure(.object(["status": .string("failed"), "result": payload])),
@@ -673,7 +696,8 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
                     envelope["detail"] = .string(why)
                     promoted = true
                 }
-                if let status = row["original_status"] { envelope["status"] = status }
+                for key in ["retrieval_result_class", "execution_result_class"] { envelope[key] = row[key] }
+                if !sending { envelope["terminal"] = row["execution_terminal"] }
                 envelope["untrusted_remote_data"] = .bool(promoted || PeerDataTaintDispatcher.containsPeerText(payload))
             }
             // The same proof, on the same terms, for a network peer: the send
@@ -708,7 +732,6 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             return finished(envelope)
         }
     }
-
     /// Moves a saved contact to one of her abilities, or (false) back to its
     /// built-in route; its thread, identity, trust and keys stay as they are.
     private func routeContact(_ name: String, ability: JSONValue, store: AgentPeerStore) throws -> JSONValue {
@@ -732,1308 +755,6 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
             "sent": .bool(false), "detail": .string(id.map { "\(moved.name) is reached through your ability \($0) from now on: agent.message runs it, and it answers with agent.reply. Its conversation, identity and trust are unchanged." }
                 ?? "\(moved.name) is reached through its built-in route again.")])
     }
-
-    // MARK: - Connect by name
-
-    static func peerFailure(_ failure: ProviderFailure.Report, into envelope: inout [String: JSONValue]) {
-        AgentPeerPolicy.peerFailure(failure, into: &envelope)
-    }
-
-    /// Connect-by-name. By the time this runs the person has already pressed
-    /// the button on the card `AgentHostConnection.cardText` wrote — a
-    /// confirm-tier tool body only executes on the approved replay — so this is
-    /// where the entry is actually written and not one step earlier.
-    private func hostConnect(name: String, workspace: String?, executablePath: String?, store: AgentPeerStore, surface: String, workingDirectory: String? = nil, conversationLabel: String? = nil) async throws -> JSONValue {
-        guard conversationLabel == nil || AgentHostDirectory.row(named: name)?.route == .grokBot else {
-            throw AgentCommunicationError.invalid("conversation_label by name applies to Grok Bot only; for a desktop app's chat use transport desktop with app_bundle_id")
-        }
-        // A chat app driven through its own window: nothing is written to its
-        // settings and no key is minted, so saving it needs no card.
-        if let row = AgentHostDirectory.row(named: name), row.route == .desktopChat {
-            guard row.isInstalled, let bundle = row.bundleIDs.first, let endpoint = URL(string: "app://" + bundle) else {
-                return .object(["status": .string("not_supported"), "requested": .string(name), "changed": .bool(false),
-                                "detail": .string("Installation/bundle check failed: \(row.installationCheck)")])
-            }
-            let saved = try store.insertDiscovered(AgentPeerContact(name: row.displayName, endpoint: endpoint, transport: .desktopChat))
-            return .object(["status": .string("configured"), "contact": Self.peerProjection(saved, peers: (try? store.list()) ?? []),
-                "changed": .bool(true), "completed": .bool(false),
-                "detail": .string("Saved. Your first message opens a chat of your own in \(row.displayName) and brings its answer back in the same call.")])
-        }
-        guard AgentHostDirectory.row(named: name)?.acp != nil || AgentHostConnection.personApproved else {
-            throw AgentCommunicationError.invalid("Connecting a named agent requires the person's approval card.")
-        }
-        guard usesCanonicalBody else {
-            throw AgentCommunicationError.invalid("setting another agent up on this Mac is unavailable outside the canonical app")
-        }
-        var proposal: AgentHostConnection.Proposal
-        do { proposal = try AgentHostConnection.propose(name: name, store: store, dataRoot: dataRoot, workspace: workspace, workingDirectory: workingDirectory) }
-        catch let refusal as AgentHostConnection.Refusal {
-            // Unknown or uninstalled: an honest result, nothing changed.
-            return .object(["status": .string("not_supported"),
-                            "requested": .string(name),
-                            "known_agents": .array(AgentHostDirectory.knownNames.map(JSONValue.string)),
-                            "changed": .bool(false),
-                            "detail": .string(refusal.localizedDescription)])
-        }
-        if proposal.row.route == .grokBot {
-            let result = try AgentHostConnection.connect(proposal: proposal, store: store)
-            // The Connect card's "Use this Bot": the exact sidebar name of the
-            // Bot that receives the routine request, chosen before it is sent.
-            if let conversationLabel {
-                guard result.contact.grokConversation == nil else {
-                    throw AgentCommunicationError.invalid("The routine request already went to a Bot, so the Bot cannot be changed here. Disconnect Grok Bot (disconnect true, name peer:\(result.contact.id)) and connect again with conversation_label.")
-                }
-                do {
-                    try store.updateGrok(result.contact.id) { current in
-                        guard current.grokConversation == nil else { throw GrokLinkCredential.Failure.invalid }
-                        current.conversationLabel = conversationLabel
-                    }
-                } catch {
-                    throw AgentCommunicationError.invalid("conversation_label was not saved: it must be the Bot's exact sidebar name on one line, and the routine request must not have gone out yet")
-                }
-            }
-            return .object(["status": .string("grok_setup"), "peer_id": .string(result.contact.id)])
-        }
-        if var existing = proposal.existing, proposal.row.acp == nil {
-            if proposal.row.format == .shellEnvironment {
-                let result = try AgentHostConnection.ensureEnvironment(proposal: proposal, store: store)
-                return Self.environmentSetupResult(proposal: proposal, contact: result.contact, peers: try store.list(),
-                    changed: result.repaired, repaired: result.repaired)
-            }
-            let setup = try AgentHostConnection.connect(proposal: proposal, store: store)
-            existing = setup.contact
-            let repaired = setup.outcome.backupPath != nil
-            let permissionsChanged = setup.permissionsChanged
-            // Connecting again approves the program installed now (the path the
-            // card showed) when the approved one is gone, changed, or no longer
-            // the installed version — updates leave old version folders behind.
-            var programApproved = false
-            if proposal.row.commandLine != nil,
-               let path = proposal.executablePath, path == executablePath, existing.verifiedExecutablePath != path {
-                programApproved = (try? store.approveExecutable(peerID: existing.id, path: path)) == true
-                if programApproved, let saved = try? store.list().first(where: { $0.id == existing.id }) { existing = saved }
-            }
-            var value: [String: JSONValue] = ["status": .string(repaired ? "configured" : "already_configured"), "contact": Self.peerProjection(existing, peers: (try? store.list()) ?? []),
-                            "changed": .bool(repaired || permissionsChanged || programApproved),
-                            "detail": .string(repaired
-                                ? "Repaired \(proposal.row.displayName)'s connector entry and key on the same contact. Restart: \(proposal.row.restartNote)"
-                                : programApproved
-                                ? "Approved the \(proposal.row.displayName) program at \(existing.approvedExecutablePath ?? ""); a Full Mac launch runs exactly this file. Nothing else was changed."
-                                : "\(proposal.row.displayName) already has this app's entry and its own key. Nothing was changed.")]
-            if existing.state != .connected, proposal.row.commandLine?.automaticMCPProbe == false {
-                value["detail"] = .string(Self.directCommandSetupDetail)
-            }
-            if permissionsChanged { value["detail"] = .string("Enabled only this connection's two messaging tools in Antigravity. Send a message to verify the return path; existing Ask/Deny rules and all other permissions are unchanged.") }
-            if existing.state != .connected, proposal.row.commandLine?.automaticMCPProbe == true {
-                let probe = try await hostCommandRun(row: proposal.row, contact: existing,
-                    message: AgentHostDirectory.probeText(appName: Self.appDisplayName),
-                    session: nil, store: store, surface: surface, probe: true)
-                let settled = (try? store.list().first { $0.id == existing.id }) ?? existing
-                let peers = (try? store.list()) ?? []
-                let state = Self.currentPeerState(settled, peers: peers)
-                value["contact"] = Self.peerProjection(settled, peers: peers)
-                value["state"] = .string(state.rawValue)
-                value["status"] = .string(state == .connected ? "connected" : "configured")
-                value["detail"] = .string(state == .connected ? state.detail : Self.probeReason(probe, row: proposal.row))
-                Self.includeConnectionProbe(probe, in: &value)
-            }
-            Self.sayReplaced(setup.outcome, in: &value)
-            return .object(value)
-        }
-        if proposal.row.acp != nil {
-            // The person already answered this named connect in chat (or Full Mac
-            // allows it): a second card here is filed where the chat never shows
-            // it, and the first live drive waited on it unseen for fifteen
-            // minutes. Ask here only when no one has been asked yet.
-            if !AgentHostConnection.personApproved {
-                guard try await AgentACPApproval.connect(proposal, appName: Self.appDisplayName,
-                    inbox: SwiftNativeApprovalInbox(root: dataRoot)) else {
-                    return .object(["status": .string("denied"), "changed": .bool(false), "completed": .bool(false),
-                                    "detail": .string("The person declined this connection; nothing was sent.")])
-                }
-            }
-            // Its --version runs the program, so only once the connect is approved.
-            let version = try await proposal.executable?.reported(environment: proposal.row.installation.launchEnvironment())
-            proposal.executable?.version = version
-        } else if proposal.executablePath != executablePath {
-            throw AgentCommunicationError.invalid("The agent executable changed since the approval card. Ask to connect again; nothing ran or changed.")
-        }
-        let result = try AgentHostConnection.connect(proposal: proposal, store: store)
-        let row = proposal.row
-        if row.format == .shellEnvironment {
-            return Self.environmentSetupResult(proposal: proposal, contact: result.contact, peers: try store.list(), changed: true)
-        }
-        if row.acp != nil {
-            return .object(["status": .string("configured"), "contact": Self.peerProjection(result.contact, peers: (try? store.list()) ?? []),
-                "changed": .bool(true), "completed": .bool(false),
-                "detail": .string("Saved this connection with its own key. Its settings were not changed. Send a message to check that it can answer; setup alone does not prove that.")])
-        }
-        // PROVE THE ROUND TRIP WHERE THAT IS POSSIBLE. The entry is written and
-        // approved; a host with a command line now gets one fixed probe asking
-        // it to answer through that entry. The contact turns connected only
-        // when the inbound request carrying this connection's key actually
-        // arrives — not because the probe returned, and never on a handshake.
-        var probe: JSONValue?
-        if row.commandLine?.automaticMCPProbe == true {
-            probe = try await hostCommandRun(
-                row: row, contact: result.contact,
-                message: AgentHostDirectory.probeText(appName: Self.appDisplayName),
-                session: nil, store: store, surface: surface, probe: true)
-        }
-        let settled = (try? store.list().first { $0.id == result.contact.id }) ?? result.contact
-        // The probe's own reply is the CLI talking back on its command line.
-        // Only an inbound request through the entry proves the entry works, so
-        // the connect state is read back from the contact, never from the run.
-        let state = Self.currentPeerState(settled, peers: (try? store.list()) ?? [])
-        var value: [String: JSONValue] = [
-            "status": .string(state == .connected ? "connected" : "configured"),
-            "contact": Self.peerProjection(settled, peers: (try? store.list()) ?? []),
-            "state": .string(state.rawValue), "state_detail": .string(state == .unavailable ? state.detail : AgentContactHealth.checkIn(settled)?.detail ?? state.detail),
-            "config_path": .string(result.outcome.path),
-            "entry": .string(AgentHostDirectory.entryName),
-            "restart_required": .bool(row.restartRequired),
-            "detail": .string(
-                "Wrote one entry into \(row.displayName)'s own settings and kept a timestamped backup beside the file. "
-                + "This connection has its own key; it is not elevated and nothing was restarted. "
-                + (row.restartRequired
-                   ? "\(row.displayName) may need a restart before it picks the entry up — restart it yourself; nothing of its window is opened or read. "
-                   : "")
-                + (state == .connected
-                   ? "The executable answered a request; the contact carries the scope and time of that proof."
-                   : row.commandLine != nil
-                     ? "The probe did not come back through the entry, so this stays set up: an entry that exists proves only that it was written. " + Self.probeReason(probe, row: row)
-                     : "No inbound message authenticated this contact's key yet. Check agents/recipes/\(row.id).json host.configPath=\(row.expandedConfigPath) with agent.verify. Restart: \(row.restartNote) Then send a message through that host's connector to prove it.")),
-        ]
-        if let probe { Self.includeConnectionProbe(probe, in: &value) }
-        if row.commandLine?.automaticMCPProbe == false, state != .connected {
-            value["detail"] = .string(Self.directCommandSetupDetail)
-        }
-        if let backup = result.outcome.backupPath { value["backup_path"] = .string(backup) }
-        Self.sayReplaced(result.outcome, in: &value)
-        return .object(value)
-    }
-
-    private static let directCommandSetupDetail = "Contact saved with permission for its two MCP messaging tools only. agent.message returns the command's answer; conversation_id continues it. No callback was attempted. The separate MCP reply path stays unverified until an inbound message arrives."
-
-    private static func environmentSetupResult(proposal: AgentHostConnection.Proposal, contact: AgentPeerContact,
-                                               peers: [AgentPeerContact], changed: Bool, repaired: Bool = false) -> JSONValue {
-        let prefix = "set -a && . " + AgentHostDirectory.shellQuoted(proposal.row.expandedConfigPath)
-            + " && set +a && " + AgentHostDirectory.shellQuoted(proposal.command)
-        let message = prefix + " message \"hello\""
-        let reply = prefix + " reply --session '<session_id>' --request '<request_id>'"
-        let state = currentPeerState(contact, peers: peers)
-        return .object(["status": .string(repaired ? "repaired" : changed ? "configured" : "already_configured"),
-            "contact": peerProjection(contact, peers: peers), "changed": .bool(changed),
-            "state": .string(state.rawValue), "state_detail": .string(proposal.row.description),
-            "env_file": .string(proposal.row.expandedConfigPath), "outbound_route": .string("chatgpt-dot-ipc"),
-            "message_command": .string(message), "reply_command": .string(reply), "restart_required": .bool(false),
-            "detail": .string("\(repaired ? "Repaired" : changed ? "Created" : "Already configured") ChatGPT Dot with its own scoped key and private (0600) environment file. No ChatGPT settings were edited. NativeAgent can message Dot in-house after a read-only route check.\nGive Dot this exact command:\n\(message)\nIf the answer is enqueued, use the session_id and request_id returned by that command:\n\(reply)\nKeep the same --session to continue the conversation. Read enqueued answers with reply; do not resend the message.")])
-    }
-
-    private func hostDisconnect(name: String, store: AgentPeerStore) async throws -> JSONValue {
-        guard usesCanonicalBody else {
-            throw AgentCommunicationError.invalid("changing another agent's settings is unavailable outside the canonical app")
-        }
-        // 2026-09-22 WHY: a disconnect of "Grok" matched Grok Bot by name and
-        // revoked its keys. Only the exact peer id from agent_contacts removes.
-        guard let contact = try store.list().first(where: { "peer:" + $0.id == name }) else {
-            return .object(["status": .string("not_configured"), "requested": .string(name),
-                            "changed": .bool(false),
-                            "detail": .string("Disconnect needs the exact peer:<id> from agent_contacts. Nothing was changed.")])
-        }
-        let outcome: AgentHostConfigWriter.Outcome?
-        if contact.transport == .grokBot {
-            try store.updateGrok(contact.id, allowDisconnected: true) { revoked in
-                if revoked.grokBootstrapConfirmed == nil {
-                    revoked.grokBootstrapConfirmed = ["secure-paste", "set up"].contains(revoked.grokSetup ?? "")
-                }
-                try GrokLinkCredential.delete(peer: contact.id)
-                try AgentPeerCredentials.delete(peerID: contact.id)
-                revoked.grokSetup = "disconnected"
-            }
-            return .object(["status": .string("grok_disconnect"), "peer_id": .string(contact.id)])
-        }
-        if contact.transport == .mcpHost {
-            outcome = try AgentHostConnection.disconnect(contact: contact, store: store)
-        } else {
-            try AgentPeerCredentials.delete(peerID: contact.id)
-            _ = try store.remove(contact.id)
-            await AgentACPConnections.shared.revoke(peer: contact.id)
-            outcome = nil
-        }
-        var value: [String: JSONValue] = ["status": .string("disconnected"), "changed": .bool(true),
-            "detail": .string(contact.transport == .mcpHost && outcome != nil
-                ? "Removed exactly this app's entry, revoked that connection's key, and forgot the contact. Everything else in that file is unchanged."
-                : "Removed the contact and its saved key. No other app's settings were changed.")]
-        if AgentPeerStore.hostRowID(contact.endpoint).flatMap({ AgentHostDirectory.row(named: $0)?.format }) == .shellEnvironment {
-            value["detail"] = .string("Deleted this contact's environment file, revoked its scoped key and removed ChatGPT Dot. No ChatGPT settings were changed.")
-        }
-        if let outcome {
-            value["config_path"] = .string(outcome.path)
-            if let backup = outcome.backupPath { value["backup_path"] = .string(backup) }
-        }
-        return .object(value)
-    }
-
-    // MARK: - One verb, one adapter: run the other agent's command line
-
-    /// The installed program, approved in place of the one pinned at connect
-    /// when it moved (Cursor's version folders) or changed (Hermes in place).
-    private static func followACPUpdate(_ contact: AgentPeerContact, installed: String?, environment: [String: String], store: AgentPeerStore) async -> AgentPeerContact {
-        guard let installed else { return contact }
-        let path = URL(fileURLWithPath: installed).standardizedFileURL.resolvingSymlinksInPath().path
-        if let approved = contact.approvedACPExecutable, approved.path == path, approved.isCurrent { return contact }
-        // Its version, for the startup check (startupBlocker) and the contact's version note.
-        let version = try? await AgentACPExecutable.capture(path: path).reported(environment: environment)
-        guard (try? store.approveExecutable(peerID: contact.id, path: path, version: version)) == true else { return contact }
-        return (try? store.list())?.first { $0.id == contact.id } ?? contact
-    }
-
-    /// What a dry run changed in an ACP recipe, said plainly: the two downgrades, or what it recorded.
-    private static func learned(_ old: AgentHostACP, _ new: AgentHostACP) -> String {
-        var said: [String] = []
-        if new.modes != old.modes {
-            said.append(new.modes == [] ? "dropped set_mode — no modes advertised" : "its modes are " + (new.modes ?? []).joined(separator: ", "))
-        }
-        if new.supportsLoad == false, new.supportsResume == false, old.supportsLoad != false || old.supportsResume != false {
-            said.append("no session/load or session/resume — continuing the conversation opens a new ACP session")
-        }
-        return said.isEmpty ? "recorded its protocol version and session support" : said.joined(separator: "; ")
-    }
-
-    /// THE RULE FOR RUNNING ANOTHER AGENT'S PROGRAM, a send's and an explicit
-    /// discover's handshake alike: Full Mac runs it as is; otherwise it runs
-    /// inside the builder sandbox and never reads the bridge directory. Denied
-    /// or locked down, nothing runs and `refused` is the receipt that says why.
-    private func agentProgramLaunch(_ permission: DrivenAgentLaunchPermission) async
-        -> (launch: AgentPeerDiscovery.Launch, refused: [String: JSONValue]) {
-        func refused(_ status: String, _ detail: String, reason: String? = nil) -> (launch: AgentPeerDiscovery.Launch, refused: [String: JSONValue]) {
-            var receipt: [String: JSONValue] = ["status": .string(status), "sent": .bool(false), "completed": .bool(false), "detail": .string(detail)]
-            if let reason { receipt["reason"] = .string(reason) }
-            return (.refused(detail), receipt)
-        }
-        if case .denied(let reason) = permission { return refused("failed", "Nothing was launched: \(reason).", reason: "launch_blocked") }
-        guard permission != .fullMac else { return (.run { executable, arguments in [executable] + arguments }, [:]) }
-        let sandbox = await Self.builderShellSandboxMode(dataRoot: dataRoot)
-        guard sandbox != .lockedDown else { return refused("unavailable", "Running another agent is turned off in the current permission settings.") }
-        // 2026-09-22: the peer never reads the main bridge bearer; its link
-        // uses the url-only descriptor outside this directory.
-        let bridgeDir = Self.sbplEscapeLiteral(AgentHostDirectory.bridgeDiscoveryDirectory(dataRoot: dataRoot)
-            .standardizedFileURL.resolvingSymlinksInPath().path)
-        let profile = (sandbox == .developerFullMac ? Self.builderDeveloperSandboxProfile(dataRoot: dataRoot)
-            : Self.builderSandboxProfile(dataRoot: dataRoot)) + "\n(deny file-read* (subpath \"\(bridgeDir)\"))"
-        return (.run { executable, arguments in ["/usr/bin/sandbox-exec", "-p", profile, executable] + arguments }, [:])
-    }
-
-    private func hostACPRun(contact: AgentPeerContact, message: String, conversationID: String?, store: AgentPeerStore,
-                            surface: String) async throws -> JSONValue {
-        guard usesCanonicalBody, await fullMacToolAccess(surface: surface).fileOpsAllowed else {
-            return builderFullMacRequired(tool: "agent_message")
-        }
-        // The recipe this send runs on, kept for its proof.
-        func missing(_ reason: String, _ detail: String, instruction: String, call: String? = nil, tap: String? = nil) -> JSONValue {
-            .object(["status": .string("unavailable"), "reason": .string(reason), "effects": .string("none"),
-                "sent": .bool(false), "completed": .bool(false), "detail": .string(detail),
-                "remedy": Repair.remedy(owner: contact.name, nextCall: call.flatMap { try? JSONValue.parse(Data($0.utf8)) },
-                    tap: tap, instruction: instruction)])
-        }
-        let recipeCall = ToolFailureError.call("app", ["action": .string("agent.recipe"),
-            "args": .object(contact.recipeID.map { ["host": .string($0)] } ?? [:])])
-        guard let recipe = AgentPeerStore.hostRowID(contact.endpoint).flatMap(AgentRecipeStore.recipe) else {
-            return missing("agent_recipe_missing", "No recipe is available for \(contact.name).",
-                instruction: "Read the recipe problem, then repair the named recipe with agent.recipe_write.", call: recipeCall)
-        }
-        guard let line = recipe.host.acp else {
-            return missing("acp_configuration_missing", "agents/recipes/\(recipe.host.id).json has no host.acp.",
-                instruction: "Read the recipe, then set host.acp to the installed agent's ACP contract with agent.recipe_write.", call: recipeCall)
-        }
-        guard let link = AgentHostDirectory.linkCommandPath() else {
-            return missing("agent_link_helper_missing", "This app's nativeagent-link helper is missing.",
-                instruction: "Report the missing contact helper to the person.", tap: "Tell the person: this copy of NativeAgent is missing nativeagent-link.")
-        }
-        guard let secret = try AgentPeerCredentials.read(peerID: contact.id) else {
-            return missing("agent_credential_missing", "Keychain has no credential for contact peer:\(contact.id).",
-                instruction: "Reconnect this contact to create its missing credential.",
-                call: ToolFailureError.call("app", ["action": .string("agent.connect"), "args": .object(["name": .string("peer:" + contact.id)])]))
-        }
-        let row = recipe.host
-        if let failure = row.installation.failure { throw failure }
-        let handshakeCheck = " Recipe agents/recipes/\(row.id).json host.acp: executable=\(line.executable), arguments=\(line.arguments), protocolVersion=\(line.protocolVersion.map(String.init) ?? "unset"), modes=\(line.modes ?? []); host.searchPaths=\(row.searchPaths). Match fields to the installed agent with agent.recipe_write; agent.verify. Keep permissionMode and sandbox restrictions."
-        let origin = SecurityOriginContext.currentTurn(
-            verifiedSessionId: ChatToolSessionContext.verifiedSessionId, surface: surface)
-        let launchPermission = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
-            .drivenAgentLaunchPermission(tool: "agent_message", origin: origin)
-        // Full Mac follows updates, as drivenAgentLaunch does for command
-        // contacts: the version installed now is approved here, so an update
-        // never needs a reconnect and never runs the old build.
-        let current = launchPermission == .fullMac
-            ? try await Self.followACPUpdate(contact, installed: row.resolveExecutable(line.executable), environment: row.installation.launchEnvironment(), store: store) : contact
-        guard let approved = current.approvedACPExecutable, approved.isCurrent else {
-            await AgentACPConnections.shared.revoke(peer: contact.id)
-            // 2026-09-22 WHY: awaiting a renewal card here held the turn (756s
-            // once) and never changed the reply; reconnecting raises the card.
-            return .object(["status": .string("reconnect_required"), "sent": .bool(false), "completed": .bool(false),
-                "detail": .string("The approved program is missing, changed, or was never bound to this contact. Reconnect this agent to approve it. Nothing ran; the message was not resent.")])
-        }
-        if let blocker = line.startupBlocker(installedVersion: approved.version) {
-            await AgentACPConnections.shared.revoke(peer: contact.id)
-            store.recordUnavailable(peerID: contact.id)
-            return .object(["status": .string("unavailable"), "sent": .bool(false), "completed": .bool(false),
-                "reason": .string("incompatible_sandboxed_acp"), "detail": .string(blocker)])
-        }
-        let executable = approved.path
-        // A repair's dry run (`AgentRecipeStore.dryRun`): a fresh session, its handshake, no prompt.
-        let dryRun = AgentRecipeStore.dryRun
-        let shown = contact.name + (approved.version.map { " " + AgentContactHealth.shortVersion($0) } ?? "")
-        guard let folder = contact.acpWorkingDirectory else {
-            return .object(["status": .string("reconnect_required"), "completed": .bool(false),
-                "detail": .string("Reconnect this agent to approve its starting folder.")])
-        }
-        let directory = URL(fileURLWithPath: folder)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
-                                                attributes: [.posixPermissions: 0o700])
-        let environment: [String: String] = [
-            AgentHostDirectory.peerIDVariable: contact.id,
-            AgentHostDirectory.peerSecretVariable: secret,
-            AgentHostDirectory.bridgeDescriptorVariable: AgentHostDirectory.bridgeDescriptorPath(dataRoot: dataRoot)]
-        let server: JSONValue = .object(["name": .string(AgentHostDirectory.entryName), "command": .string(link),
-            "args": .array([.string("mcp")]),
-            "env": .array(environment.sorted { $0.key < $1.key }.map {
-                .object(["name": .string($0.key), "value": .string($0.value)])
-            })])
-        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        let rule = await agentProgramLaunch(launchPermission)
-        guard case .run(let wrap) = rule.launch else {
-            await AgentACPConnections.shared.revoke(peer: contact.id)
-            return .object(rule.refused)
-        }
-        let command = wrap(executable, line.arguments)
-        let program = command[0], arguments = Array(command.dropFirst())
-        let approvalContext = AgentACPApproval.Context.current
-        let decidedSessionID = ChatToolSessionContext.verifiedSessionId
-        let childEnvironment = try row.installation.launchEnvironment()
-        // The program's identity, not just its path: an in-place update starts a new process.
-        let configuration = try JSONValue.object([
-            "program": .string(program), "executable": .string("\(approved.path)\n\(approved.inode)\n\(approved.digest)"),
-            "arguments": .array(arguments.map(JSONValue.string)),
-            "folder": .string(folder), "server": server,
-            "environment": .object(childEnvironment.mapValues(JSONValue.string))
-        ]).serialize(pretty: false)
-        var lease: AgentACPConnections.Lease?
-        do {
-            let acquired = try await AgentACPConnections.shared.acquire(peer: contact.id, conversation: dryRun ? nil : conversationID, configuration: configuration)
-            lease = acquired
-            let reply = try await acquired.client.turn(
-                executable: program, arguments: arguments,
-                directory: directory, environment: childEnvironment,
-                message: dryRun ? nil : message, peerCredential: secret, mcpServers: [server], line: line,
-                conversationID: dryRun ? nil : conversationID,
-                approvedExecutable: approved, keepAlive: true, requireVerifiedRestore: row.id == "hermes", permission: { request in
-                    // Revocation wins even if an already-open card was approved.
-                    guard try store.list().contains(where: { $0.id == contact.id }) else { return false }
-                    // User 10-01: under Full Mac what an agent she drives asks
-                    // for is her call, as for Codex and Claude; no card. A
-                    // delete stays the person's (irreversible loss).
-                    var kind = "other"
-                    if case .object(let params) = request, case .object(let call)? = params["toolCall"],
-                       case .string(let value)? = call["kind"], !value.isEmpty { kind = value }
-                    let allowed: Bool
-                    let currentPermission = await SwiftNativeSecurityCenter(dataRoot: self.dataRoot)
-                        .drivenAgentLaunchPermission(tool: "agent_message", origin: origin)
-                    if case .denied = currentPermission { return false }
-                    let automaticallyAllowed = kind != "delete" && launchPermission == .fullMac && currentPermission == .fullMac
-                    if automaticallyAllowed {
-                        HarnessDecidedRow.post(requester: contact.name, tool: kind,
-                                                     sessionID: decidedSessionID, dataRoot: self.dataRoot)
-                        allowed = true
-                    } else {
-                        allowed = try await AgentACPApproval.request(request, peer: contact, context: approvalContext,
-                                                                     dataRoot: self.dataRoot, inbox: inbox)
-                    }
-                    let stillConnected = try store.list().contains(where: { $0.id == contact.id })
-                    let permissionAfterResponse = await SwiftNativeSecurityCenter(dataRoot: self.dataRoot)
-                        .drivenAgentLaunchPermission(tool: "agent_message", origin: origin)
-                    if case .denied = permissionAfterResponse { return false }
-                    return allowed && stillConnected && (!automaticallyAllowed || permissionAfterResponse == .fullMac)
-                }, update: Self.acpLiveUpdate(AgentConversationLiveContext.target))
-            // A cancelled turn (agent_cancel's session/cancel) keeps its session:
-            // ACP ends the prompt and the conversation continues from there.
-            guard await AgentACPConnections.shared.finish(acquired, peer: contact.id, conversation: dryRun ? nil : reply.sessionID) else { throw AgentACPClient.Failure.interrupted }
-            lease = nil
-            if dryRun {
-                // What the agent advertised now goes into its recipe.
-                let found = await acquired.client.learned(line)
-                var host = row
-                host.acp = found
-                // A finding that cannot be written proves nothing, and no retry runs on it.
-                var written: AgentRecipeStore.Recipe?
-                if found != line {
-                    do { written = try AgentRecipeStore.learn(recipe, host: host) }
-                    catch {
-                        return Self.peerRedact(.object(["status": .string("failed"), "dry_run": .bool(true), "sent": .bool(false),
-                            "agent": .string("peer:" + contact.id), "transport": .string("acp"),
-                            "detail": .string("Handshake verified for \(shown); recipe save unconfirmed (\(Self.learned(line, found))): \(error).")]), token: secret)
-                    }
-                }
-                let now = written ?? recipe
-                var result: [String: JSONValue] = ["status": .string(written == nil ? "passed" : "repaired"), "dry_run": .bool(true), "sent": .bool(false),
-                    "agent": .string("peer:" + contact.id), "transport": .string("acp"), "recipe_version": .int(Int64(now.recipeVersion)),
-                    "detail": .string("\(shown) answered its handshake with no prompt sent.")]
-                if let written { result["healed"] = .string("\(shown): \(Self.learned(line, found)) — recipe updated to v\(written.recipeVersion)") }
-                return .object(result)
-            }
-            store.recordProof(peerID: contact.id, inbound: reply.completed && !reply.text.isEmpty, outbound: true)
-            // A prompt that went and ended without an answer is the agent's turn,
-            // not a failed send path: only a send that never went marks it unavailable.
-            if reply.completed && !reply.text.isEmpty {
-                store.recordRoundTrip(peerID: contact.id, executable: approved.path,
-                    version: approved.version, workspace: directory.path, recipe: recipe)
-            }
-            var result: [String: JSONValue] = ["status": .string(reply.completed ? "replied" : reply.stopReason),
-                "agent": .string("peer:" + contact.id), "transport": .string("acp"),
-                "conversation_id": .string(reply.sessionID), "continued": .bool(reply.continued),
-                "sent": .bool(true), "completed": .bool(reply.completed), "reply": .string(reply.text),
-                "untrusted_remote_data": .bool(!reply.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)]
-            if let detail = reply.detail { result["detail"] = .string(detail) }
-            return Self.peerRedact(.object(result), token: secret)
-        } catch AgentACPClient.Failure.executableChanged {
-            if let lease { await AgentACPConnections.shared.finish(lease, peer: contact.id, conversation: nil) }
-            store.recordUnavailable(peerID: contact.id)
-            return .object(["status": .string("reconnect_required"), "sent": .bool(false), "completed": .bool(false),
-                "detail": .string("The program changed before launch. Reconnect this agent to approve it. Nothing ran; the message was not resent.")])
-        } catch {
-            // The session it already has, so an uncertain turn can be resumed, not orphaned.
-            let opened = await lease?.client.currentSessionID
-            let delivered = await lease?.client.delivered == true
-            let reported = await lease?.client.learned(line).protocolVersion
-            let session = conversationID ?? opened
-            if let lease { await AgentACPConnections.shared.finish(lease, peer: contact.id, conversation: nil) }
-            if let failure = error as? AgentACPClient.Failure, failure == .sessionUnavailable || failure == .busy {
-                return .object(["status": .string(failure == .busy ? "busy" : "session_unavailable"), "sent": .bool(false), "completed": .bool(false), "detail": .string(failure.localizedDescription)])
-            }
-            // Nothing was sent: the agent and its recipe disagree (a repair acts on it), or a dry run failed.
-            if let refused = error as? AgentACPClient.Mismatch {
-                store.recordUnavailable(peerID: contact.id)
-                var result: [String: JSONValue] = ["status": .string(dryRun ? "failed" : "unavailable"), "agent": .string("peer:" + contact.id),
-                    "transport": .string("acp"), "sent": .bool(false), "completed": .bool(false), "reason": .string("protocol_mismatch"),
-                    "method": .string(refused.method), "detail": .string("\(shown): \(refused.method) — \(refused.detail). Nothing was sent." + handshakeCheck)]
-                if let code = refused.code { result["code"] = .int(code) }
-                if let reported { result["protocol_version"] = .int(Int64(reported)) }
-                if let version = approved.version { result["program_version"] = .string(version) }
-                if dryRun { result["dry_run"] = .bool(true) }
-                // The agent's own error text never carries this connection's key.
-                return Self.peerRedact(.object(result), token: secret)
-            }
-            // Cut off mid-reply (her app quitting, a cancel) says nothing about
-            // whether the agent can start; marking it unavailable hid a working
-            // Cursor after a restart (User 09-27).
-            // Our own quit (closeAll) cut it off when the error says so; a peer's own EOF stays unknown.
-            let quit = (error as? AgentACPClient.Failure) == .appQuit && !Task.isCancelled
-            let cutOff = (error as? AgentACPClient.Failure) == .interrupted || quit || error is CancellationError || Task.isCancelled
-            // After the prompt went (a post-delivery timeout, an unreadable answer)
-            // the send path did not fail: the reply stalled, and health says so.
-            if !cutOff, !delivered { store.recordUnavailable(peerID: contact.id) }
-            if var result = AgentACPClient.startupTimeoutReceipt(error) {
-                result["agent"] = .string("peer:" + contact.id)
-                result["transport"] = .string("acp")
-                let detail: String = if case .string(let text)? = result["detail"] { text } else { error.localizedDescription }
-                result["detail"] = .string(detail + handshakeCheck)
-                if dryRun { result["status"] = .string("failed"); result["dry_run"] = .bool(true) }
-                return .object(result)
-            }
-            if dryRun {
-                return Self.peerRedact(.object(["status": .string("failed"), "dry_run": .bool(true), "sent": .bool(false), "agent": .string("peer:" + contact.id),
-                    "transport": .string("acp"), "detail": .string("\(shown) did not finish its handshake: "
-                        + ((error as? AgentACPClient.Failure)?.localizedDescription ?? error.localizedDescription) + handshakeCheck)]), token: secret)
-            }
-            if let failure = ProviderFailure.report(error, work: .outcomeUnknown) {
-                var result: [String: JSONValue] = ["agent": .string("peer:" + contact.id), "transport": .string("acp")]
-                Self.peerFailure(failure, into: &result)
-                if let session { result["conversation_id"] = .string(session) }
-                return Self.peerRedact(.object(result), token: secret)
-            }
-            // Terminal: the call is over, bounded by the client's own timeout, and
-            // nothing more arrives on it, so the thread does not wait on it.
-            var result: [String: JSONValue] = ["status": .string(Task.isCancelled ? "cancelled" : quit ? "interrupted" : "outcome_unknown"),
-                "agent": .string("peer:" + contact.id), "transport": .string("acp"), "completed": .bool(false), "terminal": .bool(true),
-                "detail": .string(Task.isCancelled ? "The conversation was stopped." : quit ? AgentConversationSession.restartDetail(contact.name) :
-                    (error as? AgentACPClient.Failure)?.localizedDescription ?? "The conversation did not finish. Do not resend automatically.")]
-            if let session { result["conversation_id"] = .string(session) }
-            return .object(result)
-        }
-    }
-
-    /// ACP `session/update` carries scrubbed reply snapshots, tool calls and
-    /// plans as progress notes, and the rest as activity.
-    static func acpLiveUpdate(_ target: AgentConversationLiveTarget?) -> @Sendable (JSONValue) async -> Void {
-        guard let target else { return { _ in } }
-        return { event in
-            let hub = AgentConversationLiveHub.shared
-            guard case .object(let update) = event, case .string(let kind)? = update["sessionUpdate"] else { return }
-            switch kind {
-            case "agent_message_chunk":
-                if case .object(let content)? = update["content"], content["type"] == .string("text"),
-                   case .string(let text)? = content["text"] { await hub.text(target, replace: text) }
-            case "tool_call":
-                if case .string(let title)? = update["title"] { await hub.note(target, title) } else { await hub.activity(target) }
-            case "plan":
-                var steps: [[String: JSONValue]] = []
-                if case .array(let entries)? = update["entries"] {
-                    steps = entries.compactMap { if case .object(let step) = $0 { step } else { nil } }
-                }
-                let current = steps.first { $0["status"] == .string("in_progress") } ?? steps.first { $0["status"] == .string("pending") }
-                if case .string(let step)? = current?["content"] { await hub.note(target, "Plan: " + step) } else { await hub.activity(target) }
-            default: await hub.activity(target)
-            }
-        }
-    }
-
-    /// agent_cancel's lane owner: the other side's own stop for a reply in
-    /// flight. "stopping"/"stopped" when asked; "cannot_stop" when the route has
-    /// none; "not_here" when only this app's own in-flight send could be
-    /// stopped, which the conversation layer does by cancelling that send.
-    private func agentCancel(_ args: [String: JSONValue], store: AgentPeerStore) async throws -> JSONValue {
-        try Self.peerKeys(args, allowed: ["agent", "conversation_id", "message_id", "task_id"])
-        let agent = try Self.peerString(args, "agent", max: 64)!
-        func answer(_ status: String, _ detail: String = "") -> JSONValue {
-            .object(["status": .string(status), "agent": .string(agent), "detail": .string(detail)])
-        }
-        if let door = AgentConversationDelivery.door(for: agent, dataRoot: dataRoot, bridgeConfigRoot: agentBridgeConfigRoot), !door.liveReader {
-            guard let message = try Self.peerString(args, "message_id", max: 160, required: false) else {
-                return answer("cannot_stop", "No accepted message is recorded for this reply, so there is nothing exact to stop.")
-            }
-            return await builtInStop(agent: door.handle, messageID: message)
-        }
-        guard agent.hasPrefix("peer:"), let peer = try store.list().first(where: { "peer:" + $0.id == agent }) else {
-            return answer("not_here")
-        }
-        // Only this app's own run of her ability can be stopped.
-        if peer.ability != nil { return answer("not_here") }
-        switch peer.transport {
-        case .acp:
-            let conversation = try Self.peerString(args, "conversation_id", max: 1024, required: false)
-            guard await AgentACPConnections.shared.cancelTurn(peer: peer.id, conversation: conversation) else { return answer("not_here") }
-            return answer("stopping", "Asked \(peer.name) to stop (ACP session/cancel). Its turn ends as cancelled and the session stays open for your next message.")
-        case .a2a:
-            guard let task = try Self.peerString(args, "task_id", max: 512, required: false) else { return answer("not_here") }
-            return await a2aCancel(peer: peer, task: task, agent: agent)
-        case .desktop, .desktopChat, .grokBot:
-            return answer("cannot_stop", "\(peer.name) has no stop from here; its answer still arrives.")
-        default:
-            // A command-line host or another NativeAgent: only the send this app is running.
-            return answer("not_here")
-        }
-    }
-
-    /// A2A CancelTask on the exact task the conversation is waiting on.
-    private func a2aCancel(peer: AgentPeerContact, task: String, agent: String) async -> JSONValue {
-        var token: String?
-        func answer(_ status: String, _ detail: String, task result: JSONValue? = nil, peerAuthored: Bool = false) -> JSONValue {
-            var fields: [String: JSONValue] = ["status": .string(status), "agent": .string(agent), "detail": .string(detail), "task_id": .string(task)]
-            if let result { fields["task"] = result }
-            if peerAuthored { fields["untrusted_remote_data"] = .bool(true) }
-            return Self.peerRedact(.object(fields), token: token)
-        }
-        do {
-            guard peer.credentialKey == nil || usesCanonicalBody else { return answer("cannot_stop", "This contact's credential is unavailable here, so no stop was sent.") }
-            token = peer.credentialKey == nil ? nil : try AgentPeerCredentials.read(peerID: peer.id)
-            let card = try await AgentPeerHTTP.get(peer.endpoint, bearerToken: token)
-            guard (200..<300).contains(card.statusCode), let json = card.json else {
-                return answer("cannot_stop", "\(peer.name)'s agent card did not load (HTTP \(card.statusCode)), so no stop was sent; its reply may still arrive.")
-            }
-            let selected = try await AgentPeerDiscovery.authenticatedInterface(card: json, cardURL: peer.endpoint, bearerToken: token).0
-            try Self.peerAuthorizeInterface(selected, cardURL: peer.endpoint, hasCredential: token != nil)
-            let request = try AgentA2AWire.cancelRequest(taskID: task, interface: selected)
-            let response = try await AgentPeerHTTP.send(request, bearerToken: token)
-            guard (200..<300).contains(response.statusCode), let payload = response.json else {
-                return answer("cannot_stop", "\(peer.name) did not accept the stop (HTTP \(response.statusCode)); its reply may still arrive.")
-            }
-            let result = try AgentA2AWire.normalizeResponse(payload, interface: selected,
-                                                            expectedRequestID: request.requestID, expectedTaskID: task)
-            let summary: JSONValue = .object(["state": .string(result.state), "terminal": .bool(result.terminal)])
-            if result.state == "canceled" { return answer("stopped", "\(peer.name) cancelled the task.", task: summary) }
-            if result.terminal { return answer("cannot_stop", "The task had already ended (\(result.state)) before the stop.", task: summary) }
-            return answer("stopping", "\(peer.name) accepted the stop; the task is \(result.state) and settles when it ends.", task: summary)
-        } catch let failure as ToolFailureError {
-            var receipt = ChatToolOutcome.failure(error: failure, tool: "agent_cancel")
-            if case .object(var fields) = receipt {
-                fields["status"] = .string("cannot_stop")
-                fields["agent"] = .string(agent); fields["task_id"] = .string(task)
-                fields["stop_sent"] = .bool(false); fields["reply_may_arrive"] = .bool(true)
-                receipt = .object(fields)
-            }
-            return Self.peerRedact(receipt, token: token)
-        } catch AgentA2AWire.WireError.remote(let code, let message) {
-            return answer("cannot_stop", "\(peer.name) refused the stop (\(code): \(message)); its reply may still arrive.", peerAuthored: true)
-        } catch {
-            return answer("cannot_stop", "The stop could not be sent: \(error.localizedDescription). The reply may still arrive.", peerAuthored: true)
-        }
-    }
-
-    /// Codex: app-server `turn/interrupt` on the exact turn. OMP: its wake run
-    /// is stopped, so the runner itself records how
-    /// it ended and the answer path settles as usual.
-    private func builtInStop(agent: String, messageID: String) async -> JSONValue {
-        @Sendable func answer(_ status: String, _ detail: String) -> JSONValue {
-            .object(["status": .string(status), "agent": .string(agent), "message_id": .string(messageID), "detail": .string(detail)])
-        }
-        let name = agent == "omp" ? "OMP" : "Codex"
-        if agent == "codex" {
-            let job = DelegationStatusProjector(configRoot: agentBridgeConfigRoot, dataRoot: dataRoot)
-                .readSnapshot(now: Date(), limit: 1, offset: 0, agent: "codex", messageID: messageID).jobs.first
-            if job?.stallBasis == .terminal { return answer("cannot_stop", "Codex already finished that turn; its answer is on the way.") }
-            guard let thread = job?.recordedThreadID, let turn = job?.recordedTurnID,
-                  let helper = AgentBridgeRuntime.codexHelperURL(dataRoot: dataRoot),
-                  let input = try? JSONValue.object(["interrupt": .bool(true), "threadId": .string(thread), "turnId": .string(turn)]).serializedData(pretty: false) else {
-                return answer("cannot_stop", "Codex has not started a turn for it yet (it is queued behind other Codex work), so there is no turn to interrupt.")
-            }
-            let cwd = Self.builderSourceRepoRoot(dataRoot: dataRoot) ?? NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
-            let receipt = await runAgentWakeupHelper(helper: helper, inputData: input, cwd: cwd, cli: "codex", variable: "CODEX_BIN",
-                                                     timeout: Self.codexWakeupHelperTimeoutSeconds())
-            guard case .object(let fields) = receipt, fields["status"] == .string("interrupted") else {
-                let why: String = if case .object(let fields) = receipt, case .string(let text)? = fields["error"] ?? fields["reason"] { text } else { "no receipt" }
-                return answer("cannot_stop", "Codex did not take the interrupt (\(why)); its reply may still arrive.")
-            }
-            return answer("stopping", "Asked Codex to interrupt its turn (turn/interrupt); the conversation settles when the turn ends.")
-        }
-        let directory = Self.bridgeConfigDirectory(named: "omp-bridge", configRootOverride: agentBridgeConfigRoot)
-        let safe = String(messageID.map { $0.isLetter && $0.isASCII || $0.isNumber && $0.isASCII || "._-".contains($0) ? $0 : "_" }.prefix(160))
-        guard let data = try? Data(contentsOf: directory.appendingPathComponent("wake-jobs/" + safe + ".json")),
-              case .object(let job)? = try? JSONValue.parse(data) else {
-            return answer("cannot_stop", "No wake run is recorded for that message, so there is nothing to interrupt.")
-        }
-        let state: String = if case .string(let value)? = job["state"] { value } else { "" }
-        guard state == "running" else {
-            return answer("cannot_stop", ["settled", "delivering"].contains(state)
-                ? "\(name) already finished that run; its answer is on the way."
-                : "\(name) has not started that run yet (\(state.isEmpty ? "unknown" : state)), so there is nothing to interrupt.")
-        }
-        // The runner recorded its own start identity (wake_worker_common's
-        // processStartIdentity: ps lstart+command, hashed). A reused pid, even
-        // another run of the same helper, never matches it.
-        guard case .int(let number)? = job["runnerPid"], let pid = Int32(exactly: number), pid > 1,
-              case .string(let recorded)? = job["runnerIdentity"], !recorded.isEmpty else {
-            return answer("cannot_stop", "\(name)'s run did not record its process identity, so it is not safe to interrupt from here.")
-        }
-        guard AgentBridgeRuntime.processStartIdentity(pid) == recorded else {
-            return answer("cannot_stop", "\(name)'s run is no longer live on this Mac, so there is nothing to interrupt.")
-        }
-        // Only the run's own children (the agent CLI), never the runner: it
-        // records the interrupted exit and settles the job like any other end.
-        let tree = ProcessTreeReaper.snapshot(rootPID: pid)
-        let children = ProcessTreeSnapshot(rootPID: pid, rootIdentity: nil, descendants: tree.descendants)
-        guard !children.descendants.isEmpty else {
-            return answer("cannot_stop", "\(name)'s run has no agent process to interrupt right now.")
-        }
-        return await settle {
-            ProcessTreeReaper.quiesceAndKill(children)
-            return answer("stopped", "Stopped \(name)'s agent process. Its runner retains any output and records the run's end.")
-        }
-    }
-
-    /// A MESSAGE GOES OUT AND A MESSAGE COMES BACK, IN THE SAME CALL.
-    ///
-    /// The only command-line adapter there is. It reads the row — executable
-    /// name, argument template, whether the CLI documents a resume flag — and
-    /// nothing here branches on which agent that row describes. The run is an
-    /// ordinary command on this Mac and takes the ordinary path for one: the
-    /// same Full Mac file_ops gate as `shell`, the same sandbox-profiled
-    /// runner, the same audit receipt. No new authority, and the person's
-    /// trust posture decides exactly as it does for any shell command.
-    ///
-    /// Its working directory is a fresh empty directory of its own, stdin is
-    /// closed so nothing can block waiting for a person, and the reply is the
-    /// CLI's own output — untrusted remote data, marked so, like every other
-    /// transport here.
-    private func hostCommandRun(
-        row: AgentHostRow, contact: AgentPeerContact, message: String, session: String?,
-        resuming: Bool = false, store: AgentPeerStore, surface: String, probe: Bool = false
-    ) async throws -> JSONValue {
-        guard let line = row.commandLine else { throw AgentCommunicationError.invalid("\(row.displayName) has no command line to run") }
-        if let failure = row.installation.failure { throw failure }
-        // The recipe this send runs on, kept for its proof.
-        let recipe = AgentRecipeStore.recipe(row.id)
-        if AgentRecipeStore.dryRun {
-            var result: [String: JSONValue] = ["status": .string("failed"), "dry_run": .bool(true),
-                "agent": .string("peer:" + contact.id), "transport": .string("mcpHost"), "host": .string(row.id),
-                "sent": .bool(false), "ran": .bool(false), "completed": .bool(false),
-                "command": .string(line.executable),
-                "arguments": .array((resuming ? line.continuation : line.arguments).map(JSONValue.string)),
-                "checked": .array([.string("commandLine.executable"), .string("commandLine.arguments")])]
-            guard let executable = row.resolveExecutable(line.executable) else {
-                result["detail"] = .string("\(row.displayName)'s readiness check failed: \(line.executable) could not be resolved to a runnable file; no prompt was sent.")
-                return .object(result)
-            }
-            result["executable"] = .string(executable)
-            if line.minimumVersion != nil, let tooOld = line.versionFailure(program: line.executable,
-                reported: try? await AgentACPExecutable.capture(path: executable).reported(environment: row.installation.launchEnvironment())) {
-                result["detail"] = .string("\(row.displayName)'s readiness check failed: \(tooOld)")
-                return .object(result)
-            }
-            guard let recipe else {
-                result["detail"] = .string("\(row.displayName)'s recipe is unavailable; no prompt was sent.")
-                return .object(result)
-            }
-            do {
-                let learned = try (recipe.host == row ? recipe : AgentRecipeStore.learn(recipe, host: row))
-                result["recipe_version"] = .int(Int64(learned.recipeVersion))
-                result["status"] = .string("passed")
-                result["detail"] = .string("\(row.displayName) answered its readiness check: \(executable) is runnable; no prompt was sent.")
-            } catch {
-                result["detail"] = .string("\(row.displayName)'s readiness check could not be recorded in its recipe: \(error). No prompt was sent.")
-            }
-            return .object(result)
-        }
-        let access = await fullMacToolAccess(surface: surface)
-        guard access.fileOpsAllowed else {
-            let refusal = builderFullMacRequired(tool: "agent_message")
-            var value: [String: JSONValue] = [:]
-            if case .object(let fields) = refusal { value = fields }
-            if value["status"] == .string("failed") {
-                value["status"] = .string("blocked_by_trust")
-            }
-            let mode = access.permissionLevel == "balanced" ? "Work mode" : "the current trust mode"
-            value["reason"] = .string("trust_center_full_mac_required")
-            value["sent"] = .bool(false)
-            value["ran"] = .bool(false)
-            value["completed"] = .bool(false)
-            value["detail"] = .string(probe
-                ? "The entry is written, but I couldn't check the link in \(mode) because running that agent here needs Builder or Full Mac; switch in Trust or the composer and say connect again, or use the connection from the other agent's side."
-                : "I didn't send the message in \(mode) because running that agent here needs Builder or Full Mac; switch in Trust or the composer and ask me to send it again, or use the connection from the other agent's side.")
-            if probe {
-                value["connection_check"] = .bool(true)
-                value["connection_reply_received"] = .bool(false)
-            }
-            return .object(value)
-        }
-        let agent = "peer:" + contact.id
-        func honest(_ status: String, _ detail: String) -> JSONValue {
-            store.recordUnavailable(peerID: contact.id)
-            let state = Self.currentPeerState(contact, peers: (try? store.list()) ?? [])
-            return .object(["status": .string(status), "agent": .string(agent), "transport": .string("mcpHost"),
-                     "host": .string(row.id), "state": .string(state.rawValue),
-                     "state_detail": .string(state.detail),
-                     "sent": .bool(false), "completed": .bool(false), "detail": .string(detail)])
-        }
-        // Every command route reconciles its binding, including those without permission flags.
-        let launch = await Self.drivenAgentLaunch(tool: "agent_message", surface: surface, contact: contact,
-                                                  name: row.displayName, dataRoot: dataRoot)
-        guard let executable = launch.executable else { return launch.deniedResult! }
-        let environment = try row.installation.launchEnvironment()
-        if line.minimumVersion != nil {
-            // The approved program's receipt keeps the version it reported, read
-            // once when it was approved; the launch re-verifies those exact bytes.
-            var reported = (try? store.list())?.first { $0.id == contact.id }?.acpExecutable.flatMap { $0.path == executable ? $0.version : nil }
-            if reported == nil {
-                reported = try? await AgentACPExecutable.capture(path: executable).reported(environment: row.installation.launchEnvironment())
-                if let reported { _ = try? store.approveExecutable(peerID: contact.id, path: executable, version: reported) }
-            }
-            if let tooOld = line.versionFailure(program: line.executable, reported: reported) { return honest("unavailable", tooOld) }
-        }
-        let launchArguments = launch.arguments
-        // ONE directory per agent, inside the workspace the command runner
-        // already confines writes to. It was a fresh one per message until the
-        // Codex drive: Codex records every directory it runs in as a trusted
-        // project in its own settings, so each message left a line behind there.
-        let workingDirectory = contact.hostWorkspace.map { URL(fileURLWithPath: $0) }
-            ?? Self.builderWorkspaceRoot(dataRoot: dataRoot).appendingPathComponent("agent-bridge-runs/" + row.id)
-        guard (try? FileManager.default.createDirectory(at: workingDirectory, withIntermediateDirectories: true,
-                                                        attributes: [.posixPermissions: 0o700])) != nil else {
-            return honest("unavailable", "A working directory for the run could not be created. Nothing ran.")
-        }
-        // The reply file is this run's alone, so two messages at once never read each other's.
-        let replyDirectory = workingDirectory.appendingPathComponent(UUID().uuidString.lowercased())
-        try? FileManager.default.createDirectory(at: replyDirectory, withIntermediateDirectories: true,
-                                                 attributes: [.posixPermissions: 0o700])
-        let replyFile = line.replyFileName.map { replyDirectory.appendingPathComponent($0).path }
-        let probeNonce: String?
-        do {
-            probeNonce = probe ? try store.beginConnectionProbe(peerID: contact.id, timeout: TimeInterval(line.timeoutSeconds)) : nil
-        } catch {
-            return honest("unavailable", "The connection check could not be recorded. Nothing ran.")
-        }
-        let outgoing = probeNonce.map { AgentHostDirectory.probeText(appName: Self.appDisplayName, nonce: $0) } ?? message
-        let argv = launchArguments + line.argv(message: outgoing, session: session, resuming: resuming,
-                                               replyFilePath: replyFile) {
-            // Named on its side the way she knows it, so the person recognizes it there.
-            let label = AgentConversationLiveContext.target?.recordID.flatMap { id in
-                (try? AgentConversationStore(dataRoot: dataRoot).records())?.first { $0.id == id }?.label
-            } ?? "Main"
-            let her = PersonaCompiler.agentDisplayName(dataRoot: dataRoot)
-            return (["NativeAgent"] + (her == "NativeAgent" ? [] : [her]) + [label]).joined(separator: " · ")
-        }
-        // Retain bounded protocol output before the runner clips stdout for
-        // display; streaming events also reach the live view as they arrive.
-        let (lines, linesIn) = AsyncStream<String>.makeStream()
-        let streamed: Task<String, Never>? = line.stream != nil || line.jsonResultReply ? Task { [line] in
-            let live = AgentConversationLiveContext.target
-            let hub = AgentConversationLiveHub.shared
-            var whole = "", active = false, overflow = false
-            var retainedBytes = 0
-            for await text in lines {
-                let parsed = line.streamEvent(line: text)
-                if parsed.retain, !overflow {
-                    retainedBytes += text.utf8.count + 1
-                    if retainedBytes <= 16 * 1024 * 1024 { whole += text + "\n" }
-                    else { overflow = true; whole = "" }
-                }
-                guard let live, let event = parsed.event else { continue }
-                if !active { await hub.activity(live); active = true }
-                switch event {
-                case .text(let chunk, whole: true): await hub.text(live, replace: chunk)
-                case .text(let chunk, whole: false): await hub.text(live, delta: chunk)
-                case .note(let note): await hub.note(live, note)
-                case .activity: break
-                }
-            }
-            return whole
-        } : nil
-        // The runner closes stdin. Pass the approved executable and argv directly.
-        // The stdout handler's parameter and @Sendable-ness come from this
-        // annotation, not inference through the nil ternary branch; the yield
-        // result is intentionally discarded.
-        let onStdoutLine: (@Sendable (String) -> Void)? = streamed == nil ? nil : { @Sendable in _ = linesIn.yield($0) }
-        let outcome = await Self.runShellLikeProcess(
-            toolName: "agent_message", executable: executable,
-            args: argv,
-            cwd: workingDirectory.path, timeoutSeconds: line.timeoutSeconds,
-            sourcePayloadForAudit: probe ? AgentHostDirectory.probeToken : nil, dataRoot: dataRoot,
-            // This app's own environment holds provider keys and the bridge
-            // token; another agent's command gets a scrubbed one instead. And
-            // nothing it backgrounds may outlive the run or its directory.
-            environmentOverride: environment,
-            closeStandardInput: true,
-            reapDescendantsOnExit: true,
-            onStdoutLine: onStdoutLine)
-        return await settle {
-            defer {
-                try? FileManager.default.removeItem(at: replyDirectory)
-                if let probeNonce {
-                    _ = store.finishConnectionProbe(peerID: contact.id, nonce: probeNonce, ran: false,
-                        workspace: workingDirectory.path)
-                }
-            }
-            linesIn.finish()
-            let streamedStdout = await streamed?.value
-            guard case .object(var envelope) = outcome else { return outcome }
-            if let streamedStdout { envelope["stdout"] = .string(streamedStdout) }
-            var reply = ""
-            var resultFailure: String?
-            var truncated = false
-            if line.jsonResultReply, case .string(let text)? = envelope["stdout"] {
-                let parsed = line.resultReply(stdout: text)
-                resultFailure = parsed.failure
-                let response = parsed.reply ?? ""
-                truncated = response.utf8.count > 64 * 1024
-                reply = String(decoding: response.utf8.prefix(64 * 1024), as: UTF8.self)
-            } else if let replyFile, let handle = FileHandle(forReadingAtPath: replyFile) {
-                defer { try? handle.close() }
-                // Bounded at the READ, not after it: a reply file is written by
-                // another program and its size is that program's choice. One byte
-                // past the cap is how we know to say so.
-                let data = (try? handle.read(upToCount: 64 * 1024 + 1)) ?? Data()
-                truncated = data.count > 64 * 1024
-                reply = String(decoding: data.prefix(64 * 1024), as: UTF8.self)
-            } else if !line.capturesThreadID, case .string(let text)? = envelope["stdout"] {
-                reply = text
-                truncated = envelope["_truncated"] == .bool(true)
-            }
-            reply = reply.trimmingCharacters(in: .whitespacesAndNewlines)
-            let ran = envelope["status"] == .string("completed")
-            // THE ROUND TRIP, recorded where it happened: a message left and a
-            // reply came back. Nothing short of that promotes the contact — and
-            // the CONNECT PROBE is deliberately not counted as a reply arriving.
-            // What the probe asks to be proven is the ENTRY, so only the inbound
-            // request carrying this connection's key may promote it; the probe's
-            // own stdout is the command line talking, which proves nothing about
-            // the entry that was just written.
-            let replied = ran && !reply.isEmpty
-            // A run she stopped says nothing about whether the contact works.
-            let arrived = envelope["status"] == .string("stopped") ? false : Self.recordHostConnectionOutcome(store: store, contact: contact, ran: ran,
-                replied: replied, probe: probe, probeNonce: probeNonce,
-                executable: executable, workspace: workingDirectory.path, recipe: recipe)
-            let settled = (try? store.list().first { $0.id == contact.id }) ?? contact
-            let state = Self.currentPeerState(settled, peers: (try? store.list()) ?? [])
-            var result: [String: JSONValue] = [
-                "status": .string(replied ? "replied" : "outcome_unknown"),
-                "agent": .string(agent), "transport": .string("mcpHost"), "host": .string(row.id),
-                "state": .string(state.rawValue), "state_detail": .string(state.detail),
-                "sent": .bool(ran), "completed": .bool(replied),
-                "reply": .string(reply), "reply_truncated": .bool(truncated),
-                "untrusted_remote_data": .bool(!reply.isEmpty),
-                "exit_code": envelope["exit_code"] ?? .null, "timed_out": envelope["timed_out"] ?? .bool(false),
-                // The process has exited (or hit the recipe's timeout): nothing more arrives on this call.
-                "terminal": .bool(true),
-            ]
-            if line.capturesThreadID {
-                let stdout: String
-                if case .string(let text)? = envelope["stdout"] { stdout = text } else { stdout = "" }
-                if let confirmed = line.capturedThreadID(stdout: stdout, expected: resuming ? session : nil) {
-                    result["conversation_id"] = .string(confirmed)
-                    result["continuation_available"] = .bool(true)
-                } else {
-                    result["continuation_available"] = .bool(false)
-                    result["continuation_detail"] = .string("The command did not confirm the expected conversation identity. Its reply is retained, but continuity is unverified. Do not resend automatically or silently start a replacement conversation.")
-                }
-            } else if let session { result["conversation_id"] = .string(session) }
-            if probe {
-                // A handshake proves the path; its words are not for her. Without them the
-                // turn is not carrying another agent's text, so the person's own next
-                // request in the same turn is still theirs (09-19 drive: "Codex asked for
-                // this, not you" on a message the person had asked for).
-                result["reply"] = nil
-                result["reply_truncated"] = nil
-                result["untrusted_remote_data"] = nil
-                result["connection_check"] = .bool(true)
-                result["connection_reply_received"] = .bool(arrived)
-                if !arrived {
-                    result["detail"] = .string("No new answer arrived through the connection. The other app may need to restart before it can reply here.")
-                }
-            }
-            if envelope["status"] == .string("stopped") {
-                // agent_cancel: interrupted at her request, not a failure of the contact.
-                result["status"] = .string("stopped")
-                result["sent"] = envelope["ran"] ?? .bool(false)
-                result["detail"] = .string("Stopped at your request: \(row.displayName)'s run was interrupted. Anything it said before stopping is kept above; nothing was resent.")
-            } else if !replied {
-                if let failure = resultFailure {
-                    // The normalized refusal repeats its cause; keep even JSON-escaped diagnostics within the receipt's 96 KiB limit.
-                    let diagnostic = String(decoding: failure.utf8.prefix(3 * 1024), as: UTF8.self)
-                        + (failure.utf8.count > 3 * 1024 ? "\n[diagnostic truncated]" : "")
-                    let refusal = ToolFailureError("\(row.displayName)'s command failed: \(diagnostic). Do not resend automatically.",
-                        effects: .unknown, owner: "\(row.displayName) command line",
-                        tap: "Terminal → run `\(line.executable)` once; sign in if requested and resolve its reported error before continuing this conversation")
-                    if case .object(let fields) = ChatToolOutcome.failure(error: refusal) {
-                        result.merge(fields) { _, failure in failure }
-                    }
-                    result["detail"] = .string(ChatSecretRedactor.redactText(refusal.message))
-                } else {
-                    result["detail"] = .string(
-                        "\(row.displayName)'s command line did not come back with a reply, so nothing is proven. "
-                        + "Its own output is in stderr. Do not resend automatically.")
-                    if case .string(let text)? = envelope["stderr"] { result["stderr"] = .string(text) }
-                    if case .string(let text)? = envelope["stderr"] {
-                        let cause = ProviderFailure.wire(text, fallback: .malformedResponse)
-                        if cause != .malformedResponse {
-                            Self.peerFailure(.init(cause: cause, work: ran ? .outcomeUnknown : .nothingRan), into: &result)
-                        }
-                    }
-                }
-            }
-            result["untrusted_remote_data"] = .bool(resultFailure != nil || PeerDataTaintDispatcher.containsPeerText(.object([
-                "reply": result["reply"] ?? .null, "stderr": result["stderr"] ?? .null,
-            ])))
-            return Self.peerRedact(.object(result), token: nil)
-        }
-    }
-
-    /// A CLI reply proves that route; the MCP return path has separate evidence.
-    static func recordHostConnectionOutcome(store: AgentPeerStore, contact: AgentPeerContact,
-                                             ran: Bool, replied: Bool, probe: Bool,
-                                             probeNonce: String? = nil,
-                                             executable: String, workspace: String, recipe: AgentRecipeStore.Recipe?) -> Bool {
-        store.recordProof(peerID: contact.id, outbound: ran)
-        let arrived = probe && probeNonce.map {
-            store.finishConnectionProbe(peerID: contact.id, nonce: $0, ran: ran, workspace: workspace, recipe: recipe)
-        } == true
-        // A command that ran and printed no answer delivered its message; only
-        // one that did not run (sent: false on its receipt) marks the path unavailable.
-        if ran && replied && !probe {
-            store.recordRoundTrip(peerID: contact.id, executable: executable, workspace: workspace, recipe: recipe)
-        } else if !probe, !ran {
-            store.recordUnavailable(peerID: contact.id)
-        }
-        return arrived
-    }
-
-    /// The probe's own reason, so "stays set up" is never a shrug: the command
-    /// was missing, the run timed out, or it simply did not answer back.
-    static func probeReason(_ probe: JSONValue?, row: AgentHostRow? = nil) -> String {
-        let check = row.map { " Checked agents/recipes/\($0.id).json host.commandLine, host.searchPaths and host.configPath=\($0.expandedConfigPath). Run agent.verify, correct the named recipe fields or settings file, then connect. Restart: \($0.restartNote) A message must arrive through this contact's connector to prove it." } ?? ""
-        guard case .object(let value)? = probe else { return "No callback probe was recorded." + check }
-        if value["reason"] == .string("trust_center_full_mac_required"),
-           case .string(let detail)? = value["detail"] { return detail }
-        if value["timed_out"] == .bool(true) { return "The probe ran past its time limit." + check }
-        if case .string(let detail)? = value["detail"] { return detail + check }
-        return "The probe ran and nothing arrived through the entry." + check
-    }
-
-    /// Connect owns its entry name: another install's entry there was replaced, and the receipt says so first.
-    static func sayReplaced(_ outcome: AgentHostConfigWriter.Outcome, in value: inout [String: JSONValue]) {
-        guard let helper = outcome.replacedInstall else { return }
-        let note = "Replaced an entry from another install of this app at \(helper); backup at \(outcome.backupPath ?? "none")."
-        value["replaced_entry"] = .string(note)
-        value["detail"] = .string(note + (value["detail"].flatMap { if case .string(let text) = $0 { " " + text } else { nil } } ?? ""))
-    }
-
-    static func includeConnectionProbe(_ probe: JSONValue, in value: inout [String: JSONValue]) {
-        value["probe"] = probe
-        guard case .object(let fields) = probe,
-              fields["reason"] == .string("trust_center_full_mac_required") else { return }
-        value["reason"] = fields["reason"]
-        value["completed"] = .bool(false)
-        value["detail"] = .string(probeReason(probe))
-        // A trust refusal says nothing about whether the other app needs a restart.
-        value["restart_required"] = nil
-    }
-
-    /// A HOST THAT PULLS (no command line). Her message is held in this
-    /// conversation and goes out in the result of the host's next call through
-    /// its entry (`held_messages`, AgentConversationStore.held); held is not
-    /// sent, and the receipt says which. It never reaches for a window.
-    static func hostPull(row: AgentHostRow?, contact: AgentPeerContact, text: String?, peers: [AgentPeerContact] = []) -> JSONValue {
-        let name = row?.displayName ?? contact.name
-        var result: [String: JSONValue] = ["agent": .string("peer:" + contact.id), "transport": .string("mcpHost"),
-            "host": .string(row?.id ?? ""), "completed": .bool(false)]
-        let presence = AgentContactHealth.checkIn(contact)?.detail ?? ""
-        guard let text else {
-            result["status"] = .string("nothing_to_read"); result["read"] = .bool(false)
-            result["detail"] = .string("\(name)'s answers arrive as its own messages; this conversation's exchanges say which of yours are held and which were delivered, and when. " + presence)
-            return .object(result)
-        }
-        if currentPeerState(contact, peers: peers) == .unavailable {
-            result["status"] = .string("unavailable"); result["sent"] = .bool(false)
-            result["detail"] = .string(AgentPeerCredentials.unavailableDetail + " Nothing was held: \(name) cannot call in without its key.")
-            result["remedy"] = Repair.remedy(owner: "Keychain peer:" + contact.id, nextCall: .object([
-                "tool": .string("app"), "input": .object(["action": .string("agent.connect"), "args": .object(["name": .string("peer:" + contact.id)])])]), tap: nil)
-            return .object(result)
-        }
-        // The held copy is the exchange's own prompt; one longer would be clipped.
-        guard text.utf8.count <= AgentConversationExchange.textLimit else {
-            result["status"] = .string("invalid_arguments"); result["sent"] = .bool(false); result["argument_path"] = .string("text")
-            result["detail"] = .string("Nothing was held: a message held for \(name) keeps at most \(AgentConversationExchange.textLimit / 1024) KiB. Send it in parts.")
-            return .object(result)
-        }
-        if AgentRecipeStore.dryRun {
-            result["status"] = .string("passed"); result["dry_run"] = .bool(true); result["sent"] = .bool(false)
-            result["detail"] = .string("Dry run: a message to \(name) would be held for its next check-in. Nothing was held.")
-            return .object(result)
-        }
-        // Held means kept in a conversation of hers; a send outside one has nowhere to wait.
-        guard AgentConversationLiveContext.target != nil else {
-            result["status"] = .string("invalid_arguments"); result["sent"] = .bool(false); result["argument_path"] = .string("conversation_id")
-            result["detail"] = .string("Nothing was held: a message to \(name) waits in one of your conversations with it. Send it from a chat, naming a conversation rather than protocol ids.")
-            return .object(result)
-        }
-        result["status"] = .string("held"); result["delivered"] = .bool(false)
-        // The host's own session for this conversation: the session_id it answers in.
-        result["conversation_id"] = .string("mcp-" + contact.id)
-        result["detail"] = .string("Held, not sent: it waits for \(name)'s next check-in and goes out in the result of that call; nothing is lost. Do not resend. " + presence)
-        return .object(result)
-    }
-
-    /// One sentence of truth about a closed desktop app: this app can type into
-    /// it, and the answer comes back through this app's own inbound door.
-    static let desktopSetupNote = "Send-only. For this contact to answer, add this app's MCP server to it (command: nativeagent-link mcp) and have it reply with its agent_message tool; the reply arrives as an ordinary inbound message."
-    static let desktopSendOnlyDetail = "Desktop contacts are send-only. Nothing was opened, focused or read. " + desktopSetupNote
-
-    static let hostInboundOnlyDetail =
-        "This contact pulls: it has no command line this build knows, and its window is not a transport, so nothing of it is opened or read. "
-        + "A message to it is held in the conversation and goes out in the result of its next call through this app's entry "
-        + "(any agent_message or agent_reply call); its own messages arrive as ordinary inbound turns."
-
-    static func agentLaneContacts(peers: [AgentPeerContact], selectedPeers: [AgentPeerContact],
-                                  readCredential: (String) throws -> String? = { try AgentPeerCredentials.read(peerID: $0) }) -> [JSONValue] {
-        let selected = Set(selectedPeers.map { peer in (peers.first { $0.id == peer.who } ?? peer).id })
-        return peers.filter { selected.contains($0.id) }.map { who in
-            guard case .object(var projection) = peerProjection(who, peers: peers, readCredential: readCredential) else { return .null }
-            projection["handles"] = .array((who.handles ?? []).map(JSONValue.string))
-            projection["doors"] = .array(peers.filter { $0.id == who.id || $0.who == who.id }.map {
-                peerProjection($0, peers: peers, readCredential: readCredential)
-            })
-            return .object(projection)
-        }
-    }
-
-    private static func currentPeerState(_ peer: AgentPeerContact, peers: [AgentPeerContact]) -> AgentPeerContactState {
-        AgentPeerCredentials.isAvailable(peer, peers: peers) ? peer.state : .unavailable
-    }
-
-    /// "hermes-agent", "hermes-acp" and "Hermes" name one agent: letters and
-    /// digits only, without a trailing agent / acp / cli / bot.
-    static func sameAgent(_ a: String, _ b: String) -> Bool {
-        func bare(_ name: String) -> String {
-            var core = name.lowercased().filter { $0.isLetter || $0.isNumber }
-            for suffix in ["agent", "acp", "cli", "bot"] where core.hasSuffix(suffix) && core.count > suffix.count {
-                core = String(core.dropLast(suffix.count)); break
-            }
-            return core
-        }
-        let x = bare(a), y = bare(b)
-        return !x.isEmpty && x == y
-    }
-
-    private static func compactContact(_ value: JSONValue) -> JSONValue {
-        guard case .object(let row) = value else { return value }
-        let keys: Set<String> = ["agent", "name", "description", "kind", "state", "state_detail", "readiness", "paused",
-            "endpoint", "card_url", "untrusted_remote_data", "presence", "remedy", "handles", "doors",
-            "can_start_turn", "can_answer_back", "capabilities", "read_inputs", "workspace",
-            "last_reply_in", "last_message_out", "last_exchange", "retained_exchanges", "unavailable_now_checked_at", "reply_path", "found_by", "ability"]
-        var compact = row.filter { keys.contains($0.key) }
-        if let contact = row["agent"] ?? row["name"] {
-            compact["detail_read"] = .object(["action": .string("agent.contacts"), "args": .object(["discover": contact])])
-        }
-        return .object(compact)
-    }
-
-    private static func peerProjection(_ peer: AgentPeerContact, peers: [AgentPeerContact] = [],
-                                       readCredential: (String) throws -> String? = { try AgentPeerCredentials.read(peerID: $0) }) -> JSONValue {
-        guard case .object(var value) = peerHistoryProjection(peer) else { return .null }
-        if let ability = peer.ability { value["ability"] = .string(ability) }
-        if !AgentPeerCredentials.isAvailable(peer, peers: peers, readCredential: readCredential) {
-            value["state"] = .string("unavailable")
-            value["state_detail"] = .string(AgentPeerCredentials.unavailableDetail)
-            value["readiness"] = .string("unavailable")
-            if peer.transport == .mcpHost {
-                value["remedy"] = Repair.remedy(owner: "Keychain peer:" + peer.id, nextCall: .object([
-                    "tool": .string("app"), "input": .object(["action": .string("agent.connect"), "args": .object(["name": .string("peer:" + peer.id)])])]), tap: nil)
-            }
-        }
-        return .object(value)
-    }
-
-    private static func peerHistoryProjection(_ peer: AgentPeerContact) -> JSONValue {
-        if peer.transport == .grokBot {
-            var value: [String: JSONValue] = ["agent": .string("peer:" + peer.id), "name": .string(peer.name),
-                "kind": .string("agent_host"), "transport": .string("grokBot"),
-                "state": .string(peer.grokSetup == "set up" && peer.provenInboundAt != nil ? "connected" : peer.grokSetup ?? "set up"),
-                "last_reply_in": peer.provenInboundAt.map(JSONValue.string) ?? .null,
-                "last_message_out": peer.provenOutboundAt.map(JSONValue.string) ?? .null,
-                "readiness": .string("not_checked"),
-                "can_start_turn": .bool(peer.grokSetup == "set up"), "can_answer_back": .bool(true),
-                "capabilities": .array([.string("message"), .string("read")]),
-                "read_inputs": .array([.string("message_id")]),
-                "state_detail": .string("Webhook acceptance starts a run. Only a correlated local reply is an answer. Grok Bot may ask for local execution approval each time.")]
-            if let proof = peer.roundTripProof {
-                value["round_trip_proof"] = .object([
-                    "route": .string("grokBot"), "at": .string(proof.at),
-                    "endpoint": .string(proof.endpoint.absoluteString),
-                    "executable": .null, "version": .null, "workspace": .string(proof.workspace)])
-            }
-            return .object(value)
-        }
-        // The state, in the same four words everywhere, on every contact.
-        var value: [String: JSONValue] = ["agent": .string("peer:" + peer.id), "name": .string(peer.name),
-            "can_start_turn": .bool(peer.canStartTurn), "can_answer_back": .bool(peer.canAnswerBack),
-            "state": .string(peer.state.rawValue), "state_detail": .string(peer.state.detail)]
-        if let workspace = peer.hostWorkspace { value["workspace"] = .string(workspace) }
-        // A host's CLI answer and its inbound MCP message are separate proofs.
-        // Show the newest reply without promoting one proof into the other.
-        var lastReply = peer.provenInboundAt
-        if peer.transport == .mcpHost, let proof = peer.roundTripProof,
-           proof.executable != nil, proof.endpoint == peer.endpoint, proof.credentialKey == peer.credentialKey {
-            lastReply = [lastReply, proof.at].compactMap { $0 }.max()
-        }
-        if let stamp = lastReply { value["last_reply_in"] = .string(stamp) }
-        if let stamp = peer.provenOutboundAt { value["last_message_out"] = .string(stamp) }
-        if let proof = peer.roundTripProof {
-            value["round_trip_proof"] = .object([
-                "route": .string(peer.transport == .acp ? "acp" : peer.transport == .desktop ? "desktop" : proof.executable == nil ? "remote" : "commandLine"),
-                "at": .string(proof.at), "endpoint": .string(proof.endpoint.absoluteString),
-                "executable": proof.executable.map(JSONValue.string) ?? .null,
-                "version": proof.version.map(JSONValue.string) ?? .null,
-                "workspace": .string(proof.workspace)])
-        }
-        if let proof = peer.mcpReturnProof {
-            value["mcp_return_proof"] = .object([
-                "route": .string(proof.endpoint.absoluteString), "at": .string(proof.at)])
-        }
-        if let stamp = peer.unavailableAt { value["unavailable_now_checked_at"] = .string(stamp) }
-        if peer.transport == .acp {
-            value["kind"] = .string("agent_host")
-            if peer.state == .setUp {
-                value["state_detail"] = .string(!peer.canStartTurn
-                    ? "The saved executable cannot currently be verified. Reconnect to review the changed or missing program; earlier replies remain recorded."
-                    : peer.unavailableAt != nil
-                        ? "The last connection attempt was unavailable. Earlier replies remain recorded; opening a new turn rechecks the route."
-                        : "The connection is saved, but it has not answered a message yet.")
-            }
-            value["transport"] = .string("acp")
-            value["route"] = .string("acp")
-            value["outbound_route"] = .string("acp")
-            value["capabilities"] = .array([.string("message")])
-            value["readiness"] = .string("not_checked")
-            value["setup"] = .string("Can start a conversation and receive its answer in the same call. The app remembers the conversation within your current chat and continues it when supported; use conversation to select a named discussion. It runs on this Mac as you; this app asks you only when the agent asks it for permission.")
-            value["executable"] = peer.approvedExecutablePath.map(JSONValue.string) ?? .null
-            value["working_directory"] = peer.acpWorkingDirectory.map(JSONValue.string) ?? .null
-            if let id = AgentPeerStore.hostRowID(peer.endpoint), let line = AgentHostDirectory.row(named: id)?.acp {
-                value["version_note"] = .string(line.versionNote(peer.acpExecutable?.version))
-            }
-            return .object(value)
-        }
-        if peer.transport == .mcpHost {
-            let row = AgentPeerStore.hostRowID(peer.endpoint).flatMap { id in
-                AgentHostDirectory.rows.first { $0.id == id }
-            }
-            let line = row?.commandLine
-            value["kind"] = .string("agent_host")
-            value["transport"] = .string("mcpHost")
-            value["host"] = .string(row?.id ?? "")
-            value["route"] = .string(row?.route.rawValue ?? "mcp-settings-only")
-            value["outbound_route"] = .string(row?.outboundRoute ?? "none")
-            if let presence = AgentContactHealth.checkIn(peer) { value["state_detail"] = .string(presence.detail) }
-            value["credential_configured"] = .bool(peer.credentialKey != nil)
-            value["readiness"] = .string("not_checked")
-            value["capabilities"] = .array([.string("message")])
-            value["read_inputs"] = .array(line?.continuesConversations == true ? [.string("conversation_id")] : [])
-            value["setup"] = .string(line == nil
-                ? hostInboundOnlyDetail
-                : "A message to this contact runs its command line once and brings its reply back in the same call."
-                    + (line?.continuesConversations == true
-                       ? " The app remembers the conversation within your current chat; use conversation to select a named discussion."
-                       : " This connection starts a separate conversation for each message.")
-                    + " It also reaches this app any time through its own entry.")
-            if row?.format == .shellEnvironment {
-                value["state_detail"] = .string(ChatGPTDotIPCTransport.detail)
-                value["outbound_route"] = .string("chatgpt-dot-ipc")
-                value["route"] = .string("chatgpt-dot-ipc")
-                value["readiness"] = ChatGPTDotIPCTransport.readiness
-                value["can_start_turn"] = .bool(ChatGPTDotIPCTransport.available)
-                value["capabilities"] = .array(ChatGPTDotIPCTransport.available ? [.string("message"), .string("read")] : [.string("read")])
-                value["read_inputs"] = .array([.string("conversation_id"), .string("limit"), .string("offset"), .string("max_chars"), .string("text_offset"), .string("source_version")])
-                value["setup"] = .string(ChatGPTDotIPCTransport.available
-                    ? "NativeAgent messages Dot in-house after a read-only route check. Unknown delivery is read by its original receipt, never resent. Dot's nativeagent-link inbound commands and per-agent Trust remain unchanged."
-                    : "Dot is inbound only: his messages arrive through nativeagent-link on this Mac as ordinary inbound turns, and a read returns the retained conversation. There is no way to send him a message from here; nothing to repair.")
-            }
-            return .object(value)
-        }
-        if peer.transport == .desktopChat {
-            value["kind"] = .string("desktop_chat_agent")
-            value["transport"] = .string("desktopChat")
-            value["app_bundle_id"] = .string(AgentPeerStore.desktopBundleID(peer.endpoint) ?? "")
-            value["capabilities"] = .array([.string("message")])
-            value["read_inputs"] = .array([.string("conversation_id")])
-            value["setup"] = .string("A message is typed into your own chat in its app and its answer comes back in the same call. The app remembers that chat within your conversation; start a new conversation for a fresh chat there.")
-            return .object(value)
-        }
-        if peer.transport == .desktop {
-            value["kind"] = .string("desktop_agent")
-            value["transport"] = .string("desktop")
-            value["app_bundle_id"] = .string(AgentPeerStore.desktopBundleID(peer.endpoint) ?? "")
-            value["readiness"] = .string("not_checked")
-            value["execution"] = .string("app_managed_desktop_route")
-            value["capabilities"] = .array([.string("message")])
-            value["setup"] = .string(peer.readsReplyInWindow
-                ? "A message is pasted into its chat \u{201C}\(peer.conversationLabel ?? "grok")\u{201D} in the Grok Bot app and its answer is read back from that same chat in the same call (up to three minutes)."
-                : desktopSetupNote)
-            if let label = peer.conversationLabel { value["conversation_label"] = .string(label) }
-            return .object(value)
-        }
-        value["kind"] = .string("external_peer")
-        value["transport"] = .string(peer.transport.rawValue)
-        value["endpoint"] = .string(peer.endpoint.absoluteString)
-        value["credential_configured"] = .bool(peer.credentialKey != nil)
-        value["readiness"] = .string("not_checked")
-        value["capabilities"] = .array([.string("message"), .string("read")])
-        value["read_inputs"] = .array(peer.transport == .a2a
-            ? [.string("task_id")] : [.string("message_id"), .string("conversation_id")])
-        return .object(value)
-    }
-
-    static func peerAuthorizeInterface(_ interface: AgentA2AWire.Interface, cardURL: URL, hasCredential: Bool) throws {
-        try AgentPeerPolicy.peerAuthorizeInterface(interface, cardURL: cardURL, hasCredential: hasCredential)
-    }
-
     static func peerRedact(_ value: JSONValue, token: String?) -> JSONValue {
         guard let token, !token.isEmpty else { return value }
         switch value {
@@ -2046,15 +767,14 @@ extension SwiftToolDispatcher: BuiltInAgentLaneProviding {
         default: return value
         }
     }
-
-    private static func peerKeys(_ args: [String: JSONValue], allowed: Set<String>) throws {
+    static func peerKeys(_ args: [String: JSONValue], allowed: Set<String>) throws {
         let unknown = Set(args.keys).subtracting(allowed).sorted()
         guard unknown.isEmpty else {
             throw ToolFailureError("Agent communication: unsupported fields: " + unknown.joined(separator: ", ") + ".",
                                    argumentPath: unknown.first, effects: .none)
         }
     }
-    private static func peerString(_ args: [String: JSONValue], _ key: String, max: Int, required: Bool = true) throws -> String? {
+    static func peerString(_ args: [String: JSONValue], _ key: String, max: Int, required: Bool = true) throws -> String? {
         guard let value = args[key] else {
             if required { throw AgentCommunicationError.invalid("missing \(key)") }
             return nil

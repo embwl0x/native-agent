@@ -28,14 +28,6 @@ struct TelegramPersistedTurnCard: Sendable, Codable, Equatable {
         self.terminalText = terminalText
     }
 
-    var isTerminal: Bool {
-        switch phase {
-        case .completed, .failed, .canceled, .outcomeUnknown:
-            return true
-        default:
-            return false
-        }
-    }
 }
 
 enum TelegramTurnCardLedgerError: Error, Sendable, Equatable {
@@ -81,7 +73,7 @@ actor TelegramTurnCardLedger {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(envelope)
-        try await SwiftNativePersistenceCore().writeDataAtomicDurable(data, to: fileURL)
+        try await SwiftNativePersistenceCore.writeDataAtomicDurableAsync(data, to: fileURL)
     }
 
     private let maximumRecords: Int
@@ -97,9 +89,8 @@ actor TelegramTurnCardLedger {
     func upsert(_ record: TelegramPersistedTurnCard) async throws {
         await acquireStorage()
         defer { releaseStorage() }
-        // 2026-09-06: cancellation stops the turn's work, not recording its
-        // terminal outcome. Keep terminal writes inside the same storage lock.
-        if !record.isTerminal {
+        // Terminal outcomes persist under the storage lock even after cancellation.
+        if !record.phase.isTerminal {
             try Task.checkCancellation()
         }
         var records = try currentRecords()
@@ -110,7 +101,7 @@ actor TelegramTurnCardLedger {
             phase: record.phase,
             updatedAt: record.updatedAt,
             terminalText: record.terminalText.flatMap {
-                TelegramTurnPresentationReducer.sanitized(
+                TurnPresentationReducer.sanitized(
                     TelegramRichMessageRenderer.sanitize($0)
                 )
             }
@@ -253,8 +244,7 @@ actor TelegramTurnCardRestartRepairer {
             )
         }
 
-        // 2026-09-22: a card deleted just before a crash is gone for good, so
-        // "message to edit not found" counts as done, not a retry forever.
+        // A missing message counts as a settled card edit.
         func edit(_ record: TelegramPersistedTurnCard, _ text: String) async throws {
             do {
                 try await editCard(
@@ -277,10 +267,9 @@ actor TelegramTurnCardRestartRepairer {
             let active = await isActive(record.turnId)
             guard !Task.isCancelled else { break }
             guard !active, attemptedCards.insert(record.turnId).inserted else { continue }
-            if record.isTerminal {
+            if record.phase.isTerminal {
                 do {
-                    // 2026-09-22: a completed card has nothing left to say
-                    // once its reply landed; delete it rather than leave "Done.".
+                    // Delete completed cards once their replies land.
                     if record.phase == .completed {
                         do {
                             try await deleteCard(token, record.chatId, record.messageId)
@@ -317,8 +306,6 @@ actor TelegramTurnCardRestartRepairer {
     }
 
     private func safe(_ error: Error) -> String {
-        TelegramPollLoop._tgRedactToken(
-            TurnTraceRedactor.redactText(String(describing: error))
-        )
+        TurnTraceRedactor.redactText(String(describing: error))
     }
 }

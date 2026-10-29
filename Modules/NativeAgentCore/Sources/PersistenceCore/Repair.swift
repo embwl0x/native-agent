@@ -2,8 +2,7 @@ import Foundation
 import NativeAgentCore
 // Blueprint: | `Repair.swift` | Shared repair, reconciliation, terminal and person-decision shapes; ToolFailureError.call builds native calls, while fileRepairInstruction owns byte-preserving person recovery prose for damaged files, without executable coding requests |
 
-/// The one shape of a fixable no (User 10-18: "No fallbacks: it works and it
-/// works right, and never can the agent say I can't fix it"). Every refusal or
+/// The one shape of a fixable no. Every refusal or
 /// failure whose cause lies outside the call's own input names what decided it
 /// and carries its lever: her native call, or the person's recovery step.
 /// A failure that carries one owes repair until that
@@ -62,6 +61,41 @@ public enum Repair {
 }
 
 public extension ToolFailureError {
+    var failureCode: String? { code ?? (argumentPath == nil ? nil : "invalid_arguments") }
+
+    func failureEvidence(defaultCode: String, defaultOwner: String? = nil) -> [String: JSONValue] {
+        let cause = failureCode ?? defaultCode
+        return ["status": .string(status.rawValue), "reason": .string(cause), "failure_code": .string(cause),
+                "effects": .string(effects.rawValue), "argument_path": argumentPath.map(JSONValue.string) ?? .null,
+                "accepted": accepted.map(JSONValue.string) ?? .null, "remedy": remedy(defaultOwner: defaultOwner)]
+    }
+
+    /// Recovery meaning belongs to the failure owner, before any surface redacts it.
+    func remedy(defaultOwner: String? = nil) -> JSONValue {
+        let owner = owner ?? defaultOwner
+        let parsed = nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }
+        let call: JSONValue? = if case .object? = parsed { parsed } else { nil }
+        let instruction = instruction ?? message
+        var value: JSONValue
+        if recovery == .terminal { value = Repair.terminal(instruction: instruction) }
+        else if personDecides, let tap { value = Repair.why(owner: owner ?? "This action", tap: tap, instruction: instruction) }
+        else if recovery == .reconcile, let call { value = Repair.reconcile(instruction: instruction, nextCall: call) }
+        else if let owner, recovery == nil || recovery == .repair {
+            value = Repair.remedy(owner: owner, nextCall: call, tap: tap, instruction: instruction)
+        } else if let recovery {
+            value = .object(["kind": .string(recovery.rawValue), "instruction": .string(instruction), "next_call": call ?? .null])
+        } else if let tap { value = Repair.why(owner: owner ?? "This action", tap: tap, instruction: instruction) }
+        else if let call {
+            value = .object(["kind": .string(argumentPath == nil ? "inspect" : "correct_arguments"),
+                             "instruction": .string(instruction), "next_call": call])
+        } else if let argumentPath {
+            value = .object(["kind": .string("correct_arguments"), "argument_path": .string(argumentPath),
+                "accepted": accepted.map(JSONValue.string) ?? .null, "instruction": .string(instruction)])
+        } else { return .null }
+        if let owner, case .object(var fields) = value { fields["owner"] = .string(owner); value = .object(fields) }
+        return value
+    }
+
     /// Her lever for `nextCall`: the call with its input.
     static func call(_ tool: String, _ input: [String: JSONValue] = [:]) -> String {
         (try? JSONValue.object(["tool": .string(tool), "input": .object(input)]).serialize(pretty: false)) ?? ""

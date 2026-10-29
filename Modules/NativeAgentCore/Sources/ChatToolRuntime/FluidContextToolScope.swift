@@ -12,7 +12,7 @@ package enum FluidContextToolScope {
 
 extension SwiftToolDispatcher {
     func impl_context_expand(input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        let locator = (jsonString(input["atom_id"]) ?? "")
+        let locator = (input["atom_id"]?.stringValue ?? "")
             .replacingOccurrences(of: "[context_expand ", with: "")
             .replacingOccurrences(of: "[context.expand ", with: "")
             .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "]")))

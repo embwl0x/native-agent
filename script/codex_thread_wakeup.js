@@ -1591,13 +1591,10 @@ async function deliverReplyJobUnlocked(jobPath, config) {
     bridge,
   };
   await appendReplyDeliveryReceipt(receipt);
-  const terminalBridgeReply = isTerminalBridgeReply(bridge);
   const jobFile = finalizeReplyJobFile(jobPath, bridge);
   return {
     jobFile,
-    status: terminalBridgeReply
-      ? bridge.replyStatus
-      : (bridge.status === "delivered" || bridge.status === "dry_run" ? "delivered" : "failed"),
+    status: bridge.status === "dry_run" ? "delivered" : bridge.status,
     delivery: receiptOnly ? "receipt_only_after_codex_turn" : "nativeagent_bridge_message_after_codex_turn",
     threadId: execution.threadId,
     turnId: execution.turnId,

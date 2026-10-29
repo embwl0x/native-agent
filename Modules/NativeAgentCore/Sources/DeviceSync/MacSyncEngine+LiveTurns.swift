@@ -16,12 +16,10 @@ extension MacSyncEngine {
         stopLiveTurnRelay()
         let (signals, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
         let mailbox = OSAllocatedUnfairLock(initialState: (
-            turns: [String: (text: String, coalescer: ICloudTextDeltaCoalescer)](),
+            turns: [String: ICloudTextDeltaCoalescer](),
             pending: [String: BridgeMessage]()
         ))
-        // The tap runs deep inside the turn's stack; yielding there overflowed
-        // a helper turn's thread (10-07 crash). A serial queue keeps order and
-        // gives the yield its own stack.
+        // A serial queue keeps event order and gives the yield its own stack.
         let hop = DispatchQueue(label: "nativeagent.live-turn-relay")
         let generation = snapshotLifecycleGeneration
         let dataRoot = sync.dataRoot
@@ -36,11 +34,8 @@ extension MacSyncEngine {
                     let sequence: Int?
                     switch event.kind {
                     case .delta(let delta):
-                        if state.turns[run] == nil { state.turns[run] = ("", ICloudTextDeltaCoalescer()) }
-                        state.turns[run]?.text += delta
-                        guard let snapshot = state.turns[run]?.text,
-                              let flush = state.turns[run]?.coalescer.push(
-                                snapshot: snapshot, nowUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
+                        guard let flush = state.turns[run, default: ICloudTextDeltaCoalescer()].push(
+                                delta: delta, nowUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
                               ) else { return false }
                         text = flush.text
                         kind = "text_delta"

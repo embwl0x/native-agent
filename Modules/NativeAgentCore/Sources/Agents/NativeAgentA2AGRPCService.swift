@@ -8,7 +8,7 @@ import NativeAgentCore
 // Blueprint: | `NativeAgentA2AGRPCService.swift` | gRPC authentication, protocol/error projection and acknowledged stream delivery |
 
 /// Protobuf is a wire projection of the same canonical endpoint used by JSON-RPC and HTTP+JSON.
-struct NativeAgentA2AGRPCService: Lf_A2a_V1_A2AService.ServiceProtocol {
+struct AgentA2AGRPCEndpoint: Lf_A2a_V1_A2AService.ServiceProtocol {
     let endpoint: @Sendable () -> AgentContactA2AEndpoint
     let authenticate: @Sendable (Metadata) throws -> AgentBridgePrincipal
 
@@ -20,14 +20,13 @@ struct NativeAgentA2AGRPCService: Lf_A2a_V1_A2AService.ServiceProtocol {
             guard values.count <= 1 else { throw RPCError(code: .unauthenticated, message: "Unauthorized") }
             headers[key] = values.first
         }
-        headers = AgentContactRoutes.contactHeaders(path: "/a2a", headers: headers, liveToken: liveToken,
+        let (admission, principal) = AgentContactRoutes.admit(headers: headers, liveToken: liveToken,
             dataRoot: dataRoot, readCredential: readCredential)
-        switch BridgeCore.authorize(authorizationHeader: headers["authorization"], liveToken: liveToken) {
+        switch admission {
         case .serverStopping: throw RPCError(code: .unavailable, message: "Server stopping")
         case .unauthorized: throw RPCError(code: .unauthenticated, message: "Unauthorized")
         case .authorized: break
         }
-        let principal = AgentBridgePrincipal.resolve(headers: headers, dataRoot: dataRoot, readCredential: readCredential)
         guard principal.peerID != nil, !principal.replyOnly
         else { throw RPCError(code: .unauthenticated, message: "Unauthorized") }
         return principal
@@ -43,8 +42,9 @@ struct NativeAgentA2AGRPCService: Lf_A2a_V1_A2AService.ServiceProtocol {
                 details: .errorInfo(reason: "VERSION_NOT_SUPPORTED", domain: "a2a-protocol.org"))
         }
         let params = try JSONSerialization.jsonObject(with: request.message.jsonUTF8Data())
-        let body = try JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": "grpc", "method": method, "params": params], options: [.sortedKeys])
-        let response = await endpoint().handle(body, principal: principal, version: versions.first ?? "1.0")
+        let envelope: [String: Any] = ["jsonrpc": "2.0", "id": "grpc", "method": method, "params": params]
+        let response = await endpoint().handle(envelope, byteCount: try JSONSerialization.data(withJSONObject: envelope, options: [.sortedKeys]).count,
+                                               principal: principal, version: versions.first ?? "1.0")
         try Task.checkCancellation()
         return response
     }

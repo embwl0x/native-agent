@@ -1,4 +1,6 @@
 import NativeAgentCore
+import NativeAgentShared
+import ApprovalTransactions
 import AppToolRuntime
 import Browser
 import Foundation
@@ -60,7 +62,7 @@ extension ChatToolCatalogSnapshot {
     }
 }
 
-/// `NativeAgentEngine.tools` (S10): the tool catalog and the authored-tool
+/// `NativeAgentEngine.tools`: the tool catalog and the authored-tool
 /// registry for one data root, in core types. The Tools page renders
 /// `catalog` (every tool, its load state and its trust here) and `authored`;
 /// the phone snapshot and Doctor use the same owner. Registry writes (auto-run, promote, quarantine) read back through
@@ -69,7 +71,6 @@ extension ChatToolCatalogSnapshot {
 @Observable
 public final class ToolsFacade {
     public private(set) var skills: [SkillRecord] = []
-    public var skillDetails: [SkillInfo] { skills.map(SkillInfo.guidance) }
     public private(set) var skillsReadError: String?
     @ObservationIgnored private let skillsRead = LatestRead()
     @ObservationIgnored private let nativePowerRead = LatestRead()
@@ -77,7 +78,7 @@ public final class ToolsFacade {
     @discardableResult
     public func refreshSkills(includingSource: Bool = false) async throws -> [SkillRecord] {
         let result: Result<[SkillRecord], Error> = await skillsRead.read({
-            do { return .success(try await RuntimeReadProjection.skills(dataRoot: dataRoot, includingSource: true)) }
+            do { return .success(try await RuntimeReadouts.skills(dataRoot: dataRoot, includingSource: true)) }
             catch { return .failure(error) }
         }, publish: { result in
             switch result {
@@ -99,41 +100,9 @@ public final class ToolsFacade {
     public private(set) var browserStatus: BrowserRuntimeStatus?
     public private(set) var nativePowerRefresh: PanelRefreshStatus?
 
-    public private(set) var slashCatalog: [ToolCapability] = []
-    public private(set) var slashTools: [ToolCapability] = []
-    public private(set) var slashCommandNames: Set<String> = []
-    private var slashCatalogFetchedAt: Date?
-    private var isFetchingSlashCatalog = false
-    @ObservationIgnored private lazy var slashRead = LatestRead()
     @ObservationIgnored private lazy var catalogRead = LatestRead()
     @ObservationIgnored private lazy var authoredRead = LatestRead()
 
-    public func refreshSlashCatalog() async {
-        if let last = slashCatalogFetchedAt, Date().timeIntervalSince(last) < 30 { return }
-        guard !isFetchingSlashCatalog else { return }
-        isFetchingSlashCatalog = true
-        defer { isFetchingSlashCatalog = false }
-        await slashRead.read({
-            do {
-                let envelope = try await loadManifest()
-                let (sorted, eligible, names) = try await Task.detached(priority: .userInitiated) {
-                    let data = try envelope.serializedData(pretty: false)
-                    let manifest = try JSONDecoder().decode(ToolCapabilityManifest.self, from: data)
-                    let sorted = manifest.tools.sorted { $0.name < $1.name }
-                    let eligible = sorted.filter { !$0.sideEffects && $0.effectiveAutonomy == "auto" && $0.availableNow }
-                    return (sorted, eligible, Set(eligible.map(\.name)))
-                }.value
-                return (sorted, eligible, names, Date() as Date?)
-            } catch {
-                return ([], [], Set<String>(), nil)
-            }
-        }, publish: {
-            slashCatalog = $0.0
-            slashTools = $0.1
-            slashCommandNames = $0.2
-            slashCatalogFetchedAt = $0.3
-        })
-    }
     public nonisolated let dataRoot: URL
     nonisolated private let manifestReader: @Sendable (String?) async throws -> JSONValue
 
@@ -147,18 +116,21 @@ public final class ToolsFacade {
 
     public func refreshNativePower() async -> [(endpoint: String, label: String, error: Error)] {
         let read = await nativePowerRead.read({
-            let receipts: [NativeActionReceipt] = await RuntimeReadProjection.tailJSONL(
+            let receiptRead: (rows: [NativeActionReceipt], malformedRows: Int, blankRows: Int, truncated: Bool, readFailed: Bool, failure: String?) = await RuntimeReadouts.tailJSONL(
                 path: SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot).nativeActionsReceiptsPath, limit: 50)
             var notification: NotificationRuntimeStatus?
             var browser: BrowserRuntimeStatus?
             var failures: [(endpoint: String, label: String, error: Error)] = []
-            do { notification = try await RuntimeReadProjection.getNotificationStatus(dataRoot: dataRoot) }
+            if let failure = receiptRead.failure {
+                failures.append(("native action receipts", "tailJSONL", RuntimeReadError.unreadableFeed(failure)))
+            }
+            do { notification = try await RuntimeReadouts.getNotificationStatus(dataRoot: dataRoot) }
             catch { failures.append(("notification status", "getNotificationStatus", error)) }
-            do { browser = try await RuntimeReadProjection.getBrowserStatus(dataRoot: dataRoot) }
+            do { browser = try await RuntimeReadouts.getBrowserStatus(dataRoot: dataRoot) }
             catch { failures.append(("browser status", "getBrowserStatus", error)) }
-            return (receipts, notification, browser, failures)
+            return (receiptRead.failure == nil ? receiptRead.rows : nil, notification, browser, failures)
         }, publish: { read in
-            nativeActionReceipts = read.0
+            if let receipts = read.0 { nativeActionReceipts = receipts }
             if let value = read.1 { notificationStatus = value }
             if let value = read.2 { browserStatus = value }
             nativePowerRefresh = PanelRefreshStatus(lastAttemptAt: Date(),
@@ -176,13 +148,14 @@ public final class ToolsFacade {
     /// Its envelope keeps its authority through nested calls and approvals.
     public nonisolated func withPartDoor<Value: Sendable>(envelope: TurnEnvelope,
         fileAccess: String = "auto", approvalFiler: (any ApprovalFiler)? = nil,
+        approvedReplay: ApprovedChatToolReplay? = nil,
         operation: @Sendable () async throws -> Value) async throws -> Value {
         let surface = envelope.surface
         let engine = NativeAgentEngine.forRoot(dataRoot)
         let filer: any ApprovalFiler = approvalFiler ?? NativeAgentChatApprovalFiler(dataRoot: dataRoot)
         let tools = engine.toolDispatchClient(enforceAppAutonomy: false, swarmApprovalFiler: filer)
         let chain = makeGatedToolDispatchClient(tools: tools, fileAccess: fileAccess,
-            approvalFiler: filer, dataRoot: dataRoot, verifiedSessionId: ResidentWake.session)
+            approvalFiler: filer, dataRoot: dataRoot, verifiedSessionId: ResidentWake.session, approvedReplay: approvedReplay)
         return try await ChatToolSessionContext.$fileAccess.withValue(fileAccess) {
             try await ChatToolSessionContext.$envelope.withValue(envelope) {
                 try await AppDoorReentry.$perform.withValue({ name, arguments in
@@ -197,15 +170,6 @@ public final class ToolsFacade {
     /// The trust-aware manifest from this engine's tool-chain composition.
     public nonisolated func loadManifest(detail: String? = nil) async throws -> JSONValue {
         try await manifestReader(detail)
-    }
-
-    /// Rendering, draft retention and dispatch all use this full descriptor.
-    public nonisolated func inputDescriptor(named name: String) async throws -> ToolCapability {
-        let data = try await loadManifest(detail: "full").serializedData(pretty: false)
-        guard let tool = try JSONDecoder().decode(ToolCapabilityManifest.self, from: data).tools.first(where: { $0.name == name }) else {
-            throw CocoaError(.coderValueNotFound)
-        }
-        return tool
     }
 
     /// The full manifest, typed for the Tools page.
@@ -241,7 +205,7 @@ public final class ToolsFacade {
     /// invalid authored fields fail the read.
     public func listAuthored() async throws -> [ToolRecord] {
         try await authoredRead.read({
-            try await SwiftNativeToolRegistry(root: dataRoot).listTools(filter: .all)
+            try await SwiftNativeToolRegistry(root: dataRoot).listTools()
         }, publish: { authored = $0 })
     }
 
@@ -305,40 +269,6 @@ public final class ToolsFacade {
         }
     }
 }
-extension ToolsFacade {
-    /// Resolve how to dispatch `toolName` given raw free-text args from the slash command.
-    /// Returns nil if no tool with that name exists.
-    public func planDispatch(toolName: String, freeText: String) -> DispatchArgPlan? {
-        guard let tool = slashCatalog.first(where: { $0.name == toolName }) else { return nil }
-
-        let schema = tool.inputSchema
-        let required = schema?.required ?? []
-        let props = schema?.properties ?? [:]
-
-        // Zero required args → fire immediately.
-        if required.isEmpty {
-            return DispatchArgPlan(tool: tool, mode: .zeroArgs, prefilled: [:])
-        }
-
-        // Single required field that is a string → shortcut.
-        if required.count == 1,
-           let fieldName = required.first,
-           let prop = props[fieldName],
-           (prop.type == "string" || prop.type == nil) {
-            let trimmed = freeText.trimmingCharacters(in: .whitespacesAndNewlines)
-            let prefilled: [String: Any] = trimmed.isEmpty ? [:] : [fieldName: trimmed]
-            return DispatchArgPlan(tool: tool, mode: .singleStringArg(field: fieldName), prefilled: prefilled)
-        }
-
-        // Anything else → show a form.
-        return DispatchArgPlan(tool: tool, mode: .formNeeded, prefilled: [:])
-    }
-}
-
-private struct ToolCapabilityManifest: Decodable, Sendable {
-    let tools: [ToolCapability]
-}
-
 extension ToolsFacade {
     public nonisolated convenience init(dataRoot: URL) {
         self.init(dataRoot: dataRoot) { detail in

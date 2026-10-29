@@ -1,17 +1,21 @@
 import AgentWorkspace
 import ChatTurnContracts
 import Foundation
+import NativeAgentShared
+import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `AgentConversationHistoryView.swift` | `AgentConversationHistoryView` enum; `adding` |
 
 /// On-demand scrollback over the conversation itself: the one session the
 /// contact owns (`ContactThread`), both directions, whichever door or chat
-/// each message came through (User 10-20). Her sends carry their state from
+/// each message came through. Her sends carry their state from
 /// the record that sent them. It never replays messages or supplies context
 /// to a peer's model session.
 enum AgentConversationHistoryView {
-    static func adding(to presentation: JSONValue, row: AgentConversationRecord,
-                       before: String? = nil, exchange: String? = nil, dataRoot: URL) -> JSONValue {
+    /// A contact can have inbound history before she ever opens a send record.
+    static func adding(to presentation: JSONValue, agent: String, name: String,
+                       before: String? = nil, exchange: String? = nil, dataRoot: URL,
+                       peers: [AgentPeerContact]? = nil, lines snapshot: Result<[ContactThread.Line], Error>? = nil) -> JSONValue {
         guard case .object(var result) = presentation else { return presentation }
         if before != nil || exchange != nil {
             // Keep live readiness for Reply, but give the selected historical
@@ -20,12 +24,13 @@ enum AgentConversationHistoryView {
             result["viewing"] = .string("Conversation history. State and Reply controls describe the conversation now; the messages below keep their own times and states.")
         }
         var metadata: [String: JSONValue] = [
-            "coverage": .string("Your one conversation with \(row.name), from its session: what you sent it from any chat, its replies, and the messages it started, whichever door each came through."),
+            "coverage": .string("Your one conversation with \(name), from its session: what you sent it from any chat, its replies, and the messages it started, whichever door each came through."),
             "order": .string("oldest_first"), "untrusted_remote_data": .bool(false)
         ]
-        let owner = row.agent.hasPrefix("peer:") ? String(row.agent.dropFirst(5)) : row.agent
+        let owner = agent.hasPrefix("peer:") ? String(agent.dropFirst(5)) : agent
+        let peers = peers ?? (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
         let lines: [ContactThread.Line]
-        do { lines = try ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, identity: AgentContactIdentity(dataRoot: dataRoot)) }
+        do { lines = try snapshot?.get() ?? ContactThread.mergedLines(dataRoot: dataRoot, owner: owner, identity: AgentContactIdentity(dataRoot: dataRoot, peers: peers)) }
         catch {
             metadata["status"] = .string("unavailable")
             metadata["detail"] = .string("This conversation's session could not be read (\(error.localizedDescription)). The conversation is preserved; no message was repeated.")
@@ -55,8 +60,7 @@ enum AgentConversationHistoryView {
             selected = lines[start..<end]
             if start > 0 { metadata["earlier_before"] = .string(lines[start].id) }
         }
-        // Only a problem reading history carries a status: "ok" beside a failed
-        // send read as if the send were fine (walk 09-25).
+        // Only a history read failure carries its own status beside the send.
         if lines.isEmpty { metadata["detail"] = .string("Nothing has been said in this conversation yet.") }
         // A send's state: the ledger of the record that sent it, from whichever
         // chat, or its own row once the ledger let it go.
@@ -64,19 +68,16 @@ enum AgentConversationHistoryView {
             Dictionary(try AgentConversationStore(dataRoot: dataRoot).records().flatMap { ($0.exchanges ?? []) + ($0.releasing ?? []) }.map { ($0.id, $0) },
                        uniquingKeysWith: { first, _ in first })
         }
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let peers = (try? AgentPeerStore(dataRoot: dataRoot).list()) ?? []
         var names = Dictionary(uniqueKeysWithValues: peers.map { ("peer:" + $0.id, $0.name) })
         for line in selected {
-            if let source = line.source { names[source] = names[PeerTrust.principal(source, dataRoot: dataRoot)] ?? source }
+            if let source = line.source { names[source] = names[PeerTrust.principal(source, dataRoot: dataRoot, peers: peers)] ?? source }
         }
         var untrusted = false
         let messages: [JSONValue] = ContactThread.project(selected, person: "the person, from the contact's thread", names: names,
             mark: { PeerDataTaint.markConsumed(peer: $0, line: $1) }).map { line in
             let full = exchange != nil
             var value: [String: JSONValue] = [
-                "message": .string(line.id), "at": .string(iso.string(from: line.at)),
+                "message": .string(line.id), "at": .string(NativeTimestampFormat.fractionalZulu(line.at)),
                 // The person wrote it in the contact's thread; it isn't yours to answer.
                 "from": .string(line.speaker),
                 "text": .string(full ? line.text : String(line.text.prefix(800)))
@@ -94,11 +95,11 @@ enum AgentConversationHistoryView {
                 }
             }
             if let answers = line.answers { value["answers_send"] = .string(answers) }
-            else if !line.mine { value["started_by"] = .string(row.name) }
+            else if !line.mine { value["started_by"] = .string(name) }
             let speakers = line.speakers
             if !speakers.isEmpty {
                 // A lane's name becomes the one contact it is, as its own turns' sources do.
-                let principals = speakers.map { PeerTrust.principal($0, dataRoot: dataRoot) }
+                let principals = speakers.map { PeerTrust.principal($0, dataRoot: dataRoot, peers: peers) }
                 let trusted = principals.allSatisfy { PeerTrust.ownerTrusts($0, dataRoot: dataRoot) }
                 if !line.mine { value["agent_id"] = .string(principals[0]) }
                 value["untrusted_remote_data"] = .bool(!trusted)

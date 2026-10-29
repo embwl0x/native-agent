@@ -1,17 +1,17 @@
 import Foundation
 import GRDB
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `MemoryStorage+Recall.swift` | `MemoryStorage`: `invalidateRecallCache`, shared `rankedRecall` scoring and bounded `recall` deduplication, canonical recall-generation cache |
 
 extension MemoryStorage {
-    struct RecallCandidate {
-        var memory: StoredMemory
+    struct RecallCandidate: Sendable {
+        let memory: StoredMemory
         let lexicalDocument: MemoryRecallScoring.LexicalDocument
     }
-    struct RecallCache {
+    struct RecallCache: Sendable {
         let candidates: [RecallCandidate]
-        let generation: Int
         let corpusGeneration: Int64
         let embeddingEpoch: String?
     }
@@ -32,128 +32,79 @@ extension MemoryStorage {
         return value
     }
 
-    /// Local invalidation fences cache installation across actor reentrancy.
-    /// The canonical generation also detects writes by other connections.
+    /// Committed invalidation fences older reads; canonical generation detects other connections.
     func invalidateRecallCache() {
-        recallGeneration += 1
-        recallCache = nil
+        recallRead.write { recallCache = nil }
     }
 
     /// Reuse decoded vectors and lexical documents while the canonical corpus
-    /// generation is unchanged. Read its epoch, generation and fresh usage
-    /// together before candidates: a racing write can only cause a later miss,
+    /// generation is unchanged. Read its epoch and generation together before
+    /// candidates: a racing write can only cause a later miss,
     /// never label an older candidate snapshot with a newer generation.
-    private func recallCandidates(
+    func recallCandidates(
         queryEpoch: MemoryEmbeddingEpoch?
-    ) async throws -> (candidates: [RecallCandidate], epochMismatch: Bool) {
-        let generation = recallGeneration
-        let (activeEpoch, corpusGeneration, usage) = try await dbPool.read { db in
-            let epoch = try Self.embeddingEpochState(in: db).activeEpoch
-            let version = try Self.recallJudgmentGeneration(in: db)
-            let rows = try Row.fetchAll(db, sql: """
-                SELECT id, use_count, last_used_at FROM memories
-                WHERE embedding IS NOT NULL AND status = 'active'
-                  AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
-                """)
-            let usage = Dictionary(uniqueKeysWithValues: rows.map { row in
-                (row["id"] as String, (row["use_count"] as Int64, row["last_used_at"] as String?))
-            })
-            return (epoch, version, usage)
-        }
-        if let activeEpoch, queryEpoch?.rawValue != activeEpoch {
-            return ([], true)
-        }
-        func refreshed(_ candidates: [RecallCandidate]) -> [RecallCandidate] {
-            candidates.map { candidate in
-                var candidate = candidate
-                if let counters = usage[candidate.memory.id] {
-                    candidate.memory.useCount = counters.0
-                    candidate.memory.lastUsedAt = counters.1
-                }
-                return candidate
+    ) async throws -> [RecallCandidate] {
+        let snapshot = try await recallRead.read {
+            let (activeEpoch, corpusGeneration) = try await dbPool.read { db in
+                let epoch = try Self.embeddingEpochState(in: db).activeEpoch
+                let version = try Self.recallJudgmentGeneration(in: db)
+                return (epoch, version)
             }
-        }
-        if let cache = recallCache,
-           cache.generation == recallGeneration,
-           cache.corpusGeneration == corpusGeneration,
-           cache.embeddingEpoch == activeEpoch {
-            return (refreshed(cache.candidates), false)
-        }
-        // One rowid-ordered query preserves equal-score tie-breaking, dedup
-        // preference, and BM25 document indices across query-planner choices.
-        let candidates = try await dbPool.read { db -> [RecallCandidate] in
-            var sql = """
-                SELECT * FROM memories
-                WHERE embedding IS NOT NULL
-                  AND status = 'active'
-                  AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
-            """
-            var arguments: StatementArguments = []
-            if let activeEpoch {
-                sql += " AND embedding_epoch = ?"
-                arguments = [activeEpoch]
-            }
-            sql += " ORDER BY rowid"
-            let rows = try Row.fetchAll(db, sql: sql, arguments: arguments)
-            return try rows.map { row in
-                let m = try Self.decodeMemory(row)
-                return RecallCandidate(
-                    memory: m,
-                    lexicalDocument: MemoryRecallScoring.LexicalDocument(m.content)
+            if let activeEpoch, queryEpoch?.rawValue != activeEpoch {
+                throw MemoryStorageError.embeddingEpochMismatch(
+                    expected: activeEpoch, actual: queryEpoch?.rawValue
                 )
             }
-        }
-        // Growth guard: the cache holds the fully-decoded candidate set
-        // (embeddings included). At Agent-scale (10³–10⁴ rows ≈ tens of MB)
-        // that's the point of R5; past it, skip caching rather than balloon
-        // resident memory — recall stays correct via the per-call scan path.
-        if candidates.count <= 50_000, generation == recallGeneration {
-            recallCache = RecallCache(
+            if let cache = recallCache,
+               cache.corpusGeneration == corpusGeneration,
+               cache.embeddingEpoch == activeEpoch {
+                return cache
+            }
+            // One rowid-ordered query preserves equal-score tie-breaking, dedup
+            // preference, and BM25 document indices across query-planner choices.
+            let candidates = try await dbPool.read { db -> [RecallCandidate] in
+                var sql = """
+                    SELECT * FROM memories
+                    WHERE embedding IS NOT NULL
+                      AND status = 'active'
+                      AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
+                """
+                var arguments: StatementArguments = []
+                if let activeEpoch {
+                    sql += " AND embedding_epoch = ?"
+                    arguments = [activeEpoch]
+                }
+                sql += " ORDER BY rowid"
+                let rows = try Row.fetchAll(db, sql: sql, arguments: arguments)
+                return try rows.map { row in
+                    let m = try Self.decodeMemory(row)
+                    return RecallCandidate(
+                        memory: m,
+                        lexicalDocument: MemoryRecallScoring.LexicalDocument(m.content)
+                    )
+                }
+            }
+            return RecallCache(
                 candidates: candidates,
-                generation: generation,
                 corpusGeneration: corpusGeneration,
                 embeddingEpoch: activeEpoch
             )
-        } else {
-            recallCache = nil
+        } publish: { snapshot in
+            // Bound resident decoded vectors; larger corpora are read per invocation.
+            recallCache = snapshot.candidates.count <= 50_000 ? snapshot : nil
         }
-        return (candidates, false)
+        return snapshot.candidates
     }
 
     // MARK: - Recall (hybrid dense + lexical sweep)
 
-    public func recall(
+    static func rankedRecall(
         embedding query: [Float],
-        embeddingEpoch queryEpoch: MemoryEmbeddingEpoch? = nil,
-        queryText: String? = nil,
-        topK: Int,
-        persona: String? = nil
-    ) async throws -> [(memory: StoredMemory, similarity: Double)] {
-        Self.uniqueRecallResults(try await rankedRecall(
-            embedding: query, embeddingEpoch: queryEpoch, queryText: queryText, persona: persona
-        ), limit: topK)
-    }
-
-    func rankedRecall(
-        embedding query: [Float],
-        embeddingEpoch queryEpoch: MemoryEmbeddingEpoch?,
         queryText: String?,
-        persona: String?
-    ) async throws -> [(memory: StoredMemory, similarity: Double)] {
-        // R5: pull the shared cached candidate set, then apply the persona
-        // filter in-memory. A single-persona equality filter over the full
-        // rowid-ordered scan yields the same rows in the same order the old
-        // persona-clause SQL returned, so BM25 idx alignment + ranking stay
-        // byte-identical.
-        let scan = try await recallCandidates(queryEpoch: queryEpoch)
-        // The canonical embedding owner repairs mismatches before retrying recall.
-        guard !scan.epochMismatch else {
-            let state = try await embeddingEpochState()
-            throw MemoryStorageError.embeddingEpochMismatch(
-                expected: state.activeEpoch ?? "unknown", actual: queryEpoch?.rawValue
-            )
-        }
-        let allCandidates = scan.candidates
+        persona: String?,
+        candidates allCandidates: [RecallCandidate]
+    ) throws -> [(memory: StoredMemory, similarity: Double)] {
+        // Filtering preserves canonical row order and BM25 document alignment.
         let candidates = persona == nil
             ? allCandidates
             : allCandidates.filter { $0.memory.personaId == persona }
@@ -164,19 +115,26 @@ extension MemoryStorage {
             )
         }
         let now = Date()
-        let lexicalScores = MemoryRecallScoring.normalizedBM25Scores(
-            query: queryText,
-            lexicalDocuments: candidates.map(\.lexicalDocument)
+        let rawLexicalScores = MemoryRecallScoring.bm25Scores(
+            queryTerms: MemoryRecallScoring.lexicalContentTerms(queryText),
+            documents: candidates.map { ($0.lexicalDocument.termCounts, $0.lexicalDocument.length) }
         )
-        var scored: [(StoredMemory, Double)] = []
-        scored.reserveCapacity(candidates.count)
+        let maxLexicalScore = rawLexicalScores.max() ?? 0
+        let lexicalScores = rawLexicalScores.map { maxLexicalScore > 0 ? $0 / maxLexicalScore : 0 }
+        var dense: [(index: Int, memory: StoredMemory, similarity: Double)] = []
+        dense.reserveCapacity(candidates.count)
         for (idx, candidate) in candidates.enumerated() {
             let m = candidate.memory
             guard let e = m.embedding, e.count == query.count else { continue }
             guard VectorMath.cosine(e, e) > 0 else { continue }
-            let sim = VectorMath.cosine(e, query)
+            dense.append((index: idx, memory: m, similarity: VectorMath.cosine(e, query)))
+        }
+        let lexicalWeight = MemoryRecallScoring.lexicalBoostWeight(denseSimilarities: dense.map(\.similarity))
+        var scored: [(StoredMemory, Double)] = []
+        scored.reserveCapacity(dense.count)
+        for (idx, m, sim) in dense {
             let lexicalBoost = (idx < lexicalScores.count)
-                ? memoryBM25LexicalBoost * lexicalScores[idx]
+                ? lexicalWeight * lexicalScores[idx]
                 : 0
             // Recency may break near-ties, never erase semantic relevance.
             // Exempt kinds and legacy nil-kind records retain factor 1.0.
@@ -205,7 +163,7 @@ extension MemoryStorage {
         var seen: [String: [MemoryDisclosureClassification?]] = [:]
         // One pass with an early stop: `seen` makes this predicate stateful,
         // so it must never run twice over the same rows (a lazy filter's
-        // `prefix` walks it once for `count` and again to copy — 10-10 crash).
+        // `prefix` walks it once for `count` and again to copy).
         var out: [(memory: StoredMemory, similarity: Double)] = []
         for candidate in scored {
             let key = comparisonKey(candidate.0.content, mode: .recall)

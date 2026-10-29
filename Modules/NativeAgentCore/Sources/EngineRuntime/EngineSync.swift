@@ -67,8 +67,8 @@ public final class SyncFacade {
         _ = await secretRead.read({
         let result = await Task.detached(priority: .utility) { () -> (String?, String?) in
             do {
-                if quiet { return (try PairingSecretManager.existingSecretBase64() ?? "", nil) }
-                return (try PairingSecretManager.currentSecretBase64(), nil)
+                if quiet { return (try PairingSecret.existingSecretBase64() ?? "", nil) }
+                return (try PairingSecret.currentSecretBase64(), nil)
             } catch { return (nil, error.localizedDescription) }
         }.value
         return result
@@ -93,7 +93,7 @@ public final class SyncFacade {
         owner.bridge.owePairingPublication(true)
         owner.engine.beginPairingSecretRotation()
         let result = await Task.detached(priority: .utility) { () -> (Data?, String?) in
-            do { return (try PairingSecretManager.rotateSecret(), nil) }
+            do { return (try PairingSecret.rotateSecret(), nil) }
             catch { return (nil, error.localizedDescription) }
         }.value
         guard let persistedSecret = result.0 else {
@@ -106,7 +106,7 @@ public final class SyncFacade {
         await owner.engine.finishPairingSecretRotation(with: persistedSecret)
         // A publication that does not land stays owed and is the pairing fact
         // of the one connection assessment until iCloud takes the key.
-        async let kvsPublished = PairingSecretManager.publishMaterialToKVS(persistedSecret)
+        async let kvsPublished = PairingSecret.publishMaterialToKVS(persistedSecret)
         async let cloudKitPublished = owner.bridge.publishPairingSecret(persistedSecret)
         _ = await (kvsPublished, cloudKitPublished)
         secretRead.write {

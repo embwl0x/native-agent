@@ -1,20 +1,5 @@
-// U5 W-D "comms resilience" (2026-06-11): poll backoff + errors.jsonl cap.
-//
-// Before this file existed there was NO backoff machinery anywhere in the
-// TelegramBot module (plan audit, grep-verified): an offline Mac meant the
-// 2s-interval poll loop hammered a dead network every tick and appended a
-// row to errors.jsonl each time, and a failed setMyCommands re-attempted on
-// EVERY tick forever. Two pieces fix that:
-//
-//   * `TelegramExponentialBackoff` — deadline-gate backoff state. No sleeps:
-//     callers ask `shouldAttempt()` and simply skip the work while a failure
-//     window is open, so the scheduler keeps its cheap cadence and a tick
-//     during the window costs one timestamp comparison.
-//   * `TelegramErrorLog` — flock'd append with size-cap rotation for
-//     errors.jsonl, mirroring the MemoryV2 dedup_shadow recipe (5MB cap,
-//     single `.1` backup, rotate inside the same critical section as the
-//     append so a concurrent appender can't write between the move and the
-//     append; fail-open on rotation errors).
+// Poll retries use a 1s base/60s cap; menu sync uses a 5s base/300s cap.
+// Both double with ±20% jitter clamped to the cap and reset on success.
 
 import Foundation
 import NativeAgentCore
@@ -25,28 +10,13 @@ import BackgroundLoops
 
 // MARK: - TelegramExponentialBackoff
 
-/// Exponential backoff state for transient failures in the Telegram poll
-/// loop (and its command-menu sync). Curve: `base * 2^(n-1)`,
-/// capped at `maxDelay`, then jittered by a uniform factor from
-/// `0.8...1.2`; the jittered delay is re-clamped to `maxDelay` so the
-/// documented cap is a hard ceiling (at the cap, jitter spreads attempts
-/// DOWNWARD — that still de-synchronizes multiple instances without ever
-/// exceeding the cap). One success resets the curve to zero.
+/// Deadline-gated retries using LoopFailureBackoffPolicy; callers skip work until due.
 public actor TelegramExponentialBackoff {
     private let policy: LoopFailureBackoffPolicy
 
     private var consecutiveFailures: Int = 0
     private var nextAttemptAt: Date?
 
-    /// Defaults are the poll-loop curve: 1s → 60s cap, doubling, ±20% jitter,
-    /// reset on success.
-    ///
-    /// FIX-7 (2026-09-01): the cap was 300s while `TelegramPollLoop` documented
-    /// 1s→60s and nothing in production passed an override, so an offline Mac
-    /// stayed dark five times longer than the contract said. Telegram is the
-    /// most-used remote surface; 60s is the contract, and it is now the code.
-    /// `commandMenuBackoff` still asks for 300s EXPLICITLY — a slow retry is
-    /// right for a menu sync, wrong for the lane that carries messages.
     public init(
         baseDelay: TimeInterval = 1,
         maxDelay: TimeInterval = 60
@@ -84,22 +54,15 @@ public actor TelegramExponentialBackoff {
 
 // MARK: - TelegramErrorLog
 
-/// Flock'd, size-capped append for `<dataRoot>/telegram/errors.jsonl`.
-/// At/over the cap the live file moves to a single `<name>.1` backup
-/// (replacing any previous backup)
-/// and a fresh file starts — worst case on disk ≈ 2× the cap. Crash-safety
-/// reasoning is the same: the move happens inside the file's flock critical
-/// section (the lock is a sidecar `.lock` file, so moving the log itself
-/// under the lock is safe), and every failure is fail-open — an error-log
-/// problem must never take down the poll loop that's trying to report.
+/// Appends to `<dataRoot>/telegram/errors.jsonl` under a sidecar flock.
+/// At the size cap, replaces the single `<name>.1` backup before appending.
+/// Append/rotation failures are logged without interrupting polling.
 public enum TelegramErrorLog {
 
-    /// Size cap for the live errors.jsonl (same 5MB figure as the
-    /// dedup_shadow ledger).
+    /// Live-log rotation threshold: 5 MiB.
     public static let maxBytes = 5 * 1024 * 1024
 
-    /// Append one row under flock, rotating first when the live file has
-    /// reached `maxBytes`. FAIL-OPEN: never throws.
+    /// Appends under flock, rotating first at `maxBytes`; logs failures without throwing.
     public static func append(
         _ row: JSONValue,
         to logURL: URL
@@ -109,10 +72,9 @@ public enum TelegramErrorLog {
                 at: logURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
-            let persistence = SwiftNativePersistenceCore()
-            try await persistence.withFileLock(logURL) {
+            try await SwiftNativePersistenceCore.withFileLock(logURL) {
                 rotateIfNeeded(logURL)
-                try await persistence.appendJSONL(row, to: logURL)
+                try await SwiftNativePersistenceCore.appendJSONL(row, to: logURL)
             }
         } catch {
             FileHandle.standardError.write(
@@ -121,12 +83,8 @@ public enum TelegramErrorLog {
         }
     }
 
-    /// Rotate once the live file has reached `maxBytes` bytes: replace any
-    /// existing `<name>.1` backup with the live file; the caller's append
-    /// then recreates a fresh live log. Call ONLY inside the log's flock
-    /// critical section. FAIL-OPEN: a rotation error is logged and the
-    /// append proceeds on the un-rotated file (worst case the log keeps
-    /// growing until a later rotation succeeds).
+    /// Replaces `<name>.1` when the live log reaches `maxBytes`; caller holds the flock.
+    /// A rotation error is logged and append proceeds on the live file.
     static func rotateIfNeeded(_ logURL: URL) {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path),
               let size = (attrs[.size] as? NSNumber)?.intValue,

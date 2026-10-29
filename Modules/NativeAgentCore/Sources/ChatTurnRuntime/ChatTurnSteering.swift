@@ -6,14 +6,8 @@ import Transcripts
 import TurnTrace
 // Blueprint: | `ChatTurnSteering.swift` | `ChatTurnSteering` actor; open turns and turn-activity clock; atomic resident claim/reservation under the common free-time law; person admission opens immediately |
 
-/// A message sent while she works goes straight to the turn already working
-/// in that conversation (User 2026-10-18, on every door; it replaces the
-/// 2026-10-04 rule that it waited in the queue until he steered it). It stays
-/// queued until her turn takes it, and runs as its own turn if her turn never
-/// does. Steer offers it again by hand, for one her turn could not take yet.
-/// Only a turn answering the same door takes it: one transcript can be shared
-/// by two doors (Telegram's /resume of a Mac chat), and a message is answered
-/// where it was sent.
+/// Messages sent during work are offered to the running turn in that conversation on the same door.
+/// Each stays queued until taken or run as its own turn; Steer manually offers a queued message again.
 ///
 /// An offer made here is picked up by the running loop at its next tool boundary, BEFORE the
 /// model chooses another action, and delivered as ordinary text in that round's
@@ -58,16 +52,12 @@ public actor ChatTurnSteering {
     static let maxPending = 8
 
     private var pending: [String: [Offer]] = [:]
-    /// Which sessions hold an offer, readable without the actor hop: the
-    /// streaming loop asks on every delta and cuts the reply when one waits
-    /// (10-17: a Steer during a words-only reply landed nowhere, since the
-    /// turn only looked before a tool round).
+    /// Sessions with pending, drainable offers; streaming replies check without an actor hop.
     nonisolated private static let pendingSessions = OSAllocatedUnfairLock<Set<String>>(initialState: [])
     nonisolated public static func hasPending(_ sessionId: String) -> Bool {
         pendingSessions.withLock { $0.contains(sessionId) }
     }
-    /// Pending AND drainable: while a reservation is unsettled, drain refuses,
-    /// so a cut would only repeat (Sol); the offer waits for the reservation.
+    /// Unsettled reservations suppress the flag because drain cannot yet consume the offer.
     private func syncPendingFlag(_ sessionId: String) {
         let waiting = reserved[sessionId] == nil && pending[sessionId]?.isEmpty == false
         Self.pendingSessions.withLock { if waiting { $0.insert(sessionId) } else { $0.remove(sessionId) } }
@@ -97,11 +87,7 @@ public actor ChatTurnSteering {
     private var lastTurnActivityAt: [String: Date] = [:]
     private init() {}
 
-    /// Mark a session as running a turn. EVERY turn calls this — Mac stream,
-    /// bridge/Telegram/Slack, bot turns — because `isTurnOpen` is
-    /// what the inline-card resume asks before starting anything, and a lane
-    /// that never registered read as idle and started a parallel turn on a
-    /// session that was already narrating (2026-09-14, session 644D65F1).
+    /// Every turn registers its session so inline-card resume can check isTurnOpen before starting another.
     ///
     /// `persist` is how THIS turn writes a delivered message to the transcript.
     /// True proves the row is on disk; false leaves the attempt unresolved and
@@ -158,10 +144,15 @@ public actor ChatTurnSteering {
         open[sessionId] != nil
     }
 
-    /// Whether any session not starting with `prefix` is running a turn: her
-    /// resident wake waits for a live one rather than starting a second.
-    public func hasOpenTurn(excludingPrefix prefix: String) -> Bool {
-        open.keys.contains { !$0.hasPrefix(prefix) }
+    /// Her resident wake waits for an open resident turn; helper-owned
+    /// loops are independent. Read the same session rows as every other door.
+    public func hasOpenResidentTurn(dataRoot: URL) -> Bool {
+        let root = dataRoot.standardizedFileURL.resolvingSymlinksInPath()
+        let sessions = try? SessionConversation(dataRoot: dataRoot)
+        return open.contains { session, turn in
+            turn.dataRoot.standardizedFileURL.resolvingSymlinksInPath() == root
+                && sessions?.isHelper(session) != true
+        }
     }
 
     public func noteTurnActivity(for dataRoot: URL, at: Date) {
@@ -177,7 +168,7 @@ public actor ChatTurnSteering {
     }
 
     package func residentWakeIsFree(dataRoot: URL, nextFreeAt: @Sendable (Date, Date) -> Date?) -> Bool {
-        if hasOpenTurn(excludingPrefix: "bot-") {
+        if hasOpenResidentTurn(dataRoot: dataRoot) {
             ResidentWake.shared.wait(dataRoot: dataRoot, until: nil)
             return false
         }

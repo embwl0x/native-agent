@@ -97,7 +97,7 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
             Spec(id: "desk", title: "Desk", relativePath: "desk", detail: "work operations, compaction base, archive, holds, nag configuration, and cadence statistics; excluded from local backups and production export; phone sync carries Desk projections only"),
             Spec(id: "workshop", title: "Workshop", relativePath: "workshop", detail: "execution records including legacy filenames, timelines, receipts, leases, claims, session results, and artifacts; backed up and exported; phone sync carries task projections only"),
             Spec(id: "studio", title: "Studio", relativePath: "studio", detail: "journal and archives, amendments, consults, canon and recall counters, working shelf, graph backfill marker and relation audit; off-disk backup only; no local backup, archive inputs or phone snapshot"),
-            Spec(id: "agents", title: "Agents", relativePath: "agents", detail: "peer, conversation and wake state, including credential-bearing peer configuration; off-disk backup with credential exclusions only; phone receives helper projections; no local backup or production export"),
+            Spec(id: "agents", title: "Agents", relativePath: "agents", detail: "peer, conversation and wake state, SQLite contact tasks and retained JSON migration evidence, including credential-bearing peer configuration; off-disk backup with credential exclusions only; phone receives helper projections; no local backup or production export"),
             Spec(id: "slack", title: "Slack", relativePath: "slack", detail: "Slack configuration, session bindings, errors and inbound delivery journal; off-disk backup with credential exclusions only; no local backup, production export, or raw Slack phone snapshot"),
             Spec(id: "swarms", title: "Swarm Receipts", relativePath: "swarms", detail: "retained swarm run receipts; phone run feeds use runs/runs.json"),
             Spec(id: "builder_audit", title: "Builder Audit", relativePath: "builder_audit", detail: "builder JSON receipts and installer logs"),
@@ -166,10 +166,10 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
             Spec(id: "experiences", title: "Experiences", relativePath: "experiences", detail: "experience SQLite store, including repair obligations; off-disk backup only; no local backup or export; phone receives work-activity projections"),
             Spec(id: "cognition", title: "Cognition", relativePath: "cognition", detail: "organism/substrate state, human-turn timing, and repair copies written by their owner; excluded from local backup and archive inputs; phone receives the living status projection"),
             Spec(id: "runs", title: "Runs", relativePath: "runs", detail: "run ledger; excluded from local backup and archive inputs; phone receives a bounded run projection"),
-            Spec(id: "turn_traces", title: "Turn Traces", relativePath: "turn_traces", detail: "turn trace JSONL, reconciliation cursor, and byte-preserved repair originals; excluded from all backups and archive inputs; phone receives turn summaries"),
+            Spec(id: "turn_traces", title: "Turn Traces", relativePath: "turn_traces", detail: "turn trace JSONL, reconciliation cursor, byte-preserved repair originals, and each agent's practice ledger and tape (exact redacted bodies of nominated calls only); excluded from all backups and archive inputs; phone receives turn summaries"),
             Spec(id: "build_launch", title: "Build Identity", relativePath: "build_launch.json", detail: "build and launch identity; excluded from local backup and archive inputs; no direct phone copy"),
-            Spec(id: "doctor", title: "Doctor Reports", relativePath: "doctor", detail: "DoctorStatusProjection measured reports; support copies this tree; excluded from local backup and direct phone copy; phone health.json is a separate process-health projection"),
-            Spec(id: "auto_doctor", title: "Doctor Configuration", relativePath: "auto_doctor", detail: "optional Doctor scheduling configuration read by DoctorStatusProjection; excluded from local backup, archive inputs and phone sync"),
+            Spec(id: "doctor", title: "Doctor Reports", relativePath: "doctor", detail: "DoctorReadout measured reports; support copies this tree; excluded from local backup and direct phone copy; phone health.json is a separate process-health projection"),
+            Spec(id: "auto_doctor", title: "Doctor Configuration", relativePath: "auto_doctor", detail: "optional Doctor scheduling configuration read by DoctorReadout; excluded from local backup, archive inputs and phone sync"),
             Spec(id: "runtime", title: "Runtime Reports", relativePath: "runtime", detail: "operator-produced hardening report and local runtime state; support copies this tree; excluded from local backup and direct phone copy"),
             Spec(id: "release", title: "Release Reports", relativePath: "release", detail: "release reports; support copies this tree; excluded from local backup and direct phone copy"),
             Spec(id: "cutover", title: "Cutover Records", relativePath: "cutover", detail: "retained cutover records; support copies this tree; excluded from local backup and direct phone copy"),
@@ -193,8 +193,8 @@ public struct PrivacyMap: Codable, Hashable, Sendable {
         ]
         return specs.map { spec in
             let selected = productionExportRelativePaths.compactMap { path in
-                path == spec.relativePath || path.hasPrefix(spec.relativePath + "/") ? path
-                    : spec.relativePath.hasPrefix(path + "/") ? spec.relativePath : nil
+                NativeAgentWorkspaceRoot.relativePath(path, under: spec.relativePath) != nil ? path
+                    : NativeAgentWorkspaceRoot.relativePath(spec.relativePath, under: path) != nil ? spec.relativePath : nil
             }
             // The persona lives where the app reads it: beside a checkout's
             // data/, not inside it (`defaultPersonaRoot`).

@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 // Blueprint: | `OrganismLivingDynamics.swift` | `OrganismAnalyticDecay` struct; `value` |
 
@@ -35,53 +34,6 @@ public struct OrganismAnalyticDecay: Sendable, Equatable {
     }
 }
 
-public enum OrganismSleepEvidenceClass: String, Codable, Sendable, Equatable {
-    /// Exact runtime state already owned by the predictive body or organism
-    /// field. This may drive bounded local repair, but never model fitting.
-    case exactRuntime = "exact_runtime"
-    /// Deterministic fixtures generated without personal source material.
-    case generated
-    /// A fixed-time, immutable provider-transplant/evaluation epoch.
-    case frozenControlled = "frozen_controlled"
-}
-
-public enum OrganismSleepResidualKind: String, Codable, Sendable, Equatable, CaseIterable {
-    case prediction
-    case transitionSurprise = "transition_surprise"
-    case contradiction
-    case fieldCharge = "field_charge"
-    case calibration
-}
-
-/// Payload-free provenance for one bounded pressure input. `id` is always an
-/// opaque digest; raw prediction IDs, field labels, messages, paths, and tool
-/// payloads never enter the read model.
-public struct OrganismSleepEvidenceReference: Codable, Sendable, Equatable, Identifiable {
-    public var id: String
-    public var kind: OrganismSleepResidualKind
-    public var evidenceClass: OrganismSleepEvidenceClass
-    public var observedAt: Date
-    public var expiresAt: Date?
-
-    public init(
-        id: String,
-        kind: OrganismSleepResidualKind,
-        evidenceClass: OrganismSleepEvidenceClass,
-        observedAt: Date,
-        expiresAt: Date? = nil
-    ) {
-        self.id = Self.opaqueID(id)
-        self.kind = kind
-        self.evidenceClass = evidenceClass
-        self.observedAt = observedAt
-        self.expiresAt = expiresAt
-    }
-
-    private static func opaqueID(_ raw: String) -> String {
-        SHA256.hash(data: Data(raw.utf8)).map { String(format: "%02x", $0) }.joined()
-    }
-}
-
 public struct OrganismSleepPressureComponents: Sendable, Equatable {
     public var predictionResidual: Double
     public var transitionSurprise: Double
@@ -107,43 +59,3 @@ public struct OrganismSleepPressureComponents: Sendable, Equatable {
         (value.isFinite ? value : 0).clamped01()
     }
 }
-
-public enum OrganismSleepLane: String, Codable, Sendable, Equatable, CaseIterable {
-    case quietLocalRepair = "quiet_local_repair"
-}
-
-public enum OrganismSleepLaneDisposition: String, Codable, Sendable, Equatable {
-    case inactive
-    case waitingForQuiet = "waiting_for_quiet"
-    case ready
-    case resourceInhibited = "resource_inhibited"
-}
-
-public struct OrganismSleepLaneOpportunity: Sendable, Equatable {
-    public var lane: OrganismSleepLane
-    public var threshold: Double
-    public var quietInterval: TimeInterval
-    public var disposition: OrganismSleepLaneDisposition
-    public var nextEligibleAt: Date?
-    public var controlAuthority: Bool
-
-    public init(
-        lane: OrganismSleepLane,
-        threshold: Double,
-        quietInterval: TimeInterval,
-        disposition: OrganismSleepLaneDisposition,
-        nextEligibleAt: Date? = nil,
-        controlAuthority: Bool = false
-    ) {
-        self.lane = lane
-        self.threshold = (threshold).clamped01()
-        self.quietInterval = max(0, quietInterval)
-        self.disposition = disposition
-        self.nextEligibleAt = nextEligibleAt
-        self.controlAuthority = controlAuthority
-    }
-}
-
-/// A local, payload-free read of why quiet repair/consolidation is warranted.
-/// It is derived from existing prediction and plastic-field truth; it is not a
-/// new affect or memory owner and never schedules a model call by itself.

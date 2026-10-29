@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import os
-// Blueprint: | `Flow.swift` | `Flow`: scope-ordered open, stopped, finished and dropped helpers over ExperienceStore; unfinished runs owe finish, with position-prefixed landed digests and references to their owners' raw records |
+// Blueprint: | `Flow.swift` | `Flow`: scope-ordered open, stopped, finished and dropped helpers over ExperienceStore; failure state shares the durable owner's root-plus-scope record identity; unfinished runs owe finish, with position-prefixed landed digests and references to their owners' raw records |
 
 /// Landed work belongs to one unfinished experience, not to a second ledger.
 /// Each stop appends the whole list of what has landed, newest last, so a
@@ -13,12 +13,13 @@ public enum Flow {
 
     private static func write(_ root: URL, _ scope: String,
                               _ body: @escaping @Sendable (ExperienceStore) async throws -> Void) -> Task<Void, Never> {
-        ExperienceStore.record(root, "flow:" + scope) { store in
+        let key = ExperienceStore.recordIdentity(root, "flow:" + scope)
+        return ExperienceStore.record(root, "flow:" + scope) { store in
             do {
                 try await body(store)
-                unrecorded.withLock { $0[scope] = nil }
+                unrecorded.withLock { $0[key] = nil }
             } catch {
-                unrecorded.withLock { $0[scope] = error.localizedDescription }
+                unrecorded.withLock { $0[key] = error.localizedDescription }
                 throw error
             }
         }
@@ -43,7 +44,8 @@ public enum Flow {
                 throw error
             }
         }.value
-        if let failure = unrecorded.withLock({ $0[scope] }) {
+        let key = ExperienceStore.recordIdentity(root, "flow:" + scope)
+        if let failure = unrecorded.withLock({ $0[key] }) {
             throw NSError(domain: "Flow", code: 1, userInfo: [NSLocalizedDescriptionKey: "the last record of this flow failed: " + failure])
         }
         return try result.withLock { $0 }.get()

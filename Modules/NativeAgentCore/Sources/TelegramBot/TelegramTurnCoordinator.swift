@@ -1,6 +1,6 @@
 import Foundation
 
-// Blueprint: | `TelegramTurnCoordinator.swift` | `TelegramTurnCoordinator`: active/queued turn ownership, durable update recovery exclusion, control claims and Stop/idle settlement |
+// Blueprint: | `TelegramTurnCoordinator.swift` | `TelegramTurns`: active/queued turn ownership, durable update recovery exclusion and control claims; Stop presentation keeps tasks owned and joinable through operation/receipt/ingress/card settlement until completion releases the slot |
 
 public struct TelegramLastUserMessage: Sendable, Equatable {
     public let chatId: Int
@@ -49,7 +49,7 @@ struct TelegramQueuedTurnSnapshot: Sendable, Equatable {
     let acknowledgementMessageId: Int?
 }
 
-public actor TelegramTurnCoordinator {
+public actor TelegramTurns {
     private var approvalRecoveryAttempted = false
 
     func claimApprovalRecovery() -> Bool {
@@ -58,7 +58,7 @@ public actor TelegramTurnCoordinator {
         return true
     }
 
-    public static let shared = TelegramTurnCoordinator()
+    public static let shared = TelegramTurns()
     static let maximumQueuedTurnsPerChat = 20
 
     private struct ActiveTurn: Sendable {
@@ -68,6 +68,8 @@ public actor TelegramTurnCoordinator {
         let promptPreview: String
         var card: TelegramTurnProgressCardDriver?
         var continuationID: Int? = nil
+        var stopRequested = false
+        var stopConfirmed = false
     }
 
     private struct QueuedTurn: Sendable {
@@ -76,7 +78,7 @@ public actor TelegramTurnCoordinator {
         var id = UUID()
         let updateId: Int
         let text: String
-        let acknowledgementMessageId: Int?
+        var acknowledgementMessageId: Int?
         let operation: @Sendable (_ turnId: UUID) async -> Void
         let onStart: @Sendable (_ acknowledgementMessageId: Int?) async -> Void
         var onDiscard: (@Sendable () -> Void)? = nil
@@ -86,7 +88,6 @@ public actor TelegramTurnCoordinator {
     private var commandTasks: [UUID: Task<Void, Never>] = [:]
     private var commandDestinations: [UUID: TelegramDestination] = [:]
     private var isShuttingDown = false
-    private var shutdownGeneration: UInt64 = 0
     private var queuedTurns: [TelegramDestination: [QueuedTurn]] = [:]
     private var pausedQueueDestinations: Set<TelegramDestination> = []
     private var lastMessages: [TelegramDestination: TelegramLastUserMessage] = [:]
@@ -94,13 +95,7 @@ public actor TelegramTurnCoordinator {
     private var callbackClaimOrder: [String] = []
     private let callbackClaimLimit = 512
     private var nextInternalUpdateID = Int.min
-    /// 2026-09-06: the update ids whose turn is running IN THIS PROCESS.
-    /// A durable claim now stays `.processing` for the whole turn (so a crash
-    /// leaves recoverable ingress), and the every-tick recovery pass settles
-    /// `.processing` claims as outcome-unknown. Without this set that pass
-    /// would quarantine a turn that is still running two seconds after it
-    /// started. The set dies with the process, which is exactly when a
-    /// `.processing` claim really is orphaned.
+    /// Live in-process update IDs exclude their `.processing` claims from orphan recovery.
     private var inFlightUpdateIds: Set<Int> = []
 
     public init() {}
@@ -117,7 +112,9 @@ public actor TelegramTurnCoordinator {
         inFlightUpdateIds.contains(updateId)
     }
 
-    public func recordLastUserMessage(destination: TelegramDestination, text: String, message: TelegramMessage? = nil) {
+    public func recordLastUserMessage(destination: TelegramDestination, text: String, message: TelegramMessage? = nil,
+                                      updatingCurrent: Bool = false) {
+        if updatingCurrent, lastMessages[destination]?.message != message { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         lastMessages[destination] = TelegramLastUserMessage(
@@ -256,35 +253,6 @@ public actor TelegramTurnCoordinator {
         return queuedTurns[destination]?.firstIndex(where: { $0.updateId == updateId }).map { $0 + 1 }
     }
 
-    /// Schedules a verified internal continuation behind the active turn.
-    /// Approval continuations are not Telegram updates and therefore have no
-    /// durable update id or queue card. They take the next serial slot so the
-    /// result of an interrupted request cannot be dropped behind later user
-    /// messages merely because the original provider turn is still unwinding.
-    @discardableResult
-    func enqueueApprovalContinuation(
-        destination: TelegramDestination,
-        text: String,
-        operation: @escaping @Sendable (_ turnId: UUID) async -> Void
-    ) -> Int {
-        guard !isShuttingDown else { return -1 }
-        let updateId = nextInternalUpdateID
-        nextInternalUpdateID &+= 1
-        let queued = QueuedTurn(
-            updateId: updateId,
-            text: text,
-            acknowledgementMessageId: nil,
-            operation: operation,
-            onStart: { _ in }
-        )
-        queuedTurns[destination, default: []].insert(queued, at: 0)
-        if activeTurns[destination] == nil {
-            startNextQueuedTurn(destination: destination)
-            return 0
-        }
-        return 1
-    }
-
     func queuedTurn(
         destination: TelegramDestination,
         updateId: Int
@@ -301,6 +269,14 @@ public actor TelegramTurnCoordinator {
             promptPreview: Self.preview(item.text),
             acknowledgementMessageId: item.acknowledgementMessageId
         )
+    }
+
+    func bindQueueAcknowledgement(destination: TelegramDestination, updateId: Int, messageId: Int) -> Bool {
+        guard var queue = queuedTurns[destination],
+              let index = queue.firstIndex(where: { $0.updateId == updateId }) else { return false }
+        queue[index].acknowledgementMessageId = messageId
+        queuedTurns[destination] = queue
+        return true
     }
 
     func removeQueuedTurn(destination: TelegramDestination, updateId: Int) -> TelegramQueuedTurnSnapshot? {
@@ -391,9 +367,10 @@ public actor TelegramTurnCoordinator {
     public func finishTurn(destination: TelegramDestination, turnId: UUID) async {
         guard activeTurns[destination]?.id == turnId else { return }
         let card = activeTurns[destination]?.card
+        await card?.close()
+        guard activeTurns[destination]?.id == turnId else { return }
         activeTurns[destination] = nil
         startNextQueuedTurn(destination: destination)
-        await card?.close()
     }
 
     private func startNextQueuedTurn(destination: TelegramDestination) {
@@ -420,6 +397,11 @@ public actor TelegramTurnCoordinator {
         case outcomeUnknown
     }
 
+    func shutdownInterruptedTurn(destination: TelegramDestination, turnId: UUID) -> Bool {
+        guard isShuttingDown, let active = activeTurns[destination], active.id == turnId else { return false }
+        return !active.stopRequested
+    }
+
     func requestStop(
         destination: TelegramDestination,
         turnId: UUID? = nil,
@@ -434,16 +416,16 @@ public actor TelegramTurnCoordinator {
               turnId == nil || active.id == turnId else {
             return commands.isEmpty ? .notRunning : .outcomeUnknown
         }
+        activeTurns[destination]?.stopRequested = true
         active.task.cancel()
         guard let card = active.card else { return .outcomeUnknown }
         if let phase = await Self.waitForTerminal(card) {
             guard phase == .canceled else { return .outcomeUnknown }
-            // The card's .canceled phase IS the cooperative-cancellation
-            // evidence. Release the chat slot now instead of waiting for the
-            // task's receipt-writing tail — a confirmed stop must never leave
-            // snapshot(destination:).isRunning true. The task's own finishTurn call
-            // becomes a no-op (same-id guard).
-            await finishTurn(destination: destination, turnId: active.id)
+            // Stopped presentation does not release ownership. Quit and idle
+            // waiters still join this task through its receipt/ingress tail.
+            if activeTurns[destination]?.id == active.id {
+                activeTurns[destination]?.stopConfirmed = true
+            }
             return commands.contains(where: { commandTasks[$0] != nil }) ? .outcomeUnknown : .confirmed
         }
         await card.transition(
@@ -495,8 +477,7 @@ public actor TelegramTurnCoordinator {
         }
     }
 
-    // 2026-09-06: command creation and registration are atomic with shutdown.
-    // Admission still releases ingress before the command's reply send finishes.
+    // Register commands atomically with shutdown; admission releases intake before replies finish.
     @discardableResult
     func runCommandUntilAdmitted(
         destination: TelegramDestination? = nil,
@@ -504,14 +485,7 @@ public actor TelegramTurnCoordinator {
     ) async -> Bool {
         guard !isShuttingDown else { return false }
         let id = UUID()
-        let generation = shutdownGeneration
         return await withCheckedContinuation { (admission: CheckedContinuation<Bool, Never>) in
-            // 2026-09-06: admission accepted before shutdown cannot register
-            // in a replacement lifecycle, even after the shutdown flag resets.
-            guard !isShuttingDown, shutdownGeneration == generation else {
-                admission.resume(returning: false)
-                return
-            }
             commandDestinations[id] = destination
             commandTasks[id] = Task {
                 await operation { admission.resume(returning: true) }
@@ -522,7 +496,6 @@ public actor TelegramTurnCoordinator {
     }
 
     public func shutdown() async {
-        shutdownGeneration &+= 1
         isShuttingDown = true
         for queued in queuedTurns.values.flatMap({ $0 }) { queued.onDiscard?() }
         queuedTurns.removeAll()
@@ -534,9 +507,7 @@ public actor TelegramTurnCoordinator {
         commandTasks.removeAll()
         commandDestinations.removeAll()
         queuedTurns.removeAll()
-        // 2026-09-06: nothing is running after shutdown, so no update id may
-        // stay marked in-flight — a leftover mark would keep the recovery pass
-        // off a claim that really is orphaned.
+        // Clear live ownership so orphaned claims remain recoverable after shutdown.
         inFlightUpdateIds.removeAll()
         isShuttingDown = false
     }
@@ -546,7 +517,7 @@ public actor TelegramTurnCoordinator {
         let last = lastMessages[destination]
         return TelegramTurnSnapshot(
             chatId: destination.chatId,
-            isRunning: active != nil,
+            isRunning: active.map { !$0.stopConfirmed } ?? false,
             startedAt: active?.startedAt,
             promptPreview: active?.promptPreview,
             lastUserMessagePreview: last.map { Self.preview($0.text) },

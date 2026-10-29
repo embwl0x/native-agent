@@ -4,15 +4,7 @@ import NativeAgentShared
 import PersistenceCore
 // Blueprint: | `HerScreenRooms+Core.swift` | `HerScreen`: `familyRoom`, `coreAction`, `coreProjection` |
 
-/// Families on her screen (2026-09-24, tool discovery). Every capability is a
-/// name she can open, the way a person opens an app: home's PLACES lists the
-/// families, and a family with no room of its own opens as its actions, one
-/// line per tool with the arguments it takes, so the next call is that tool.
-/// tool_catalog was her discovery path (188 calls in September, half followed
-/// by a separate tool_load); this is the one a person would use.
-///
-/// Rooms other slices build (mail, calendar, browser…) resolve first; this is
-/// only what a name opens when nothing else claims it.
+/// Named families expose action arguments when no dedicated room claims the name.
 extension HerScreen {
     struct Family { let name: String; let about: String; let tools: [String] }
 
@@ -38,8 +30,7 @@ extension HerScreen {
         let visible = port.modelVisibleCatalogToolNames(Set(schemas.map(\.name)))
         // A tool folded into app is that app action: the line names it so.
         let tools = schemas.filter { visible.contains($0.name) || port.appAction($0.name) != nil }.sorted { $0.name < $1.name }
-        // A room, not a schema dump (desk walk 09-24): what each thing does in
-        // words, what it needs, and the one call that does it.
+        // Each action shows what it does, its arguments and an offered call.
         let shown = tools.prefix(8)
         var rows: [String] = [], verbs: [(String, String)] = []
         for schema in shown {
@@ -63,17 +54,15 @@ extension HerScreen {
     }
 }
 
-/// Her own places as rooms like mail and music (desk walk 2, 09-24): notify
-/// and status read as what the place is and its verbs in words
-/// (`notify.mac`, `status.doctor`), never raw tool names. Finding an action
-/// is app {find}; there is no tools room.
+/// Rooms describe their places and offered verbs (`notify.mac`, `status.doctor`).
+/// Action discovery uses app {find}.
 extension HerScreen {
     static let coreDestinations: [AgentWorkspaceDestination] = [
         .init(id: "notify", title: "Notify", summary: "Send a notification now to this Mac or the paired phone; no read.",
               tool: nil, tools: ["mac_notify", "mobile_notify"]),
         .init(id: "status", title: "Status", summary: "Health: doctor, Telegram, Mac. Turns: app {action:\"trace.recent\"}; time: app {action:\"time.now\"}.",
               tool: nil, tools: ["system_info"]),
-        // A room, not a tool listing (walk 4: "1 things to do"). Nothing is read until a verb asks.
+        // Activity is read only when a verb asks.
         .init(id: "activity", title: "Activity", summary: "On-device app use and duration; read only when asked.",
               tool: nil, tools: ["activity_query"]),
     ]
@@ -101,7 +90,7 @@ extension HerScreen {
     }
 
     /// The doctor check as a room: the overall word, then what is not ok first.
-    static func coreProjection(tool: String, input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection? {
+    static func coreProjection(tool: String, input: [String: JSONValue], result: JSONValue) -> WorkspacePage? {
         guard tool == "app", input["item"] == .string("doctor"), case .object(let read) = result,
               case .object(let row)? = read["item"], row["checks"] != nil else { return nil }
         func text(_ value: JSONValue?) -> String? { if case .string(let s)? = value, !s.isEmpty { return s }; return nil }

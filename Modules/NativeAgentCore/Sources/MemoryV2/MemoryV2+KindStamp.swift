@@ -1,24 +1,5 @@
-// U3 wave-2 item 5a (2026-06-10): write-time kind stamping.
-//
-// Audit fact: decay/supersession shipped in wave 1 but are inert on 100% of
-// rows because ALL 32 live rows lack metadata.kind. This file is the
-// write-side half of the fix: every NEW write through the store path gets a
-// metadata.kind. The signal rule is deliberately conservative — memory
-// SEMANTICS (kinds, decay rates, supersession) are Agent/user-owned:
-//
-//   * caller/extractor-provided kind (the #1 signal-carry that already flows
-//     through propose() → acceptProposal()) is honored verbatim and NEVER
-//     overwritten — it is the cheapest reliable signal available at write
-//     time;
-//   * absent that, the row is stamped kind "general" + kind_source
-//     "write_default_v1". "general" maps to decayFactor 1.0 (it is not in
-//     memoryDecayHalfLifeDays) and is not in
-//     memorySupersessionSingleValuedKinds, so behavior is UNCHANGED until
-//     Agent/the user approve kinds/rates. We do NOT regex-guess identity/location/
-//     employment at write time: a heuristic stamp in those kinds would
-//     activate the supersession archiver on the next approved hygiene run
-//     without any human having seen the label. Real classification is the
-//     approval-gated LLM backfill (MemoryV2+KindBackfill.swift).
+// Every store write preserves a supplied kind or stamps "general" with kind_source "write_default_v1".
+// The default leaves decay unchanged; classification and decay rates require agent/user approval.
 //
 // kind_source provenance keeps default-stamped rows visible to future
 // backfill passes: "write_default_v1" means "machine default, still
@@ -28,14 +9,13 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `MemoryV2+KindStamp.swift` | `MemoryKindStamp`: conservative write-time memory kind and source metadata defaults |
+// Blueprint: | `MemoryV2+KindStamp.swift` | `MemoryKindStamp`: conservative write-time memory kind and source metadata defaults; the one kind vocabulary (`writerKinds`, `personKinds`) the writer, the explicit save and the person picture share |
 
 public enum MemoryKindStamp {
 
     /// Default kind for writes that carry no kind signal. NOT in
-    /// `memoryDecayHalfLifeDays` (decayFactor 1.0) and NOT in
-    /// `memorySupersessionSingleValuedKinds` — semantics-neutral by
-    /// construction.
+    /// `memoryDecayHalfLifeDays` (decayFactor 1.0). Replacement always requires
+    /// explicit intent, regardless of kind.
     public static let defaultKind = "general"
 
     /// kind_source for the write-time default stamp. Rows carrying this
@@ -45,12 +25,26 @@ public enum MemoryKindStamp {
     /// kind_source written by the approval-gated LLM backfill apply path.
     public static let backfillSource = "backfill_llm_v1"
 
-    /// Allow-list for the approval-gated backfill classifier, not the complete
-    /// kind vocabulary. Explicit caller kinds (including moment and correction)
-    /// pass through write-time stamping unchanged.
+    /// One kind vocabulary serves the memory writer, explicit saves and person-picture admission.
+    public static let writerKinds: [String] = [
+        "identity", "location", "employment", "schedule", "preference",
+        "relationship", "goal", "skill", "fact", "correction",
+    ]
+
+    /// The person picture and pinned core admit these person kinds, including persisted labels.
+    /// Other kinds remain fully recallable outside the picture.
+    public static let personKinds: Set<String> = [
+        "identity", "location", "employment", "schedule", "preference",
+        "relationship", "user_fact", "user_preference", "attribute",
+    ]
+
+    /// A generic `note` without kind_source remains classifiable.
+    public static let genericCommitKind = "note"
+
+    /// Backfill's allow-list includes every writer-named person kind; explicit caller kinds pass through stamping unchanged.
     public static let taxonomy: [String] = [
         "identity", "relationship", "preference", "attribute",
-        "location", "employment", "goal", "skill",
+        "location", "employment", "schedule", "goal", "skill",
         "project", "operational", "volatile",
         "general",
     ]
@@ -89,13 +83,12 @@ public enum MemoryKindStamp {
         }
     }
 
-    /// True when the approval-gated backfill may (re)classify this row:
-    /// either no kind at all (the 32 legacy rows), or only the machine
-    /// write-default stamp. A kind without the write-default source is a
-    /// deliberate signal (caller, extractor, or an approved backfill) and is
-    /// never re-proposed.
+    /// Backfill classifies missing kinds, machine defaults or unsourced `note` rows; deliberate kinds are never re-proposed.
+    /// Backfill changes kind metadata without touching content.
     public static func isClassifiable(_ metadata: JSONValue?) -> Bool {
         guard let k = kind(of: metadata) else { return true }
-        return k == defaultKind && kindSource(of: metadata) == writeDefaultSource
+        let source = kindSource(of: metadata)
+        if k == genericCommitKind, source == nil { return true }
+        return k == defaultKind && source == writeDefaultSource
     }
 }

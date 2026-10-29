@@ -22,7 +22,7 @@ extension AppToolExecutor {
             else if input["offset"] == nil { offset = 0 }
             else { throw PersistenceCoreError.ioFailure("Studio intake offset must be an integer.") }
             return try await SwiftNativeStudioStore(dataRoot: root).encounterIntakePage(
-                kind: Self.inputString(input["kind"]) ?? "", offset: offset, snapshot: Self.inputString(input["snapshot"]))
+                kind: input["kind"]?.scalarText ?? "", offset: offset, snapshot: input["snapshot"]?.scalarText)
         } catch {
             return Self.failure("studio_intake_unavailable", error.localizedDescription, extra: ["effects": .string("none")])
         }
@@ -34,10 +34,10 @@ extension AppToolExecutor {
     func runMake(verb: String, input: [String: JSONValue]) async -> JSONValue {
         let root = securityCenter.dataRoot
         let studio = MakeStudio(dataRoot: root)
-        let ref = Self.inputString(input["ref"])?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        let ref = input["ref"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         if verb == "read" {
             let found: MakeStudio.Meta?
-            do { found = try (ref.isEmpty ? studio.newestRef() : ref).flatMap(studio.readMeta) } catch {
+            do { found = try (ref.isEmpty ? studio.newestMeta() : studio.readMeta(ref)) } catch {
                 return Self.failure("make_unreadable", "Make could not be read: \(error.localizedDescription)", extra: ["effects": .string("none")])
             }
             guard let meta = found else {
@@ -59,7 +59,7 @@ extension AppToolExecutor {
             if let fault = quietHost()?.makeShelfFault { receipt["shelf_fault"] = .string(fault) }
             return .object(receipt)
         }
-        let path = Self.inputString(input["path"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let path = input["path"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !path.isEmpty else { return Self.failure("invalid_input", "Pass path: the file to add to Make.") }
         let file: URL
         let candidate = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
@@ -77,7 +77,7 @@ extension AppToolExecutor {
         }
         do {
             let added = try studio.add(file, ref: ref.isEmpty ? nil : ref,
-                prompt: Self.inputString(input["prompt"]), model: Self.inputString(input["model"]))
+                prompt: input["prompt"]?.scalarText, model: input["model"]?.scalarText)
             return .object(["status": .string("ok"), "ref": .string(added.ref), "version": .int(Int64(added.version.n)),
                             "path": .string(studio.url(added.ref, added.version).path)])
         } catch let refusal as MakeStudio.Refusal {
@@ -95,7 +95,7 @@ extension AppToolExecutor {
     /// make.add, chosen into the turn's own reply.
     @MainActor
     func runReplyAttach(input: [String: JSONValue]) async -> JSONValue {
-        let path = Self.inputString(input["path"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let path = input["path"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !path.isEmpty else { return Self.failure("invalid_input", "Pass path: the image to send with this reply.") }
         guard let choices = ReplyChoices.current else {
             return Self.failure("no_reply", "Only a turn answering a conversation has a reply to attach to. Nothing was attached.")

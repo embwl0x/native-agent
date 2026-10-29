@@ -5,7 +5,7 @@ import NativeAgentShared
 import Observation
 import os
 import PersistenceCore
-// Blueprint: | `SurfaceLayoutStore.swift` | Root-scoped layout store and `SurfaceLayoutLive`; the engine's one observed layout feeds Mac, DeviceSync, quiet Today, page index and live tour stops. `read`/`write` validate one shape/version and preserve replaced bytes; chat fold writes route through `setSurfaceExpanded`. Snapshot reads publish through `LatestRead`; PrivacyMap inventories the whole ui directory, including the previous revision. |
+// Blueprint: | `SurfaceLayoutStore.swift` | Root-scoped layout store and `SurfaceLayoutLive`; the engine's one observed layout feeds Mac, DeviceSync, quiet Today, page index and live tour stops. `read`/`write` validate one shape/version and preserve replaced bytes; chat fold writes route through `setSurfaceExpanded`. Snapshot reads publish through `LatestRead`; PrivacyMap inventories the whole ui directory, including the previous revision. Positive persisted versions and checked increments refuse exhaustion before touching either file. |
 
 /// HOW THE APP LAYS OUT ITS SURFACES, as one file she can read and rewrite:
 /// ui/layout.json (`SurfaceLayout`). The window's views, her home and the
@@ -22,7 +22,7 @@ public enum SurfaceLayoutStore {
         /// The file as last validated: what the window draws.
         var layout: SurfaceLayout
         /// The file's identity when `layout` was read; a change re-reads it.
-        var stamp: String
+        var stamp: SnapshotTailOpLog.FileStamp?
         /// Why the file doesn't read as a layout and how to fix it; nil when it does.
         var problem: String?
         var hasValidatedFile = false
@@ -95,11 +95,11 @@ public enum SurfaceLayoutStore {
                     }
                     let changed = JSONValue.differences(content(state.layout), content(given))
                     guard !changed.isEmpty else {
-                        return .object(["status": .string("unchanged"), "changed": .bool(false), "version": .string(version(state.layout)),
+                        return .object(["status": .string("no_change"), "changed": .bool(false), "version": .string(version(state.layout)),
                                         "detail": .string("That is the layout as it is. Nothing was written.")])
                     }
                     let saved = try commit(given, over: &state, source: "her")
-                    var receipt: [String: JSONValue] = ["status": .string("written"), "changed": .bool(true),
+                    var receipt: [String: JSONValue] = ["status": .string("updated"), "changed": .bool(true),
                         "layout_version": .int(Int64(saved.layoutVersion)), "version": .string(version(saved)),
                         "fields_changed": .array(changed.map(JSONValue.string)), "path": .string(file.path),
                         "previous": .string(previous(state.root).path),
@@ -147,7 +147,13 @@ public enum SurfaceLayoutStore {
     /// The next version: the file it replaces kept as layout.previous.json.
     private static func commit(_ next: SurfaceLayout, over state: inout Loaded, source: String) throws -> SurfaceLayout {
         var saved = next
-        saved.layoutVersion = state.layout.layoutVersion + 1
+        let (version, overflow) = state.layout.layoutVersion.addingReportingOverflow(1)
+        guard !overflow else {
+            throw ToolFailureError("The layout version is exhausted. No write was attempted; the saved layout is preserved.",
+                effects: .none, code: "layout_version_exhausted",
+                instruction: "Repair the layout version while preserving its original bytes before changing the layout.", recovery: .reconcile)
+        }
+        saved.layoutVersion = version
         saved.seededFrom = state.layout.seededFrom
         saved.updatedAt = ISO8601DateFormatter().string(from: Date())
         saved.source = source
@@ -202,6 +208,11 @@ public enum SurfaceLayoutStore {
     /// fatal. A write still refuses a name it does not know.
     private static func validated(_ document: JSONValue, fromFile: Bool = false) throws -> SurfaceLayout {
         var layout = try document.decodedExactly(as: SurfaceLayout.self)
+        // Versions start at one. Int.max is readable but exhausted: commit
+        // reports that boundary before touching either saved file.
+        guard layout.layoutVersion > 0 else {
+            throw JSONValue.ShapeError(description: "layoutVersion must be a positive integer")
+        }
         let known = Dictionary(uniqueKeysWithValues: SurfaceLayout.vocabulary.map { ($0.surface, $0.blocks.map(\.name)) })
         if fromFile {
             layout.surfaces = layout.surfaces.filter { known[$0.key] != nil }
@@ -273,7 +284,7 @@ public enum SurfaceLayoutStore {
     private static func refresh(_ state: inout Loaded) {
         let file = file(state.root)
         let now = stamp(file)
-        guard now != state.stamp else { return }
+        guard now == nil || now != state.stamp else { return }
         state.stamp = now
         do {
             state.layout = try validated(file: file)
@@ -290,7 +301,7 @@ public enum SurfaceLayoutStore {
     private static func scan(_ root: URL) -> Loaded {
         let build = NativeAgentBuildIdentity.current
         seed(file(root), from: "\(build.version) (\(build.build))")
-        var state = Loaded(root: root, layout: SurfaceLayout.seed(from: "", at: ""), stamp: "", problem: nil)
+        var state = Loaded(root: root, layout: SurfaceLayout.seed(from: "", at: ""), stamp: nil, problem: nil)
         refresh(&state)
         return state
     }
@@ -319,10 +330,10 @@ public enum SurfaceLayoutStore {
     }
 
     /// The file's identity, size and times; any change re-reads it.
-    private static func stamp(_ file: URL) -> String {
+    private static func stamp(_ file: URL) -> SnapshotTailOpLog.FileStamp? {
         var info = stat()
-        guard lstat(file.path, &info) == 0 else { return "-" }
-        return "\(info.st_ino) \(info.st_size) \(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec) \(info.st_ctimespec.tv_sec).\(info.st_ctimespec.tv_nsec)"
+        guard lstat(file.path, &info) == 0 else { return errno == ENOENT ? .absent : nil }
+        return SnapshotTailOpLog.FileStamp(info)
     }
 }
 

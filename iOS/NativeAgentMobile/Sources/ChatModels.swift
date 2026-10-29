@@ -2,14 +2,70 @@ import SwiftUI
 import UIKit
 import PhotosUI
 import NativeAgentShared
+import os
+// Blueprint: | `ChatModels.swift` | Chat values, runtime controls and Mac transcript projection onto ChatMessage |
 
-// MARK: - Models
+struct ChatRuntimeControls: Equatable, Sendable, Codable {
+    var model: String
+    var reasoningEffort: String
+    var serviceTier: String = "default"
+    var fileAccess: String
+    var providerId: String = ""
 
-/// 2026-09-06: "the Mac published no transcript for this session" and "the Mac
-/// published an EMPTY transcript for this session" are different facts, and
-/// only the second one is authority to clear the phone's copy. Every layer
-/// used to carry them as one `[ChatMessage]?` and collapse empty to nil, so a
-/// chat cleared on the Mac stayed on the phone forever with no way to say so.
+    /// An empty model leaves resolution to the Mac's Chat group.
+    static let defaults = ChatRuntimeControls(model: "", reasoningEffort: "high", serviceTier: "default", fileAccess: "auto")
+
+    var normalized: ChatRuntimeControls {
+        ChatRuntimeControls(
+            model: model.trimmingCharacters(in: .whitespacesAndNewlines),
+            reasoningEffort: reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines),
+            serviceTier: serviceTier.trimmingCharacters(in: .whitespacesAndNewlines),
+            fileAccess: fileAccess.trimmingCharacters(in: .whitespacesAndNewlines),
+            providerId: providerId.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+
+    func metadata(transport: String) -> [String: String] {
+        let clean = normalized
+        var out: [String: String] = [
+            "clientSurface": "iphone",
+            "source": "ios",
+            "transport": transport,
+            "sourceKey": NativeAgentICloudBridgeConstants.mobileSourceKey,
+            "routeKey": Self.deviceSourceKey
+        ]
+        if !clean.model.isEmpty { out["model"] = clean.model }
+        if !clean.reasoningEffort.isEmpty { out["reasoningEffort"] = clean.reasoningEffort }
+        if !clean.serviceTier.isEmpty { out["serviceTier"] = clean.serviceTier }
+        if !clean.fileAccess.isEmpty { out["fileAccess"] = clean.fileAccess }
+        if !clean.providerId.isEmpty { out["providerId"] = clean.providerId }
+        return out
+    }
+
+    private static let deviceSourceKeyCache = OSAllocatedUnfairLock<String?>(initialState: nil)
+
+    static func makeDeviceSourceKey(deviceName: String) -> String {
+        let name = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? "iphone" : "iphone:\(name)"
+    }
+
+    @MainActor
+    static func primeDeviceSourceKey() {
+        #if canImport(UIKit)
+        let value = makeDeviceSourceKey(deviceName: UIDevice.current.name)
+        #else
+        let value = "iphone"
+        #endif
+        deviceSourceKeyCache.withLock { $0 = value }
+    }
+
+    // Background scanners read the launch-primed key without entering UIKit.
+    static var deviceSourceKey: String {
+        deviceSourceKeyCache.withLock { $0 } ?? "iphone"
+    }
+}
+
+/// Only an explicitly published, newer empty Mac transcript can clear the phone's copy.
 enum MacTranscriptRead: Equatable {
     /// No row for this session in the newest snapshot (still downloading, the
     /// session is not in the published set, or the read failed). Hold last-good.
@@ -29,7 +85,7 @@ enum MacTranscriptRead: Equatable {
     }
 }
 
-struct ChatAttachmentSummary: Identifiable, Codable, Hashable {
+struct ChatAttachmentSummary: Identifiable, Hashable {
     var id: String = UUID().uuidString
     var name: String
     var type: String
@@ -37,6 +93,18 @@ struct ChatAttachmentSummary: Identifiable, Codable, Hashable {
     var base64: String?
     var byteSize: Int?
     var utterance: SpeechUtterance?
+
+    init(_ attachment: MultimodalAttachment, fallbackName: String) {
+        self.init(
+            id: attachment.id,
+            name: attachment.name ?? fallbackName,
+            type: attachment.type,
+            mime: attachment.mime,
+            base64: attachment.base64,
+            byteSize: attachment.byteSize,
+            utterance: attachment.utterance
+        )
+    }
 
     init(
         id: String = UUID().uuidString,
@@ -57,23 +125,12 @@ struct ChatAttachmentSummary: Identifiable, Codable, Hashable {
     }
 }
 
-/// One tool (or skill) firing during an assistant turn. Collected live from
-/// the Mac's `tool_use` progress events so iOS can render the "flip-through"
-/// box and the collapsed "N tools used" summary, the same as the Mac chat.
-/// `seq` is the Mac-side monotonic `toolSeq` — used for ordering and de-duping
-/// out-of-order / duplicate iCloud KVS delivery.
-struct ToolEvent: Codable, Hashable, Identifiable {
-    var id: String { "\(seq)-\(name)" }
-    let name: String
-    let seq: Int
-    /// The Mac's phrase for it ("Working in Mail"); nil from an older Mac.
-    var activity: String? = nil
-    var outcome: String? = nil
-    var resultDetail: String? = nil
+extension ToolEvent: @retroactive Identifiable {
+    public var id: String { "\(seq)-\(name)" }
 }
 
-struct ChatMessage: Identifiable, Codable, Equatable, Sendable {
-    enum Role: String, Codable { case user, assistant }
+struct ChatMessage: Identifiable, Equatable, Sendable {
+    enum Role: String { case user, assistant }
     let id: UUID
     let role: Role
     var text: String
@@ -95,7 +152,7 @@ struct ChatMessage: Identifiable, Codable, Equatable, Sendable {
 
     var isTerminalReply: Bool {
         role == .assistant && interaction == nil && interactionDescriptor == nil && !isStreaming
-            && (completionState == "completed" || completionState == "incomplete")
+            && (completionState == "completed" || completionState == "incomplete" || completionState == "failed")
     }
 
     init(
@@ -126,46 +183,39 @@ struct ChatMessage: Identifiable, Codable, Equatable, Sendable {
         self.interactionSessionID = interactionSessionID
     }
 
-    enum CodingKeys: String, CodingKey {
-        case id, role, text, isStreaming, attachments, toolEvents, awaitingMacTranscript
-        case runId, turnID, failureDetail, completionState
-        case interaction, interactionDescriptor, interactionSessionID
-    }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decode(UUID.self, forKey: .id)
-        role = try c.decode(Role.self, forKey: .role)
-        text = try c.decode(String.self, forKey: .text)
-        isStreaming = try c.decodeIfPresent(Bool.self, forKey: .isStreaming) ?? false
-        attachments = try c.decodeIfPresent([ChatAttachmentSummary].self, forKey: .attachments) ?? []
-        toolEvents = try c.decodeIfPresent([ToolEvent].self, forKey: .toolEvents) ?? []
-        awaitingMacTranscript = try c.decodeIfPresent(Bool.self, forKey: .awaitingMacTranscript) ?? false
-        runId = try c.decodeIfPresent(String.self, forKey: .runId)
-        turnID = try c.decodeIfPresent(String.self, forKey: .turnID)
-        failureDetail = try c.decodeIfPresent(String.self, forKey: .failureDetail)
-        completionState = try c.decodeIfPresent(String.self, forKey: .completionState)
-        interaction = try c.decodeIfPresent(InlineInteraction.self, forKey: .interaction)
-        interactionDescriptor = try c.decodeIfPresent(InlineInteractionDescriptor.self, forKey: .interactionDescriptor)
-        interactionSessionID = try c.decodeIfPresent(String.self, forKey: .interactionSessionID)
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(id, forKey: .id)
-        try c.encode(role, forKey: .role)
-        try c.encode(text, forKey: .text)
-        try c.encode(isStreaming, forKey: .isStreaming)
-        try c.encode(attachments, forKey: .attachments)
-        if !toolEvents.isEmpty { try c.encode(toolEvents, forKey: .toolEvents) }
-        if awaitingMacTranscript { try c.encode(true, forKey: .awaitingMacTranscript) }
-        try c.encodeIfPresent(runId, forKey: .runId)
-        try c.encodeIfPresent(turnID, forKey: .turnID)
-        try c.encodeIfPresent(failureDetail, forKey: .failureDetail)
-        try c.encodeIfPresent(completionState, forKey: .completionState)
-        try c.encodeIfPresent(interaction, forKey: .interaction)
-        try c.encodeIfPresent(interactionDescriptor, forKey: .interactionDescriptor)
-        try c.encodeIfPresent(interactionSessionID, forKey: .interactionSessionID)
+    nonisolated static func projectChatRecords(_ records: [ChatMessageRecord]) -> [ChatMessage] {
+        // Project metadata.attachments into chat summaries so snapshot refresh preserves attachments.
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return records.compactMap { rec in
+            let roleStr = rec.role
+            let interaction = rec.interactionJSON.flatMap { try? decoder.decode(InlineInteraction.self, from: Data($0.utf8)) }
+            let descriptor = rec.interactionDescriptorJSON.flatMap { try? decoder.decode(InlineInteractionDescriptor.self, from: Data($0.utf8)) }
+            guard roleStr == "user" || roleStr == "assistant" || interaction != nil else { return nil }
+            let role: ChatMessage.Role = roleStr == "user" ? .user : .assistant
+            let uuid = UUID(uuidString: rec.id) ?? UUID()
+            let attachments: [ChatAttachmentSummary] = (rec.metadata?.attachments ?? []).map { a in
+                ChatAttachmentSummary(
+                    id: a.id,
+                    name: a.name ?? "attachment",
+                    type: a.type,
+                    mime: a.mime,
+                    base64: a.preview?.png?.base64EncodedString(),
+                    byteSize: a.byteSize.map(Int.init),
+                    utterance: a.utterance
+                )
+            }
+            var message = ChatMessage(id: uuid, role: role, text: interaction == nil ? rec.content : "", attachments: attachments, runId: rec.runId,
+                interaction: interaction, interactionDescriptor: descriptor, interactionSessionID: rec.interactionSessionID)
+            message.toolEvents = rec.toolEvents ?? []
+            if roleStr == "assistant" {
+                message.turnID = rec.metadata?.turnTraceId
+                message.failureDetail = rec.metadata?.error
+                message.completionState = rec.metadata?.failureWork != nil || rec.metadata?.error != nil ? "failed"
+                    : rec.metadata?.partial == true || rec.metadata?.cancelled == true ? "incomplete" : rec.metadata?.completionState
+            }
+            return message
+        }
     }
 }
 
@@ -205,43 +255,18 @@ struct ChatSessionTab: Identifiable, Hashable {
     }
 }
 
-/// Whether the human has explicitly picked a chat session since this launch.
-/// Process-scoped for the same reason as the Mac's `MacChatSelectionIntent`:
-/// "this launch" is the window in which their choice is still current.
+/// An explicit session choice lasts this launch; nil follows main.
 @MainActor
 enum MobileChatSelectionIntent {
-    private(set) static var userChoseThisLaunch = false
+    private(set) static var explicitlySelectedSessionID: String?
 
     static func followMain() {
-        userChoseThisLaunch = false
-        notifiedSessionID = nil
+        explicitlySelectedSessionID = nil
     }
 
-    /// 2026-09-06: the conversation a tapped reply notification opened. It is
-    /// an explicit selection, not a pinned tab, so the externally-removed-pin
-    /// reconciler must not read its absence from the pinned snapshot as a pin
-    /// the Mac took away and bounce the user back to the main chat. Cleared the
-    /// moment the human picks any other session.
-    private(set) static var notifiedSessionID: String?
-
-    /// Called wherever the human's own intent selects a session — tapping a
-    /// tab, or starting a new chat.
-    static func noteUserChoice() {
-        userChoseThisLaunch = true
-        notifiedSessionID = nil
-    }
-
-    /// A tapped reply notification chose this session.
-    static func noteNotifiedSelection(_ sessionID: String?) {
-        userChoseThisLaunch = true
-        let clean = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
-        notifiedSessionID = (clean?.isEmpty == false) ? clean : nil
-    }
-
-    /// Test seam. Production never calls this; a launch has exactly one start.
-    static func resetForTesting() {
-        userChoseThisLaunch = false
-        notifiedSessionID = nil
+    static func selectSession(_ sessionID: String) {
+        let clean = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
+        explicitlySelectedSessionID = clean.isEmpty ? nil : clean
     }
 }
 
@@ -249,7 +274,7 @@ enum MobileChatSelectionIntent {
 /// session plus the exact ordered Mac-owned pinned snapshot—never a second
 /// source-based definition of what counts as a tab. The conversation anchor,
 /// when there is one, rides at the front of the pinned run as a derived tab.
-enum ChatSessionTabProjection {
+enum ChatSessionTabs {
     static func make(
         mainSessionID: String?,
         mainTitle: String,

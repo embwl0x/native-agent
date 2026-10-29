@@ -1,4 +1,5 @@
 import UserNotifications
+import NativeAgentShared
 
 // The system expiry callback races donation. The lock owns both retained
 // fields and makes delivery exactly once across those callbacks.
@@ -11,7 +12,7 @@ final class NotificationService: UNNotificationServiceExtension, @unchecked Send
                             withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void) {
         // UNNotificationContent is immutable; its ObjC declaration lacks
         // Sendable. Do not carry the framework-owned request into the task.
-        nonisolated(unsafe) let content = MobileNotificationRouting.categorized(request.content)
+        nonisolated(unsafe) let content = request.content
         lock.lock()
         handler = contentHandler
         original = content
@@ -23,12 +24,12 @@ final class NotificationService: UNNotificationServiceExtension, @unchecked Send
                 retainForExpiry(routed)
                 do { alert = try await CommunicationNotification.decorate(routed) }
                 catch {
-                    NSLog("[NativeAgentMobile] Communication notification unavailable: %@", error.localizedDescription)
+                    ModuleLog(category: "NativeAgentMobile")("[NativeAgentMobile] Communication notification unavailable: %@", error.localizedDescription)
                     alert = routed
                 }
             }
             catch {
-                NSLog("[NativeAgentMobile] Notification routing unavailable: %@", error.localizedDescription)
+                ModuleLog(category: "NativeAgentMobile")("[NativeAgentMobile] Notification routing unavailable: %@", error.localizedDescription)
                 alert = content
             }
             finish(alert)
@@ -36,7 +37,7 @@ final class NotificationService: UNNotificationServiceExtension, @unchecked Send
     }
 
     override func serviceExtensionTimeWillExpire() {
-        NSLog("[NativeAgentMobile] Communication notification service deadline expired")
+        ModuleLog(category: "NativeAgentMobile")("[NativeAgentMobile] Communication notification service deadline expired")
         finish(nil)
     }
 

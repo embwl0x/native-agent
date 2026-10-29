@@ -22,14 +22,14 @@ enum InteractionCardDelivery {
     static func answer(payload: [String: String], actionID: String, clientID: String, dataRoot: URL) async throws -> [String: String] {
         try await InlineInteractionDelivery.answer(payload: payload, actionID: actionID,
             clientID: clientID, dataRoot: dataRoot, controls: {
-                NativeAgentAppCoordinator.shared.appModel.map(AppInlineInteractionControlPort.init)
+                ApplicationLifetime.shared.appModel.map(AppInlineInteractionControlPort.init)
             })
     }
 
     @MainActor
     static func act(id: String, action: String, dataRoot: URL, quiet: Bool = false) async throws {
         try await InlineInteractionDelivery.act(id: id, action: action, dataRoot: dataRoot, quiet: quiet) { pointer in
-            guard let appModel = NativeAgentAppCoordinator.shared.appModel else {
+            guard let appModel = ApplicationLifetime.shared.appModel else {
                 throw NSError(domain: "InteractionCard", code: 2, userInfo: [
                     NSLocalizedDescriptionKey: "Open NativeAgent on your Mac to finish this request."
                 ])
@@ -48,7 +48,7 @@ enum InteractionCardDelivery {
                     NSLocalizedDescriptionKey: "This request is unavailable. Refresh Activity and try again."
                 ])
             }
-            _ = NativeAgentAppCoordinator.shared.request(.sidebar(.chat))
+            _ = ApplicationLifetime.shared.request(.sidebar(.chat))
         }
     }
 }
@@ -57,11 +57,11 @@ enum InteractionCardDelivery {
 @MainActor
 struct AppInlineInteractionPlatformPort: InlineInteractionPlatformPort {
     func interactionControls() -> (any InlineInteractionControlPort)? {
-        NativeAgentAppCoordinator.shared.appModel.map(AppInlineInteractionControlPort.init)
+        ApplicationLifetime.shared.appModel.map(AppInlineInteractionControlPort.init)
     }
 
     func probeAppleEventApp(_ name: String) async -> String {
-        await SystemAppleScriptAdapter.automationStatus(app: name, ask: false)
+        await AppleScriptExecution.automationStatus(app: name, ask: false)
     }
 
     func mailListRecent(input: [String: JSONValue]) async throws -> JSONValue {
@@ -73,7 +73,7 @@ struct AppInlineInteractionPlatformPort: InlineInteractionPlatformPort {
         return (status.enabled, status.state == .connected)
     }
 
-    var chromeSteps: String { InlineCardProjection.chromeSteps }
+    var chromeSteps: String { InlineCards.chromeSteps }
 
     func pairedPhoneCount() async -> Int {
         await NativeAgentEngine.liveDeviceSync.pairedPhones.pairedCount()
@@ -86,7 +86,7 @@ struct AppInlineInteractionPlatformPort: InlineInteractionPlatformPort {
     }
 
     func providers() async throws -> [InlineInteractionProviderStatus] {
-        try await NativeAgentEngine.live.providers.list().map {
+        try await NativeAgentEngine.live.providers.list().providers.map {
             (providerID: $0.provider_id, displayName: $0.display_name,
              authState: $0.auth_status.state, eligible: $0.auth_status.eligible, defaultModel: $0.default_model,
              firstModel: $0.models.first?.id)
@@ -138,15 +138,14 @@ struct AppInlineInteractionControlPort: InlineInteractionControlPort {
             if let raw = NativeOAuthFlow.saveAnthropicSetupToken(value) {
                 return (NativeOAuthFlow.inlineSetupFailureReason(raw, service: "Claude", secret: "setup token", typed: [value]), nil)
             }
-            await appModel.loadProvidersForChat()
             await appModel.adoptProviderForBlankSurfaces(provider)
             return (nil, nil)
         }
         let outcome = await NativeOAuthFlow.saveInlineProviderKey(
             value, providerName: InlineInteractionRegistry.providerDisplayName(provider),
-            testProvider: { try await appModel.testProvider(provider, apiKeyOverride: value) },
+            testProvider: { try await appModel.engine.providers.testProvider(provider, apiKeyOverride: value) },
             configureProvider: {
-                try await appModel.configureProvider(provider, apiKey: value, authMode: "api_key", defaultModel: nil)
+                try await appModel.engine.configureProvider(provider, apiKey: value, authMode: "api_key", defaultModel: nil)
             }
         )
         return (outcome.error, outcome.note)
@@ -154,9 +153,8 @@ struct AppInlineInteractionControlPort: InlineInteractionControlPort {
 
     func signInProvider(_ signIn: InlineInteractionRegistry.ProviderSignIn, dataRoot: URL) async -> String? {
         let result = await NativeOAuthFlow.startOAuthFlow(platform: NativeOAuthPlatform.self,
-            providerId: signIn.oauthProviderID, dataRoot: appModel.dataRootOverride ?? dataRoot)
+            providerId: signIn.oauthProviderID, dataRoot: dataRoot)
         if result.ok {
-            await appModel.loadProvidersForChat()
             await appModel.adoptProviderForBlankSurfaces(signIn.oauthProviderID)
             return nil
         }
@@ -175,7 +173,7 @@ struct AppInlineInteractionControlPort: InlineInteractionControlPort {
     }
 
     func saveProviderGroupSelection(group: ProviderSurfaceGroup, providerID: String?, model: String) async throws {
-        _ = try await appModel.saveProviderGroupSelection(group: group, providerID: providerID, model: model)
+        _ = try await appModel.engine.saveProviderGroupSelection(group: group, providerID: providerID, model: model)
     }
 }
 
@@ -216,8 +214,8 @@ extension AppInlineInteractionPlatformPort {
         let rows = (try? await NativeAgentEngine.live.inbox.list()) ?? []
         return rows.compactMap { row in
             guard row.id.hasPrefix("interaction:"), ["unread", "read"].contains(row.status),
-                  let session = row.chat_session_id, !session.isEmpty else { return nil }
-            return (id: String(row.id.dropFirst("interaction:".count)), sessionID: session)
+                  let pointer = try? InlineInteractionDelivery.Pointer(item: row) else { return nil }
+            return (id: pointer.interactionID, sessionID: pointer.sessionID)
         }
     }
 
@@ -246,93 +244,58 @@ extension AppInlineInteractionPlatformPort {
             userInfo: ["screen": "inbox", "source": InlineInteractionDelivery.source, "itemId": id], pinnedTo: .phone)
     }
 
-    var telegramApprovalFiler: TelegramApprovalFiler? { TelegramApprovalFilerRef.shared.current() }
+    var telegramApprovalFiler: TelegramApprovalFiler? { ApprovalChatCards.runningTelegram }
 }
 
 /// Reuse the chat card and its existing controls without copying its state to
 /// User's conversation or changing the session that a tap resumes.
 struct InteractionInboxCard: View {
-    /// The card's inbox note id, or the original card itself (a chat mirror).
-    let noteID: String
-    var pinned: InlineInteractionDelivery.Pointer? = nil
-    /// Above the chat only what still needs an answer shows; a receipt
-    /// belongs in its conversation, never pinned over this one.
-    var hidesAnswered = false
-    private var observesOrigin = true
-    init(item: InboxItemRecord) { noteID = item.id; hidesAnswered = true }
-    init(mirrorOf pointer: InlineInteractionDelivery.Pointer, hidesAnswered: Bool = false,
-         binding: InlineInteractionChatBinding? = nil) {
-        noteID = "interaction:\(pointer.interactionID)"
-        pinned = pointer
-        self.hidesAnswered = hidesAnswered
-        observesOrigin = binding == nil
-        if let binding { _binding = State(initialValue: binding) }
+    let origin: Result<InlineInteractionDelivery.Pointer, Error>
+    init(item: InboxItemRecord, binding: InlineInteractionChatBinding) {
+        origin = Result { try .init(item: item) }
+        self.binding = binding
     }
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.chatPageIsVisible) private var chatPageIsVisible
-    @State private var binding = InlineInteractionChatBinding()
-    @State private var pointer: InlineInteractionDelivery.Pointer?
-    @State private var loaded = false
+    let binding: InlineInteractionChatBinding
+    @State private var isRetrying = false
 
     var body: some View {
         VStack(alignment: .leading) {
-            if let pointer, let card = appModel.engine.transcripts.card(id: pointer.interactionID, in: pointer.sessionID),
-               !hidesAnswered || card.needsAttention {
-                InlineCardView(model: card) { action in
-                    binding.handle(card: card, action: action, appModel: appModel)
+            if case .failure(let error) = origin {
+                Text(error.localizedDescription).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+                Button("Try again") { Task { await retry() } }.disabled(isRetrying)
+            } else if case .success(let pointer) = origin {
+                if let card = appModel.engine.transcripts.card(id: pointer.interactionID, in: pointer.sessionID),
+                   card.needsAttention {
+                    InlineCardView(model: card) { action in
+                        binding.handle(card: card, action: action, appModel: appModel)
+                    }
+                    .padding(.bottom, 8)
+                } else if case .unavailable(let reason) = appModel.engine.transcripts.transcriptReadStatus(for: pointer.sessionID) {
+                    Text(reason).font(.caption).foregroundStyle(.red).textSelection(.enabled)
+                    Button("Try again") { Task { await retry() } }.disabled(isRetrying)
+                } else if case .loading = appModel.engine.transcripts.transcriptReadStatus(for: pointer.sessionID) {
+                    ProgressView()
                 }
-                .padding(.bottom, hidesAnswered ? 8 : 0)
-            } else if let pointer,
-                      case .unavailable(let reason) = appModel.engine.transcripts.transcriptReadStatus(for: pointer.sessionID) {
-                Text(reason).font(.caption).foregroundStyle(.red).textSelection(.enabled)
-            } else if !loaded {
-                ProgressView()
             }
             // Loaded with no card: answered or gone, so nothing is left to show.
-        }
-        .sheet(item: Binding(get: { binding.connectorSheet }, set: { request in
-            if request == nil { Task { await binding.connectorSheetClosed() } }
-        })) { request in
-            ConnectorWizardView(provider: request.provider) {
-                Task { await binding.connectorSheetClosed() }
-            }
-            .environment(appModel)
-        }
-        .sheet(isPresented: Binding(get: { binding.panelPage != nil }, set: { shown in
-            if !shown { Task { await binding.panelClosed() } }
-        })) {
-            if let page = binding.panelPage {
-                SimpleSetupPanel(showsClose: true, close: {
-                    Task { await binding.panelClosed() }
-                }) {
-                    InlineCardSetupPresentation.page(page)
-                }
-                .frame(minWidth: 700, minHeight: 540)
-                .environment(appModel)
-            }
-        }
-        .task(id: noteID) {
-            do {
-                let root = appModel.engine.transcripts.dataRoot
-                let origin: InlineInteractionDelivery.Pointer
-                if let pinned { origin = pinned } else {
-                    origin = try await InlineInteractionDelivery.pointer(id: noteID, dataRoot: root)
-                }
-                pointer = origin
-                if observesOrigin { await appModel.engine.transcripts.refreshCards(in: origin.sessionID) }
-            } catch {}
-            loaded = true
-        }
-        .onReceive(NotificationCenter.default.publisher(for: InlineInteractionWire.changedNotification)) { event in
-            guard observesOrigin, let pointer, event.object as? String == pointer.sessionID else { return }
-            Task { await appModel.engine.transcripts.refreshCards(in: pointer.sessionID) }
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await binding.verifyOnReturn() } }
         }
         .onChange(of: chatPageIsVisible) { _, visible in
             if visible { Task { await binding.verifyOnReturn() } }
+        }
+    }
+
+    private func retry() async {
+        isRetrying = true
+        defer { isRetrying = false }
+        switch origin {
+        case .success(let pointer): await appModel.engine.transcripts.refreshCards(in: pointer.sessionID)
+        case .failure: await appModel.engine.inbox.refresh()
         }
     }
 }

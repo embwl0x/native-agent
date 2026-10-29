@@ -1,22 +1,25 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `ToolResultSections.swift` | `ToolResultSections` enum; `pages`; complete line/value records, search records first and then shortest fields first (a result's verdict before its bulk), source-order query selection, raw references for oversized records |
+// Blueprint: | `ToolResultSections.swift` | `ToolResultSections` enum; `pages`; complete line/value records, search records first and then shortest fields first (a result's verdict before its bulk), source-order query selection, oversized structured records expand by child path; raw references remain for oversized atoms |
 
 /// Complete values and lines for reading; the retained byte stream remains
 /// available separately for exact reconstruction, including unusually large atoms.
 package enum ToolResultSections {
     package static let pageBudget = 24_000
 
-    package static func pages(content: String, query: String = "", budget: Int = pageBudget) -> [[JSONValue]] {
-        pages(sections: projection(content: content, budget: budget), query: query, budget: budget)
-    }
-
-    static func projection(content: String, budget: Int) -> [(value: JSONValue, text: String, bytes: Int)] {
+    package static func projection(content: String, value: JSONValue?, budget: Int) -> [(value: JSONValue, text: String, bytes: Int)] {
         var sections: [(value: JSONValue, text: String, bytes: Int)] = []
         func append(_ value: JSONValue, path: [JSONValue], line: Int? = nil) {
+            let encoded = (try? value.serialize(pretty: false)) ?? ""
+            // A large structured section has named children. Page those
+            // children instead of making the reader reconstruct raw JSON.
+            if (value.objectValue != nil || value.arrayValue != nil),
+               encoded.utf8.count > budget - 1_024 {
+                visit(value, path: path)
+                return
+            }
             var row: [String: JSONValue] = ["path": .array(path), "value": value]
             if let line { row["line"] = .int(Int64(line)) }
-            let encoded = (try? value.serialize(pretty: false)) ?? ""
             if encoded.utf8.count > budget - 1_024 {
                 row.removeValue(forKey: "value")
                 row["omitted_bytes"] = .int(Int64(encoded.utf8.count))
@@ -32,12 +35,14 @@ package enum ToolResultSections {
             }
             // Paths are source content too: a large key can outweigh its value.
             // Keep the exact location in raw recovery rather than exceed the page.
-            if ((try? JSONValue.object(row).serialize(pretty: false))?.utf8.count ?? 0) > budget - 2 {
+            var rowBytes = (try? JSONValue.object(row).serialize(pretty: false))?.utf8.count ?? 0
+            if rowBytes > budget - 2 {
                 row = [
                     "raw_byte_start": .int(0),
                     "raw_byte_end": .int(Int64(content.utf8.count)),
                     "detail": .string("This section and its location are too large for one page. Read the original with raw=true and follow next_page; nothing was discarded."),
                 ]
+                rowBytes = (try? JSONValue.object(row).serialize(pretty: false))?.utf8.count ?? 0
             }
             // Match actual Unicode words, not the transport's ASCII escapes.
             let searchable: String
@@ -45,8 +50,7 @@ package enum ToolResultSections {
             else if let data = try? JSONEncoder().encode(value) {
                 searchable = String(decoding: data, as: UTF8.self)
             } else { searchable = encoded }
-            let section = JSONValue.object(row)
-            sections.append((section, searchable, ((try? section.serialize(pretty: false))?.utf8.count ?? 0) + 1))
+            sections.append((.object(row), searchable, rowBytes + 1))
         }
         func visit(_ value: JSONValue, path: [JSONValue]) {
             switch value {
@@ -87,27 +91,20 @@ package enum ToolResultSections {
             default: append(value, path: path)
             }
         }
-        visit((try? JSONValue.parse(Data(content.utf8))) ?? .string(content), path: [])
+        visit(value ?? .string(content), path: [])
         return sections
     }
 
-    static func pages(sections projection: [(value: JSONValue, text: String, bytes: Int)], query: String, budget: Int) -> [[JSONValue]] {
-        var sections = projection
+    package static func pages(sections projection: [(value: JSONValue, text: String, bytes: Int)], query: String, budget: Int) -> [[JSONValue]] {
         let terms = query.split(whereSeparator: \.isWhitespace).map(String.init)
-        if !terms.isEmpty {
-            sections = sections.filter { section in
-                terms.allSatisfy { section.text.localizedCaseInsensitiveContains($0) }
-            }
-        }
         var pages: [[JSONValue]] = [[]]
         var bytes = 2
-        for section in sections {
-            let size = section.bytes
-            if bytes + size > budget, !pages[pages.count - 1].isEmpty {
+        for section in projection where terms.allSatisfy({ section.text.localizedCaseInsensitiveContains($0) }) {
+            if bytes + section.bytes > budget, !pages[pages.count - 1].isEmpty {
                 pages.append([]); bytes = 2
             }
             pages[pages.count - 1].append(section.value)
-            bytes += size
+            bytes += section.bytes
         }
         return pages
     }

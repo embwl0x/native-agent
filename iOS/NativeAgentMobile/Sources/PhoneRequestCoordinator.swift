@@ -1,6 +1,6 @@
 import CoreLocation
 import Foundation
-import Network
+import Combine
 import NativeAgentShared
 import PhotosUI
 import SwiftUI
@@ -12,8 +12,8 @@ import AVFoundation
 /// are separate so a retry never opens a second picker or repeats a location fix.
 /// CLLocationManager is created on the main run loop, which owns its callbacks.
 @MainActor
-final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency CLLocationManagerDelegate {
-    static let shared = PhoneRequestCoordinator()
+final class PhoneRequests: NSObject, ObservableObject, @preconcurrency CLLocationManagerDelegate {
+    static let shared = PhoneRequests()
     @Published private(set) var active: PhoneRequest?
     @Published var errorMessage: String?
     private struct Record: Codable, Sendable {
@@ -44,8 +44,7 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
     private var loadTask: Task<History, Error>?
     private var loaded = false
     private var publishing = false
-    private let connectivity = NWPathMonitor()
-    private var wasConnected = false
+    private var connectivity: AnyCancellable?
     private var recoveryQueued = false
     private var deadline: Task<Void, Never>?
     private var locationManager: CLLocationManager?
@@ -55,16 +54,12 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
 
     override private init() {
         super.init()
-        connectivity.pathUpdateHandler = { [weak self] path in
-            let connected = path.status == .satisfied
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                let recovered = connected && !self.wasConnected
-                self.wasConnected = connected
-                if recovered { self.syncDidSucceed() }
+        NetworkPathObserver.shared.start()
+        connectivity = NetworkPathObserver.shared.$isOffline.removeDuplicates()
+            .filter { $0 == false }
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in self?.syncDidSucceed() }
             }
-        }
-        connectivity.start(queue: DispatchQueue(label: "phone-request-connectivity"))
     }
 
     private func load() async throws {
@@ -130,7 +125,7 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
                   request.expiresAt.timeIntervalSince(message.timestamp) <= 125,
                   request.expiresAt > message.timestamp,
                   let pairing = AgentNameCache.fingerprint(secret) else {
-                NSLog("[PhoneRequest] Dropping invalid request %@", message.id)
+                ModuleLog(category: "PhoneRequest")("[PhoneRequest] Dropping invalid request %@", message.id)
                 return true
             }
             validRequest = true
@@ -148,7 +143,7 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
             return true
         } catch {
             errorMessage = "Could not accept phone request: \(error.localizedDescription)"
-            NSLog("[PhoneRequest] Could not accept request %@: %@", message.id, error.localizedDescription)
+            ModuleLog(category: "PhoneRequest")("[PhoneRequest] Could not accept request %@: %@", message.id, error.localizedDescription)
             // Malformed requests are terminal; valid requests remain eligible
             // for transport redelivery until acceptance is durable.
             return !validRequest
@@ -328,7 +323,7 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
         Task { await complete(id, status: .completed, values: [
             "latitude": String(location.coordinate.latitude), "longitude": String(location.coordinate.longitude),
             "accuracy_meters": String(location.horizontalAccuracy),
-            "timestamp": ISO8601DateFormatter().string(from: location.timestamp)
+            "timestamp": NativeTimestampFormat.plainZulu(location.timestamp)
         ]) }
     }
 
@@ -403,7 +398,7 @@ final class PhoneRequestCoordinator: NSObject, ObservableObject, @preconcurrency
 
 private struct PhoneCamera: UIViewControllerRepresentable {
     let completion: (UIImage?) -> Void
-    func makeCoordinator() -> Coordinator { Coordinator(completion: completion) }
+    func makeCoordinator() -> PhotoSelection { PhotoSelection(completion: completion) }
     func makeUIViewController(context: Context) -> UIImagePickerController {
         let picker = UIImagePickerController()
         picker.sourceType = .camera
@@ -412,7 +407,7 @@ private struct PhoneCamera: UIViewControllerRepresentable {
         return picker
     }
     func updateUIViewController(_ controller: UIImagePickerController, context: Context) {}
-    final class Coordinator: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
+    final class PhotoSelection: NSObject, UIImagePickerControllerDelegate, UINavigationControllerDelegate {
         let completion: (UIImage?) -> Void
         init(completion: @escaping (UIImage?) -> Void) { self.completion = completion }
         func imagePickerControllerDidCancel(_ picker: UIImagePickerController) { completion(nil) }
@@ -425,7 +420,7 @@ private struct PhoneCamera: UIViewControllerRepresentable {
 
 struct PhoneRequestSheet: View {
     let request: PhoneRequest
-    @ObservedObject var coordinator = PhoneRequestCoordinator.shared
+    @ObservedObject var coordinator = PhoneRequests.shared
     @State private var photo: PhotosPickerItem?
     @State private var working = false
     @State private var camera = false

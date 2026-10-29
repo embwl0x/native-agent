@@ -1,23 +1,9 @@
 import NativeAgentCore
 import Foundation
+import NativeAgentShared
 import GRDB
 import PersistenceCore
-// Blueprint: | `CognitiveSQLiteStore.swift` | `CognitiveSQLiteStore` actor; `backupForDoctor`, `saveNodes` |
-
-struct CognitiveSQLitePruneResult: Sendable, Equatable {
-    var deletedNodes: Int
-    var deletedArtifacts: Int
-    /// Receipts trimmed beyond the retention cap (additive, 2026-07-02 — the
-    /// append-only receipt log was the one unbounded table; User: "we have to
-    /// make sure [it] doesnt wind up becoming a huge pile").
-    var deletedReceipts: Int
-
-    init(deletedNodes: Int, deletedArtifacts: Int, deletedReceipts: Int = 0) {
-        self.deletedNodes = max(0, deletedNodes)
-        self.deletedArtifacts = max(0, deletedArtifacts)
-        self.deletedReceipts = max(0, deletedReceipts)
-    }
-}
+// Blueprint: | `CognitiveSQLiteStore.swift` | `CognitiveSQLiteStore` actor; `backupForDoctor`, `commitMaintenance` |
 
 struct CognitiveArtifactWrite: Sendable, Equatable {
     var kind: String
@@ -30,6 +16,8 @@ struct CognitiveArtifactWrite: Sendable, Equatable {
 struct CognitiveReceiptWrite: Sendable, Equatable {
     var kind: String
     var payload: JSONValue
+    /// When execution began, for a receipt measured at its insertion point.
+    var startedAt: ContinuousClock.Instant? = nil
 }
 
 /// Minimum newest rows retained from each active or migration-compatible
@@ -43,15 +31,16 @@ struct CognitiveReceiptWrite: Sendable, Equatable {
 /// the rest of the table has no unprotected rows left.
 /// Kinds the generic cap never counts or evicts. Cares have no count cap:
 /// lane 3's night fades the unused ones, and the four seeds never go.
-private let cognitiveUnprunedArtifactKinds: Set<String> = ["care", "care_migration", "standing_view", "thought_seed"]
+private let cognitiveUnprunedArtifactKinds: Set<String> = [
+    "care", "care_migration", "care_retired_migration", "standing_view", "thought_seed",
+]
 
 private let cognitiveProtectedArtifactMinimums: [String: Int] = [
     "affect": 32,
     // One row, rewritten in place: the capsule cadence ledger. Tiny, but losing
     // it re-opens a suppressed nag on the next relaunch.
     "capsule_presentation": 1,
-    // One row, rewritten in place, already capped (48 rejections, 24 undo
-    // entries): her own corrections must never be pruned out (Phase 5 B0).
+    // One row: 48 rejections and one disposition undo; her corrections survive pruning.
     "mind_ledger": 1,
     "disposition": 32,
     "emotional_consolidation": 32,
@@ -60,26 +49,11 @@ private let cognitiveProtectedArtifactMinimums: [String: Int] = [
     // Retired from resident cognition, but old rows remain byte-preserved for
     // backup/migration readers rather than being silently deleted at store open.
     "identity_proposal": 32,
-    "standing_view": 60,
     "developmental_timeline": 128,
     "reflection_receipt": 32,
-    "experiment": 20,
 ]
 
-/// Minimum newest rows retained from critical receipt families before generic
-/// FIFO trimming may spend them. Live stores are overwhelmingly microcycle
-/// noise (9,051 of 9,910 rows on 2026-08-28), so preservation here is about
-/// keeping the rare "why did her mind change?" trail — reflection, emotional
-/// consolidation, replay, workshop — available once the table reaches the cap.
-///
-/// BOUNDED WORST CASE — like the artifact floors, this is an eviction ORDERING,
-/// never a veto. pruneReceipts always deletes exactly `count - (cap - slack)`
-/// rows, so the table lands on `cap - slack` after every trim regardless of how
-/// much protected mass exists; protection only decides WHICH rows go. Floors
-/// sum to 8 × 32 = 256 rows against the default cap of 10,000 (slack 256, trim
-/// target 9,744), i.e. 2.6% of the table — every floor is satisfiable at once
-/// with 9,488 rows still free for FIFO. If a caller supplies a cap below 256
-/// the hard cap still wins and the lowest-priority floors are spent.
+/// Receipt floors prioritize critical history for retention without overriding the hard cap.
 private let cognitiveProtectedReceiptMinimums: [String: Int] = [
     "reflection.persona_context": 32,
     "reflection.persona_load_failed": 32,
@@ -121,6 +95,18 @@ enum CognitiveSQLiteReadError: Error, Sendable, Equatable, CustomStringConvertib
     }
 }
 
+enum CognitiveSQLiteCounterError: Error, CustomStringConvertible {
+    case outsideStorageRange(String)
+    case exhausted(String)
+
+    var description: String {
+        switch self {
+        case .outsideStorageRange(let name): "\(name) is outside SQLite's nonnegative signed-integer range"
+        case .exhausted(let name): "\(name) has exhausted SQLite's signed-integer range"
+        }
+    }
+}
+
 public actor CognitiveSQLiteStore {
     private static let maximumMotorConsequenceAdmissions = 4_096
     public let databaseURL: URL
@@ -133,7 +119,7 @@ public actor CognitiveSQLiteStore {
         var config = Configuration()
         // Without a busy timeout GRDB fails a write instantly with SQLITE_BUSY
         // when any second connection (probe CLI, second process) holds the
-        // lock — persistSnapshot's affect/node snapshot would be lost, and
+        // lock — the affect/node checkpoint would be lost, and
         // recordReceipt swallows the throw. Matches every sibling store.
         config.busyMode = .timeout(2)
         config.prepareDatabase { db in
@@ -146,9 +132,7 @@ public actor CognitiveSQLiteStore {
 
     /// Consistent online snapshot through the mounted writer before Doctor restores.
     public func backupForDoctor() throws -> URL {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let name = "cognition.sqlite.doctor-bak-\(formatter.string(from: Date()).replacingOccurrences(of: ":", with: ""))-\(UUID().uuidString)"
+        let name = "cognition.sqlite.doctor-bak-\(NativeTimestampFormat.fractionalZulu(Date()).replacingOccurrences(of: ":", with: ""))-\(UUID().uuidString)"
         let destination = databaseURL.deletingLastPathComponent().appendingPathComponent(name)
         let backup = try DatabaseQueue(path: destination.path)
         try dbQueue.backup(to: backup)
@@ -196,15 +180,6 @@ public actor CognitiveSQLiteStore {
         }
     }
 
-    public func saveNodes(_ nodes: [CognitiveNode], at now: Date) async throws {
-        try await dbQueue.write { db in
-            try db.execute(sql: "DELETE FROM cognitive_nodes")
-            for node in nodes {
-                try Self.insertNode(db, node: node, at: now)
-            }
-        }
-    }
-
     /// Durable, payload-free replay guard for canonical motor projections.
     /// Domain owners remain authoritative; this table only prevents an older,
     /// duplicate, or equal-time contradictory projection from re-entering
@@ -231,9 +206,9 @@ public actor CognitiveSQLiteStore {
                     """,
                 arguments: [actionKey]
             ) {
-                let existingFingerprint: String = existing["semantic_fingerprint"]
+                let existingFingerprint: String = try existing.decode(forColumn: "semantic_fingerprint")
                 if existingFingerprint == fingerprint { return false }
-                let existingOwnerUpdatedAt: Double? = existing["owner_updated_at"]
+                let existingOwnerUpdatedAt: Double? = try existing.decode(forColumn: "owner_updated_at")
                 // Without a strictly newer canonical owner timestamp, a
                 // contradiction is ambiguous and therefore cannot affect the
                 // resident body. Exact later corrections remain admissible.
@@ -269,30 +244,7 @@ public actor CognitiveSQLiteStore {
         }
     }
 
-    public func upsertArtifact(
-        kind: String,
-        id: UUID,
-        status: String,
-        score: Double,
-        payload: JSONValue,
-        at now: Date
-    ) async throws {
-        try await dbQueue.write { db in
-            try Self.upsertArtifact(
-                db,
-                artifact: CognitiveArtifactWrite(
-                    kind: kind,
-                    id: id,
-                    status: status,
-                    score: score,
-                    payload: payload
-                ),
-                at: now
-            )
-        }
-    }
-
-    /// Approval and its capacity releases are one artifact transaction.
+    /// Artifact writes and their capacity releases are one transaction.
     func commitArtifactTransition(
         artifacts: [CognitiveArtifactWrite],
         deletedArtifactIDs: [UUID],
@@ -321,42 +273,10 @@ public actor CognitiveSQLiteStore {
     ) async throws {
         try await dbQueue.write { db in
             for artifact in artifacts {
-                try db.execute(
-                    sql: """
-                    INSERT INTO cognitive_artifacts (
-                        id, kind, status, score, payload_json, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        kind = excluded.kind,
-                        status = excluded.status,
-                        score = excluded.score,
-                        payload_json = excluded.payload_json,
-                        updated_at = excluded.updated_at
-                    """,
-                    arguments: [
-                        artifact.id.uuidString,
-                        artifact.kind,
-                        artifact.status,
-                        (artifact.score).clamped01(),
-                        Self.jsonString(artifact.payload),
-                        now.timeIntervalSince1970,
-                        now.timeIntervalSince1970,
-                    ]
-                )
+                try Self.upsertArtifact(db, artifact: artifact, at: now)
             }
             if let receiptPayload {
-                try db.execute(
-                    sql: """
-                    INSERT INTO cognitive_receipts (id, kind, payload_json, created_at)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    arguments: [
-                        UUID().uuidString,
-                        "replay.integration",
-                        Self.jsonString(receiptPayload),
-                        now.timeIntervalSince1970,
-                    ]
-                )
+                try Self.insertReceipt(db, kind: "replay.integration", payload: receiptPayload, at: now)
             }
             _ = try Self.pruneArtifacts(
                 db,
@@ -371,8 +291,8 @@ public actor CognitiveSQLiteStore {
         }
     }
 
-    /// Commit one complete cognition-maintenance transition. Affect/ambient
-    /// settlement, emotional consolidation, the exact node snapshot, and their receipts all
+    /// Commit one complete cognition-maintenance transition. Affect, consumed
+    /// residue, emotional consolidation, the exact node snapshot, and their receipts all
     /// become durable or none do. This deliberately remains inside the one
     /// canonical cognition store; maintenance does not gain a second ledger.
     func commitMaintenance(
@@ -415,20 +335,72 @@ public actor CognitiveSQLiteStore {
                 """,
                 arguments: [nodeCap]
             )
-            _ = try Self.pruneArtifacts(
+            let deletedNodes = db.changesCount
+            // Remove legacy receipt mirrors even if restored after store open.
+            try db.execute(sql: "DELETE FROM cognitive_artifacts WHERE kind LIKE 'receipt.%'")
+            let deletedMirrors = db.changesCount
+            let deletedArtifacts = try Self.pruneArtifacts(
                 db,
                 maxArtifacts: maxArtifacts,
                 protectedMinimums: cognitiveProtectedArtifactMinimums
-            )
+            ).count + deletedMirrors
             for receipt in receipts {
-                try Self.insertReceipt(db, kind: receipt.kind, payload: receipt.payload, at: now)
+                var payload = receipt.payload
+                if let startedAt = receipt.startedAt, case .object(var fields) = payload {
+                    let elapsed = startedAt.duration(to: ContinuousClock.now).components
+                    fields["durationSeconds"] = .double(max(0,
+                        Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18))
+                    payload = .object(fields)
+                }
+                try Self.insertReceipt(db, kind: receipt.kind, payload: payload, at: now)
             }
-            _ = try Self.pruneReceipts(
+            let deletedReceipts = try Self.pruneReceipts(
                 db,
                 maxReceipts: maxReceipts,
                 protectedMinimums: cognitiveProtectedReceiptMinimums
             )
+            if deletedNodes > 0 || deletedArtifacts > 0 || deletedReceipts > 0 {
+                try Self.insertReceipt(db, kind: "prune", payload: .object([
+                    "deletedNodes": .int(Int64(deletedNodes)),
+                    "deletedArtifacts": .int(Int64(deletedArtifacts)),
+                    "deletedReceipts": .int(Int64(deletedReceipts)),
+                    "maxNodes": .int(Int64(maxNodes)),
+                    "maxArtifacts": .int(Int64(maxArtifacts)),
+                    "maxReceipts": .int(Int64(maxReceipts)),
+                ]), at: now)
+            }
         }
+    }
+
+    /// The durable forgetting epoch of `domain` (0 before its first forgetting).
+    public func loadEpoch(_ domain: String) async throws -> UInt64 {
+        try await dbQueue.read { db -> UInt64 in
+            let value = try Int64.fetchOne(
+                db, sql: "SELECT epoch FROM cognitive_epochs WHERE domain = ?", arguments: [domain])
+            let epoch = value ?? 0
+            guard epoch >= 0 else { throw CognitiveSQLiteCounterError.outsideStorageRange(domain) }
+            return UInt64(epoch)
+        }
+    }
+
+    static func sqliteCounter(_ value: UInt64, named name: String) throws -> Int64 {
+        guard let stored = Int64(exactly: value) else {
+            throw CognitiveSQLiteCounterError.outsideStorageRange(name)
+        }
+        return stored
+    }
+
+    static func bumpEpoch(_ db: Database, domain: String) throws -> UInt64 {
+        let prior = try Int64.fetchOne(
+            db, sql: "SELECT epoch FROM cognitive_epochs WHERE domain = ?", arguments: [domain]) ?? 0
+        guard prior >= 0 else { throw CognitiveSQLiteCounterError.outsideStorageRange(domain) }
+        guard prior < Int64.max else { throw CognitiveSQLiteCounterError.exhausted(domain) }
+        let next = prior + 1
+        try db.execute(sql: """
+            INSERT INTO cognitive_epochs (domain, epoch) VALUES (?, ?)
+            ON CONFLICT(domain) DO UPDATE SET epoch = excluded.epoch
+            """, arguments: [domain, next])
+        return UInt64(next)
     }
 
     public func appendReceipt(
@@ -437,7 +409,7 @@ public actor CognitiveSQLiteStore {
         at now: Date,
         id: UUID = UUID()
     ) async throws {
-        let payloadJSON = Self.jsonString(payload)
+        let payloadJSON = try Self.jsonString(payload)
         try await dbQueue.write { db in
             try db.execute(
                 sql: """
@@ -451,88 +423,16 @@ public actor CognitiveSQLiteStore {
         }
     }
 
+    /// Forget her transient mind: nodes, artifacts and receipts go, and the
+    /// mind's forgetting epoch moves in the SAME transaction (it lives outside
+    /// what this deletes). Returns the new epoch.
     @discardableResult
-    /// `maxReceipts` (additive, default 10_000): the receipts table is an append-only
-    /// audit log written on every loop tick (~900/day live) and was the ONE unbounded
-    /// table in the store — nodes cap at 256 and artifacts at artifactCap, but receipts
-    /// grew forever (8.6k rows in 3 weeks when caught). Consumers only ever read the
-    /// newest ≤100, so trimming to the newest 10k (~10 days of history) is invisible
-    /// to every surface while making the whole store bounded (User, 2026-07-02: "make
-    /// sure [it] doesnt wind up becoming a huge pile of saved memories and files").
-    func prune(maxNodes: Int, maxArtifacts: Int, maxReceipts: Int = 10_000) async throws -> CognitiveSQLitePruneResult {
-        try await dbQueue.write { db in
-            let nodesBefore = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM cognitive_nodes") ?? 0
-            let artifactsBefore = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM cognitive_artifacts") ?? 0
-            let receiptsBefore = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM cognitive_receipts") ?? 0
-            try db.execute(
-                sql: """
-                DELETE FROM cognitive_nodes
-                WHERE id IN (
-                    SELECT id FROM cognitive_nodes
-                    ORDER BY salience ASC, activation ASC, last_activated_at ASC, id ASC
-                    LIMIT MAX((SELECT COUNT(*) FROM cognitive_nodes) - ?, 0)
-                )
-                """,
-                arguments: [max(1, maxNodes)]
-            )
-            // Keep the explicit operator prune defensive against a legacy or
-            // externally restored database that acquired mirror rows after
-            // this store instance opened. The hot microcycle and artifact-
-            // family transitions rely on the one-time open drain instead.
-            try db.execute(sql: "DELETE FROM cognitive_artifacts WHERE kind LIKE 'receipt.%'")
-            _ = try Self.pruneArtifacts(
-                db,
-                maxArtifacts: maxArtifacts,
-                protectedMinimums: cognitiveProtectedArtifactMinimums
-            )
-            // Hysteresis: only trim once the table EXCEEDS the cap, and then cut to
-            // cap − slack — otherwise the prune receipt inserted below (plus the
-            // caller's own functional receipt) would leave the table at cap+1 and
-            // every subsequent prune would churn a delete + a "prune" receipt into
-            // the recent-receipts view (gpt-5.5 review, 2026-07-02). With slack,
-            // trimming fires a few times a day instead of every persist.
-            _ = try Self.pruneReceipts(
-                db,
-                maxReceipts: maxReceipts,
-                protectedMinimums: cognitiveProtectedReceiptMinimums
-            )
-            let nodesAfter = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM cognitive_nodes") ?? 0
-            let artifactsAfter = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM cognitive_artifacts") ?? 0
-            let receiptsAfter = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM cognitive_receipts") ?? 0
-            let result = CognitiveSQLitePruneResult(
-                deletedNodes: nodesBefore - nodesAfter,
-                deletedArtifacts: artifactsBefore - artifactsAfter,
-                deletedReceipts: receiptsBefore - receiptsAfter
-            )
-            if result.deletedNodes > 0 || result.deletedArtifacts > 0 || result.deletedReceipts > 0 {
-                let payload: JSONValue = .object([
-                    "deletedNodes": .int(Int64(result.deletedNodes)),
-                    "deletedArtifacts": .int(Int64(result.deletedArtifacts)),
-                    "deletedReceipts": .int(Int64(result.deletedReceipts)),
-                    "maxNodes": .int(Int64(maxNodes)),
-                    "maxArtifacts": .int(Int64(maxArtifacts)),
-                    "maxReceipts": .int(Int64(maxReceipts)),
-                ])
-                let id = UUID()
-                let payloadJSON = Self.jsonString(payload)
-                let now = Date().timeIntervalSince1970
-                try db.execute(
-                    sql: """
-                    INSERT INTO cognitive_receipts (id, kind, payload_json, created_at)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    arguments: [id.uuidString, "prune", payloadJSON, now]
-                )
-            }
-            return result
-        }
-    }
-
-    public func clear() async throws {
-        try await dbQueue.write { db in
+    public func clear() async throws -> UInt64 {
+        try await dbQueue.write { db -> UInt64 in
             try db.execute(sql: "DELETE FROM cognitive_nodes")
             try db.execute(sql: "DELETE FROM cognitive_artifacts")
             try db.execute(sql: "DELETE FROM cognitive_receipts")
+            return try Self.bumpEpoch(db, domain: "mind")
         }
     }
 
@@ -567,10 +467,10 @@ public actor CognitiveSQLiteStore {
             sql: "SELECT id, kind, status, updated_at FROM cognitive_artifacts WHERE kind NOT IN (\(exemptMarks))",
             arguments: StatementArguments(Array(exempt))
         ).compactMap { row -> ArtifactPruneRow? in
-            guard let id: String = row["id"],
-                  let kind: String = row["kind"],
-                  let status: String = row["status"],
-                  let updatedAt: Double = row["updated_at"] else { return nil }
+            guard let id: String = try row.decode(forColumn: "id"),
+                  let kind: String = try row.decode(forColumn: "kind"),
+                  let status: String = try row.decode(forColumn: "status"),
+                  let updatedAt: Double = try row.decode(forColumn: "updated_at") else { return nil }
             return ArtifactPruneRow(id: id, kind: kind, status: status, updatedAt: updatedAt)
         }
 
@@ -615,34 +515,6 @@ public actor CognitiveSQLiteStore {
         }
     }
 
-    private static func insertArtifact(
-        _ db: Database,
-        kind: String,
-        id: UUID,
-        status: String,
-        score: Double,
-        payload: JSONValue,
-        at now: Date,
-        createdAt: Date? = nil
-    ) throws {
-        try db.execute(
-            sql: """
-            INSERT INTO cognitive_artifacts (
-                id, kind, status, score, payload_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            arguments: [
-                id.uuidString,
-                kind,
-                status,
-                (score).clamped01(),
-                jsonString(payload),
-                (createdAt ?? now).timeIntervalSince1970,
-                now.timeIntervalSince1970,
-            ]
-        )
-    }
-
     private static func upsertArtifact(
         _ db: Database,
         artifact: CognitiveArtifactWrite,
@@ -665,7 +537,7 @@ public actor CognitiveSQLiteStore {
                 artifact.kind,
                 artifact.status,
                 (artifact.score).clamped01(),
-                jsonString(artifact.payload),
+                try jsonString(artifact.payload),
                 now.timeIntervalSince1970,
                 now.timeIntervalSince1970,
             ]
@@ -680,8 +552,8 @@ public actor CognitiveSQLiteStore {
                 activation, salience, confidence, source_class,
                 created_at, last_activated_at, decay_half_life,
                 summary, metadata_json, updated_at,
-                emotional_valence, emotional_arousal, emotional_warmth
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                emotional_valence, emotional_arousal, emotional_warmth, lived_seq
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             arguments: [
                 node.id.uuidString,
@@ -697,11 +569,12 @@ public actor CognitiveSQLiteStore {
                 node.lastActivatedAt.timeIntervalSince1970,
                 node.decayHalfLife,
                 node.summary,
-                jsonString(.object(node.metadata)),
+                try jsonString(.object(node.metadata)),
                 now.timeIntervalSince1970,
                 node.emotionalValence,
                 node.emotionalArousal,
                 node.emotionalWarmth,
+                node.livedSeq.map { try sqliteCounter($0, named: "node lived_seq") },
             ]
         )
     }
@@ -727,9 +600,9 @@ public actor CognitiveSQLiteStore {
             db,
             sql: "SELECT id, kind, created_at FROM cognitive_receipts"
         ).compactMap { row -> ReceiptPruneRow? in
-            guard let id: String = row["id"],
-                  let kind: String = row["kind"],
-                  let createdAt: Double = row["created_at"] else { return nil }
+            guard let id: String = try row.decode(forColumn: "id"),
+                  let kind: String = try row.decode(forColumn: "kind"),
+                  let createdAt: Double = try row.decode(forColumn: "created_at") else { return nil }
             return ReceiptPruneRow(id: id, kind: kind, createdAt: createdAt)
         }
 
@@ -780,7 +653,7 @@ public actor CognitiveSQLiteStore {
             INSERT INTO cognitive_receipts (id, kind, payload_json, created_at)
             VALUES (?, ?, ?, ?)
             """,
-            arguments: [UUID().uuidString, kind, jsonString(payload), now.timeIntervalSince1970]
+            arguments: [UUID().uuidString, kind, try jsonString(payload), now.timeIntervalSince1970]
         )
     }
 
@@ -833,10 +706,7 @@ public actor CognitiveSQLiteStore {
                 CREATE INDEX idx_cognitive_receipts_kind ON cognitive_receipts(kind, created_at);
                 """)
         }
-        // Wave A: per-node emotional tag. Purely ADDITIVE — three REAL columns with a
-        // NOT NULL DEFAULT 0 (the neutral tag), so an existing DB from v1/v2 opens clean
-        // and every pre-tag node loads as neutral. This ALTER-ADD-COLUMN path is the
-        // migration-safety crux; nothing here touches existing rows or wire strings.
+        // New emotional-tag columns default to neutral without changing existing values.
         migrator.registerMigration("v3_cognitive_node_emotional_tags") { db in
             try db.execute(sql: """
                 ALTER TABLE cognitive_nodes ADD COLUMN emotional_valence REAL NOT NULL DEFAULT 0;
@@ -856,6 +726,39 @@ public actor CognitiveSQLiteStore {
                     ON cognitive_motor_consequence_admission(admitted_at);
                 """)
         }
+        migrator.registerMigration("v5_care_folded_movement_days") { db in
+            // Old folds kept no distinct-day evidence. Preserve their summary
+            // and start an explicit empty witness list; the retained story still
+            // counts, and future folds keep its days. Never invent lost evidence.
+            for row in try Row.fetchAll(db, sql: "SELECT id, payload_json FROM cognitive_artifacts WHERE kind = 'care'") {
+                let id: String = try row.decode(forColumn: "id")
+                let payload: String = try row.decode(forColumn: "payload_json")
+                guard case .object(var object) = try JSONValue.parse(Data(payload.utf8)),
+                      case .object(var folded)? = object["folded"], folded["movedDays"] == nil else { continue }
+                folded["movedDays"] = .array([])
+                object["folded"] = .object(folded)
+                try db.execute(sql: "UPDATE cognitive_artifacts SET payload_json = ? WHERE id = ?",
+                               arguments: [try JSONValue.object(object).serialize(pretty: false), id])
+            }
+        }
+        migrator.registerMigration("v6_retire_cognitive_experiments") { db in
+            // These count-based ratings never measured a cognitive outcome.
+            // Retire only their artifacts; living state and receipts keep their format.
+            try db.execute(sql: "DELETE FROM cognitive_artifacts WHERE kind = 'experiment'")
+        }
+        migrator.registerMigration("v7_forgetting_epochs") { db in
+            // One durable forgetting boundary per domain, kept OUTSIDE what
+            // `clear()` deletes: a moment admitted under an older epoch of a
+            // domain is refused by that domain's parts. An older binary ignores
+            // this table (GRDB skips unknown applied migrations).
+            try db.execute(sql: """
+                CREATE TABLE IF NOT EXISTS cognitive_epochs (
+                    domain TEXT PRIMARY KEY NOT NULL,
+                    epoch INTEGER NOT NULL
+                )
+                """)
+        }
+        registerLivedMomentsMigration(&migrator)
         return migrator
     }
 
@@ -864,8 +767,8 @@ public actor CognitiveSQLiteStore {
         return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
     }
 
-    static func jsonString(_ value: JSONValue) -> String {
-        (try? value.serialize(pretty: false)) ?? "null"
+    static func jsonString(_ value: JSONValue) throws -> String {
+        try value.serialize(pretty: false)
     }
 
 

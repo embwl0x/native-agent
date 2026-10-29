@@ -1,18 +1,18 @@
 import SwiftUI
 import MemoryV2
+import NativeAgentShared
 // Blueprint: | `KnowledgeGraphRows.swift` | Entity rows and detail render `MemoryFacade.graphSnapshot`, without separate neighborhood reads |
 
 // ---------------------------------------------------------------------------
 // MARK: - Entity row
 // ---------------------------------------------------------------------------
 
-// PATCH-2026-05-07: polish-KnowledgeGraphView static type helpers promoted to internal for detail view
 struct KGEntityRow: View {
     let entity: KnowledgeGraphEntity
 
     var body: some View {
         HStack(spacing: NativeAgentSpacing.sm) {
-            Image(systemName: KGEntityRow.typeIcon(entity.type))
+            Image(systemName: knowledgeGraphTypeSymbols[entity.type] ?? "circle")
                 .foregroundStyle(KGEntityRow.typeColor(entity.type))
                 .frame(width: 18)
             VStack(alignment: .leading, spacing: 2) {
@@ -23,10 +23,6 @@ struct KGEntityRow: View {
             }
             Spacer()
             if let count = entity.mentionCount, count > 1 {
-                // ui-taste-sweep 2026-06-07: bare "8" with no context — a
-                // user has no idea what the number means. Now: icon + count
-                // + tooltip so it reads as "this entity was mentioned 8
-                // times."
                 HStack(spacing: 3) {
                     Image(systemName: "text.alignleft")
                         .font(.caption2)
@@ -37,20 +33,6 @@ struct KGEntityRow: View {
             }
         }
         .padding(.vertical, NativeAgentSpacing.xs)
-    }
-
-    static func typeIcon(_ type: String) -> String {
-        switch type {
-        case "person": return "person.circle"
-        case "organization": return "building.2"
-        case "project": return "folder"
-        case "concept": return "lightbulb"
-        case "place": return "mappin.circle"
-        case "event": return "calendar"
-        case "tool": return "wrench.and.screwdriver"
-        case "fact": return "text.quote"
-        default: return "circle"
-        }
     }
 
     static func typeColor(_ type: String) -> Color {
@@ -78,16 +60,15 @@ struct KGEntityDetailView: View {
     let selectableEntityIDs: Set<String>
     let onSelectEntity: (String) -> Void
 
-    private var neighbors: KnowledgeGraphNeighborhood? { memory.neighborhood(entityID: entity.id) }
-
     var body: some View {
+        let neighbors = memory.neighborhood(entityID: entity.id)
         ScrollView {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
                 // Header: the kit's card (content, so a fill — never glass);
                 // the entity type's colour stays on its icon and name.
                 VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
                     HStack(spacing: NativeAgentSpacing.sm) {
-                        Image(systemName: KGEntityRow.typeIcon(entity.type))
+                        Image(systemName: knowledgeGraphTypeSymbols[entity.type] ?? "circle")
                             .font(.title2)
                             .foregroundStyle(KGEntityRow.typeColor(entity.type))
                         Text(entity.name)
@@ -121,20 +102,13 @@ struct KGEntityDetailView: View {
                 let relationshipState = KnowledgeGraphPresentation.entityDetailRelationships(
                     isLoading: memory.graphLoading,
                     error: memory.graphLoadError,
-                    rootID: entity.id,
-                    response: neighbors
-                )
-                let visibleEdges = KnowledgeGraphPresentation.visibleRelationshipEdges(
-                    rootID: entity.id,
                     response: neighbors
                 )
                 switch relationshipState {
                 case .loading:
                     ProgressView("Loading neighbors…")
                 case let .failed(loadError):
-                    // ui-honesty 2026-06-10: loadError was captured but never
-                    // rendered — a failed neighbors fetch looked identical to
-                    // "no relationships". Show the error + a Retry.
+                    // Failed neighbor reads show their error and Retry, never an empty relationship list.
                     NativePanel(title: "Relationships") {
                         VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
                             Label(loadError, systemImage: "exclamationmark.triangle")
@@ -155,40 +129,14 @@ struct KGEntityDetailView: View {
                     }
                 case let .loaded(count):
                     if let nbr = neighbors {
-                        NativePanel(title: "Relationships (\(count))", systemImage: "arrow.triangle.branch") {
+                        NativePanel(title: "Relationships (\(count))") {
                             VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
-                                ForEach(visibleEdges) { edge in
+                                ForEach(nbr.edges) { edge in
                                     KGEdgeRow(
                                         edge: edge, entities: nbr.neighbors, rootId: entity.id,
                                         selectableEntityIDs: selectableEntityIDs,
                                         onSelectEntity: onSelectEntity
                                     )
-                                }
-                            }
-                        }
-                    }
-                case let .partial(visibleCount, omittedUnrelatedCount):
-                    if let nbr = neighbors {
-                        NativePanel(title: "Relationships (\(visibleCount))", systemImage: "arrow.triangle.branch") {
-                            VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                                Label(
-                                    "\(omittedUnrelatedCount) unrelated relationship record\(omittedUnrelatedCount == 1 ? " was" : "s were") omitted.",
-                                    systemImage: "exclamationmark.triangle"
-                                )
-                                .font(NativeAgentFont.label)
-                                .foregroundStyle(.orange)
-                                if visibleEdges.isEmpty {
-                                    Text("No usable relationships were returned for this entity.")
-                                        .font(NativeAgentFont.body)
-                                        .foregroundStyle(.secondary)
-                                } else {
-                                    ForEach(visibleEdges) { edge in
-                                        KGEdgeRow(
-                                            edge: edge, entities: nbr.neighbors, rootId: entity.id,
-                                            selectableEntityIDs: selectableEntityIDs,
-                                            onSelectEntity: onSelectEntity
-                                        )
-                                    }
                                 }
                             }
                         }
@@ -271,7 +219,6 @@ extension KnowledgeGraphPresentation {
         case notLoaded
         case none
         case loaded(count: Int)
-        case partial(visibleCount: Int, omittedUnrelatedCount: Int)
     }
 
     static func relationshipLabel(_ kind: String) -> String {
@@ -292,20 +239,9 @@ extension KnowledgeGraphPresentation {
         return reconciledSelection(destination, visibleIDs: visibleIDs)
     }
 
-    /// A detail response must only render edges connected to the entity whose
-    /// pane is open. Corrupt or stale rows for another root are evidence of an
-    /// incomplete response, never a relationship of the selected entity.
-    static func visibleRelationshipEdges(
-        rootID: String,
-        response: KnowledgeGraphNeighborhood?
-    ) -> [KnowledgeGraphEdge] {
-        (response?.edges ?? []).filter { $0.from == rootID || $0.to == rootID }
-    }
-
     static func entityDetailRelationships(
         isLoading: Bool,
         error: String?,
-        rootID: String,
         response: KnowledgeGraphNeighborhood?
     ) -> EntityDetailRelationships {
         if isLoading { return .loading }
@@ -314,11 +250,6 @@ extension KnowledgeGraphPresentation {
             return .failed(detail.isEmpty ? "Relationship details could not be loaded." : detail)
         }
         guard let response else { return .notLoaded }
-        let visible = visibleRelationshipEdges(rootID: rootID, response: response)
-        let omitted = response.edges.count - visible.count
-        if omitted > 0 {
-            return .partial(visibleCount: visible.count, omittedUnrelatedCount: omitted)
-        }
-        return visible.isEmpty ? .none : .loaded(count: visible.count)
+        return response.edges.isEmpty ? .none : .loaded(count: response.edges.count)
     }
 }

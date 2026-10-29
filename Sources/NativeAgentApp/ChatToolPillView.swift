@@ -1,3 +1,4 @@
+import EngineRuntime
 import SwiftUI
 import ToolRegistry
 import Foundation
@@ -5,14 +6,7 @@ import ChatToolParsing
 import ChatSessionWork
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `ChatToolPillView.swift` | `ToolPillPresentation` struct; retained metadata projection, `outcome`, `title` |
-
-private extension JSONValue {
-    var stringValue: String? {
-        guard case .string(let value) = self else { return nil }
-        return value
-    }
-}
+// Blueprint: | `ChatToolPillView.swift` | `ToolPillPresentation` struct; retained metadata projection, `outcome`, `title`; `ToolCallGroup` preserves approval expansion and persona receipt partitioning |
 
 struct ToolPillPresentation: Sendable {
     struct Revision: Equatable, Sendable {
@@ -39,7 +33,7 @@ struct ToolPillPresentation: Sendable {
         title = Self.title(call.name)
         target = Self.boundedLine(Self.target(input), limit: 180)
         outcome = ChatToolOutcome.projection(kind: meta?.kind, ok: meta?.ok,
-            resultSummary: meta?.resultSummary, resultStatus: meta?.resultStatus,
+            result: result, hasResult: meta?.resultSummary != nil, resultStatus: meta?.resultStatus,
             interactionState: meta?.interactionState).outcome
         summary = Self.boundedLine(ChatToolOutcome.displaySummary(outcome: outcome, input: input, result: result), limit: 240)
         durationText = Self.durationText(meta?.durationMs)
@@ -71,19 +65,13 @@ struct ToolPillPresentation: Sendable {
             .truncated(to: limit, suffix: "…")
     }
 
-    /// ui-simplify 2026-09-02: an absent duration used to render the words
-    /// "unknown duration" beside every streamed tool call — a confession the
-    /// reader could do nothing with. A missing duration now says nothing at
-    /// all; the pill's outcome glyph still distinguishes pending from done.
+    /// Missing duration is blank; the outcome glyph distinguishes pending from done.
     static func durationText(_ durationMs: Int?) -> String {
         guard let durationMs else { return "" }
         return "\(durationMs)ms"
     }
 
-    /// Fluid glass A2: a call's arguments or result as "key: value" lines a
-    /// person can read — top-level fields in key order, each value one short
-    /// line, nested values counted rather than dumped. Raw JSON stays behind
-    /// the row's "Raw" toggle. Not an object (or not JSON): no lines.
+    /// Object fields become sorted, bounded key/value lines; nested values are counted and raw JSON is separate.
     static func fieldLines(_ value: JSONValue?, limit: Int = 8) -> [(key: String, value: String)] {
         guard case .object(let fields)? = value else { return [] }
         let lines = fields.keys.sorted().lazy.compactMap { key -> (key: String, value: String)? in
@@ -152,11 +140,7 @@ enum ToolDiffPresentation {
     }
 }
 
-// PATCH-2026-05-08: wave2-chat-ux — ToolPillView for role=tool messages.
-// Fluid glass A2: one tool call as the transcript's one activity row
-// (`ChatActivityRow`). Opened, it reads as a person would say it — the short
-// summary, then the call's arguments and result as "key: value" lines — and
-// the raw JSON sits behind a secondary "Raw" toggle.
+// Tool activity expands from a summary into arguments and results, with raw JSON on demand.
 struct ToolPillView: View {
     var message: ChatMessage
     /// The settled fold's own sentence for this call ("Wrote a file"); nil
@@ -245,6 +229,85 @@ struct ToolPillView: View {
     }
 }
 
+enum ToolCallGroupPresentation {
+    static func expandsInline(messages: [ChatMessage]) -> Bool {
+        messages.contains { $0.metadata?.isPendingApproval == true }
+    }
+}
+
+struct ToolCallGroup: View {
+    @Environment(AppModel.self) private var appModel
+    var messages: [ChatMessage]
+    private struct Revision: Equatable, Sendable {
+        let messages: [ChatMessage]
+        let exemptTitle: String?
+    }
+    @State private var preparedRevision: Revision?
+    @State private var partition = (receipts: [(id: String, outcome: String, meta: String)](), rest: [ChatMessage]())
+
+    // An unresolved approval must never be hidden behind a collapsed summary.
+    private var hasPendingApproval: Bool {
+        ToolCallGroupPresentation.expandsInline(messages: messages)
+    }
+
+    var body: some View {
+        // Phases swap at the incoming size; the settled fold leaves live progress to the turn card.
+        ChatCrossfadeStack(current: hasPendingApproval ? 0 : 1) {
+            phaseBody
+        }
+        .task(id: Revision(messages: messages, exemptTitle: appModel.firstConversationReceiptTitle)) {
+            guard !hasPendingApproval else { return }
+            let revision = Revision(messages: messages, exemptTitle: appModel.firstConversationReceiptTitle)
+            let prepared = await Task.detached(priority: .userInitiated) {
+                revision.messages.reduce(into: (receipts: [(id: String, outcome: String, meta: String)](), rest: [ChatMessage]())) { result, message in
+                    if let receipt = PersonaWriteReceiptRow.receipt(for: message, exemptTitle: revision.exemptTitle) {
+                        result.receipts.append((message.id, receipt.outcome, receipt.meta))
+                    } else { result.rest.append(message) }
+                }
+            }.value
+            guard !Task.isCancelled else { return }
+            partition = prepared
+            preparedRevision = revision
+        }
+    }
+
+    @ViewBuilder
+    private var phaseBody: some View {
+        if hasPendingApproval {
+            fullList
+                .layoutValue(key: ChatCrossfadePhase.self, value: 0)
+                .transition(.identity)
+        } else {
+            // Fold tool traffic into one row; persona writes retain separate consequence receipts.
+            let current = preparedRevision == Revision(messages: messages, exemptTitle: appModel.firstConversationReceiptTitle)
+            let partition = current ? self.partition : (receipts: [], rest: [])
+            VStack(alignment: .leading, spacing: NativeAgentShellLayout.transcriptGap) {
+                if !partition.rest.isEmpty {
+                    ShellToolRow(messages: partition.rest)
+                }
+                ForEach(partition.receipts, id: \.id) { receipt in
+                    PersonaWriteReceiptRow(outcome: receipt.outcome, meta: receipt.meta)
+                }
+            }
+            .layoutValue(key: ChatCrossfadePhase.self, value: 1)
+            .transition(NativeAgentMotion.fadeThrough)
+        }
+    }
+
+    private var fullList: some View {
+        VStack(alignment: .leading, spacing: NativeAgentShellLayout.transcriptGap) {
+            ForEach(messages) { msg in
+                if msg.metadata?.isPendingApproval == true {
+                    InlineApprovalCard(message: msg)
+                } else {
+                    ToolPillView(message: msg)
+                }
+            }
+        }
+    }
+}
+
+
 extension ChatToolOutcome.DisplayOutcome {
     var icon: String {
         switch self {
@@ -261,7 +324,6 @@ extension ChatToolOutcome.DisplayOutcome {
     }
 }
 
-// PATCH-2026-05-08: wave2-chat-ux — unified diff viewer for write_file expanded view
 struct ToolDiffView: View {
     let diffLines: [String]
 

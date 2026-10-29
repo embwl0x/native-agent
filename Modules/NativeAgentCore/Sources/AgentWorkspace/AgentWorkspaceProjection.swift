@@ -1,6 +1,6 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `AgentWorkspaceProjection.swift` | `AgentWorkspaceProjection`: async `project` sends Music and helpers through the owned workspace part while native readers retain the other areas; record titles stay native; `AgentWorkspace` binds receipt read refs through the existing workspace name book |
+// Blueprint: | `AgentWorkspaceProjection.swift` | `WorkspacePage`: async `project` sends Music and helpers through the owned workspace part while native readers retain the other areas; record titles stay native; `AgentWorkspace` binds receipt read refs through the existing workspace name book |
 
 extension AgentWorkspace {
     package static func readReferences(_ reads: [(tool: String, input: [String: JSONValue], title: String)], dataRoot: URL) throws -> [JSONValue] {
@@ -9,16 +9,13 @@ extension AgentWorkspace {
                   let key = HerScreen.key(.record(tool: read.tool, input: read.input, title: read.title)) else { return nil }
             return (room, key)
         }
-        var failure: Error?
-        let refs: [JSONValue] = HerScreen.withNames(dataRoot, onWriteFailure: { failure = $0 }) { book in
-            keys.map { entry in
+        return try HerScreen.withNames(dataRoot) { book in
+            try keys.map { entry in
                 guard let (room, key) = entry else { return .null }
                 let present = Set(keys.compactMap { $0?.0 == room ? $0?.1 : nil })
-                return .string(room + ".\(book.number("item." + room, id: key) { present })")
+                return .string(room + ".\(try book.number("item." + room, id: key) { present })")
             }
         }
-        if let failure { throw failure }
-        return refs
     }
 
     package static func attachReadReferences(tool: String, input: [String: JSONValue], result: JSONValue, dataRoot: URL) -> JSONValue {
@@ -52,8 +49,8 @@ extension AgentWorkspace {
 
 /// A view of an owner's returned evidence. This layer neither reads sources nor
 /// interprets prose as instructions, permissions, completion, or fresh state.
-extension AgentWorkspaceProjection {
-    static func project(location: AgentWorkspaceLocation, result: JSONValue, dataRoot: URL) async -> Self {
+extension WorkspacePage {
+    static func project(location: AgentWorkspaceLocation, result: JSONValue, dataRoot: URL, evidence: (text: String, fingerprint: String)?) async -> Self {
         // The actual owner receipt retains diagnostics. Navigation needs its
         // evidence, not a second copy of per-call organism instrumentation.
         var result = result
@@ -72,7 +69,7 @@ extension AgentWorkspaceProjection {
             return workspaceContacts(result: result, page: page)
         case .form(let form): return form.projection
         case .page(let source, let page):
-            var view = await project(location: source, result: result, dataRoot: dataRoot); view.page = page; return view
+            var view = await project(location: source, result: result, dataRoot: dataRoot, evidence: evidence); view.page = page; return view
         case .area, .capabilities, .receipt, .openPlaces, .workOverview, .savedWorkspaces, .browserBookmark, .conversations, .arrivals, .find:
             return .init(title: location.title, content: result, items: [], actions: [])
         case .record(let tool, let input, _):
@@ -90,8 +87,13 @@ extension AgentWorkspaceProjection {
             if tool == "work_context", let query = workspaceText(input["query"]) {
                 return workspaceWork(query: query, result: result, input: input)
             }
-            if tool == "agent_contacts" { return workspaceContacts(result: result) }
-            if tool == "chat_conversations" { return AgentWorkspaceHumanProjection.project(input: input, result: result) }
+            if tool == "agent_contacts" {
+                if input["details"] == .bool(true) {
+                    return .init(title: title, content: result, items: [], actions: [])
+                }
+                return workspaceContacts(result: result)
+            }
+            if tool == "chat_conversations" { return HumanConversationRead.project(input: input, result: result) }
             if tool == "agent_read" { return AgentWorkspaceConversation.project(input: input, title: title, result: result) }
             if var projection = AgentWorkspaceKnowledge.project(tool: tool, input: input, result: result)
                 ?? AgentWorkspaceApps.project(tool: tool, input: input, result: result)
@@ -128,8 +130,7 @@ extension AgentWorkspaceProjection {
             }
             // In particular, desk_read may return plain rendered text. Never
             // discover actions by parsing that text or nested receipt content.
-            if tool == "read_file", let path = workspaceText(input["path"]),
-               AgentWorkspaceDocument.evidence(result) != nil {
+            if tool == "read_file", let path = workspaceText(input["path"]), evidence != nil {
                 actions.append(.init(label: "Add to this file", action: .perform(tool: "write_file",
                     input: ["path": .string(path), "append": .bool(true)], title: "Add to " + title,
                     textField: "content", isEffect: true), needsText: true))
@@ -137,17 +138,16 @@ extension AgentWorkspaceProjection {
             if tool == "read_file", let file = AgentWorkspaceFileRevision(input: input, title: title, result: result) {
                 actions.append(.init(label: "Revise this file", action: .reviseFile(file)))
             }
-            let links = tool == "read_file" ? documentLinks(result) : []
+            let links = tool == "read_file" ? documentLinks(evidence?.text) : []
             return .init(title: title, content: result, items: links, actions: actions)
         }
     }
 
     /// Ordinary hyperlinks in the returned text window, not instructions or
     /// inferred tasks. Nothing opens until its explicit button is selected.
-    private static func documentLinks(_ result: JSONValue) -> [AgentWorkspaceItem] {
-        guard let evidence = AgentWorkspaceDocument.evidence(result),
+    private static func documentLinks(_ text: String?) -> [AgentWorkspaceItem] {
+        guard let text,
               let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) else { return [] }
-        let text = String(evidence.text.prefix(12000))
         var seen = Set<String>()
         var links: [AgentWorkspaceItem] = []
         for match in detector.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
@@ -246,8 +246,7 @@ extension AgentWorkspaceProjection {
             let title = workspaceText(row["name"]) ?? workspaceText(row["agent"]) ?? "Contact"
             var actions: [AgentWorkspaceButton] = []
             if let agent = workspaceText(row["agent"]), workspaceExactAgent(agent) {
-                // 2026-09-24 desk walk: every contact opens to its conversation
-                // (a read-only room, its last exchange), send-only ones too.
+                // Every contact opens its last exchange, including send-only contacts.
                 actions.append(.init(label: "Open conversation", action: .open(.record(
                     tool: "agent_read", input: ["agent": .string(agent)], title: title))))
                 if case .array(let capabilities)? = row["capabilities"], capabilities.contains(.string("message")),
@@ -258,10 +257,10 @@ extension AgentWorkspaceProjection {
                 actions.append(.init(label: "Connect", action: .perform(tool: "agent_connect", input: ["name": .string(title)],
                                                                       title: "Connect " + title, textField: nil, isEffect: true)))
             }
-            // Readiness, route limits and declared capabilities remain the
-            // contact owner's words. A button is never a presence assertion.
-            // 2026-09-22: an unchecked readiness says nothing; the owner receipt keeps the detail.
-            let visible: Set<String> = ["name", "kind", "state", "readiness", "can_start_turn", "can_answer_back"]
+            // Contact receipts own readiness and capabilities; buttons never assert presence.
+            actions.append(.init(label: "Connection details", action: .open(.record(tool: "agent_contacts",
+                input: ["discover": row["agent"] ?? .string(title), "details": .bool(true)], title: title))))
+            let visible: Set<String> = ["name", "kind", "state", "last_answered", "readiness", "can_start_turn", "can_answer_back"]
             return .init(title: title, content: .object(row.filter {
                 visible.contains($0.key) && !($0.key == "readiness" && $0.value == .string("not_checked")) }), actions: actions)
         }

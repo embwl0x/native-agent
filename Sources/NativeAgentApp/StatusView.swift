@@ -1,20 +1,8 @@
 import SwiftUI
+import EngineRuntime
 import AppKit
-import CoreGraphics
-import ScreenCaptureKit
-import ScreenVision
-import Speech
-import AVFoundation
-import UniformTypeIdentifiers
 import NativeAgentShared
-import MemoryV2
 import PersistenceCore
-#if canImport(CoreSpotlight)
-import CoreSpotlight
-#endif
-#if canImport(CloudKit)
-import CloudKit
-#endif
 
 // Blueprint: | `StatusView.swift` | `StatusView`: living system status and latest chronological activity projection with raw malformed-time evidence retained |
 
@@ -78,7 +66,7 @@ struct StatusView: View {
                 // The living status card — posture, body, behaviour, and the
                 // Desk, approvals and dream it reads — first, above the app's.
                 LivingStatusPanel()
-                NativePanel(title: "The app", systemImage: "server.rack") {
+                NativePanel(title: "The app") {
                     let status = appModel.engine.doctor.runtimeStatus(lastRefreshError: appModel.lastRefreshError)
                     Label(status.text, systemImage: status.systemImage)
                         .foregroundStyle(status.tone == .success ? .green : status.tone == .warning ? .orange : status.tone == .failure ? .red : .secondary)
@@ -86,9 +74,11 @@ struct StatusView: View {
                         Text(detail).font(.caption).foregroundStyle(.orange)
                     }
                     if let health = appModel.engine.doctor.health {
+                        let uptime = Int(exactly: health.uptimeSeconds.rounded(.towardZero))
+                            .flatMap { $0 >= 0 ? "\($0)s" : nil } ?? "Unavailable"
                         LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 10)], spacing: 10) {
                             MetricTile(title: "Version", value: health.version, systemImage: "number")
-                            MetricTile(title: "Uptime", value: "\(Int(health.uptimeSeconds))s", systemImage: "timer")
+                            MetricTile(title: "Uptime", value: uptime, systemImage: "timer")
                             MetricTile(title: "Runs", value: "\(appModel.engine.runs.rows.count)", systemImage: "play.rectangle")
                             MetricTile(title: "Sessions", value: "\(appModel.engine.transcripts.sessions.count)", systemImage: "bubble.left.and.bubble.right")
                         }
@@ -102,7 +92,7 @@ struct StatusView: View {
                 }
 
                 if let watchdog = appModel.engine.doctor.watchdog {
-                    NativePanel(title: "Background work", systemImage: "waveform.path.ecg") {
+                    NativePanel(title: "Background work") {
                         HStack {
                             StatusBadge(text: "SWIFT", status: watchdog.runtimeBadgeStatus)
                             Text(watchdog.runtimeLifecycleDetail)
@@ -116,11 +106,12 @@ struct StatusView: View {
                     }
                 }
 
-                NativePanel(title: "Recent activity", systemImage: "clock.arrow.circlepath") {
-                    switch StatusActivityPresentation.state(
+                NativePanel(title: "Recent activity") {
+                    let state = StatusActivityPresentation.state(
                         events: appModel.engine.doctor.activityEvents,
                         refresh: appModel.engine.doctor.activityRefresh
-                    ) {
+                    )
+                    switch state {
                     case .loading:
                         ProgressView("Loading activity…")
                             .font(.caption)
@@ -132,18 +123,13 @@ struct StatusView: View {
                         Text("No activity recorded yet.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                    case .current(let events):
-                        // NEWEST first. `getActivity` returns the tail of events.jsonl in
-                        // file (chronological) order, so `.prefix` showed the OLDEST 8 of
-                        // the last 200 — on a 5,400-event feed that was a week stale while
-                        // today's entries sat just below (2026-08-02).
-                        ForEach(StatusActivityPresentation.recentEvents(from: events)) { event in
-                            ActivityRow(event: event)
+                    case .current(let events), .stale(let events):
+                        if case .stale = state {
+                            Label("Showing the activity that loaded last time; the refresh could not read the activity log.", systemImage: "clock.badge.exclamationmark")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
                         }
-                    case .stale(let events):
-                        Label("Showing the activity that loaded last time; the refresh could not read the activity log.", systemImage: "clock.badge.exclamationmark")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
+                        // Show newest first; getActivity returns chronological file order.
                         ForEach(StatusActivityPresentation.recentEvents(from: events)) { event in
                             ActivityRow(event: event)
                         }

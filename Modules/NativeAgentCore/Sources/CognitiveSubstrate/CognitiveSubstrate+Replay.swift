@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `CognitiveSubstrate+Replay.swift` | `CognitiveSubstrate`: `integrateReplayChecked`; schema status and dated REM resolutions share the inbox's decision snapshot by proposal identity; adoption requires its application claim; unmatched retained history stays explicitly unavailable; retired view/opinion/interest events never enter timeline or growth-week readouts |
@@ -120,7 +121,7 @@ extension CognitiveSubstrate {
         stagedDirtyRevision = dirtyRevision
         if configuration.persistenceEnabled {
             guard let store else { throw CognitivePersistenceError.storeUnavailable }
-            guard !persistenceWritesBlocked else {
+            guard !persistenceHealth.writesBlocked, !forgettingInFlight else {
                 throw CognitivePersistenceError.writesBlocked(
                     status: persistenceHealth.status,
                     detail: persistenceHealth.failureDetail
@@ -173,17 +174,7 @@ extension CognitiveSubstrate {
         }
     }
 
-    // Agent's subconscious is for feelings / emotions / views / continuity — NOT a task
-    // tracker (User, 2026-06-30). The commitment/prediction extraction machinery that once
-    // ran here was removed in R8c (2026-07-01); the vestigial assimilate() no-op seam and
-    // its ChatOrchestration callers were retired in the follow-up (2026-07-02).
-
-    public func episodeSnapshot() async -> [CognitiveEpisodeReference] {
-        episodes.values.sorted { lhs, rhs in
-            if lhs.occurredAt != rhs.occurredAt { return lhs.occurredAt > rhs.occurredAt }
-            return lhs.id.uuidString < rhs.id.uuidString
-        }
-    }
+    // Cognition owns feelings and continuity; the Desk owns explicit task tracking.
 
     public func schemaProposalSnapshot() async -> [CognitiveSchemaProposal] {
         let decisions = await dependencies.decisions()
@@ -280,26 +271,6 @@ extension CognitiveSubstrate {
         }.prefix(max(0, limit)))
     }
 
-    @discardableResult
-    func recordTimelineEvent(
-        kind: CognitiveDevelopmentalTimelineKind,
-        title: String,
-        summary: String,
-        artifactId: UUID?,
-        lineageId: String,
-        externalEvidenceIds: [String]
-    ) async -> CognitiveDevelopmentalTimelineEvent {
-        let event = recordTimelineEventInMemory(
-            kind: kind,
-            title: title,
-            summary: summary,
-            artifactId: artifactId,
-            lineageId: lineageId,
-            externalEvidenceIds: externalEvidenceIds
-        )
-        await persistArtifact(kind: "developmental_timeline", id: event.id, status: "recorded", score: 0.5, payload: event.toJSON())
-        return event
-    }
 
     func recordTimelineEventInMemory(
         kind: CognitiveDevelopmentalTimelineKind,
@@ -332,10 +303,6 @@ extension CognitiveSubstrate {
         for event in events where developmentalTimeline[event.id] == event {
             developmentalTimeline.removeValue(forKey: event.id)
         }
-    }
-
-    func timelineEvents(for artifactId: UUID) -> [CognitiveDevelopmentalTimelineEvent] {
-        developmentalTimeline.values.filter { $0.artifactId == artifactId }
     }
 
     private func dreamReplayEvidenceID(_ dream: CognitiveDreamReplayReference) -> String {

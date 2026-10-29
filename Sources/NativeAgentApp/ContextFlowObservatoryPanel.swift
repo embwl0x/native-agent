@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Context
 import ContextFlow
 import Foundation

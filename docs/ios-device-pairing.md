@@ -18,6 +18,14 @@ status. Only the Mac Pair button promotes a pending key. Missing storage starts
 empty; malformed, unreadable, or nonregular storage refuses mutations and
 decisions without replacing its contents. No private device key reaches the Mac.
 
+KVS pairing-material publication advances its stored version with checked
+arithmetic. An exhausted version reports publication failure and leaves the
+material, version and synchronization checkpoint unchanged.
+
+The Mac's paired-phone snapshot publishes reloads through `LatestRead` and
+committed status changes through its `write` boundary. A newer pending read
+does not suppress an older completed read; canceled reads publish nothing.
+
 Wire fields: `clientId` is the lowercase 64-character SHA-256 fingerprint of the
 32-byte Ed25519 public key; `devicePublicKey` and `deviceSignature` are base64.
 The signature covers sorted-key JSON for the entire envelope excluding only

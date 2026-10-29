@@ -8,7 +8,6 @@ import TurnTrace
 import PersonaEngine
 import MemoryV2
 import ProviderRouting
-import TrustCenter
 import Dispatcher
 import MacControl
 import SwarmRuns
@@ -18,8 +17,8 @@ import CognitiveSubstrate
 
 // MARK: - SwiftNative impl
 
-struct StructuredChatExecution: Sendable {
-    var response: ChatResponse
+package struct StructuredChatExecution: Sendable {
+    package var response: ChatResponse
     let turn: Result<TurnEngineResult, any Error>
 
     func responseOrThrow() throws -> ChatResponse {
@@ -30,21 +29,18 @@ struct StructuredChatExecution: Sendable {
 
 /// SwiftNative ChatOrchestrationClient — composes the in-process Swift
 /// building blocks into a single chat()/chatStream() surface.
-public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
+public actor SwiftNativeChatOrchestrationClient {
     let engine: SwiftNativeTurnEngine
     let tools: any ToolDispatchClient
     let llm: any LLMClient
     let history: SessionHistoryReader
-    let persistence: any PersistenceCoreProtocol
     let dataRoot: URL
-    let turnTraceBus: TurnTraceBus
-    let trust: SwiftNativeTrustCenter
+    public nonisolated let turnTraceBus: TurnTraceBus
     let approvalFiler: (any ApprovalFiler)?
     let approvalTimeoutSeconds: Double
     let historyLimit: Int
     let continuationCapabilityProfile: String?
-    let cognitiveObserver: (any CognitiveEventObserving)?
-    let cognitiveContextProvider: (any CognitiveContextProviding)?
+    let cognitiveRuntime: (any CognitiveRuntimeProviding)?
     let providerLifecycleObserverInstalled: Bool
     let autocompactionConfig: ChatSessionAutocompactionConfig
     let clock: @Sendable () -> Date
@@ -57,7 +53,7 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         try await LLMCallContext.$admittedModel.withValue(nil) {
         try await LLMCallContext.$surface.withValue("chat") {
         try await SkillRunContext.$admitModel.withValue({ call in
-            try await self.withModelContext(try await self.engine.checkedRouteAdmission(for: "chat"), surface: "chat", call)
+            try await self.withModelContext(try await self.engine.router.checkedRouteAdmission(for: "chat"), surface: "chat", call)
         }, operation: body)
         }
         }
@@ -68,11 +64,8 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
                                      _ body: () async throws -> T) async rethrows -> T {
         try await LLMCallContext.$client.withValue(llm) {
         try await LLMCallContext.$surface.withValue(surface) {
-        try await LLMCallContext.$admittedModel.withValue(admission.modelId) {
-        try await LLMCallContext.$providerId.withValue(admission.providerId) {
-        try await LLMCallContext.$reasoningEffort.withValue(admission.reasoningEffort) {
-        try await LLMCallContext.$serviceTier.withValue(admission.serviceTier, operation: body)
-        } } } } }
+        try await admission.withModelContext(body)
+        } }
     }
 
     public init(
@@ -80,16 +73,13 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         tools: any ToolDispatchClient,
         llm: any LLMClient,
         history: SessionHistoryReader? = nil,
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         turnTraceBus: TurnTraceBus? = nil,
-        trust: SwiftNativeTrustCenter? = nil,
         approvalFiler: (any ApprovalFiler)? = nil,
         approvalTimeoutSeconds: Double = 30,
         historyLimit: Int = 400,
         continuationCapabilityProfile: String? = nil,
-        cognitiveObserver: (any CognitiveEventObserving)? = nil,
-        cognitiveContextProvider: (any CognitiveContextProviding)? = nil,
+        cognitiveRuntime: (any CognitiveRuntimeProviding)? = nil,
         providerLifecycleObserverInstalled: Bool = false,
         autocompactionConfig: ChatSessionAutocompactionConfig = .productionDefault(),
         clock: @escaping @Sendable () -> Date = { Date() }
@@ -105,22 +95,13 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         self.tools = tools
         self.llm = llm
         self.history = history ?? SessionHistoryReader(dataRoot: dataRoot)
-        self.persistence = persistence
         self.dataRoot = dataRoot
         self.turnTraceBus = turnTraceBus ?? engine.turnTraceBus
-        // Resolve trust against the SAME dataRoot the client is bound to.
-        // Default params can't reference other params in Swift, so this is an
-        // optional-then-resolve seam: production callers that pass nothing AND
-        // a default dataRoot get the identical SwiftNativeTrustCenter() they
-        // got before; tests that pass an override dataRoot stay hermetic.
-        self.trust = trust ?? SwiftNativeTrustCenter(dataRoot: dataRoot)
         self.approvalFiler = approvalFiler
         self.approvalTimeoutSeconds = approvalTimeoutSeconds
         self.historyLimit = historyLimit
         self.continuationCapabilityProfile = continuationCapabilityProfile
-        self.cognitiveObserver = cognitiveObserver
-        let runtime = cognitiveObserver as? (any CognitiveRuntimeProviding)
-        self.cognitiveContextProvider = cognitiveContextProvider ?? runtime
+        self.cognitiveRuntime = cognitiveRuntime
         self.providerLifecycleObserverInstalled = providerLifecycleObserverInstalled
         self.autocompactionConfig = autocompactionConfig
         self.clock = clock
@@ -135,51 +116,10 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         reasoningEffort: String,
         fileAccess: String,
         attachments: [MultimodalAttachment],
-        suppressUserAppend: Bool
-    ) async throws -> ChatResponse {
-        return try await chat(
-            message: message,
-            sessionId: sessionId,
-            model: model,
-            reasoningEffort: reasoningEffort,
-            fileAccess: fileAccess,
-            attachments: attachments,
-            persona: nil,
-            suppressUserAppend: suppressUserAppend
-        )
-    }
-
-    public func chat(
-        message: String,
-        sessionId: String?,
-        model: String,
-        reasoningEffort: String,
-        fileAccess: String,
-        attachments: [MultimodalAttachment],
-        persona: String?,
-        surface: String,
-        suppressUserAppend: Bool
-    ) async throws -> ChatResponse {
-        return try await chatExecution(
-            message: message, sessionId: sessionId, model: model,
-            reasoningEffort: reasoningEffort, fileAccess: fileAccess,
-            attachments: attachments, persona: persona, surface: surface,
-            suppressUserAppend: suppressUserAppend,
-            progress: nil
-        ).responseOrThrow()
-    }
-
-    public func chat(
-        message: String,
-        sessionId: String?,
-        model: String,
-        reasoningEffort: String,
-        fileAccess: String,
-        attachments: [MultimodalAttachment],
-        persona: String?,
-        surface: String,
+        persona: String? = nil,
+        surface: String = "chat",
         suppressUserAppend: Bool,
-        progress: ChatOrchestrationProgressHandler?
+        progress: TurnEventSink? = nil
     ) async throws -> ChatResponse {
         return try await chatExecution(
             message: message, sessionId: sessionId, model: model,
@@ -190,26 +130,7 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         ).responseOrThrow()
     }
 
-    public func chat(
-        message: String,
-        sessionId: String?,
-        model: String,
-        reasoningEffort: String,
-        fileAccess: String,
-        attachments: [MultimodalAttachment],
-        persona: String?,
-        suppressUserAppend: Bool
-    ) async throws -> ChatResponse {
-        return try await chatExecution(
-            message: message, sessionId: sessionId, model: model,
-            reasoningEffort: reasoningEffort, fileAccess: fileAccess,
-            attachments: attachments, persona: persona, surface: "chat",
-            suppressUserAppend: suppressUserAppend,
-            progress: nil
-        ).responseOrThrow()
-    }
-
-    func chatExecution(
+    package func chatExecution(
         message: String,
         sessionId: String?,
         model: String,
@@ -219,39 +140,13 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
         persona: String?,
         surface: String,
         suppressUserAppend: Bool,
-        progress: ChatOrchestrationProgressHandler?
+        progress: TurnEventSink?
     ) async throws -> StructuredChatExecution {
-        // A turn that parks on a card has to be able to RECORD that it did, or
-        // the tool loop's `waitForInteraction` writes to nil, the waiting
-        // terminal is unreachable, and the turn ends with no final at all —
-        // which is what reached the Claude bridge as "stream ended without
-        // final reply" while the card sat in the conversation (2026-09-13).
-        // The bot entry binds its own before calling in; a nested call keeps
-        // the outer turn's execution, so this binds at most once per turn.
-        // Origin steering and the answered set share this turn's lifetime,
-        // independently of whether its execution is already bound.
-        if PeerDataTaint.current == nil {
-            return try await PeerDataTaint.withScope {
-                try await chatExecution(
-                    message: message, sessionId: sessionId, model: model,
-                    reasoningEffort: reasoningEffort, fileAccess: fileAccess,
-                    attachments: attachments, persona: persona, surface: surface,
-                    suppressUserAppend: suppressUserAppend, progress: progress
-                )
-            }
-        }
-        guard ChatTurnExecution.current != nil else {
-            return try await ChatTurnExecution.$current.withValue(ChatTurnExecution()) {
-                try await chatExecution(
-                    message: message, sessionId: sessionId, model: model,
-                    reasoningEffort: reasoningEffort, fileAccess: fileAccess,
-                    attachments: attachments, persona: persona, surface: surface,
-                    suppressUserAppend: suppressUserAppend, progress: progress
-                )
-            }
-        }
+        // Every turn owns execution and peer provenance, preserving outer scopes.
+        return try await PeerDataTaint.withScope {
+        try await ChatTurnExecution.$current.withValue(ChatTurnExecution.current ?? ChatTurnExecution()) {
         return try await StandingBotContinuity.withSessionContract(sessionID: sessionId, dataRoot: dataRoot) {
-        let admission = try await engine.checkedRouteAdmission(
+        let admission = try await engine.router.checkedRouteAdmission(
             for: surface,
             requestedModel: model,
             requestedReasoningEffort: reasoningEffort
@@ -276,9 +171,14 @@ public actor SwiftNativeChatOrchestrationClient: ChatOrchestrationClient {
                 progress: progress,
                 noticeSink: { kind, text in await progress?(.notice(kind: kind, text: text)) }
             )
+            if case .success = execution.turn, let suffix = TurnSettle.takeStreamSuffix() {
+                await progress?(.delta(suffix))
+            }
             let requested = model.trimmingCharacters(in: .whitespacesAndNewlines)
             execution.response.requestedModel = requested.isEmpty ? nil : requested
             return execution
+        }
+        }
         }
         }
         }

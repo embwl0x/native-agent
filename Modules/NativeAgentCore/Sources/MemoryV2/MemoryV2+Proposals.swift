@@ -1,6 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import NativeAgentShared
 // Blueprint: | `MemoryV2+Proposals.swift` | `SwiftNativeMemoryV2`: `propose`, `acceptProposal`, `supersedingAcceptance` |
 
 extension SwiftNativeMemoryV2 {
@@ -14,20 +15,9 @@ extension SwiftNativeMemoryV2 {
         kind: String? = nil,
         supportingSessionIDs: [String] = [],
         recurrenceCount: Int? = nil,
-        // Lane-specific metadata the caller owns (the moments lane's
-        // lane/valence/salience/quote/session/surface/author). Merged UNDER the
-        // typed fields above so no caller can overwrite confidence/kind through
-        // the side door. Empty (the default) is byte-identical to the previous
-        // behavior on both the fresh-insert and the dedup-merge path.
+        // Caller metadata is subordinate to typed fields when staging a new proposal.
         extraMetadata: [String: JSONValue] = [:]
     ) async throws -> ProposalRecord {
-        let turnMetadata = try MemorySenseProvenance.stamping(.object(extraMetadata))
-        let extraMetadata: [String: JSONValue]
-        if case .object(let stamped)? = turnMetadata {
-            extraMetadata = stamped
-        } else {
-            extraMetadata = [:]
-        }
         let content = MemoryTextClip.memoryDisplayText(content, kind: kind)
         guard !content.isEmpty else { throw MemoryV2Error.invalidQuery }
         if let reason = MemoryCandidateQuality.rejectionReason(text: content, source: source, kind: kind) {
@@ -35,39 +25,19 @@ extension SwiftNativeMemoryV2 {
         }
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
-        // Carry the extractor's confidence + kind so acceptProposal stamps them
-        // on the memory instead of discarding them (#1). nil → empty metadata.
         let sessions = Array(Set(supportingSessionIDs.compactMap { raw -> String? in
             let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             return value.isEmpty ? nil : value
         })).sorted().prefix(32)
-        // 2026-07-21 audit fix: content-hash dedup on PENDING proposals.
-        // observeTurn re-stages the same extracted fact every turn with a
-        // fresh UUID, flooding the review queue with duplicates of one fact.
-        // A pending proposal with the same normalized content hash (persona
-        // is the store constant — the bridge stamps
-        // MemoryV2Defaults.personaID on every proposal insert) is updated in
-        // place instead: session evidence unions, recurrence accrues,
-        // confidence keeps the max, and the canonical row's id is returned
-        // so the auto-accept lane still fires on it. Resolved proposals are
-        // untouched — their rows are audit trail.
-        // 2026-08-14 proposal-hygiene fix: fold articles before hashing so
-        // extractor variants of one fact ("user is a AI assistant" vs "user
-        // is AI assistant") dedupe instead of double-staging. Folding is
-        // LOCAL to this comparison — both sides are folded at compare time
-        // and no folded hash is ever stored, so stored contentHash uses
-        // (KG memory index, kind backfill) are untouched.
+        // Deduplicate pending facts by article-folded content; never persist the comparison hash.
         let dedupKey: @Sendable (String) -> String = { s in
             MemoryStorage.contentHash(MemoryStorage.comparisonKey(s, mode: .proposal))
         }
-        // The evidence merge, lifted out of the old inline branch so BOTH the
-        // atomic staging path and the legacy fallback below apply exactly the
-        // same rules to the row they found.
-        let mergedMetadata: @Sendable (ProposalRecord) throws -> JSONValue? = { existing in
+        // Merge sessions, recurrence and maximum confidence under the pending-proposal write lock.
+        let mergedMetadata: @Sendable (StoredProposal) throws -> JSONValue? = { existing in
             var merged: [String: JSONValue]
             if case .object(let m)? = existing.metadata { merged = m } else { merged = [:] }
-            // Runs under the pending-proposal write lock, including an `add`
-            // that deduplicates into a correction staged by a newer turn.
+            // Corrections merge only for the same subject and a nonolder originating turn.
             if kind == "correction" || merged["kind"] == .string("correction") {
                 guard kind == "correction", merged["kind"] == .string("correction"),
                       case .string(let subject)? = merged["correction_subject"],
@@ -98,7 +68,7 @@ extension SwiftNativeMemoryV2 {
                     }
                     return count
                 case .string(let s)?:
-                    // 2026-09-06: malformed saved evidence is not absence.
+                    // Malformed saved evidence is not absence.
                     guard let count = Int64(s.trimmingCharacters(in: .whitespaces)) else {
                         nativeLog("MemoryV2: refusing proposal merge with invalid recurrence_count; saved evidence retained")
                         throw MemoryStorageError.databaseUnavailable("stage proposal: recurrence_count is not a valid Int64")
@@ -110,8 +80,7 @@ extension SwiftNativeMemoryV2 {
                     throw MemoryStorageError.databaseUnavailable("stage proposal: recurrence_count has an invalid type")
                 }
             }
-            // 2026-09-06: reject unrepresentable counters before staging writes;
-            // propagate through the existing transaction instead of trapping.
+            // Reject counter overflow before staging writes.
             let priorRecurrence = try intMeta(merged, "recurrence_count") ?? 1
             let incomingRecurrence = Int64(max(1, recurrenceCount ?? 1))
             let (nextRecurrence, overflow) = priorRecurrence.addingReportingOverflow(incomingRecurrence)
@@ -137,9 +106,6 @@ extension SwiftNativeMemoryV2 {
             for (key, value) in extraMetadata where key != "kind" && key != "sense_versions" {
                 merged[key] = value
             }
-            for (key, value) in MemorySenseProvenance.merging(existing: existing.metadata, incoming: .object(extraMetadata)) {
-                merged[key] = value
-            }
             return merged.isEmpty ? nil : .object(merged)
         }
         var meta: [String: JSONValue] = extraMetadata
@@ -151,12 +117,12 @@ extension SwiftNativeMemoryV2 {
         if let recurrenceCount {
             meta["recurrence_count"] = .int(Int64(max(1, recurrenceCount)))
         }
-        let proposal = ProposalRecord(
+        var proposal = StoredProposal(
             id: UUID().uuidString,
             content: content,
             source: source,
+            stagedAt: Self.iso8601Now(),
             status: "pending",
-            createdAt: Self.iso8601Now(),
             metadata: meta.isEmpty ? nil : .object(meta)
         )
 
@@ -164,24 +130,22 @@ extension SwiftNativeMemoryV2 {
         // transaction so concurrent observations retain all their evidence.
         if let merged = try await storage.stagePendingProposal(
             proposal,
-            embedding: nil,
-            embeddingEpoch: nil,
             insertIfAbsent: false,
             foldedKey: dedupKey,
             merge: mergedMetadata
         ) {
-            return merged
+            return ProposalRecord(stored: merged)
         }
         let embedded = try await embedOneWithEpoch(content)
+        proposal.embedding = embedded.vector
+        proposal.embeddingEpoch = embedded.epoch.rawValue
         guard let staged = try await storage.stagePendingProposal(
             proposal,
-            embedding: embedded.vector,
-            embeddingEpoch: embedded.epoch,
             insertIfAbsent: true,
             foldedKey: dedupKey,
             merge: mergedMetadata
         ) else { throw MemoryV2Error.storageUnavailable }
-        return staged
+        return ProposalRecord(stored: staged)
     }
 
     public func acceptProposal(id: String) async throws -> MemoryRecord {
@@ -196,47 +160,29 @@ extension SwiftNativeMemoryV2 {
             kind: MemoryRecallScoring.kind(of: proposal.metadata)
         ) {
             let rejection = "quality gate at acceptance: \(reason)"
-            try await storage.updateProposalStatus(
-                id: id,
-                status: "rejected",
-                rejectionReason: rejection
-            )
+            try await storage.rejectProposal(id: id, reason: rejection)
+            requestEmbeddingEpochReconcile()
             throw MemoryV2Error.rejectedCandidate("\(reason); the proposal was marked rejected.", effects: .occurred)
         }
-        // The tombstone gate runs at acceptance too, not just at proposal time —
-        // a proposal that was queued before the denylist entry landed must still
-        // be rejected when it tries to promote.
+        // Recheck tombstones at acceptance, including denials made after staging.
         if try await storage.isTombstoned(content: proposal.content) {
-            try await storage.updateProposalStatus(id: id, status: "rejected", rejectionReason: "tombstoned at acceptance")
+            try await storage.rejectProposal(id: id, reason: "tombstoned at acceptance")
+            requestEmbeddingEpochReconcile()
             throw MemoryV2Error.forgottenContent("Proposal content matches a forgotten or rejected memory; the proposal was marked rejected.", effects: .occurred)
         }
-        // An `update` from the memory manager carries the id of the memory it
-        // replaces, plus that row's fingerprint at staging time. Keep is then ONE
-        // transaction: the new memory lands and the old one is demoted (lifecycle
-        // 'corrected' with superseded_by provenance — DEMOTION, never erasure),
-        // or neither happens and this proposal stays pending with a reason.
-        // Before 2026-09-11 this was accept-then-`try?`-demote, which could leave
-        // both rows current and still report success (audit finding 1).
-        if let targetId = Self.supersedesTargetId(from: proposal.metadata) {
-            guard let superseding = Self.supersedingAcceptance(from: proposal.metadata) else {
-                // A legacy proposal staged before the fingerprint existed. There
-                // is nothing to check the target against, so applying it would be
-                // an unverified demotion of whatever now holds that id. Left
-                // pending for re-review rather than silently demoting.
-                throw ToolFailureError("The replacement target has no recorded fingerprint (\(targetId)); the proposal remains pending.",
-                    effects: .none, nextCall: ToolFailureError.call("app", ["action": .string("memory.list")]),
-                    code: "memory_supersession_review_required", status: .refused,
-                    instruction: "Read the current target and stage a newly reviewed replacement; do not resubmit this unverified proposal.", recovery: .inspect)
-            }
-            let accepted = try await acceptSuperseding(id: id, superseding: superseding)
-            return accepted
+        // Fingerprinted replacements atomically accept and mark the old memory corrected, preserving it.
+        let superseding = Self.supersedingAcceptance(from: proposal.metadata)
+        if let targetId = Self.supersedesTargetId(from: proposal.metadata), superseding == nil {
+            // Without a recorded fingerprint, leave the replacement pending for review.
+            throw ToolFailureError("The replacement target has no recorded fingerprint (\(targetId)); the proposal remains pending.",
+                effects: .none, nextCall: ToolFailureError.call("app", ["action": .string("memory.list")]),
+                code: "memory_supersession_review_required", status: .refused,
+                instruction: "Read the current target and stage a newly reviewed replacement; do not resubmit this unverified proposal.", recovery: .inspect)
         }
-        let accepted = try await storage.acceptProposal(id: id)
-        return accepted
+        return MemoryRecord(stored: try await storage.acceptProposal(id: id, superseding: superseding))
     }
 
-    /// The replacement an accepted update must perform, read off the proposal
-    /// the person reviewed. nil when this proposal claims no supersession.
+    /// Reviewed replacement intent; nil unless both target and fingerprint are present.
     static func supersedingAcceptance(from metadata: JSONValue?) -> SupersedingAcceptance? {
         guard case .object(let meta)? = metadata,
               let targetId = Self.supersedesTargetId(from: metadata),
@@ -249,9 +195,7 @@ extension SwiftNativeMemoryV2 {
         )
     }
 
-    /// The memory id this proposal claims to replace, fingerprint or not.
-    /// Used to tell "no supersession" apart from "supersession we cannot
-    /// verify" — the second must never be applied.
+    /// Read target intent independently so missing fingerprints cannot turn replacements into ordinary accepts.
     static func supersedesTargetId(from metadata: JSONValue?) -> String? {
         guard case .object(let meta)? = metadata,
               case .string(let targetId)? = meta[MemoryManagerLane.supersedesKey],
@@ -259,45 +203,7 @@ extension SwiftNativeMemoryV2 {
         return targetId
     }
 
-    /// Accept and demote together; transaction conflicts leave the proposal pending.
-    private func acceptSuperseding(
-        id: String,
-        superseding: SupersedingAcceptance
-    ) async throws -> MemoryRecord {
-        try await ensureCanonicalAttachment()
-        guard let storage else { throw MemoryV2Error.storageUnavailable }
-        return try await storage.acceptProposal(id: id, superseding: superseding)
-    }
-
-    /// Prepare the final words before promotion. No active row or projection
-    /// exists until the storage transaction accepts this exact reviewed version.
-    public func acceptReviewedMoment(id: String, content: String) async throws -> MemoryRecord {
-        try await ensureCanonicalAttachment()
-        guard let storage else { throw MemoryV2Error.storageUnavailable }
-        guard let proposal = try await storage.getProposal(id: id),
-              proposal.status == "pending", MemoryMoments.isMoment(proposal.metadata) else {
-            throw MemoryV2Error.recordNotFound
-        }
-        if let reason = MemoryCandidateQuality.rejectionReason(
-            text: content, source: proposal.source, kind: MemoryRecallScoring.kind(of: proposal.metadata)
-        ) { throw MemoryV2Error.rejectedCandidate(reason) }
-        let embedded = try await embedOneWithEpoch(content)
-        let accepted = try await storage.acceptReviewedMoment(id: id, review: ReviewedMomentAcceptance(
-            expectedContent: proposal.content, content: content,
-            embedding: embedded.vector, embeddingEpoch: embedded.epoch.rawValue
-        ))
-        return accepted
-    }
-
-    /// A pending statement replaced by its own correction (2026-09-11, Astra
-    /// comb finding 1). NOT a rejection: a rejection writes a tombstone, and the
-    /// tombstone of "Claude uses GPT-5.6 for build reviews" then blocked its
-    /// refined successor at the semantic gate (cosine 0.927 against a 0.92
-    /// threshold, live). Refined is not denied. Status only, no tombstone, and
-    /// any tombstone an earlier build wrote for this exact text is removed.
-    ///
-    /// Pending state, successor metadata, tombstone removal and retirement
-    /// commit together so a concurrent review decision cannot be overwritten.
+    /// Retire a pending proposal and record its successor atomically; preserve all tombstones.
     @discardableResult
     public func supersedeProposal(id: String, by successorId: String) async throws -> Bool {
         try await ensureCanonicalAttachment()
@@ -305,31 +211,9 @@ extension SwiftNativeMemoryV2 {
         return try await storage.supersedeProposal(id: id, by: successorId)
     }
 
-    /// Launch repair for rows the 2026-09-11 build retired through the rejection
-    /// path: flip them to `superseded` and drop their tombstones so their
-    /// successors can be kept. Idempotent; a no-op once clean.
-    ///
-    /// BOTH HALVES OF AN INTERRUPTED REPAIR (Astra comb 3, lane1 finding 2 /
-    /// lane2 finding 5, 2026-09-12). The first cut flipped the status, then
-    /// deleted the tombstone under `try?`: if the delete failed — or the process
-    /// stopped between the two — the row was no longer `rejected`, so no later
-    /// launch ever selected it again and the tombstone kept blocking the
-    /// successor forever. This pass therefore looks for both shapes:
-    ///
-    /// - `rejected` rows whose reason names a correction: the untouched case.
-    /// - `superseded` rows that still carry a tombstone: the half-repaired case.
-    ///   Supersession never tombstones, so that combination is itself the
-    ///   evidence, and it does not depend on a reason string that
-    ///   `markProposalStatus` does not persist.
-    /// - `pending` rows that already carry `supersededBy` metadata (Astra comb
-    ///   3, lane2 finding 3, 2026-09-12): older builds wrote the
-    ///   successor link first and flipped the status last, so a crash between the
-    ///   two leaves a row that is still actionable in the review queue while its
-    ///   replacement is already staged. The metadata IS the evidence the
-    ///   supersession had begun; this pass finishes it.
-    ///
-    /// The tombstone goes FIRST and is verified gone before the status moves, so
-    /// an interrupted run always leaves a row this pass can still find.
+    /// Repair correction-rejected, superseded and successor-linked pending rows in cursor order.
+    /// Remove only tombstones matching the proposal's content/hash and recorded supersession reason.
+    /// Genuine denials remain authoritative; repair and cursor advancement commit together.
     public func repairSupersededTombstones() async {
         do { try await ensureCanonicalAttachment() }
         catch { emitDiagnostic("[MemoryV2] Supersession repair attachment failed: \(error)"); return }
@@ -340,9 +224,6 @@ extension SwiftNativeMemoryV2 {
 
     static let supersessionReasonPrefix = "superseded by a correction: "
 
-    /// The successor id `supersedeProposal` wrote into a row's metadata, if any.
-    /// Present on a pending row means the supersession started and did not
-    /// reach its status flip.
     /// A pending statement waits on the owner's review when nothing has
     /// superseded it and it passes the durable-candidate gate. The Today page
     /// ("Waiting on you") and the agent's home count by this one rule.
@@ -352,6 +233,7 @@ extension SwiftNativeMemoryV2 {
         return MemoryCandidateQuality.isDurableCandidate(text: content, source: source, kind: kind)
     }
 
+    /// Successor evidence applies even while a proposal's status remains pending.
     public static func supersededByMarker(in metadata: JSONValue?) -> String? {
         guard case .object(let meta)? = metadata,
               case .string(let successor)? = meta["supersededBy"],
@@ -366,34 +248,18 @@ extension SwiftNativeMemoryV2 {
         guard try await storage.getProposal(id: id) != nil else {
             throw MemoryV2Error.recordNotFound
         }
-        // Rejection writes its tombstone (with the proposal's vector) in the
-        // same transaction as the status, so the same fact can't re-enter via
-        // a future proposal.
-        try await storage.updateProposalStatus(id: id, status: "rejected", rejectionReason: reason)
+        // Rejection and its vector-bearing tombstone commit together to prevent re-entry.
+        try await storage.rejectProposal(id: id, reason: reason)
+        requestEmbeddingEpochReconcile()
         return true
     }
 
-    /// A row that already carries a successor link is NOT offered among pending
-    /// statements, whatever its status says (Astra comb 4, lane5 finding 2).
-    /// Older builds wrote the link first and flipped the status last, and
-    /// the flip is refused outright when a review decision arrived meanwhile —
-    /// so "pending with a successor" is a real state, and a statement whose
-    /// replacement is already staged must not be offered for approval or fed
-    /// back to the manager as competition for its own correction. `nil` status
-    /// (the audit listings and the repair itself) is untouched.
+    /// Pending listings exclude successor-linked rows; other status filters and unfiltered audit reads retain them.
     public func listProposals(status: String? = nil) async throws -> [ProposalRecord] {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
-        let rows = try await storage.listProposals(status: status)
+        let rows = try await storage.listProposals(status: status).map(ProposalRecord.init(stored:))
         guard status == "pending" else { return rows }
         return rows.filter { Self.supersededByMarker(in: $0.metadata) == nil }
     }
-
-    /// Count the moments lane without decoding proposal rows.
-    public func countMomentProposals(status: String? = "pending") async throws -> Int {
-        try await ensureCanonicalAttachment()
-        guard let storage else { throw MemoryV2Error.storageUnavailable }
-        return try await storage.countMomentProposals(status: status)
-    }
-
 }

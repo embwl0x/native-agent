@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Foundation
 import PersistenceCore
 import Desk
@@ -70,7 +71,7 @@ struct WorkshopObservatoryPanel: View {
         header(snapshot)
 
         if let deskUnavailable = snapshot.deskUnavailable {
-            noticeRow(
+            ObservatoryNoticeRow(
                 icon: "questionmark.circle", tint: .orange,
                 title: "Desk state unavailable",
                 detail: deskUnavailable)
@@ -165,7 +166,7 @@ struct WorkshopObservatoryPanel: View {
             .font(NativeAgentFont.section)
         switch state {
         case .unavailable(let reason):
-            noticeRow(
+            ObservatoryNoticeRow(
                 icon: "questionmark.circle", tint: .orange,
                 title: "Session receipts unavailable", detail: reason)
         case .rows(let rows):
@@ -219,9 +220,4 @@ struct WorkshopObservatoryPanel: View {
         }
     }
 
-    /// Thin wrapper over the shared `ObservatoryNoticeRow` (C10 dedup); call
-    /// sites in this panel are unchanged.
-    private func noticeRow(icon: String, tint: Color, title: String, detail: String?) -> some View {
-        ObservatoryNoticeRow(icon: icon, tint: tint, title: title, detail: detail)
-    }
 }

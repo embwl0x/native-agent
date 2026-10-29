@@ -2,38 +2,8 @@ import SwiftUI
 
 // Blueprint: | `HealthPill.swift` | `HealthPill`: compact health status color/label presentation |
 
-/// The health pill has one navigation responsibility: take the person to the
-/// mounted Doctor diagnostics surface. A queued request is useful, but it is
-/// not the same as Doctor having already rendered.
-enum HealthPillDoctorJump {
-    static let destination: NativeAgentNavigationDestination = .sidebar(.diagnostics)
-
-    @MainActor
-    static func request(
-        using coordinator: NativeAgentAppCoordinator = .shared
-    ) -> NativeAgentNavigationRequestReceipt {
-        coordinator.request(destination)
-    }
-
-    static func help(for receipt: NativeAgentNavigationRequestReceipt?) -> String {
-        switch receipt {
-        case .some(.deliveredToMountedScene):
-            return "Opening Diagnostics in the app window."
-        case .some(.queuedForMainScene):
-            return "Diagnostics will open when the main window is ready."
-        case .none:
-            return "Open Diagnostics"
-        }
-    }
-}
-
 /// The pill renders each owner's repair face without requiring another surface.
 enum HealthPillPopoverPresentation: Equatable {
-    enum Action: Equatable {
-        case check          // run it now
-        case checking       // a run is already in flight
-    }
-
     static func headline(summary: SystemHealthSummary, isChecking: Bool) -> String {
         if isChecking { return "Looking things over…" }
         switch summary {
@@ -59,17 +29,6 @@ enum HealthPillPopoverPresentation: Equatable {
             return "The app still works. These are things worth fixing when you have a minute."
         case .error:
             return "Some features will not work until these are fixed."
-        }
-    }
-
-    static func action(isChecking: Bool) -> Action {
-        isChecking ? .checking : .check
-    }
-
-    static func actionTitle(_ action: Action) -> String {
-        switch action {
-        case .check: "Take a look"
-        case .checking: "Looking…"
         }
     }
 
@@ -103,10 +62,6 @@ public struct HealthPill: View {
             .houseSurface(in: Capsule())
         }
         .buttonStyle(.plain)
-        // D3: the tooltip used to be derived from the LAST navigation receipt,
-        // so after one click it read "Doctor navigation is queued until the
-        // main window is ready." forever — stale, and developer vocabulary in
-        // a permanent tooltip. It is a fixed description of the control now.
         .help("How the app is doing")
         .accessibilityLabel("How the app is doing: \(label)")
         .accessibilityIdentifier("health-pill.open-doctor")
@@ -123,7 +78,6 @@ public struct HealthPill: View {
         statusColor: Color
     ) -> some View {
         let isChecking = appModel.engine.doctor.isRunning
-        let action = HealthPillPopoverPresentation.action(isChecking: isChecking)
 
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 7) {
@@ -177,19 +131,17 @@ public struct HealthPill: View {
                     .disabled(isChecking)
                     .accessibilityIdentifier("health-pill.repair-now")
                 }
-                Button(HealthPillPopoverPresentation.actionTitle(action)) {
+                Button(isChecking ? "Looking…" : "Take a look") {
                     Task { _ = await appModel.runDoctor(repair: false) }
                 }
-                .disabled(action == .checking)
+                .disabled(isChecking)
                 .accessibilityIdentifier("health-pill.check-now")
 
-                // The jump survives, but only for people who already turned
-                // developer surfaces on — everyone else has no Diagnostics row
-                // to come back to.
+                // Diagnostics follows developer-surface visibility.
                 if showDeveloperSurfaces {
                     Button(HealthPillPopoverPresentation.detailsTitle) {
                         showPopover = false
-                        _ = HealthPillDoctorJump.request()
+                        ApplicationLifetime.shared.request(.sidebar(.diagnostics))
                     }
                     .accessibilityIdentifier("health-pill.open-diagnostics")
                 }
@@ -202,10 +154,7 @@ public struct HealthPill: View {
     private func label(for summary: SystemHealthSummary) -> String {
         switch summary {
         case .unknown:
-            // D3: this arm rendered "Checking" whether or not anything was
-            // actually running, so a machine that never ran a check displayed
-            // a permanent progress claim. "Checking" now belongs to a real
-            // in-flight run; a cold pill says it has no answer yet.
+            // Claim checking only during a real run.
             appModel.engine.doctor.isRunning ? "Checking" : "Unknown"
         case .ok:
             "OK"

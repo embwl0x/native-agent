@@ -8,13 +8,7 @@ extension AgentPeerHTTP {
         try await send(request, bearerToken: bearerToken, timeout: timeout, liveUpdate: conversationLiveUpdate)
     }
 
-    public static func get(_ url: URL, bearerToken: String? = nil, headers: [String: String] = [:],
-                           timeout: TimeInterval = 30) async throws -> Response {
-        try await get(url, bearerToken: bearerToken, headers: headers, timeout: timeout,
-                      liveUpdate: conversationLiveUpdate)
-    }
-
-    private static var conversationLiveUpdate: LiveUpdateHandler? {
+    private static var conversationLiveUpdate: LiveUpdateSink? {
         guard let live = AgentConversationLiveContext.target else { return nil }
         return { update in
             let hub = AgentConversationLiveHub.shared

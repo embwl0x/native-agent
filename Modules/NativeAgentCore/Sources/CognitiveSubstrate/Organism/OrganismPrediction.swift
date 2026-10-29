@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 import PersistenceCore
 // Blueprint: | `OrganismPrediction.swift` | `OrganismPredictiveBody` enum; `predictionID`, `applying` |
 
@@ -17,30 +16,13 @@ public enum OrganismPredictiveBody {
     public static func applying(
         signal: SomaticSignal,
         to ledger: OrganismPredictionLedger,
-        chemicalState: ChemicalState,
-        bodySchema: BodySchema
-    ) -> (ledger: OrganismPredictionLedger, chemicalState: ChemicalState, bodySchema: BodySchema) {
+        chemicalState: ChemicalState
+    ) -> (ledger: OrganismPredictionLedger, chemicalState: ChemicalState) {
         var nextLedger = ledger
         var nextChemistry = chemicalState
-        var nextBody = bodySchema
 
-        // Item 5's mint is NOT here. A `.horizonRefresh` signal never reaches
-        // this function — the kernel routes it to `applyingHorizonRefresh`,
-        // which is the whole of what a calendar read is allowed to do. Ordinary
-        // signals still expire passed horizon rows through the sweep below
-        // (`applyExpiryTransition` owns the no-miss exception), so a horizon can
-        // pass while she is working and be announced without waiting for the
-        // next deadline.
-
-        // Ordering (reviews ccd2f13456f8 + 25de444129c7): RESOLUTION signals
-        // settle their own row BEFORE expiry — a prediction resolving one
-        // beat past due is exactly the outcome the body braced hardest for;
-        // expiring it first stamped a violation, denied the relief, and (for
-        // late failures) punished the same row twice. Every OTHER signal
-        // keeps the historical expiry-first order: a repeated start must not
-        // refresh its own overdue row past the sweep (the missed expectation
-        // is real), and cancellation of an overdue row stays a violation-
-        // stamped expiry, not a silent removal.
+        // Horizon refresh belongs to applyingHorizonRefresh; ordinary signals still expire passed horizons.
+        // Resolve an outcome before expiry; other signals sweep first so starts and cancellations cannot erase a miss.
         let resolvesOwnRow: Bool
         switch signal.kind {
         case .userSpoke, .toolSucceeded, .toolFailed,
@@ -59,88 +41,51 @@ public enum OrganismPredictiveBody {
         case .toolStarted:
             upsertPending(.toolCompletion, signal: signal, in: &nextLedger)
         case .toolSucceeded:
-            nextBody.toolCapabilityReading = nil
-            satisfy(.toolCompletion, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
-            nextBody.toolHandsAvailable = true
+            resolveOperational(.toolCompletion, satisfied: true, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
         case .toolFailed:
-            nextBody.toolCapabilityReading = nil
-            violate(.toolCompletion, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
-            nextBody.toolHandsAvailable = false
+            resolveOperational(.toolCompletion, satisfied: false, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
         case .toolCancelled:
             cancel(.toolCompletion, signal: signal, ledger: &nextLedger)
         case .providerStarted:
-            nextBody.providerPathBelief = nil
             upsertPending(.providerCompletion, signal: signal, in: &nextLedger)
         case .providerSucceeded:
-            nextBody.providerPathBelief = nil
-            satisfy(.providerCompletion, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
-            nextBody.providersHealthy = true
+            resolveOperational(.providerCompletion, satisfied: true, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
         case .providerFailed:
-            nextBody.providerPathBelief = nil
-            violate(.providerCompletion, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
-            nextBody.providersHealthy = false
+            resolveOperational(.providerCompletion, satisfied: false, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
         case .providerCancelled:
-            nextBody.providerPathBelief = nil
             cancel(.providerCompletion, signal: signal, ledger: &nextLedger)
-        case .providerRecovered:
-            nextBody.providerPathBelief = nil
-            nextBody.providersHealthy = true
-        case .iPhoneReachable:
-            nextBody.peerPresenceBelief = nil
-            nextBody.iPhoneReachable = true
-            nextBody.notificationPathHealthy = true
-        case .iPhoneStale:
-            nextBody.peerPresenceBelief = nil
-            nextBody.iPhoneReachable = false
-            nextBody.notificationPathHealthy = false
         case .phoneDeliveryStarted:
-            nextBody.notificationDeliveryBelief = nil
             upsertPending(.phoneDelivery, signal: signal, in: &nextLedger)
         case .phoneDeliveryReceived:
-            nextBody.notificationDeliveryBelief = nil
-            satisfy(.phoneDelivery, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
-            nextBody.iPhoneReachable = true
-            nextBody.notificationPathHealthy = true
+            resolveOperational(.phoneDelivery, satisfied: true, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
         case .phoneDeliveryFailed:
-            nextBody.notificationDeliveryBelief = nil
-            violate(.phoneDelivery, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
+            resolveOperational(.phoneDelivery, satisfied: false, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
         case .approvalRequested:
             upsertPending(.approvalResolution, signal: signal, in: &nextLedger)
         case .approvalResolved:
-            satisfy(.approvalResolution, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
+            resolveOperational(.approvalResolution, satisfied: true, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
         case .deskItemCreated:
             upsertPending(.workflowAdvance, signal: signal, in: &nextLedger)
         case .deskItemClosed:
-            satisfy(.workflowAdvance, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
+            resolveOperational(.workflowAdvance, satisfied: true, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
         case .deskItemCancelled:
             cancel(.workflowAdvance, signal: signal, ledger: &nextLedger)
         case .deskItemBlocked:
-            violate(.workflowAdvance, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
-        case .memoryCommitted, .memoryCorrected, .memoryHygieneCompleted:
-            nextBody.memoryIntegrityReading = nil
-        case .dreamCompleted, .remIntegrated:
-            nextBody.dreamIntegrityReading = nil
-        case .resourcePressureChanged:
-            nextBody.resourcePressureReading = nil
+            resolveOperational(.workflowAdvance, satisfied: false, signal: signal, ledger: &nextLedger, chemicalState: &nextChemistry)
         case .assistantSpoke:
-            // Item 46 MINT. Inert unless the appraisal owner stamped an
-            // expectation on this turn — the common case is no metadata and no
-            // row.
+            // Only the appraisal owner's metadata can mint an expectation.
             mintSemanticExpectation(signal: signal, in: &nextLedger)
         case .userSpoke:
-            // Item 46 RESOLVE. The next user turn is the answer to whatever she
-            // expected of the last one.
+            // The scoped reaction answers the completion she expected a response to.
             resolveSemanticExpectations(
                 signal: signal,
                 ledger: &nextLedger,
                 chemicalState: &nextChemistry
             )
-        case .correctionReceived, .appWake, .appSleep:
-            break
-        case .horizonRefresh:
-            // Already handled: `applyHorizonSources` runs at the top of this
-            // function, before the expiry sweep, for exactly this signal. There
-            // is nothing left for the kind switch to do.
+        case .correctionReceived, .appWake, .appSleep, .horizonRefresh,
+             .providerRecovered, .iPhoneReachable, .iPhoneStale,
+             .memoryCommitted, .memoryCorrected, .memoryHygieneCompleted,
+             .dreamCompleted, .remIntegrated, .resourcePressureChanged:
             break
         }
 
@@ -155,7 +100,7 @@ public enum OrganismPredictiveBody {
             signal.occurredAt
         )
         nextLedger = enforcingCapacity(nextLedger)
-        return (nextLedger, nextChemistry, nextBody)
+        return (nextLedger, nextChemistry)
     }
 
     private static func expireOverdue(
@@ -169,13 +114,10 @@ public enum OrganismPredictiveBody {
                   prediction.dueAt < date else { continue }
             let isMiss = applyExpiryTransition(to: &prediction, at: date)
             ledger.predictions[id] = prediction
-            ledger.expiredCount += 1
+            ledger.expiredCount = min(ledger.expiredCount, Int.max - 1) + 1
             guard isMiss else { continue }
             recordOutcome(.expired, kind: prediction.kind, at: date, ledger: &ledger)
-            // M15 (2026-07-09): an expiry damages bodyConfidence via the violation
-            // effect below but never stamped lastViolationAt — so the prospective
-            // shadow (modulate reads it) disagreed with the body about whether a
-            // miss just happened. One clock, both readers.
+            // An expired miss stamps the same violation clock that prospective affect reads.
             ledger.lastViolationAt = date
             if OrganismProspectiveAffect.carriesFeeling(prediction.kind) {
                 ledger.lastFeltViolationAt = max(ledger.lastFeltViolationAt ?? .distantPast, date)
@@ -189,26 +131,9 @@ public enum OrganismPredictiveBody {
         }
     }
 
-    /// THE expiry transition on a prediction ROW. One function, two callers:
-    /// this file's live sweep and `OrganismPersistentState.decayed(at:)`'s
-    /// restart/idle sweep. They had drifted — the restore path flipped `status`
-    /// and `lastUpdatedAt` and stopped, so an expectation that ran out across a
-    /// restart kept the confidence and uncertainty of a live pending row, while
-    /// the same expectation running out with the app awake was marked down.
-    /// Same event, two different bodies, decided by whether she happened to be
-    /// running.
-    ///
-    /// Returns whether this expiry is a MISS — evidence she was wrong, to be
-    /// counted and punished by the caller. Every non-horizon expiry is; no
-    /// horizon expiry is (Friday arriving with nothing on it means she was
-    /// waiting, not wrong), which is the one deliberate exception and is stated
-    /// here rather than duplicated at both call sites.
-    ///
-    /// The LEDGER-level consequences deliberately stay with the callers: the
-    /// live sweep stamps `lastViolationAt` and applies the chemistry, and the
-    /// restore sweep does neither, because a miss discovered hours later must
-    /// not arm a 20-minute violation shadow dated now or move a body that has
-    /// already decayed through the gap.
+    /// Live and restored rows share expiry; only non-horizon expiry is a miss.
+    /// Callers own ledger effects: the live sweep stamps violation and chemistry,
+    /// while restore avoids dosing a body already decayed through the gap.
     static func applyExpiryTransition(
         to prediction: inout OrganismPrediction,
         at date: Date
@@ -242,7 +167,7 @@ public enum OrganismPredictiveBody {
             existing.dueAt = dueAt
             existing.confidence = OrganismBodyConfidence.clamp(existing.confidence + 0.04 * signal.intensity)
             existing.uncertainty = OrganismBodyConfidence.clamp(existing.uncertainty + 0.04 * signal.intensity)
-            existing.evidenceCount += 1
+            existing.evidenceCount = min(existing.evidenceCount, Int.max - 1) + 1
             existing.lastUpdatedAt = signal.occurredAt
             ledger.predictions[id] = existing
         } else {
@@ -259,84 +184,29 @@ public enum OrganismPredictiveBody {
         }
     }
 
-    private static func satisfy(
+    private static func resolveOperational(
         _ kind: OrganismPredictionKind,
+        satisfied: Bool,
         signal: SomaticSignal,
         ledger: inout OrganismPredictionLedger,
         chemicalState: inout ChemicalState
     ) {
         let id = pendingID(kind: kind, signal: signal)
         let existing = ledger.predictions[id]
+        let status: OrganismPredictionStatus = satisfied ? .satisfied : .violated
         if let existing {
             guard signal.occurredAt >= existing.lastUpdatedAt else { return }
             // A replay of the same terminal edge is not new evidence. Keep
             // equal-time pending→terminal transitions valid: some lifecycle
             // owners legitimately stamp both phases from one clock sample.
-            if existing.status == .satisfied,
+            if existing.status == status,
                signal.occurredAt == existing.lastUpdatedAt { return }
         }
-        var prediction = existing ?? terminalPrediction(kind, signal: signal)
-        // Round 3 Wave A: measure how BRACED the body was for THIS outcome
-        // BEFORE the resolution mutates the prediction — the same math the
-        // projection used to hold the breath sizes the exhale. Only a REAL
-        // pending ledger row counts (review ccd2f13456f8, Medium: the
-        // synthetic terminal fallback is .pending-shaped and would mint
-        // relief for an outcome nothing anticipated). Zero bracing →
-        // multiplier 1 → byte-identical to the pre-relief release.
-        let bracing = (existing?.status == .pending)
-            ? min(1, OrganismProspectiveAffect.predictionBracingContribution(
-                prediction, ledger: ledger, at: signal.occurredAt
-              ).bracing + OrganismProspectiveAffect.violationShadow(ledger, at: signal.occurredAt))
-            : 0
-        if prediction.status != .satisfied {
-            ledger.satisfiedCount += 1
-            recordOutcome(.satisfied, kind: kind, at: signal.occurredAt, ledger: &ledger)
-        }
-        prediction.status = .satisfied
-        prediction.confidence = OrganismBodyConfidence.clamp(prediction.confidence + 0.18 * signal.intensity)
-        prediction.uncertainty = OrganismBodyConfidence.clamp(prediction.uncertainty - 0.16 * signal.intensity)
-        prediction.evidenceCount += 1
-        prediction.lastUpdatedAt = signal.occurredAt
-        ledger.predictions[prediction.id] = prediction
-        applySatisfiedEffect(
-            kind: kind,
-            intensity: signal.intensity,
-            bracing: bracing,
-            ledger: &ledger,
-            chemicalState: &chemicalState
-        )
-    }
-
-    private static func violate(
-        _ kind: OrganismPredictionKind,
-        signal: SomaticSignal,
-        ledger: inout OrganismPredictionLedger,
-        chemicalState: inout ChemicalState
-    ) {
-        let id = pendingID(kind: kind, signal: signal)
-        let existing = ledger.predictions[id]
-        if let existing {
-            guard signal.occurredAt >= existing.lastUpdatedAt else { return }
-            if existing.status == .violated,
-               signal.occurredAt == existing.lastUpdatedAt { return }
-        }
-        var prediction = existing ?? terminalPrediction(kind, signal: signal)
-        if prediction.status != .violated {
-            ledger.violatedCount += 1
-            recordOutcome(.violated, kind: kind, at: signal.occurredAt, ledger: &ledger)
-        }
-        prediction.status = .violated
-        prediction.confidence = OrganismBodyConfidence.clamp(prediction.confidence - 0.20 * signal.intensity)
-        prediction.uncertainty = OrganismBodyConfidence.clamp(prediction.uncertainty + 0.22 * signal.intensity)
-        prediction.evidenceCount += 1
-        prediction.lastUpdatedAt = signal.occurredAt
-        ledger.predictions[prediction.id] = prediction
-        ledger.lastViolationAt = signal.occurredAt
-        if OrganismProspectiveAffect.carriesFeeling(kind) {
-            ledger.lastFeltViolationAt = max(ledger.lastFeltViolationAt ?? .distantPast, signal.occurredAt)
-        }
-        applyViolationEffect(
-            kind: kind,
+        settlePrediction(
+            existing ?? terminalPrediction(kind, signal: signal),
+            satisfied: satisfied,
+            anticipated: existing?.status == .pending,
+            at: signal.occurredAt,
             intensity: signal.intensity,
             ledger: &ledger,
             chemicalState: &chemicalState
@@ -372,191 +242,59 @@ public enum OrganismPredictiveBody {
         )
     }
 
-    // MARK: - Item 46: the semantic lane
-
-    /// Open an expectation about how the turn she just finished will land.
-    /// Bounded four ways: the label AND the scope must be present and legible,
-    /// at most `maximumPendingPerSession` may be open for that session, and a
-    /// replayed signal cannot open the same row twice (the id folds in the turn
-    /// and its own second).
-    private static func mintSemanticExpectation(
-        signal: SomaticSignal,
-        in ledger: inout OrganismPredictionLedger
-    ) {
-        guard let rawLabel = OrganismSemanticExpectation.field(
-            OrganismSemanticExpectation.concernField,
-            in: signal.metadata,
-            key: OrganismSemanticExpectation.mintMetadataKey
-        ) else { return }
-        let label = OrganismToken.canonicalToken(rawLabel)
-        guard label != "unknown" else { return }
-        // Review fix 2: an unscoped expectation could only ever be resolved by
-        // settling the whole ledger, which is the defect. No scope, no row.
-        guard let scope = OrganismSemanticExpectation.scope(
-            in: signal.metadata,
-            key: OrganismSemanticExpectation.mintMetadataKey
-        ) else { return }
-        let id = semanticExpectationID(signal: signal, label: label, scope: scope)
-        guard ledger.predictions[id] == nil else { return }
-
-        // Review fix 5: the cap is per session and evicts the OLDEST pending row
-        // there. The newest expectation is the one the next turn is about;
-        // dropping it discarded the only row that could still resolve.
-        let sessionPending = ledger.predictions.values
-            .filter {
-                $0.kind == .semanticExpectation && $0.status == .pending
-                    && $0.semanticScope?.sessionID == scope.sessionID
-            }
-            .sorted { lhs, rhs in
-                if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
-                return lhs.id < rhs.id
-            }
-        if sessionPending.count >= OrganismSemanticExpectation.maximumPendingPerSession {
-            let overflow = sessionPending.count
-                - OrganismSemanticExpectation.maximumPendingPerSession + 1
-            for stale in sessionPending.prefix(overflow) {
-                // Evicted, not expired: she stopped holding it, which is not the
-                // same as having been wrong about it. No outcome is recorded and
-                // no violation effect fires.
-                ledger.predictions.removeValue(forKey: stale.id)
-            }
-        }
-
-        let i = OrganismBodyConfidence.clamp(signal.intensity)
-        ledger.predictions[id] = OrganismPrediction(
-            id: id,
-            kind: .semanticExpectation,
-            sourceOrgan: OrganismToken.canonicalToken(signal.sourceOrgan),
-            createdAt: signal.occurredAt,
-            dueAt: signal.occurredAt.addingTimeInterval(OrganismSemanticExpectation.horizon),
-            confidence: 0.5 + 0.3 * i,
-            uncertainty: 0.5 - 0.2 * i,
-            lastUpdatedAt: signal.occurredAt,
-            semanticScope: scope
-        )
-    }
-
-    /// Settle the semantic expectations THIS user turn actually answers.
-    ///
-    /// Review fix 2: scope decides, not "everything pending". The reaction
-    /// carries the session and the completion turn it is a verdict on, and only
-    /// rows minted under that exact pair are settled — a reply in one
-    /// conversation can no longer resolve, or punish, an expectation formed in
-    /// another. A turn is also never the reaction to itself (the same guard the
-    /// substrate's completion reconsolidation makes).
-    static func resolveSemanticExpectations(
-        signal: SomaticSignal,
-        ledger: inout OrganismPredictionLedger,
-        chemicalState: inout ChemicalState
-    ) {
-        guard let rawReaction = OrganismSemanticExpectation.field(
-            OrganismSemanticExpectation.reactionField,
-            in: signal.metadata,
-            key: OrganismSemanticExpectation.reactionMetadataKey
-        ) else { return }
-        guard let scope = OrganismSemanticExpectation.scope(
-            in: signal.metadata,
-            key: OrganismSemanticExpectation.reactionMetadataKey
-        ) else { return }
-        let clean = rawReaction.lowercased()
-        // Fail toward "he did not push back". An unrecognised label is an absent
-        // reading, and an absent reading must never mint the punishing outcome.
-        let reaction = [
-            OrganismSemanticExpectation.pushbackReaction,
-            OrganismSemanticExpectation.confirmedReaction,
-        ].contains(clean) ? clean : OrganismSemanticExpectation.neutralReaction
-        let violated = reaction == OrganismSemanticExpectation.pushbackReaction
-        let intensity = violated
-            ? OrganismBodyConfidence.clamp(max(0.2, signal.intensity))
-            : OrganismSemanticExpectation.satisfiedIntensity(
-                for: reaction, signalIntensity: signal.intensity
-            )
-        for id in ledger.predictions.keys.sorted() {
-            guard let prediction = ledger.predictions[id],
-                  prediction.kind == .semanticExpectation,
-                  prediction.status == .pending,
-                  prediction.semanticScope == scope,
-                  signal.occurredAt > prediction.createdAt,
-                  signal.occurredAt >= prediction.lastUpdatedAt else { continue }
-            settleSemanticExpectation(
-                prediction,
-                satisfied: !violated,
-                at: signal.occurredAt,
-                intensity: intensity,
-                ledger: &ledger,
-                chemicalState: &chemicalState
-            )
-        }
-    }
-
-    /// The SAME resolution arithmetic `satisfy`/`violate` apply, addressed by
-    /// row id instead of by signal correlation — a semantic expectation is
-    /// answered by "the next thing he said", which carries no correlation id.
-    /// Every downstream consequence (outcome counts, lastViolationAt, the felt
-    /// relief/disappointment diff, chemistry) is the shared machinery.
-    private static func settleSemanticExpectation(
+    /// Applies one admitted terminal transition; synthetic rows carry no bracing.
+    static func settlePrediction(
         _ prediction: OrganismPrediction,
         satisfied: Bool,
+        anticipated: Bool,
         at date: Date,
         intensity: Double,
         ledger: inout OrganismPredictionLedger,
         chemicalState: inout ChemicalState
     ) {
         var row = prediction
-        let i = OrganismBodyConfidence.clamp(intensity)
-        // Measure the bracing BEFORE the row mutates, exactly as `satisfy` does.
-        let bracing = satisfied
+        let i = intensity
+        // Measure the held breath before mutating the row.
+        let bracing = satisfied && anticipated
             ? min(1, OrganismProspectiveAffect.predictionBracingContribution(
                     row, ledger: ledger, at: date
                   ).bracing + OrganismProspectiveAffect.violationShadow(ledger, at: date))
             : 0
         if satisfied {
-            ledger.satisfiedCount += 1
-            recordOutcome(.satisfied, kind: .semanticExpectation, at: date, ledger: &ledger)
+            if row.status != .satisfied {
+                ledger.satisfiedCount = min(ledger.satisfiedCount, Int.max - 1) + 1
+                recordOutcome(.satisfied, kind: row.kind, at: date, ledger: &ledger)
+            }
             row.status = .satisfied
             row.confidence = OrganismBodyConfidence.clamp(row.confidence + 0.18 * i)
             row.uncertainty = OrganismBodyConfidence.clamp(row.uncertainty - 0.16 * i)
         } else {
-            ledger.violatedCount += 1
-            recordOutcome(.violated, kind: .semanticExpectation, at: date, ledger: &ledger)
+            if row.status != .violated {
+                ledger.violatedCount = min(ledger.violatedCount, Int.max - 1) + 1
+                recordOutcome(.violated, kind: row.kind, at: date, ledger: &ledger)
+            }
             row.status = .violated
             row.confidence = OrganismBodyConfidence.clamp(row.confidence - 0.20 * i)
             row.uncertainty = OrganismBodyConfidence.clamp(row.uncertainty + 0.22 * i)
             ledger.lastViolationAt = date
-            ledger.lastFeltViolationAt = max(ledger.lastFeltViolationAt ?? .distantPast, date)
+            if OrganismProspectiveAffect.carriesFeeling(row.kind) {
+                ledger.lastFeltViolationAt = max(ledger.lastFeltViolationAt ?? .distantPast, date)
+            }
         }
-        row.evidenceCount += 1
+        row.evidenceCount = min(row.evidenceCount, Int.max - 1) + 1
         row.lastUpdatedAt = date
         ledger.predictions[row.id] = row
         if satisfied {
             applySatisfiedEffect(
-                kind: .semanticExpectation, intensity: i, bracing: bracing,
+                kind: row.kind, intensity: i, bracing: bracing,
                 ledger: &ledger, chemicalState: &chemicalState
             )
         } else {
             applyViolationEffect(
-                kind: .semanticExpectation, intensity: i,
+                kind: row.kind, intensity: i,
                 ledger: &ledger, chemicalState: &chemicalState
             )
         }
-    }
-
-    /// Bounded deterministic identity from the organ, scope, concern and second.
-    public static func semanticExpectationID(
-        signal: SomaticSignal,
-        label: String,
-        scope: OrganismSemanticScope
-    ) -> String {
-        let components = [
-            signal.sourceOrgan,
-            scope.sessionID,
-            scope.turnID,
-            label,
-            String(Int(signal.occurredAt.timeIntervalSince1970)),
-        ]
-        let identity = components.map { "\($0.utf8.count):\($0)" }.joined()
-        let digest = SHA256.hash(data: Data(identity.utf8)).map { String(format: "%02x", $0) }.joined()
-        return "\(OrganismSemanticExpectation.idPrefix):\(digest)"
     }
 
     /// Rows the incoming terminal signal can settle, before wall-time expiry.
@@ -569,16 +307,7 @@ public enum OrganismPredictiveBody {
         case .approvalResolved: kind = .approvalResolution
         case .deskItemClosed, .deskItemCancelled, .deskItemBlocked: kind = .workflowAdvance
         case .userSpoke:
-            guard OrganismSemanticExpectation.field(
-                OrganismSemanticExpectation.reactionField, in: signal.metadata,
-                key: OrganismSemanticExpectation.reactionMetadataKey) != nil,
-                  let scope = OrganismSemanticExpectation.scope(
-                    in: signal.metadata, key: OrganismSemanticExpectation.reactionMetadataKey) else { return [] }
-            return Set(ledger.predictions.values.filter {
-                $0.kind == .semanticExpectation && $0.status == .pending
-                    && $0.semanticScope == scope && signal.occurredAt > $0.createdAt
-                    && signal.occurredAt >= $0.lastUpdatedAt
-            }.map(\.id))
+            return Set(semanticPredictionsResolved(by: signal, in: ledger)?.ids ?? [])
         default: return []
         }
         let id = pendingID(kind: kind, signal: signal)
@@ -587,9 +316,7 @@ public enum OrganismPredictiveBody {
         return [id]
     }
 
-    /// Relief gain: a satisfied outcome the body was fully braced for
-    /// releases up to 2.5× the calm-path amount — the exhale is sized to the
-    /// held breath (round 3 Wave A; bracing 0 → multiplier exactly 1).
+    /// Relief releases up to 2.5 times the calm-path amount in proportion to bracing; zero bracing leaves gain at one.
     static let reliefGain = 1.5
 
     static func applySatisfiedEffect(
@@ -640,10 +367,7 @@ public enum OrganismPredictiveBody {
             chemicalState.vigilance = raise(chemicalState.vigilance, by: 0.05 * i)
             chemicalState.urgency = raise(chemicalState.urgency, by: 0.04 * i)
         case .semanticExpectation:
-            // Being wrong about the WORK is the learning this whole item exists
-            // for. It rides the same axes a tool violation does — she gets more
-            // careful about the next claim and less sure of herself — but does
-            // not raise urgency: a person disagreeing is not a deadline.
+            // Disagreement raises caution and lowers confidence without urgency.
             ledger.strategyCaution = raise(ledger.strategyCaution, by: 0.16 * i)
             chemicalState.vigilance = raise(chemicalState.vigilance, by: 0.06 * i)
             chemicalState.confidence = lower(chemicalState.confidence, by: 0.05 * i)
@@ -683,9 +407,7 @@ public enum OrganismPredictiveBody {
         return next
     }
 
-    /// Internal rather than private: the restart/idle sweep in
-    /// `OrganismPersistentState.decayed(at:)` finds expiries the live sweep
-    /// never sees, and both paths must stamp identical evidence.
+    /// Live and restart/idle sweeps stamp the same cumulative outcome evidence.
     static func recordOutcome(
         _ status: OrganismPredictionStatus,
         kind: OrganismPredictionKind,
@@ -697,13 +419,13 @@ public enum OrganismPredictiveBody {
         var weights = count.effectiveWeights(at: date)
         switch status {
         case .satisfied:
-            count.satisfied += 1
+            count.satisfied = min(count.satisfied, Int.max - 1) + 1
             weights.satisfied += 1
         case .violated:
-            count.violated += 1
+            count.violated = min(count.violated, Int.max - 1) + 1
             weights.violated += 1
         case .expired:
-            count.expired += 1
+            count.expired = min(count.expired, Int.max - 1) + 1
             weights.expired += 1
         case .pending: return
         }
@@ -754,25 +476,15 @@ public enum OrganismPredictiveBody {
 
 }
 
-/// Keeps every pending expectation first, then retains recent terminal
-/// evidence fairly across capability kinds. Status never decides which
-/// terminal outcomes survive: prioritizing violations made the reservoir look
-/// like a failure-rate sample even when lifetime outcomes were overwhelmingly
-/// successful.
+/// Pending expectations precede recent terminal evidence, retained fairly
+/// across capability kinds without favoring any terminal status.
 enum OrganismPredictionRetention {
     static func bounded(
         _ predictions: [OrganismPrediction],
         maximum: Int
     ) -> [OrganismPrediction] {
         guard maximum > 0 else { return [] }
-        // Item 5 (2026-09-02): HORIZON rows rank after every other pending row.
-        // They are pending for DAYS by construction, and `recentFirst` sorts by
-        // `lastUpdatedAt` — so a register refreshed at the residual deadline
-        // looked like the freshest thing in the ledger and could evict live
-        // tool, provider and approval expectations at the 96 cap. Her calendar
-        // must never crowd out her hands. The horizon family has its own cap
-        // (`OrganismHorizonRegister.maximumOpen`, enforced at the mint), so this
-        // ordering is the only place the operational cap needs to know about it.
+        // Pending horizons rank after operational expectations so calendar rows cannot evict live work.
         let allPending = predictions.filter { $0.status == .pending }
         let pending = allPending.filter { $0.horizon == nil }.sorted(by: recentFirst)
             + allPending.filter { $0.horizon != nil }.sorted(by: recentFirst)

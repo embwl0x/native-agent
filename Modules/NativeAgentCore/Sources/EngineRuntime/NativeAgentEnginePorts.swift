@@ -1,4 +1,5 @@
 import Foundation
+import os
 import AttentionRouting
 import BackgroundWork
 import Desk
@@ -23,75 +24,42 @@ import Senses
 import NativeAgentShared
 // Blueprint: | `NativeAgentEnginePorts.swift` | Once-installed native host factories, body effects and shared EngineCognitionHost defaults; pure readout faces bind the selected Parts version through the no-effect authored host; read-part calls bind the existing ToolsFacade originating door and narrow the pinned candidate to native-permitted read actions/capabilities |
 
-/// The agent-bridge listener an A2A peer pushes task notifications to.
-public protocol EngineAgentBridgePort: Sendable {
-    func a2aPushConfiguration(for peer: AgentPeerContact) async -> JSONValue?
-}
-
-/// The standing-bot runner that drains queued bot runs.
-public protocol EngineStandingBotQueuePort: Sendable {
-    func enqueueRun(bot: UUID, question: String?) throws -> BotRunReceipt
-}
-
 /// Platform hosts supplied once to Core's composition root. The factories
 /// bind existing app adapters; dispatch and chat policy stay in the engine.
 public struct NativeAgentEnginePorts: Sendable {
     public let backgroundWork: any EngineBackgroundWorkHost
-    public let connectorStatus: any ConnectorStatusPlatform
-    public let browserRoutes: BrowserActionRoutes
+    public let connectorStatus: AppConnectorStatusPlatform
     public let cognitionHost: any CognitionHost
     public let deviceSyncHost: any DeviceSyncHost
     public let macIntegration: any MacIntegrationToolBridge
-    public let agentBridge: any EngineAgentBridgePort
+    public let a2aPushConfiguration: @Sendable (AgentPeerContact) async -> JSONValue?
     public let completionSender: @Sendable (URL) -> any AgentBridgeCompletionSending
-    public let standingBotQueue: any EngineStandingBotQueuePort
+    public let standingBotQueue: BotRunQueue
     public let appTools: @Sendable (SwiftNativeSecurityCenter, Bool) -> AppToolExecutor
-    public let interactions: any ToolInteractionResolving
     public let chatPlatform: ChatToolPlatformPort
-    public let connectorActionStatuses: @Sendable () async throws -> [String: String]
 
     public init(
         backgroundWork: any EngineBackgroundWorkHost,
-        connectorStatus: any ConnectorStatusPlatform,
-        browserRoutes: BrowserActionRoutes,
+        connectorStatus: AppConnectorStatusPlatform,
         cognitionHost: any CognitionHost,
         deviceSyncHost: any DeviceSyncHost,
         macIntegration: any MacIntegrationToolBridge,
-        agentBridge: any EngineAgentBridgePort,
+        a2aPushConfiguration: @escaping @Sendable (AgentPeerContact) async -> JSONValue?,
         completionSender: @escaping @Sendable (URL) -> any AgentBridgeCompletionSending,
-        standingBotQueue: any EngineStandingBotQueuePort,
+        standingBotQueue: BotRunQueue,
         appTools: @escaping @Sendable (SwiftNativeSecurityCenter, Bool) -> AppToolExecutor,
-        interactions: any ToolInteractionResolving,
-        chatPlatform: ChatToolPlatformPort,
-        connectorActionStatuses: @escaping @Sendable () async throws -> [String: String]
+        chatPlatform: ChatToolPlatformPort
     ) {
         self.backgroundWork = backgroundWork
         self.connectorStatus = connectorStatus
-        self.browserRoutes = browserRoutes
         self.cognitionHost = cognitionHost
         self.deviceSyncHost = deviceSyncHost
         self.macIntegration = macIntegration
-        self.agentBridge = agentBridge
+        self.a2aPushConfiguration = a2aPushConfiguration
         self.completionSender = completionSender
         self.standingBotQueue = standingBotQueue
         self.appTools = appTools
-        self.interactions = interactions
         self.chatPlatform = chatPlatform
-        self.connectorActionStatuses = connectorActionStatuses
-    }
-}
-
-extension EngineAgentBridgePort {
-    public func a2aPushConfiguration(for peer: AgentPeerContact, activePort port: UInt16) async -> JSONValue? {
-        guard port != 0, let secret = try? AgentPeerCredentials.read(peerID: peer.id), !secret.isEmpty else { return nil }
-        return .object(["url": .string("http://127.0.0.1:\(port)/a2a/notifications"),
-            "authentication": .object(["scheme": .string("Bearer"), "credentials": .string(secret)])])
-    }
-}
-
-extension BotRunQueue: EngineStandingBotQueuePort {
-    public func enqueueRun(bot: UUID, question: String?) throws -> BotRunReceipt {
-        try enqueue(bot: bot, context: question)
     }
 }
 
@@ -166,19 +134,18 @@ extension AttentionRouter {
 }
 
 extension NativeAgentEnginePorts {
-    private static let portsLock = NSLock()
-    nonisolated(unsafe) private static var appPorts: (@Sendable (URL) -> Self)?
+    private static let appPorts = OSAllocatedUnfairLock<(@Sendable (URL) -> Self)?>(initialState: nil)
 
     public static func installAppPorts(_ factory: @escaping @Sendable (URL) -> Self) {
-        portsLock.withLock {
-            precondition(appPorts == nil, "App ports are already installed")
-            appPorts = factory
+        appPorts.withLock {
+            precondition($0 == nil, "App ports are already installed")
+            $0 = factory
         }
     }
 
     public static func app(dataRoot: URL) -> Self {
-        let factory = portsLock.withLock {
-            guard let appPorts else { preconditionFailure("Install app ports before constructing the engine") }
+        let factory = appPorts.withLock {
+            guard let appPorts = $0 else { preconditionFailure("Install app ports before constructing the engine") }
             return appPorts
         }
         return factory(dataRoot)

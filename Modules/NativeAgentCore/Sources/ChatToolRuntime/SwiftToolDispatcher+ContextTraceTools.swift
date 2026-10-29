@@ -1,5 +1,6 @@
 import AgentWorkspace
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
@@ -21,9 +22,9 @@ import Transcripts
 extension SwiftToolDispatcher {
     func impl_context_lookup(input: [String: JSONValue]) async throws -> JSONValue {
         var body = input
-        if jsonString(body["type"]) == nil,
-           jsonString(body["lookup"]) == nil,
-           jsonString(body["id"]) == nil {
+        if body["type"]?.stringValue == nil,
+           body["lookup"]?.stringValue == nil,
+           body["id"]?.stringValue == nil {
             body["type"] = .string("lookup_feature_surface")
         }
         let client = SwiftNativeContextClient()
@@ -48,14 +49,14 @@ extension SwiftToolDispatcher {
 
     func impl_scratchpad_read(input: [String: JSONValue]) async throws -> JSONValue {
         let input = input.filter { $0.value != .string("") }
-        let rawSessionID = jsonString(input["session_id"])
-            ?? jsonString(input["sessionId"])
+        let rawSessionID = input["session_id"]?.stringValue
+            ?? input["sessionId"]?.stringValue
             ?? ""
         let sessionID = rawSessionID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !sessionID.isEmpty else {
             throw AutonomyGateError.toolDenied(reason: "scratchpad_read requires session_id")
         }
-        guard isSafeSessionPathComponent(sessionID) else {
+        guard NativeAgentChatSessionID.isSafePathComponent(sessionID) else {
             throw AutonomyGateError.toolDenied(reason: "scratchpad_read invalid session_id")
         }
 
@@ -70,7 +71,7 @@ extension SwiftToolDispatcher {
             ])
         }
 
-        if let key = jsonString(input["key"])?.trimmingCharacters(in: .whitespacesAndNewlines),
+        if let key = input["key"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
            !key.isEmpty {
             return .object([
                 "status": .string("ok"),
@@ -99,36 +100,33 @@ extension SwiftToolDispatcher {
     }
 
     func impl_recent_trace_summary(input: [String: JSONValue]) async throws -> JSONValue {
-        if jsonString(input["view"]) == "model_calls" {
+        if input["view"]?.stringValue == "model_calls" {
             return try await TurnTraceRecentReader(dataRootOverride: dataRoot).modelCalls()
         }
-        let usage = jsonString(input["view"]) == "usage"
+        let usage = input["view"]?.stringValue == "usage"
         let now = Date()
         let requestedLimit = Self.jsonInt(input["limit"]) ?? 10
         let limit = max(1, min(requestedLimit, 50))
         let offset = max(0, Self.jsonInt(input["offset"]) ?? 0)
         let effectsOnly = input["effects_only"] == .bool(true)
-        let receiptID = jsonString(input["receipt_id"])
-        let receiptView = effectsOnly || jsonString(input["view"]) == "receipts"
+        let receiptID = input["receipt_id"]?.stringValue
+        let receiptView = effectsOnly || input["view"]?.stringValue == "receipts"
         let since: Date?
-        if let raw = jsonString(input["since"]) ?? (usage ? "today" : nil) {
-            let formatter = ISO8601DateFormatter()
-            let fractional = ISO8601DateFormatter()
-            fractional.formatOptions.insert(.withFractionalSeconds)
-            since = raw == "today" ? Calendar.current.startOfDay(for: now) : formatter.date(from: raw) ?? fractional.date(from: raw)
+        if let raw = input["since"]?.stringValue ?? (usage ? "today" : nil) {
+            since = raw == "today" ? Calendar.current.startOfDay(for: now) : NativeTimestampFormat.parseISO8601(raw)
             guard since != nil else {
                 throw AutonomyGateError.toolDenied(reason: "since must be today or an ISO-8601 timestamp with Z or an offset.")
             }
         } else { since = nil }
         if usage, let since {
-            let by = jsonString(input["by"]) ?? "model"
+            let by = input["by"]?.stringValue ?? "model"
             guard ["model", "surface", "day"].contains(by), since <= now else {
                 throw AutonomyGateError.toolDenied(reason: "Usage requires by model, surface or day and since no later than now.")
             }
             return try await TurnTraceRecentReader(dataRootOverride: dataRoot).usage(since: since, now: now, by: by)
         }
         let completedTurns = Self.jsonInt(input["completed_turns"]).map { max(1, min($0, 50)) }
-        let kindFilter = jsonString(input["kind"])
+        let kindFilter = input["kind"]?.stringValue
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
             .flatMap { $0.isEmpty ? nil : $0 }
         if let kindFilter, ToolNameAliases.appAction(kindFilter) != nil || ToolNameAliases.isFoldedAction(kindFilter) {
@@ -139,19 +137,19 @@ extension SwiftToolDispatcher {
                 "detail": .string("kind selects events such as tool.dispatch; name selects a tool or action. Nothing was read."),
                 "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("trace.recent"), "args": .object(next)])])])
         }
-        let nameFilter = jsonString(input["name"]).map { ToolNameAliases.appAction(ToolNameAliases.canonical($0)) ?? $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        let nameFilter = input["name"]?.stringValue.map { ToolNameAliases.appAction(ToolNameAliases.canonical($0)) ?? $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
             .flatMap { $0.isEmpty ? nil : $0 }
-        let statusFilter = jsonString(input["status"])
+        let statusFilter = input["status"]?.stringValue
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
             .flatMap { $0.isEmpty ? nil : $0 }
         // Normalize each alias before choosing one: a blank optional primary
         // must not erase an explicit compatibility-alias filter.
         let normalizedSessionFilter = ["session_id", "sessionId"]
-            .compactMap { jsonString(input[$0])?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .compactMap { input[$0]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .first { !$0.isEmpty }
-        let turnID = jsonString(input["turn_id"])?
+        let turnID = input["turn_id"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let trace = jsonString(input["trace"])
+        let trace = input["trace"]?.stringValue
         var fields: [String] = []
         if let requested = input["fields"], requested != .null {
             guard (turnID?.isEmpty == false || completedTurns != nil),
@@ -162,7 +160,7 @@ extension SwiftToolDispatcher {
                   }) else {
                 throw AutonomyGateError.toolDenied(reason: "fields requires turn_id or completed_turns and 1–16 payload keys of at most 80 characters.")
             }
-            fields = values.compactMap { jsonString($0) }
+            fields = values.compactMap { $0.stringValue }
         }
         // Shared across all returned events, in serialized UTF-8 bytes.
         var remainingPayloadBytes = 8 * 1024
@@ -208,7 +206,7 @@ extension SwiftToolDispatcher {
         }
         var completedIDs: [String] = []
         if let completedTurns {
-            for event in events where ["turn.terminal", "turn.cancelled", "turn.failed"].contains(event.kind) {
+            for event in events where TurnTraceEvent.isTerminalKind(event.kind) {
                 guard event.turnId != "unknown", !completedIDs.contains(event.turnId),
                       normalizedSessionFilter == nil || sessionTurnIDs.contains(event.turnId),
                       turnID?.isEmpty != false || event.turnId == turnID else { continue }
@@ -223,21 +221,20 @@ extension SwiftToolDispatcher {
                   payload["phase"] == .string("end") else { return false }
             let receipt = if case .object(let receipt)? = payload["receipt"] { receipt } else { [String: JSONValue]() }
             let result = if case .object(let result)? = receipt["resultReceipt"] { result } else { [String: JSONValue]() }
-            let action = jsonString(receipt["action"]) ?? jsonString(payload["name"]) ?? jsonString(payload["tool"]) ?? ""
-            let arguments = jsonString(payload["args"]).flatMap { try? JSONValue.parse(Data($0.utf8)) }
+            let action = receipt["action"]?.stringValue ?? payload["name"]?.stringValue ?? payload["tool"]?.stringValue ?? ""
+            let arguments = payload["args"]?.stringValue.flatMap { try? JSONValue.parse(Data($0.utf8)) }
             let args = if case .object(let args)? = arguments { args } else { [String: JSONValue]() }
             let policy = AppActionBinding.action(input: ["action": .string(action), "args": args["args"] ?? .object(args)])
             return result["effects"] == .string("occurred")
                 || (policy?.read == false && (arguments != nil || policy?.readWhen.isEmpty == true))
         }
-        if receiptView {
-            // Rank after anchoring in time so continuation offsets retain this ordering.
-            let ranked = events.map { (event: $0, nonRead: nonReadReceipt($0)) }
-            events = ranked.filter(\.nonRead).map(\.event) + ranked.filter { !$0.nonRead }.map(\.event)
-        }
+        // Rank after anchoring in time so continuation offsets retain this ordering.
+        let classified = events.map { (event: $0, nonRead: receiptView && nonReadReceipt($0)) }
+        let ranked = receiptView ? classified.filter(\.nonRead) + classified.filter { !$0.nonRead } : classified
+        events = ranked.map(\.event)
         var summaries: [JSONValue] = []
         var matched = 0, summaryBytes = 0, hasMore = false
-        for event in events {
+        for (event, nonRead) in ranked {
             if let since, event.ts < since { continue }
             if completedTurns != nil, !completedIDs.contains(event.turnId) { continue }
             if let turnID, !turnID.isEmpty, event.turnId != turnID { continue }
@@ -253,7 +250,7 @@ extension SwiftToolDispatcher {
             } else {
                 payload = [:]
             }
-            let status = jsonString(payload["status"]) ?? ""
+            let status = payload["status"]?.stringValue ?? ""
             if let receiptID {
                 guard payload["phase"] == .string("end"), case .object(let receipt)? = payload["receipt"],
                       receipt["id"] == .string(receiptID) else { continue }
@@ -265,11 +262,11 @@ extension SwiftToolDispatcher {
                 continue
             }
 
-            let title = jsonString(payload["name"])
-                ?? jsonString(payload["tool"])
-                ?? jsonString(payload["model"])
+            let title = payload["name"]?.stringValue
+                ?? payload["tool"]?.stringValue
+                ?? payload["model"]?.stringValue
                 ?? ""
-            let action = if case .object(let receipt)? = payload["receipt"] { jsonString(receipt["action"]) } else { String?.none }
+            let action = if case .object(let receipt)? = payload["receipt"] { receipt["action"]?.stringValue } else { String?.none }
             if let nameFilter {
                 guard kind == "tool.dispatch", nameFilter == (ToolNameAliases.appAction(ToolNameAliases.canonical(title)) ?? title.lowercased())
                     || nameFilter == action?.lowercased() else { continue }
@@ -280,7 +277,7 @@ extension SwiftToolDispatcher {
                       receipt["preview"] != .bool(true), receipt["resultClass"] == .string("succeeded"),
                       case .object(let result)? = receipt["resultReceipt"],
                       result["effects"] != .string("none"), result["execution"] != .string("not_run") else { continue }
-                guard nonReadReceipt(event) else { continue }
+                guard nonRead else { continue }
             }
             matched += 1
             if matched <= offset { continue }
@@ -303,7 +300,7 @@ extension SwiftToolDispatcher {
                 summary["phase"] = payload["phase"]
                 summary["action"] = action.map(JSONValue.string)
                 summary.removeValue(forKey: "payload_keys")
-                if effectsOnly || nonReadReceipt(event) {
+                if effectsOnly || nonRead {
                     summary["args"] = payload["args"]
                     summary["result"] = payload["result"]
                 }
@@ -346,14 +343,13 @@ extension SwiftToolDispatcher {
         next["offset"] = .int(Int64(offset + summaries.count))
         next["before"] = anchor
         let candidateIDs = Array(events.filter { event in
-            ["turn.terminal", "turn.cancelled", "turn.failed"].contains(event.kind)
-                && (normalizedSessionFilter == nil || sessionTurnIDs.contains(event.turnId))
+            TurnTraceEvent.isTerminalKind(event.kind) && (normalizedSessionFilter == nil || sessionTurnIDs.contains(event.turnId))
         }.reduce(into: [String]()) { ids, event in
             if event.turnId != "unknown", !ids.contains(event.turnId) { ids.append(event.turnId) }
         }.prefix(6))
         let missingTurn = turnID?.isEmpty == false && !events.contains { $0.turnId == turnID }
         let reads = summaries.compactMap { value -> (tool: String, input: [String: JSONValue], title: String)? in
-            guard case .object(let row) = value, let id = jsonString(row["turn_id"]) else { return nil }
+            guard case .object(let row) = value, let id = row["turn_id"]?.stringValue else { return nil }
             return ("recent_trace_summary", ["turn_id": .string(id), "view": .string("receipts"), "session_id": row["session_id"] ?? .null], "Trace turn")
         } + (missingTurn ? candidateIDs.map { id in
             let session = events.first { $0.turnId == id && $0.sessionId != nil }?.sessionId
@@ -405,25 +401,21 @@ extension SwiftToolDispatcher {
         if effectsOnly {
             response["effects_note"] = .string("Successful non-read actions, excluding previews and explicit no-effect results. args/result are bounded redacted previews for target and effect; paired inner/app receipts can describe one action. No matches is not proof of no changes; check scan_truncated and has_more. Dispatch success does not prove the effect still persists.")
         }
-        while try JSONValue.object(response).serializedData(pretty: false).count > 32 * 1024 {
-            guard summaries.count > 1 else {
-                return .object(["status": .string("failed"), "effects": .string("none"),
-                    "detail": .string("Trace filters exceed the response budget. Shorten the filter values and retry.")])
+        let bounded = try EncodedPrefix.largestPrefix(count: summaries.count, maximumEncodedBytes: 32 * 1024) { count in
+            if count < summaries.count {
+                next["offset"] = .int(Int64(offset + count))
+                response["count"] = .int(Int64(count))
+                response["traces"] = .array(Array(summaries.prefix(count)))
+                response["has_more"] = .bool(true)
+                response["next_call"] = .object(["tool": .string("app"), "input": .object(["action": .string("trace.recent"), "args": .object(next)])])
             }
-            summaries.removeLast()
-            next["offset"] = .int(Int64(offset + summaries.count))
-            response["count"] = .int(Int64(summaries.count))
-            response["traces"] = .array(summaries)
-            response["has_more"] = .bool(true)
-            response["next_call"] = .object(["tool": .string("app"), "input": .object(["action": .string("trace.recent"), "args": .object(next)])])
+            return try JSONValue.object(response).serializedData(pretty: false)
         }
-        return .object(response)
+        guard bounded.data.count <= 32 * 1024, bounded.included > 0 || summaries.isEmpty else {
+            return .object(["status": .string("failed"), "effects": .string("none"),
+                "detail": .string("Trace filters exceed the response budget. Shorten the filter values and retry.")])
+        }
+        return try JSONValue.parse(bounded.data)
     }
 
-    private func isSafeSessionPathComponent(_ value: String) -> Bool {
-        guard !value.isEmpty, value.count <= 160 else { return false }
-        if value == "." || value == ".." { return false }
-        if value.contains("/") || value.contains("\\") || value.contains("\0") { return false }
-        return !value.split(separator: ":", omittingEmptySubsequences: false).contains("..")
-    }
 }

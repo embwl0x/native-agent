@@ -1,15 +1,5 @@
-// Swift-native cutover mem-m7: regenerate USER.md from the SQLite memory store.
-//
-// Canonical path: the active persona root's `USER.md`. MemoryV2 owns the
-// rendering and commits of the same document the compiler and tools read.
-// No fallback to the legacy `<dataRoot>/memory/USER.md`.
-//
-// MemoryV2 owns the truth (SQLite); USER.md is a derived, human-readable +
-// LLM-injected projection. This generator regenerates it from active memories
-// for a persona, preserving any human-edited preamble between
-// `<!-- USER_PREAMBLE_START -->` ... `<!-- USER_PREAMBLE_END -->` markers.
-// MemoryStorage pokes `requestRegeneration` on insertMemory / acceptProposal,
-// debounced to once per 30s.
+// Regenerate the active persona root's USER.md from canonical SQLite memory,
+// preserving its marked human preamble. MemoryStorage requests coalesced refreshes.
 
 import Darwin
 import Experiences
@@ -17,17 +7,14 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import PersonaEngine
+import NativeAgentShared
 
-// Blueprint: | `MemoryV2+UserMDGen.swift` | `UserMDGenerator`: coalesced regeneration of derived USER.md at the active canonical persona root; SQLite remains truth |
+// Blueprint: | `MemoryV2+UserMDGen.swift` | `UserMDGenerator`: coalesced regeneration of derived USER.md at the active canonical persona root; SQLite remains truth; admits `MemoryKindStamp.personKinds`, bounded at `UserMDAutogenMarkers.promptByteCap` |
 
 public enum UserMDGeneratorError: Error, CustomStringConvertible, LocalizedError {
-    /// USER.md was requested on an install that has not completed onboarding.
-    /// Not a failure: writing it there would fabricate the identity anchor
-    /// onboarding is about to create.
+    /// Onboarding must create the identity anchor before regeneration can project it.
     case onboardingIncomplete
-    /// A file that carries evidence of the generator's preamble contract is
-    /// unreadable or only partially marked. Regeneration must leave it untouched
-    /// instead of treating damage as an intentionally absent preamble.
+    /// Preserve unreadable documents or damaged preamble markers without overwriting them.
     case damagedExistingDocument(String)
 
     public var failure: ToolFailureError {
@@ -52,10 +39,7 @@ public enum UserMDGeneratorError: Error, CustomStringConvertible, LocalizedError
 /// USER.md is backed up/exported under the persona PrivacyMap scope, never
 /// phone-synced. Onboarding supplies its initial bytes to this commit owner.
 public actor UserMDGenerator {
-    // One owner: `UserMDAutogenMarkers` in NativeAgentCore. The Context
-    // compiler cuts per-fact atoms on these exact strings and the flow
-    // coordinator gates precoverage on them; a private literal here would
-    // drift silently.
+    // Share exact section markers with the Context compiler and prompt rendering.
     public static let preambleStartMarker = UserMDAutogenMarkers.preambleStart
     public static let preambleEndMarker = UserMDAutogenMarkers.preambleEnd
     public static let bodyStartMarker = UserMDAutogenMarkers.bodyStart
@@ -67,8 +51,7 @@ public actor UserMDGenerator {
     private let debounceInterval: TimeInterval
     private let nowProvider: @Sendable () -> Date
     private var lastRegen: Date?
-    /// U5 W-G trailing-edge fix (2026-06-11): personas whose regeneration
-    /// was debounced and is owed a trailing run when the window closes.
+    /// Personas owed a trailing regeneration when the debounce window closes.
     private var pendingPersonas: Set<String> = []
     /// Owns the deadline AND regeneration, until the flight actually exits.
     private var pendingTask: Task<Void, Never>?
@@ -90,21 +73,8 @@ public actor UserMDGenerator {
         self.nowProvider = now
     }
 
-    /// True once this install has finished onboarding, and therefore owns a
-    /// real identity that USER.md is allowed to project.
-    ///
-    /// Two accepted proofs, in order:
-    ///   * `<dataRoot>/.onboarded` — the completion sentinel onboarding
-    ///     publishes last, after every persona doc verifies.
-    ///   * The complete legacy persona document bundle, using onboarding's
-    ///     completion predicate at the resolved persona root.
-    ///
-    /// USER.md alone is not proof. A missing legacy document must keep this
-    /// generator from completing a partial bundle itself.
-    ///
-    /// A pending completion or reset owns exact bytes until its manifest clears,
-    /// even if SOUL.md or the sentinel already committed. Regeneration before
-    /// then would invalidate the transaction's resumption checks.
+    /// Require the completion sentinel or complete legacy identity bundle; USER.md alone is insufficient.
+    /// Pending completion/reset manifests block regeneration to preserve their exact transaction bytes.
     public nonisolated var onboardingHasCompleted: Bool {
         let fm = FileManager.default
         if fm.fileExists(atPath: dataRoot.appendingPathComponent("onboarding/pending-completion.json").path)
@@ -124,9 +94,7 @@ public actor UserMDGenerator {
         )
     }
 
-    /// Path the generator writes to for a given persona. A resolved persona
-    /// root is one active document, so it deliberately does not vary by the
-    /// storage partition supplied by a caller.
+    /// A resolved persona root names one document regardless of the requested storage partition.
     public nonisolated func userMDPath(persona: String) -> URL {
         if let personaRoot {
             return personaRoot.appendingPathComponent("USER.md")
@@ -137,19 +105,10 @@ public actor UserMDGenerator {
             .appendingPathComponent("USER.md")
     }
 
-    /// Skip if the last regeneration was within the debounce window. Returns
-    /// the URL when a regeneration actually ran, nil when debounced.
-    ///
-    /// U5 W-G fix (2026-06-11): debounced pokes used to be DROPPED — a burst
-    /// of inserts right after a regen left USER.md stale until some future
-    /// poke happened to land outside the window (trailing-edge loss). Now a
-    /// debounced poke schedules exactly one trailing regeneration at window
-    /// expiry, coalescing every poke that arrives meanwhile.
+    /// Return the regenerated URL, or nil when coalesced into one owed trailing run.
     @discardableResult
     public func requestRegeneration(persona: String = MemoryV2Defaults.personaID) async throws -> URL? {
         guard !stopped else { throw CancellationError() }
-        // Checked before the debounce bookkeeping so a pre-onboarding poke
-        // cannot schedule a trailing-edge task that will only fail later.
         guard onboardingHasCompleted else {
             throw UserMDGeneratorError.onboardingIncomplete
         }
@@ -168,15 +127,18 @@ public actor UserMDGenerator {
         return try await regenerateDocument(persona: projectionPersona)
     }
 
-    /// The app writes one active persona document. Its memory partition is a
-    /// stable runtime identity, not the configurable display name or a legacy
-    /// partition that happened to trigger a mutation.
+    /// The active document uses the stable runtime persona, independent of display names or mutation sources.
     private func projectionPersona(for requestedPersona: String) -> String {
         guard personaRoot != nil else { return requestedPersona }
         return MemoryV2Defaults.personaID
     }
 
     private func scheduleTrailingEdge(persona: String, after delay: TimeInterval) {
+        guard delay.isFinite, delay >= 0,
+              let nanoseconds = UInt64(exactly: (delay * 1_000_000_000).rounded(.towardZero)) else {
+            nativeLog("UserMDGenerator: invalid trailing-edge delay %@", String(describing: delay))
+            return
+        }
         pendingPersonas.insert(persona)
         guard pendingTask == nil else { return }
         pendingTaskWaiting = true
@@ -190,7 +152,7 @@ public actor UserMDGenerator {
                 }
             }
             do {
-                try await Task.sleep(nanoseconds: UInt64(max(0, delay) * 1_000_000_000))
+                try await Task.sleep(nanoseconds: nanoseconds)
                 try Task.checkCancellation()
             }
             catch { return }
@@ -229,11 +191,7 @@ public actor UserMDGenerator {
         shutdownTask = nil
     }
 
-    /// Regenerate USER.md from active memories for `persona`. Called on app
-    /// launch and by `requestRegeneration` after debounce.
-    ///
-    /// Throws `UserMDGeneratorError.onboardingIncomplete` on a machine that has
-    /// not finished onboarding — see `onboardingHasCompleted`.
+    /// Regenerate from active memories; refuse until onboarding has completed.
     @discardableResult
     public func regenerate(persona: String = MemoryV2Defaults.personaID) async throws -> URL {
         guard !stopped else { throw CancellationError() }
@@ -241,42 +199,26 @@ public actor UserMDGenerator {
     }
 
     private func regenerateDocument(persona: String) async throws -> URL {
-        // fix-blank-install-onboarding (2026-08-02): USER.md is one of
-        // onboarding's OWN transaction targets, and its mere existence used to
-        // satisfy onboarding's `hasExisting`/`hasIdentityAnchor` checks. Launch
-        // called this generator unconditionally, so on a blank machine it
-        // created the persona dir and wrote a USER.md containing nothing but
-        // the autogen header — and that empty file made the install look
-        // already-onboarded. Whether the wizard ever appeared came down to
-        // which task won a race at launch: launch-first meant no wizard at all
-        // (unnamed agent, no SOUL/VOICE), wizard-first meant a Build that died
-        // on `persona_already_exists`. Gating generation on onboarding having
-        // completed removes the race entirely — before completion there is
-        // simply nothing to write, in either order.
         let projectionPersona = projectionPersona(for: persona)
         let target = userMDPath(persona: projectionPersona)
         let parent = target.deletingLastPathComponent()
 
-        let core = SwiftNativePersistenceCore()
         let manifestPath = dataRoot.appendingPathComponent("onboarding/pending-completion.json")
         // Match onboarding's lock order and hold its manifest lock from the
         // completion check through replacement of the derived document.
         do {
-            let generatedAt = try await core.withFileLock(manifestPath) { [self, storage, nowProvider, target] in
+            let generatedAt = try await SwiftNativePersistenceCore.withFileLock(manifestPath) { [self, storage, nowProvider, target] in
                 guard onboardingHasCompleted else {
                     throw UserMDGeneratorError.onboardingIncomplete
                 }
                 try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-                return try await core.withFileLock(target) {
-                    // Read canonical memory only after owning the projection lock.
-                    // Otherwise a waiter can publish an old snapshot after a newer
-                    // regeneration won this non-FIFO lock and already wrote new facts.
-                    // listMemories is database-only and never acquires the USER lock.
+                return try await SwiftNativePersistenceCore.withFileLock(target) {
+                    // Read memory under the projection lock; listMemories never acquires the USER lock.
                     let memories = try await storage.listMemories(
                         persona: projectionPersona, status: "active", limit: nil
                     )
                     let now = nowProvider()
-                    let body = Self.renderBody(memories: memories, now: now)
+                    let body = Self.renderBody(memories: memories, now: now, dataRoot: dataRoot)
                     let existing = try Self.loadPreambleForRegeneration(at: target)
                     let payload = Self.assemble(preamble: existing.preamble, body: body)
                     try Self.atomicReplaceIfChanged(payload, existingBytes: existing.bytes, at: target)
@@ -295,114 +237,61 @@ public actor UserMDGenerator {
         }
     }
 
-    /// Durable atomic replacement through the shared persistence core. This is
-    /// the same temp-fsync + rename + parent-directory-fsync contract used by
-    /// canonical chat/session state; a successful regeneration must survive a
-    /// power loss, not merely a process crash. The caller holds the target lock;
-    /// onboarding has already verified its exact transaction base bytes.
+    /// Durable atomic replacement under the caller's target lock; onboarding verifies its exact base bytes.
     package static func atomicReplaceIfChanged(_ payload: String, existingBytes: Data?, at target: URL) throws {
         let bytes = Data(payload.utf8)
-        // Launch reconciliation is intentionally allowed to call regenerate,
-        // but an identical derived projection must not manufacture a file
-        // change. Replacing unchanged USER.md wakes ContextFlow, persona file
-        // watchers, and backup/sync surfaces even though canonical memory did
-        // not move. Compare under the same file lock that protects the write;
-        // unreadable/damaged documents have already failed closed above.
+        // Identical bytes must not wake document watchers; compare under the write lock.
         if existingBytes == bytes { return }
         try SwiftNativePersistenceCore.writeDataAtomicDurable(bytes, to: target)
     }
 
     // MARK: - Rendering
 
-    static func renderBody(memories: [StoredMemory], now: Date) -> String {
-        _ = now
-        return "# User Facts (auto-generated from memory SQLite)\n\n"
-            + userFacts(memories: memories).map { "- \($0)\n" }.joined() + "\n"
+    /// Bound newest-first facts at promptByteCap; facts beyond it remain recallable.
+    static func renderBody(memories: [StoredMemory], now: Date, dataRoot: URL) -> String {
+        var budget = UserMDAutogenMarkers.promptByteCap - "# USER\n".utf8.count
+        var lines: [String] = []
+        for fact in userFacts(memories: memories, now: now, dataRoot: dataRoot) {
+            let line = "- \(fact)\n"
+            guard line.utf8.count <= budget else { break }
+            lines.append(line)
+            budget -= line.utf8.count
+        }
+        return "# User Facts (auto-generated from memory SQLite)\n\n" + lines.joined() + "\n"
     }
 
-    static func userFacts(memories: [StoredMemory]) -> [String] {
-        var facts: [String] = []
-
-        // Flat list, newest first — no provenance grouping, no per-fact dates.
-        // Clean single-signal facts are the substrate Agent reasons from; the
-        // `## From <source>` headers, counters, and regenerated timestamps were
-        // machine cruft.
-        let items = memories.sorted { $0.createdAt > $1.createdAt }
-        for m in items {
-            // USER.md is User's IDENTITY doc, not the agent's working memory.
-            // The workshop gate above killed one pollution source; the disease
-            // was that renderBody projected EVERY active row, and the store
-            // legitimately holds the agent's own operational knowledge —
-            // corrections, procedures, delegation forensics, build decisions
-            // (2026-08-06 live read: ~45 of 60 rendered bullets were agent ops,
-            // zero about User). Kind labels are model-chosen at commit time, so
-            // a denylist of "bad" kinds leaks on every new label; this is a
-            // fail-closed ALLOWLIST of person-kinds instead. A row with no
-            // kind, an unknown kind, or an ops kind stays fully recallable —
-            // it just doesn't ride the identity doc. Cost accepted: a genuine
-            // User-fact mislabeled `decision` drops out until relabeled; a
-            // 100%-about-User doc beats a complete-but-70%-noise one.
+    static func userFacts(memories: [StoredMemory], now: Date = Date(), dataRoot: URL) -> some Sequence<String> {
+        memories.lazy.compactMap { m -> String? in
+            // Admit only known person kinds; excluded kinds remain recallable outside USER.md.
             guard let kind = MemoryRecallScoring.kind(of: m.metadata),
-                  Self.userIdentityKinds.contains(kind) else { continue }
-            // Admission parity with the memory CONTEXT projection
-            // (2026-07-24). USER.md is a projection of the same rows the
-            // context projection compiles into memory atoms, and
-            // ContextFlowCoordinator suppresses USER.md only when every
-            // generated line is carried by an eligible atom. A row rendered
-            // here but rejected there made that all-or-nothing join fail for
-            // the WHOLE document — USER.md and the identical memory atoms both
-            // rode every turn.
-            //
-            // Both gates are corrections in their own right, independent of the
-            // join:
-            //   * lifecycle — `corrected` / `contradicted` / `deleted` rows are
-            //     recall-INELIGIBLE everywhere else in the system. Publishing
-            //     them into a doc that rides every prompt re-states superseded
-            //     facts next to the ones that superseded them. (Live 2026-07-24:
-            //     7 of 50 active rows, all superseded sleep-schedule variants,
-            //     were queued to land in USER.md on the next regeneration.)
-            //   * durability — the same precision gate every other write path
-            //     applies; a row that is not durable memory is not a user fact.
-            //
-            // The on-disk document is surface-independent. Prompt rendering
-            // filters disclosure before using these facts as its initial core.
-            guard MemoryLifecycle.isRecallEligible(m.lifecycle) else { continue }
+                  Self.userIdentityKinds.contains(kind) else { return nil }
+            // Require eligible lifecycle, unexpired validity, completed admission and durable content.
+            // The document is surface-independent; prompt rendering applies disclosure filtering.
+            guard MemoryLifecycle.isRecallEligible(m.lifecycle) else { return nil }
+            guard MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: m.validTo, at: now) else { return nil }
             // A cold write is not a fact until its vector lands and passes admission.
-            guard !MemoryStorage.metadataFlag(m.metadata, MemoryStorage.pendingAdmissionKey) else { continue }
+            guard !MemoryStorage.metadataFlag(m.metadata, MemoryStorage.pendingAdmissionKey) else { return nil }
             guard MemoryCandidateQuality.isDurableCandidate(
                 text: m.content,
                 source: m.source,
                 kind: MemoryRecallScoring.kind(of: m.metadata)
-            ) else { continue }
+            ) else { return nil }
             let content = MemoryTextClip.memoryDisplayText(
                 m.content.replacingOccurrences(of: "\n", with: " "),
                 kind: MemoryRecallScoring.kind(of: m.metadata)
             )
-            guard !content.isEmpty else { continue }
-            facts.append(content)
+            guard !content.isEmpty else { return nil }
+            return MemoryDataProvenance.presentation(
+                MemorySenseProvenance.presentation(content, metadata: m.metadata), metadata: m.metadata, dataRoot: dataRoot)
         }
-        return facts
     }
 
-    /// Kinds that describe the PERSON (or the User↔Agent relationship) rather
-    /// than the agent's work. The union observed live 2026-08-06 across
-    /// chat.commit_memory and adaptive-promoter rows; extend deliberately,
-    /// never automatically — every addition puts rows on a doc that rides
-    /// every prompt. Also the pinned core's admission (`userPromptCore`).
-    /// `moment` and `experience` are hers, not facts about User (10-10): they
-    /// ride recall, the Memories page and the diary.
-    static let userIdentityKinds: Set<String> = [
-        "user_fact", "user_preference", "preference", "relationship",
-        "identity", "attribute",
-    ]
+    /// USER.md and userPromptCore share person-kind admission; moments, experiences and ops stay in recall.
+    static let userIdentityKinds: Set<String> = MemoryKindStamp.personKinds
 
     /// Why a memory of `kind` cannot be pinned, or nil when it can. The pinned
     /// core carries only `userIdentityKinds`; every pin writer (the chat tool,
     /// the Memories page, the phone) refuses with these words.
-    public static func pinRefusal(kind: String?) -> String? {
-        pinFailure(kind: kind).map(MemoryV2Error.describe)
-    }
-
     public static func pinFailure(kind: String?) -> ToolFailureError? {
         if userIdentityKinds.contains(kind ?? "") { return nil }
         return ToolFailureError("Pins carry owner facts; \(kind ?? "a memory with no kind") is excluded.", effects: .none,

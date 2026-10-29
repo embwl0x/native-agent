@@ -13,6 +13,7 @@ package protocol AgentWorkspaceConversationPort: Sendable {
     func find(dataRoot: URL, scopeSessionID: String, agent: String, label: String?) throws -> AgentConversationRecord?
     func peers(dataRoot: URL) throws -> [AgentWorkspacePeer]
     func identity(dataRoot: URL) -> AgentContactIdentity
+    func answeredRequests(dataRoot: URL) -> [(message: String?, run: String?, chat: String?, modified: Date)]
     func openHuman(sessionID: String, limit: Int?, dataRoot: URL) async throws -> JSONValue
     func presentation(_ row: AgentConversationRecord) -> JSONValue
     func liveHandOff(_ row: AgentConversationRecord) -> Bool
@@ -47,7 +48,6 @@ package protocol AgentWorkspaceToolPort: Sendable {
     func appAction(_ tool: String) -> String?
     func macIntegrationGate(_ name: String) -> (integration: String, mode: MacIntegrationPermissionMode)?
     func markConsumed(peer: String)
-    func normalizeWorkspaceAlias(_ path: String, workspaceRoot: URL) -> String
     func withWebScheme(_ value: String) -> String
     func builderSourceRepoRoot(dataRoot: URL) -> URL?
     var listedPeerState: String { get }

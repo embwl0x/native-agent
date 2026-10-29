@@ -6,8 +6,9 @@ Encoding.default_external = Encoding::UTF_8
 require 'json'
 require 'yaml'
 require 'open3'
+require 'find'
 
-ROOT = File.expand_path('..', __dir__)
+ROOT = ARGV[0] == '--verify-resources' ? File.realpath(ARGV.fetch(1)) : File.expand_path('..', __dir__)
 def replace_generated(path, label, body)
   path = File.join(ROOT, path)
   source = File.read(path)
@@ -23,6 +24,30 @@ end
 spec = YAML.safe_load(File.read(File.join(ROOT, 'project.yml')))
 app = spec.fetch('targets').fetch('NativeAgent')
 resources = spec.fetch('targets').fetch('NativeAgent_NativeAgentApp').fetch('sources')
+if ARGV[0] == '--verify-resources'
+  destination = ARGV[2]
+  abort "symlinked resource root: #{destination}" if destination && File.symlink?(destination)
+  destination = File.realpath(destination) if destination
+  [[resources, 'NativeAgent_NativeAgentApp.bundle/Contents/Resources'], [app.fetch('sources'), '']].each do |entries, subdir|
+    entries.each do |entry|
+      phase = entry['buildPhase']
+      next unless phase == 'resources' || phase.is_a?(Hash) && phase.dig('copyFiles', 'destination') == 'resources'
+      path = entry.fetch('path')
+      target = File.join(subdir, phase.is_a?(Hash) ? phase.fetch('copyFiles').fetch('subpath', '') : '', File.basename(path))
+      source = File.join(ROOT, path)
+      Find.find(source, ignore_error: false) do |file|
+        abort "symlinked resource: #{file}" unless File.realpath(file) == file
+        abort "invalid resource: #{file}" unless File.directory?(file) || File.file?(file) && File.size(file) > 0
+        next unless destination
+        staged = File.join(destination, target + file.delete_prefix(source))
+        abort "symlinked resource: #{staged}" unless File.realpath(staged) == staged
+        abort "altered resource: #{staged}" unless File.directory?(file) ? File.directory?(staged) : File.file?(staged) && File.binread(staged) == File.binread(file)
+      end
+    end
+  end
+  puts '[resources] verified assembly-declared resources'
+  exit
+end
 body = "            dependencies: [\n"
 app.fetch('dependencies').each do |entry|
   next unless entry.key?('package') # Embedded targets stay in Xcode.

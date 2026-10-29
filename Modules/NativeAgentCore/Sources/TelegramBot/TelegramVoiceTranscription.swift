@@ -1,12 +1,14 @@
 @preconcurrency import AVFoundation
 @preconcurrency import Speech
 import Foundation
-import Darwin
+import MacControl
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 import NativeAgentShared
-// Blueprint: | `TelegramVoiceTranscription.swift` | Telegram voice transcription and system-temp audio preparation/cleanup outside the data root; temporary audio is excluded from backup/export/phone sync and the PrivacyMap telegram tree |
+import Darwin
+import os
+// Blueprint: | `TelegramVoiceTranscription.swift` | Telegram voice transcription owns and joins conversion, recognition and system-temp cleanup on Stop/deadline; temporary audio stays outside the data root, backup/export/phone sync and the PrivacyMap telegram tree |
 
 // MARK: - Telegram voice transcription
 
@@ -28,9 +30,6 @@ public struct TelegramVoiceTranscription: Sendable, Codable, Equatable {
 public enum TelegramVoiceTranscriptionBackends {
     public static let appleSpeech = "apple_speech"
     public static let appleSpeechModel = "apple-speech"
-
-    /// Apple Speech is the only backend; any stored value reads as it.
-    public static func canonical(_ raw: String) -> String { appleSpeech }
 }
 
 public enum TelegramVoiceTranscriptionError: Error, Equatable, LocalizedError, Sendable {
@@ -59,76 +58,6 @@ public enum TelegramVoiceTranscriptionError: Error, Equatable, LocalizedError, S
     }
 }
 
-private final class TelegramAVExportSessionBox: @unchecked Sendable {
-    let export: AVAssetExportSession
-
-    init(_ export: AVAssetExportSession) {
-        self.export = export
-    }
-}
-
-private final class TelegramFFmpegCapture: @unchecked Sendable {
-    private let queue = DispatchQueue(label: "TelegramFFmpeg.stderr")
-    private let reader: FileHandle
-    private let source: DispatchSourceRead
-    private var bytes = Data()
-    private var ended = false
-
-    init(_ reader: FileHandle) throws {
-        self.reader = reader
-        let fd = reader.fileDescriptor
-        let flags = fcntl(fd, F_GETFL)
-        guard flags >= 0, fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else {
-            throw TelegramVoiceTranscriptionError.conversionFailed("ffmpeg stderr could not be opened")
-        }
-        source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
-        source.setEventHandler { [weak self] in self?.drain() }
-        source.setCancelHandler { try? reader.close() }
-        source.resume()
-    }
-
-    private func drain() {
-        guard !ended else { return }
-        var chunk = [UInt8](repeating: 0, count: 4096)
-        while true {
-            let count = Darwin.read(reader.fileDescriptor, &chunk, chunk.count)
-            if count > 0 {
-                let room = max(0, 64 * 1024 - bytes.count)
-                bytes.append(contentsOf: chunk.prefix(min(count, room)))
-            } else if count < 0, errno == EINTR {
-                continue
-            } else {
-                if count == 0 || (errno != EAGAIN && errno != EWOULDBLOCK) {
-                    ended = true
-                    source.cancel()
-                }
-                break
-            }
-        }
-    }
-
-    func finish() -> Data {
-        queue.sync {
-            drain()
-            source.cancel()
-            return bytes
-        }
-    }
-}
-
-private final class TelegramFFmpegCancellation: @unchecked Sendable {
-    private let lock = NSLock()
-    private var cancelled = false
-    let wake = DispatchSemaphore(value: 0)
-
-    func cancel() {
-        lock.withLock { cancelled = true }
-        wake.signal()
-    }
-
-    var isCancelled: Bool { lock.withLock { cancelled } }
-}
-
 private final class TelegramSpeechRecognitionTaskBox: @unchecked Sendable {
     private let lock = NSLock()
     private var task: SFSpeechRecognitionTask?
@@ -139,40 +68,40 @@ private final class TelegramSpeechRecognitionTaskBox: @unchecked Sendable {
     private var wasCancelled = false
 
     func set(_ task: SFSpeechRecognitionTask, continuation: CheckedContinuation<SpeechUtterance, Error>) {
-        let completed = lock.withLock { () -> (Result<SpeechUtterance, Error>, Bool)? in
-            if let result { return (result, wasCancelled) }
-            self.task = task
-            self.continuation = continuation
-            return nil
+        let (completed, cancelled) = lock.withLock {
+            if result == nil {
+                self.task = task
+                self.continuation = continuation
+            }
+            return (result, wasCancelled)
         }
-        guard let (result, cancelled) = completed else { return }
         if cancelled { task.cancel() }
-        continuation.resume(with: result)
+        if let completed { continuation.resume(with: completed) }
     }
 
     func cancel() {
-        finish(with: .failure(CancellationError()), cancelling: true)
+        let task = lock.withLock {
+            wasCancelled = true
+            return self.task
+        }
+        // The terminal recognition callback owns continuation settlement;
+        // cancellation requests exit without releasing the audio underneath it.
+        task?.cancel()
     }
 
     func resume(with result: Result<SpeechUtterance, Error>) {
-        finish(with: result, cancelling: false)
-    }
-
-    private func finish(with result: Result<SpeechUtterance, Error>, cancelling: Bool) {
         let completed = lock.withLock { () -> (CheckedContinuation<SpeechUtterance, Error>?, SFSpeechRecognitionTask?)? in
             guard self.result == nil else { return nil }
-            self.result = result
-            wasCancelled = cancelling
+            self.result = wasCancelled ? .failure(CancellationError()) : result
             let continuation = self.continuation
             let task = self.task
             self.continuation = nil
             self.task = nil
             return (continuation, task)
         }
-        guard let (continuation, task) = completed else { return }
-        // Speech may invoke its callback during cancel; never call it locked.
-        if cancelling { task?.cancel() }
-        continuation?.resume(with: result)
+        guard let (continuation, _) = completed else { return }
+        let settled = lock.withLock { self.result }
+        if let settled { continuation?.resume(with: settled) }
     }
 
     deinit {
@@ -199,6 +128,7 @@ enum TelegramVoiceAudioPreparer {
     static func prepareSpeechURL(
         _ attachment: TelegramMediaAttachment
     ) async throws -> TelegramPreparedVoiceAudio {
+        try Task.checkCancellation()
         guard let bytes = attachment.bytes, !bytes.isEmpty else {
             throw TelegramVoiceTranscriptionError.missingAudioBytes
         }
@@ -221,8 +151,10 @@ enum TelegramVoiceAudioPreparer {
                 return TelegramPreparedVoiceAudio(url: output, cleanupURLs: [input, output])
             } catch {
                 try? FileManager.default.removeItem(at: output)
+                if error is CancellationError || Task.isCancelled { throw CancellationError() }
             }
 
+            try Task.checkCancellation()
             guard let ffmpeg = ffmpegURL() else {
                 throw TelegramVoiceTranscriptionError.conversionFailed(
                     "Telegram OGG/Opus audio is not readable by AVFoundation on this Mac, and no ffmpeg binary was found"
@@ -275,30 +207,15 @@ enum TelegramVoiceAudioPreparer {
         guard let export = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
             throw TelegramVoiceTranscriptionError.conversionFailed("AVAssetExportSession unavailable")
         }
-        export.outputURL = output
-        export.outputFileType = .m4a
         export.shouldOptimizeForNetworkUse = true
-        let exportBox = TelegramAVExportSessionBox(export)
-
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            export.exportAsynchronously {
-                let export = exportBox.export
-                switch export.status {
-                case .completed:
-                    continuation.resume()
-                case .failed:
-                    continuation.resume(throwing: TelegramVoiceTranscriptionError.conversionFailed(
-                        export.error?.localizedDescription ?? "export failed"
-                    ))
-                case .cancelled:
-                    continuation.resume(throwing: CancellationError())
-                default:
-                    continuation.resume(throwing: TelegramVoiceTranscriptionError.conversionFailed(
-                        "unexpected export status \(export.status.rawValue)"
-                    ))
-                }
-            }
+        do {
+            try Task.checkCancellation()
+            try await export.export(to: output, as: .m4a)
+        } catch {
+            if error is CancellationError || Task.isCancelled { throw CancellationError() }
+            throw TelegramVoiceTranscriptionError.conversionFailed(error.localizedDescription)
         }
+        try Task.checkCancellation()
     }
 
     private static func ffmpegURL() -> URL? {
@@ -312,82 +229,31 @@ enum TelegramVoiceAudioPreparer {
     }
 
     private static func transcodeWithFFmpeg(ffmpeg: URL, input: URL, output: URL) async throws {
-        try Task.checkCancellation()
-        let cancellation = TelegramFFmpegCancellation()
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                Thread {
-                    do {
-                        try transcodeWithFFmpegBlocking(ffmpeg: ffmpeg, input: input, output: output, cancellation: cancellation)
-                        continuation.resume()
-                    } catch {
-                        continuation.resume(throwing: error)
-                    }
-                }.start()
-            }
-        } onCancel: {
-            cancellation.cancel()
-        }
-        try Task.checkCancellation()
-    }
-
-    private static func transcodeWithFFmpegBlocking(
-        ffmpeg: URL, input: URL, output: URL, cancellation: TelegramFFmpegCancellation
-    ) throws {
-        if cancellation.isCancelled { throw CancellationError() }
-        let process = Process()
-        process.executableURL = ffmpeg
-        process.arguments = [
-            "-hide_banner",
-            "-loglevel", "error",
-            "-y",
-            "-i", input.path,
-            "-vn",
-            "-acodec", "aac",
-            "-b:a", "96k",
-            output.path,
-        ]
-        let errorPipe = Pipe()
-        process.standardError = errorPipe
-        process.standardOutput = FileHandle.nullDevice
-        process.standardInput = FileHandle.nullDevice
-        let capture = try TelegramFFmpegCapture(errorPipe.fileHandleForReading)
-        let exited = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in
-            exited.signal()
-            cancellation.wake.signal()
-        }
+        let result: ProcessRunResult
         do {
-            try process.run()
-            try? errorPipe.fileHandleForWriting.close()
+            result = try await ProcessExecution().run(
+                executable: ffmpeg.path,
+                arguments: [
+                    "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", input.path, "-vn", "-acodec", "aac", "-b:a", "96k", output.path,
+                ],
+                currentDirectory: nil, environment: nil, standardInput: nil,
+                timeoutSeconds: 30, outputByteLimit: 64 * 1024,
+                launchFailure: { TelegramVoiceTranscriptionError.conversionFailed("ffmpeg failed to start: \($0.localizedDescription)") }
+            )
         } catch {
-            try? errorPipe.fileHandleForWriting.close()
-            _ = capture.finish()
-            throw TelegramVoiceTranscriptionError.conversionFailed("ffmpeg failed to start: \(error.localizedDescription)")
+            if error is CancellationError || error is ProcessRunCancellation { throw CancellationError() }
+            throw error as? TelegramVoiceTranscriptionError
+                ?? TelegramVoiceTranscriptionError.conversionFailed(error.localizedDescription)
         }
-        let pid = process.processIdentifier
-        ProcessTreeReaper.ensureChildLeadsOwnProcessGroup(pid)
-        let timedOut = cancellation.wake.wait(timeout: .now() + .seconds(30)) == .timedOut
-        if process.isRunning {
-            let tree = ProcessTreeReaper.snapshot(rootPID: pid)
-            ProcessTreeReaper.signal(tree, signal: SIGTERM)
-            let graceExpired = exited.wait(timeout: .now() + .milliseconds(200)) == .timedOut
-            let remaining = ProcessTreeReaper.snapshot(rootPID: pid, retaining: tree)
-            if graceExpired || ProcessTreeReaper.hasLiveDescendant(in: remaining) {
-                ProcessTreeReaper.quiesceAndKill(remaining)
-            }
-        }
-        process.waitUntilExit()
-        let errorData = capture.finish()
-        if cancellation.isCancelled { throw CancellationError() }
-        if timedOut {
+        try Task.checkCancellation()
+        if result.timedOut {
             throw TelegramVoiceTranscriptionError.conversionFailed("ffmpeg timed out")
         }
-        guard process.terminationStatus == 0 else {
-            let message = String(data: errorData, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard result.exitCode == 0 else {
+            let message = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
             throw TelegramVoiceTranscriptionError.conversionFailed(
-                "ffmpeg exited \(process.terminationStatus)\(message.map { ": \($0)" } ?? "")"
+                "ffmpeg exited \(result.exitCode): \(message)"
             )
         }
         guard FileManager.default.fileExists(atPath: output.path) else {
@@ -427,22 +293,23 @@ public final class SwiftAppleSpeechTranscriber: Sendable {
         // ensuring this headless surface never reaches a prompting API.
         try validateSpeechAuthorization()
         let started = Date()
-        // Conversion and recognition together have one real deadline: it
-        // answers on time without waiting for work that ignores cancellation,
-        // so one slow note never holds the Telegram line.
-        let utterance: SpeechUtterance
-        // The body's own error rides back typed (a permission denial keeps the note).
-        switch await raceAgainstTimeout(seconds: Double(timeoutNanoseconds) / 1_000_000_000, { [self] () async -> Result<SpeechUtterance, Error> in
-            do {
+        // Deadline and Stop cancel the owned body, then join its conversion,
+        // recognition and temporary-file cleanup before releasing the turn.
+        let utterance = try await withThrowingTaskGroup(of: SpeechUtterance.self) { group in
+            group.addTask { [self] in
                 let prepared = try await TelegramVoiceAudioPreparer.prepareSpeechURL(attachment)
                 defer { prepared.cleanup() }
-                return .success(try await self.recognizeWithoutTimeout(url: prepared.url))
-            } catch { return .failure(error) }
-        }) {
-        case .value(let result): utterance = try result.get()
-        case .timedOut: throw TelegramVoiceTranscriptionError.speechRecognitionFailed("timed out")
-        case .failure(let message): throw TelegramVoiceTranscriptionError.speechRecognitionFailed(message)
-        case .cancelled: throw CancellationError()
+                try Task.checkCancellation()
+                return try await self.recognizeWithoutTimeout(url: prepared.url)
+            }
+            group.addTask { [timeoutNanoseconds] in
+                try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                throw TelegramVoiceTranscriptionError.speechRecognitionFailed("timed out")
+            }
+            defer { group.cancelAll() }
+            guard let utterance = try await group.next() else { throw CancellationError() }
+            try Task.checkCancellation()
+            return utterance
         }
         let elapsed = max(0, Int(Date().timeIntervalSince(started) * 1000))
         return TelegramVoiceTranscription(
@@ -468,6 +335,7 @@ public final class SwiftAppleSpeechTranscriber: Sendable {
     }
 
     private func recognizeOnce(url: URL, forceOnDevice: Bool) async throws -> SpeechUtterance {
+        try Task.checkCancellation()
         // Read authorization only: headless Telegram work cannot present the
         // macOS prompt safely. Permission requests belong to MainActor's
         // SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined().
@@ -513,13 +381,8 @@ public final class SwiftAppleSpeechTranscriber: Sendable {
     }
 
     private static func shouldRetryWithoutOnDevice(_ error: Error) -> Bool {
-        let description = [
-            (error as? LocalizedError)?.errorDescription,
-            String(describing: error)
-        ]
-        .compactMap { $0 }
-        .joined(separator: " ")
-        .lowercased()
+        guard case TelegramVoiceTranscriptionError.speechRecognitionFailed(let detail) = error else { return false }
+        let description = detail.lowercased()
         return description.contains("siri and dictation")
             || description.contains("dictation")
             || description.contains("local speech recognition")

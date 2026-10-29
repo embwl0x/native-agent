@@ -61,7 +61,7 @@ final class InlineInteractionChatBinding {
             // "Not now." The resolver settles it as declined and resumes the
             // turn with the consequence the card promised, so she carries on
             // and says plainly what she could not do.
-            Task { await self.decline(card.id, sessionID: sessionID) }
+            Task { await self.decline(card.id, sessionID: sessionID, appModel: appModel) }
         case .primary(let value, let choice, let values):
             Task {
                 await self.begin(
@@ -112,10 +112,14 @@ final class InlineInteractionChatBinding {
 
     // MARK: - Begin, open, complete
 
-    private func decline(_ id: String, sessionID: String) async {
-        _ = try? await InlineInteractionResolver.decline(
-            id: id, sessionID: sessionID, dataRoot: dataRoot
-        )
+    private func decline(_ id: String, sessionID: String, appModel: AppModel) async {
+        do {
+            _ = try await InlineInteractionResolver.decline(
+                id: id, sessionID: sessionID, dataRoot: dataRoot
+            )
+        } catch {
+            appModel.setFailureStatus(error, action: "decline that request")
+        }
         await refreshCurrent()
     }
 
@@ -142,7 +146,6 @@ final class InlineInteractionChatBinding {
         }
         await refreshCurrent()
         await open(
-            descriptor.control,
             sessionID: sessionID,
             interaction: current,
             descriptor: descriptor,
@@ -158,7 +161,6 @@ final class InlineInteractionChatBinding {
     /// whether the thing is done — that is always the owner's answer, asked
     /// through `complete`.
     private func open(
-        _ control: InlineInteractionDescriptor.Control,
         sessionID: String,
         interaction: InlineInteraction,
         descriptor: InlineInteractionDescriptor,
@@ -175,7 +177,13 @@ final class InlineInteractionChatBinding {
             present: { control in
                 switch control {
                 case .internetAccounts:
-                    NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Internet-Accounts-Settings.extension")!)
+                    guard let url = URL(string: "x-apple.systempreferences:com.apple.Internet-Accounts-Settings.extension") else {
+                        appModel.systemToasts.push(error: "Could not form the Internet Accounts Settings URL.")
+                        return
+                    }
+                    if !NSWorkspace.shared.open(url) {
+                        appModel.systemToasts.push(error: "Could not open Internet Accounts in System Settings.")
+                    }
                 case .pairDevice:
                     // The route lands on the page's first tab, so the tab is chosen after it.
                     self.openPage(.connectors, for: interaction.id, sessionID: sessionID)
@@ -205,7 +213,7 @@ final class InlineInteractionChatBinding {
         if SimpleViewMode.isShowing {
             panelPage = item
         } else {
-            _ = NativeAgentAppCoordinator.shared.request(.sidebar(item))
+            _ = ApplicationLifetime.shared.request(.sidebar(item))
         }
     }
 

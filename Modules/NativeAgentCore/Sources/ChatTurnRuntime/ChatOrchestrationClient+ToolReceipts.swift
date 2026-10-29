@@ -4,29 +4,21 @@ import PersistenceCore
 import ToolRegistry
 // Blueprint: | `ChatOrchestrationClient+ToolReceipts.swift` | `SwiftNativeChatOrchestrationClient`: `persistToolReceipt` |
 
-/// One tool receipt on its way to the transcript, fully redacted at the
-/// point of production so the writer can drain the queue off the dispatch
-/// critical path without touching turn state (A2). Every field is a value
-/// type: the writer is a separate task, and the row must be complete before
-/// it leaves the dispatch loop.
+/// A complete value-form receipt, redacted before leaving dispatch.
 struct ToolReceipt: Sendable {
-    /// Carries execution identity through the existing progress callback to its receipt writer.
-    @TaskLocal static var dispatchedCall: (tool: String, input: [String: JSONValue])?
+    /// Carries the exact dispatch through progress to its awaited receipt write.
+    @TaskLocal static var dispatched: ToolReceipt?
     let toolName: String
-    let inputJSON: String
+    let input: JSONValue
     let ranCall: (tool: String, input: [String: JSONValue])?
-    let resultJSON: String
+    let output: JSONValue
     let ok: Bool
     /// What the cognitive tool event is read from — the lane's own choice of
     /// raw or redacted output, kept exactly as each lane had it.
     let cognitiveOutput: JSONValue
 }
 
-/// The one writer of tool receipts to the transcript, for every lane. A
-/// failed row reports its notice (M2 fail-loud: silent receipt loss is a
-/// previously-fixed bug class) and never prevents later rows from being
-/// saved. The loop `write`s each receipt as its result lands, awaited in its
-/// progress handler.
+/// Await each receipt write; a failed row is reported without dropping later rows.
 struct ToolReceiptWriter: Sendable {
     let client: SwiftNativeChatOrchestrationClient
     let sessionId: String
@@ -49,23 +41,19 @@ extension SwiftNativeChatOrchestrationClient {
                 sessionId: writer.sessionId,
                 runId: writer.runId,
                 toolName: receipt.toolName,
-                inputJSON: receipt.inputJSON,
+                input: receipt.input,
                 ranCall: receipt.ranCall,
-                resultSummary: receipt.resultJSON,
+                result: receipt.output,
                 ok: receipt.ok,
                 // An app call of a folded action is that tool's outcome.
                 cognitiveResult: ChatToolOutcome.cognitiveResult(
-                    tool: receipt.ranCall?.tool ?? ToolNameAliases.shown(receipt.toolName, inputJSON: receipt.inputJSON).name,
+                    tool: receipt.ranCall?.tool ?? ToolNameAliases.shown(receipt.toolName, input: receipt.input).name,
                     output: receipt.cognitiveOutput
                 ),
                 source: writer.surface
             )
             await TurnCheckpointScope.current?.receiptWritten()
         } catch {
-            // M2 (2026-07-09): a swallowed failure here dropped the tool
-            // receipt from the persisted transcript while the live pill still
-            // rendered — on reload the user saw a reply with no evidence of
-            // the tool that produced it.
             await Self.reportTranscriptWriteFailure(
                 label: "appendToolMessage(\(receipt.toolName))\(writer.laneLabel)",
                 path: dataRoot,

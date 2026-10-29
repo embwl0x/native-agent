@@ -21,7 +21,8 @@ Import the validated file into development with `cktool import-schema
 `cktool`; deployment changes the live container and must be performed
 deliberately in CloudKit Console. After promotion, export production again and
 verify that `NAChatMessage`, `NANotification`, `NAPairingDevice`, and `NAStatus`
-all exist with the fields in this file. `NANotification` provides durable signed
+all exist with the fields and types in this file, including `payloadAsset` on `NAChatMessage` and `NANotification`
+as `ASSET` for encrypted attachment envelopes. `NANotification` provides durable signed
 notification transport. Both its subscription and the `NAChatMessage`
 subscription silently wake sync. Direct APNS owns normal remote alerts; when
 the phone processes a bridge notification, it schedules a local fallback alert

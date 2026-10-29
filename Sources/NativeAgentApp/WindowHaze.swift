@@ -1,28 +1,10 @@
+import NativeAgentShared
 import AppToolRuntime
 
-// Blueprint: | `WindowHaze.swift` | Window haze components: shared glass backdrop, palette/saturation and appearance-aware window surface rendering |
-// WindowHaze.swift
-// "Alive glass", first half — User approved the mockup 2026-09-23. Behind every
-// column's content sits ONE single-hue haze that drifts like soft light in
-// fog: three very large, very soft discs in three shades of one hue, at low
-// opacity, on long slow loops. Drawn once for the whole window, above the
-// sheet and its coat, below the columns (ShellFrame), like the lamp.
-//
-// COST. The drift is Core Animation, not SwiftUI: three radial-gradient
-// layers carry additive keyframe animations that the render server runs on
-// its own. The main thread builds the layers once and then does nothing per
-// frame — no body, no layout, no display list. It only acts when the state
-// changes (a turn starts, text starts streaming, the window hides), and then
-// it ramps the container's `speed` and `opacity` for a second and a half.
-// A radial gradient IS the blurred disc, so there is no blur pass at all.
-//
-// TEXT WINS (the agent, 2026-09-23). The brightest point the haze can reach is
-// all three discs overlapping at their centres at the busy opacity; the disc
-// core is derived from that so the overlap never exceeds `peakAlpha`. At 0.35
-// (0.5 since User's first look: 0.35 read as no haze at all; body text keeps >6:1)
-// the lightest preset shade (amber #dc9a3d) over the dark room (#12161F)
-// measures L ≈ 0.064. Text now uses native label colours; small reading labels
-// over the lifted glass use primary-label ink at 85% opacity.
+// Blueprint: | `WindowHaze.swift` | Mac window haze palette, controls and shared `HazeView` presentation |
+// One single-hue haze drifts above the shared sheet and below every column.
+// Core Animation drives three radial-gradient discs without per-frame main-thread work.
+// Disc cores cap their combined overlap at 0.44 alpha to preserve text contrast.
 
 import AppKit
 import SwiftUI
@@ -47,20 +29,15 @@ extension HazeColor {
     }
 
     /// The swatch colour: the middle-bright shade.
-    var swatch: Color { Color(nsColor: HazeColor.nsColor(shades[0])) }
+    var swatch: Color { Color(hex: shades[0]) }
 
     /// Root control ink: retain the dark swatch, deepen it on the light room.
     func windowTint(dark: Bool) -> Color {
         guard !dark else { return base }
-        let deep = HazeColor.nsColor(shades[1])
+        let deep = NSColor(Color(hex: shades[1]))
         return Color(nsColor: NSColor(srgbRed: deep.redComponent * 0.7,
                                      green: deep.greenComponent * 0.7,
                                      blue: deep.blueComponent * 0.7, alpha: 1))
-    }
-
-    static func nsColor(_ hex: UInt) -> NSColor {
-        NSColor(srgbRed: CGFloat((hex >> 16) & 0xFF) / 255, green: CGFloat((hex >> 8) & 0xFF) / 255,
-                blue: CGFloat(hex & 0xFF) / 255, alpha: 1)
     }
 
     /// A switch's "on" track: the base shade in dark (≥3.4:1 on the room for
@@ -70,16 +47,14 @@ extension HazeColor {
     /// button — always takes the deep shade: the label is ≥5:1 there, and
     /// only 3.1:1 on the base teal and amber.
     func control(dark: Bool, labelled: Bool) -> NSColor {
-        HazeColor.nsColor(dark && !labelled ? shades[0] : shades[1])
+        NSColor(Color(hex: dark && !labelled ? shades[0] : shades[1]))
     }
 }
 
 // MARK: - Controls wear the haze
 
 extension View {
-    /// Tint ONE control's "on" state with the chosen haze (User, 2026-09-23:
-    /// system blue clashed with the single-hue glass). Per control, never a
-    /// page: a page-level `.tint` is an accent on everything.
+    /// Tint one control's on state with haze; page-level tint accents everything.
     func hazeTinted(_ kind: HazeControlKind = .toggle) -> some View { modifier(HazeControlTint(kind: kind)) }
 }
 
@@ -144,31 +119,6 @@ private struct SegmentBezelTint: NSViewRepresentable {
     }
 }
 
-// MARK: - The state
-
-enum HazeMood: Equatable {
-    case idle, busy, replying
-
-    /// Container opacity, dark appearance. Light takes 0.85 of it (pale shades).
-    var opacity: Float {
-        switch self {
-        case .idle: return 0.52
-        case .busy: return 0.62
-        case .replying: return 0.56
-        }
-    }
-
-    /// Multiplier on the idle loops (40 / 48 / 56 s): busy → 12–17 s,
-    /// replying → 20–28 s.
-    var speed: Float {
-        switch self {
-        case .idle: return 1
-        case .busy: return 3.3
-        case .replying: return 2
-        }
-    }
-}
-
 // MARK: - The window's haze
 
 /// The SwiftUI seam: reads the turn state and the setting, draws nothing under
@@ -223,208 +173,4 @@ private struct HazeLayer: NSViewRepresentable {
     }
 
     static func dismantleNSView(_ view: HazeView, coordinator: ()) { view.teardown() }
-}
-
-/// Three radial-gradient discs in one container layer. The container's
-/// `speed` is the tempo and the pause; the layer around it carries the
-/// state's weight, so a pause never holds a fade.
-final class HazeView: NSView {
-    /// The brightest the haze may ever be: all three discs overlapping at
-    /// their centres, at the busy opacity. See the header for the contrast.
-    private static let peakAlpha: Double = 0.44
-    /// The disc's own core alpha, derived from the cap:
-    /// 1 − (1 − busy·core)³ ≤ peakAlpha.
-    private static let core: CGFloat = CGFloat(
-        (1 - pow(1 - peakAlpha, 1.0 / 3.0)) / Double(HazeMood.busy.opacity))
-    private static let ramp: TimeInterval = 1.5
-    private static let size = CGSize(width: 640, height: 580)
-    /// Idle loop lengths, one per disc.
-    private static let loops: [CFTimeInterval] = [40, 48, 56]
-    /// Where each disc rests, as a fraction of the window.
-    private static let anchors: [CGPoint] = [
-        CGPoint(x: 0.18, y: 0.70), CGPoint(x: 0.74, y: 0.42), CGPoint(x: 0.46, y: 0.16),
-    ]
-    /// Each disc's loop, in points from its anchor.
-    private static let paths: [[CGPoint]] = [
-        [.zero, CGPoint(x: 160, y: -60), CGPoint(x: 90, y: -170), CGPoint(x: -120, y: -90), .zero],
-        [.zero, CGPoint(x: -150, y: 90), CGPoint(x: -60, y: 180), CGPoint(x: 110, y: 70), .zero],
-        [.zero, CGPoint(x: 120, y: 130), CGPoint(x: -100, y: 160), CGPoint(x: -140, y: 20), .zero],
-    ]
-
-    /// The weight (opacity) lives on its own layer, outside the tempo: a
-    /// paused `drift` also froze any fade attached to it, so a haze built
-    /// while the window was in the background (a Simple | Advanced swap from
-    /// the agent, a launch behind other windows) held at opacity 0 until the
-    /// app was next activated. Simple view read as flat #20232A.
-    private let weight = CALayer()
-    private let drift = CALayer()
-    private var discs: [CAGradientLayer] = []
-    private var color: HazeColor?
-    private var mood: HazeMood = .idle
-    private var dark = true
-    private var still = false
-    private var observers: [NSObjectProtocol] = []
-    private var rampTimer: Timer?
-
-    init() {
-        super.init(frame: .zero)
-        wantsLayer = true
-        layer?.masksToBounds = true
-        weight.opacity = 0
-        weight.actions = ["opacity": NSNull(), "bounds": NSNull(), "position": NSNull()]
-        drift.actions = ["bounds": NSNull(), "position": NSNull()]
-        layer?.addSublayer(weight)
-        weight.addSublayer(drift)
-        for (index, loop) in Self.loops.enumerated() {
-            let disc = CAGradientLayer()
-            disc.type = .radial
-            disc.startPoint = CGPoint(x: 0.5, y: 0.5)
-            disc.endPoint = CGPoint(x: 1, y: 1)
-            disc.locations = [0, 0.35, 0.7, 1]
-            disc.bounds = CGRect(origin: .zero, size: Self.size)
-            disc.actions = ["position": NSNull(), "bounds": NSNull()]
-            drift.addSublayer(disc)
-            discs.append(disc)
-
-            let move = CAKeyframeAnimation(keyPath: "position")
-            move.values = Self.paths[index].map { NSValue(point: $0) }
-            move.isAdditive = true
-            move.calculationMode = .cubic
-            move.duration = loop
-            move.repeatCount = .infinity
-            move.isRemovedOnCompletion = false
-            // Slow light needs few frames; the render server can idle between.
-            move.preferredFrameRateRange = CAFrameRateRange(minimum: 8, maximum: 30, preferred: 20)
-            // Start each disc somewhere along its loop, not all at the origin.
-            move.timeOffset = loop * Double(index) / 3
-            disc.add(move, forKey: "drift")
-        }
-        setSpeed(0)
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
-
-    /// SwiftUI sizes a representable by frame; that alone never runs layout().
-    override func setFrameSize(_ newSize: NSSize) {
-        super.setFrameSize(newSize)
-        needsLayout = true
-    }
-
-    override func layout() {
-        super.layout()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        weight.frame = bounds
-        drift.frame = bounds
-        for (disc, anchor) in zip(discs, Self.anchors) {
-            disc.position = CGPoint(x: bounds.width * anchor.x, y: bounds.height * anchor.y)
-        }
-        CATransaction.commit()
-    }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        observers.forEach(NotificationCenter.default.removeObserver)
-        observers = []
-        guard let window else { return }
-        let center = NotificationCenter.default
-        let names: [(Notification.Name, AnyObject?)] = [
-            (NSWindow.didChangeOcclusionStateNotification, window),
-            (NSApplication.didBecomeActiveNotification, NSApp),
-            (NSApplication.didResignActiveNotification, NSApp),
-        ]
-        for (name, object) in names {
-            observers.append(center.addObserver(forName: name, object: object, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.retarget() }
-            })
-        }
-        retarget()
-    }
-
-    func teardown() {
-        observers.forEach(NotificationCenter.default.removeObserver)
-        observers = []
-        rampTimer?.invalidate()
-        rampTimer = nil
-    }
-
-    func apply(color: HazeColor, mood: HazeMood, dark: Bool, still: Bool) {
-        if color != self.color || dark != self.dark {
-            // A colour change crossfades; the first paint does not.
-            CATransaction.begin()
-            CATransaction.setAnimationDuration(self.color == nil ? 0 : 1.2)
-            CATransaction.setDisableActions(self.color == nil)
-            for (disc, hex) in zip(discs, color.shades) {
-                // Light room (2026-10-09): the dark-tuned shades at half weight
-                // were a grey-green cast over everything. Pale shades at full
-                // weight read as coloured light on paper instead.
-                let shade = HazeColor.nsColor(hex)
-                let base = dark ? shade : (shade.blended(withFraction: 0.5, of: .white) ?? shade)
-                let k = Self.core
-                disc.colors = [k, k * 0.9, k * 0.45, 0].map { base.withAlphaComponent($0).cgColor }
-            }
-            CATransaction.commit()
-        }
-        let changed = mood != self.mood || dark != self.dark || still != self.still || self.color == nil
-        self.color = color
-        self.mood = mood
-        self.dark = dark
-        self.still = still
-        if changed { retarget() }
-    }
-
-    // MARK: Tempo and weight
-
-    private var visible: Bool {
-        guard let window else { return false }
-        return NSApp.isActive && window.occlusionState.contains(.visible)
-    }
-
-    /// Ease the container toward the current state: opacity by one CA fade,
-    /// tempo by a short main-thread ramp (a speed change is not animatable).
-    private func retarget() {
-        let targetOpacity = mood.opacity * (dark ? 1 : 0.85)
-        let from = weight.presentation()?.opacity ?? weight.opacity
-        if from != targetOpacity {
-            let fade = CABasicAnimation(keyPath: "opacity")
-            fade.fromValue = from
-            fade.toValue = targetOpacity
-            fade.duration = Self.ramp
-            fade.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            weight.opacity = targetOpacity
-            weight.add(fade, forKey: "weight")
-        }
-
-        let target: Float = (still || !visible) ? 0 : mood.speed
-        let start = drift.speed
-        rampTimer?.invalidate()
-        rampTimer = nil
-        guard start != target else { return }
-        let began = CACurrentMediaTime()
-        let timer = Timer(timeInterval: 1.0 / 12, repeats: true) { [weak self] timer in
-            let done = MainActor.assumeIsolated { () -> Bool in
-                guard let self else { return true }
-                let t = min(1, (CACurrentMediaTime() - began) / Self.ramp)
-                let eased = Float(t * t * (3 - 2 * t))
-                self.setSpeed(start + (target - start) * eased)
-                if t >= 1 { self.rampTimer = nil }
-                return t >= 1
-            }
-            if done { timer.invalidate() }
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        rampTimer = timer
-    }
-
-    /// Change tempo without a jump: rebase the container's clock so its local
-    /// time at this instant is unchanged (QA1673's pause, generalised).
-    private func setSpeed(_ speed: Float) {
-        let now = CACurrentMediaTime()
-        let local = drift.convertTime(now, from: nil)
-        drift.speed = speed
-        drift.timeOffset = local
-        drift.beginTime = now
-    }
 }

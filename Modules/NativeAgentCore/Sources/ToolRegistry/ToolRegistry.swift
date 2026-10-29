@@ -1,5 +1,6 @@
 import AuthoredCapabilities
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `ToolRegistry.swift` | `ToolRecord` and AbilityStore's checked part-record projection: missing required fields are omitted; invalid authored fields fail listing and dispatch discovery; `keepReview` and `reviewedKeepDigest` bind waiting or selected code to the review captured under the ability-store lock |
@@ -9,234 +10,67 @@ import PersistenceCore
 /// Errors raised by the tool registry.
 public enum ToolRegistryError: Error, LocalizedError {
     case invalidRequest(String)
-    case toolNotFound(String)
     case registryUnreadable(reason: String)
-    /// Record's status/field combination is internally inconsistent — e.g.
-    /// status=="active" but activePath is nil. Mirrors Python's hard-raise
-    /// on the same shape so we never quarantine the wrong bytes.
-    case invalidState(String)
 
     public var errorDescription: String? {
         switch self {
         case .invalidRequest(let msg): return "invalid request: \(msg)"
-        case .toolNotFound(let id): return "tool not found: \(id)"
         case .registryUnreadable(let r): return "registry unreadable: \(r)"
-        case .invalidState(let m): return "invalid state: \(m)"
         }
     }
 }
 
 // MARK: - ToolRecord
-//
-// Retained tool records preserve typed fields, unknown extras and explicit
-// nulls on round-trip. AbilityStore owns migration into the unified store.
 
-public struct ToolRecord: Sendable, Equatable {
-    // Required fields — always present.
-    public var id: String
-    public var name: String
-    public var status: String
-    public var createdAt: String
+/// One checked object preserves unknown fields and explicit nulls.
+public struct ToolRecord: Sendable, Equatable, Identifiable {
+    public let fields: [String: JSONValue]
 
-    // Typed presence-tracking optionals. nil ⇒ key absent.
-    public var updatedAt: String?
-    public var phase: String?
-    public var lastUsedAt: String?
-    public var manifestSignature: String?
+    public var id: String { (fields["id"]?.stringValue)! }
+    public var name: String { (fields["name"]?.stringValue)! }
+    public var status: String { (fields["status"]?.stringValue)! }
+    public var createdAt: String { (fields["createdAt"]?.stringValue)! }
+    public var updatedAt: String? { fields["updatedAt"]?.stringValue }
+    public var phase: String? { fields["phase"]?.stringValue }
+    public var lastUsedAt: String? { fields["lastUsedAt"]?.stringValue }
+    public var manifestSignature: String? { fields["manifestSignature"]?.stringValue }
     /// Selected candidate seal, including manifest/fixtures/dependencies/prior; not source SHA-256.
-    public var codeFingerprint: String?
-    public var signedAt: String?
-    public var activePath: String?
-    public var proposalPath: String?
-    public var validationStatus: String?
-
-    /// Unknown fields preserved on round-trip, excluding `__presentNullKeys`.
-    public var extras: JSONValue?
-
-    /// Typed keys that arrived as explicit JSON null, preserved on serialization.
-    /// Internal bookkeeping; `__presentNullKeys` is excluded from extras.
-    private var presentNullKeys: Set<String>
-
-    public init(
-        id: String,
-        name: String,
-        status: String,
-        createdAt: String,
-        updatedAt: String? = nil,
-        phase: String? = nil,
-        lastUsedAt: String? = nil,
-        manifestSignature: String? = nil,
-        codeFingerprint: String? = nil,
-        signedAt: String? = nil,
-        activePath: String? = nil,
-        proposalPath: String? = nil,
-        validationStatus: String? = nil,
-        extras: JSONValue? = nil
-    ) {
-        self.id = id
-        self.name = name
-        self.status = status
-        self.createdAt = createdAt
-        self.updatedAt = updatedAt
-        self.phase = phase
-        self.lastUsedAt = lastUsedAt
-        self.manifestSignature = manifestSignature
-        self.codeFingerprint = codeFingerprint
-        self.signedAt = signedAt
-        self.activePath = activePath
-        self.proposalPath = proposalPath
-        self.validationStatus = validationStatus
-        self.extras = extras
-        self.presentNullKeys = []
-    }
-}
-
-extension ToolRecord {
-    /// Typed key set the struct claims directly. Everything else round-trips
-    /// through `extras`. KEEP IN SYNC with both `init(json:)` and `toJSON()`.
-    static let typedKeys: Set<String> = [
-        "id", "name", "status", "createdAt",
-        "updatedAt", "phase", "lastUsedAt",
-        "manifestSignature", "codeFingerprint", "signedAt",
-        "activePath", "proposalPath", "validationStatus",
-    ]
-
-    /// Reserved key never round-tripped through `extras` — used internally
-    /// for the present-null bookkeeping channel.
-    static let reservedExtrasKey = "__presentNullKeys"
+    public var codeFingerprint: String? { fields["codeFingerprint"]?.stringValue }
+    public var signedAt: String? { fields["signedAt"]?.stringValue }
+    public var activePath: String? { fields["activePath"]?.stringValue }
+    public var proposalPath: String? { fields["proposalPath"]?.stringValue }
+    public var validationStatus: String? { fields["validationStatus"]?.stringValue }
 
     public init?(json: JSONValue) {
-        guard case .object(let obj) = json else { return nil }
-
-        // Required fields. If id / name / status / createdAt are missing or
-        // empty, the record is malformed — drop it (caller filters nils).
-        func str(_ k: String) -> String {
-            if case .string(let s) = obj[k] ?? .null { return s }
-            return ""
+        guard case .object(var fields) = json else { return nil }
+        for key in ["id", "name", "status", "createdAt"] {
+            guard case .string(let value)? = fields[key], !value.isEmpty else { return nil }
         }
-        let idS = str("id")
-        let nameS = str("name")
-        let statusS = str("status")
-        let createdS = str("createdAt")
-        if idS.isEmpty || nameS.isEmpty || statusS.isEmpty || createdS.isEmpty {
-            return nil
-        }
-        self.id = idS
-        self.name = nameS
-        self.status = statusS
-        self.createdAt = createdS
-
-        // Presence-tracking optionals. ABSENT → nil. PRESENT-AS-NULL → nil
-        // but recorded in presentNullKeys so the explicit null re-emits.
-        // PRESENT-AS-STRING → some(value).
-        var nulls: Set<String> = []
-        func optStr(_ k: String) -> String? {
-            guard let v = obj[k] else { return nil } // absent
-            switch v {
-            case .null:
-                nulls.insert(k); return nil
-            case .string(let s):
-                return s
-            default:
-                return nil
+        // Malformed optional strings are absent; explicit nulls remain null.
+        for key in ["updatedAt", "phase", "lastUsedAt", "manifestSignature", "codeFingerprint",
+                    "signedAt", "activePath", "proposalPath", "validationStatus"] {
+            switch fields[key] {
+            case .string?, .null?, nil: break
+            default: fields.removeValue(forKey: key)
             }
         }
-        self.updatedAt = optStr("updatedAt")
-        self.phase = optStr("phase")
-        self.lastUsedAt = optStr("lastUsedAt")
-        self.manifestSignature = optStr("manifestSignature")
-        self.codeFingerprint = optStr("codeFingerprint")
-        self.signedAt = optStr("signedAt")
-        self.activePath = optStr("activePath")
-        self.proposalPath = optStr("proposalPath")
-        self.validationStatus = optStr("validationStatus")
-        self.presentNullKeys = nulls
-
-        // Stash everything else in extras. Strip the reserved key on read so
-        // a malicious / corrupted on-disk record can't smuggle a fake
-        // present-null channel through us.
-        var extra: [String: JSONValue] = [:]
-        for (k, v) in obj where !ToolRecord.typedKeys.contains(k) && k != ToolRecord.reservedExtrasKey {
-            extra[k] = v
-        }
-        self.extras = extra.isEmpty ? nil : .object(extra)
+        fields.removeValue(forKey: "__presentNullKeys")
+        self.fields = fields
     }
 
-    public func toJSON() -> JSONValue {
-        var obj: [String: JSONValue] = [
-            "id": .string(id),
-            "name": .string(name),
-            "status": .string(status),
-            "createdAt": .string(createdAt),
-        ]
-        // Emit typed optionals using presence semantics:
-        //   - .some(v)         → key present with v
-        //   - .none + nullKey  → key present as JSON null
-        //   - .none            → key omitted
-        func emitOpt(_ key: String, _ value: String?) {
-            if let v = value {
-                obj[key] = .string(v)
-            } else if presentNullKeys.contains(key) {
-                obj[key] = .null
-            }
-        }
-        emitOpt("updatedAt", updatedAt)
-        emitOpt("phase", phase)
-        emitOpt("lastUsedAt", lastUsedAt)
-        emitOpt("manifestSignature", manifestSignature)
-        emitOpt("codeFingerprint", codeFingerprint)
-        emitOpt("signedAt", signedAt)
-        emitOpt("activePath", activePath)
-        emitOpt("proposalPath", proposalPath)
-        emitOpt("validationStatus", validationStatus)
-        // Merge extras (skip typed keys defensively + strip reserved key).
-        if case .object(let extra)? = extras {
-            for (k, v) in extra where !ToolRecord.typedKeys.contains(k) && k != ToolRecord.reservedExtrasKey {
-                obj[k] = v
-            }
-        }
-        return .object(obj)
-    }
-}
+    private func extra(_ key: String) -> JSONValue? { fields[key] }
 
-extension ToolRecord: Identifiable {}
+    public var description: String { fields["description"]?.stringValue ?? "" }
 
-/// The authored-tool fields the registry keeps in `extras`, read as the Tools
-/// page shows them (S10). Reads only: writes still go through `extras`.
-extension ToolRecord {
-    private func extra(_ key: String) -> JSONValue? {
-        guard case .object(let obj)? = extras else { return nil }
-        return obj[key]
-    }
+    public var triggers: [String] { fields["triggers"]?.arrayValue?.compactMap(\.stringValue) ?? [] }
+    public var permissions: [String]? { fields["permissions"]?.arrayValue?.compactMap(\.stringValue) }
+    public var actions: [String]? { fields["actions"]?.arrayValue?.compactMap(\.stringValue) }
+    public var validationErrors: [String]? { fields["validationErrors"]?.arrayValue?.compactMap(\.stringValue) }
+    public var autoCreated: Bool? { fields["autoCreated"]?.boolValue }
+    public var autoRun: Bool? { fields["autoRun"]?.boolValue }
 
-    private func extraString(_ key: String) -> String? {
-        if case .string(let value)? = extra(key) { return value }
-        return nil
-    }
-
-    private func extraBool(_ key: String) -> Bool? {
-        if case .bool(let value)? = extra(key) { return value }
-        return nil
-    }
-
-    private func extraStrings(_ key: String) -> [String]? {
-        guard case .array(let values)? = extra(key) else { return nil }
-        return values.compactMap { value in
-            if case .string(let string) = value { return string }
-            return nil
-        }
-    }
-
-    public var description: String { extraString("description") ?? "" }
-
-    public var triggers: [String] { extraStrings("triggers") ?? [] }
-    public var permissions: [String]? { extraStrings("permissions") }
-    public var validationErrors: [String]? { extraStrings("validationErrors") }
-    public var autoCreated: Bool? { extraBool("autoCreated") }
-    public var autoRun: Bool? { extraBool("autoRun") }
-
-    public var language: String? { extraString("language") }
-    public var candidateDigest: String? { extraString("candidateDigest") }
+    public var language: String? { fields["language"]?.stringValue }
+    public var candidateDigest: String? { fields["candidateDigest"]?.stringValue }
     /// Review material and identity captured together by the ability-store read.
     /// Never substitute a fresh catalog digest for the version a row displayed.
     public var keepReview: [String: JSONValue]? {
@@ -250,33 +84,10 @@ extension ToolRecord {
         guard case .string(let digest)? = keepReview?["version"] else { return nil }
         return digest
     }
-    public var pendingCandidate: Bool {
-        guard let candidate = candidateDigest else { return false }
-        return candidate != codeFingerprint
-    }
-
     public var useCount: Int? {
-        switch extra("useCount") {
-        case .int(let value)?: return Int(exactly: value)
-        case .double(let value)?: return Int(exactly: value)
-        default: return nil
-        }
+        extra("useCount")?.exactIntegerValue
     }
 
-    /// The first registry string field of a raw record that is present but
-    /// not a string. `init(json:)` reads such a field as absent, so a caller
-    /// holding the raw record checks it first.
-    public static func stringFieldProblem(in json: JSONValue) -> String? {
-        guard case .object(let obj) = json else { return "record" }
-        for key in ["id", "name", "status", "phase", "validationStatus", "proposalPath", "activePath",
-                    "sourceRunId", "createdAt", "updatedAt", "lastUsedAt"] {
-            switch obj[key] {
-            case nil, .null?, .string?: continue
-            default: return key
-            }
-        }
-        return nil
-    }
 
     /// The first authored field that does not read as the Tools page reads
     /// it, or nil when every one does: `description` is required, the rest
@@ -289,13 +100,6 @@ extension ToolRecord {
             return values.allSatisfy(isString)
         }
         func isBool(_ value: JSONValue) -> Bool { if case .bool = value { return true }; return false }
-        func isCount(_ value: JSONValue) -> Bool {
-            switch value {
-            case .int(let n): return Int(exactly: n) != nil
-            case .double(let d): return Int(exactly: d) != nil
-            default: return false
-            }
-        }
         guard let description = extra("description"), isString(description) else { return "description" }
         // Triggers are discovery phrases, not identity: a part found by its
         // description needs none (the seed parts have none).
@@ -304,7 +108,7 @@ extension ToolRecord {
             ("language", isString), ("entrypoint", isString), ("permissions", isStrings), ("actions", isStrings),
             ("autoCreated", isBool), ("autoPromote", isBool), ("autoRun", isBool), ("autoPromotable", isBool),
             ("validationErrors", isStrings), ("disabledReason", isString),
-            ("sourceRunId", isString), ("useCount", isCount),
+            ("sourceRunId", isString), ("useCount", { $0.exactIntegerValue != nil }),
         ]
         for (key, reads) in optional {
             if let value = extra(key), value != .null, !reads(value) { return key }
@@ -313,50 +117,34 @@ extension ToolRecord {
     }
 }
 
-// MARK: - Filter
-
-public enum ToolFilter: Sendable, Equatable {
-    case all
-    case status(String)
-}
-
 // MARK: - SwiftNative impl
 
 /// Checked ability-file reads; mutations use the canonical storage owner.
 public actor SwiftNativeToolRegistry {
     private let root: URL
-    private let clock: @Sendable () -> Date
-    public init(
-        root: URL = PersistenceCore.defaultDataRoot(),
-        clock: @escaping @Sendable () -> Date = { Date() }
-    ) {
+    public init(root: URL = PersistenceCore.defaultDataRoot()) {
         self.root = root
-        self.clock = clock
     }
 
     // MARK: list / get
 
-    public func listTools(filter: ToolFilter) async throws -> [ToolRecord] {
+    public func listTools() async throws -> [ToolRecord] {
         let records = try AbilityStore(dataRoot: root).checkedToolRecords()
         // Newest effective timestamp first; ties retain their on-disk order.
         func sortKey(_ r: ToolRecord) -> String {
             (r.updatedAt?.isEmpty == false ? r.updatedAt : nil) ?? r.createdAt
         }
         let indexed = records.enumerated().map { (idx: $0.offset, rec: $0.element) }
-        let sorted = indexed.sorted { lhs, rhs in
+        return indexed.sorted { lhs, rhs in
             let lk = sortKey(lhs.rec)
             let rk = sortKey(rhs.rec)
             if lk != rk { return lk > rk }   // primary: key DESC
             return lhs.idx < rhs.idx         // tie-break: input order ASC (stable)
         }.map(\.rec)
-        switch filter {
-        case .all: return sorted
-        case .status(let s): return sorted.filter { $0.status == s }
-        }
     }
 
     public func getTool(id: String) async throws -> ToolRecord? {
-        let all = try await listTools(filter: .all)
+        let all = try await listTools()
         return all.first { $0.id == id }
     }
 

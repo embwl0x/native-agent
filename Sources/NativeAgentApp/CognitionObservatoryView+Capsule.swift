@@ -1,5 +1,4 @@
-// Move-only extraction (tightness Wave C) from CognitionObservatoryView.swift
-
+import NativeAgentShared
 import Cognition
 import SwiftUI
 import CognitiveSubstrate
@@ -10,11 +9,7 @@ import PersistenceCore
 
 extension CognitionObservatoryView {
 
-    /// Read-only felt-MODE chip (U3, 2026-07-09): the aboutness beneath the fingerprint's
-    /// words — what her current felt state is ABOUT, not how strong it is. Derived from the
-    /// same signals the fingerprint reads; shown only when a mode is genuinely dominant, so
-    /// an absent chip means "no single aboutness," never "broken." Purely observational —
-    /// it changes no capsule text and drives nothing.
+    /// The read-only chip shows a dominant felt mode; absence means no single aboutness.
     @ViewBuilder
     private func feltModeChip(_ mode: CognitiveSubstrate.FeltMode) -> some View {
         // Name the thing on screen: a bare "seeking" beside a capsule reads as a label
@@ -97,6 +92,10 @@ extension CognitionObservatoryView {
             } else {
                 VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
                     ForEach(Array(reflections.prefix(6)), id: \.id) { receipt in
+                        let total = receipt.estimatedPromptTokens.addingReportingOverflow(receipt.estimatedResultTokens)
+                        let tokens = total.overflow
+                            ? "total unavailable (prompt \(receipt.estimatedPromptTokens), result \(receipt.estimatedResultTokens); total exceeds integer range)"
+                            : String(total.partialValue)
                         VStack(alignment: .leading, spacing: 4) {
                             Text(receipt.request.reason)
                                 .font(.caption.weight(.semibold))
@@ -106,7 +105,7 @@ extension CognitionObservatoryView {
                             Text("\(receipt.request.model) via \(receipt.provider)")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
-                            Text("estimated tokens \(receipt.estimatedPromptTokens + receipt.estimatedResultTokens), estimated cost units \(String(format: "%.2f", receipt.estimatedCostUnits)), proposals \(receipt.proposalIds.count), yield \(String(format: "%.2f", receipt.proposalYieldScore))")
+                            Text("estimated tokens \(tokens), estimated cost units \(String(format: "%.2f", receipt.estimatedCostUnits)), proposals \(receipt.proposalIds.count), yield \(String(format: "%.2f", receipt.proposalYieldScore))")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }

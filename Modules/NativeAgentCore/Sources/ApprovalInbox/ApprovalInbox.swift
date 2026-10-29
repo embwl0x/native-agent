@@ -1,460 +1,13 @@
 import AuthoredCapabilities
-import ChatToolParsing
 import Experiences
 import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-// Surface identity is security-relevant and `ConversationSurfaceProfile` owns
-// the remote/iOS sets. A second copy of them here would be a second answer to
-// "is this surface the person" — the thing that type exists to prevent.
 import TrustCenter
 // Blueprint: | `ApprovalInbox.swift` | `SwiftNativeApprovalInbox`; canonical checked authority storage and decision/grant facts; recordsUnlocked/list share the originating DataRootLife projection for execution and chat continuation. Old approved but unexecuted work reads stopped/restored without changing the grant or settled outcomes; resolution stamps new work; raw offline validation remains side effect free |
 
-// MARK: - Records
-
-/// One record in the autonomy approval queue. Preserves the stable
-/// `create_approval_request` shape plus NativeAgent's durable typed resolution
-/// provenance.
-///
-/// Timestamps are ISO-8601 strings. The `decision`, `resolvedAt`, `decidedBy`,
-/// and `resolutionProvenance` fields stay nil until the request is resolved.
-///
-/// `executedAction` preserves the domain's outcome. `detail` is its shared
-/// decision face. Unlike the nullable decision, both are omitted when nil.
-public struct ApprovalRecord: Sendable, Equatable, Identifiable {
-    public var id: String
-    public var title: String
-    public var action: String
-    public var risk: String
-    public var reason: String
-    public var status: String            // "pending" | "resolved" | "denied" | "canceled" | "orphaned"
-    public var payload: JSONValue        // arbitrary JSON dict
-    public var payloadPreview: String
-    public var createdAt: String         // ISO-8601
-    /// User, 2026-09-06: when this still-pending request was last ASKED FOR.
-    /// A repeated identical request reuses this row instead of piling up
-    /// duplicates, so `createdAt` alone stopped describing the moment the
-    /// person is being asked — a chat card that fences on the turn it belongs
-    /// to hid a live question raised again in a later turn. Nil on rows that
-    /// were only ever asked once.
-    public var lastRequestedAt: String?  // ISO-8601 or nil
-
-    /// What a person reads about this ask: its reason, else, for an
-    /// owner-review card (a REM lesson, a skill or memory proposal), the
-    /// preview its filer wrote in words. Never a serialized payload. 10-18: a
-    /// REM card's reason is empty on purpose, so the phone's overview showed a
-    /// blank row and Telegram printed the payload as JSON. Not redacted here:
-    /// each surface redacts what it sends.
-    public var readableAsk: String {
-        let reason = self.reason.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !reason.isEmpty { return reason }
-        guard SwiftNativeApprovalInbox.ownerReviewActions.contains(action) else { return "" }
-        return payloadPreview.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-    public var resolvedAt: String?       // ISO-8601 or nil
-    public var decision: String?         // "approved" | "denied" | "canceled" | nil
-    public var decidedBy: String?        // durable human/system decision attribution
-    public var resolutionProvenance: ApprovalResolutionProvenance?
-    public var remoteResolvable: Bool
-    public var localOnly: Bool
-    public var executedAction: JSONValue?
-    private var executionDetail: String?
-    public var cause: String? = nil
-    public var detail: String? {
-        get { executedAction == nil ? executionDetail : decisionExperience.face?.words }
-        set { executionDetail = newValue }
-    }
-
-    public var executionResultClass: ChatToolOutcome.ExactResultClass {
-        guard let executedAction else { return .unknown }
-        guard case .object(let execution) = executedAction,
-              execution["op"] == .string("chat_tool_approval_replay") else {
-            return ChatToolOutcome.exactResultClass(executedAction)
-        }
-        if case .string(let raw)? = execution["resultClass"],
-           let result = ChatToolOutcome.ExactResultClass(rawValue: raw) { return result }
-        guard let status = execution["status"] else { return .unknown }
-        return ChatToolOutcome.exactResultClass(.object(["status": status]))
-    }
-
-    public var executionIsStopped: Bool {
-        guard case .object(let execution)? = executedAction else { return false }
-        return execution["status"] == .string("stopped")
-    }
-
-    /// The inbox owns the decision. Every reader gets this same expression,
-    /// including old rows whose execution sentence contradicted their receipt.
-    public var decisionExperience: Experience {
-        let ref = Experience.Ref(source: "workflows/approvals/requests.json", id: id)
-        var obligation = Experience.Obligation(to: "person")
-        if decision != nil {
-            obligation.phase = .accepted
-            obligation.evidence = ref
-        } else if status != "pending" {
-            obligation.phase = .letGo
-            obligation.reason = .expired
-        }
-        var fields: [String: JSONValue] = if case .object(let fields)? = executedAction { fields } else { [:] }
-        if fields["detail"] == nil, let executionDetail { fields["detail"] = .string(executionDetail) }
-        let words: String
-        if case .object(let execution)? = executedAction,
-           execution["op"] == .string("chat_tool_approval_replay") {
-            let outcome: String = switch executionResultClass {
-            case .succeeded: "Completed"
-            case .failed: "Failed"
-            case .refused: "Refused"
-            case .cancelled: "Cancelled"
-            case .timeout: "Timed out"
-            case .unknown: "Outcome unconfirmed"
-            }
-            if let preview = execution["resultPreview"] { fields["detail"] = preview }
-            let preview = ChatToolOutcome.explanation(.object(fields)).map { " Result: \($0)" } ?? ""
-            // A result's own `decided_by` names who carried the action out;
-            // read beside the approval, "agent" was taken for "the app
-            // approved it on its own" (0.6.8, five times).
-            let ranBy = preview.contains("decided_by") ? " Its decided_by names who carried it out, not who approved it." : ""
-            words = (decision == "approved" ? "\(action): \(outcome) after approval by \(approvedBy ?? "an unrecorded decider")."
-                : "\(action): \(decision ?? status). The tool did not run.") + preview + ranBy
-        } else if executedAction != nil {
-            let value = JSONValue.object(fields)
-            words = [ChatToolOutcome.explanation(value), ChatToolOutcome.remedy(value)]
-                .compactMap { $0 }.joined(separator: " ")
-        } else {
-            words = executionDetail ?? decision.map { "\(action): \($0)." } ?? readableAsk
-        }
-        // Permission is not adoption. This receipt is written only after the
-        // application completes; false means the lesson was already present.
-        let applied: Bool
-        if action == "rem.proposal", decision == "approved",
-           fields["op"] == .string("rem_proposal_approve"), case .bool? = fields["growthAppended"],
-           !ChatToolOutcome.carriesFailureEvidence(.object(fields)) { applied = true } else { applied = false }
-        return Experience(id: id, kind: .decision, cause: cause.map { [$0] } ?? [], evidence: [ref],
-                          outcome: decision.map { .init(domain: "approvals", status: $0, at: resolvedAt) },
-                          face: .init(words: words, artifacts: []), addressedTo: ["person"],
-                          owes: ["decide": obligation],
-                          claims: applied ? [.init(claim: "applied", evidence: [ref])] : [])
-    }
-    /// Who approved, in words, with the time: "you, in the Mac app, 18:22".
-    /// A person's channel says "you" (her receipts address the person); any
-    /// other decider is named by its own label.
-    public var approvedBy: String? {
-        guard decision == "approved",
-              let provenance = resolutionProvenance ?? decidedBy.map(ApprovalResolutionProvenance.local) else { return nil }
-        let who = switch provenance {
-        case .telegram: "you, in Telegram"
-        case .signedIOS: "you, on your iPhone"
-        case .local(decidedBy: "mac_ui"), .local(decidedBy: "local_desk_click"): "you, in the Mac app"
-        case .local(let label): label
-        }
-        guard let at = resolvedAt.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst) else { return who }
-        let clock = DateFormatter()
-        clock.dateFormat = Calendar.current.isDateInToday(at) ? "HH:mm" : "MMM d, HH:mm"
-        return "\(who), \(clock.string(from: at))"
-    }
-    public var chatContinuation: JSONValue? = nil
-    /// User, 10-03: the one inline card this approval posted into his
-    /// conversation (`ApprovalChatCards`): `{sessionId, telegramChatId?, at}`.
-    /// Display binding only; set once, so a request never posts two cards.
-    public var chatCard: JSONValue? = nil
-
-    public init(
-        id: String,
-        title: String,
-        action: String,
-        risk: String,
-        reason: String,
-        status: String,
-        payload: JSONValue,
-        payloadPreview: String,
-        createdAt: String,
-        lastRequestedAt: String? = nil,
-        resolvedAt: String? = nil,
-        decision: String? = nil,
-        decidedBy: String? = nil,
-        resolutionProvenance: ApprovalResolutionProvenance? = nil,
-        remoteResolvable: Bool,
-        localOnly: Bool,
-        executedAction: JSONValue? = nil,
-        detail: String? = nil
-    ) {
-        self.id = id
-        self.title = title
-        self.action = action
-        self.risk = risk
-        self.reason = reason
-        self.status = status
-        self.payload = payload
-        self.payloadPreview = payloadPreview
-        self.createdAt = createdAt
-        self.lastRequestedAt = lastRequestedAt
-        self.resolvedAt = resolvedAt
-        self.decision = decision
-        self.decidedBy = decidedBy
-        self.resolutionProvenance = resolutionProvenance
-        self.remoteResolvable = remoteResolvable
-        self.localOnly = localOnly
-        self.executedAction = executedAction
-        self.executionDetail = detail
-    }
-}
-
-extension ApprovalRecord {
-    /// The conversation that asked, for a chat tool approval: the filer
-    /// (`NativeAgentChatApprovalFiler`) records it as `payload.origin.sessionId`.
-    /// Only chat approvals carry a chat origin — every other kind is nil rather
-    /// than borrowing a lookalike field.
-    public var chatOriginSessionId: String? {
-        guard case .object(let fields) = payload,
-              case .string(let kind)? = fields["kind"],
-              // ACP questions belong to a live protocol request, not a tool
-              // replay. They share chat presentation only, never execution.
-              kind == "chat_tool_approval" || kind == "agent_acp_live_approval",
-              case .object(let origin)? = fields["origin"],
-              case .string(let sessionId)? = origin["sessionId"] else { return nil }
-        let trimmed = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    /// Her own decision, filed here only so she can resolve it with her own
-    /// tool (`studio_canon_resolve`): never a card, note or button for the
-    /// person. The canon filer's action is the marker.
-    public var isAgentsOwnDecision: Bool { action == "studio.canon" }
-
-    /// The conversation this approval's chat card was posted into, if any.
-    public var chatCardSessionId: String? {
-        guard case .object(let card)? = chatCard, case .string(let id)? = card["sessionId"],
-              !id.isEmpty else { return nil }
-        return id
-    }
-
-    public var chatCardDelivered: Bool {
-        guard case .object(let card)? = chatCard else { return false }
-        return card["delivered"] == .bool(true)
-    }
-}
-
-extension ApprovalRecord {
-    /// Build a record from its saved JSON object, tolerating missing keys.
-    public init?(json: JSONValue) {
-        guard case .object(let obj) = json else { return nil }
-        func str(_ key: String) -> String {
-            if case .string(let s) = obj[key] ?? .null { return s }
-            return ""
-        }
-        func optStr(_ key: String) -> String? {
-            switch obj[key] ?? .null {
-            case .string(let s): return s
-            case .null: return nil
-            default: return nil
-            }
-        }
-        func bool(_ key: String) -> Bool {
-            if case .bool(let b) = obj[key] ?? .null { return b }
-            return false
-        }
-        let idStr = str("id")
-        if idStr.isEmpty { return nil }
-        self.id = idStr
-        self.title = str("title")
-        self.action = str("action")
-        self.risk = str("risk")
-        self.reason = str("reason")
-        self.status = str("status")
-        self.payload = obj["payload"] ?? .object([:])
-        self.payloadPreview = str("payloadPreview")
-        self.createdAt = str("createdAt")
-        self.lastRequestedAt = optStr("lastRequestedAt")
-        self.resolvedAt = optStr("resolvedAt")
-        self.decision = optStr("decision")
-        self.decidedBy = optStr("decidedBy")
-        if let value = obj["resolutionProvenance"], case .null = value {
-            self.resolutionProvenance = nil
-        } else if let value = obj["resolutionProvenance"] {
-            self.resolutionProvenance = ApprovalResolutionProvenance(json: value)
-        } else {
-            self.resolutionProvenance = nil
-        }
-        // Owner-review cards staged before User's 2026-09-25 ruling were
-        // stored local-only; a still-pending one reads as phone-answerable, so
-        // the card already waiting is one he can answer. Terminal history
-        // keeps the flags it was decided under.
-        if self.status == "pending",
-           SwiftNativeApprovalInbox.ownerReviewActions.contains(self.action) {
-            self.remoteResolvable = true
-            self.localOnly = false
-        } else {
-            self.remoteResolvable = bool("remoteResolvable")
-            self.localOnly = bool("localOnly")
-        }
-        // Preserve the saved execution outcome's shape.
-        if let v = obj["executedAction"], case .null = v {
-            self.executedAction = nil
-        } else if let v = obj["executedAction"] {
-            self.executedAction = v
-        } else {
-            self.executedAction = nil
-        }
-        self.executionDetail = optStr("detail")
-        self.cause = optStr("cause")
-        self.chatContinuation = obj["chatContinuation"]
-        self.chatCard = obj["chatCard"]
-    }
-
-    /// Serialize nullable decision fields as explicit `null`, not absent.
-    ///
-    /// `executedAction` and `detail` are OMITTED when nil (not written as
-    /// null) — these keys are added after action execution.
-    public func toJSON() -> JSONValue {
-        var obj: [String: JSONValue] = [
-            "id": .string(id),
-            "title": .string(title),
-            "action": .string(action),
-            "risk": .string(risk),
-            "reason": .string(reason),
-            "status": .string(status),
-            "payload": payload,
-            "payloadPreview": .string(payloadPreview),
-            "createdAt": .string(createdAt),
-            "remoteResolvable": .bool(remoteResolvable),
-            "localOnly": .bool(localOnly),
-        ]
-        if let lastRequestedAt {
-            obj["lastRequestedAt"] = .string(lastRequestedAt)
-        }
-        obj["resolvedAt"] = resolvedAt.map(JSONValue.string) ?? .null
-        obj["decision"] = decision.map(JSONValue.string) ?? .null
-        if let decidedBy {
-            obj["decidedBy"] = .string(decidedBy)
-        }
-        if let resolutionProvenance {
-            obj["resolutionProvenance"] = resolutionProvenance.toJSON()
-        }
-        if let ea = executedAction {
-            obj["executedAction"] = ea
-        }
-        if let cause { obj["cause"] = .string(cause) }
-        if let d = detail {
-            obj["detail"] = .string(d)
-        }
-        if let chatContinuation { obj["chatContinuation"] = chatContinuation }
-        if let chatCard { obj["chatCard"] = chatCard }
-        return .object(obj)
-    }
-}
-
-// MARK: - Filter / Decision
-
-public struct ApprovalFilter: Sendable, Equatable {
-    /// "pending", "resolved", "denied", "canceled", "orphaned", or nil for all.
-    public var status: String?
-    /// If set, only records whose `action` matches — compared through
-    /// `ExecutionEventVocabulary`, so `mission.step` and `execution.step`
-    /// are the same filter.
-    public var action: String?
-
-    public init(status: String? = nil, action: String? = nil) {
-        self.status = status
-        self.action = action
-    }
-
-    public static let all = ApprovalFilter()
-    public static let pending = ApprovalFilter(status: "pending")
-    public static let resolved = ApprovalFilter(status: "resolved")
-}
-
-/// Accepted approval decision values.
-public enum ApprovalDecision: String, Sendable, Equatable {
-    case approved
-    case denied
-    case canceled
-}
-
-/// Typed, durable origin for an approval decision.
-///
-/// Remote cases are deliberately distinct from local decisions so
-/// the inbox can enforce `remoteResolvable` and bind transport identity while
-/// holding the same lock that commits the terminal decision. A caller cannot
-/// safely turn a Telegram or signed-iOS decision into a local string label.
-public enum ApprovalResolutionProvenance: Sendable, Equatable {
-    case local(decidedBy: String)
-    case telegram(chatID: String, userID: String)
-    case signedIOS(clientID: String, decidedBy: String)
-
-    public static let schema = "approval-resolution-provenance.v1"
-
-    public var decidedBy: String {
-        switch self {
-        case .local(let decidedBy), .signedIOS(_, let decidedBy):
-            return decidedBy
-        case .telegram:
-            return "telegram_verified_user"
-        }
-    }
-
-    var isRemote: Bool {
-        switch self {
-        case .telegram, .signedIOS: true
-        case .local: false
-        }
-    }
-
-    var channel: String {
-        switch self {
-        case .local: "local"
-        case .telegram: "telegram"
-        case .signedIOS: "ios_signed"
-        }
-    }
-
-    init?(json: JSONValue) {
-        guard case .object(let object) = json,
-              object["schema"] == .string(Self.schema),
-              case .string(let channel)? = object["channel"],
-              case .string(let decidedBy)? = object["decidedBy"],
-              !decidedBy.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return nil
-        }
-        switch channel {
-        case "local":
-            self = .local(decidedBy: decidedBy)
-        case "ios_signed":
-            guard case .string(let clientID)? = object["clientID"],
-                  !clientID.isEmpty else { return nil }
-            self = .signedIOS(clientID: clientID, decidedBy: decidedBy)
-        case "telegram":
-            guard case .string(let chatID)? = object["chatID"],
-                  case .string(let userID)? = object["userID"],
-                  !chatID.isEmpty, !userID.isEmpty else { return nil }
-            self = .telegram(chatID: chatID, userID: userID)
-        default:
-            return nil
-        }
-        guard object["remote"] == .bool(isRemote) else { return nil }
-    }
-
-    func toJSON() -> JSONValue {
-        var object: [String: JSONValue] = [
-            "schema": .string(Self.schema),
-            "channel": .string(channel),
-            "decidedBy": .string(decidedBy),
-            "remote": .bool(isRemote),
-        ]
-        if case .telegram(let chatID, let userID) = self {
-            object["chatID"] = .string(chatID)
-            object["userID"] = .string(userID)
-        }
-        if case .signedIOS(let clientID, _) = self {
-            object["clientID"] = .string(clientID)
-            // New companion clients use their verified public-key fingerprint
-            // as clientID. Preserve that device identity explicitly in receipts.
-            if clientID.count == 64 {
-                object["deviceID"] = .string(clientID)
-            }
-        }
-        return .object(object)
-    }
-}
+// Surface identity belongs to ConversationSurfaceProfile.
 
 // MARK: - Errors
 
@@ -469,59 +22,12 @@ public enum ApprovalInboxError: Error, Equatable {
     case unavailable(underlying: String)
     /// The decision origin is not permitted to resolve this exact row.
     case resolutionNotAuthorized(id: String, reason: String)
-    /// 2026-09-06: the store is at its row cap and every row in it is still
-    /// pending, so there is no terminal history left to evict. Creating
-    /// anyway would have to delete a decision User has not made yet.
+    /// The row cap is exceeded and no settled terminal history can be evicted.
     case queueFull(pending: Int, cap: Int)
 }
 
-// MARK: - Protocol
-
-/// Subsystem #2 — autonomy approval request queue.
-///
-/// Storage: `<root>/workflows/approvals/requests.json` (single JSON file,
-/// list of records). Mutation is single-writer per process: callers must
-/// not run two `resolve` calls concurrently against the same on-disk file.
-public protocol ApprovalInboxProtocol: Sendable {
-    /// Return the queue, newest-first by createdAt, optionally filtered.
-    func list(filter: ApprovalFilter) async throws -> [ApprovalRecord]
-
-    /// Return a single record by id, or `.notFound` if absent.
-    func get(_ id: String) async throws -> ApprovalRecord
-
-    /// Create and persist a pending approval request. Preserves the
-    /// `create_approval_request` record shape; notification/chat side effects
-    /// are owned by higher-level surfaces.
-    @discardableResult
-    func create(_ body: JSONValue) async throws -> ApprovalRecord
-
-    /// Resolve a pending approval through a typed authority origin. Throws
-    /// `.alreadyResolved` for terminal states.
-    @discardableResult
-    func resolve(
-        _ id: String,
-        decision: ApprovalDecision,
-        provenance: ApprovalResolutionProvenance
-    ) async throws -> ApprovalRecord
-
-    /// Attach the executor outcome without letting app adapters rewrite the
-    /// authoritative approval file themselves.
-    @discardableResult
-    func annotateExecution(
-        _ id: String,
-        executedAction: JSONValue,
-        detail: String,
-        result: JSONValue?
-    ) async throws -> ApprovalRecord
-}
-
-public extension ApprovalInboxProtocol {
-    @discardableResult
-    func annotateExecution(_ id: String, executedAction: JSONValue, detail: String) async throws -> ApprovalRecord {
-        try await annotateExecution(id, executedAction: executedAction, detail: detail, result: nil)
-    }
-
-    /// Source-compatible local decision convenience. Remote adapters must use
+public extension SwiftNativeApprovalInbox {
+    /// Local decision convenience. Remote adapters must use
     /// the typed provenance overload and cannot enter through this label.
     @discardableResult
     func resolve(
@@ -536,9 +42,6 @@ public extension ApprovalInboxProtocol {
         )
     }
 }
-
-// MARK: - SwiftNative implementation
-
 /// File-backed implementation. Reads/writes
 /// `<root>/workflows/approvals/requests.json` via PersistenceCore for
 /// atomic, 0600, sorted-keys, UTF-8 IO.
@@ -547,19 +50,12 @@ public extension ApprovalInboxProtocol {
 /// and its completed-import requests.json.migrated archive are excluded from
 /// backup/export/raw sync and listed under Legacy Approvals.
 ///
-/// Actor-isolated: serializes concurrent resolve/archive calls so two
-/// in-flight mutations against the same on-disk file can't clobber each
-/// other's writes.
-public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
+/// Every mutation holds PersistenceCore's file lock across read, change and
+/// write, including mutations through another inbox instance.
+public actor SwiftNativeApprovalInbox {
     // Module-internal (not private) so `ApprovalInbox+InjectionSpend.swift`
     // can build the durable spend marker against the same root/persistence.
     let root: URL
-    let persistence = SwiftNativePersistenceCore()
-    /// Serializes mutating ops (resolve/archive) against actor reentrancy:
-    /// each new mutation chains after the prior one so two concurrent
-    /// resolve calls can't interleave their read→mutate→write sequence.
-    private var mutationTail: Task<Void, Never>? = nil
-
     /// These actions retain local-only flags regardless of caller input.
     /// A verified paired iPhone may decide them; Telegram may not.
     nonisolated static let hardLocalOnlyActions: Set<String> = [
@@ -567,7 +63,6 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         "backup_restore",
         "memory.update",
         "memory.delete",
-        "memory.consolidate",
         "memory.proposal.approve",
         "memory.proposal.reject",
         "improvement.promote",
@@ -577,15 +72,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         SwiftNativeApprovalInbox.procedureReviewApprovalAction,
         SwiftNativeApprovalInbox.procedureExactActivationApprovalAction,
     ]
-
-    /// Owner-review cards: the agent proposing a change to its own memory,
-    /// skills or upkeep, for the owner to say yes or no. User's ruling
-    /// (2026-09-25): he answers these from his paired phone too. They are
-    /// always remote-resolvable whatever the caller passed; a phone decision
-    /// still goes through the same pairing, signature and provenance checks as
-    /// a tool approval, and Telegram still cannot answer them (it needs a card
-    /// bound to its own chat). Nothing here widens permissions or autonomy —
-    /// those kinds stay in `hardLocalOnlyActions`.
+    /// Owner reviews always allow verified paired-phone decisions, never Telegram decisions.
     public nonisolated static let ownerReviewActions: Set<String> = [
         "self_improvement.apply",
         "skill.proposal",
@@ -594,63 +81,47 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         "care.life",
         "memory.repair",
         "memory.kind_backfill",
-        "memory.consolidation.swap",
         // User's own Install of a skill script, bound to its exact digest.
         SwiftNativeApprovalInbox.skillScriptInstallAction,
     ]
-
     /// - root: the canonical data root. The approvals
     ///   file lives at `<root>/workflows/approvals/requests.json`.
     public init(root: URL) {
         self.root = root
     }
-
     /// Canonical approval storage path.
-    public nonisolated var approvalsPath: URL {
-        root
-            .appendingPathComponent("workflows", isDirectory: true)
-            .appendingPathComponent("approvals", isDirectory: true)
-            .appendingPathComponent("requests.json")
-    }
-
+    public nonisolated var approvalsPath: URL { Self.approvalsPath(root: root) }
     /// Pending requests, read-only and without the lock, for a glance that
     /// must not wait; a file caught mid-write fails its check and throws.
     public nonisolated func pendingUnlocked() throws -> [ApprovalRecord] {
         try recordsUnlocked().filter { $0.status == "pending" }
     }
-
     public nonisolated func resolvedUnlocked() throws -> [ApprovalRecord] {
         try recordsUnlocked().filter { $0.status == "resolved" }
     }
-
     public nonisolated func recordsUnlocked() throws -> [ApprovalRecord] {
         try readContinuations(Self.loadApprovalRowsChecked(at: approvalsPath).compactMap(ApprovalRecord.init(json:)))
     }
-
     public func list(filter: ApprovalFilter) async throws -> [ApprovalRecord] {
-        let items = try await persistence.withFileLock(approvalsPath) { [approvalsPath] in
+        let items = try await SwiftNativePersistenceCore.withFileLock(approvalsPath) { [approvalsPath] in
             try Self.loadApprovalRowsChecked(at: approvalsPath)
         }
         // `loadApprovalRowsChecked` validates every row before returning, so
         // compactMap cannot hide a corrupt record as a shorter healthy queue.
         let records = try readContinuations(items.compactMap(ApprovalRecord.init(json:)))
         let sorted = records.sorted { lhs, rhs in
-            // Match Python's: sorted(..., key=lambda x: str(x.createdAt or ""), reverse=True).
+            // Newest saved creation timestamp first.
             lhs.createdAt > rhs.createdAt
         }
         return sorted.filter { record in
             if let s = filter.status, record.status != s { return false }
-            // P2-4: `mission.step` records written before 0.3.8 sit in
-            // approvals.jsonl forever and are never rewritten. Match through
-            // the vocabulary bridge so an old record answers a new-vocabulary
-            // filter and a new record answers an old-vocabulary one.
+            // Persisted and requested action names match through the same vocabulary.
             if let a = filter.action, !ExecutionEventVocabulary.matches(record.action, a) {
                 return false
             }
             return true
         }
     }
-
     public func get(_ id: String) async throws -> ApprovalRecord {
         let records = try await list(filter: .all)
         guard let match = records.first(where: { $0.id == id }) else {
@@ -658,47 +129,23 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         }
         return match
     }
-
     @discardableResult
     public func create(_ body: JSONValue) async throws -> ApprovalRecord {
-        let (record, expired) = try await runSerialized { [persistence, approvalsPath] in
-            try await Self._createImpl(
-                body: body,
-                persistence: persistence,
-                approvalsPath: approvalsPath,
-                now: Date()
-            )
-        }
-        ApprovalLifecycleBus.fire(.init(phase: .requested, record: record))
-        recordFiled(record, expired: expired)
-        return record
+        try await createOrTouchPending(body, matchesPending: { _ in false }).record
     }
-
-    /// User, 2026-09-06: match-or-create for a request that can be asked more
-    /// than once. `list` then `create` was two trips to the file with the lock
-    /// released in between, so two callers (or one caller re-asking while the
-    /// first write was in flight) both saw no match and both created a row —
-    /// the duplicate the dedup exists to prevent. Matching and creating now
-    /// happen in ONE locked pass. A matched pending row has its
-    /// `lastRequestedAt` stamped, so a surface can tell when the person was
-    /// last asked rather than only when the row was born.
-    ///
-    /// `matchesPending` is asked only about rows that are still pending, and
-    /// gets the row's payload. Returns the row and whether it was created.
+    /// Matches pending payloads or creates under one lock; matches stamp `lastRequestedAt`.
     @discardableResult
     public func createOrTouchPending(
         _ body: JSONValue,
         matchesPending: @escaping @Sendable (JSONValue) -> Bool
     ) async throws -> (record: ApprovalRecord, created: Bool) {
-        let outcome = try await runSerialized { [persistence, approvalsPath] in
-            try await Self._createOrTouchPendingImpl(
-                body: body,
-                matchesPending: matchesPending,
-                persistence: persistence,
-                approvalsPath: approvalsPath,
-                now: Date()
-            )
-        }
+        let outcome = try await Self._createOrTouchPendingImpl(
+            body: body,
+            lifeID: try DataRootLife.current(in: root),
+            matchesPending: matchesPending,
+            approvalsPath: approvalsPath,
+            now: Date()
+        )
         if outcome.created {
             ApprovalLifecycleBus.fire(.init(phase: .requested, record: outcome.record))
         }
@@ -706,13 +153,11 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         recordFiled(outcome.record, expired: outcome.expired)
         return (outcome.record, outcome.created)
     }
-
     /// Id-only birth keeps E0 records readable; cause and face append after it.
-    private static func filed(_ id: String) -> Experience {
+    static func filed(_ id: String) -> Experience {
         Experience(id: id, kind: .decision, evidence: [.init(source: "workflows/approvals/requests.json", id: id)],
                    addressedTo: ["person"], owes: ["decide": .init(to: "person")])
     }
-
     /// Recorded after the approvals lock is released. Cards this write aged out let theirs go.
     private func recordFiled(_ record: ApprovalRecord, expired: [ApprovalRecord]) {
         recordProjection(record)
@@ -721,7 +166,6 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             ApprovalLifecycleBus.fire(.init(phase: .resolved, record: expired))
         }
     }
-
     private func recordProjection(_ record: ApprovalRecord) {
         ExperienceStore.record(root, record.id) { store in
             try await Self.project(record, into: store)
@@ -744,7 +188,6 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             }
         }
     }
-
     /// The durable domain row is the decision's source, not its advisory copy.
     /// Reads are projections only; a failed experience write cannot hold a turn.
     public func decisionsForREM() async throws -> [String: Experience] {
@@ -758,7 +201,6 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         }
         return decisions
     }
-
     private static func project(_ record: ApprovalRecord, into store: ExperienceStore) async throws {
         let projection = record.decisionExperience
         try await store.begin(Self.filed(record.id))
@@ -773,9 +215,8 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         }
         try await store.append(changes, to: record.id)
     }
-
     /// Pending rows a capped write no longer holds as pending: aging is the only way out.
-    private static func expired(from before: [JSONValue], to after: [JSONValue]) -> [ApprovalRecord] {
+    static func expired(from before: [JSONValue], to after: [JSONValue]) -> [ApprovalRecord] {
         let pending = Set(after.compactMap { ApprovalRecord(json: $0) }.filter { $0.status == "pending" }.map(\.id))
         return before.compactMap { row in
             guard var record = ApprovalRecord(json: row), record.status == "pending",
@@ -784,15 +225,14 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             return record
         }
     }
-
     private static func _createOrTouchPendingImpl(
         body: JSONValue,
+        lifeID: String,
         matchesPending: @Sendable (JSONValue) -> Bool,
-        persistence: any PersistenceCoreProtocol,
         approvalsPath: URL,
         now: Date
     ) async throws -> (record: ApprovalRecord, created: Bool, expired: [ApprovalRecord]) {
-      return try await persistence.withFileLock(approvalsPath) {
+      return try await SwiftNativePersistenceCore.withFileLock(approvalsPath) {
         var items = try Self.loadApprovalRowsChecked(at: approvalsPath)
         let stamp = Self.isoTimestamp(now)
         for (idx, item) in items.enumerated() {
@@ -814,35 +254,16 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             }
             guard let touched = ApprovalRecord(json: .object(obj)) else { continue }
             items[idx] = .object(obj)
-            try await persistence.writeJSON(.array(items), to: approvalsPath)
+            try await SwiftNativePersistenceCore.writeJSON(.array(items), to: approvalsPath)
             return (touched, false, [])
         }
         let approval = try Self.makeApprovalRecord(body: body, now: now)
         items.insert(approval.toJSON(), at: 0)
-        let capped = try Self.cappedEvictingTerminalRows(items, cap: Self.storedApprovalCap, now: now)
-        try await persistence.writeJSON(.array(capped), to: approvalsPath)
+        let capped = try Self.cappedEvictingTerminalRows(items, cap: Self.storedApprovalCap, now: now, lifeID: lifeID)
+        try await SwiftNativePersistenceCore.writeJSON(.array(capped), to: approvalsPath)
         return (approval, true, Self.expired(from: items, to: capped))
       }
     }
-
-    /// Reentrancy-safe mutation gate: each mutating call wraps its work
-    /// in a Task and chains the next call behind the prior Task's value.
-    /// Because the read→mutate→write happens INSIDE the spawned Task and
-    /// the next caller awaits the prior Task before spawning its own,
-    /// two concurrent resolve() calls cannot interleave their IO.
-    private func runSerialized<T: Sendable>(
-        _ body: @Sendable @escaping () async throws -> T
-    ) async throws -> T {
-        let prior = mutationTail
-        let task = Task<T, Error> {
-            _ = await prior?.value  // wait for previous mutation to finish
-            return try await body()
-        }
-        // Erase to Void-returning Task for the tail chain.
-        mutationTail = Task { _ = try? await task.value }
-        return try await task.value
-    }
-
     /// Resolve with a typed authority origin. Remote authorization is checked
     /// against the same row generation inside the same file lock as the write.
     @discardableResult
@@ -852,27 +273,20 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         provenance: ApprovalResolutionProvenance
     ) async throws -> ApprovalRecord {
         let lifeID = try DataRootLife.current(in: root)
-        let record = try await runSerialized { [persistence, approvalsPath] in
-            return try await Self._resolveImpl(
-                id: id, decision: decision,
-                provenance: provenance,
-                lifeID: lifeID,
-                persistence: persistence,
-                approvalsPath: approvalsPath,
-                now: Date()
-            )
-        }
+        let record = try await Self._resolveImpl(
+            id: id, decision: decision,
+            provenance: provenance,
+            lifeID: lifeID,
+            approvalsPath: approvalsPath,
+            now: Date()
+        )
         ApprovalLifecycleBus.fire(.init(phase: .resolved, record: record))
         // The inbox holding the decision is the person's durable acceptance; the
         // birth goes first in case this resolver got there before the filer.
         recordProjection(record)
         return record
     }
-
-    /// User, 2026-09-06: the record's construction — id, clamped strings, and
-    /// the authority flags — lifted out of `_createImpl` unchanged so the
-    /// match-or-create path builds a row through EXACTLY this logic instead of
-    /// a second copy of it. Pure: no file IO, no lock.
+    /// Constructs every new record's ID, clamped strings and authority flags without file I/O.
     private static func makeApprovalRecord(body: JSONValue, now: Date) throws -> ApprovalRecord {
         // Validation cannot file an approval.
         if SkillRunContext.handsBack { throw SkillRunContext.HandBack("an approval") }
@@ -888,11 +302,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         } else {
             payload = .object([:])
         }
-        // A caller-provided human preview wins — stagers write readable
-        // previews like "[GROWTH.md] <lesson>", and unconditionally
-        // serializing the payload here made every rich card render raw JSON
-        // with \uXXXX escapes in the Approvals panel (User, 2026-07-03).
-        // Fallback stays the serialized payload for callers without one.
+        // A nonblank caller preview takes precedence over serialized payload.
         let rawPayloadPreview: String
         if case .string(let s)? = bodyObj["payloadPreview"],
            !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -962,44 +372,18 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             remoteResolvable: remoteResolvable,
             localOnly: localOnly
         )
-
         approval.cause = Experience.currentAct
         return approval
     }
-
-    private static func _createImpl(
-        body: JSONValue,
-        persistence: any PersistenceCoreProtocol,
-        approvalsPath: URL,
-        now: Date
-    ) async throws -> (ApprovalRecord, [ApprovalRecord]) {
-      let approval = try Self.makeApprovalRecord(body: body, now: now)
-      return try await persistence.withFileLock(approvalsPath) {
-        var items = try Self.loadApprovalRowsChecked(at: approvalsPath)
-        items.insert(approval.toJSON(), at: 0)
-        // 2026-09-06: the cap used to be `items.prefix(300)` — a positional
-        // truncation that dropped the OLDEST rows whatever their status, so
-        // creating approval 301 deleted approval 1 even while it was still
-        // pending and waiting on User. The cap now evicts terminal history
-        // (oldest first) and never a pending row; a store whose whole cap is
-        // pending work refuses the create instead of silently discarding a
-        // decision nobody made.
-        let capped = try Self.cappedEvictingTerminalRows(items, cap: Self.storedApprovalCap, now: now)
-        try await persistence.writeJSON(.array(capped), to: approvalsPath)
-        return (approval, Self.expired(from: items, to: capped))
-      }
-    }
-
     private static func _resolveImpl(
         id: String,
         decision: ApprovalDecision,
         provenance: ApprovalResolutionProvenance,
         lifeID: String,
-        persistence: any PersistenceCoreProtocol,
         approvalsPath: URL,
         now: Date
     ) async throws -> ApprovalRecord {
-      return try await persistence.withFileLock(approvalsPath) {
+      return try await SwiftNativePersistenceCore.withFileLock(approvalsPath) {
         let items = try Self.loadApprovalRowsChecked(at: approvalsPath)
         var mutated: [JSONValue] = items
         var resolvedRecord: ApprovalRecord?
@@ -1011,8 +395,7 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
                 if case .string(let s) = obj["status"] ?? .null { return s }
                 return ""
             }()
-            let terminal: Set<String> = ["resolved", "denied", "canceled", "orphaned"]
-            if terminal.contains(currentStatus) {
+            if Self.terminalApprovalStatuses.contains(currentStatus) {
                 throw ApprovalInboxError.alreadyResolved(id: id, status: currentStatus)
             }
             // All decisions share the resolved status; retain the outcome separately.
@@ -1022,6 +405,11 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
             obj["decidedBy"] = .string(provenance.decidedBy)
             obj["resolutionProvenance"] = provenance.toJSON()
             obj["chatContinuation"] = .object(["lifeID": .string(lifeID)])
+            if let record = ApprovalRecord(json: .object(obj)), !Self.hasChatReportingObligation(record) {
+                obj["chatContinuation"] = .object([
+                    "lifeID": .string(lifeID), "done": .bool(true), "settlement": .string("no_reporting")
+                ])
+            }
             mutated[idx] = .object(obj)
             guard let rec = ApprovalRecord(json: .object(obj)) else {
                 throw ApprovalInboxError.malformedResponse("could not re-parse mutated record")
@@ -1032,11 +420,10 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         guard let final = resolvedRecord else {
             throw ApprovalInboxError.notFound(id)
         }
-        try await persistence.writeJSON(.array(mutated), to: approvalsPath)
+        try await SwiftNativePersistenceCore.writeJSON(.array(mutated), to: approvalsPath)
         return final
       }
     }
-
     @discardableResult
     public func annotateExecution(
         _ id: String,
@@ -1044,35 +431,33 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         detail: String,
         result: JSONValue? = nil
     ) async throws -> ApprovalRecord {
-        let record = try await runSerialized { [persistence, approvalsPath] in
-            try await persistence.withFileLock(approvalsPath) {
-                let items = try Self.loadApprovalRowsChecked(at: approvalsPath)
-                var mutated = items
-                var annotated: ApprovalRecord?
-                for (index, item) in items.enumerated() {
-                    guard case .object(var object) = item,
-                          object["id"] == .string(id) else { continue }
-                    object["executedAction"] = executedAction
-                    object["detail"] = .string(detail)
-                    guard let record = ApprovalRecord(json: .object(object)) else {
-                        throw ApprovalInboxError.malformedResponse(
-                            "could not re-parse annotated approval record"
-                        )
-                    }
-                    if await ApprovalLifecycleBus.shared.awaitsHostReply(record) {
-                        var state: [String: JSONValue] = if case .object(let saved)? = object["chatContinuation"] { saved } else { [:] }
-                        state["done"] = .bool(true)
-                        state["settlement"] = .string("host_reply")
-                        object["chatContinuation"] = .object(state)
-                    }
-                    mutated[index] = .object(object)
-                    annotated = record
-                    break
+        let record = try await SwiftNativePersistenceCore.withFileLock(approvalsPath) { [approvalsPath] in
+            let items = try Self.loadApprovalRowsChecked(at: approvalsPath)
+            var mutated = items
+            var annotated: ApprovalRecord?
+            for (index, item) in items.enumerated() {
+                guard case .object(var object) = item,
+                      object["id"] == .string(id) else { continue }
+                object["executedAction"] = executedAction
+                object["detail"] = .string(detail)
+                guard let record = ApprovalRecord(json: .object(object)) else {
+                    throw ApprovalInboxError.malformedResponse(
+                        "could not re-parse annotated approval record"
+                    )
                 }
-                guard let annotated else { throw ApprovalInboxError.notFound(id) }
-                try await persistence.writeJSON(.array(mutated), to: approvalsPath)
-                return annotated
+                if await ApprovalLifecycleBus.shared.awaitsHostReply(record) {
+                    var state: [String: JSONValue] = if case .object(let saved)? = object["chatContinuation"] { saved } else { [:] }
+                    state["done"] = .bool(true)
+                    state["settlement"] = .string("host_reply")
+                    object["chatContinuation"] = .object(state)
+                }
+                mutated[index] = .object(object)
+                annotated = ApprovalRecord(json: .object(object))
+                break
             }
+            guard let annotated else { throw ApprovalInboxError.notFound(id) }
+            try await SwiftNativePersistenceCore.writeJSON(.array(mutated), to: approvalsPath)
+            return annotated
         }
         let settled = try readContinuations([record])[0]
         await ApprovalLifecycleBus.shared.publish(.init(phase: .executed, record: settled,
@@ -1080,591 +465,8 @@ public actor SwiftNativeApprovalInbox: ApprovalInboxProtocol {
         recordProjection(settled)
         return settled
     }
-
     /// Claim or complete the reporting turn independently of deletable chat history.
     /// Execution annotations may heal an outcome without replacing this state.
-    public func annotateChatContinuation(
-        _ id: String, done: Bool, legacyStartedAt: String? = nil,
-        clearQueuedDelivery: Bool = false, settlement: String? = nil,
-        assistantDelivery: JSONValue? = nil
-    ) async throws -> Bool {
-        let now = Date()
-        return try await updateChatContinuation(id) { record, state in
-            if let assistantDelivery {
-                guard state["done"] != .bool(true) else { return false }
-                state["assistantDelivery"] = assistantDelivery
-                return true
-            }
-            if done {
-                guard state["done"] != .bool(true) else { return false }
-                state["done"] = .bool(true)
-                if let settlement { state["settlement"] = .string(settlement) }
-                state["delivery"] = nil
-                return true
-            }
-            guard Self.continuationIsPending(record, now: now),
-                  state["done"] == nil, state["started"] == nil else { return false }
-            state["started"] = .string(legacyStartedAt ?? Self.isoTimestamp(now))
-            if clearQueuedDelivery { state["delivery"] = nil }
-            return true
-        } && (done || legacyStartedAt == nil)
-    }
-
-    /// The current-life approval owns its queued delivery until the turn starts.
-    public func queueChatContinuation(_ id: String, delivery: JSONValue) async throws -> Bool {
-        let now = Date()
-        return try await updateChatContinuation(id) { record, state in
-            guard Self.continuationIsPending(record, now: now),
-                  state["done"] == nil, state["started"] == nil else { return false }
-            state["delivery"] = delivery
-            return true
-        }
-    }
-
-    /// A queued delivery remains owed across downtime; age only bounds records
-    /// without that durable evidence. Started and completed claims never replay.
-    public nonisolated static func continuationIsPending(_ record: ApprovalRecord, now: Date = Date()) -> Bool {
-        guard record.status == "resolved", record.decision != nil else { return false }
-        if let saved = record.chatContinuation {
-            guard case .object(let state) = saved,
-                  state["started"] == nil, state["done"] == nil else { return false }
-            if case .object? = state["delivery"] { return true }
-        }
-        guard let date = record.resolvedAt.flatMap(NativeTimestampFormat.parseISO8601) else { return false }
-        return (0...600).contains(now.timeIntervalSince(date))
-    }
-
-    /// Retain the destination before delivery, then mark it delivered only
-    /// after its idempotent transcript write. An unfinished claim resumes at
-    /// the same destination; an old claim without delivery evidence does too.
-    public func claimChatCard(
-        _ id: String, card: JSONValue,
-        deliver: @escaping @Sendable (ApprovalRecord) async throws -> Void
-    ) async throws -> ApprovalRecord? {
-        try await runSerialized { [persistence, approvalsPath] in
-            try await persistence.withFileLock(approvalsPath) {
-                var items = try Self.loadApprovalRowsChecked(at: approvalsPath)
-                guard let index = items.firstIndex(where: {
-                    guard case .object(let object) = $0 else { return false }
-                    return object["id"] == .string(id)
-                }), case .object(var object) = items[index],
-                    object["status"] == .string("pending") else { return nil }
-                // A Telegram mark (`markChatCard`) may come first; the
-                // destination joins it.
-                var current: [String: JSONValue] = [:]
-                if case .object(let saved)? = object["chatCard"] { current = saved }
-                if current["sessionId"] == nil, case .object(let fresh) = card {
-                    object["chatCard"] = .object(current.merging(fresh) { kept, _ in kept })
-                    items[index] = .object(object)
-                    try await persistence.writeJSON(.array(items), to: approvalsPath)
-                }
-                guard case .object(var savedCard)? = object["chatCard"],
-                      savedCard["delivered"] != .bool(true),
-                      let claimed = ApprovalRecord(json: .object(object)) else { return nil }
-                try await deliver(claimed)
-                savedCard["delivered"] = .bool(true)
-                object["chatCard"] = .object(savedCard)
-                items[index] = .object(object)
-                try await persistence.writeJSON(.array(items), to: approvalsPath)
-                return ApprovalRecord(json: .object(object))
-            }
-        }
-    }
-
-    /// Merge delivery receipts even if the approval was resolved while its
-    /// Telegram send was in flight. A decision does not erase what was sent.
-    public func markChatCard(_ id: String, _ fields: [String: JSONValue]) async throws {
-        try await runSerialized { [persistence, approvalsPath] in
-            try await persistence.withFileLock(approvalsPath) {
-                var items = try Self.loadApprovalRowsChecked(at: approvalsPath)
-                guard let index = items.firstIndex(where: {
-                    guard case .object(let object) = $0 else { return false }
-                    return object["id"] == .string(id)
-                }), case .object(var object) = items[index] else { return }
-                var card: [String: JSONValue] = [:]
-                if case .object(let saved)? = object["chatCard"] { card = saved }
-                object["chatCard"] = .object(card.merging(fields) { _, new in new })
-                items[index] = .object(object)
-                try await persistence.writeJSON(.array(items), to: approvalsPath)
-            }
-        }
-    }
-
-    private func updateChatContinuation(
-        _ id: String,
-        update: @escaping @Sendable (ApprovalRecord, inout [String: JSONValue]) -> Bool
-    ) async throws -> Bool {
-        let lifeID = try DataRootLife.current(in: root)
-        return try await runSerialized { [persistence, approvalsPath] in
-            try await persistence.withFileLock(approvalsPath) {
-                var items = try Self.loadApprovalRowsChecked(at: approvalsPath)
-                guard let index = items.firstIndex(where: {
-                    guard case .object(let object) = $0 else { return false }
-                    return object["id"] == .string(id)
-                }), case .object(var object) = items[index],
-                    let record = ApprovalRecord(json: items[index]) else {
-                    throw ApprovalInboxError.notFound(id)
-                }
-                guard record.status == "resolved", record.decision != nil else { return false }
-                var state: [String: JSONValue] = [:]
-                if let saved = object["chatContinuation"] {
-                    guard case .object(let value) = saved else { return false }
-                    state = value
-                }
-                let read = Self.readContinuation(state, lifeID: lifeID)
-                if read != state {
-                    object["chatContinuation"] = .object(read)
-                    items[index] = .object(object)
-                    try await persistence.writeJSON(.array(items), to: approvalsPath)
-                    return false
-                }
-                guard update(record, &state) else { return false }
-                object["chatContinuation"] = .object(state)
-                items[index] = .object(object)
-                try await persistence.writeJSON(.array(items), to: approvalsPath)
-                return true
-            }
-        }
-    }
-
-    private nonisolated func readContinuations(_ records: [ApprovalRecord]) throws -> [ApprovalRecord] {
-        let lifeID = try DataRootLife.current(in: root)
-        return records.map { original in
-            var record = original
-            if record.status == "resolved" {
-                let state: [String: JSONValue] = if case .object(let saved)? = record.chatContinuation { saved } else { [:] }
-                record.chatContinuation = .object(Self.readContinuation(state, lifeID: lifeID))
-                if record.decision == "approved", record.executedAction == nil, DataRootLife.life(of: state["lifeID"]) != lifeID {
-                    record.executedAction = .object(["status": .string("stopped"), "reason": .string(DataRootLife.stoppedReason)])
-                }
-            }
-            return record
-        }
-    }
-
-    private nonisolated static func readContinuation(_ original: [String: JSONValue], lifeID: String) -> [String: JSONValue] {
-        guard original["done"] != .bool(true), DataRootLife.life(of: original["lifeID"]) != lifeID else { return original }
-        var state = original
-        state["done"] = .bool(true)
-        state["status"] = .string("stopped")
-        state["reason"] = .string(DataRootLife.stoppedReason)
-        return state
-    }
-
-    // MARK: - Helpers
-
-    /// The most rows `requests.json` keeps. Terminal rows above it are the
-    /// store's settled history and are evictable; pending work is not.
-    public static let storedApprovalCap = 300
-
-    /// The statuses a row can be in once it is no longer waiting on anyone.
-    static let terminalApprovalStatuses: Set<String> = [
-        "resolved", "denied", "canceled", "orphaned",
-    ]
-
-    /// How long an unanswered card holds its place in a full queue.
-    static let pendingApprovalTimeout: TimeInterval = 24 * 3600
-
-    /// Rewrite pending rows nobody has answered within `pendingApprovalTimeout`
-    /// to `orphaned`. Newest-first order and every other field are preserved.
-    nonisolated static func agingStalePendingRows(
-        _ items: [JSONValue],
-        now: Date
-    ) -> [JSONValue] {
-        // ISO-8601 lexicographic compare: every writer here
-        // emits the same fractional `+00:00` shape.
-        let cutoff = isoTimestamp(now.addingTimeInterval(-pendingApprovalTimeout))
-        return items.map { item in
-            guard case .object(var object) = item,
-                  case .string("pending")? = object["status"] else { return item }
-            // A re-asked card is stamped `lastRequestedAt`; the clock runs from
-            // the last time the agent actually wanted the answer.
-            let stamp: String = {
-                if case .string(let value)? = object["lastRequestedAt"] { return value }
-                if case .string(let value)? = object["createdAt"] { return value }
-                return ""
-            }()
-            guard !stamp.isEmpty, stamp < cutoff else { return item }
-            object["status"] = .string("orphaned")
-            return .object(object)
-        }
-    }
-
-    /// 2026-09-06: trim `items` (newest-first) to `cap` by dropping TERMINAL
-    /// rows, oldest first. A pending row is never evicted — it is a decision
-    /// User has not made yet, and deleting it loses the request outright.
-    /// Continuation claims and queued deliveries remain until completed.
-    /// Throws `.queueFull` when there is no settled terminal row left to drop.
-    ///
-    /// 2026-09-17: a pending row was also never evictable AND never expired, so
-    /// 300 cards nobody answered filled the store for good and every later
-    /// create threw `.queueFull` — the agent could no longer ask anything at
-    /// all. Pending rows older than `pendingApprovalTimeout` are aged to
-    /// `orphaned` first: a card nobody has answered in a day is not a decision
-    /// in progress, and `orphaned` is the store's existing "no longer waiting
-    /// on anyone" status, so the row and its payload stay readable. The aging
-    /// runs only once the cap is actually reached — under it, a pending card
-    /// waits as long as the person needs.
-    nonisolated static func cappedEvictingTerminalRows(
-        _ items: [JSONValue],
-        cap: Int,
-        now: Date
-    ) throws -> [JSONValue] {
-        var overflow = items.count - cap
-        guard overflow > 0 else { return items }
-        let items = agingStalePendingRows(items, now: now)
-        var dropped = Set<Int>()
-        // The array is newest-first, so the oldest candidates are at the end.
-        for index in stride(from: items.count - 1, through: 0, by: -1) {
-            guard overflow > 0 else { break }
-            guard case .object(let object) = items[index],
-                  case .string(let status)? = object["status"],
-                  terminalApprovalStatuses.contains(status) else { continue }
-            // Approval precedes execution. Denied and canceled decisions have
-            // no executor outcome to await, but may still owe a reporting turn.
-            if status == "resolved", object["decision"] == .string("approved"),
-               object["executedAction"] == nil || object["executedAction"] == .null {
-                continue
-            }
-            // A resolved decision is not settled while its reporting turn is
-            // unclaimed, queued or in flight. Durable state does not age out.
-            if let saved = object["chatContinuation"] {
-                guard case .object(let state) = saved,
-                      state["done"] == .bool(true) else { continue }
-            }
-            if let record = ApprovalRecord(json: items[index]),
-               continuationIsPending(record, now: now) {
-                continue
-            }
-            dropped.insert(index)
-            overflow -= 1
-        }
-        guard overflow == 0 else {
-            throw ApprovalInboxError.queueFull(pending: items.count - dropped.count, cap: cap)
-        }
-        return items.enumerated()
-            .filter { !dropped.contains($0.offset) }
-            .map(\.element)
-    }
-
-    /// Strict authoritative-store read used by every approval read/mutation.
-    /// A missing file is the one legitimate empty queue. Once the file exists,
-    /// unreadable bytes, malformed JSON, the wrong top-level shape, or even one
-    /// malformed row make the whole queue unavailable. In particular, mutation
-    /// callers must never turn damaged state into `[]` and overwrite pending
-    /// approvals with a newly created record.
-    public nonisolated static func loadApprovalRowsChecked(at path: URL) throws -> [JSONValue] {
-        let fileManager = FileManager.default
-        guard fileManager.fileExists(atPath: path.path) else { return [] }
-
-        let data: Data
-        do {
-            data = try Data(contentsOf: path)
-        } catch {
-            throw ApprovalInboxError.unavailable(
-                underlying: "approval store unreadable: \(error.localizedDescription)"
-            )
-        }
-
-        let raw: JSONValue
-        do {
-            raw = try JSONValue.parse(data)
-        } catch {
-            throw ApprovalInboxError.malformedResponse(
-                "approval store contains malformed JSON: \(error.localizedDescription)"
-            )
-        }
-        guard case .array(let items) = raw else {
-            throw ApprovalInboxError.malformedResponse(
-                "approval store is not a JSON array"
-            )
-        }
-        try validateApprovalRows(items)
-        return items
-    }
-
-    /// 2026-09-06: the row-shape half of `loadApprovalRowsChecked`, extracted so
-    /// a caller that MERGES rows into this file can prove the merged array is
-    /// still readable before it writes — a merge that lands a row this check
-    /// rejects takes the whole queue offline for every reader.
-    public nonisolated static func validateApprovalRows(_ items: [JSONValue]) throws {
-        var ids = Set<String>()
-        for (index, item) in items.enumerated() {
-            guard case .object(let object) = item,
-                  let record = ApprovalRecord(json: item) else {
-                throw ApprovalInboxError.malformedResponse(
-                    "approval store row \(index) is not a valid approval record"
-                )
-            }
-            guard ids.insert(record.id).inserted else {
-                throw ApprovalInboxError.malformedResponse(
-                    "approval store contains duplicate id \(record.id)"
-                )
-            }
-            let validStatuses: Set<String> = [
-                "pending", "resolved", "denied", "canceled", "orphaned",
-            ]
-            guard validStatuses.contains(record.status) else {
-                throw ApprovalInboxError.malformedResponse(
-                    "approval store row \(index) has invalid status"
-                )
-            }
-            // Retired writers emitted explicit null authority fields on
-            // terminal history. Those rows can no longer grant authority and
-            // remain safe to read; pending rows below still require two exact
-            // booleans. Wrong-typed non-null values remain store corruption.
-            for key in ["remoteResolvable", "localOnly"] {
-                guard let value = object[key], value != .null else { continue }
-                guard case .bool = value else {
-                    throw ApprovalInboxError.malformedResponse(
-                        "approval store row \(index) has non-boolean \(key)"
-                    )
-                }
-            }
-            if record.status == "pending" {
-                guard case .string(let title)? = object["title"], !title.isEmpty,
-                      case .string(let action)? = object["action"], !action.isEmpty,
-                      case .string? = object["risk"],
-                      case .string? = object["reason"],
-                      case .object? = object["payload"],
-                      case .string? = object["payloadPreview"],
-                      case .string(let createdAt)? = object["createdAt"], !createdAt.isEmpty else {
-                    throw ApprovalInboxError.malformedResponse(
-                        "pending approval row \(index) lacks required typed fields"
-                    )
-                }
-                guard case .bool? = object["remoteResolvable"],
-                      case .bool? = object["localOnly"] else {
-                    throw ApprovalInboxError.malformedResponse(
-                        "pending approval row \(index) lacks authority fields"
-                    )
-                }
-                guard object["decision"] == .null, object["resolvedAt"] == .null else {
-                    throw ApprovalInboxError.malformedResponse(
-                        "pending approval row \(index) carries terminal decision state"
-                    )
-                }
-                if Self.hardLocalOnlyActions.contains(record.action),
-                   (record.remoteResolvable || !record.localOnly) {
-                    throw ApprovalInboxError.malformedResponse(
-                        "pending approval row \(index) widens a local-only action"
-                    )
-                }
-            }
-            if record.status == "pending", record.localOnly != !record.remoteResolvable {
-                throw ApprovalInboxError.malformedResponse(
-                    "approval store row \(index) has conflicting authority fields"
-                )
-            }
-            let decidedByPresent = object["decidedBy"] != nil
-            let provenancePresent = object["resolutionProvenance"] != nil
-            guard decidedByPresent == provenancePresent else {
-                throw ApprovalInboxError.malformedResponse(
-                    "approval store row \(index) has incomplete resolution provenance"
-                )
-            }
-            if provenancePresent {
-                guard let provenance = record.resolutionProvenance,
-                      record.decidedBy == provenance.decidedBy else {
-                    throw ApprovalInboxError.malformedResponse(
-                        "approval store row \(index) has malformed resolution provenance"
-                    )
-                }
-            }
-        }
-    }
-
-    private nonisolated static func validateResolutionAuthority(
-        _ provenance: ApprovalResolutionProvenance,
-        row: [String: JSONValue],
-        id: String
-    ) throws {
-        guard let record = ApprovalRecord(json: .object(row)) else {
-            throw ApprovalInboxError.malformedResponse("approval row is malformed")
-        }
-        guard !provenance.decidedBy.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw ApprovalInboxError.resolutionNotAuthorized(
-                id: id, reason: "decision provenance has no actor"
-            )
-        }
-        if case .telegram = provenance, record.requiresExecutableReview {
-            throw ApprovalInboxError.resolutionNotAuthorized(
-                id: id, reason: "Review and approve the exact code on the Mac or paired phone; Telegram cannot show the whole review."
-            )
-        }
-        if case .signedIOS(let clientID, _) = provenance {
-            guard !clientID.isEmpty else {
-                throw ApprovalInboxError.resolutionNotAuthorized(
-                    id: id, reason: "signed iOS provenance has no client identity"
-                )
-            }
-            // MacSyncActionRouter verifies the per-device signature and pairing.
-            // User may answer any request from that phone, whoever raised it;
-            // Agent alone decides her studio canon.
-            guard !record.isAgentsOwnDecision else {
-                throw ApprovalInboxError.resolutionNotAuthorized(
-                    id: id, reason: "The agent decides her own studio canon."
-                )
-            }
-            return
-        }
-        // The card posted into User's own Telegram DM (`ApprovalChatCards`):
-        // a private chat's id IS its one user's id, so the binding is the
-        // chat and that person both. User, 10-07: that DM is User, with the
-        // signed phone's authority, local-only included.
-        if case .telegram(let chatID, let userID) = provenance, !chatID.isEmpty, chatID == userID,
-           case .object(let card)? = row["chatCard"], card["telegramChatId"] == .string(chatID) {
-            guard !record.isAgentsOwnDecision else {
-                throw ApprovalInboxError.resolutionNotAuthorized(
-                    id: id, reason: "The agent decides her own studio canon."
-                )
-            }
-            return
-        }
-        if provenance.isRemote {
-            guard record.remoteResolvable, !record.localOnly else {
-                throw ApprovalInboxError.resolutionNotAuthorized(
-                    id: id, reason: "approval is local-only"
-                )
-            }
-        }
-        guard case .telegram(let chatID, let userID) = provenance else { return }
-        guard !chatID.isEmpty, !userID.isEmpty else {
-            throw ApprovalInboxError.resolutionNotAuthorized(
-                id: id, reason: "Telegram transport identity is incomplete"
-            )
-        }
-        guard case .object(let payload) = record.payload,
-              case .object(let telegram)? = payload["telegram"],
-              telegram["chatId"] == .string(chatID),
-              case .object(let origin)? = payload["origin"],
-              origin["userId"] == .string(userID) else {
-            throw ApprovalInboxError.resolutionNotAuthorized(
-                id: id, reason: "Telegram transport identity does not match approval origin"
-            )
-        }
-    }
-
-    private nonisolated static func strip(_ value: String) -> String {
-        value.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private nonisolated static func codepointPrefix(_ value: String, _ n: Int) -> String {
-        let scalars = value.unicodeScalars
-        if scalars.count <= n { return value }
-        return String(String.UnicodeScalarView(scalars.prefix(n)))
-    }
-
-    private nonisolated static func pyStr(_ value: JSONValue?, fallback: String) -> String {
-        guard let value else { return fallback }
-        switch value {
-        case .null: return fallback
-        case .string(let s): return s
-        case .bool(let b): return b ? "True" : "False"
-        case .int(let i): return String(i)
-        case .double(let d): return String(d)
-        case .array, .object: return ""
-        }
-    }
-
-    /// STRICT JSON bool parse for authority fields. This returns nil for
-    /// ANYTHING that is not a literal JSON `true`/`false` — no string coercion,
-    /// no numeric coercion. Callers of authority fields treat nil as
-    /// "undeclared" and fall back to the fail-CLOSED default.
-    nonisolated static func strictBool(_ value: JSONValue?) -> Bool? {
-        guard case .bool(let b)? = value else { return nil }
-        return b
-    }
-
-    /// Actions declared REMOTE-SAFE: an approval for one of these may be
-    /// resolved from a remote surface (iCloud/Telegram/chat) even when the
-    /// creating caller did not pass an explicit `remoteResolvable` boolean.
-    /// Everything NOT listed here (and not carrying an explicit `true`) fails
-    /// closed to local-only. Keep this list minimal and justified — adding an
-    /// entry widens who can approve that action.
-    ///
-    /// Workflow step gates live here because "the run is parked waiting on
-    /// you" is exactly the case a phone approval exists for, and the action
-    /// was remotely resolvable before the fail-closed flip (behavior preserved
-    /// deliberately, not by accident).
-    nonisolated static let remoteSafeActions: Set<String> = [
-        "workflow_step",
-    ]
-
-    /// Matches Python's `now_iso()` shape: an ISO-8601 string with
-    /// fractional seconds and a `+00:00` offset.
-    nonisolated static func isoTimestamp(_ date: Date) -> String {
-        NativeTimestampFormat.fractionalUTCOffset(date)
-    }
-
-    /// One-time legacy merge under the canonical owner's mutation lock.
-    /// Canonical wins on conflicts. Renaming the source completes the import;
-    /// its absence prevents retention-evicted rows from being re-imported.
-    /// The .migrated archive preserves the completed import's source bytes.
-    public func mergeLegacyApprovalRows() async throws {
-        let legacyPath = root
-            .appendingPathComponent("approvals", isDirectory: true)
-            .appendingPathComponent("requests.json")
-        guard FileManager.default.fileExists(atPath: legacyPath.path) else { return }
-        try await runSerialized { [persistence, approvalsPath] in
-            try await persistence.withFileLock(approvalsPath) {
-                try Self.mergeLegacyRowsLocked(
-                    legacyPath: legacyPath,
-                    canonicalPath: approvalsPath
-                )
-            }
-        }
-    }
-
-    /// The merge itself. Caller holds the approvals lock.
-    private nonisolated static func mergeLegacyRowsLocked(
-        legacyPath: URL,
-        canonicalPath: URL
-    ) throws {
-        let legacyRows: [JSONValue] = {
-            guard let data = try? Data(contentsOf: legacyPath),
-                  let parsed = try? JSONValue.parse(data),
-                  case .array(let rows) = parsed else { return [] }
-            return rows
-        }()
-        if !legacyRows.isEmpty {
-            var merged = try Self.loadApprovalRowsChecked(at: canonicalPath)
-            func rowKey(_ value: JSONValue) -> String? {
-                guard case .object(let object) = value else { return nil }
-                let execution: String? = {
-                    if case .string(let s) = object["executionId"] ?? object["execution_id"]
-                        ?? object["missionId"] ?? object["mission_id"] ?? .null { return s }
-                    return nil
-                }()
-                let step: String? = {
-                    if case .string(let s) = object["stepId"] ?? object["step_id"]
-                        ?? object["id"] ?? .null { return s }
-                    return nil
-                }()
-                guard let execution, let step else { return nil }
-                return "\(execution)#\(step)"
-            }
-            let existing = Set(merged.compactMap(rowKey))
-            var appended = false
-            for row in legacyRows where rowKey(row).map({ !existing.contains($0) }) == true {
-                merged.append(row)
-                appended = true
-            }
-            if appended {
-                try Self.validateApprovalRows(merged)
-                let data = try JSONValue.array(merged).serialize(pretty: false)
-                try Data(data.utf8).write(to: canonicalPath, options: [.atomic])
-            }
-        }
-        let migratedPath = legacyPath
-            .deletingLastPathComponent()
-            .appendingPathComponent("requests.json.migrated")
-        try? FileManager.default.removeItem(at: migratedPath)
-        try? FileManager.default.moveItem(at: legacyPath, to: migratedPath)
-    }
-
-    // MARK: - Data root resolution (delegated to PersistenceCore)
-
     /// Approval storage uses PersistenceCore's canonical data root.
     public nonisolated static func defaultDataRoot() -> URL {
         PersistenceCore.defaultDataRoot()

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Transcripts
@@ -15,13 +16,6 @@ public enum OutcomeEvidenceState: String, Codable, Sendable, Equatable, CaseIter
     case unknown
     case censored
     case notApplicable = "not_applicable"
-}
-
-/// Optional immutable intervention binding. Production leaves this nil. A
-/// controlled harness may bind one before entering the real reducer/turn code;
-/// attaching an assignment after observing the outcome is not supported.
-public enum OutcomeInterventionContext {
-    @TaskLocal public static var assignment: CausalInterventionAssignment?
 }
 
 public struct ResponseOutcomeToolReference: Codable, Sendable, Equatable {
@@ -88,7 +82,7 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
     public let turnElapsedMs: Int?
     public let tools: [ResponseOutcomeToolReference]
     public let motorActions: [ResponseOutcomeMotorReference]
-    public let dimensionStates: [String: OutcomeEvidenceState]
+    public private(set) var dimensionStates: [String: OutcomeEvidenceState]
     public let interventionAssignment: CausalInterventionAssignment?
 
     public init(
@@ -129,7 +123,7 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
     }
 
     public var jsonValue: JSONValue {
-        (try? JSONValue.parse(JSONEncoder().encode(self))) ?? .null
+        (try? JSONValue.fromEncodable(self)) ?? .null
     }
 
     public init?(jsonValue: JSONValue) {
@@ -159,26 +153,9 @@ public struct ResponseOutcomeObservationV2: Codable, Sendable, Equatable {
     }
 
     func promotingReactionEvidence() -> Self {
-        var states = dimensionStates
-        states["reaction"] = .observed
-        return Self(
-            turnID: turnID,
-            messageID: messageID,
-            sessionID: sessionID,
-            surface: surface,
-            observedAt: observedAt,
-            responsePersistence: responsePersistence,
-            contextGenerationID: contextGenerationID,
-            contextSelectionReceiptID: contextSelectionReceiptID,
-            providerID: providerID,
-            providerModel: providerModel,
-            reasoningEffort: reasoningEffort,
-            turnElapsedMs: turnElapsedMs,
-            tools: tools,
-            motorActions: motorActions,
-            dimensionStates: states,
-            interventionAssignment: interventionAssignment
-        )
+        var copy = self
+        copy.dimensionStates["reaction"] = .observed
+        return copy
     }
 
     package static func aggregateMotorEvidence(
@@ -468,9 +445,6 @@ public struct OutcomeDimensionStatePopulationReader: Sendable {
         var bytesRead = 0
         var filesRead = 0
         var truncated = candidateCount > candidates.count
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let whole = ISO8601DateFormatter()
         for (url, _) in candidates {
             guard bytesRead < Self.maximumPopulationBytes else {
                 truncated = true
@@ -492,8 +466,7 @@ public struct OutcomeDimensionStatePopulationReader: Sendable {
             let messages = result.messages
             for (index, message) in messages.enumerated() where message.role == "assistant" {
                 if let since {
-                    let timestamp = fractional.date(from: message.timestamp)
-                        ?? whole.date(from: message.timestamp)
+                    let timestamp = NativeTimestampFormat.parseISO8601FractionalFirst(message.timestamp)
                     guard let timestamp, timestamp >= since else { continue }
                 }
                 guard case .object(let row)? = message.extras,
@@ -503,16 +476,18 @@ public struct OutcomeDimensionStatePopulationReader: Sendable {
                     continue
                 }
                 let observation = ResponseOutcomeObservationV2(jsonValue: raw)
+                // Historical adjacency proves continuation, never sentiment; reads manufacture no feedback records.
                 if let observation,
                    reactionKeys.contains(OutcomeReactionEvidenceKey(
                     sessionID: observation.sessionID,
                     messageID: observation.messageID,
                     turnID: observation.turnID
-                   )) || Self.hasCanonicalContinuation(
-                    after: index,
-                    in: messages,
-                    anchoredTo: observation
-                   ) {
+                   )) || (messages.indices.contains(index + 1)
+                    && messages[index + 1].role == "user"
+                    && OutcomeFeedbackStore.hasCanonicalContinuation(
+                        assistant: row, reaction: messages[index + 1].extras ?? .null,
+                        precedingRows: messages[..<index].reversed().lazy.map { $0.extras ?? .null },
+                        sessionID: observation.sessionID)) {
                     population.add(observation.promotingReactionEvidence())
                 } else {
                     population.add(observation)
@@ -525,38 +500,5 @@ public struct OutcomeDimensionStatePopulationReader: Sendable {
                 ? "Outcome population is incomplete: read \(filesRead) of \(candidateCount) candidate transcripts within file, row and byte limits; unreadable or malformed rows are excluded."
                 : nil
         )
-    }
-
-    /// Read-side migration for outcomes written before continuation receipts
-    /// existed. An immediately following durable user row in the same
-    /// canonical transcript proves only that the conversation continued; it
-    /// does not infer sentiment or whether the answer was good. This gives
-    /// historical outcome health an honest eligible cohort without rewriting
-    /// old transcripts or manufacturing feedback events.
-    private static func hasCanonicalContinuation(
-        after assistantIndex: Int,
-        in messages: [ChatMessage],
-        anchoredTo observation: ResponseOutcomeObservationV2
-    ) -> Bool {
-        let nextIndex = assistantIndex + 1
-        guard messages.indices.contains(assistantIndex),
-              messages.indices.contains(nextIndex) else { return false }
-        let next = messages[nextIndex]
-        guard next.role == "user",
-              case .object(let assistantRow)? = messages[assistantIndex].extras,
-              assistantRow["role"] == .string("assistant"),
-              assistantRow["sessionId"] == .string(observation.sessionID),
-              case .string(let assistantRunID)? = assistantRow["runId"],
-              OutcomeFeedbackStore.hasOriginatingRequest(
-                in: messages[..<assistantIndex].reversed().lazy.map { $0.extras ?? .null },
-                sessionID: observation.sessionID, runID: assistantRunID),
-              case .object(let row)? = next.extras,
-              row["role"] == .string("user"),
-              row["sessionId"] == .string(observation.sessionID),
-              case .string(let reactionMessageID)? = row["id"],
-              OutcomeTraceIdentity.normalized(reactionMessageID) != nil else {
-            return false
-        }
-        return true
     }
 }

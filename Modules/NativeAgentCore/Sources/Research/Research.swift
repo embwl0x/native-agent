@@ -2,7 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `Research.swift` | `SwiftNativeResearchClient` and research values: SearXNG discovery/search, fetched-source receipts and persisted lab run contracts |
+// Blueprint: | `Research.swift` | `SwiftNativeResearchClient` and research values: SearXNG discovery/search, fetched-source receipts, classified DNS/refused-connection/timeout causes and persisted lab run contracts |
 
 // MARK: - Research
 //
@@ -14,7 +14,7 @@ import PersistenceCore
 
 public struct SearXNGCandidate: Sendable, Equatable {
     public let source: String   // "common-port" | "docker"
-    public let baseURL: String  // already rstripped of trailing "/"
+    public let baseURL: String  // no trailing "/"
 
     public init(source: String, baseURL: String) {
         self.source = source
@@ -64,9 +64,7 @@ public struct SearXNGAutodetectResult: Sendable, Equatable {
         self.error = error
     }
 
-    /// JSON-serializable shape (matches Python's autodetect_searxng return
-    /// dict byte-for-byte: keys `found`, `baseURL`, `source`, `error` with
-    /// nullable strings).
+    /// `baseURL`, `source` and `error` serialize as null when absent.
     public func toJSON() -> JSONValue {
         var obj: [String: JSONValue] = [:]
         obj["found"] = .bool(found)
@@ -91,10 +89,8 @@ public struct ResearchSearchResult: Identifiable, Sendable, Hashable, Codable {
         self.source = source
     }
 
-    /// Mirrors Python's per-item dict: `{title, url, snippet, source}`.
-    /// `source` is comma-joined `engines` when that key is a list, else the
-    /// scalar `engine` key, else `null` (matches the Python `if isinstance`
-    /// fallback chain at the retired daemon).
+    /// `source` is comma-joined engine names when `engines` is an array,
+    /// otherwise the string `engine` or null.
     public func toJSON() -> JSONValue {
         var obj: [String: JSONValue] = [:]
         obj["title"] = .string(title)
@@ -107,8 +103,7 @@ public struct ResearchSearchResult: Identifiable, Sendable, Hashable, Codable {
 
 public struct ResearchSearchResponse: Sendable, Equatable {
     public let results: [ResearchSearchResult]
-    /// 2026-09-23: SearXNG engines that failed ("name: reason"). Without them an
-    /// empty search reads as "nothing exists" when the engines were just down.
+    /// SearXNG engines that failed ("name: reason"), distinct from no matches.
     public let unresponsiveEngines: [String]
 
     public init(results: [ResearchSearchResult], unresponsiveEngines: [String] = []) {
@@ -116,7 +111,36 @@ public struct ResearchSearchResponse: Sendable, Equatable {
         self.unresponsiveEngines = unresponsiveEngines
     }
 
-    /// Mirrors Python's `{"results": [...]}` response.
+    public var enginesFailed: Bool { results.isEmpty && !unresponsiveEngines.isEmpty }
+
+    init(data: Data) throws {
+        let parsed: JSONValue
+        do { parsed = try JSONValue.parse(data) }
+        catch { throw ResearchClientError.malformedResponse("SearXNG body is not JSON: \(error)") }
+        guard case .object(let payload) = parsed else { throw ResearchClientError.malformedResponse("SearXNG body is not a JSON object") }
+        guard case .array(let items)? = payload["results"] else { throw ResearchClientError.malformedResponse("SearXNG results is missing or is not an array") }
+        var results: [ResearchSearchResult] = []
+        for (index, item) in items.enumerated() {
+            try Task.checkCancellation()
+            guard case .object(let entry) = item else { throw ResearchClientError.malformedResponse("SearXNG results[\(index)] is not an object") }
+            guard index < 10 else { continue }
+            func string(_ key: String) -> String? { if case .string(let value)? = entry[key] { return value }; return nil }
+            func nonempty(_ key: String) -> String? { string(key).flatMap { $0.isEmpty ? nil : $0 } }
+            let source: String?
+            if case .array(let engines)? = entry["engines"] {
+                source = engines.compactMap { if case .string(let value) = $0 { return value }; return nil }.joined(separator: ",")
+            } else { source = string("engine") }
+            results.append(ResearchSearchResult(title: nonempty("title") ?? nonempty("url") ?? "Untitled",
+                url: nonempty("url") ?? "", snippet: string("content") ?? "", source: source))
+        }
+        let engines: [JSONValue] = if case .array(let values)? = payload["unresponsive_engines"] { values } else { [] }
+        self.init(results: results, unresponsiveEngines: engines.compactMap {
+            guard case .array(let pair) = $0, case .string(let name)? = pair.first else { return nil }
+            if pair.count > 1, case .string(let reason) = pair[1] { return name + ": " + reason }
+            return name
+        })
+    }
+
     public func toJSON() -> JSONValue {
         var obj: [String: JSONValue] = ["results": .array(results.map { $0.toJSON() })]
         if !unresponsiveEngines.isEmpty {
@@ -126,11 +150,11 @@ public struct ResearchSearchResponse: Sendable, Equatable {
     }
 }
 
-// MARK: - fetch / lab result types (wave 30 W17)
+// MARK: - fetch / lab result types
 
-/// Retains the legacy `{id, url, text, createdAt}` fields and adds source
-/// coverage and a read outcome for current fetches. All text extracted within
-/// the bounded response is retained; the tool-output pager handles sections.
+/// A fetched-source receipt with `{id, url, text, createdAt}`, source coverage
+/// and a read outcome. The bounded extraction is retained;
+/// readJSON selection and output paging are described in the web-read blueprint.
 /// Receipt is written to `data/research/source-<id>.json`.
 public struct ResearchFetchRecord: Sendable, Equatable {
     public let id: String
@@ -139,17 +163,18 @@ public struct ResearchFetchRecord: Sendable, Equatable {
     public let createdAt: String
     public let coverage: JSONValue?
     public let sourceReceipt: JSONValue?
+    public let verdict: [String: JSONValue]
 
-    public init(id: String, url: String, text: String, createdAt: String, coverage: JSONValue? = nil, sourceReceipt: JSONValue? = nil) {
+    public init(id: String, url: String, text: String, createdAt: String, verdict: [String: JSONValue], coverage: JSONValue? = nil, sourceReceipt: JSONValue? = nil) {
         self.id = id
         self.url = url
         self.text = text
         self.createdAt = createdAt
         self.coverage = coverage
         self.sourceReceipt = sourceReceipt
+        self.verdict = verdict
     }
 
-    /// Legacy fields remain stable; current reads add explicit source coverage.
     public func toJSON() -> JSONValue {
         var fields: [String: JSONValue] = [
             "id": .string(id),
@@ -160,39 +185,15 @@ public struct ResearchFetchRecord: Sendable, Equatable {
         ]
         if let coverage { fields["coverage"] = coverage }
         if !text.isEmpty {
-            fields["untrusted_remote_data"] = .bool(true)
             fields["agent"] = .string("web")
         }
         if let sourceReceipt { fields["source_receipt"] = sourceReceipt }
-        if case .object(let details)? = coverage,
-           case .string(let extraction)? = details["extraction_status"] {
-            switch extraction {
-            case "unsupported_content_type", "unsupported_text_encoding",
-                 "file_too_large", "unreadable_document", "encrypted_document", "no_text_in_document":
-                // HTTP receipt success is not successful readable extraction.
-                // Keep that transport evidence in coverage while stating the
-                // actual read outcome at the ordinary tool-result boundary.
-                fields["status"] = .string("failed")
-                fields["reason"] = .string(extraction)
-            case "html_text", "plain_text", "empty_text", "pdf_text":
-                if case .bool(let complete)? = details["complete"] {
-                    fields["status"] = .string(complete ? "completed" : (text.isEmpty ? "failed" : "partial"))
-                    if !complete && text.isEmpty { fields["reason"] = .string("incomplete_empty_extraction") }
-                }
-                if details["thin_page"] == .bool(true) {
-                    fields["reason"] = .string("thin_page")
-                    fields["hint"] = details["hint"]
-                }
-            default: break
-            }
-        }
+        fields.merge(verdict) { _, verdict in verdict }
         return .object(fields)
     }
 }
 
-/// Mirrors Python `run_research_lab`'s `run` dict:
-/// `{id, objective, status, query, sources, brief, createdAt, connector,
-/// error}`. `error` is null on success, a string when search failed.
+/// A persisted lab run; `error` serializes as null when absent.
 public struct ResearchLabRun: Identifiable, Sendable, Hashable {
     public let id: String
     public let objective: String
@@ -220,8 +221,6 @@ public struct ResearchLabRun: Identifiable, Sendable, Hashable {
         self.error = error
     }
 
-    /// Mirrors the Python `run` dict key order/shape. `error` serializes to
-    /// `null` when nil (matches Python's `search_error or None`).
     public func toJSON() -> JSONValue {
         .object([
             "id": .string(id),
@@ -237,7 +236,7 @@ public struct ResearchLabRun: Identifiable, Sendable, Hashable {
     }
 }
 
-// MARK: - Stored rows (S10)
+// MARK: - Stored rows
 
 extension ResearchSearchResult {
     /// One stored source row: `title`, `url` and `snippet` are required;
@@ -292,15 +291,48 @@ extension ResearchLabRun {
 // MARK: - Errors
 
 public enum ResearchClientError: LocalizedError, Sendable, Equatable {
-    /// `searxng_base_url` is empty in config — matches Python's
-    /// `raise ValueError("SearXNG base URL is not configured")` at
-    /// the retired daemon.
+    /// No SearXNG base URL is configured.
     case notConfigured
     /// Non-2xx response or unparseable body.
     case malformedResponse(String)
     case httpStatus(Int)
     case transport(String)
+    case noSuchHost(String)
+    case connectionRefused(String)
+    case timedOut(String)
     case localServerNotRunning(String)
+
+    public var failureReason: String? {
+        switch self {
+        case .noSuchHost: "no_such_host"
+        case .connectionRefused: "connection_refused"
+        case .timedOut: "timeout"
+        case .transport: "transport_error"
+        default: nil
+        }
+    }
+
+    static func transportFailure(_ error: Error, url: URL) -> ResearchClientError {
+        if let failure = error as? ResearchClientError { return failure }
+        let host = url.host ?? url.absoluteString
+        var cause = error as NSError
+        for _ in 0..<5 {
+            if cause.domain == NSURLErrorDomain {
+                switch URLError.Code(rawValue: cause.code) {
+                case .cannotFindHost, .dnsLookupFailed: return .noSuchHost(host)
+                case .cannotConnectToHost: return .connectionRefused(host)
+                case .timedOut: return .timedOut(host)
+                default: break
+                }
+            }
+            if cause.domain == NSPOSIXErrorDomain, cause.code == Int(POSIXErrorCode.ECONNREFUSED.rawValue) {
+                return .connectionRefused(host)
+            }
+            guard let underlying = cause.userInfo[NSUnderlyingErrorKey] as? NSError else { break }
+            cause = underlying
+        }
+        return .transport(String(describing: error))
+    }
 
     /// Keep the actual read failure useful in ordinary Workspace recovery.
     /// NSError's synthesized enum number otherwise hides even an HTTP refusal.
@@ -312,13 +344,19 @@ public enum ResearchClientError: LocalizedError, Sendable, Equatable {
             return "The source could not be read: \(detail.prefix(400)). Check the address or open it in Browser."
         case .httpStatus(let status):
             return "HTTP \(status) refused this public read."
+        case .noSuchHost(let host):
+            return "No such host: \(host). DNS could not resolve the hostname; no page was read."
+        case .connectionRefused(let host):
+            return "Connection refused by \(host); no page was read."
+        case .timedOut(let host):
+            return "The read from \(host) timed out; no page was read."
         case .transport(let detail) where detail.range(of: #"Code=-120[0-6]\b"#, options: .regularExpression) != nil:
             // 10-08: a search hit was a lookalike mirror; its certificate failed
             // and the raw NSError dump read as "the site is down".
             return "The site's security certificate is not valid for this address, so nothing was read. It may not be "
                 + "the site it looks like; prefer the official domain."
         case .transport(let detail):
-            return "The source could not be reached: \(detail.prefix(400)). Check the connection or open it in Browser."
+            return "The source could not be reached: \(detail.prefix(400))."
         case .localServerNotRunning:
             return "The configured local research service is not running. Start it or use another available research route."
         }
@@ -350,7 +388,6 @@ public actor SwiftNativeResearchClient {
     // emitting here keeps those surfaces complete.
     let activityPath: URL
     let tracesPath: URL
-    let persistence = SwiftNativePersistenceCore()
     let http = URLSessionResearchHTTPClient()
     let docker = SystemDockerPSExecutor()
 

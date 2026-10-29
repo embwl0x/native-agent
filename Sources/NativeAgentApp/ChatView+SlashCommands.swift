@@ -5,10 +5,8 @@ import SwiftUI
 import NativeAgentShared
 import ChatSessionWork
 import PersistenceCore
-import Privacy
-import TurnTrace
 import Dispatcher
-// Blueprint: | `ChatView+SlashCommands.swift` | `ChatView`: `send`, `handleSlashCommand`, `dispatchSlashCommandTool` |
+// Blueprint: | `ChatView+SlashCommands.swift` | `ChatView`: `send` admits ordinary chat; built-in commands use `ChatSlashCommandRouting.perform` and preserve pending attachments |
 
 extension ChatView {
     func send() {
@@ -24,24 +22,16 @@ extension ChatView {
         }
         let attachments = pendingAttachments
         let message = text
-        // 2026-09-06: the snapshot's own edit time, captured BEFORE the box is
-        // cleared (clearing `text` stamps a fresh one). The send-clear carries
-        // it so sending older text here cannot delete a newer unsent edit made
-        // in a detached panel on the same conversation.
+        // Capture the edit time before clearing so this send cannot erase a newer draft in another panel.
         let messageEditedAt = draftEditedAt
         let composerSessionId = appModel.activeChatSessionId
         // Known commands consume no attachments; other slash text is sent unchanged.
         switch ChatSlashCommandRouting.decide(
             text: message,
-            dynamicToolNames: capabilitiesStore.slashCommandNames,
             supportsDispatch: true
         ) {
         case .dispatch(let commandLine):
-            // 2026-09-06: this used to drop the pending attachments on the
-            // floor. A slash command sends nothing, so it consumes nothing —
-            // and cancelling the /clear confirmation left the attachments
-            // already gone. Picking the same command from the popover never
-            // came through here, so mouse and Return also disagreed.
+            // Slash commands preserve pending attachments because they send no message.
             handleSlashCommand(commandLine)
             return
         case .unsupportedHere(let command):
@@ -76,10 +66,7 @@ extension ChatView {
                     editedAt: messageEditedAt
                 )
                 pendingAttachments = []
-                // 2026-09-06: the composer's words have been sent, but the
-                // recognizer's transcript is cumulative and its pre-dictation
-                // base still pointed at them — the next update wrote the whole
-                // already-sent phrase back into the empty box.
+                // Ending dictation prevents cumulative transcripts from restoring sent words.
                 endDictation()
                 transcriptLatestRequest &+= 1
                 scrollCoordinator.forceFollow()
@@ -101,7 +88,7 @@ extension ChatView {
         let commandEditedAt = draftEditedAt
         let disposition = ChatSlashCommandRouting.perform(
             raw, sessionId: commandSessionId,
-            tools: capabilitiesStore.slashCatalog.map { ($0.name, $0.availableNow) }, host: appModel,
+            host: appModel,
             toast: { showToast($0) },
             mutationFinished: { succeeded, message in
                 showToast(message)
@@ -120,19 +107,12 @@ extension ChatView {
             case .clear: clearConfirmation.request(sessionId: appModel.activeChatSessionId)
             case .help:
                 appModel.chatMessages.append(ChatMessage(role: "system", content: ChatSlashCommandRegistry.helpText()))
-            case .tools: NativeAgentAppCoordinator.shared.request(.skillsTools(.tools))
-            case .nextgen:
-                NotificationCenter.default.post(name: .openNextGenRequest, object: nil)
-                showToast("Navigating to NextGen in Capabilities\u{2026}")
+            case .tools: ApplicationLifetime.shared.request(.skillsTools(.tools))
             case .export: exportCurrentChatToDownloads()
             default: preconditionFailure("Core requested a nonpresentation slash command")
             }
         case .consumed: break
         case .deferred: return
-        case .tool(let name, let argument):
-            if let capability = capabilitiesStore.slashCatalog.first(where: { $0.name == name }) {
-                Task { await dispatchSlashCommandTool(cap: capability, freeText: argument, sessionId: commandSessionId) }
-            }
         case .refused(let message):
             showToast(message)
             return
@@ -147,40 +127,6 @@ extension ChatView {
               text == command else { return }
         appModel.clearChatDraftAfterSend(command, sessionId: sessionId, editedAt: editedAt)
     }
-
-    @MainActor
-    func dispatchSlashCommandTool(cap: ToolCapability, freeText: String, sessionId: String) async {
-        var plan = capabilitiesStore.planDispatch(toolName: cap.name, freeText: freeText)
-            ?? DispatchArgPlan(tool: cap, mode: .zeroArgs, prefilled: [:])
-        // Carried through the form sheet so a submission made after a session
-        // switch still lands where the command was typed (2026-09-06).
-        plan.sessionId = sessionId
-
-        switch plan.mode {
-        case .zeroArgs:
-            await appModel.engine.runChatSlashCommand(tool: cap.name, input: [:], sessionId: sessionId)
-
-        case .singleStringArg(let field):
-            let trimmed = freeText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmed.isEmpty {
-                // Need the user to supply the value — fall back to a form.
-                currentDispatchPlan = plan
-                showToolInputForm = true
-            } else {
-                await appModel.engine.runChatSlashCommand(
-                    tool: cap.name,
-                    input: [field: trimmed],
-                    sessionId: sessionId
-                )
-            }
-
-        case .formNeeded:
-            currentDispatchPlan = plan
-            showToolInputForm = true
-        }
-    }
-
-
 }
 
 extension AppModel: ChatSlashCommandHost {

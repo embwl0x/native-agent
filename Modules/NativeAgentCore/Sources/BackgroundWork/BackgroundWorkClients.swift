@@ -7,38 +7,15 @@ import PersistenceCore
 import ProviderRouting
 import Cognition
 import DreamREMCycle
-// Blueprint: | `BackgroundWorkClients.swift` | `PersonaBackedBackgroundLLMClient` struct; `complete`, `completeMessages`; task-only context for `recall_judge`, `memory_interpret`, `memory_held`, and `kind_backfill`; other work honors caller-bound context assembly |
+// Blueprint: | `BackgroundWorkClients.swift` | `PersonaBackedBackgroundLLMClient` struct; `complete`, `streamMessages`; task-only context for `recall_judge`, `memory_interpret`, `memory_held`, and `kind_backfill`; other work honors caller-bound context assembly |
 
 // MARK: - Execution planner tool catalog injection
 //
-// The Executions module cannot import ChatTurnRuntime (it would create a
-// dependency cycle / pull the whole tool stack into the planner), so the real
-// tool catalog that makes the planner TOOL-AWARE is injected from the app
-// layer here. Without this the planner's availableConnectorActions() returns
-// `[]` and executions can ONLY ever emit chat.synthesize steps — they can
-// describe work but never DO it (root cause fixed 2026-06-15).
-//
-// Each entry is `{id, description}` exactly as planWorkshopExecution reads it
-// (WorkshopExecution.swift ~L900). Source is SwiftToolDispatcher's own tool schemas —
-// the same catalog the chat tool loop sees. Capped to 40 to bound prompt size
-// (the planner itself prefixes 30 before rendering the menu).
+// Inject the dispatcher's tool catalog so Executions avoids a ChatTurnRuntime dependency cycle.
 public func makeWorkshopPlannerConnectorActionsProvider(
     dataRoot: URL = PersistenceCore.defaultDataRoot()
 ) -> @Sendable () async -> [JSONValue] {
-    // The dispatcher owns a policy-keyed schema cache and root-exact MemoryV2
-    // / knowledge-graph bindings. Rebuilding that graph for every plan threw
-    // away the cache and repeated all of the binding work. One captured
-    // dispatcher is safe here: schema enumeration still rechecks the current
-    // Full Mac access flags and dispatch authority remains effect-time owned.
-    //
-    // A5.3 (W5#P1-4): building the dispatcher forces the MemoryV2 GRDB sqlite
-    // open+migrate+prune (via SwiftNativeMemoryV2.shared). This factory is
-    // called SYNCHRONOUSLY from applicationDidFinishLaunching, so constructing
-    // eagerly here paid that sqlite cost on the MAIN THREAD at launch. Defer it
-    // to a LazyDispatcherHolder: the first (background, async) invocation of the
-    // provider builds and caches the one dispatcher off-main, keeping launch's
-    // main thread clear. Schema-cache reuse is preserved — the holder returns
-    // the same dispatcher on every later call.
+    // Reuse one dispatcher; schema reads recheck Full Mac flags and effects check authority.
     let holder = LazyDispatcherHolder(dataRoot: dataRoot)
     return {
         let dispatcher = await holder.dispatcher()
@@ -53,11 +30,7 @@ public func makeWorkshopPlannerConnectorActionsProvider(
     }
 }
 
-/// Lazily builds + caches one `SwiftToolDispatcher` on first use. Isolating the
-/// build behind an actor moves the MemoryV2 sqlite open+migrate off the main
-/// thread (A5.3): the provider factory can be called at launch on the main
-/// actor, but the actual construction runs the first time the (async) provider
-/// closure is invoked from a background loop/trigger.
+/// Build and cache the dispatcher on first use, keeping MemoryV2 setup off the main actor.
 private actor LazyDispatcherHolder {
     private let dataRoot: URL
     private var cached: SwiftToolDispatcher?
@@ -76,10 +49,7 @@ private actor LazyDispatcherHolder {
     }
 }
 
-/// Append the tool's arg names to its description so the execution planner fills
-/// the RIGHT args (e.g. shell needs `cmd` — without this the planner emitted a
-/// shell step with no cmd → "missing_cmd" failure; 2026-06-15). `*` marks
-/// required args.
+/// Append argument names to the planner's tool description; `*` marks required arguments.
 public func workshopPlannerToolDescription(_ schema: LLMToolSchema) -> String {
     guard let obj = try? JSONSerialization.jsonObject(with: schema.parametersJSON) as? [String: Any],
           let props = obj["properties"] as? [String: Any], !props.isEmpty else {
@@ -101,56 +71,21 @@ public struct PersonaBackedBackgroundLLMClient: LLMClient {
         self.cognitionRuntime = cognitionRuntime
     }
 
-    public func complete(prompt: String, system: String?, model: String?) async throws -> String {
-        try await inner.complete(
-            prompt: prompt,
-            system: try await personaSystem(existing: system, surface: "background"),
-            model: model
-        )
-    }
-
     public func complete(
         prompt: String,
-        system: String?,
-        model: String?,
-        surface: String
-    ) async throws -> String {
-        try await inner.complete(
-            prompt: prompt,
-            system: try await personaSystem(existing: system, surface: surface),
-            model: model,
-            surface: surface
-        )
-    }
-
-    public func complete(
-        prompt: String,
-        system: String?,
-        model: String?,
-        tools: [LLMToolSchema]?
-    ) async throws -> String {
-        try await inner.complete(
-            prompt: prompt,
-            system: try await personaSystem(existing: system, surface: "background"),
-            model: model,
-            tools: tools
-        )
-    }
-
-    public func completeMessages(
-        messages: [LLMMessage],
         system: String?,
         model: String?,
         surface: String,
+        purpose: String,
         tools: [LLMToolSchema]?
     ) async throws -> String {
-        try await inner.completeMessages(
-            messages: messages,
-            system: try await personaSystem(existing: system, surface: surface),
-            model: model,
-            surface: surface,
-            tools: tools
-        )
+        try await LLMCallContext.$purpose.withValue(purpose) {
+            try await inner.complete(
+                prompt: prompt,
+                system: try await personaSystem(existing: system, surface: surface),
+                model: model, surface: surface, purpose: purpose, tools: tools
+            )
+        }
     }
 
     public func servingProviderID(model: String?, surface: String) async -> String? {
@@ -190,20 +125,7 @@ public struct PersonaBackedBackgroundLLMClient: LLMClient {
 
     private func personaSystem(existing: String?, surface: String) async throws -> String {
         let trimmedExisting = existing?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        // Memory judgment and classification are task-only by purpose. Reflection
-        // callers bind suppliedPersona where they actually assemble context.
-        let assembly: PrivateWorkContextAssembly = switch LLMCallContext.purpose {
-        case "recall_judge", "memory_interpret", "memory_held", "kind_backfill":
-            .taskOnly
-        default:
-            PrivateWorkContextAssembly.current
-        }
-        switch assembly {
-        case .suppliedPersona, .taskOnly:
-            return trimmedExisting
-        case .compilePersona:
-            break
-        }
+        guard case .compilePersona = PrivateWorkContextAssembly.current else { return trimmedExisting }
 
         let persona = dataRoot.standardizedFileURL
             == PersistenceCore.defaultDataRoot().standardizedFileURL
@@ -235,24 +157,6 @@ public struct PersonaBackedBackgroundLLMClient: LLMClient {
         return sections.joined(separator: "\n\n")
     }
 
-}
-
-/// Secondary/test roots have no authority to borrow the process-global
-/// provider credentials, Codex home, or telemetry owners. They may assemble
-/// loops for deterministic inspection, but any unexpected model spend fails
-/// loudly at the provider boundary.
-public struct AlternateRootUnavailableBackgroundLLMClient: LLMClient {
-    public init() {}
-    public func complete(prompt: String, system: String?, model: String?) async throws -> String {
-        throw NSError(
-            domain: "BackgroundLoopsAssembly",
-            code: 503,
-            userInfo: [
-                NSLocalizedDescriptionKey:
-                    "background providers are unavailable for an alternate data root",
-            ]
-        )
-    }
 }
 
 private enum BackgroundPersonaContextError: Error, Sendable, CustomStringConvertible {

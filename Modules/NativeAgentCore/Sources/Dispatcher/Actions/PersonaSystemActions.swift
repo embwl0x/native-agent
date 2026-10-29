@@ -17,36 +17,33 @@ package enum PersonaSystemActions {
     /// An explicit context personaRoot, otherwise
     /// PersistenceCore.defaultPersonaRoot for the context's data root.
     static func personaRootURL(_ ctx: ConnectorActionContext) -> URL {
-        if let pr = ctx.personaRoot, !pr.isEmpty {
-            return URL(fileURLWithPath: pr)
-        }
-        if let dr = ctx.dataRoot, !dr.isEmpty {
-            return PersistenceCore.defaultPersonaRoot(dataRoot: URL(fileURLWithPath: dr))
-        }
-        return PersistenceCore.defaultPersonaRoot()
+        ctx.personaRoot ?? PersistenceCore.defaultPersonaRoot(dataRoot: dataRootURL(ctx))
     }
 
     /// Resolve the data root used for skill bodies + sensitive-path block.
     static func dataRootURL(_ ctx: ConnectorActionContext) -> URL {
-        if let dr = ctx.dataRoot, !dr.isEmpty { return URL(fileURLWithPath: dr) }
-        return PersistenceCore.defaultDataRoot()
+        ctx.dataRoot ?? PersistenceCore.defaultDataRoot()
     }
 
     // MARK: - persona_read
 
-    package static func personaRead(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
-        let kind = SwiftNativePersonaEngine.canonicalizeKind(FileSystemActions.stringField(input, "kind"))
-        if !SwiftNativePersonaEngine.personaReadKinds.contains(kind) {
+    package static func personaRead(_ input: [String: JSONValue], _ ctx: ConnectorActionContext, selectedDocument: URL? = nil) -> JSONValue {
+        let kind = SwiftNativePersonaEngine.canonicalizeKind((input["kind"]?.stringValue ?? ""))
+        if selectedDocument == nil, !SwiftNativePersonaEngine.personaReadKinds.contains(kind) {
             let allowed = SwiftNativePersonaEngine.personaReadKinds.sorted().joined(separator: ", ")
             return FileSystemActions.errResult(
                 "kind must be one of: \(allowed)", code: "bad_input")
         }
         let personaRoot = personaRootURL(ctx)
-        guard let target = SwiftNativePersonaEngine.personaDocumentPath(kind: kind, root: personaRoot) else {
+        guard let target = selectedDocument ?? SwiftNativePersonaEngine.personaDocumentPath(kind: kind, root: personaRoot) else {
             return FileSystemActions.errResult("Could not resolve persona path", code: "bad_input")
         }
 
-        let resolved = FileSystemActions.resolvePath(target.path, repoRoot: ctx.repoRoot)
+        let resolved = NativeAgentWorkspaceRoot.canonicalFileURL(target)
+        let rootPath = personaRoot.resolvingSymlinksInPath().path
+        guard let tail = NativeAgentWorkspaceRoot.relativePath(resolved.path, under: rootPath), !tail.isEmpty else {
+            return FileSystemActions.errResult("Persona path escapes personaRoot.", code: "path_not_allowed")
+        }
         if FileSystemActions.isSensitiveDataPath(resolved, ctx) {
             return FileSystemActions.errResult(
                 "Persona file resolves to a protected credential or policy path.", code: "path_not_allowed")
@@ -84,17 +81,13 @@ package enum PersonaSystemActions {
     // MARK: - persona_list_skills
 
     static func personaListSkills(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
-        // Python: bool(inp.get("verbose", False)); int(inp.get("limit") or 0);
-        // int(inp.get("offset") or 0). Keep RAW values — Python's list slicing
-        // honours a negative offset (slice from the end) and treats limit<=0 as
-        // "no cap"; the slicing logic below mirrors that exactly (gpt-5.5 review).
         let verbose = boolField(input["verbose"])
         let limit = intOrZero(input["limit"])
         let offset = intOrZero(input["offset"])
 
         let dataRoot = dataRootURL(ctx)
-        var records: [String: SkillRecord] = [:]
-        let entries: [InstalledSkillInventory.Entry]
+        var records: [String: PersonaEngine.SkillRecord] = [:]
+        let entries: [PersonaEngine.SkillRecord]
         do {
             entries = try InstalledSkillInventory.entries(dataRoot: dataRoot)
         } catch {
@@ -102,27 +95,13 @@ package enum PersonaSystemActions {
                 "Could not load skill inventory: \(error.localizedDescription)", code: "skill_inventory_unavailable")
         }
         for entry in entries {
-            let row = entry.row
-            let text = { (key: String) -> String in
-                if case .string(let value)? = row[key] { return value }; return ""
-            }
-            let source = text("source") == "persona_body" ? "persona"
-                : text("source") == "runtime_body" ? "data" : "registry"
-            let triggers: [JSONValue]?
-            if case .array(let values)? = row["triggers"], !values.isEmpty { triggers = values } else { triggers = nil }
-            records[entry.name] = SkillRecord(name: entry.name, source: source,
-                path: text("bodyPath"), description: text("description"),
-                triggers: triggers, kind: text("kind").isEmpty ? nil : text("kind"),
-                useCount: row["useCount"] == .null ? nil : row["useCount"])
+            records[entry.name] = entry
         }
 
         let sortedNames = records.keys.sorted()
         let totalCount = sortedNames.count
 
-        // Pagination: Python `sorted_names[offset:]` then `[:limit]` (when
-        // limit>0). Mirror Python list-slice semantics INCLUDING negatives:
-        //   offset >= 0 → start at min(offset, count)
-        //   offset <  0 → start at max(count + offset, 0)  (from the end)
+        // Negative offsets count from the end, clamped to zero; positive offsets cap at count; limit <= 0 is uncapped.
         var pageNames = sortedNames
         if offset != 0 {
             let count = pageNames.count
@@ -138,24 +117,31 @@ package enum PersonaSystemActions {
             pageNames = Array(pageNames[0..<limit])
         }
 
-        let fullRecords = pageNames.map { records[$0]! }
+        let fullRecords = pageNames.compactMap { records[$0] }
         let manifest: [JSONValue]
         if verbose {
-            manifest = fullRecords.map { $0.toFullJSON() }
+            manifest = fullRecords.map { skill in
+                var row: [String: JSONValue] = ["name": .string(skill.name), "source": .string("persona"),
+                    "path": .string(skill.bodyPath ?? ""), "description": .string(skill.description)]
+                if !skill.triggers.isEmpty { row["triggers"] = .array(skill.triggers.map(JSONValue.string)) }
+                if let kind = skill.kind { row["kind"] = .string(kind) }
+                if let count = skill.useCount { row["use_count"] = .int(Int64(count)) }
+                return .object(row)
+            }
         } else {
             manifest = fullRecords.map {
                 .object([
                     "name": .string($0.name),
                     "description": .string($0.description),
-                    "source": .string($0.source),
+                    "source": .string("persona"),
                 ])
             }
         }
 
         let sources: [String: JSONValue] = [
-            "persona": .int(Int64(fullRecords.filter { $0.source == "persona" }.count)),
-            "data": .int(Int64(fullRecords.filter { $0.source == "data" }.count)),
-            "registry_only": .int(Int64(fullRecords.filter { $0.source == "registry" }.count)),
+            "persona": .int(Int64(fullRecords.count)),
+            "data": .int(0),
+            "registry_only": .int(0),
         ]
         return .object([
             "ok": .bool(true),
@@ -168,51 +154,22 @@ package enum PersonaSystemActions {
         ])
     }
 
-    /// A per-skill manifest record. Mirrors the Python `records[name]` dict.
-    struct SkillRecord {
-        var name: String
-        var source: String
-        var path: String
-        var description: String
-        var triggers: [JSONValue]?
-        var kind: String?
-        var useCount: JSONValue?
-
-        /// Full (verbose) record — includes path + the runtime metadata that was
-        /// present. Mirrors the Python verbose record (the raw dict).
-        func toFullJSON() -> JSONValue {
-            var obj: [String: JSONValue] = [
-                "name": .string(name),
-                "source": .string(source),
-                "path": .string(path),
-                "description": .string(description),
-            ]
-            if let t = triggers { obj["triggers"] = .array(t) }
-            if let k = kind { obj["kind"] = .string(k) }
-            if let uc = useCount { obj["use_count"] = uc }
-            return .object(obj)
-        }
-    }
-
     // MARK: - workspace_list
 
     static func workspaceList(_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue {
         let workspaceRoot = workspaceRootURL(ctx)
-        // Python: str(inp.get("subdir") or "").strip().lstrip("/")
-        var subdir = FileSystemActions.stringField(input, "subdir")
+        var subdir = (input["subdir"]?.stringValue ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         while subdir.hasPrefix("/") { subdir.removeFirst() }
 
-        // C4 fix: resolve root + target with the SAME symlink strategy, then
-        // confirm target stays within root. Do NOT mkdir (list-only tool).
+        // Resolve root and target identically before checking containment; listing never creates directories.
         let resolvedRoot = workspaceRoot.standardizedFileURL.resolvingSymlinksInPath()
         let rawTarget = subdir.isEmpty
             ? resolvedRoot
             : resolvedRoot.appendingPathComponent(subdir)
         let resolvedTarget = rawTarget.standardizedFileURL.resolvingSymlinksInPath()
 
-        // relative_to check (mirror Python ValueError on escape).
-        if !isWithinRoot(resolvedTarget, root: resolvedRoot) {
+        if NativeAgentWorkspaceRoot.relativePath(resolvedTarget.path, under: resolvedRoot.path) == nil {
             return FileSystemActions.errResult(
                 "subdir '\(subdir)' escapes workspace root '\(workspaceRoot.path)'",
                 code: "path_not_allowed")
@@ -231,10 +188,7 @@ package enum PersonaSystemActions {
             ])
         }
 
-        // Python: the iterdir loop is inside a `try` whose `except` returns
-        // `{ok:false, error:str(exc)}` with NO error_code. A file-as-target (the
-        // path exists but isn't a directory) raises NotADirectoryError there.
-        // (gpt-5.5 review: do NOT swallow this into an empty ok=true result.)
+        // Listing failures, including a file target, return ok=false and error without error_code.
         let fm = FileManager.default
         let children: [URL]
         do {
@@ -249,8 +203,7 @@ package enum PersonaSystemActions {
             ])
         }
 
-        // Python sort key: (p.is_file(), p.name) — dirs (is_file False=0) before
-        // files (True=1), each group by name.
+        // Directories sort before files, each group by name.
         struct Entry { let isDir: Bool; let name: String; let size: Int64 }
         var entries: [Entry] = []
         for child in children {
@@ -259,7 +212,7 @@ package enum PersonaSystemActions {
             var cIsDir: ObjCBool = false
             _ = fm.fileExists(atPath: child.path, isDirectory: &cIsDir)
             let isDirectory = cIsDir.boolValue
-            // Python: `entry.stat().st_size if entry.is_file() else 0`; OSError → 0.
+            // Directories and unreadable metadata report zero bytes.
             var size: Int64 = 0
             if !isDirectory {
                 if let attrs = try? fm.attributesOfItem(atPath: child.path),
@@ -278,14 +231,7 @@ package enum PersonaSystemActions {
 
         var items: [JSONValue] = []
         for e in entries {
-            // rel = entry relative to the workspace ROOT. Python computes
-            // `entry.relative_to(resolved_root)` where `entry` is
-            // `resolved_target / name` (the target is already resolved; the
-            // ENTRY itself is NOT individually symlink-resolved — a symlinked
-            // entry keeps its listed path). Reconstruct the entry path the same
-            // way: `resolvedTarget / name`, then strip the resolvedRoot prefix.
-            // (gpt-5.5 review: do NOT resolvingSymlinksInPath() the child — that
-            // would rewrite a symlinked entry's reported path away from Python's.)
+            // Report paths relative to the resolved workspace root; do not resolve child symlinks away from listed names.
             let entryPath = resolvedTarget.appendingPathComponent(e.name)
             let rel = relativePath(of: entryPath, base: resolvedRoot)
             items.append(.object([
@@ -303,17 +249,9 @@ package enum PersonaSystemActions {
         ])
     }
 
-    /// Resolve workspace root mirroring `_resolve_workspace_root_bt` priority:
-    ///   1. explicit context `_na_workspace_root` (test override)
-    ///   2. `NATIVE_AGENT_WORKSPACE_ROOT` env var
-    ///   3. canonical `NativeAgentWorkspaceRoot` resolution: `<repo>/workspace`
-    ///      for a verified source-backed install, otherwise
-    ///      `<dataRoot>/workspace` for a public/app-only install.
+    /// Explicit workspaceRoot wins; otherwise NativeAgentWorkspaceRoot owns environment and install-root resolution.
     static func workspaceRootURL(_ ctx: ConnectorActionContext) -> URL {
-        if let ws = ctx.workspaceRoot, !ws.isEmpty {
-            return URL(fileURLWithPath: ws)
-        }
-        return NativeAgentWorkspaceRoot.resolve(dataRoot: dataRootURL(ctx))
+        ctx.workspaceRoot ?? NativeAgentWorkspaceRoot.resolve(dataRoot: dataRootURL(ctx))
     }
 
     // MARK: - time_now
@@ -336,9 +274,8 @@ package struct ClockReply {
     }
 
     package static func read(_ input: [String: JSONValue], project: (ClockReply) -> JSONValue) -> JSONValue {
-        // Python: inp.get("timezone") or inp.get("tz") or "" ; .strip()
-        var tzName = FileSystemActions.stringField(input, "timezone")
-        if tzName.isEmpty { tzName = FileSystemActions.stringField(input, "tz") }
+        var tzName = input["timezone"]?.stringValue ?? ""
+        if tzName.isEmpty { tzName = (input["tz"]?.stringValue ?? "") }
         tzName = tzName.trimmingCharacters(in: .whitespacesAndNewlines)
 
         let tz: TimeZone
@@ -350,7 +287,6 @@ package struct ClockReply {
             tz = z
         } else {
             tz = TimeZone.current
-            // tz_name = local_probe.tzname() or str(tz) or "local"
             tzName = tz.abbreviation() ?? tz.identifier
             if tzName.isEmpty { tzName = "local" }
         }
@@ -384,7 +320,7 @@ package struct ClockReply {
     package var local: JSONValue {
         let tz = zone, tzName = zoneName, cal = calendar
         let comps = cal.dateComponents([.year, .month, .day, .hour, .minute, .second, .weekday], from: now)
-        // ISO-8601 with offset (mirror datetime.isoformat() incl. +HH:MM offset).
+        // Local-action timestamps use optional six-digit microseconds and an explicit ±HH:MM offset, including UTC.
         let isoLocal = isoFormat(now, tz: tz)
         let isoUTC = isoFormat(now, tz: TimeZone(identifier: "UTC")!)
 
@@ -424,9 +360,7 @@ private func boolField(_ v: JSONValue?) -> Bool {
     }
 }
 
-/// Mirror Python `int(inp.get("k") or 0)`: null/missing/empty → 0; numeric or
-/// numeric-string → its int; non-numeric → 0 (Python would raise, but these
-/// inputs are model-supplied and the daemon path tolerates them upstream).
+/// Numbers and numeric strings truncate toward zero, booleans map to 0/1, and absent or invalid values yield zero.
 private func intOrZero(_ v: JSONValue?) -> Int {
     switch v ?? .null {
     case .null: return 0
@@ -442,28 +376,12 @@ private func intOrZero(_ v: JSONValue?) -> Int {
     }
 }
 
-/// True when `path` equals or is nested under `root` (both pre-resolved).
-private func isWithinRoot(_ path: URL, root: URL) -> Bool {
-    let p = path.path
-    let r = root.path
-    if p == r { return true }
-    let prefix = r.hasSuffix("/") ? r : r + "/"
-    return p.hasPrefix(prefix)
-}
-
-/// `entry` path relative to `base` (both resolved). Mirrors `Path.relative_to`.
+/// Listed entry path relative to the resolved base, preserving the entry's symlink name.
 private func relativePath(of entry: URL, base: URL) -> String {
-    let e = entry.path
-    let b = base.path
-    if e == b { return "" }
-    let prefix = b.hasSuffix("/") ? b : b + "/"
-    if e.hasPrefix(prefix) { return String(e.dropFirst(prefix.count)) }
-    return entry.lastPathComponent
+    NativeAgentWorkspaceRoot.relativePath(entry.path, under: base.path) ?? entry.lastPathComponent
 }
 
-/// ISO-8601 with timezone offset, microsecond fractional seconds (mirrors
-/// Python `datetime.isoformat()` which emits `YYYY-MM-DDTHH:MM:SS.ffffff±HH:MM`,
-/// or `...SS±HH:MM` when microseconds are zero).
+/// YYYY-MM-DDTHH:MM:SS.ffffff±HH:MM, omitting the fraction when microseconds are zero.
 private func isoFormat(_ date: Date, tz: TimeZone) -> String {
     var cal = Calendar(identifier: .gregorian)
     cal.timeZone = tz
@@ -478,7 +396,7 @@ private func isoFormat(_ date: Date, tz: TimeZone) -> String {
     return base + frac + offset
 }
 
-/// `±HH:MM` (Python isoformat offset). UTC → `+00:00`.
+/// ±HH:MM; UTC is +00:00.
 private func isoOffset(_ seconds: Int) -> String {
     let sign = seconds < 0 ? "-" : "+"
     let abs = Swift.abs(seconds)
@@ -487,7 +405,7 @@ private func isoOffset(_ seconds: Int) -> String {
     return String(format: "%@%02d:%02d", sign, h, m)
 }
 
-/// `±HHMM` (Python `strftime("%z")`).
+/// ±HHMM without a colon.
 private func formatUTCOffset(_ seconds: Int) -> String {
     let sign = seconds < 0 ? "-" : "+"
     let abs = Swift.abs(seconds)
@@ -496,8 +414,7 @@ private func formatUTCOffset(_ seconds: Int) -> String {
     return String(format: "%@%02d%02d", sign, h, m)
 }
 
-/// Calendar weekday (1=Sunday … 7=Saturday) → English name (Python
-/// `strftime("%A")`, which is locale-default English in the daemon).
+/// Gregorian weekday (1=Sunday … 7=Saturday) to its English name.
 private func weekdayName(_ weekday: Int) -> String {
     let names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
     let idx = weekday - 1

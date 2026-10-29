@@ -1,5 +1,3 @@
-// Move-only extraction (tightness Wave C) from NativeCognitionRuntime.swift
-
 import Foundation
 import BackgroundLoops
 import CognitiveSubstrate
@@ -9,20 +7,10 @@ import PersonaEngine
 import PersistenceCore
 import ProviderRouting
 
-// Blueprint: | `NativeCognitionRuntime+Deadlines.swift` | `CoalescingDeadline` and cognition deadline scheduling: one cancellable wake per owner, residual repair and maintenance outcome reporting |
+// Blueprint: | `NativeCognitionRuntime+Deadlines.swift` | `CoalescingDeadline` and cognition background settlement: dirty microcycles, checked maintenance, residual repair and exact wakes |
 
-/// One coalesced, cancellable exact-deadline wake. Extracted (C6) from the two
-/// sites that hand-rolled the identical structure — residual-repair and
-/// cognition-maintenance — each of which owned a generation counter, the armed
-/// trailing-edge sleep task, and the last scheduled instant.
-///
-/// The struct owns only *state and mechanics*; each site keeps its own
-/// projection/short-circuit/fire body. Generation is the single monotonic
-/// authority: every reschedule/cancel begins by `invalidate()`-ing (bump +
-/// tear down), each armed task guards on the generation it captured, and a
-/// concurrent wake or normal reschedule simply wins the generation while the
-/// losers no-op. This is why the wake re-anchor is safe against double-arm.
-struct CoalescingDeadline {  // internal for actor extensions (move-only Wave C)
+/// One cancellable deadline per owner; only its latest arm may fire.
+struct CoalescingDeadline {
     /// The monotonic arm authority. A fired task compares the generation it
     /// captured against this; a mismatch means a newer arm superseded it.
     private(set) var generation: UInt64 = 0
@@ -32,12 +20,7 @@ struct CoalescingDeadline {  // internal for actor extensions (move-only Wave C)
     /// cognition-maintenance unchanged-deadline short-circuit; the residual site
     /// never reads it (stays nil there).
     var scheduledAt: Date?
-    /// Bump the generation and tear down any armed task and remembered schedule.
-    /// Every reschedule/cancel path begins here; the returned value
-    /// is the fresh generation the caller binds its armed task and fire receipts
-    /// to. (Cancelling an already-nil task and re-nilling nil fields is inert, so
-    /// this is byte-equivalent to the residual site — which never set
-    /// `scheduledAt` — and the cognition site alike.)
+    /// Cancel the armed task, clear its schedule and return the new arm generation.
     @discardableResult
     mutating func invalidate() -> UInt64 {
         generation &+= 1
@@ -49,8 +32,8 @@ struct CoalescingDeadline {  // internal for actor extensions (move-only Wave C)
 
     /// Arm the trailing-edge sleep task for `deadline`. `clampSeconds` bounds the
     /// wall sleep so a far-future deadline cannot outlive one `Task.sleep`. A
-    /// non-finite delay leaves the deadline unarmed (task nil), matching the
-    /// original guard. The `fire` closure carries its own `[weak self]` re-entry.
+    /// non-finite delay leaves the deadline unarmed (task nil).
+    /// The `fire` closure carries its own `[weak self]` re-entry.
     mutating func arm(
         deadline: Date,
         now: Date,
@@ -79,14 +62,138 @@ struct CoalescingDeadline {  // internal for actor extensions (move-only Wave C)
 }
 
 extension NativeCognitionRuntime {
-    // G-M3: single-consumer clamp bounds relocated from the core runtime into the
-    // extension that owns their only reader (arm(clampSeconds:) below).
+    private static let cognitionMaintenanceRetryDelay: TimeInterval = 60 * 60
+    /// When due maintenance is excluded by the
+    /// microcycle's commit window, the natural next deadline is
+    /// effectively "now" — a plain reschedule would arm a zero-delay task and
+    /// hot-loop against a slow SQLite commit. Retry on a short bounded delay
+    /// instead; the hour-scale retry above is for gate/error skips, not
+    /// momentary commit contention.
+    private static let cognitionMaintenanceContentionRetryDelay: TimeInterval = 30
+
+    @discardableResult
+    public func runMicrocycle(reason: String) async -> LoopTickOutcome {
+        await bootstrap()
+        if let bootstrapFailure { return .failed(error: bootstrapFailure) }
+        do {
+            let snapshot = try await substrate.runMicrocycleChecked(reason: reason)
+            guard snapshot != nil else {
+                return .skipped(reason: "cognitive substrate disabled or clean")
+            }
+            publishRuntimeChange(reason: "microcycle:completed")
+            return .completed(result: "cognitive field settled through checked persistence")
+        } catch {
+            publishRuntimeChange(reason: "microcycle:failed")
+            return .failed(error: "cognitive microcycle failed: \(error.localizedDescription)")
+        }
+    }
+
+    func scheduleDirtyMicrocycle(
+        reason: String
+    ) {
+        // Post-flush arrivals (a replay tail, a late
+        // organism drain) must not arm new microcycles after the terminal
+        // snapshot. Same latch the reschedule bodies honor.
+        guard !isFlushedForTermination else { return }
+        microcycleTelemetry.scheduledSignalCount &+= 1
+        if microcycleTimer.isPending {
+            microcycleTelemetry.coalescedReplacementCount &+= 1
+        }
+        microcycleTelemetry.lastScheduledAt = now()
+        microcycleTelemetry.lastReason = String(reason.prefix(160))
+        microcycleTimer.schedule(delay: .seconds(Self.microcycleCoalescingDelay)) { [weak self] generation in
+            await self?.runScheduledMicrocycle(generation: generation, reason: reason)
+        }
+    }
+
+    private func runScheduledMicrocycle(generation: UInt64, reason: String) async {
+        guard !isFlushedForTermination,
+              microcycleTimer.take(generation) else { return }
+        // This generation is now in flight, not pending. A reentrant event
+        // arriving while persistence awaits must start a distinct generation
+        // instead of being merged into work already started by this cycle.
+        let startedAt = now()
+        let monotonicStartedAt = monotonicNowNanoseconds()
+        microcycleTelemetry.executedCount &+= 1
+        microcycleTelemetry.lastStartedAt = startedAt
+        let outcome = await runMicrocycle(reason: reason)
+        switch outcome {
+        case .completed:
+            microcycleTelemetry.completedCount &+= 1
+            microcycleTelemetry.lastOutcome = "completed"
+        case .skipped:
+            microcycleTelemetry.skippedCount &+= 1
+            microcycleTelemetry.lastOutcome = "skipped"
+        case .failed:
+            microcycleTelemetry.failedCount &+= 1
+            microcycleTelemetry.lastOutcome = "failed"
+        }
+        let finishedAt = now()
+        let monotonicFinishedAt = monotonicNowNanoseconds()
+        microcycleTelemetry.lastFinishedAt = finishedAt
+        let elapsedNanoseconds = monotonicFinishedAt >= monotonicStartedAt
+            ? monotonicFinishedAt - monotonicStartedAt
+            : 0
+        microcycleTelemetry.lastDurationMilliseconds = Int(min(
+            elapsedNanoseconds / 1_000_000,
+            UInt64(Int.max)
+        ))
+        // A microcycle may change the field and its visible projections.
+        // Re-project the single maintenance deadline after that canonical
+        // transition; ordinary reads and quiet elapsed time remain wake-free.
+        await caresSourceChanged()
+        await rescheduleCognitionMaintenanceDeadline()
+        // `runMicrocycle` publishes after the substrate commit; scheduled
+        // settlement publishes once more after its telemetry has reached the
+        // same terminal state so Observatory readers cannot see stale counters.
+        publishRuntimeChange(reason: "microcycle_settlement:finished")
+        await rescheduleResidualRepairDeadline()
+    }
+
+    public func microcycleTelemetrySnapshot() -> CognitiveMicrocycleTelemetry {
+        microcycleTelemetry
+    }
+
+    @discardableResult
+    public func runMaintenance(reason: String) async -> LoopTickOutcome {
+        await bootstrap()
+        if let bootstrapFailure { return .failed(error: bootstrapFailure) }
+        do {
+            let configuration = await substrate.configurationSnapshot()
+            let persistenceEnabled = configuration.persistenceEnabled
+            let ran = try await substrate.runMaintenanceChecked(reason: reason)
+            guard ran else {
+                // A not-ran outcome includes "still due
+                // but excluded by the microcycle commit window" — re-arming at
+                // the natural (already-due) deadline would spin. The bounded
+                // contention delay wins only when the natural deadline is
+                // effectively now; a genuinely future deadline still wins.
+                await rescheduleCognitionMaintenanceDeadline(
+                    notBefore: now().addingTimeInterval(Self.cognitionMaintenanceContentionRetryDelay)
+                )
+                return .skipped(reason: configuration.enabled
+                    ? "cognitive maintenance not due or busy"
+                    : LoopTickOutcome.offPrefix + "cognition disabled")
+            }
+            await rescheduleCognitionMaintenanceDeadline()
+            publishRuntimeChange(reason: "maintenance:completed")
+            return .completed(result: persistenceEnabled
+                ? "cognitive maintenance checkpoint and receipt are durable"
+                : "cognitive maintenance completed in memory-only mode")
+        } catch {
+            await rescheduleCognitionMaintenanceDeadline(
+                notBefore: now().addingTimeInterval(Self.cognitionMaintenanceRetryDelay)
+            )
+            publishRuntimeChange(reason: "maintenance:failed")
+            return .failed(error: "cognitive maintenance failed: \(error.localizedDescription)")
+        }
+    }
+
     private static let residualRepairSleepClampSeconds: TimeInterval = 7 * 24 * 60 * 60
     private static let cognitionMaintenanceSleepClampSeconds: TimeInterval = 30 * 24 * 60 * 60
 
-    func rescheduleResidualRepairDeadline() async {  // internal for actor extensions (move-only Wave C)
-        // G-H2: covers every re-arm site, not just the wake re-anchor. Once
-        // `flushForTermination` has latched, no path may resurrect this timer.
+    func rescheduleResidualRepairDeadline() async {
+        // Termination prevents every path from re-arming this deadline.
         guard !isFlushedForTermination else { return }
         if let due = sourceWakes.pursuitNextAt, due <= now() {
             sourceWakes.pursuitNextAt = nil
@@ -102,11 +209,7 @@ extension NativeCognitionRuntime {
         // The forward register's source dirty bit and real eligibility/expiry
         // boundaries gate its retained read task (+Expectations).
         considerHorizonExpectations()
-        // Personality depth item 9 (2026-09-02) — HER HOUR. Same reading, same
-        // events, no timer of its own. When the
-        // Settings switch is off the lane is NOT INSTALLED: the call below
-        // returns having read nothing and written nothing. See
-        // NativeCognitionRuntime+StudioWander.swift.
+        // Her hour shares this deadline and performs no reads or writes while disabled.
         considerStudioWander()
         // Reach uses source invalidations plus quiet, expiry and cooldown
         // boundaries, sharing this deadline (+Reach).
@@ -139,10 +242,7 @@ extension NativeCognitionRuntime {
             return
         }
         let repaired = await organismKernel.runResidualRepairIfDue()
-        // G-L2 (2026-07-18): re-check generation after the repair
-        // await, mirroring the guards at the top of this function. A concurrent
-        // reschedule or wake re-anchor may have superseded this arm while the
-        // organism actor ran; the newer arm owns persist/publish/reschedule.
+        // Only the current arm may persist, publish or reschedule after the repair await.
         guard generation == residualDeadline.generation else { return }
         if repaired {
             _ = await persistOrganismContinuity(reason: "residual_pressure_repair")
@@ -168,12 +268,11 @@ extension NativeCognitionRuntime {
     /// Re-arm one cancellable wake from the substrate's mutation-free deadline
     /// projection. This remains owned by the cognition runtime; it is not a new
     /// scheduler or a second maintenance authority.
-    func rescheduleCognitionMaintenanceDeadline(  // internal for actor extensions (move-only Wave C)
+    func rescheduleCognitionMaintenanceDeadline(
         notBefore: Date? = nil,
         force: Bool = false
     ) async {
-        // G-H2: covers every re-arm site, not just the wake re-anchor. Once
-        // `flushForTermination` has latched, no path may resurrect this timer.
+        // Termination prevents every path from re-arming this deadline.
         guard !isFlushedForTermination else { return }
         let currentGeneration = cognitionDeadline.generation
         let opportunity = await substrate.maintenanceOpportunity()
@@ -190,11 +289,7 @@ extension NativeCognitionRuntime {
             cognitionDeadline.invalidate()
             return
         }
-        // R-F4: a system-wake re-anchor forces past this unchanged-deadline
-        // short-circuit. `Task.sleep` does not advance across system sleep, so
-        // the already-armed task's remaining delay is stale even though the
-        // absolute deadline Date is unchanged; re-arming re-derives the delay
-        // from the post-wake clock.
+        // System wake forces re-arming: Task.sleep excludes system sleep, so its delay is stale.
         if !force,
            cognitionDeadline.scheduledAt == deadline,
            cognitionDeadline.task != nil {
@@ -228,42 +323,25 @@ extension NativeCognitionRuntime {
         await reportLoopOutcome(loopId: "cognition_maintenance", outcome: outcome)
     }
 
-    /// One reporting door for the three cognition lanes whose real work happens
-    /// off the loop tick. `completedWork` is true ONLY for a real completion, so
-    /// a lane that merely skipped can never claim a completion stamp it did not
-    /// earn (BackgroundLoops.recordResult's C8 rule).
+    /// Report out-of-band cognition work; only real completions receive completion stamps.
     func reportLoopOutcome(  // internal for actor extensions
         loopId: String,
-        outcome: CognitiveBackgroundRunOutcome
+        outcome: LoopTickOutcome
     ) async {
         let tick: LoopTickOutcome
         switch outcome {
         case .completed(let detail):
-            tick = .completed(result: String(detail.prefix(200)))
-        case .skipped(let reason):
-            tick = .skipped(reason: String(reason.prefix(180)))
+            tick = .completed(result: detail.map { String($0.prefix(200)) })
+        case .skipped(let reason, let healthNeutral):
+            tick = .skipped(reason: String(reason.prefix(180)), healthNeutral: healthNeutral)
         case .failed(let error):
-            tick = .failed(error: String(String(describing: error).prefix(180)))
+            tick = .failed(error: String(error.prefix(180)))
         }
-        await BackgroundLoops.BackgroundLoopsManager.shared
+        await BackgroundLoops.BackgroundLoopLifetimes.shared
             .recordOutOfBandOutcome(loopId: loopId, outcome: tick)
     }
 
-    /// R-F4: re-anchor the exact-deadline cognition timers after a system wake.
-    /// `Task.sleep` does not advance across system sleep, so a deadline armed
-    /// before sleep fires late until the next sensory event re-arms it (never
-    /// missed-forever — the fire path re-checks + re-arms — only late). Called
-    /// from the app's `didWake` handler, mirroring the ContextFlow re-anchor.
-    ///
-    /// Idempotent and safe against double-arm: both reschedule paths bump their
-    /// generation counter and cancel the prior task, and each armed task guards
-    /// on its own generation, so a concurrent wake or a normal reschedule simply
-    /// wins the generation and the losers no-op. The residual-repair reschedule
-    /// always re-derives its delay; the cognition-maintenance reschedule is
-    /// forced past its unchanged-deadline short-circuit for the same reason.
-    /// No-op before bootstrap — there are no armed timers to re-anchor — and
-    /// after `flushForTermination` (review round 2, LOW: a wake landing during
-    /// app teardown must not re-arm the timers the flush just cancelled).
+    /// Re-anchor both deadlines after wake, only while the bootstrapped runtime is active.
     public func reanchorDeadlinesAfterWake() async {
         guard bootstrapTask != nil, !isFlushedForTermination else { return }
         sourceWakes.canonDirty = true

@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 // Blueprint: | `BrowserConnectionMirror.swift` | `BrowserConnectionMirror`: last runtime-published Chrome connection state for synchronous home reads; nil remains unobserved |
 
@@ -6,9 +7,8 @@ import Foundation
 /// reader (the agent's home screen) can say it without dispatching a tool.
 /// Nil until the runtime has said anything.
 public enum BrowserConnectionMirror {
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var value: Bool?
+    private static let value = OSAllocatedUnfairLock<Bool?>(initialState: nil)
 
-    public static func set(connected: Bool) { lock.withLock { value = connected } }
-    public static var connected: Bool? { lock.withLock { value } }
+    public static func set(connected: Bool) { value.withLock { $0 = connected } }
+    public static var connected: Bool? { value.withLock { $0 } }
 }

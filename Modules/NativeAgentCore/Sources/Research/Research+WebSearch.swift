@@ -29,7 +29,7 @@ public enum WebSearchRoutes {
             try Task.checkCancellation()
             let response = try await searxng()
             try Task.checkCancellation()
-            if response.results.isEmpty, !response.unresponsiveEngines.isEmpty {
+            if response.enginesFailed {
                 return failure("searxng_failed", "SearXNG's engines gave no sources: "
                     + response.unresponsiveEngines.joined(separator: "; ") + ". Run Doctor to check SearXNG.")
             }
@@ -70,7 +70,10 @@ public enum WebSearchRoutes {
     /// results page in her own browser, which has no sign-in to clear a consent wall.
     static func browserSearchURL(query: String, categories: String?, timeRange: String?, chrome: Bool) -> String {
         let span = ["day": "d", "week": "w", "month": "m", "year": "y"][timeRange ?? ""]
-        var components = URLComponents(string: chrome ? "https://www.google.com/search" : "https://html.duckduckgo.com/html/")!
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = chrome ? "www.google.com" : "html.duckduckgo.com"
+        components.path = chrome ? "/search" : "/html/"
         var items = [URLQueryItem(name: "q", value: query)]
         if chrome {
             if categories == "news" { items.append(URLQueryItem(name: "tbm", value: "nws")) }

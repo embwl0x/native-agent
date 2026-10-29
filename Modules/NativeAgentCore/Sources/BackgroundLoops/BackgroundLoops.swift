@@ -1,409 +1,9 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `BackgroundLoops.swift` | `SwiftNativeLoopScheduler`, loop registrations and accounting: in-process scheduling, event deadlines, durable outcomes and worker lifecycle |
-
-private struct AnyKey: CodingKey, Hashable {
-    var stringValue: String
-    var intValue: Int? { nil }
-    init(_ s: String) { self.stringValue = s }
-    init?(stringValue: String) { self.stringValue = stringValue }
-    init?(intValue: Int) { return nil }
-}
-
-// MARK: - Background loop inspection and control
-//
-// BackgroundLoopsManager owns live workers and watchdog state in NativeAgent.app.
-// The watchdog model retains its existing wire keys for persisted and
-// surface-facing compatibility.
-
-// MARK: - WatchdogStatus
-
-public struct WatchdogStatus: Sendable, Encodable, Equatable {
-    public var uptimeSeconds: Double
-    public var runtimeLifecycleStatus: String
-    public var runtimeLifecycleDetail: String
-    public var runningImprovements: Int
-    public var runningExecutions: Int
-    public var lastActivity: JSONValue?
-    public var repairAvailable: Bool
-    public var extras: JSONValue?
-
-    public init(
-        uptimeSeconds: Double,
-        runtimeLifecycleStatus: String,
-        runtimeLifecycleDetail: String,
-        runningImprovements: Int,
-        runningExecutions: Int,
-        lastActivity: JSONValue? = nil,
-        repairAvailable: Bool,
-        extras: JSONValue? = nil
-    ) {
-        self.uptimeSeconds = uptimeSeconds
-        self.runtimeLifecycleStatus = runtimeLifecycleStatus
-        self.runtimeLifecycleDetail = runtimeLifecycleDetail
-        self.runningImprovements = runningImprovements
-        self.runningExecutions = runningExecutions
-        self.lastActivity = lastActivity
-        self.repairAvailable = repairAvailable
-        self.extras = extras
-    }
-
-    private static let knownKeys: Set<String> = [
-        "daemon",
-        "uptimeSeconds",
-        "daemonLifecycleStatus", "daemonLifecycleDetail",
-        "launchAgentStatus", "launchAgentDetail",
-        "runningImprovements", "runningMissions",
-        "lastActivity",
-        "repairAvailable",
-        "extras",
-    ]
-
-    public func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: AnyKey.self)
-        try c.encode("swift", forKey: AnyKey("daemon"))
-        try c.encode(uptimeSeconds, forKey: AnyKey("uptimeSeconds"))
-        try c.encode(runtimeLifecycleStatus, forKey: AnyKey("daemonLifecycleStatus"))
-        try c.encode(runtimeLifecycleDetail, forKey: AnyKey("daemonLifecycleDetail"))
-        try c.encode("not_applicable", forKey: AnyKey("launchAgentStatus"))
-        try c.encode("NativeAgent.app owns background loops; legacy daemon launch agents are retired.", forKey: AnyKey("launchAgentDetail"))
-        try c.encode(runningImprovements, forKey: AnyKey("runningImprovements"))
-        try c.encode(runningExecutions, forKey: AnyKey("runningMissions"))
-        try c.encodeIfPresent(lastActivity, forKey: AnyKey("lastActivity"))
-        try c.encode(repairAvailable, forKey: AnyKey("repairAvailable"))
-        if case .object(let obj)? = extras {
-            for (k, v) in obj where !Self.knownKeys.contains(k) {
-                try c.encode(v, forKey: AnyKey(k))
-            }
-        }
-    }
-}
-
-// MARK: - Phase B: Swift periodic-tick framework
-//
-// LoopRunner / LoopState / SwiftNativeLoopScheduler are the Swift framework
-// for in-process periodic background work.
-
-/// Typed result of one background-loop attempt. Returning from `tick()` is not
-/// itself proof of success: loops that handle their own errors override
-/// `tickOutcome()` so the scheduler can preserve honest state and receipts.
-public enum LoopTickOutcome: Sendable, Equatable {
-    case completed(result: String?)
-    /// `healthNeutral: true` declares "this skip is NOT evidence the loop is
-    /// healthy". The canonical case is a loop that skips BECAUSE it is inside
-    /// its own failure-backoff window (TelegramPollLoop). Before this flag
-    /// existed the scheduler cleared the consecutive-failure streak on every
-    /// non-coalesced skip, so a self-backing-off loop on a 2s cadence reset
-    /// its own streak between every real failure and the failure-streak push
-    /// could NEVER fire — a revoked token or offline Mac stayed silent
-    /// forever. Defaults to `false` so an ordinary "nothing to do" skip
-    /// remains a genuine health signal.
-    case skipped(reason: String, healthNeutral: Bool = false)
-    case failed(error: String)
-
-    /// The manager's single-flight gate returns this reason when a tick
-    /// request joins an already-active execution instead of running. Shared
-    /// constant so the scheduler's failure-streak accounting can recognize it:
-    /// a coalesced skip is "someone else is executing", NOT evidence of
-    /// health, and must not reset the consecutive-failure streak (gpt-5.5
-    /// BLOCKING, A4.8 round).
-    public static let coalescedSkipReason = "coalesced with active tick"
-    /// An opportunistic wake arrived before the canonical durable cadence was
-    /// eligible. The wake is only a signal; it does not advance loop health,
-    /// counters, or the durable last-run clock.
-    public static let notDueSkipReason = "durable cadence not due"
-
-    /// Constructor for "I am skipping because I am failing". Prefer this over
-    /// a bare `.skipped(reason:)` in any loop that gates itself behind its own
-    /// backoff/cooldown after an operational failure.
-    public static func backingOff(reason: String) -> LoopTickOutcome {
-        .skipped(reason: reason, healthNeutral: true)
-    }
-
-    /// A tick has one of four words: worked (`.completed`, the only outcome
-    /// that stamps `lastCompletedAt`), nothing to do (a plain skip), off (its
-    /// config switches it off) and not needed (another authority already does
-    /// its job). Off and not needed are skips whose reason carries the word,
-    /// so Doctor never counts them as healthy work.
-    public static let offPrefix = "off: "
-    public static let notNeededPrefix = "not needed: "
-
-    public static func off(_ reason: String) -> LoopTickOutcome {
-        .skipped(reason: offPrefix + reason)
-    }
-
-    public static func notNeeded(_ reason: String) -> LoopTickOutcome {
-        .skipped(reason: notNeededPrefix + reason)
-    }
-
-    /// True only for the manager's single-flight coalesce skip.
-    public var isCoalescedSkip: Bool {
-        if case .skipped(let reason, _) = self { return reason == Self.coalescedSkipReason }
-        return false
-    }
-
-    /// True when this outcome proves nothing about the loop's health and must
-    /// therefore leave the consecutive-failure streak untouched. Covers both
-    /// the coalesced skip and any loop-declared health-neutral skip.
-    public var isHealthNeutralSkip: Bool {
-        if case .skipped(let reason, let healthNeutral) = self {
-            return healthNeutral || reason == Self.coalescedSkipReason
-        }
-        return false
-    }
-}
-
-/// Exponential-with-jitter retry curve applied by the scheduler when a loop's
-/// tick fails, and by Telegram's intra-tick deadline gate. Each caller owns
-/// its failure counter and deadline; this policy owns the curve.
-public struct LoopFailureBackoffPolicy: Sendable, Equatable {
-    public var baseDelay: TimeInterval
-    public var maxDelay: TimeInterval
-    public var multiplier: Double
-    public var jitterRange: ClosedRange<Double>
-
-    /// Defaults: 5s → 300s cap, doubling, ±20% jitter, reset on first success.
-    public init(
-        baseDelay: TimeInterval = 5,
-        maxDelay: TimeInterval = 300,
-        multiplier: Double = 2,
-        jitterRange: ClosedRange<Double> = 0.8...1.2
-    ) {
-        self.baseDelay = max(0, baseDelay)
-        self.maxDelay = max(0, maxDelay)
-        self.multiplier = max(1, multiplier)
-        self.jitterRange = jitterRange
-    }
-
-    public static let `default` = LoopFailureBackoffPolicy()
-
-    /// `base * multiplier^(n-1)`, capped at `maxDelay`, jittered, then
-    /// re-clamped so the documented cap is a hard ceiling.
-    public func delay(
-        forConsecutiveFailures failures: Int,
-        jitter: (ClosedRange<Double>) -> Double
-    ) -> TimeInterval {
-        guard failures > 0 else { return 0 }
-        let exponent = Double(min(failures - 1, 64))
-        let raw = min(maxDelay, baseDelay * pow(multiplier, exponent))
-        return min(maxDelay, max(0, raw * jitter(jitterRange)))
-    }
-}
-
-private struct FailureReceiptIncident: Sendable {
-    let loopId: String
-    let error: String
-    let firstAt: String
-    let lastAt: String
-    let occurrences: Int
-
-    init(loopId: String, error: String, firstAt: String, lastAt: String, occurrences: Int = 1) {
-        self.loopId = loopId
-        self.error = error
-        self.firstAt = firstAt
-        self.lastAt = lastAt
-        self.occurrences = max(1, occurrences)
-    }
-
-    func toJSON(id: String) -> JSONValue {
-        .object([
-            "id": .string(id),
-            "kind": .string("background_loop.failure"),
-            "loopId": .string(loopId),
-            "status": .string("failed"),
-            "error": .string(error),
-            "createdAt": .string(firstAt),
-            "firstAt": .string(firstAt),
-            "lastAt": .string(lastAt),
-            "occurrences": .int(Int64(occurrences)),
-        ])
-    }
-
-    func coalescing(_ next: FailureReceiptIncident) -> FailureReceiptIncident {
-        FailureReceiptIncident(
-            loopId: loopId,
-            error: error,
-            firstAt: firstAt,
-            lastAt: next.lastAt,
-            occurrences: occurrences + next.occurrences
-        )
-    }
-
-}
-
-/// A single periodic worker the scheduler drives. Neither entry point may
-/// throw. `tickOutcome()` is the PRIMARY method every loop implements: the
-/// scheduler records the returned `LoopTickOutcome` as the loop's durable state
-/// and failure receipt. A loop that catches operational failure MUST return the
-/// honest outcome (`.failed`/`.skipped`) from `tickOutcome()` rather than
-/// converting failure into a successful tick. `tick()` is a defaulted
-/// fire-and-forget wrapper (see the extension) that discards the outcome — no
-/// loop should hand-roll it, and error-catching work must NOT live only in a
-/// custom `tick()` where its outcome would be lost.
-///
-/// CANCELLATION CONTRACT: `tickOutcome()` MUST honor `Task.isCancelled` /
-/// `Task.checkCancellation()` and return promptly when cancellation is
-/// observed. Swift cancellation is cooperative — a tick body that ignores
-/// it will keep running after `stop()` and the wrapping scheduler Task will
-/// leak even though it is marked cancelled. For callers that need a hard
-/// upper bound on a single tick, use `tickWithTimeoutOutcome(_:timeout:)`.
-public protocol LoopRunner: Sendable {
-    var loopId: String { get }
-    var interval: TimeInterval { get }
-    /// Per-loop override for the scheduler's uniform tick timeout (300s
-    /// default). nil → use the scheduler's value. Loops whose tick
-    /// legitimately runs long — a full Telegram chat turn with tool
-    /// subprocesses, a weekly LLM consolidation pass — MUST override, or
-    /// the 300s budget cancels them mid-LLM-call with no user-visible
-    /// trace (audit 2026-06-09). Requirement (not extension-only) so the
-    /// override dispatches dynamically through `any LoopRunner`.
-    var tickTimeoutOverride: TimeInterval? { get }
-    /// The honest per-tick outcome. Required — there is no default, so every
-    /// loop implements it and the scheduler always records a real outcome
-    /// rather than a swallowed `.completed`.
-    func tickOutcome() async -> LoopTickOutcome
-    /// Fire-and-forget entry point. Defaulted to call `tickOutcome()` and
-    /// discard the result (see extension); a loop should not implement it.
-    func tick() async
-    /// Cancels and drains work that the loop intentionally owns beyond one
-    /// admitted tick. Most loops own no such work and use the default no-op.
-    func shutdown() async
-}
-
-public extension LoopRunner {
-    var tickTimeoutOverride: TimeInterval? { nil }
-
-    func tick() async {
-        _ = await tickOutcome()
-    }
-
-    func shutdown() async {}
-}
-
-/// A configured worker or a visible lane with no work to schedule.
-public enum LoopRegistration: Sendable {
-    case enabled(any LoopRunner)
-    case disabled(loopId: String, reason: String)
-    /// Its configuration could not be read: a fault that says its cause, never
-    /// off (an unreadable credential is not "not connected").
-    case unreadable(loopId: String, error: String)
-
-    public var loopId: String {
-        switch self {
-        case .enabled(let runner): runner.loopId
-        case .disabled(let loopId, _), .unreadable(let loopId, _): loopId
-        }
-    }
-
-    public var runner: (any LoopRunner)? {
-        if case .enabled(let runner) = self { return runner }
-        return nil
-    }
-}
-
-/// An event-first background worker with one optional exact persisted deadline.
-///
-/// `interval` remains the deliberately slow integrity sweep used to recover a
-/// process-local event lost across a crash or an out-of-process write the
-/// primary signal path could not observe. Normal work is driven by
-/// `physiologyEvents()` and `nextMeaningfulDeadline(after:)`; neither path may
-/// manufacture user intent or provider work merely because time passed.
-public protocol EventDeadlineLoopRunner: LoopRunner {
-    /// Multicast/domain event stream. Events carry no authority or payload;
-    /// the tick rereads the canonical owner.
-    func physiologyEvents() -> AsyncStream<Void>
-    /// Earliest future instant at which a persisted state transition becomes
-    /// eligible. Return nil when no crossing exists. A date at/before `now`
-    /// is reconciled by the manager's startup/event pass and is not rescheduled
-    /// as a spin loop.
-    func nextMeaningfulDeadline(after now: Date) async -> Date?
-    /// Trailing-edge burst coalescing before the canonical reread.
-    var eventCoalescingDelay: TimeInterval { get }
-}
-
-public extension EventDeadlineLoopRunner {
-    var eventCoalescingDelay: TimeInterval { 0.25 }
-}
-
-/// Thrown by `tickWithTimeoutOutcome` when a tick exceeds its allotted budget.
-public struct TickTimeoutError: Error, Equatable {
-    public init() {}
-}
-
-/// Race a single `tick()` against a timeout. Throws `TickTimeoutError` if
-/// the deadline elapses before the tick returns. The tick branch is
-/// intentionally unstructured: the caller gets its upper bound even if a
-/// buggy loop ignores Swift's cooperative cancellation. The timed-out tick is
-/// cancelled, but it may keep running until its body observes cancellation or
-/// returns on its own.
-public func tickWithTimeoutOutcome(
-    _ loop: any LoopRunner,
-    timeout: TimeInterval
-) async throws -> LoopTickOutcome {
-    let result = await raceAgainstTimeout(nanoseconds: timeoutNanoseconds(timeout)) {
-        await loop.tickOutcome()
-    }
-
-    switch result {
-    case .value(let outcome):
-        return outcome
-    case .failure(let error):
-        return .failed(error: error)
-    case .timedOut:
-        throw TickTimeoutError()
-    case .cancelled:
-        throw CancellationError()
-    }
-}
-
-private func timeoutNanoseconds(_ seconds: TimeInterval) -> UInt64 {
-    let clamped = max(0, min(seconds, TimeInterval(UInt64.max) / 1_000_000_000))
-    return UInt64(clamped * 1_000_000_000)
-}
-
-/// Snapshot of settled outcomes and projected timing.
-public struct LoopState: Sendable, Equatable {
-    public var loopId: String
-    public var lastTickAt: Date?
-    /// Periodic projection, also advanced by event/out-of-band accounting; not the retained sleeper.
-    public var nextTickAt: Date?
-    public var lastResult: String?
-    public var lastError: String?
-    public var tickCount: Int
-    /// C8: when this loop last COMPLETED — did real work, as opposed to
-    /// ticking. `lastTickAt` advances on failures and on skips alike, so a lane
-    /// that is registered, scheduled and ticking perfectly while every tick
-    /// says "not configured" reads as healthy on every other field. This is the
-    /// one field that can tell dormancy from health, and it is DURABLE (see
-    /// the "completions" map in the loop-state file) so a relaunch does not
-    /// reset the dormancy clock.
-    public var lastCompletedAt: Date?
-    /// C8: when this loop was first registered on this machine (durable). The
-    /// floor dormancy is measured from when nothing has ever completed.
-    public var firstSeenAt: Date?
-
-    public init(
-        loopId: String,
-        lastTickAt: Date? = nil,
-        nextTickAt: Date? = nil,
-        lastResult: String? = nil,
-        lastError: String? = nil,
-        tickCount: Int = 0,
-        lastCompletedAt: Date? = nil,
-        firstSeenAt: Date? = nil
-    ) {
-        self.loopId = loopId
-        self.lastTickAt = lastTickAt
-        self.nextTickAt = nextTickAt
-        self.lastResult = lastResult
-        self.lastError = lastError
-        self.tickCount = tickCount
-        self.lastCompletedAt = lastCompletedAt
-        self.firstSeenAt = firstSeenAt
-    }
-}
+// Blueprint: | `BackgroundLoops.swift` | SwiftNativeLoopScheduler registrations, timing, backoff and worker lifecycle; LoopTickAccounting settlement |
 
 /// An execution releases ownership only after both its body and the caller's
 /// cadence/backoff accounting have finished, in either order.
@@ -436,101 +36,66 @@ actor LoopTickAccounting {
 public actor SwiftNativeLoopScheduler {
     /// A per-registration record. `registrationId` is the generation token
     /// used to keep a retired wake from rescheduling a replacement.
-    private struct Registration {
+    internal struct Registration {
         let loop: any LoopRunner
         let registrationId: UUID
         let wake: @Sendable () async -> Void
     }
-    private var loops: [String: Registration] = [:]
+    internal var loops: [String: Registration] = [:]
     private var tasks: [String: Task<Void, Never>] = [:]
-    private var states: [String: LoopState] = [:]
-    private let clock: @Sendable () -> Date
-    private let failureReceiptsPath: URL?
-    private let persistence = SwiftNativePersistenceCore()
+    internal var states: [String: LoopState] = [:]
+    internal let clock: @Sendable () -> Date
+    internal let failureReceiptsPath: URL?
     private var running: Bool = false
 
-    // Failure backoff (audit 2026-08-02, HIGH): before this, the next tick was
-    // scheduled `interval` out on the SUCCESS and the FAILURE path alike, so a
-    // 2s loop kept hammering a dead endpoint every 2s for as long as the
-    // outage lasted. The curve reuses the loop's existing consecutive-failure
-    // streak (already reset on the first real success), so backoff and the
-    // failure-streak push agree on what "still failing" means.
+    // Backoff and failure notifications share the consecutive-failure streak, reset on real success.
     private let defaultFailureBackoff: LoopFailureBackoffPolicy
     private let jitter: @Sendable (ClosedRange<Double>) -> Double
-    /// Floor for any computed next-tick delay. Start-relative scheduling can
-    /// produce a negative delay when a tick outruns its own interval (a 25s
-    /// Telegram long poll on a 2s cadence); this keeps that from becoming a
-    /// busy spin without stretching the cadence the way tick-END scheduling
-    /// did.
+
+    /// Floor computed delays so work that outruns its interval cannot busy-spin.
     private let minimumTickSpacing: TimeInterval
 
-    // LOOPS-4: the tick task used to sleep a FULL interval before its first
-    // tick and the scheduler kept run history only in memory. A weekly loop
-    // therefore never ran on a machine restarted more often than weekly — each
-    // launch restarted the 7-day sleep from zero. Per-loop last-run is now
-    // durable, and the FIRST sleep after launch is the REMAINDER of the period
-    // (or a short startup stagger when the period already elapsed).
-    private let loopStatePath: URL?
+    /// Durable run stamps preserve the elapsed part of an interval across launches.
+    internal let loopStatePath: URL?
     private let startupStagger: TimeInterval
-    private var persistedLastRun: [String: Date] = [:]
-    /// C8: durable last-COMPLETED stamp per loop, flushed alongside
-    /// `persistedLastRun` under the "completions" key. Separate map rather than
-    /// a field on the run stamp so the existing file shape stays readable by an
-    /// older build (it simply ignores the extra key).
-    private var persistedLastCompleted: [String: Date] = [:]
-    /// C8: when this loop was FIRST registered on this machine, written once
-    /// and never advanced. Dormancy is measured from max(firstSeen,
-    /// lastCompleted): `lastTickAt` is useless for it (a loop that ticks hourly
-    /// and completes nothing looks freshly-run forever), and without a durable
-    /// floor a relaunch would reset the clock every time.
-    private var persistedFirstSeen: [String: Date] = [:]
+    internal var persistedLastRun: [String: Date] = [:]
+
+    /// The completions map records real work without changing the saved run-stamp shape.
+    internal var persistedLastCompleted: [String: Date] = [:]
+
+    /// Written once; dormancy starts at max(firstSeen, lastCompleted), never at a skipped tick.
+    internal var persistedFirstSeen: [String: Date] = [:]
     /// The last `OrganPulse` per organ, flushed under the "pulses" key.
-    private var persistedPulses: [String: OrganPulse] = [:]
+    internal var persistedPulses: [String: OrganPulse] = [:]
     package typealias PersistedLoopState = (
         runs: [String: Date], completions: [String: Date], firstSeen: [String: Date], pulses: [String: OrganPulse], fault: String?
     )
-    /// Damaged run history found at load. Timing restarts from this launch
-    /// (a clock must be chosen), but the damage is a durable receipt and no
-    /// loop is stamped as first seen now: its dormancy floor is unknown.
-    private var persistedStateFault: String?
+
+    /// Damaged history restarts timing with a durable fault receipt and unknown dormancy floor.
+    internal var persistedStateFault: String?
     /// The pseudo loop id that the run-history store files its receipts under.
     static let loopStateReceiptId = "loop_state"
-    private var persistedStateLoaded = false
-    private var persistedStateLoad: Task<PersistedLoopState, Never>?
+    internal var persistedStateLoaded = false
+    internal var persistedStateLoad: Task<PersistedLoopState, Never>?
     /// Installed before suspension so snapshots reach disk in actor order.
-    private var persistedStateWrite: Task<Void, Never>?
+    internal var persistedStateWrite: Task<Void, Never>?
     public static let healthCheckpointInterval: TimeInterval = 60
-    private let durableFlushImmediateInterval: TimeInterval
-    private var lastDurableFlushAt: Date?
+    internal let durableFlushImmediateInterval: TimeInterval
+    internal var lastDurableFlushAt: Date?
     /// Slot counter used to fan overdue startup ticks out instead of firing
     /// every starved loop in the same instant. Reset on each `start()`.
     private var overdueStartupSlots = 0
 
     /// Every failure files or refreshes the loop's one finding. Salience owns
     /// attention; the scheduler keeps its receipts and execution backoff.
-    private var failureOutcome: (@Sendable (_ loopId: String, _ error: String) async -> Void)?
+    internal var failureOutcome: (@Sendable (_ loopId: String, _ error: String) async -> Void)?
     /// Resolve the finding after the first proven-healthy tick on launch and
     /// after every recorded failure episode.
-    private var failureRecoveryPush:
+    internal var failureRecoveryPush:
         (@Sendable (_ loopId: String, _ healthyAt: Date) async -> Bool)?
-    private var failureRecoveryProbePending: Set<String> = []
-    private var consecutiveFailures: [String: Int] = [:]
-    /// FIX-13: the receipt row this process appended last. Coalescing a repeat
-    /// failure is decided from this plus `consecutiveFailures`, so the feed is
-    /// never read to write to it. `bytes` is the exact serialized line and is
-    /// re-verified against the file's tail before any in-place rewrite.
-    private struct LastFailureReceipt: Sendable {
-        let incident: FailureReceiptIncident
-        let id: String
-        let bytes: Data
-    }
-    private var lastFailureReceipt: LastFailureReceipt?
-    /// Byte budget that amortizes the failure-feed line cap, exactly as
-    /// `activityTrimTriggerBytes` / `traceTrimTriggerBytes` do for their feeds.
-    /// Below it the cap is not evaluated at all, so an append costs one write
-    /// rather than a full read + rewrite of the accumulated receipts.
-    private static let failureReceiptTrimTriggerBytes = 1024 * 1024
-
+    internal var failureRecoveryProbePending: Set<String> = []
+    internal var consecutiveFailures: [String: Int] = [:]
+    internal var lastFailureReceipt: LastFailureReceipt?
     /// `loopStatePath` holds the durable per-loop last-run map. When nil it is
     /// derived as a sibling of `failureReceiptsPath` — durable run state lives
     /// beside the durable failure receipts.
@@ -556,27 +121,10 @@ public actor SwiftNativeLoopScheduler {
         self.jitter = jitter
     }
 
-    // MARK: C5 — healthy-branch jitter and randomized startup stagger
-    //
-    // Both spread the herd: without them every loop of a given interval ticks
-    // in lockstep forever (they all seed from the same launch instant), and N
-    // starved loops all fire in the same instant on a cold start.
-    //
-    // THE BOUND both must respect: Doctor calls a loop overdue when it drifts
-    // past `nextRun` by more than `DoctorLoopHealth.overdueTolerance` =
-    // max(registered interval / 2, 60s). The scheduler publishes `nextTickAt`
-    // AFTER applying jitter, so a jittered tick is never late against its own
-    // advertised time — but a consumer holding a pre-jitter `nextRun` (a status
-    // read racing the delay computation, or the spawn-time seed) would be. So
-    // the added delay is capped at BOTH a fraction of the interval and an
-    // absolute ceiling strictly below the 60s tolerance floor, which makes it
-    // unconditionally inside the tolerance for every interval.
-
-    /// Fraction of a loop's interval available as healthy-branch jitter.
+    /// Healthy jitter spreads ticks within Doctor's overdue tolerance; nextTickAt includes it.
     public static let healthyJitterFraction = 0.1
-    /// Absolute ceiling on added jitter. Strictly below `overdueTolerance`'s
-    /// 60s floor, so `jitterCeiling(for:) < overdueTolerance(for:)` holds for
-    /// every interval — pinned by `LoopJitterBoundsTests`.
+
+    /// Added jitter stays strictly below Doctor's 60-second overdue-tolerance floor.
     public static let maximumHealthyJitter: TimeInterval = 30
 
     /// The largest delay jitter may ADD for `interval`. One-sided (never early)
@@ -599,12 +147,7 @@ public actor SwiftNativeLoopScheduler {
         return base + draw
     }
 
-    /// Randomized startup stagger for the `slot`-th overdue loop. The
-    /// deterministic `stagger * slot` ladder still put every launch's loops in
-    /// the same order at the same offsets; the draw spreads them across the
-    /// slot's own window. Bounded by `maximumStartupStagger` so a data root
-    /// with dozens of starved loops cannot push the last one minutes out, and
-    /// `firstTickDelay` additionally clamps it to the loop's period.
+    /// Randomize overdue startup slots within this ceiling; firstTickDelay also caps them to the period.
     public static let maximumStartupStagger: TimeInterval = 60
 
     public static func randomizedStagger(
@@ -618,13 +161,7 @@ public actor SwiftNativeLoopScheduler {
         return min(max(jitter(0...capped), 0), capped)
     }
 
-    /// First-sleep rule after (re)start. Pure so it can be pinned directly.
-    ///
-    /// - no persisted last-run → sleep the full period (the loop's clock
-    ///   starts now; the seed written at spawn makes the NEXT launch honor it)
-    /// - period already elapsed → tick after `stagger` (bounded by the period)
-    /// - otherwise → sleep only the remainder, clamped to the period so a
-    ///   backwards clock jump cannot stretch the wait past one interval
+    /// Missing history waits one period; overdue work uses bounded stagger; other work waits the remainder, capped to one period.
     public static func firstTickDelay(
         interval: TimeInterval,
         lastRun: Date?,
@@ -652,14 +189,9 @@ public actor SwiftNativeLoopScheduler {
 
     func register(_ loop: any LoopRunner, wake: @escaping @Sendable () async -> Void) async {
         let id = loop.loopId
-        // Load durable last-run BEFORE any spawn so the first sleep can be the
-        // remainder of the period rather than a fresh full interval.
+        // Load durable history before spawning so the first wait uses the remaining interval.
         await loadPersistedStateIfNeeded()
-        // First time we have ever seen this loop: start its durable clock now.
-        // Written synchronously (not fire-and-forget) so a process that exits
-        // shortly after launch still leaves the stamp behind — otherwise a
-        // weekly loop's clock resets on every restart, which is the starvation
-        // bug itself.
+        // Persist first registration synchronously so relaunch cannot reset its clock.
         let stampedFirstSeen: Bool
         if persistedFirstSeen[id] == nil, persistedStateFault == nil {
             persistedFirstSeen[id] = clock()
@@ -674,19 +206,10 @@ public actor SwiftNativeLoopScheduler {
         } else if persistedLastRun[id] == nil {
             await recordDurableRun(loopId: id, at: clock())
         } else if stampedFirstSeen {
-            // `recordDurableRun` above flushes; this is the OTHER case — a loop
-            // an older build already knew (it has a run stamp) but that has no
-            // first-seen stamp yet. Written synchronously for the same reason
-            // the run stamp is: a process that exits shortly after launch must
-            // not keep re-stamping "first seen" as now on every relaunch, which
-            // would hold the dormancy clock at zero forever.
+            // A run stamp without firstSeen still needs a synchronous dormancy-floor write.
             await flushLoopState()
         }
-        // If this loopId is already registered, cancel the old task before
-        // installing the new registration. The old task's generation token
-        // is stale; without cancelling it, spawnTaskIfNeeded() would refuse
-        // to spawn a new task (tasks[id] != nil) and the new loop would
-        // never run.
+        // Retire the previous task before replacement so its slot admits the new registration.
         if let previous = loops[id] {
             tasks.removeValue(forKey: id)?.cancel()
             await previous.loop.shutdown()
@@ -713,19 +236,16 @@ public actor SwiftNativeLoopScheduler {
         }
     }
 
-    /// Close scheduled work and passive domain resources while retaining the
+    /// Drain scheduled work and passive domain resources while retaining the
     /// registration: a canceled replacement must preserve its physical gate.
     func stopWorkForReplacement(loopId: String) async {
         tasks.removeValue(forKey: loopId)?.cancel()
         await loops[loopId]?.loop.shutdown()
     }
 
-    public func unregister(loopId: String) async {
-        if let t = tasks.removeValue(forKey: loopId) {
-            t.cancel()
-        }
-        let removed = loops.removeValue(forKey: loopId)
-        await removed?.loop.shutdown()
+    /// Remove a registration already drained by `stopWorkForReplacement`.
+    public func unregister(loopId: String) {
+        loops.removeValue(forKey: loopId)
         states.removeValue(forKey: loopId)
         // A replacement loop starts its own execution backoff.
         consecutiveFailures.removeValue(forKey: loopId)
@@ -853,11 +373,7 @@ public actor SwiftNativeLoopScheduler {
                 // returns — a tick that suspended a long time may have been
                 // raced by stop(); exit the loop before sleeping again.
                 if Task.isCancelled { return }
-                // The next delay is computed on the actor because it depends on
-                // the loop's live failure streak AND on when THIS tick started
-                // (see nextDelay: `interval` measured from tick end is what
-                // turned a 6h loop with a 25-minute tick into a 6h25m loop,
-                // permanently, across restarts).
+                // The actor computes cadence from tick start and the live failure streak.
                 guard let next = await self.nextDelay(
                     for: capturedLoop, registrationId: capturedRegId, tickStartedAt: tickStartedAt
                 ) else { return }
@@ -865,9 +381,7 @@ public actor SwiftNativeLoopScheduler {
             }
         }
         tasks[id] = task
-        // Seed nextTickAt so consumers see a forward-looking time even
-        // before the first tick lands. It must reflect the ACTUAL first
-        // delay, or Doctor's overdue check would disagree with the scheduler.
+        // Publish the actual first delay for Doctor's overdue check.
         var st = states[id] ?? LoopState(loopId: id)
         st.nextTickAt = now.addingTimeInterval(firstDelay)
         states[id] = st
@@ -877,22 +391,8 @@ public actor SwiftNativeLoopScheduler {
     /// stamp a tick's START without capturing the closure itself.
     private func currentClock() -> Date { clock() }
 
-    /// Delay before the NEXT tick of `loop`.
-    ///
-    /// Two rules, both fixes for shipped drift/hammering bugs:
-    ///
-    /// * FAILING (`consecutiveFailures > 0`): back off exponentially with
-    ///   jitter from the tick's END, floored at the loop's own interval and
-    ///   capped by the policy. Reset happens implicitly — the streak is
-    ///   cleared on the first real success/health-bearing skip, so the very
-    ///   next delay returns to the normal cadence.
-    /// * HEALTHY: the next tick is scheduled `interval` after the tick's
-    ///   START, not after it returned. Tick-end scheduling made every loop's
-    ///   effective period `interval + tickDuration` and that drift persisted
-    ///   across restarts through the durable last-run stamp.
-    ///
-    /// Both branches are floored at `minimumTickSpacing` so a tick that
-    /// outruns its own interval cannot become a busy spin.
+    /// Failure backoff runs from tick end and resets on success or health-bearing skip; healthy cadence runs from tick start.
+    /// Both delays respect minimumTickSpacing, and the published nextTickAt includes jitter.
     private func nextDelay(
         for loop: any LoopRunner, registrationId: UUID, tickStartedAt: Date
     ) -> TimeInterval? {
@@ -908,435 +408,18 @@ public actor SwiftNativeLoopScheduler {
             delay = max(minimumTickSpacing, max(interval, backoff))
         } else {
             let elapsed = max(0, now.timeIntervalSince(tickStartedAt))
-            // C5: jitter the HEALTHY branch only. The failing branch already
-            // jitters through the backoff policy, and `nextTickAt` below is
-            // stamped from this jittered delay, so Doctor's overdue check reads
-            // the same time the task actually sleeps to.
+            // Healthy jitter and published nextTickAt use the same delay.
             delay = Self.jitteredHealthyDelay(
                 base: max(minimumTickSpacing, interval - elapsed),
                 interval: interval,
                 jitter: jitter
             )
         }
-        // Keep the advertised next-tick time honest: Doctor's overdue check
-        // reads this, and after backoff/drift correction `now + interval` is
-        // simply wrong.
+        // Publish the same corrected delay Doctor will inspect.
         if var st = states[id] {
             st.nextTickAt = now.addingTimeInterval(delay)
             states[id] = st
         }
         return delay
-    }
-
-    // MARK: durable per-loop run state (LOOPS-4)
-
-    /// Reads the durable map at most once. `register` and `start` both suspend
-    /// here, so the in-flight read is memoized as a Task and later callers AWAIT
-    /// it — a plain `loaded = true` flag would let a second concurrent
-    /// `register` spawn against a still-empty map and sleep a full interval.
-    private func loadPersistedStateIfNeeded() async {
-        if persistedStateLoaded { return }
-        let load: Task<PersistedLoopState, Never>
-        if let inFlight = persistedStateLoad {
-            load = inFlight
-        } else {
-            let path = loopStatePath
-            load = Task { await Self.readLoopState(path) }
-            persistedStateLoad = load
-        }
-        let loaded = await load.value
-        guard !persistedStateLoaded else { return }
-        persistedStateLoaded = true
-        persistedStateLoad = nil
-        // Never clobber a stamp recorded while the read was in flight — that
-        // one is newer than anything on disk.
-        for (id, date) in loaded.runs where persistedLastRun[id] == nil {
-            persistedLastRun[id] = date
-        }
-        for (id, date) in loaded.completions where persistedLastCompleted[id] == nil {
-            persistedLastCompleted[id] = date
-        }
-        // First-seen is the OLDEST stamp, not the newest: a register that ran
-        // while the read was in flight recorded "now", and disk holds the truth.
-        for (id, date) in loaded.firstSeen {
-            persistedFirstSeen[id] = [persistedFirstSeen[id], date].compactMap { $0 }.min()
-        }
-        for (organ, pulse) in loaded.pulses where persistedPulses[organ] == nil {
-            persistedPulses[organ] = pulse
-        }
-        if let fault = loaded.fault {
-            persistedStateFault = fault
-            await appendFailureReceipt(loopId: Self.loopStateReceiptId,
-                error: fault + "; every loop's timing restarted from this launch")
-        }
-    }
-
-
-    /// A missing file yields no persisted history. A damaged one (readJSON
-    /// keeps corrupt bytes beside it) or damaged entries yield what survived
-    /// plus the fault, so startup never blocks and the damage is never silent.
-    package static func readLoopState(
-        _ path: URL?
-    ) async -> PersistedLoopState {
-        guard let path else { return ([:], [:], [:], [:], nil) }
-        let value: JSONValue
-        do {
-            value = try await SwiftNativePersistenceCore().readJSON(path, ifMissing: .object([:]))
-        } catch {
-            nativeLog("BackgroundLoops: loop state unreadable, starting with no run history: %@", "\(error)")
-            return ([:], [:], [:], [:], "Loop run history unreadable: \(error.localizedDescription)")
-        }
-        return decodeLoopState(value)
-    }
-
-    package static func decodeLoopState(_ value: JSONValue) -> PersistedLoopState {
-        guard case .object(let root) = value else {
-            return ([:], [:], [:], [:], "Loop run history is not a JSON object")
-        }
-        let iso = ISO8601DateFormatter()
-        var damaged: [String] = []
-        func stamps(_ key: String) -> [String: Date] {
-            guard let section = root[key] else { return [:] }
-            guard case .object(let rows) = section else { damaged.append(key); return [:] }
-            var result: [String: Date] = [:]
-            for (id, raw) in rows {
-                guard case .string(let stamp) = raw, let date = iso.date(from: stamp) else {
-                    damaged.append("\(key).\(id)")
-                    continue
-                }
-                result[id] = date
-            }
-            return result
-        }
-        var pulses: [String: OrganPulse] = [:]
-        if case .object(let rows)? = root["pulses"] {
-            for (organ, raw) in rows {
-                guard case .object(let row) = raw,
-                      case .string(let stamp)? = row["at"], let at = iso.date(from: stamp),
-                      case .string(let word)? = row["outcome"], let outcome = OrganPulse.Outcome(rawValue: word)
-                else { damaged.append("pulses.\(organ)"); continue }
-                let note: String = if case .string(let text)? = row["note"] { text } else { "" }
-                let cadence: TimeInterval? = switch row["cadenceSeconds"] {
-                case .int(let seconds)?: TimeInterval(seconds)
-                case .double(let seconds)?: seconds
-                default: nil
-                }
-                pulses[organ] = OrganPulse(organ: organ, at: at, outcome: outcome, note: note, cadence: cadence)
-            }
-        }
-        let runs = stamps("loops"), completions = stamps("completions"), firstSeen = stamps("firstSeen")
-        return (runs, completions, firstSeen, pulses,
-                damaged.isEmpty ? nil : "Loop run history has unreadable entries: " + damaged.sorted().joined(separator: ", "))
-    }
-
-    /// Serializes the whole (small — one entry per loop id ever registered)
-    /// map. Entries deliberately OUTLIVE `unregister`: a hot-reload via
-    /// `restartLoop` must not reset a weekly loop's due clock back to zero.
-    private func flushLoopState() async {
-        guard let loopStatePath else { return }
-        lastDurableFlushAt = clock()
-        let iso = ISO8601DateFormatter()
-        var loops: [String: JSONValue] = [:]
-        for (id, date) in persistedLastRun {
-            loops[id] = .string(iso.string(from: date))
-        }
-        var completions: [String: JSONValue] = [:]
-        for (id, date) in persistedLastCompleted {
-            completions[id] = .string(iso.string(from: date))
-        }
-        var firstSeen: [String: JSONValue] = [:]
-        for (id, date) in persistedFirstSeen {
-            firstSeen[id] = .string(iso.string(from: date))
-        }
-        let pulses = persistedPulses.mapValues { pulse -> JSONValue in
-            var row: [String: JSONValue] = [
-                "at": .string(iso.string(from: pulse.at)),
-                "outcome": .string(pulse.outcome.rawValue),
-                "note": .string(pulse.note),
-            ]
-            row["cadenceSeconds"] = pulse.cadence.map { .double($0) }
-            return .object(row)
-        }
-        let snapshot = JSONValue.object([
-            "version": .string("1"),
-            "loops": .object(loops),
-            "completions": .object(completions),
-            "firstSeen": .object(firstSeen),
-            "pulses": .object(pulses),
-        ])
-        let previous = persistedStateWrite
-        let write = Task {
-            await previous?.value
-            do {
-                try await persistence.writeJSON(snapshot, to: loopStatePath)
-                consecutiveFailures[Self.loopStateReceiptId] = 0
-            } catch {
-                lastDurableFlushAt = nil
-                FileHandle.standardError.write(Data(
-                    "BackgroundLoops: failed to persist loop run state: \(error)\n".utf8
-                ))
-                // The attempt outlives this process as a receipt; repeats coalesce.
-                await appendFailureReceipt(loopId: Self.loopStateReceiptId,
-                    error: "Loop run history could not be saved: \(error.localizedDescription)")
-                consecutiveFailures[Self.loopStateReceiptId, default: 0] += 1
-            }
-        }
-        persistedStateWrite = write
-        await write.value
-    }
-
-    /// Keep sub-minute liveness current in memory and checkpoint it on an
-    /// existing tick. Long-period and unclassified work stays immediately
-    /// durable; stop flushes the final live stamps without another wakeup.
-    private func recordDurableRun(loopId: String, at date: Date) async {
-        persistedLastRun[loopId] = date
-        await flushLoopState(cadence: loops[loopId]?.loop.interval, at: date)
-    }
-
-    private func flushLoopState(cadence: TimeInterval?, at date: Date) async {
-        if let cadence, cadence < durableFlushImmediateInterval,
-           let lastDurableFlushAt,
-           date.timeIntervalSince(lastDurableFlushAt) < durableFlushImmediateInterval {
-            return
-        }
-        await flushLoopState()
-    }
-
-    /// An organ's pulse rides the same checkpoint rule as a loop's run stamp.
-    func recordPulse(_ pulse: OrganPulse) async {
-        await loadPersistedStateIfNeeded()
-        if let held = persistedPulses[pulse.organ], held.at > pulse.at { return }
-        persistedPulses[pulse.organ] = pulse
-        await flushLoopState(cadence: pulse.cadence, at: pulse.at)
-    }
-
-    func organPulses() async -> [OrganPulse] {
-        await loadPersistedStateIfNeeded()
-        return Array(persistedPulses.values)
-    }
-
-
-    /// W1(b) upgrade campaign (L4-02): a closed lid is not a broken agent.
-    /// 556 of 2,064 failure receipts over 32 days were literally "the
-    /// internet is offline" — they polluted the durable receipt file, counted
-    /// toward Doctor's persistent-failure threshold, and manufactured the
-    /// ok→fail transitions that re-paged User about his own wifi. Definitely-
-    /// offline errors mint no receipt, count no streak, fire no push.
-    /// Deliberately EXCLUDES plain timeouts (-1001 / "timed out"): the
-    /// github_tracking 120s-timeout defect (L4-03) surfaces as timeouts, and
-    /// classifying those as offline would bury a real bug.
-    static func isOfflineError(_ error: String) -> Bool {
-        let e = error.lowercased()
-        if e.contains("internet connection appears to be offline") { return true }
-        if e.contains("network connection was lost") { return true }
-        if e.contains("socket is not connected") { return true }
-        if e.contains("nsurlerrordomain") {
-            for code in ["-1009", "-1005", "-1003"]
-            where e.contains("code=\(code)") || e.contains("code \(code)") {
-                return true
-            }
-        }
-        if e.contains("nsposixerrordomain"),
-           e.contains("code=57") || e.contains("code=60")
-            || e.contains("code 57") || e.contains("code 60") {
-            return true
-        }
-        return false
-    }
-
-    /// Network weather belongs to the loop's retry cadence, not a finding.
-    static func isRetriedNetworkError(_ error: String) -> Bool {
-        if isOfflineError(error) { return true }
-        let e = error.lowercased()
-        if e.contains("nsurlerrordomain"), ["-1001", "-1003", "-1004", "-1005", "-1009"].contains(where: {
-            e.contains("code=\($0)") || e.contains("code \($0)") || e.contains("error \($0)")
-        }) { return true }
-        if ["the request timed out", "could not connect to the server",
-            "a server with the specified hostname could not be found"].contains(where: e.contains) { return true }
-        return e.range(of: #"(server status|http) 5\d\d"#, options: .regularExpression) != nil
-    }
-
-    /// L4-13: an error whose `localizedDescription` is empty ("The operation
-    /// couldn't be completed" with no reason, or a custom Error with an empty
-    /// message) produced receipts whose `error` field was blank — a failure row
-    /// that says nothing. Loops should build strings via
-    /// `Self.describeLoopError(_:)`; this guard is the backstop for any string
-    /// that arrives empty anyway.
-    package static func describeLoopError(_ error: any Error) -> String {
-        let described = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !described.isEmpty { return described }
-        let ns = error as NSError
-        return "\(type(of: error)) (\(ns.domain) code \(ns.code))"
-    }
-
-    /// FIX-13: per receipt, this path used to read the WHOLE failure feed,
-    /// coalesce in memory, rewrite it durably, and then let `enforceJSONLLineCap`
-    /// read and rewrite it a second time — all under the feed lock, at exactly
-    /// the moment a flapping loop mints receipts fastest (4 MB of I/O per row on
-    /// a 1 MB feed). It is now append-only:
-    ///   * the coalescing DECISION comes from the in-memory consecutive-failure
-    ///     streak plus the row this process last wrote, never from re-reading;
-    ///   * a coalesced repeat rewrites only the trailing line in place (and
-    ///     therefore needs no cap check — the line count did not change);
-    ///   * a new row goes through the shared capped append, whose line cap is
-    ///     amortized behind the same byte trigger `activity/events.jsonl` and
-    ///     `traces/events.jsonl` already use.
-    /// The on-disk shape is unchanged: one coalesced row per incident.
-    private func appendFailureReceipt(loopId: String, error: String) async {
-        guard let failureReceiptsPath else { return }
-        guard !Self.isOfflineError(error) else { return }
-        let trimmed = error.trimmingCharacters(in: .whitespacesAndNewlines)
-        let boundedError = trimmed.isEmpty
-            ? "unspecified failure (empty error description)"
-            : String(trimmed.prefix(2_000))
-        let now = ISO8601DateFormatter().string(from: clock())
-        let incident = FailureReceiptIncident(
-            loopId: loopId,
-            error: boundedError,
-            firstAt: now,
-            lastAt: now
-        )
-        // Same predicate as before — "this loop is mid-streak and the last
-        // receipt was this exact failure" — but answered from memory.
-        let coalesceTarget: LastFailureReceipt? = {
-            guard (consecutiveFailures[loopId] ?? 0) > 0,
-                  let last = lastFailureReceipt,
-                  last.incident.loopId == loopId,
-                  last.incident.error == boundedError else { return nil }
-            return last
-        }()
-        let path = failureReceiptsPath
-        let persistence = self.persistence
-        do {
-            let written: LastFailureReceipt? = try await persistence.withFileLock(path) {
-                if let target = coalesceTarget {
-                    let merged = target.incident.coalescing(incident)
-                    let row = merged.toJSON(id: target.id)
-                    if let bytes = try? Self.jsonlLineBytes(row),
-                       Self.replaceTrailingLine(target.bytes, with: bytes, at: path) {
-                        return LastFailureReceipt(incident: merged, id: target.id, bytes: bytes)
-                    }
-                    // The tail is not ours any more (another process appended,
-                    // or the feed was trimmed): fall through and append.
-                }
-                let id = UUID().uuidString.lowercased()
-                let row = incident.toJSON(id: id)
-                try await appendJSONLCapped(
-                    row,
-                    to: path,
-                    using: persistence,
-                    maxLines: JSONLLineCaps.backgroundLoopFailures,
-                    logLabel: "BackgroundLoops.failures",
-                    takeLock: false,
-                    trimWhenBytesExceed: Self.failureReceiptTrimTriggerBytes,
-                    durable: true
-                )
-                guard let bytes = try? Self.jsonlLineBytes(row) else { return nil }
-                return LastFailureReceipt(incident: incident, id: id, bytes: bytes)
-            }
-            lastFailureReceipt = written
-        } catch {
-            // The row may or may not have landed — forget the memo rather than
-            // coalescing the next failure into a line we cannot vouch for.
-            lastFailureReceipt = nil
-            FileHandle.standardError.write(Data(
-                "BackgroundLoops: failed to persist \(loopId) failure receipt: \(error)\n".utf8
-            ))
-        }
-    }
-
-    /// The exact bytes `appendJSONLDurable` writes for one row.
-    private static func jsonlLineBytes(_ row: JSONValue) throws -> Data {
-        Data((try row.serialize(pretty: false) + "\n").utf8)
-    }
-
-    /// Rewrites ONLY the feed's trailing line, in place, and returns whether it
-    /// did. False means the tail is not the bytes we remember writing — another
-    /// process appended, or a trim moved the file — and the caller must append a
-    /// fresh row instead of clobbering someone else's receipt. The replacement
-    /// is written BEFORE the truncate so no interruption can leave the row
-    /// missing entirely. The caller holds the feed lock.
-    private static func replaceTrailingLine(
-        _ expected: Data, with replacement: Data, at path: URL
-    ) -> Bool {
-        guard !expected.isEmpty, !replacement.isEmpty else { return false }
-        guard let handle = try? FileHandle(forUpdating: path) else { return false }
-        defer { try? handle.close() }
-        guard let size = try? handle.seekToEnd(), size >= UInt64(expected.count) else { return false }
-        let offset = size - UInt64(expected.count)
-        guard (try? handle.seek(toOffset: offset)) != nil,
-              let tail = try? handle.readToEnd(),
-              tail == expected else { return false }
-        do {
-            try handle.seek(toOffset: offset)
-            try handle.write(contentsOf: replacement)
-            try handle.truncate(atOffset: offset + UInt64(replacement.count))
-            // The append this replaces was fsync'd; the rewrite must not be the
-            // weak link.
-            try handle.synchronize()
-        } catch {
-            return false
-        }
-        return true
-    }
-
-    private func recordFailureOutcome(
-        loopId: String, error: String
-    ) async {
-        if !Self.isOfflineError(error) {
-            consecutiveFailures[loopId, default: 0] += 1
-        }
-        failureRecoveryProbePending.insert(loopId)
-        if !Self.isRetriedNetworkError(error) { await failureOutcome?(loopId, error) }
-    }
-
-    /// A timeout records failure without advancing the durable due clock.
-    func recordFailure(
-        loopId: String, error: String, advanceDurableRun: Bool = true
-    ) async {
-        var st = states[loopId] ?? LoopState(loopId: loopId)
-        let now = clock()
-        st.lastError = error
-        st.lastTickAt = now
-        st.tickCount += 1
-        st.lastResult = "failed"
-        if let reg = loops[loopId] {
-            st.nextTickAt = now.addingTimeInterval(reg.loop.interval)
-        }
-        states[loopId] = st
-        if advanceDurableRun {
-            await recordDurableRun(loopId: loopId, at: now)
-        }
-        await appendFailureReceipt(loopId: loopId, error: error)
-        await recordFailureOutcome(loopId: loopId, error: error)
-    }
-
-    /// `completedWork: false` records the tick without advancing the durable
-    /// last-COMPLETED stamp — the out-of-band `.skipped` path passes it so a
-    /// lane that only ever skips cannot masquerade as productive (C8).
-    func recordResult(
-        loopId: String, result: String, completedWork: Bool = true
-    ) async {
-        var st = states[loopId] ?? LoopState(loopId: loopId)
-        let now = clock()
-        st.lastResult = result
-        st.lastError = nil
-        if completedWork {
-            st.lastCompletedAt = now
-            persistedLastCompleted[loopId] = now
-        }
-        st.lastTickAt = now
-        st.tickCount += 1
-        if let reg = loops[loopId] {
-            st.nextTickAt = now.addingTimeInterval(reg.loop.interval)
-        }
-        states[loopId] = st
-        await recordDurableRun(loopId: loopId, at: now)
-        consecutiveFailures[loopId] = 0
-        if failureRecoveryProbePending.contains(loopId),
-           let recovery = failureRecoveryPush,
-           await recovery(loopId, now) {
-            failureRecoveryProbePending.remove(loopId)
-        }
     }
 }

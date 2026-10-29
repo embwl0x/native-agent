@@ -1,8 +1,10 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import TelegramBot
 import TriggerScheduler
+import DreamREMCycle
 // Blueprint: | `SchedulerDueJobRunner+CycleHelpers.swift` | `SchedulerDueJobRunner`: `pruneRetiredRows`, `nextEpoch`, `containsLastRunToday`; dream/REM diary and inbox helpers |
 
 extension SchedulerDueJobRunner {
@@ -11,7 +13,6 @@ extension SchedulerDueJobRunner {
 
     static func pruneRetiredRows(
         _ rows: [JSONValue],
-        liveActions: Set<String>,
         now: Date
     ) -> (rows: [JSONValue], retired: [JSONValue]) {
         var kept: [JSONValue] = []
@@ -27,22 +28,12 @@ extension SchedulerDueJobRunner {
             let kind = (SchedulerJobRuntime.string(obj["kind"]) ?? "notify").lowercased()
             let enabled = SchedulerJobRuntime.bool(obj["enabled"], default: true)
             // Held work retains the owner of its resume/reconciliation lever.
-            if SchedulerJobRuntime.string(obj["lastRunStatus"]) == "unknown"
+            if obj["activeOccurrence"] != nil
+                || SchedulerJobRuntime.string(obj["lastRunStatus"]) == "unknown"
                 || SchedulerJobRuntime.string(obj["pausedAt"]) != nil
                 || (!enabled && SchedulerJobRuntime.string(obj["completedAt"]) == nil
                     && !(SchedulerJobRuntime.string(obj["disabledReason"]) ?? "").isEmpty) {
                 kept.append(row)
-                continue
-            }
-            // A job naming a gone action pauses whole, so she can replace it with what she grows.
-            if enabled, JobKind(rawValue: kind) == .connectorAction, case .object(let payload)? = obj["payload"],
-               let action = SchedulerJobRuntime.string(payload["actionId"]) ?? SchedulerJobRuntime.string(payload["action_id"]),
-               !liveActions.contains(action) {
-                var paused = obj
-                paused["enabled"] = .bool(false)
-                paused["pausedAt"] = .string(NativeTimestampFormat.fractionalZulu(now))
-                paused["disabledReason"] = .string("its action \(action) is gone; grow an ability for it and schedule that instead")
-                kept.append(.object(paused))
                 continue
             }
             let lastRun = SchedulerJobRuntime.string(obj["lastRunAt"]).flatMap(parseISODate)
@@ -88,11 +79,12 @@ extension SchedulerDueJobRunner {
             "oneShot": .bool(false),
             "schedule": .object(schedule),
         ])
-        return try SchedulerJobRuntime.nextRunEpoch(
+        guard let next = try SchedulerJobRuntime.nextRunEpoch(
             for: job,
             afterEpoch: now.timeIntervalSince1970,
             now: { now }
-        )!
+        ) else { throw NSError(domain: "NativeAgentScheduler", code: -413, userInfo: [NSLocalizedDescriptionKey: "cycle_schedule_missing: no next occurrence"]) }
+        return next
     }
 
     static func containsLastRunToday(rows: [JSONValue], kind: String, dateKey: String, includingFailed: Bool = false) -> Bool {
@@ -132,62 +124,19 @@ extension SchedulerDueJobRunner {
         return dates
     }
 
-    static func hasDreamEntry(dataRoot: URL, dateKey: String) -> Bool {
-        let dir = dataRoot.appendingPathComponent("dream_diary", isDirectory: true)
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return false }
-        return names.contains { name in
-            name == "\(dateKey).md" || (name.hasPrefix("\(dateKey)_") && name.hasSuffix(".md"))
-        }
-    }
-
     static func dreamEntriesForToday(dataRoot: URL, dateKey: String) -> [DreamDiarySnippet] {
-        let dir = dataRoot.appendingPathComponent("dream_diary", isDirectory: true)
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return [] }
-        let urls = names
-            .filter { $0 == "\(dateKey).md" || ($0.hasPrefix("\(dateKey)_") && $0.hasSuffix(".md")) }
-            .map { dir.appendingPathComponent($0) }
-            .sorted { lhs, rhs in
-                modificationDate(lhs) > modificationDate(rhs)
+        let files = (try? FileBackedDreamDiary(dataRoot: dataRoot).discover(in: .active, matching: .markdown)) ?? []
+        let newest = files
+            .filter { $0.name == "\(dateKey).md" || $0.name.hasPrefix("\(dateKey)_") }
+            .map { file in
+                (file.url, (try? file.url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast)
             }
-        return urls.prefix(5).map { url in
+            .sorted { $0.1 > $1.1 }
+        return newest.prefix(5).map { url, _ in
             let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-            let extracted = extractDreamTitleAndSummary(text)
-            return DreamDiarySnippet(path: url.path, title: extracted.title, summary: extracted.summary)
+            let dream = DreamNight(text).latest
+            return DreamDiarySnippet(path: url.path, title: dream?.title ?? "", summary: dream?.summary ?? "")
         }
-    }
-
-    static func modificationDate(_ url: URL) -> Date {
-        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
-              let date = attrs[.modificationDate] as? Date else {
-            return .distantPast
-        }
-        return date
-    }
-
-    static func extractDreamTitleAndSummary(_ text: String) -> (title: String, summary: String) {
-        // A day's entry can hold several dream sections; the receipt names the newest.
-        let newest = text.range(of: "\n## ", options: .backwards).map { String(text[$0.lowerBound...]) } ?? text
-        let lines = newest
-            .split(whereSeparator: \.isNewline)
-            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        var title = ""
-        var summary = ""
-        for line in lines {
-            if line.hasPrefix("#") { continue }
-            if title.isEmpty, line.hasPrefix("**"), line.hasSuffix("**"), line.count > 4 {
-                title = String(line.dropFirst(2).dropLast(2))
-                continue
-            }
-            if line.hasPrefix("**") || line.hasPrefix("_Mood:") || line.hasPrefix("- ") {
-                continue
-            }
-            if summary.isEmpty {
-                summary = line
-                break
-            }
-        }
-        return (title, summary)
     }
 
     static func dreamInboxMessage(
@@ -199,12 +148,7 @@ extension SchedulerDueJobRunner {
         var lines: [String] = []
         if entriesWritten <= 0, !errors.isEmpty {
             lines.append("Dream cycle hit a provider or runtime error before writing a diary entry.")
-            // User, 2026-09-13 (a 0.4.11 install): the generic sentence plus the
-            // trailing "Errors:" block read as "something went wrong" in the
-            // notification, while the actual cause was one sentence the backend
-            // had already said ("The 'gpt-5.4-mini' model is not supported when
-            // using Codex with a ChatGPT account"). Put the real line second so
-            // it survives into the notification body.
+            // Put the error detail second so it survives notification truncation.
             if let detail = firstErrorDetailLine(errors) {
                 lines.append(detail)
             }
@@ -270,8 +214,7 @@ extension SchedulerDueJobRunner {
     }
 
     static func remRelatedPaths(dataRoot: URL) -> [String] {
-        // Canonical REM stores (2026-06-10 cutover): proposals + pins live at
-        // the dataRoot root; harness/rem_proposals.jsonl is import-only.
+        // REM proposals and pins live at dataRoot; harness/rem_proposals.jsonl is import-only.
         [
             dataRoot.appendingPathComponent("rem_proposals.jsonl").path,
             dataRoot.appendingPathComponent("rem_pins.json").path,
@@ -316,11 +259,10 @@ extension SchedulerDueJobRunner {
 
     static func jsonValue(from dictionary: [String: Any]) -> JSONValue {
         guard JSONSerialization.isValidJSONObject(dictionary),
-              let data = try? JSONSerialization.data(withJSONObject: dictionary),
-              let parsed = try? JSONValue.parse(data) else {
+              let fields = try? NativeActionWire.jsonValueBody(dictionary) else {
             return .object([:])
         }
-        return parsed
+        return .object(fields)
     }
 
     static func object(_ value: JSONValue) -> [String: JSONValue] {

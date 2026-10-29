@@ -65,7 +65,7 @@ public struct DiskStorageOwner: Sendable {
         let resolved = candidate.resolvingSymlinksInPath()
         guard !path.isEmpty, !path.hasPrefix("/"), !path.split(separator: "/").contains(".."),
               resolved.path == root.appendingPathComponent(path).standardizedFileURL.path,
-              resolved.path.hasPrefix(root.path + "/"),
+              NativeAgentWorkspaceRoot.relativePath(resolved.path, under: root.path).map({ !$0.isEmpty }) == true,
               try candidate.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink != true else {
             throw CocoaError(.fileReadInvalidFileName)
         }

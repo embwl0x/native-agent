@@ -1,6 +1,7 @@
 import Foundation
+import NativeAgentShared
 
-// Blueprint: | `TimeoutRace.swift` | `TimeoutRaceLatch` and `raceAgainstTimeout`: first-wins operation/deadline coordination with explicit parent-cancellation outcome |
+// Blueprint: | `TimeoutRace.swift` | `raceAgainstTimeout` through `ContinuationOnce`: first-wins operation/deadline coordination with explicit parent-cancellation outcome |
 
 /// Outcome of racing an async operation against a wall-clock deadline.
 public enum TimeoutRaceOutcome<T: Sendable>: Sendable {
@@ -15,40 +16,10 @@ public enum TimeoutRaceOutcome<T: Sendable>: Sendable {
     case cancelled
 }
 
-/// First-wins latch coordinating the body task and the deadline task. Whichever
-/// resolves first is delivered to the single waiter; later resolves are ignored.
-private actor TimeoutRaceLatch<T: Sendable> {
-    private var resolved: TimeoutRaceOutcome<T>?
-    private var waiter: CheckedContinuation<TimeoutRaceOutcome<T>, Never>?
-
-    func resolve(_ outcome: TimeoutRaceOutcome<T>, beforeResume: @Sendable () -> Void = {}) {
-        guard resolved == nil else { return }
-        resolved = outcome
-        beforeResume()
-        if let waiter {
-            self.waiter = nil
-            waiter.resume(returning: outcome)
-        }
-    }
-
-    func wait() async -> TimeoutRaceOutcome<T> {
-        if let resolved { return resolved }
-        return await withCheckedContinuation { continuation in
-            if let resolved {
-                continuation.resume(returning: resolved)
-            } else {
-                waiter = continuation
-            }
-        }
-    }
-}
-
 /// Race `operation` against `seconds`. Resolves on the FIRST of {operation
 /// completes, deadline elapses} WITHOUT structurally awaiting the loser: on
 /// timeout the operation's Task is cancelled and abandoned, so a non-cooperative
-/// body lingers in the background but never blocks the caller. Exposed at file
-/// scope (not actor-isolated) so it is directly unit-testable with a scripted
-/// closure.
+/// body lingers in the background but never blocks the caller.
 /// Timeout bounds only the response: execution exclusion/resources belong to
 /// the body's actual exit (`onBodyExit`), never to the returned timeout receipt.
 public func raceAgainstTimeout<T: Sendable>(
@@ -66,27 +37,27 @@ public func raceAgainstTimeout<T: Sendable>(
     onBodyExit: @escaping @Sendable () -> Void = {},
     _ operation: @escaping @Sendable () async throws -> T
 ) async -> TimeoutRaceOutcome<T> {
-    let latch = TimeoutRaceLatch<T>()
+    let latch = ContinuationOnce<TimeoutRaceOutcome<T>>()
     let bodyTask = Task {
         defer { onBodyExit() }
         do {
             let value = try await operation()
-            await latch.resolve(.value(value))
+            latch.resume(.value(value))
         } catch is CancellationError {
             // The canceller (deadline or parent) owns `.cancelled`. A body that
             // threw CancellationError on its own is a failure of that job, not
             // a stop of the pass, and it must settle rather than wait for the
             // deadline.
-            if !Task.isCancelled { await latch.resolve(.failure("job cancelled itself")) }
+            if !Task.isCancelled { latch.resume(.failure("job cancelled itself")) }
         } catch {
-            await latch.resolve(.failure(error.localizedDescription))
+            latch.resume(.failure(error.localizedDescription))
         }
     }
     let timerTask = Task {
         do { try await Task.sleep(nanoseconds: nanoseconds) } catch { return }
         // Claim the receipt before cancellation can trigger a body completion,
         // but set the body's cancellation flag before waking the caller.
-        await latch.resolve(.timedOut) { bodyTask.cancel() }
+        latch.resume(.timedOut) { bodyTask.cancel() }
     }
 
     // Propagate PARENT cancellation into the race: if the enclosing task (the
@@ -96,11 +67,9 @@ public func raceAgainstTimeout<T: Sendable>(
     let outcome = await withTaskCancellationHandler {
         await latch.wait()
     } onCancel: {
-        Task {
-            await latch.resolve(.cancelled) {
-                bodyTask.cancel()
-                timerTask.cancel()
-            }
+        latch.resume(.cancelled) {
+            bodyTask.cancel()
+            timerTask.cancel()
         }
     }
     timerTask.cancel()

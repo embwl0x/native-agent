@@ -1,7 +1,7 @@
 [actions.Run]
-command = "./script/build_and_run.sh"
-description = "Build and launch the Swift-native NativeAgent app"
+command = "./script/install_app.sh"
+description = "Build, sign, install and launch NativeAgent; verify authenticated readiness and source identity"
 
 [actions.BuildLaunchCheck]
-command = "./script/build_and_run.sh --verify"
-description = "Build/sign, launch, check PID after 2 seconds, then quit; refused in Codex shells"
+command = "./script/install_app.sh"
+description = "Build, sign, install and launch NativeAgent; verify authenticated readiness and source identity"

@@ -1,6 +1,6 @@
 import Foundation
 import SwiftUI
-// Blueprint: | `AdvancedPageComponents.swift` | `AdvancedEyebrow` struct |
+// Blueprint: | `AdvancedPageComponents.swift` | Shared Advanced page sections and read status |
 
 /// A stable quiet slot for a page read; cached content stays mounted below it.
 struct PageReadStatus: View {
@@ -23,23 +23,7 @@ struct PageReadStatus: View {
 
 // MARK: - The Advanced page kit
 //
-// 2026-09-03 finish pass. Capabilities, Knowledge Graph and Dreams sit inside
-// `ShellPageFrame` (SetupView.swift:110), which already draws the back row, the
-// title and the sheet. These are the only surfaces the three pages add on top
-// of it: one card, one eyebrow, one empty state, one waiting line — everything
-// else is words on the sheet. Type comes from `ShellType`, colour from
-// `NativeAgentShell`, and nothing here paints a material.
-
-/// A section head, spelled exactly like the Advanced list's: 13 semibold,
-/// uppercase, 0.6 of tracking, on the sheet rather than on a plate.
-struct AdvancedEyebrow: View {
-    let text: String
-
-    // Alive glass (2026-09-23): the kit's eyebrow.
-    var body: some View {
-        AliveEyebrow(text)
-    }
-}
+// Page components use shell type and colour without painting another material.
 
 /// How a section's content sits under its eyebrow.
 enum AdvancedSectionCard {
@@ -229,70 +213,5 @@ struct AdvancedStat: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-/// A code at caption size, which `ShellType` has no token for (13 monospaced
-/// is `ShellType.code`). Sized off `ShellType`, never a loose number.
-enum AdvancedType {
-    static let codeCaption = Font.system(size: ShellType.captionSize, design: .monospaced)
-}
-
-/// A bare fold: a chevron, the words, and one gesture on the whole row. No
-/// plate, and the motion goes through the shell's fold spring.
-struct AdvancedFold<Content: View>: View {
-    let title: String
-    var subtitle: String = ""
-    /// What the fold would otherwise hide — the one signal that survives a
-    /// collapse.
-    var attention: String?
-    @Binding var isExpanded: Bool
-    @ViewBuilder var content: Content
-
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Button {
-                withAnimation(
-                    NativeAgentMotion.respecting(NativeAgentMotion.arrive, reduceMotion: reduceMotion)
-                ) {
-                    isExpanded.toggle()
-                }
-            } label: {
-                HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                        .font(ShellType.labelSemibold)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .padding(.top, 2)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(title)
-                            .font(ShellType.bodySemibold)
-                            .foregroundStyle(NativeAgentShell.text)
-                        if !subtitle.isEmpty {
-                            Text(subtitle)
-                                .font(ShellType.label)
-                                .foregroundStyle(NativeAgentShell.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                    Spacer(minLength: 8)
-                    // Folded, the count is one quiet word, not an alarm.
-                    if let attention {
-                        AdvancedStatusWord(status: nil, text: attention)
-                            .padding(.top, 2)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
-
-            if isExpanded {
-                content
-                    .transition(NativeAgentMotion.arrivalFade)
-            }
-        }
     }
 }

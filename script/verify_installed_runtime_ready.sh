@@ -1,21 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 3 || $# -gt 4 ]]; then
-  echo "usage: $0 <app-bundle> <expected-source-revision> <expected-dirty:true|false> [timeout-seconds]" >&2
+if [[ $# -lt 2 || $# -gt 3 ]]; then
+  echo "usage: $0 <app-bundle> <expected-source-content-id> [timeout-seconds]" >&2
   exit 2
 fi
 
 APP_BUNDLE="$1"
-EXPECTED_REVISION="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"
-EXPECTED_DIRTY="$3"
-TIMEOUT_SECONDS="${4:-20}"
+EXPECTED_CONTENT_ID="$2"
+TIMEOUT_SECONDS="${3:-20}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/nativeagent_bridge.sh
 source "$SCRIPT_DIR/lib/nativeagent_bridge.sh"
 
-if [[ "$EXPECTED_DIRTY" != "true" && "$EXPECTED_DIRTY" != "false" ]]; then
-  echo "expected-dirty must be true or false" >&2
+if ! [[ "$EXPECTED_CONTENT_ID" =~ ^[0-9a-f]{40}$ || "$EXPECTED_CONTENT_ID" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "expected-source-content-id must be a full Git tree ID" >&2
   exit 2
 fi
 if ! [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || (( TIMEOUT_SECONDS < 1 )); then
@@ -54,17 +53,12 @@ while (( SECONDS < deadline )); do
   fi
 
   chat_ready="$(/usr/bin/plutil -extract chatReady raw -o - "$state_file" 2>/dev/null || true)"
-  running_revision="$(/usr/bin/plutil -extract buildIdentity.sourceRevision raw -o - "$state_file" 2>/dev/null || true)"
-  running_dirty="$(/usr/bin/plutil -extract buildIdentity.sourceDirty raw -o - "$state_file" 2>/dev/null || true)"
-  running_revision="$(printf '%s' "$running_revision" | tr '[:upper:]' '[:lower:]')"
-  running_dirty="$(printf '%s' "$running_dirty" | tr '[:upper:]' '[:lower:]')"
+  running_content_id="$(/usr/bin/plutil -extract buildIdentity.sourceContentID raw -o - "$state_file" 2>/dev/null || true)"
 
   if [[ "$chat_ready" != "true" ]]; then
     last_reason="bridge answered but chatReady is not true"
-  elif [[ "$running_revision" != "$EXPECTED_REVISION" ]]; then
-    last_reason="running source revision '$running_revision' does not match '$EXPECTED_REVISION'"
-  elif [[ "$running_dirty" != "$EXPECTED_DIRTY" ]]; then
-    last_reason="running dirty state '$running_dirty' does not match '$EXPECTED_DIRTY'"
+  elif [[ "$running_content_id" != "$EXPECTED_CONTENT_ID" ]]; then
+    last_reason="running source content '$running_content_id' does not match '$EXPECTED_CONTENT_ID'"
   else
     echo "ready: authenticated bridge, chat, and source identity verified in $((SECONDS - started))s"
     exit 0

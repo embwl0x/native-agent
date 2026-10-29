@@ -1,5 +1,7 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
+import PersistenceCore
 
 // Blueprint: | `ErrorFeeds.swift` | `ErrorFeeds`: shared live error-feed inventory and bounded recent-burst scans for heartbeat and weekly improvement |
 
@@ -53,6 +55,7 @@ public enum ErrorFeeds {
         /// Rows inside `errorBurstWindow` (always 0 for a silent feed — it is
         /// not read at all).
         public let recentCount: Int
+        public let earliestExpiry: Date?
         /// Up to 30 of those rows, oldest-first, truncated for evidence.
         public let recentLines: [String]
     }
@@ -79,29 +82,24 @@ public enum ErrorFeeds {
             let silent = lastWriteAt.map { now.timeIntervalSince($0) > feedSilentAfter } ?? true
             guard !silent else {
                 return ErrorFeedStatus(
-                    feed: feed, recentCount: 0, recentLines: [])
+                    feed: feed, recentCount: 0, earliestExpiry: nil, recentLines: [])
             }
             let kept = recentRows(at: path, now: now)
             return ErrorFeedStatus(
                 feed: feed,
-                recentCount: kept.count,
-                recentLines: Array(kept.prefix(30).reversed()))
+                recentCount: kept.lines.count, earliestExpiry: kept.earliestExpiry,
+                recentLines: Array(kept.lines.prefix(30).reversed()))
         }
     }
 
     /// Newest-first rows inside the burst window from one feed's bounded tail.
-    private static func recentRows(at path: URL, now: Date) -> [String] {
-        guard let handle = try? FileHandle(forReadingFrom: path) else { return [] }
-        defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()) ?? 0
-        let start = size > UInt64(errorLogTailBytes) ? size - UInt64(errorLogTailBytes) : 0
-        try? handle.seek(toOffset: start)
-        guard let data = try? handle.readToEnd(),
-              let text = String(data: data, encoding: .utf8) else { return [] }
+    private static func recentRows(at path: URL, now: Date) -> (lines: [String], earliestExpiry: Date?) {
+        guard let read = try? SwiftNativePersistenceCore.tailPhysicalLines(path, limit: .max, maxBytes: errorLogTailBytes) else { return ([], nil) }
         let cutoff = now.addingTimeInterval(-errorBurstWindow)
         var kept: [String] = []
-        for line in text.split(separator: "\n").reversed() {
-            guard let lineData = line.data(using: .utf8),
+        var earliestExpiry: Date?
+        for lineData in read.lines.reversed() {
+            guard let line = String(data: lineData, encoding: .utf8),
                   let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
                   let ts = (obj["lastAt"] as? String ?? obj["createdAt"] as? String ?? obj["at"] as? String
                     ?? obj["ts"] as? String ?? obj["timestamp"] as? String).flatMap(parseISO)
@@ -110,11 +108,13 @@ public enum ErrorFeeds {
             // timestamps, and one stale row must not hide newer rows behind
             // it. The scan is already bounded by errorLogTailBytes.
             if ts < cutoff { continue }
-            // 2026-09-22: a wifi drop is not a fault.
-            if SwiftNativeLoopScheduler.isOfflineError(String(line)) { continue }
+            // Offline errors do not count as faults.
+            if SwiftNativeLoopScheduler.isOfflineError(line) { continue }
+            let expiry = ts.addingTimeInterval(errorBurstWindow + 0.001)
+            earliestExpiry = min(earliestExpiry ?? expiry, expiry)
             kept.append(line.prefix(280).description)
         }
-        return kept
+        return (kept, earliestExpiry)
     }
 
     // MARK: - Helpers

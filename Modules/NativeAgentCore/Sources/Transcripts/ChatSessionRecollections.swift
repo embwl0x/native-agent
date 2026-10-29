@@ -1,24 +1,17 @@
 import Foundation
+import NativeAgentShared
+import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `ChatSessionRecollections.swift` | Recollection row/coverage parsing, incremental scans and lock-protected timestamp formatters |
+// Blueprint: | `ChatSessionRecollections.swift` | Recollection row/coverage parsing, exchange pairing by conversation/run with runless adjacency, incremental scans and timestamps |
 
-/// The ONE accessor for a session's consolidated recollections.
-///
-/// NORTHSTAR clause 1 (one consolidation owner), sweep item 45. A chat
-/// transcript's older turns are distilled — off the critical path, as they age
+/// Shared row and coverage semantics for a session's consolidated recollections.
+/// A chat transcript's older turns are distilled as they age
 /// past the aging boundary — into `compaction_summary` rows. Those rows ARE the
 /// consolidated memory of the turns they replaced: the raw turns no longer
 /// exist in the transcript.
 ///
-/// Before this accessor there were two summarizers over the same lived session:
-/// the chat lane's compaction distiller and the dream lane's episodic pass,
-/// each re-reading raw turns. The dream lane now reads recollections through
-/// here instead of re-summarizing material the chat lane already consolidated.
-///
-/// This lives in PersistenceCore because BOTH sides must agree on the row
-/// shape and neither may import the other (ChatTurnRuntime → DreamREMCycle is
-/// the only arrow between them). Writer: `ChatSessionAutocompactor`.
-/// Reader: `DreamCycleRunner`.
+/// The compaction writer and dream reader share this row shape so consolidated
+/// material is not summarized again from raw turns.
 public struct ChatSessionRecollection: Sendable, Equatable {
     public let sessionId: String
     public let rowId: String?
@@ -65,6 +58,48 @@ public struct ChatSessionRecollection: Sendable, Equatable {
 }
 
 public enum ChatSessionRecollections {
+    /// Rows arrive in conversation order. Ineligible origins block their replies;
+    /// runless replies use adjacency, and other roles stand alone and break it.
+    /// Her own opening (a contact send, a post she started) answers no one and
+    /// stands as its own exchange: it is lived, not a reply to drop.
+    public static func pairExchanges(_ rows: [(conversation: String, run: String?, role: String, eligible: Bool)])
+        -> [(row: Int, origin: Int, exchange: Int, firstReply: Bool)] {
+        var current: [String: (exchange: Int, origin: Int)] = [:]
+        var runs: [String: [String: (exchange: Int, origin: Int?)]] = [:]
+        var asked = Set<String>(), answered: [String: Set<String>] = [:], blocked = Set<String>()
+        var paired: [(row: Int, origin: Int, exchange: Int, firstReply: Bool)] = []
+        for (index, row) in rows.enumerated() {
+            let conversation = row.conversation
+            if row.role == "user" {
+                let exchange = row.run.flatMap { runs[conversation]?[$0]?.exchange } ?? index
+                if let run = row.run { runs[conversation, default: [:]][run] = (exchange, row.eligible ? index : nil) }
+                guard row.eligible else { current[conversation] = nil; blocked.insert(conversation); continue }
+                blocked.remove(conversation)
+                current[conversation] = (exchange, index)
+                asked.insert(conversation)
+                paired.append((index, index, exchange, false))
+            } else if row.role == "assistant" {
+                guard row.eligible else { continue }
+                let pair: (exchange: Int, origin: Int)?
+                if let run = row.run {
+                    let saved = runs[conversation]?[run]
+                    pair = saved.flatMap { saved in saved.origin.map { (saved.exchange, $0) } }
+                } else { pair = current[conversation] }
+                guard let pair else {
+                    if row.run == nil, !blocked.contains(conversation) { paired.append((index, index, index, false)) }
+                    continue
+                }
+                let first = row.run.map { answered[conversation, default: []].insert($0).inserted } ?? asked.contains(conversation)
+                asked.remove(conversation)
+                paired.append((index, pair.origin, pair.exchange, first))
+            } else if row.eligible {
+                current[conversation] = nil
+                paired.append((index, index, index, false))
+            }
+        }
+        return paired
+    }
+
     /// One experience across live subjects, dated exchange refs and historical message IDs.
     public static func experienceIdentities(for references: [String], dataRoot: URL?) async throws -> [String: String] {
         try await ExperienceResolver(dataRoot: dataRoot).resolve(for: references, includingSourceRows: false).identities
@@ -135,28 +170,29 @@ public enum ChatSessionRecollections {
                         try ChatSessionRetention.transcriptFiles(dataRoot: dataRoot, sessionId: $0, archived: archived)
                     }
             }
+            let byID = Dictionary(grouping: messages, by: { $0.value.id })
             var readFiles: Set<URL> = []
             func read(_ files: [(String, URL)], isolation: isolated ExperienceResolver) async throws {
                 for (session, file) in files {
-                    let wanted = messages.filter { $0.value.session == nil || $0.value.session == session }
-                    guard !wanted.isEmpty, readFiles.insert(file.standardizedFileURL).inserted else { continue }
+                    guard messages.values.contains(where: { $0.session == nil || $0.session == session }),
+                          readFiles.insert(file.standardizedFileURL).inserted else { continue }
                     let key = file.standardizedFileURL
-                    if transcripts[key] == nil {
-                        transcripts[key] = Task {
-                            let read = try await SwiftNativePersistenceCore().readJSONLReporting(file)
-                            guard read.report.isClean else {
-                                throw PersistenceCoreError.ioFailure("experience identity transcript is incomplete: \(session)")
-                            }
-                            return read.rows
+                    let transcript = transcripts[key] ?? Task {
+                        let read = try await SwiftNativePersistenceCore.readJSONLReporting(file)
+                        guard read.report.isClean else {
+                            throw PersistenceCoreError.ioFailure("experience identity transcript is incomplete: \(session)")
                         }
+                        return read.rows
                     }
-                    for value in try await transcripts[key]!.value {
-                        guard case .object(let row) = value, case .string(let id)? = row["id"] else { continue }
+                    transcripts[key] = transcript
+                    for value in try await transcript.value {
+                        guard case .object(let row) = value, case .string(let id)? = row["id"],
+                              let matches = byID[UUID(uuidString: id)?.uuidString ?? id] else { continue }
                         let run: String?
                         if case .string(let value)? = row["runId"] { run = UUID(uuidString: value)?.uuidString ?? value }
                         else { run = nil }
-                        for (reference, message) in wanted where messages[reference] != nil
-                            && message.id == (UUID(uuidString: id)?.uuidString ?? id)
+                        for (reference, message) in matches where messages[reference] != nil
+                            && (message.session == nil || message.session == session)
                             && (message.run == nil || message.run == run) {
                             resolved[reference] = (session, row)
                             if let run, !run.isEmpty, !reference.hasPrefix("recollection:") {
@@ -170,50 +206,60 @@ public enum ChatSessionRecollections {
             }
             try await read(files([:]), isolation: self)
             if !messages.isEmpty {
-                if archived == nil { archived = Result { try ChatSessionRetention.archivedTranscripts(dataRoot: dataRoot) } }
-                try await read(files(archived!.get()), isolation: self)
+                let archive: Result<[String: [URL]], Error>
+                if let cached = archived {
+                    archive = cached
+                } else {
+                    archive = Result { try ChatSessionRetention.archivedTranscripts(dataRoot: dataRoot) }
+                    archived = archive
+                }
+                try await read(files(archive.get()), isolation: self)
             }
             self.identities.merge(identities) { _, new in new }
             return (identities, resolved)
         }
     }
 
-    public struct LatestScan: Sendable {
-        public let recollection: ChatSessionRecollection?
+    package struct Scan: Sendable {
+        package let completeRecollections: [ChatSessionRecollection]
+        let trailingRecollection: ChatSessionRecollection?
         /// Start of an unfinished trailing line, or EOF after a newline.
-        public let nextOffset: UInt64
-        public let bytesRead: Int
+        package let nextOffset: UInt64
+
+        package var recollections: [ChatSessionRecollection] {
+            guard let trailingRecollection else { return completeRecollections }
+            return completeRecollections + [trailingRecollection]
+        }
     }
 
     /// Streaming/incremental accessor for append-owned transcripts. Callers
     /// must reset the offset on replacement, truncation, or an in-place rewrite.
-    public static func scanLatest(path: URL, sessionId: String, offset: UInt64 = 0,
-                                  previous: ChatSessionRecollection? = nil) throws -> LatestScan {
+    /// Only completed lines may be reused as `previous`; the trailing line is reread.
+    package static func scan(path: URL, sessionId: String, offset: UInt64 = 0,
+                             previous: [ChatSessionRecollection] = []) throws -> Scan {
         let file = try FileHandle(forReadingFrom: path)
         defer { try? file.close() }
         try file.seek(toOffset: offset)
         var pending = Data()
-        var newest = previous
+        var recollections = previous
         var consumed = offset
-        var bytesRead = 0
-        func absorb(_ bytes: Data) {
-            if let row = try? JSONValue.parse(bytes),
-               let value = recollection(fromTranscriptRow: row, sessionId: sessionId) { newest = value }
+        func parse(_ bytes: Data) -> ChatSessionRecollection? {
+            guard let row = try? JSONValue.parse(bytes) else { return nil }
+            return recollection(fromTranscriptRow: row, sessionId: sessionId)
         }
         while let chunk = try file.read(upToCount: 64 * 1024), !chunk.isEmpty {
-            bytesRead += chunk.count
             pending.append(chunk)
             while let newline = pending.firstIndex(of: 10) {
                 let end = pending.index(after: newline)
-                absorb(Data(pending[..<newline]))
+                if let value = parse(Data(pending[..<newline])) { recollections.append(value) }
                 consumed += UInt64(pending.distance(from: pending.startIndex, to: end))
                 pending.removeSubrange(..<end)
             }
         }
         // Preserve the tolerant accessor's support for a valid final JSON row
         // without a newline. Re-read that line if another append completes it.
-        if !pending.isEmpty { absorb(pending) }
-        return LatestScan(recollection: newest, nextOffset: consumed, bytesRead: bytesRead)
+        return Scan(completeRecollections: recollections,
+                    trailingRecollection: pending.isEmpty ? nil : parse(pending), nextOffset: consumed)
     }
 
     /// `metadata.kind` marking a transcript row as a consolidated recollection.
@@ -345,33 +391,6 @@ public enum ChatSessionRecollections {
         )
     }
 
-    /// Every recollection in one session's transcript, oldest first. Tolerant
-    /// by design: an unparseable line is skipped, never thrown — a reader of
-    /// recollections must not be the thing that fails on a corrupt transcript.
-    public static func recollections(
-        forSession sessionId: String,
-        dataRoot: URL
-    ) -> [ChatSessionRecollection] {
-        let path = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("messages", isDirectory: true)
-            .appendingPathComponent("\(sessionId).jsonl")
-        guard let data = try? Data(contentsOf: path),
-              let text = String(data: data, encoding: .utf8)
-        else { return [] }
-        var out: [ChatSessionRecollection] = []
-        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty,
-                  let lineData = trimmed.data(using: .utf8),
-                  let parsed = try? JSONValue.parse(lineData),
-                  let recollection = recollection(fromTranscriptRow: parsed, sessionId: sessionId)
-            else { continue }
-            out.append(recollection)
-        }
-        return out
-    }
-
     /// The dream lane's high-water mark — the newest turn a dream has already
     /// consumed — read from the runner's own `.dream_state.json` sidecar.
     ///
@@ -408,18 +427,6 @@ public enum ChatSessionRecollections {
         return from <= mark && until > mark
     }
 
-    private static let timestampLock = NSLock()
-    nonisolated(unsafe) private static let fractionalTimestampFormatter: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter
-    }()
-    nonisolated(unsafe) private static let plainTimestampFormatter: ISO8601DateFormatter = {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter
-    }()
-
     /// Live transcripts carry microsecond ISO8601 (`...T11:33:32.167835+00:00`)
     /// while `ISO8601DateFormatter.withFractionalSeconds` accepts three digits.
     /// Try fractional, then plain, then truncate to milliseconds.
@@ -427,10 +434,7 @@ public enum ChatSessionRecollections {
         guard case .string(let raw)? = value else { return nil }
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
-        timestampLock.lock()
-        defer { timestampLock.unlock() }
-        if let date = fractionalTimestampFormatter.date(from: text) { return date }
-        if let date = plainTimestampFormatter.date(from: text) { return date }
+        if let date = NativeTimestampFormat.parseISO8601FractionalFirst(text) { return date }
         // Truncate an over-long fractional part to milliseconds and retry.
         if let dot = text.firstIndex(of: ".") {
             let afterDot = text.index(after: dot)
@@ -442,124 +446,9 @@ public enum ChatSessionRecollections {
             if digits.count > 3 {
                 let keep = text.index(afterDot, offsetBy: 3)
                 let rebuilt = String(text[text.startIndex..<keep]) + String(text[digitsEnd...])
-                if let date = fractionalTimestampFormatter.date(from: rebuilt) { return date }
+                if let date = NativeTimestampFormat.parseISO8601FractionalFirst(rebuilt) { return date }
             }
         }
         return nil
-    }
-}
-
-extension ChatSessionRecollections {
-    /// A recollection records what happened, never what people call each
-    /// other. 2026-09-24: one compaction wrote a standing trait ("…calls me
-    /// 'boss' and 'momma'") into the note that heads her replayed history,
-    /// every later recollection folded it forward, and she started saying it
-    /// every few replies. The distiller prompt no longer mints such lines; this
-    /// drops the ones already on disk at render time, by SHAPE (a habitual
-    /// naming claim aimed at a person), never by word — so the next word is
-    /// covered the same way. Only the claiming CLAUSE goes; the rest of its
-    /// sentence stays.
-    public static func droppingAddressTraits(_ text: String) -> String {
-        guard matchesAddressTrait(text) else { return text }
-        var kept: [String] = []
-        for line in text.components(separatedBy: "\n") {
-            let sentences = splitSentences(line)
-            let survivors = sentences.compactMap(droppingAddressClauses)
-            if survivors == sentences {
-                kept.append(line)
-            } else if survivors.contains(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) {
-                kept.append(survivors.joined(separator: " "))
-            }
-        }
-        return kept.joined(separator: "\n")
-    }
-
-    /// The sentence without its habit-of-address clause(s); nil when nothing
-    /// else is left.
-    private static func droppingAddressClauses(_ sentence: String) -> String? {
-        guard matchesAddressTrait(sentence) else { return sentence }
-        let ns = sentence as NSString
-        var clauses: [(separator: String, text: String)] = []
-        var cursor = 0
-        var separator = ""
-        let whole = NSRange(location: 0, length: ns.length)
-        for match in clauseSeparator.matches(in: sentence, range: whole) {
-            let range = NSRange(location: cursor, length: match.range.location - cursor)
-            clauses.append((separator, ns.substring(with: range)))
-            separator = ns.substring(with: match.range)
-            cursor = match.range.location + match.range.length
-        }
-        clauses.append((separator, ns.substring(from: cursor)))
-        let kept = clauses.filter { !matchesAddressTrait($0.text) }
-        guard let first = kept.first else { return nil }
-        var out = first.text
-        if first.separator.isEmpty == false {
-            // The opening clause went; the survivor now starts the sentence.
-            out = out.prefix(1).uppercased() + out.dropFirst()
-        }
-        for clause in kept.dropFirst() { out += clause.separator + clause.text }
-        if let last = clauses.last, matchesAddressTrait(last.text) {
-            // The sentence's ending went with the dropped clause.
-            out = out.trimmingCharacters(in: CharacterSet(charactersIn: " ,;—–")) + "."
-        }
-        return out
-    }
-
-    private static let clauseSeparator = try! NSRegularExpression(
-        pattern: ",[\"”’]?\\s+(?:and|but|while|so)\\s+|;\\s+|\\s+[—–]\\s+",
-        options: [.caseInsensitive]
-    )
-
-    private static func matchesAddressTrait(_ text: String) -> Bool {
-        addressTraitPattern.firstMatch(
-            in: text, range: NSRange(text.startIndex..., in: text)
-        ) != nil
-    }
-
-    private static let addressTraitPattern: NSRegularExpression = {
-        let person = "(?:me|him|her|them|us|you|each other|one another)"
-        // What follows the person when "call" means a phone call or a summons,
-        // not a name — so "I'll call him back" survives.
-        let notAName = "(?!(?:back|later|again|soon|now|today|tonight|tomorrow|out|up|over|in|on|off|when|if|to|at|about|and|or|after|before|first|once|right|whenever)\\b)"
-        // HABITUAL claims about people only: "calls me 'X'" files a trait; "he
-        // called me perfect" is a moment that happened and stays, and so does
-        // any mention of a nickname that is not a claim about a person. An
-        // unquoted capitalized word is a real name ("calls me Agent").
-        let patterns = [
-            // calls me "X" · call him X. · calling her X and Y
-            "\\bcall(?:s|ing)?\\s+\(person)\\s+(?:[\"“‘*]|\(notAName)(?-i:\\p{Ll})[\\p{L}'’-]*(?:\\s*(?:[.,;:!?)\"”]|$)|\\s+(?:and|or)\\b))",
-            // refers to me as · addressing him as · nicknames me
-            "\\b(?:refer(?:s|ring)?\\s+to|address(?:es|ing)?)\\s+\(person)\\s+as\\b",
-            "\\bnicknam(?:es|ing)\\s+\(person)\\b",
-            // his (pet) name for me · User's pet name for me
-            "\\b(?:his|her|their|my|your|our|\\p{L}+['’]s)\\s+(?:pet\\s+)?(?:name|word)s?\\s+for\\s+\(person)\\b",
-        ]
-        return try! NSRegularExpression(
-            pattern: patterns.joined(separator: "|"),
-            options: [.caseInsensitive, .anchorsMatchLines]
-        )
-    }()
-
-    /// Sentences of one line, each keeping its own closing quotes/markup.
-    private static func splitSentences(_ line: String) -> [String] {
-        var out: [String] = []
-        var current = ""
-        var pendingEnd = false
-        for character in line {
-            if pendingEnd, character.isWhitespace {
-                out.append(current)
-                current = ""
-                pendingEnd = false
-                continue
-            }
-            current.append(character)
-            if ".!?…".contains(character) {
-                pendingEnd = true
-            } else if pendingEnd, !"\"”’')]*_".contains(character) {
-                pendingEnd = false
-            }
-        }
-        out.append(current)
-        return out
     }
 }

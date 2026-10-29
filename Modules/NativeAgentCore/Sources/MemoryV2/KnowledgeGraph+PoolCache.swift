@@ -1,11 +1,6 @@
 // The Knowledge Graph's handle on memory.sqlite.
 //
-// memory.sqlite has ONE owner: MemoryV2's MemoryStorage opens it, and its
-// migrator alone shapes it (every kg_* table included). The graph never opens
-// a connection or creates a table of its own — before 2026-09-26 this file
-// held a second DatabasePool writing the same file beside MemoryStorage's and
-// completed the kg_* schema itself. Now `pool(at:)` returns the owning
-// MemoryStorage's pool, resolved directly within MemoryV2.
+// MemoryStorage alone opens memory.sqlite and migrates every table; `pool(at:)` returns its pool.
 //
 // Lifecycle (every add has a remove):
 //   - ADD: the first `pool(at:)` for a path asks the owner for its pool and

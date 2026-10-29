@@ -3,6 +3,7 @@ import CryptoKit
 import PersistenceCore
 import MacControl
 import Darwin
+import NativeAgentShared
 // Blueprint: | `AgentBridgeRuntime.swift` | `AgentBridgeRuntime` enum; helper discovery and shared execution; wake-runner process identity; OMP reply-job recovery |
 
 /// Discovery and helper execution for the external coding organs NativeAgent
@@ -66,7 +67,7 @@ public enum AgentBridgeRuntime {
                                 try receipt.serialize(pretty: false))
                         }
                     }
-                } catch is CancellationError { throw CancellationError() }
+                } catch let error where error is CancellationError || error is ProcessRunCancellation { throw CancellationError() }
                 catch {
                     nativeLog("[ClaudeBridge] OMP reply recovery for %@ failed: %@", path.lastPathComponent, error.localizedDescription)
                 }
@@ -83,8 +84,7 @@ public enum AgentBridgeRuntime {
         timeoutSeconds: TimeInterval?,
         arguments: [String] = []
     ) async -> JSONValue {
-        // The helpers address the agent and the user by their configured
-        // names (2026-09-05: the scripts used to carry the maintainer's).
+        // Helpers address the agent and user by their configured names.
         var environment = environment
         if environment["NATIVE_AGENT_AGENT_NAME"] == nil || environment["NATIVE_AGENT_USER_NAME"] == nil {
             let names = AgentBridgeRuntime.configuredNames(dataRoot: PersistenceCore.defaultDataRoot())
@@ -99,7 +99,7 @@ public enum AgentBridgeRuntime {
             "action": .string("agent.jobs"), "args": .object(inspectionArgs)])])
         let result: ProcessRunResult
         do {
-            result = try await SystemProcessAdapter().run(
+            result = try await ProcessExecution().run(
                 executable: node.path,
                 arguments: [helper.path] + arguments,
                 currentDirectory: cwd,
@@ -108,7 +108,8 @@ public enum AgentBridgeRuntime {
                 timeoutSeconds: timeoutSeconds,
                 outputByteLimit: 8 * 1024 * 1024
             )
-        } catch is CancellationError {
+        } catch let error where error is CancellationError || error is ProcessRunCancellation {
+            // Stop after launch: the helper's drained output is evidence, not a failure.
             return .object([
                 "status": .string("cancelled"),
                 "reason": .string("helper_cancelled"),
@@ -300,20 +301,9 @@ public enum AgentBridgeRuntime {
         default: nil
         }
 
-        var directories = (environment["PATH"] ?? "")
+        let directories = (processEnvironment(base: environment, homeDirectory: homeDirectory)["PATH"] ?? "")
             .split(separator: ":")
             .map { URL(fileURLWithPath: String($0), isDirectory: true) }
-        directories.append(contentsOf: [
-            homeDirectory.appendingPathComponent(".local/bin", isDirectory: true),
-            homeDirectory.appendingPathComponent(".claude/bin", isDirectory: true),
-            homeDirectory.appendingPathComponent(".codex/bin", isDirectory: true),
-            homeDirectory.appendingPathComponent(".volta/bin", isDirectory: true),
-            homeDirectory.appendingPathComponent(".local/share/mise/shims", isDirectory: true),
-            URL(fileURLWithPath: "/opt/homebrew/bin", isDirectory: true),
-            URL(fileURLWithPath: "/usr/local/bin", isDirectory: true),
-            URL(fileURLWithPath: "/usr/bin", isDirectory: true),
-            URL(fileURLWithPath: "/bin", isDirectory: true),
-        ])
 
         var candidates = override.map { [URL(fileURLWithPath: $0)] } ?? []
         if name == "codex" {

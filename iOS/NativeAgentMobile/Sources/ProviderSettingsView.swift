@@ -1,58 +1,11 @@
-// PATCH-2026-07-15: iOS ProviderSettingsView — signed remote control for the
-// Mac-owned provider configuration. API keys are never stored or edited here;
-// atomic surface selections and connection tests cross the authenticated action
-// channel and are accepted only after the Mac returns a matching verified tuple.
+// Phone credential entry is encrypted for the Mac's Keychain and verification.
+// Model selections are accepted only after a matching verified Mac tuple.
 import SwiftUI
+import NativeAgentShared
 // Blueprint: | `ProviderSettingsView.swift` | `ProviderSettingsView` struct |
 
-/// Keeps the refresh button honest once its spinner stops: a failed provider
-/// snapshot refresh remains visible instead of looking like an empty success.
-enum ProviderRefreshPresentation {
-    static func statusText(for outcome: ProviderControlsRefreshOutcome) -> String {
-        outcome.feedbackMessage ?? ""
-    }
-}
-
-/// iOS cannot import the Mac-only provider-routing module, so it retains a
-/// presentation mirror for the canonical routing surfaces. Unknown or malformed
-/// wire keys must read as a repair condition, never as a plausible prettified
-/// storage key such as `Cognition_reflection`.
-enum MobileProviderSurfaceLabelPresentation: Equatable {
-    case named(String)
-    case unrecognized(String)
-    case malformed
-
-    private static let namedLabels: [String: String] = [
-        "chat": "Chat",
-        "ios": "iPhone",
-        "telegram": "Telegram",
-        "slack": "Slack",
-        "desk": "Desk",
-        "workshop": "Desk tasks",
-        "missions": "Desk tasks",
-        "autonomy": "Autonomy",
-        "swarms": "Swarms",
-        "dream": "Dream",
-        "rem": "REM",
-        "training": "Training",
-        "memory": "Memory",
-        "heartbeat": "Heartbeat",
-        "diagnostics": "Diagnostics",
-        "cognition_reflection": "Cognition Reflection",
-        "studio_wander": "Studio Wandering",
-        "compaction": "Compaction",
-        "self_improvement": "Self-Improvement",
-    ]
-
-    static func presentation(for rawSurface: String) -> Self {
-        let trimmed = rawSurface.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed == rawSurface, rawSurface == rawSurface.lowercased() else {
-            return .malformed
-        }
-        guard let label = namedLabels[rawSurface] else { return .unrecognized(rawSurface) }
-        return .named(label)
-    }
-
+/// Unknown or malformed wire keys remain explicit repair conditions.
+extension ProviderSurfaceLabel {
     var text: String {
         switch self {
         case .named(let label): label
@@ -69,7 +22,7 @@ enum MobileProviderSurfaceLabelPresentation: Equatable {
 enum MobileProviderSurfaceModelMenuPresentation {
     static let unpublishedLabel = "Model not published"
 
-    static func label(for surface: String, surfaceModels: [String: SurfaceModelPref]) -> String {
+    static func label(for surface: String, surfaceModels: [String: NAProviderSurfaceSelection]) -> String {
         guard let rawModel = surfaceModels[surface]?.model else {
             return unpublishedLabel
         }
@@ -110,19 +63,10 @@ struct ProviderSettingsView: View {
     private let sync = iCloudSyncEngine.shared
     @EnvironmentObject private var pairingStore: PairingStore
 
-    // Presentation mirror of ProviderSurfaceGroups. Submit one representative
-    // surface; the Mac applies the choice to every member of its group.
-    private var renderedSurfaces: [String] {
-        ["chat", "desk", "memory"]
-    }
+    private var renderedSurfaces: [String] { ProviderSurfaceGroups.all.compactMap { $0.surfaces.first } }
 
     private func groupCaption(_ surface: String) -> String {
-        switch surface {
-        case "chat": "Chat, iPhone, Telegram and Slack"
-        case "desk": "Desk, Task execution, Independent tasks, Coordinated tasks, Skill practice, Background check-ins and Diagnostics"
-        case "memory": "Memory, Dreams, REM, Reflection, Conversation summaries, Learning and Creative exploration"
-        default: ""
-        }
+        ProviderSurfaceGroups.all.first { $0.surfaces.contains(surface) }?.caption ?? ""
     }
 
     @State private var configSheet: ProviderInfo? = nil
@@ -231,7 +175,7 @@ struct ProviderSettingsView: View {
 
     /// One routing group and its exact provider/model pair.
     private func surfaceRow(_ surface: String) -> some View {
-        let providerID = sync.surfaceModels[surface]?.providerId ?? ""
+        let providerID = sync.surfaceModels[surface]?.providerID ?? ""
         let providerName = selectableProviders.first(where: { $0.provider_id == providerID })?.display_name
         return Menu {
             ForEach(selectableProviders) { provider in
@@ -279,7 +223,7 @@ struct ProviderSettingsView: View {
         isRefreshing = true
         _ = await iCloudBridge.shared.drainDeviceTransport()
         let outcome = await iCloudSyncEngine.shared.refreshProviderControlsSnapshot()
-        statusText = ProviderRefreshPresentation.statusText(for: outcome)
+        statusText = outcome.feedbackMessage ?? ""
         isRefreshing = false
     }
 
@@ -303,7 +247,7 @@ struct ProviderSettingsView: View {
                 statusText = "\(surfaceLabel(surface)) now uses \(selectedModelLabel(for: surface))."
             } catch {
                 statusText = "Error: \(error.localizedDescription)"
-                iOSSystemToastCenter.shared.push(
+                SystemToastCenter.shared.push(
                     error: "Couldn't update \(surfaceLabel(surface)): \(error.localizedDescription)"
                 )
             }
@@ -318,12 +262,8 @@ struct ProviderSettingsView: View {
     }
 
     private func surfaceLabel(_ surface: String) -> String {
-        switch surface {
-        case "chat": "Chat"
-        case "desk": "Work"
-        case "memory": "Memory and mind"
-        default: MobileProviderSurfaceLabelPresentation.presentation(for: surface).text
-        }
+        ProviderSurfaceGroups.all.first { $0.surfaces.contains(surface) }?.title
+            ?? ProviderSurfaceLabel.presentation(for: surface).text
     }
 }
 
@@ -384,43 +324,17 @@ enum ProviderWords {
         return name.isEmpty ? model.id : name
     }
 
-    static func capabilities(_ model: ProviderCapabilityPresentation.Model) -> String {
+    static func capabilities(_ model: ProviderModelInfo) -> String {
         var words: [String] = []
-        if model.supportsStreaming { words.append("streams") }
-        if model.supportsVision { words.append("sees images") }
-        if model.supportsTools { words.append("uses tools") }
-        if model.supportsJSONMode { words.append("JSON mode") }
+        if model.supports_streaming { words.append("streams") }
+        if model.supports_vision { words.append("sees images") }
+        if model.supports_tools { words.append("uses tools") }
+        if model.supports_json_mode { words.append("JSON mode") }
         guard let first = words.first else { return "No extra capabilities published" }
         words[0] = first.prefix(1).uppercased() + first.dropFirst()
         return words.joined(separator: " · ")
     }
 }
-
-enum ProviderCapabilityPresentation {
-    struct Model: Identifiable, Equatable {
-        let id: String
-        let name: String
-        let supportsStreaming: Bool
-        let supportsVision: Bool
-        let supportsTools: Bool
-        let supportsJSONMode: Bool
-    }
-
-    static func models(from source: [ProviderModelInfo]) -> [Model] {
-        source.enumerated().map { index, model in
-            let displayName = model.name.trimmingCharacters(in: .whitespacesAndNewlines)
-            return Model(
-                id: "\(index):\(model.id)",
-                name: displayName.isEmpty ? model.id : displayName,
-                supportsStreaming: model.supports_streaming,
-                supportsVision: model.supports_vision,
-                supportsTools: model.supports_tools,
-                supportsJSONMode: model.supports_json_mode
-            )
-        }
-    }
-}
-
 
 // MARK: - Detail / action sheet
 
@@ -465,15 +379,14 @@ struct ProviderDetailSheet: View {
                 }
 
                 // ── Models and what each can do ───────────────────────────
-                let capabilityModels = ProviderCapabilityPresentation.models(from: provider.models)
                 AliveSection("Models") {
-                    if capabilityModels.isEmpty {
+                    if provider.models.isEmpty {
                         AliveRow("Not published yet",
                                 detail: "The Mac hasn’t published this provider’s models and what they can do.")
                     }
-                    ForEach(Array(capabilityModels.enumerated()), id: \.element.id) { index, model in
+                    ForEach(Array(provider.models.enumerated()), id: \.offset) { index, model in
                         if index > 0 { AliveDivider() }
-                        AliveRow(model.name, detail: ProviderWords.capabilities(model))
+                        AliveRow(ProviderWords.modelName(model), detail: ProviderWords.capabilities(model))
                     }
                 }
 
@@ -547,7 +460,7 @@ struct ProviderDetailSheet: View {
         isWorking = true
         workLabel = kind
         feedbackText = kind == "oauth" ? "Waiting for sign-in on your Mac…" : ""
-        let submittedKey = kind == "save" ? apiKey : nil
+        let submittedKey = kind == "save" ? apiKey : ""
         Task {
             do {
                 switch kind {
@@ -557,8 +470,7 @@ struct ProviderDetailSheet: View {
                     applySignInState()
                 case "save":
                     feedbackText = try await sync.configureProvider(
-                        providerId: provider.provider_id, apiKey: submittedKey,
-                        authMode: "api_key"
+                        providerId: provider.provider_id, apiKey: submittedKey
                     )
                     if apiKey == submittedKey { apiKey = "" }
                     isWorking = false

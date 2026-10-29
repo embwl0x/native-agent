@@ -3,6 +3,8 @@ import AgentConversations
 import GRPCCore
 import GRPCNIOTransportHTTP2TransportServices
 import NativeAgentCore
+import NativeAgentShared
+import PersistenceCore
 // Blueprint: | `NativeAgentA2AGRPCListener.swift` | gRPC loopback listener generation and endpoint publication; stop closes publication and retains the serving worker through graceful drain, excluding restart until actual exit |
 
 /// The third A2A wire listener. All task ownership and execution stays in AgentContactTasks.
@@ -41,10 +43,10 @@ public final class NativeAgentA2AGRPCListener: @unchecked Sendable {
                 defer { finished(id) }
                 let transport = HTTP2ServerTransport.TransportServices(
                     address: .ipv4(host: "127.0.0.1", port: 0), transportSecurity: .plaintext)
-                let service = NativeAgentA2AGRPCService(endpoint: {
+                let service = AgentA2AGRPCEndpoint(endpoint: {
                     self.endpoint(self.port)
                 }, authenticate: { metadata in
-                    try NativeAgentA2AGRPCService.authenticate(metadata: metadata,
+                    try AgentA2AGRPCEndpoint.authenticate(metadata: metadata,
                         liveToken: self.liveToken(), dataRoot: self.dataRoot())
                 })
                 let server = GRPCServer(transport: transport, services: [service])
@@ -95,8 +97,7 @@ public final class NativeAgentA2AGRPCListener: @unchecked Sendable {
                 attributes: [.posixPermissions: 0o700])
             let bytes = try JSONSerialization.data(withJSONObject: ["schemaVersion": 1, "host": "127.0.0.1",
                 "port": Int(port), "url": "http://127.0.0.1:\(port)", "protocolVersion": "1.0", "protocolBinding": "GRPC"])
-            try bytes.write(to: descriptorURL, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: descriptorURL.path)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(bytes, to: descriptorURL)
             boundPort = port
         }
     }

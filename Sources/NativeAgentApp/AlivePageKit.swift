@@ -1,13 +1,8 @@
+import NativeAgentShared
 import AppToolRuntime
 
 // Blueprint: | `AlivePageKit.swift` | Alive page components: shared glass metrics/palette, headers, cards, pills, progress and flow layout for Today/Desk |
-// AlivePageKit.swift
-// "Alive glass", the pages — User approved the mockup 2026-09-23. The shared
-// pieces Today and Desk are built from in the Advanced shell. Cards share
-// the house glass; the window owns the single haze behind them.
-//
-// Text keeps the shell's primary and secondary ink. Verify translucent
-// contrast in installed dark and light captures; tertiary stays off cards.
+// Cards share house glass over the window's single haze; text uses primary or secondary ink, never tertiary.
 
 import AppKit
 import SwiftUI
@@ -202,7 +197,7 @@ private struct HazeShades {
     let base: Color
     init(_ raw: String) {
         let haze = HazeColor(stored: raw)
-        deep = Color(nsColor: HazeColor.nsColor(haze.shades[1]))
+        deep = Color(hex: haze.shades[1])
         base = haze.base
     }
 }

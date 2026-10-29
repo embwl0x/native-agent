@@ -1,9 +1,4 @@
-// CloudKitDeviceTransport.swift — CloudKit implementation of DeviceSyncTransport.
-//
-// The live Mac/iPhone transport owns private-database writes, cursor-paginated
-// reads, subscriptions, error mapping, and bounded CloudKit operations here.
-// It remains independent of NativeAgentCore so both apps share the same
-// device-sync contract. The retired MemoryV2 sync prototype is not a dependency.
+// CloudKit device transport is shared by the Mac and phone independently of the core.
 
 import Foundation
 import CryptoKit
@@ -13,7 +8,7 @@ import CloudKit
 import OSLog
 // Blueprint: | `CloudKitDeviceTransport.swift` | `CloudKitDeviceTransport` class; `observeAccountFailures`, `observeIncoming` (returns subscription readiness), `isChatNotification`, `shouldPersistPullCursor`, `resignalMessage` (original signed envelope; existing query clock renewed) |
 
-private let devicePushLog = Logger(subsystem: "NativeAgent.DeviceSync", category: "subscription")
+let devicePushLog = Logger(subsystem: "NativeAgent.DeviceSync", category: "subscription")
 
 enum DeviceCloudKitSubscriptionID {
     static let chat = "NAChatMessage.incoming"
@@ -39,11 +34,6 @@ enum DeviceCloudKitSubscriptionID {
 
 // MARK: - Device timeout policies
 
-private func formatDeviceCKTimeoutSeconds(_ seconds: TimeInterval) -> String {
-    if seconds.rounded() == seconds { return "\(Int(seconds))s" }
-    return String(format: "%.1fs", seconds)
-}
-
 struct DeviceCKLandmineTimeout: LocalizedError, Sendable {
     let label: String
     let seconds: TimeInterval
@@ -52,16 +42,14 @@ struct DeviceCKLandmineTimeout: LocalizedError, Sendable {
     }
 }
 
-/// 2026-09-06: the container rejected a sort on the server modificationDate
-/// (no sortable `___modTime` index). Signals the pull to retry once in the
-/// legacy client-`createdAt` order rather than surfacing a sync failure.
+/// Requests one pull retry in client `createdAt` order when CloudKit cannot sort `modificationDate`.
 struct DeviceCKUnsortableField: LocalizedError, Sendable {
     var errorDescription: String? {
         "CloudKit rejected the modificationDate sort for this record type."
     }
 }
 
-private func withDeviceCKTimeout<T: Sendable>(
+func withDeviceCKTimeout<T: Sendable>(
     _ label: String,
     seconds: TimeInterval = 5,
     onFailure: (@Sendable (Error) async -> Void)? = nil,
@@ -69,30 +57,30 @@ private func withDeviceCKTimeout<T: Sendable>(
 ) async -> T? {
     guard NADeviceSyncRecoveryBudget.hasTime else { return nil }
     let seconds = NADeviceSyncRecoveryBudget.seconds(upTo: seconds)
-    let state = CloudKitTimeoutResultLatch<T>()
+    let state = ContinuationOnce<Result<T, Error>?>()
     let timeoutNanoseconds = UInt64(max(0, seconds) * 1_000_000_000)
-    let workTask = Task(priority: .utility) {
+    let workTask = Task<Void, Never>(priority: .utility) {
         do {
             guard NADeviceSyncRecoveryBudget.hasTime else { throw CancellationError() }
-            await state.finish(.success(try await work()))
+            state.resume(.success(try await work()))
         }
-        catch { await state.finish(.failure(error)) }
+        catch { state.resume(.failure(error)) }
     }
 
-    switch await state.race(workTask: workTask, timeoutNanoseconds: timeoutNanoseconds) {
+    switch await state.cloudKitRace(workTask: workTask, timeoutNanoseconds: timeoutNanoseconds) {
     case .success(let value): return value
     case .failure(let error):
         await onFailure?(error)
         nativeLog("[ck-device] \(label) failed: \(error)"); return nil
     case .timedOut:
-        nativeLog("[ck-device] \(label) timed out after \(formatDeviceCKTimeoutSeconds(seconds)); cloudd unhealthy?")
+        nativeLog("[ck-device] \(label) timed out after \(formatCKTimeoutSeconds(seconds)); cloudd unhealthy?")
         return nil
     case .cancelled:
         return nil
     }
 }
 
-private func withDeviceCKTimeoutThrowing<T: Sendable>(
+func withDeviceCKTimeoutThrowing<T: Sendable>(
     _ label: String,
     seconds: TimeInterval = 5,
     onFailure: (@Sendable (Error) async -> Void)? = nil,
@@ -103,22 +91,22 @@ private func withDeviceCKTimeoutThrowing<T: Sendable>(
     guard NADeviceSyncRecoveryBudget.hasTime else { throw CancellationError() }
     let seconds = NADeviceSyncRecoveryBudget.seconds(upTo: seconds)
     try await beforeDispatch()
-    let state = CloudKitTimeoutResultLatch<T>()
+    let state = ContinuationOnce<Result<T, Error>?>()
     let timeoutNanoseconds = UInt64(max(0, seconds) * 1_000_000_000)
-    let workTask = Task(priority: .utility) {
+    let workTask = Task<Void, Never>(priority: .utility) {
         do {
-            await state.finish(.success(try await work()))
+            state.resume(.success(try await work()))
         }
-        catch { await state.finish(.failure(error)) }
+        catch { state.resume(.failure(error)) }
     }
 
-    switch await state.race(workTask: workTask, timeoutNanoseconds: timeoutNanoseconds, timeoutOnCancellation: true) {
+    switch await state.cloudKitRace(workTask: workTask, timeoutNanoseconds: timeoutNanoseconds, timeoutOnCancellation: true) {
     case .success(let value): return value
     case .failure(let error):
         await onFailure?(error)
         throw error
     case .timedOut:
-        nativeLog("[ck-device] \(label) timed out after \(formatDeviceCKTimeoutSeconds(seconds)); cloudd unhealthy?")
+        nativeLog("[ck-device] \(label) timed out after \(formatCKTimeoutSeconds(seconds)); cloudd unhealthy?")
         throw DeviceCKLandmineTimeout(label: label, seconds: seconds)
     case .cancelled:
         throw CancellationError()
@@ -129,13 +117,10 @@ private func withDeviceCKTimeoutThrowing<T: Sendable>(
 /// record NAMES (not `CKRecord.ID`s) so the page crosses the continuation as a
 /// plain Sendable value; the delete op rebuilds the ids in the default zone,
 /// which is the zone every send writes into.
-private final class DeviceCKRecordNameHolder: @unchecked Sendable {
+final class DeviceCKRecordNameHolder: @unchecked Sendable {
     private let lock = NSLock()
     private var names: [String] = []
-    // 2026-09-06: every record the page returned, eligible or not. The backlog
-    // signal is "the page came back full", which the deleted count cannot tell
-    // us — in the createdAt fallback order most of a full page is often still
-    // inside the retention window.
+    // Backlog means a full fetched page, regardless of how many records expired.
     private var fetched = 0
     func noteFetched() { lock.lock(); fetched += 1; lock.unlock() }
     func add(_ name: String) { lock.lock(); names.append(name); lock.unlock() }
@@ -148,7 +133,7 @@ private final class DeviceCKRecordNameHolder: @unchecked Sendable {
 /// records the page actually returned, and the server-side resume position.
 /// `@unchecked Sendable` because a `CKQueryOperation.Cursor` is an opaque
 /// position we only ever hand back to CloudKit — never read, never mutated.
-private final class DeviceCKSweepPage: @unchecked Sendable {
+final class DeviceCKSweepPage: @unchecked Sendable {
     let names: [String]
     let fetched: Int
     let cursor: CKQueryOperation.Cursor?
@@ -162,7 +147,7 @@ private final class DeviceCKSweepPage: @unchecked Sendable {
 /// What one record type's sweep achieved. `deleted` counts CONFIRMED deletions
 /// only: a delete batch that timed out may or may not have been applied by the
 /// server, so it is reported as unknown rather than as zero.
-private struct DeviceCKSweepOutcome {
+struct DeviceCKSweepOutcome {
     var deleted = 0
     var backlog = false
     var deleteTimedOut = false
@@ -173,9 +158,13 @@ private struct DeviceCKSweepOutcome {
 final class DeviceCKPullPageHolder: @unchecked Sendable {
     private let lock = NSLock()
     private var items: [NAChatMessageFields] = []
+    private var modificationDates: [String: Date?] = [:]
     private var firstError: Error?
     private var payloadError: DeviceSyncError?
     func add(_ r: NAChatMessageFields) { lock.lock(); items.append(r); lock.unlock() }
+    func noteModificationDate(_ id: String, _ date: Date?) {
+        lock.lock(); modificationDates.updateValue(date, forKey: id); lock.unlock()
+    }
     func fail(_ error: Error) {
         lock.lock(); defer { lock.unlock() }
         if firstError == nil { firstError = error }
@@ -184,19 +173,19 @@ final class DeviceCKPullPageHolder: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         if payloadError == nil { payloadError = error }
     }
-    func snapshot() throws -> (records: [NAChatMessageFields], payloadError: DeviceSyncError?) {
+    func snapshot() throws -> (records: [(fields: NAChatMessageFields, modDate: Date?)], payloadError: DeviceSyncError?, modificationDates: [Date?]) {
         lock.lock(); defer { lock.unlock() }
         if let firstError { throw firstError }
-        return (items, payloadError)
+        return (items.map { ($0, modificationDates[$0.recordName] ?? nil) }, payloadError, Array(modificationDates.values))
     }
 }
 
-private struct DeviceCKPullResult: Sendable {
+struct DeviceCKPullResult: Sendable {
     var records: [(fields: NAChatMessageFields, modDate: Date?)] = []
     var payloadError: DeviceSyncError?
 }
 
-private struct DeviceCKPullCheckpoint {
+struct DeviceCKPullCheckpoint {
     var result: DeviceCKPullResult
     var cursor: CKQueryOperation.Cursor
 }
@@ -205,78 +194,44 @@ private struct DeviceCKPullCheckpoint {
 
 /// CloudKit-backed device transport. `@unchecked Sendable` with an internal
 /// NSLock for mutable state (handlers + last-pull cursor + seen ids).
-public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Sendable {
+public final class CloudKitDeviceTransport: @unchecked Sendable {
     public let role: NADeviceRole
     public let containerIdentifier: String
 
-    /// Whether this process may safely touch `CKContainer`. Computed ONCE at
-    /// init from the entitlement preflight (entitlements are fixed for a
-    /// process's lifetime). When false, EVERY method short-circuits to
-    /// `.notConfigured` / a safe default and NEVER constructs a `CKContainer` —
-    /// this is the 2026-06-03 `_os_crash` guard. `CKContainer.__allocating_init`
-    /// traps synchronously when CloudKit isn't entitled, so no timeout race can
-    /// catch it; the only safe defense is to not reach the constructor at all.
-    /// Injectable so tests can exercise the guard without real entitlements.
-    private let configured: Bool
-
-    private let lock = NSLock()
+    let lock = NSLock()
     private var incomingHandler: (@Sendable (BridgeMessage) async -> Bool)?
-    private var controlAdmission: (@Sendable (BridgeMessage) async -> Bool)?
-    private var controlDrainInFlight = false
+    var controlAdmission: (@Sendable (BridgeMessage) async -> Bool)?
+    var controlDrainInFlight = false
     private var pairingHandler: (@Sendable (Data) async -> Bool)?
-    private var statusWrites: [String: Task<Void, Never>] = [:]
-    private var pendingStatusWrites: [String: (work: @Sendable () async throws -> Void, completion: CheckedContinuation<Void, Error>)] = [:]
+    var statusWrites: [String: Task<Void, Never>] = [:]
+    var pendingStatusWrites: [String: (work: @Sendable () async throws -> Void, completion: CheckedContinuation<Void, Error>)] = [:]
     private var statusHandlers: [String: @Sendable (String, Date?) async -> Bool] = [:]
     private var lastPullDate: Date?
     private var lastPullCursorPersistenceAt: Date?
-    // CK-3c: transport-level drain serialization (guarded by `lock`). Concurrent
-    // drains must NOT overlap — one drain's releaseClaim racing another's
-    // cursor-advance can drop a record (gpt-5.5 CK-3c review P0). While a drain
-    // body runs, concurrent callers set drainAgain and return; the active loop
-    // re-runs once to service them.
-    private var drainInFlight = false
-    private var drainAgain = false
-    // 2026-09-06: the status lane needs the same slot, for the same reason.
-    // Two overlapping status drains could each claim a DIFFERENT generation of
-    // the same key and then run their handlers concurrently, so the older
-    // delivery could finish last and overwrite the newer bytes it raced.
-    private var statusDrainInFlight = false
-    private var statusDrainAgain = false
-    // 2026-09-06: record types whose container index rejected a
-    // modificationDate sort, so we stop paying for a rejected query every drain
-    // and use the legacy createdAt order instead. PER RECORD TYPE: the sortable
-    // `___modTime` index is declared per record type, and iOS pulls two of them
-    // (chatMessage and notification) — one type's missing index must not demote
-    // the other's pull to the createdAt order that the paging stop cannot trust.
-    // Accepted as is (2026-09-06): the set lives on the transport instance, so a
-    // teardown/setup cycle in the same process re-probes the rejected sort once
-    // per type. That costs one rejected query and immediately re-latches.
-    private var serverModDateSortRejected: Set<String> = []
+    // One drain owns claims and cursor advancement; overlapping callers queue another pass.
+    var drainInFlight = false
+    var drainAgain = false
+    // Status delivery is serialized so an older handler cannot overwrite a newer value.
+    var statusDrainInFlight = false
+    var statusDrainAgain = false
+    // Rejected server-date sorts are remembered per record type for this transport lifetime.
+    var serverModDateSortRejected: Set<String> = []
     // Completed fallback pages survive a bounded pull. No records are returned
     // or acknowledged until the traversal completes. A restart safely rescans.
-    private var fallbackPullCheckpoints: [String: DeviceCKPullCheckpoint] = [:]
-    private var fallbackPullOwners: [String: UUID] = [:]
+    var fallbackPullCheckpoints: [String: DeviceCKPullCheckpoint] = [:]
+    var fallbackPullOwners: [String: UUID] = [:]
     // LWW/dedup cursors for the status singletons, one record per (peer role,
     // key). We only re-dispatch when the server modificationDate advances, so a
     // redraw triggered by a redundant push does not re-fire the same value.
     private var lastStatusModDates: [String: Date] = [:]
-    // 2026-09-06: when the last retention sweep ran, so a Mac that drains every
-    // eight seconds does not pay for a housekeeping query on every drain. In
-    // memory only — a relaunch simply sweeps once more, which is harmless.
-    private var lastRetentionSweepAt: Date?
+    // Retention cadence is in-memory; a relaunch permits another sweep.
+    var lastRetentionSweepAt: Date?
     // True while the last sweep's query page came back full, i.e. there is more
     // of the collection to walk; the next sweep then comes back in a minute
     // instead of an hour.
-    private var retentionBacklog = false
-    // 2026-09-06: the resume position of the createdAt-order sweep, per record
-    // type. In that fallback order the page is NOT sorted by the eligibility
-    // clock, so the hundred oldest by createdAt can contain nothing older than
-    // the cutoff — and with no resume position that same hundred came back on
-    // every sweep, forever, deleting nothing. The cursor advances past each page
-    // that has been examined; storing nil (a page that returned nothing, or a
-    // cursor CloudKit did not hand back because the walk reached the end)
-    // restarts the walk from the oldest record on the next sweep.
-    private var retentionFallbackCursors: [String: CKQueryOperation.Cursor] = [:]
+    var retentionBacklog = false
+    // The createdAt-order sweep advances past every examined page, restarting only when its cursor ends.
+    var retentionFallbackCursors: [String: CKQueryOperation.Cursor] = [:]
     // Insertion-ordered seen-id dedup, capped, mirroring iCloudBridge.
     private var seenMessageIDs: Set<String> = []
     private var seenMessageIDsOrdered: [String] = []
@@ -285,31 +240,31 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     private var assetSecretProvider: (@Sendable () async -> Data?)?
     // Set by `claimPairing`: another Mac on this Apple Account holds the
     // account's Mac pairing record, so the phone is that Mac's.
-    private var heldElsewhere = false
+    var heldElsewhere = false
     // Counts this transport's own pairing publications, so a claim whose read
     // began before one of them cannot undo it.
-    private var pairingPublications: UInt64 = 0
+    var pairingPublications: UInt64 = 0
 
     public func useAssetSecret(_ provider: @escaping @Sendable () async -> Data?) {
         lock.lock(); defer { lock.unlock() }
         assetSecretProvider = provider
     }
 
-    private func loadAssetSecretProvider() -> (@Sendable () async -> Data?)? {
+    func loadAssetSecretProvider() -> (@Sendable () async -> Data?)? {
         lock.lock(); defer { lock.unlock() }
         return assetSecretProvider
     }
 
-    private static func assetContext(recordName: String, direction: String) -> Data {
+    static func assetContext(recordName: String, direction: String) -> Data {
         Data("NativeAgent.chat.asset.v1:\(recordName):\(direction)".utf8)
     }
 
-    private static func assetKey(_ secret: Data) -> SymmetricKey {
+    static func assetKey(_ secret: Data) -> SymmetricKey {
         HKDF<SHA256>.deriveKey(inputKeyMaterial: SymmetricKey(data: secret),
             salt: Data("NativeAgent.chat.asset.v1".utf8), info: Data("aes-256-gcm".utf8), outputByteCount: 32)
     }
 
-    private static func payload(in record: CKRecord, secret: Data?) throws -> String {
+    static func payload(in record: CKRecord, secret: Data?) throws -> String {
         if let asset = record["payloadAsset"] as? CKAsset {
             guard let url = asset.fileURL, let secret,
                   secret.count == 32,
@@ -347,32 +302,23 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         await loadAccountFailureHandler()?(failure)
     }
 
-    private var accountFailureReporter: @Sendable (Error) async -> Void {
+    var accountFailureReporter: @Sendable (Error) async -> Void {
         { error in await self.reportAccountFailure(error) }
     }
 
-    public init(
+    fileprivate init(
         role: NADeviceRole,
-        containerIdentifier: String,
-        configured: Bool? = nil
+        containerIdentifier: String
     ) {
         self.role = role
         self.containerIdentifier = containerIdentifier
-        self.configured = configured ?? (
-            DeviceCloudKitPreflight.hasCloudKitEntitlement()
-                && DeviceCloudKitPreflight.entitlementGrantsContainer(containerIdentifier)
-        )
-        // CK-3c: restore the persisted pull cursor so a cold start resumes from
-        // where it left off instead of re-pulling every record from zero (which
-        // would re-deliver old messages past the bridge seen-set cap). Keyed by
-        // (role, container) so distinct devices/containers never share a cursor.
+        // Restore the role/container cursor so restarts cannot replay messages beyond the seen-set cap.
         if let ts = UserDefaults.standard.object(forKey: Self.cursorKey(role: role, container: containerIdentifier)) as? Double {
             self.lastPullDate = Date(timeIntervalSince1970: ts)
             self.lastPullCursorPersistenceAt = Date()
         }
     }
 
-    public var presentsVisualNotifications: Bool { false }
 
     private static func cursorKey(role: NADeviceRole, container: String) -> String {
         "NADeviceSync.cursor.\(role.rawValue).\(container)"
@@ -392,11 +338,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         } ?? true
     }
 
-    /// CK-3c: true iff `userInfo` is a CloudKit silent push for one of the
-    /// device-sync subscriptions (chat / pairing / status). The APNs push handler
-    /// uses this to route ONLY our pushes to a drain — every other push passes
-    /// through untouched. Pure parse of the push dictionary; constructs no
-    /// `CKContainer`, so it's safe to call regardless of entitlement state.
+    /// Recognizes device-sync subscription pushes without constructing CKContainer.
     public static func isDeviceSyncNotification(_ userInfo: [AnyHashable: Any]) -> Bool {
         guard let note = CKNotification(fromRemoteNotificationDictionary: userInfo),
               let subID = note.subscriptionID else { return false }
@@ -414,1121 +356,14 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         CKNotification(fromRemoteNotificationDictionary: userInfo)?.subscriptionID == DeviceCloudKitSubscriptionID.chat
     }
 
-    /// The private CloudKit database. Constructing `CKContainer(identifier:)` is
-    /// the 2026-06-03 `_os_crash` trap site — so this property MUST NOT be reached
-    /// unless `configured` is true. Every PUBLIC entry point below opens with a
-    /// `guard configured` that returns `.notConfigured` / a safe default, and the
-    /// private helpers (`pull`, `registerBroadSubscription`) are only ever called
-    /// from those guarded publics. That gate is what makes the cutover safe;
-    /// completeness is pinned by the crash-guard tests, which exercise every
-    /// method with `configured: false` and assert no `CKContainer` is touched.
-    private var database: CKDatabase {
+    // The database is reached only after entitlement preflight.
+    var database: CKDatabase {
         CKContainer(identifier: containerIdentifier).privateCloudDatabase
-    }
-
-    // MARK: send
-
-    public func send(_ message: BridgeMessage) async throws {
-        try await send(message, beforeDispatch: {})
-    }
-
-    public func send(_ message: BridgeMessage, beforeDispatch: @Sendable () async throws -> Void) async throws {
-        guard configured else { throw DeviceSyncError.notConfigured }  // crash-guard: no CKContainer
-        try refuseWhilePairedElsewhere()
-        let fields = try NAChatMessageCodec.encode(message)
-        let recordType = Self.recordType(for: fields)
-        let usesAsset = NAChatMessageCodec.usesAsset(fields)
-        var assetURL: URL?
-        var legacyFields: NAChatMessageFields?
-        if usesAsset {
-            guard let secret = await loadAssetSecretProvider()?(), secret.count == 32 else {
-                throw DeviceSyncError.underlying(message: "Pairing is required to encrypt this attachment.")
-            }
-            // 0.5.1 reads only payloadJSON, then claims the record. Give that
-            // phone a signed reading copy while newer peers decrypt the asset.
-            if fields.direction == NAChatDirection.mac2ios.rawValue {
-                var text = message.text
-                while true {
-                    let notice = "\n\nThe image is on the Mac."
-                        + (text == message.text ? "" : "\nThe rest of the reply is on the Mac.")
-                    let preview = try BridgeMessage.make(id: message.id, sender: message.sender,
-                        text: text + notice, sessionID: message.sessionID, correlationID: message.correlationID,
-                        metadata: message.metadata, timestamp: message.timestamp).signed(with: secret)
-                    do {
-                        legacyFields = try NAChatMessageCodec.encode(preview)
-                        break
-                    } catch DeviceSyncError.payloadTooLarge(_, _) where !text.isEmpty {
-                        text = String(text.prefix(text.count / 2))
-                    }
-                }
-            }
-            let box = try AES.GCM.seal(Data(fields.payloadJSON.utf8), using: Self.assetKey(secret),
-                authenticating: Self.assetContext(recordName: fields.recordName, direction: fields.direction))
-            guard let bytes = box.combined else { throw DeviceSyncError.underlying(message: "Attachment encryption failed.") }
-            let url = FileManager.default.temporaryDirectory.appendingPathComponent("nativeagent-chat-\(UUID().uuidString).sealed")
-            do {
-                try bytes.write(to: url, options: .atomic)
-                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-            } catch {
-                try? FileManager.default.removeItem(at: url)
-                throw error
-            }
-            assetURL = url
-        }
-        let preparedAssetURL = assetURL
-        let preparedLegacyFields = legacyFields
-        do {
-            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.send", onFailure: accountFailureReporter,
-                                                  beforeDispatch: {
-                do { try await beforeDispatch() }
-                catch {
-                    if let preparedAssetURL { try? FileManager.default.removeItem(at: preparedAssetURL) }
-                    throw error
-                }
-            }) {
-                defer { if let preparedAssetURL { try? FileManager.default.removeItem(at: preparedAssetURL) } }
-                let ck = CKRecord(
-                    recordType: recordType,
-                    recordID: CKRecord.ID(recordName: fields.recordName)
-                )
-                ck["direction"] = fields.direction as CKRecordValue
-                if let s = fields.sessionId { ck["sessionId"] = s as CKRecordValue }
-                ck["text"] = (preparedLegacyFields?.text ?? fields.text) as CKRecordValue
-                if let preparedAssetURL { ck["payloadAsset"] = CKAsset(fileURL: preparedAssetURL) }
-                if let preparedLegacyFields { ck["payloadJSON"] = preparedLegacyFields.payloadJSON as CKRecordValue }
-                else if preparedAssetURL == nil { ck["payloadJSON"] = fields.payloadJSON as CKRecordValue }
-                ck["createdAt"] = fields.createdAt as CKRecordValue
-                ck["senderDevice"] = fields.senderDevice as CKRecordValue
-                if let k = fields.kind { ck["kind"] = k as CKRecordValue }
-                if let title = fields.notificationTitle {
-                    ck["notificationTitle"] = title as CKRecordValue
-                }
-                if let screen = fields.notificationScreen {
-                    ck["notificationScreen"] = screen as CKRecordValue
-                }
-                if let eventID = fields.notificationEventID {
-                    ck["notificationEventId"] = eventID as CKRecordValue
-                }
-
-                let op = CKModifyRecordsOperation(recordsToSave: [ck], recordIDsToDelete: nil)
-                op.savePolicy = .ifServerRecordUnchanged
-                op.qualityOfService = .userInitiated
-                do { try await self.performModifyRecords(op) }
-                catch let error as DeviceSyncError {
-                    if case .conflict = error, await self.existingMessageRecordMatches(fields) {
-                        do { try await self.resignalMessage(named: fields.recordName) }
-                        catch { throw DeviceSyncSendOutcomeUnknown(message: error.localizedDescription) }
-                        return
-                    }
-                    switch error {
-                    case .transient, .underlying, .conflict:
-                        throw DeviceSyncSendOutcomeUnknown(message: error.localizedDescription)
-                    default: throw error
-                    }
-                } catch {
-                    throw DeviceSyncSendOutcomeUnknown(message: error.localizedDescription)
-                }
-            }
-        } catch is DeviceCKLandmineTimeout {
-            if await existingMessageRecordMatches(fields) {
-                return
-            }
-            throw DeviceSyncSendOutcomeUnknown(message: "CloudKit send timed out; server acceptance is unknown")
-        } catch is CancellationError {
-            if let preparedAssetURL { try? FileManager.default.removeItem(at: preparedAssetURL) }
-            throw CancellationError()
-        }
-    }
-
-    /// Renew the original delivery, never mint a second request. A changed
-    /// query clock makes it eligible for an update push; the signed payload keeps
-    /// its original timestamp and identity. Uses the existing CloudKit schema.
-    public func resignalMessage(named recordName: String) async throws {
-        guard configured else { throw DeviceSyncError.notConfigured }
-        try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.resignal", onFailure: accountFailureReporter) {
-            let id = CKRecord.ID(recordName: recordName)
-            let records = try await self.database.records(for: [id], desiredKeys: ["direction", "createdAt"])
-            guard let fetched = records[id] else { throw CKError(.unknownItem) }
-            let record = try fetched.get()
-            let direction: NAChatDirection = self.role == .mac ? .mac2ios : .ios2mac
-            guard record["direction"] as? String == direction.rawValue else {
-                throw DeviceSyncError.underlying(message: "Cannot re-signal another device's message.")
-            }
-            record["createdAt"] = ISO8601DateFormatter().string(from: Date()) as CKRecordValue
-            let op = CKModifyRecordsOperation(recordsToSave: [record], recordIDsToDelete: nil)
-            op.savePolicy = .changedKeys
-            op.qualityOfService = .userInitiated
-            try await self.performModifyRecords(op)
-        }
-    }
-
-    /// Resolves timeout-after-commit and stable-id retries without weakening
-    /// conflict handling. Only exact payloadJSON + direction equality converts
-    /// the ambiguous write into success.
-    static func recordType(for fields: NAChatMessageFields) -> String {
-        fields.kind == "notification"
-            ? NADeviceSyncRecordType.notification
-            : NADeviceSyncRecordType.chatMessage
-    }
-
-    private func existingMessageRecordMatches(_ fields: NAChatMessageFields) async -> Bool {
-        let secret = await loadAssetSecretProvider()?()
-        return await withDeviceCKTimeout("CloudKitDeviceTransport.sendReplayProof", onFailure: accountFailureReporter) {
-            let record = try await self.database.record(
-                for: CKRecord.ID(recordName: fields.recordName)
-            )
-            return NAChatMessageCodec.isExactIdempotentReplay(
-                existingPayloadJSON: try Self.payload(in: record, secret: secret),
-                existingDirection: record["direction"] as? String,
-                intended: fields
-            )
-        } ?? false
-    }
-
-    // MARK: observeIncoming
-
-    @discardableResult
-    public func observeIncoming(_ onMessage: @escaping @Sendable (BridgeMessage) async -> Bool) async -> Bool {
-        guard configured else {
-            nativeLog("[ck-device] observeIncoming: CloudKit entitlement absent — not subscribing (notConfigured). Legacy transport should own delivery.")
-            return false
-        }
-        setIncomingHandler(onMessage)  // last registration wins (single forwarder)
-        // Let the bridge record subscription failure before its initial drain.
-        return await ensurePushSubscriptions()
-    }
-
-    public func ensurePushSubscriptions() async -> Bool {
-        guard configured else { return false }
-        do {
-            try await subscribeToChanges()
-            return true
-        } catch {
-            // Fail loud (no-silent-fallbacks): a failed subscription means no
-            // live push wakeups — the drain still works when polled, but callers
-            // must not describe the visual route as eligible.
-            nativeLog("[ck-device] subscription registration FAILED (no live push): \(error)")
-            devicePushLog.error("Chat subscription failed role=\(self.role.rawValue, privacy: .public): \(String(describing: error), privacy: .private)")
-            return false
-        }
-    }
-
-    /// Pull incoming messages since the last cursor, decode, dispatch to the
-    /// registered handler, and advance the cursor with a clock-skew overlap
-    /// window. Idempotent per message id. Failed queries never report an empty success.
-    @discardableResult
-    public func drainIncoming() async -> DeviceSyncDrainResult {
-        guard NADeviceSyncRecoveryBudget.hasTime else { return .skipped(0) }
-        guard configured else { return .skipped(0) }  // crash-guard: pull() touches CKContainer
-        guard !pairingHeldElsewhere else { return .skipped(0) }
-        // CK-3c: serialize via SYNC lock helpers (the codebase keeps every NSLock
-        // use in a synchronous scope — never held across an await). The body's own
-        // fine-grained locking still works since the slot flag isn't held here.
-        guard beginDrainOrCoalesce() else { return .skipped(await drainIncomingControls()) }
-        var total = 0
-        var outcome: DeviceSyncDrainResult = .skipped(0)
-        while true {
-            outcome = await drainIncomingBody()
-            total += outcome.dispatchedCount
-            if endDrainOrContinue() { continue }  // a concurrent caller requested a re-run
-            break
-        }
-        if case .success = outcome { return .success(total) }
-        if case .failure(let error, _) = outcome { return .failure(error, dispatched: total) }
-        return .skipped(total)
-    }
-
-    /// Acquire the single drain slot. Returns true if acquired; false if a drain
-    /// is already running (then flags a re-run so the active loop services us).
-    private func beginDrainOrCoalesce() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        if drainInFlight { drainAgain = true; return false }
-        drainInFlight = true
-        return true
-    }
-
-    /// End a drain iteration. Returns true if a re-run is needed (clearing the
-    /// request); false if the slot is now free.
-    private func endDrainOrContinue() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        if drainAgain && NADeviceSyncRecoveryBudget.hasTime { drainAgain = false; return true }
-        drainAgain = false
-        drainInFlight = false
-        return false
-    }
-
-    /// The drain body — always run serialized by `drainIncoming`; never call it
-    /// directly (concurrent bodies can drop records, the P0 the wrapper prevents).
-    private func drainIncomingBody() async -> DeviceSyncDrainResult {
-        let (handler, since) = loadHandlerAndCursor()
-        guard handler != nil else { return .skipped(0) }
-        let queryStartedAt = Date()
-
-        let inbound = role.inboundDirection.rawValue
-        let fetched: DeviceCKPullResult
-        do {
-            var records = try await pull(
-                recordType: NADeviceSyncRecordType.chatMessage,
-                since: since,
-                inboundDirection: inbound
-            )
-            if role == .ios {
-                let notifications = try await pull(
-                    recordType: NADeviceSyncRecordType.notification,
-                    since: since,
-                    inboundDirection: inbound
-                )
-                records.records += notifications.records
-                records.payloadError = records.payloadError ?? notifications.payloadError
-            }
-            fetched = records
-        } catch {
-            nativeLog("[ck-device] drainIncoming pull failed: \(error)")
-            return .failure(Self.mapError(error))
-        }
-
-        let dispatched = await deliverIncoming(fetched.records, since: since, queryStartedAt: queryStartedAt,
-                                               advanceCursor: fetched.payloadError == nil)
-        if let error = fetched.payloadError { return .failure(error, dispatched: dispatched) }
-        return .success(dispatched)
-    }
-
-    func deliverIncoming(_ fetched: [(fields: NAChatMessageFields, modDate: Date?)], since: Date?, queryStartedAt: Date,
-                         advanceCursor: Bool = true) async -> Int {
-        guard let handler = loadHandlerAndCursor().0 else { return 0 }
-        let inbound = role.inboundDirection.rawValue
-        // Deliver in chronological order — CloudKit query order is undefined.
-        // Sort ascending by server modDate, then createdAt, then id.
-        let sorted = Self.orderedIncoming(fetched)
-
-        // Controls in this batch must reach their owners before awaiting chat.
-        guard let controls = await deliverControls(sorted) else { return 0 }
-        var dispatched = controls
-        // The cursor may only advance to the last point BEFORE the first
-        // UNDELIVERED inbound record — a rejected message must never be skipped.
-        // Delivered / already-seen / not-for-us records advance it; the first
-        // handler rejection halts advancement (that record is retried next drain).
-        var cursorAdvance: Date? = nil
-        var halted = false
-        for item in sorted {
-            // A concurrent cancellation has not yet earned acknowledgement.
-            // Never advance the ordinary cursor past its temporary claim.
-            if isControlDrainInFlight() { halted = true; break }
-            if !NADeviceSyncRecoveryBudget.hasTime { halted = true; break }
-            if halted && role != .ios { break }
-            let m = item.modDate
-            guard item.fields.direction == inbound else {
-                if !halted, let m { cursorAdvance = m }   // our own outbound / other — safe to pass
-                continue
-            }
-            let id = Self.deliveryClaimKey(item.fields)
-            // Atomic check-and-claim under one lock so two concurrent drains
-            // cannot both deliver the same id.
-            guard let claimed = claimForSerialDrain(id) else { halted = true; break }
-            guard claimed else {
-                if !halted, let m { cursorAdvance = m }    // already delivered — safe to pass
-                continue
-            }
-            guard let message = try? NAChatMessageCodec.decode(item.fields) else {
-                nativeLog("[ck-device] drainIncoming: undecodable payload for \(id)")
-                if !halted, let m { cursorAdvance = m }    // poison — keep it claimed, pass
-                continue
-            }
-            if await handler(message) {
-                dispatched += 1
-                NADeviceSyncRecoveryBudget.didApplyData?()
-                if !halted, let m { cursorAdvance = m }
-            } else {
-                releaseClaim(id)                  // not delivered — retry next drain
-                halted = true                     // do not advance past this record
-                // iPhone replies are independent deliveries. Keep the failed
-                // row unclaimed and the cursor pinned, but deliver later replies.
-            }
-        }
-        if isControlDrainInFlight() { halted = true }
-        // Keep a sliding 30s overlap (matches the memory framework). An idle
-        // successful query must still move an established cursor forward;
-        // otherwise a quiet bridge re-queries from the date of its last record
-        // forever. A halted delivery never advances past the rejected row.
-        if advanceCursor, let nextCursor = Self.nextPullCursor(
-            previousCursor: since,
-            queryStartedAt: queryStartedAt,
-            safeRecordDate: cursorAdvance,
-            halted: halted
-        ) {
-            setLastPullDate(
-                nextCursor,
-                persistImmediately: cursorAdvance != nil || halted
-            )
-        }
-        return dispatched
-    }
-
-    private static func orderedIncoming(_ records: [(fields: NAChatMessageFields, modDate: Date?)]) -> [(fields: NAChatMessageFields, modDate: Date?)] {
-        records.sorted { a, b in
-            let am = a.modDate ?? .distantPast, bm = b.modDate ?? .distantPast
-            if am != bm { return am < bm }
-            if a.fields.createdAt != b.fields.createdAt { return a.fields.createdAt < b.fields.createdAt }
-            return a.fields.recordName < b.fields.recordName
-        }
-    }
-
-    /// Mac-only admission; the bridge authenticates phone actions and handoffs.
-    /// Ordinary chat delivery and its terminal receipt retain their original owner.
-    public func setControlAdmission(_ admission: @escaping @Sendable (BridgeMessage) async -> Bool) {
-        lock.lock(); defer { lock.unlock() }
-        controlAdmission = admission
-    }
-
-    @discardableResult
-    public func drainIncomingControls() async -> Int {
-        guard configured, role == .mac, NADeviceSyncRecoveryBudget.hasTime, !pairingHeldElsewhere,
-              loadControlAdmission() != nil, beginControlDrain() else { return 0 }
-        defer { endControlDrain() }
-        let (_, since) = loadHandlerAndCursor()
-        do {
-            let records = try await pull(recordType: NADeviceSyncRecordType.chatMessage,
-                                         since: since, inboundDirection: role.inboundDirection.rawValue)
-            if let error = records.payloadError { nativeLog("[ck-device] cancellation payload failed: %@", error.localizedDescription) }
-            return await deliverAdmittedControls(Self.orderedIncoming(records.records))
-        } catch {
-            nativeLog("[ck-device] cancellation pull failed: \(error)")
-            return 0
-        }
-    }
-
-    private func isControlDrainInFlight() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return controlDrainInFlight
-    }
-
-    private func beginControlDrain() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        guard !controlDrainInFlight else { return false }
-        controlDrainInFlight = true
-        return true
-    }
-
-    private func endControlDrain() {
-        lock.lock(); defer { lock.unlock() }
-        controlDrainInFlight = false
-    }
-
-    private func loadControlAdmission() -> (@Sendable (BridgeMessage) async -> Bool)? {
-        lock.lock(); defer { lock.unlock() }
-        return controlAdmission
-    }
-
-    func deliverControls(_ records: [(fields: NAChatMessageFields, modDate: Date?)]) async -> Int? {
-        guard role == .mac, loadControlAdmission() != nil else { return 0 }
-        guard beginControlDrain() else { return nil }
-        defer { endControlDrain() }
-        return await deliverAdmittedControls(records)
-    }
-
-    private func deliverAdmittedControls(_ records: [(fields: NAChatMessageFields, modDate: Date?)]) async -> Int {
-        guard let admission = loadControlAdmission(),
-              let handler = loadHandlerAndCursor().0 else { return 0 }
-        var delivered = 0
-        for record in records {
-            guard NADeviceSyncRecoveryBudget.hasTime else { break }
-            // A record this Mac already took is never admitted again, so skip
-            // its decode and signature check: a pinned cursor re-pulls the
-            // same rows every drain (perf sweep 2026-10-05).
-            guard record.fields.direction == role.inboundDirection.rawValue,
-                  !isSeen(Self.deliveryClaimKey(record.fields)),
-                  let message = try? NAChatMessageCodec.decode(record.fields),
-                  await admission(message), claimIfUnseen(Self.deliveryClaimKey(record.fields)) else { continue }
-            if await handler(message) {
-                delivered += 1
-                NADeviceSyncRecoveryBudget.didApplyData?()
-            } else {
-                releaseClaim(Self.deliveryClaimKey(record.fields))
-            }
-        }
-        // This path never writes the cursor. The serial drain accounts for
-        // every intervening chat and any cancellation whose response failed.
-        return delivered
-    }
-
-    static func nextPullCursor(
-        previousCursor: Date?,
-        queryStartedAt: Date,
-        safeRecordDate: Date?,
-        halted: Bool
-    ) -> Date? {
-        let overlap: TimeInterval = 30
-
-        if halted {
-            guard let safeRecordDate else { return previousCursor }
-            let candidate = safeRecordDate.addingTimeInterval(-overlap)
-            guard let previousCursor else { return candidate }
-            return max(previousCursor, candidate)
-        }
-
-        // On a first-ever empty pull, retain nil so the next attempt still
-        // performs a complete bootstrap read. Once a durable cursor exists (or
-        // this pull saw a record), successful emptiness is an observed high
-        // watermark and can slide the overlap window forward safely.
-        guard previousCursor != nil || safeRecordDate != nil else { return nil }
-        let highWatermark = max(queryStartedAt, safeRecordDate ?? queryStartedAt)
-        let candidate = highWatermark.addingTimeInterval(-overlap)
-        guard let previousCursor else { return candidate }
-        return max(previousCursor, candidate)
-    }
-
-    // MARK: retention sweep
-
-    /// 2026-09-06: every `send` wrote an `NAChatMessage`/`NANotification`
-    /// record and nothing ever deleted one — draining advances a cursor and
-    /// remembers seen ids, but acknowledged records stayed in the private
-    /// database forever. The Mac is the deleting device (it is the always-on
-    /// owner); the phone never sweeps.
-    ///
-    /// A record is eligible once its SERVER modificationDate is older than the
-    /// window, whether or not the phone drained it. That is accepted: a phone
-    /// offline for two weeks resyncs from the Mac's transcript snapshot, which
-    /// is the source of truth. Pairing and status records are singletons that
-    /// are overwritten in place, so they are never swept.
-    public static let retentionWindow: TimeInterval = 14 * 24 * 60 * 60
-
-    /// Deletions per sweep, per record type. Bounded so a first sweep over a
-    /// large backlog cannot turn one drain into a long CloudKit transaction;
-    /// the backlog clears over successive sweeps.
-    public static let retentionSweepBatch = 100
-
-    /// Minimum spacing between sweeps in the steady state. Drains run as often
-    /// as every eight seconds; retention is housekeeping, not a per-drain cost.
-    static let retentionSweepInterval: TimeInterval = 60 * 60
-
-    /// Spacing while a sweep's page still comes back full. The first sweep on a
-    /// container that has been accumulating since the cutover has a large
-    /// backlog, and at one bounded batch an hour it would take weeks to clear.
-    static let retentionBacklogSweepInterval: TimeInterval = 60
-
-    static func shouldSweepRetention(
-        role: NADeviceRole,
-        lastSweepAt: Date?,
-        backlog: Bool,
-        now: Date
-    ) -> Bool {
-        guard role == .mac else { return false }   // the phone never deletes
-        guard let lastSweepAt else { return true }
-        let interval = backlog ? retentionBacklogSweepInterval : retentionSweepInterval
-        return now.timeIntervalSince(lastSweepAt) >= interval
-    }
-
-    /// Delete chat + notification records past the retention window. Mac-only,
-    /// rate-limited, and bounded per record type. Returns the number deleted.
-    /// Safe to call on every drain — it self-throttles and no-ops on iOS.
-    @discardableResult
-    public func sweepExpiredRecords() async -> Int {
-        guard configured else { return 0 }  // crash-guard: no CKContainer
-        guard !pairingHeldElsewhere else { return 0 }
-        let now = Date()
-        guard claimRetentionSweep(now: now) else { return 0 }
-        let cutoff = now.addingTimeInterval(-Self.retentionWindow)
-        var deleted = 0
-        var backlog = false
-        var timedOut = false
-        for recordType in [
-            NADeviceSyncRecordType.chatMessage,
-            NADeviceSyncRecordType.notification,
-        ] {
-            let outcome = await sweepExpiredRecords(recordType: recordType, cutoff: cutoff)
-            deleted += outcome.deleted
-            // 2026-09-06: the backlog signal is a FULL PAGE, not a full batch of
-            // deletions — a page that fetched a hundred records and deleted two
-            // still means there is more of the collection to walk.
-            if outcome.backlog { backlog = true }
-            if outcome.deleteTimedOut { timedOut = true }
-        }
-        setRetentionBacklog(backlog)
-        // Cancellation cannot prove the server rejected a timed-out batch.
-        if timedOut {
-            nativeLog(
-                "[ck-device] retention sweep: %d confirmed deletion(s) before %@, plus a batch whose delete timed out — that batch's count is unknown",
-                deleted,
-                "\(cutoff)"
-            )
-        } else {
-            nativeLog(
-                "[ck-device] retention sweep deleted %d record(s) modified before %@",
-                deleted,
-                "\(cutoff)"
-            )
-        }
-        return deleted
-    }
-
-    /// Claim the sweep slot under the lock. Doubles as the rate limiter and as
-    /// the mutual exclusion between two concurrent drains.
-    private func claimRetentionSweep(now: Date) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        guard Self.shouldSweepRetention(
-            role: role,
-            lastSweepAt: lastRetentionSweepAt,
-            backlog: retentionBacklog,
-            now: now
-        ) else { return false }
-        lastRetentionSweepAt = now
-        return true
-    }
-
-    private func setRetentionBacklog(_ backlog: Bool) {
-        lock.lock(); retentionBacklog = backlog; lock.unlock()
-    }
-
-    private func sweepExpiredRecords(recordType: String, cutoff: Date) async -> DeviceCKSweepOutcome {
-        var outcome = DeviceCKSweepOutcome()
-        let orderedByServerModDate = serverModDateSortAvailable(recordType: recordType)
-        let page: DeviceCKSweepPage
-        do {
-            page = try await withDeviceCKTimeoutThrowing(
-                "CloudKitDeviceTransport.sweep",
-                seconds: 10,
-                onFailure: accountFailureReporter
-            ) {
-                if orderedByServerModDate {
-                    do {
-                        return try await self.expiredRecordPage(
-                            recordType: recordType,
-                            cutoff: cutoff,
-                            orderByServerModDate: true,
-                            resumeCursor: nil
-                        )
-                    } catch is DeviceCKUnsortableField {
-                        // Same missing `___modTime` index the pull depends on;
-                        // latch it once so neither lane pays for a rejected
-                        // query again.
-                        self.markServerModDateSortRejected(recordType: recordType)
-                    }
-                }
-                return try await self.expiredRecordPage(
-                    recordType: recordType,
-                    cutoff: cutoff,
-                    orderByServerModDate: false,
-                    resumeCursor: self.retentionFallbackCursor(recordType: recordType)
-                )
-            }
-        } catch {
-            nativeLog("[ck-device] retention sweep query failed for %@: %@", recordType, String(describing: error))
-            // A stored cursor can go stale on the server; keeping it would make
-            // every later sweep fail the same way. Drop it and walk again from
-            // the oldest record next time.
-            if !serverModDateSortAvailable(recordType: recordType) {
-                setRetentionFallbackCursor(nil, recordType: recordType)
-            }
-            return outcome
-        }
-        // The order actually used: a first query rejected for its sort
-        // descriptor latched the fallback above.
-        let usedServerModDateOrder = orderedByServerModDate
-            && serverModDateSortAvailable(recordType: recordType)
-        if !usedServerModDateOrder {
-            // Advance (or, on nil, reset) the walk before deleting: a delete
-            // that fails leaves those records for the next full walk rather
-            // than pinning the sweep on a page it cannot clear.
-            setRetentionFallbackCursor(page.fetched == 0 ? nil : page.cursor, recordType: recordType)
-        }
-        // 2026-09-06: a full page means there is more collection to walk. In
-        // modificationDate order the page is sorted by the eligibility clock
-        // itself, so a page that is only partly eligible IS the cutoff boundary
-        // — nothing older remains, and claiming a backlog there would hold the
-        // sweep at its one-minute cadence forever on any busy container.
-        outcome.backlog = page.fetched >= Self.retentionSweepBatch
-            && (!usedServerModDateOrder || page.names.count == page.fetched)
-        let names = page.names
-        guard !names.isEmpty else { return outcome }
-        do {
-            try await withDeviceCKTimeoutThrowing(
-                "CloudKitDeviceTransport.sweepDelete",
-                seconds: 15,
-                onFailure: accountFailureReporter
-            ) {
-                let op = CKModifyRecordsOperation(
-                    recordsToSave: nil,
-                    recordIDsToDelete: names.map { CKRecord.ID(recordName: $0) }
-                )
-                op.qualityOfService = .utility
-                try await self.performModifyRecords(op)
-            }
-        } catch is DeviceCKLandmineTimeout {
-            // Keep the batch count unknown until server acceptance is proven.
-            nativeLog(
-                "[ck-device] retention sweep delete batch of %d timed out for %@; the server may still have applied it — count unknown",
-                names.count,
-                recordType
-            )
-            outcome.deleteTimedOut = true
-            return outcome
-        } catch {
-            nativeLog("[ck-device] retention sweep delete failed for %@: %@", recordType, String(describing: error))
-            return outcome
-        }
-        outcome.deleted = names.count
-        return outcome
-    }
-
-    private func retentionFallbackCursor(recordType: String) -> CKQueryOperation.Cursor? {
-        lock.lock(); defer { lock.unlock() }
-        return retentionFallbackCursors[recordType]
-    }
-
-    private func setRetentionFallbackCursor(_ cursor: CKQueryOperation.Cursor?, recordType: String) {
-        lock.lock()
-        retentionFallbackCursors[recordType] = cursor
-        lock.unlock()
-    }
-
-    /// One bounded page of the OLDEST records of `recordType`, filtered to those
-    /// the cutoff has passed. In modificationDate order, ascending is what makes
-    /// a single page enough: the page is either wholly eligible or contains the
-    /// cutoff boundary, and deleting it moves the next sweep's page forward.
-    /// Eligibility is ALWAYS the server modificationDate — the client
-    /// `createdAt` is only a fallback sort key for a container whose
-    /// `___modTime` index is not sortable. In THAT order the page is not sorted
-    /// by the eligibility clock and nothing on it need be deletable, so the
-    /// caller passes `resumeCursor` to continue past the records this page
-    /// already examined instead of re-reading them forever. `desiredKeys = []`
-    /// keeps the page to system fields, so a sweep never downloads payloads it
-    /// is about to delete.
-    private func expiredRecordPage(
-        recordType: String,
-        cutoff: Date,
-        orderByServerModDate: Bool,
-        resumeCursor: CKQueryOperation.Cursor?
-    ) async throws -> DeviceCKSweepPage {
-        let op: CKQueryOperation
-        // Only a FRESH query carries the sort descriptor, so only a fresh query
-        // can be rejected for it; an `.invalidArguments` on a cursor
-        // continuation is a stale cursor and must not latch the fallback order.
-        let carriesSortDescriptor = resumeCursor == nil
-        if let resumeCursor {
-            op = CKQueryOperation(cursor: resumeCursor)
-        } else {
-            // 2026-10-07: TRUEPREDICATE needs a queryable recordName, which the
-            // deployed NANotification type lacks ("Field 'recordName' is not
-            // marked queryable", every sweep). Filter on the indexed direction
-            // the pull already uses; every record carries one of the two.
-            let query = CKQuery(recordType: recordType, predicate: NSPredicate(
-                format: "direction IN %@",
-                [NAChatDirection.mac2ios.rawValue, NAChatDirection.ios2mac.rawValue]
-            ))
-            query.sortDescriptors = [
-                NSSortDescriptor(key: orderByServerModDate ? "modificationDate" : "createdAt", ascending: true)
-            ]
-            op = CKQueryOperation(query: query)
-        }
-        op.qualityOfService = .utility
-        op.resultsLimit = Self.retentionSweepBatch
-        op.desiredKeys = []
-
-        let holder = DeviceCKRecordNameHolder()
-        op.recordMatchedBlock = { id, result in
-            guard case .success(let ck) = result else { return }
-            holder.noteFetched()
-            guard let modDate = ck.modificationDate, modDate < cutoff else { return }
-            holder.add(id.recordName)
-        }
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<DeviceCKSweepPage, Error>) in
-            op.queryResultBlock = { result in
-                let page = holder.snapshot()
-                switch result {
-                case .success(let cursor):
-                    cont.resume(returning: DeviceCKSweepPage(
-                        names: page.names,
-                        fetched: page.fetched,
-                        cursor: cursor
-                    ))
-                case .failure(let err):
-                    if carriesSortDescriptor,
-                       orderByServerModDate,
-                       Self.rejectsServerModDateSort(err) {
-                        cont.resume(throwing: DeviceCKUnsortableField())
-                    } else {
-                        cont.resume(throwing: Self.mapError(err))
-                    }
-                }
-            }
-            self.database.add(op)
-        }
-    }
-
-    /// 2026-10-07: only a rejection that names the server-date field means the
-    /// sort index is missing. Any other `.invalidArguments` (the sweep's
-    /// non-queryable recordName was one) must not latch that type into the
-    /// createdAt order for the rest of the process.
-    static func rejectsServerModDateSort(_ error: Error) -> Bool {
-        guard (error as? CKError)?.code == .invalidArguments else { return false }
-        let text = String(describing: error)
-        return text.contains("modTime") || text.contains("modificationDate")
-    }
-
-    // MARK: pairing
-
-    public func publishPairing(secret: Data) async throws {
-        guard configured else { throw DeviceSyncError.notConfigured }  // crash-guard: no CKContainer
-        let recordType = NADeviceSyncRecordType.pairingDevice
-        let secretHex = secret.map { String(format: "%02x", $0) }.joined()
-        let recordName = "pairing.\(role.rawValue)"
-        let publishedAt = isoNow()
-        do {
-            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.publishPairing", onFailure: accountFailureReporter) {
-                let ck = CKRecord(
-                    recordType: recordType,
-                    recordID: CKRecord.ID(recordName: recordName)
-                )
-                ck["role"] = self.role.rawValue as CKRecordValue
-                ck["secretHex"] = secretHex as CKRecordValue
-                ck["publishedAt"] = publishedAt as CKRecordValue
-                let op = CKModifyRecordsOperation(recordsToSave: [ck], recordIDsToDelete: nil)
-                // Pairing is a mutable singleton per device — overwrite freely.
-                op.savePolicy = .changedKeys
-                op.qualityOfService = .userInitiated
-                try await self.performModifyRecords(op)
-            }
-        } catch is DeviceCKLandmineTimeout {
-            throw DeviceSyncError.transient(message: "CloudKit publishPairing timed out")
-        }
-        notePairingPublished()
-    }
-
-    /// Every Mac on one Apple Account shares the account's Mac pairing record,
-    /// and the phone follows whichever key it holds. A Mac takes the record
-    /// only when it is free or already its own; another Mac's key stays until
-    /// the person moves the phone, which is `publishPairing`. While another Mac
-    /// holds it this transport neither reads the phone's records nor writes
-    /// any: the phone is that Mac's. Returns whether this Mac holds the
-    /// pairing, or nil when the record could not be read (nothing changes).
-    @discardableResult
-    public func claimPairing(secret: Data) async -> Bool? {
-        guard configured, role == .mac, secret.count == 32 else { return nil }
-        let recordName = "pairing.\(role.rawValue)"
-        let publications = pairingPublicationCount()
-        let slot: PairingSlot? = await withDeviceCKTimeout("CloudKitDeviceTransport.claimPairing", onFailure: accountFailureReporter) {
-            do {
-                let record = try await self.database.record(for: CKRecord.ID(recordName: recordName))
-                return (record["secretHex"] as? String).flatMap(Self.data(fromHex:)).map(PairingSlot.holds) ?? .empty
-            } catch let error as CKError where error.code == .unknownItem {
-                return .empty
-            }
-        }
-        switch slot {
-        case nil:
-            return nil
-        case .holds(let held)?:
-            return settleClaim(elsewhere: held != secret, since: publications)
-        case .empty?:
-            do { try await publishPairing(secret: secret) } catch { return nil }
-            return true
-        }
-    }
-
-    /// True while another Mac on this Apple Account holds the pairing.
-    public var pairingHeldElsewhere: Bool {
-        lock.lock(); defer { lock.unlock() }
-        return heldElsewhere
-    }
-
-    private func notePairingPublished() {
-        lock.lock(); defer { lock.unlock() }
-        pairingPublications &+= 1
-        heldElsewhere = false
-    }
-
-    private func pairingPublicationCount() -> UInt64 {
-        lock.lock(); defer { lock.unlock() }
-        return pairingPublications
-    }
-
-    /// A publication that landed while the claim was reading is newer than
-    /// what the read saw, and already decided the answer.
-    private func settleClaim(elsewhere: Bool, since publications: UInt64) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        if pairingPublications == publications { heldElsewhere = elsewhere }
-        return !heldElsewhere
-    }
-
-    private func refuseWhilePairedElsewhere() throws {
-        if pairingHeldElsewhere { throw DeviceSyncError.pairedElsewhere }
-    }
-
-    public func observePairing(onChange: @escaping @Sendable (Data) async -> Bool) async {
-        guard configured else {
-            nativeLog("[ck-device] observePairing: CloudKit entitlement absent — not subscribing (notConfigured).")
-            return
-        }
-        setPairingHandler(onChange)  // last registration wins (single forwarder)
-        // Register the durable silent-push subscription so the peer's pairing
-        // writes notify this device, then do an initial drain to pick up a
-        // secret already published. Live push → drain wiring is CK-3; drainPairing()
-        // is the pull half and is exercisable now.
-        do {
-            try await subscribeToPairingChanges()
-        } catch {
-            nativeLog("[ck-device] observePairing: subscription registration FAILED (no live push): \(error)")
-        }
-        await drainPairing()
-    }
-
-    /// 2026-09-06: read the PEER's currently published pairing secret without
-    /// dispatching or claiming it.
-    /// A manually pasted recovery key has to be verified against the material
-    /// the peer actually published, and on a build with no KVS entitlement
-    /// this record is the only place that material exists.
-    public func peekPairingSecret() async -> Data? {
-        guard configured else { return nil }  // crash-guard: record(for:) touches CKContainer
-        let peerRole: NADeviceRole = role == .mac ? .ios : .mac
-        let recordName = "pairing.\(peerRole.rawValue)"
-        return await withDeviceCKTimeout("CloudKitDeviceTransport.peekPairingSecret", onFailure: accountFailureReporter) {
-            let record = try await self.database.record(for: CKRecord.ID(recordName: recordName))
-            guard let hex = record["secretHex"] as? String else { return nil }
-            return Self.data(fromHex: hex)
-        } ?? nil
-    }
-
-    /// Pull the PEER's pairing singleton and offer it to the registered handler
-    /// on every drain. The record is the truth: the handler compares it with
-    /// the key it holds, so a key replaced by anything else is put back on the
-    /// next drain, not only when the record's date advances. Returns true when
-    /// the handler installed a different key.
-    @discardableResult
-    public func drainPairing() async -> Bool {
-        guard NADeviceSyncRecoveryBudget.hasTime else { return false }
-        guard let handler = loadPairingHandler(),
-              let secret = await peekPairingSecret(),
-              await handler(secret) else { return false }
-        NADeviceSyncRecoveryBudget.didApplyData?()
-        return true
-    }
-
-    // MARK: status
-
-    public func setStatus(key: String, value: String) async throws {
-        guard configured else { throw DeviceSyncError.notConfigured }  // crash-guard: no CKContainer
-        try refuseWhilePairedElsewhere()
-        let recordType = NADeviceSyncRecordType.status
-        let recordName = "status.\(role.rawValue).\(key)"
-        let updatedAt = isoNow()
-        // The lane belongs to the actual CloudKit completion, not the caller's
-        // bounded wait. A timed-out write must settle before a successor starts.
-        do {
-            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.setStatus", seconds: 15, onFailure: accountFailureReporter) {
-                try await self.enqueueStatusWrite(key: key) {
-                    let ck = CKRecord(
-                        recordType: recordType,
-                        recordID: CKRecord.ID(recordName: recordName)
-                    )
-                    ck["key"] = key as CKRecordValue
-                    ck["value"] = value as CKRecordValue
-                    ck["role"] = self.role.rawValue as CKRecordValue
-                    ck["updatedAt"] = updatedAt as CKRecordValue
-                    let op = CKModifyRecordsOperation(recordsToSave: [ck], recordIDsToDelete: nil)
-                    op.savePolicy = .changedKeys
-                    // Utility permits discretionary deferral when the Mac app is
-                    // backgrounded; phone status has a bounded publication deadline.
-                    op.qualityOfService = .userInitiated
-                    try await self.performModifyRecords(op)
-                }
-            }
-        } catch is DeviceCKLandmineTimeout {
-            throw DeviceSyncError.transient(message: "CloudKit setStatus timed out")
-        }
-    }
-
-    // MARK: presence
-
-    /// One fixed record per pairing, updated in place. It rides the NANotification type
-    /// because that type's subscription fires on CREATION only: an update
-    /// wakes nobody, so the beat costs the phone no push. It has no
-    /// `direction`, so the incoming pull never returns it, and it is modified
-    /// every beat, so the retention sweep never reaches it. A type of its own
-    /// would need a production schema deploy.
-    private static func presenceRecordName(pairingSecret: Data) -> String {
-        let identity = HMAC<SHA256>.authenticationCode(for: Data("NativeAgent.presence.identity.v1".utf8),
-                                                     using: SymmetricKey(data: pairingSecret))
-        return "presence.mac." + identity.map { String(format: "%02x", $0) }.joined()
-    }
-
-    public func setPresence(pairingSecret: Data) async throws {
-        guard configured else { throw DeviceSyncError.notConfigured }  // crash-guard: no CKContainer
-        try refuseWhilePairedElsewhere()
-        guard pairingSecret.count == 32 else { throw DeviceSyncError.notConfigured }
-        let recordName = Self.presenceRecordName(pairingSecret: pairingSecret)
-        do {
-            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.setPresence", seconds: 15, onFailure: accountFailureReporter) {
-                try await self.enqueueStatusWrite(key: recordName) {
-                    let timestamp = self.isoNow()
-                    let ck = CKRecord(
-                        recordType: NADeviceSyncRecordType.notification,
-                        recordID: CKRecord.ID(recordName: recordName)
-                    )
-                    ck["kind"] = "presence" as CKRecordValue
-                    ck["createdAt"] = timestamp as CKRecordValue
-                    let signature = HMAC<SHA256>.authenticationCode(for: Data("\(recordName):\(timestamp)".utf8),
-                                                                  using: SymmetricKey(data: pairingSecret))
-                    ck["payloadJSON"] = Data(signature).base64EncodedString() as CKRecordValue
-                    let op = CKModifyRecordsOperation(recordsToSave: [ck], recordIDsToDelete: nil)
-                    op.savePolicy = .changedKeys
-                    op.qualityOfService = .utility
-                    try await self.performModifyRecords(op)
-                }
-            }
-        } catch is DeviceCKLandmineTimeout {
-            throw DeviceSyncError.transient(message: "CloudKit setPresence timed out")
-        }
-    }
-
-    public func peerPresence(pairingSecret: Data) async -> Date? {
-        guard configured else { return nil }  // crash-guard: record(for:) touches CKContainer
-        guard pairingSecret.count == 32 else { return nil }
-        let recordName = Self.presenceRecordName(pairingSecret: pairingSecret)
-        return await withDeviceCKTimeout("CloudKitDeviceTransport.peerPresence", seconds: 3, onFailure: accountFailureReporter) {
-            let record = try await self.database.record(for: CKRecord.ID(recordName: recordName))
-            guard record["kind"] as? String == "presence",
-                  let timestamp = record["createdAt"] as? String,
-                  let encoded = record["payloadJSON"] as? String, let signature = Data(base64Encoded: encoded),
-                  HMAC<SHA256>.isValidAuthenticationCode(signature, authenticating: Data("\(recordName):\(timestamp)".utf8),
-                                                       using: SymmetricKey(data: pairingSecret)) else { return nil }
-            // The signature authenticates the beat; CloudKit dates its freshness.
-            return record.modificationDate
-        } ?? nil
-    }
-
-    private func enqueueStatusWrite(
-        key: String,
-        work: @escaping @Sendable () async throws -> Void
-    ) async throws {
-        try await withCheckedThrowingContinuation { (completion: CheckedContinuation<Void, Error>) in
-            lock.lock()
-            defer { lock.unlock() }
-            // Keep one operation and the latest replacement. Each caller owns
-            // its result, including a value displaced before it reached the wire.
-            pendingStatusWrites.removeValue(forKey: key)?.completion.resume(
-                throwing: DeviceSyncError.transient(message: "CloudKit status write was superseded before sending."))
-            pendingStatusWrites[key] = (work, completion)
-            guard statusWrites[key] == nil else { return }
-            statusWrites[key] = Task.detached(priority: .utility) {
-                while let pending = self.nextStatusWrite(key: key) {
-                    do { try await pending.work(); pending.completion.resume() }
-                    catch { pending.completion.resume(throwing: error) }
-                }
-            }
-        }
-    }
-
-    private func nextStatusWrite(key: String) -> (work: @Sendable () async throws -> Void, completion: CheckedContinuation<Void, Error>)? {
-        lock.lock(); defer { lock.unlock() }
-        let work = pendingStatusWrites.removeValue(forKey: key)
-        if work == nil { statusWrites.removeValue(forKey: key) }
-        return work
-    }
-
-    public func observeStatus(key: String, onChange: @escaping @Sendable (String) async -> Void) async {
-        await observeStatus(key: key, onApply: { value in
-            await onChange(value)
-            return true
-        })
-    }
-
-    /// 2026-09-06: the acknowledging registration. `onApply` returns true only
-    /// once the value is durably applied; until it does, the peer's record keeps
-    /// its place in the drain and is redelivered — the same claim/commit split
-    /// the pairing lane has always used.
-    public func observeStatus(key: String, onApply: @escaping @Sendable (String) async -> Bool) async {
-        await observeStatus(key: key, onApply: { value, _ in
-            await onApply(value)
-        })
-    }
-
-    public func observeStatus(key: String, onApply: @escaping @Sendable (String, Date?) async -> Bool) async {
-        guard configured else {
-            nativeLog("[ck-device] observeStatus: CloudKit entitlement absent — not subscribing (notConfigured).")
-            return
-        }
-        setStatusHandler(key: key, onApply)
-        // Register the durable silent-push subscription for status writes, then
-        // do an initial drain across all observed keys (picks up this key's
-        // current value). Live push → drain wiring is CK-3.
-        do {
-            try await subscribeToStatusChanges()
-        } catch {
-            nativeLog("[ck-device] observeStatus: subscription registration FAILED (no live push): \(error)")
-        }
-        await drainStatus()
-    }
-
-    /// Pull the PEER's status singleton for every observed key and dispatch each
-    /// to its handler iff newer than the last dispatched value (LWW by server
-    /// modificationDate, per key). Returns the number of handlers invoked.
-    @discardableResult
-    public func drainStatus() async -> Int {
-        guard NADeviceSyncRecoveryBudget.hasTime else { return 0 }
-        guard configured else { return 0 }  // crash-guard: record(for:) touches CKContainer
-        guard !pairingHeldElsewhere else { return 0 }
-        // 2026-09-06: serialized, exactly as drainIncoming is. Unserialized,
-        // two drains could claim two generations of one key and then apply them
-        // concurrently — an older snapshot finishing last overwrites newer bytes.
-        guard beginStatusDrainOrCoalesce() else { return 0 }
-        var total = 0
-        while true {
-            total += await drainStatusBody()
-            if endStatusDrainOrContinue() { continue }
-            break
-        }
-        return total
-    }
-
-    /// Acquire the single status-drain slot. Mirrors `beginDrainOrCoalesce`.
-    private func beginStatusDrainOrCoalesce() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        if statusDrainInFlight { statusDrainAgain = true; return false }
-        statusDrainInFlight = true
-        return true
-    }
-
-    /// End a status-drain iteration. Mirrors `endDrainOrContinue`.
-    private func endStatusDrainOrContinue() -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        if statusDrainAgain && NADeviceSyncRecoveryBudget.hasTime { statusDrainAgain = false; return true }
-        statusDrainAgain = false
-        statusDrainInFlight = false
-        return false
-    }
-
-    /// The status-drain body — always run serialized by `drainStatus`.
-    private func drainStatusBody() async -> Int {
-        let handlers = loadStatusHandlers()
-        guard !handlers.isEmpty else { return 0 }
-        let peerRole: NADeviceRole = role == .mac ? .ios : .mac
-        var dispatched = 0
-        for (key, handler) in handlers {
-            guard NADeviceSyncRecoveryBudget.hasTime else { break }
-            let recordName = "status.\(peerRole.rawValue).\(key)"
-            let hit: PeerStatusHit? = await withDeviceCKTimeout("CloudKitDeviceTransport.drainStatus", seconds: 3, onFailure: accountFailureReporter) {
-                let record = try await self.database.record(for: CKRecord.ID(recordName: recordName))
-                guard let value = record["value"] as? String else { return nil }
-                return PeerStatusHit(value: value, modDate: record.modificationDate)
-            } ?? nil
-            guard let hit else { continue }
-            // 2026-09-06: check WITHOUT consuming, and commit only after the
-            // handler reports the value durably applied. Claiming first meant a
-            // snapshot generation the phone then failed to store was marked seen
-            // and never redelivered.
-            guard statusIsNewer(key: key, hit.modDate) else { continue }
-            guard await handler(hit.value, hit.modDate) else { continue }
-            commitStatusDate(key: key, hit.modDate)
-            dispatched += 1
-            NADeviceSyncRecoveryBudget.didApplyData?()
-        }
-        return dispatched
     }
 
     // MARK: account status
 
     public func accountStatus() async -> String {
-        guard configured else { return "notConfigured" }  // crash-guard: CKContainer init is the trap site
         return await withDeviceCKTimeout("CloudKitDeviceTransport.accountStatus", onFailure: accountFailureReporter) {
             let s = try await CKContainer(identifier: self.containerIdentifier).accountStatus()
             switch s {
@@ -1542,454 +377,6 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         } ?? "unknown"
     }
 
-    // MARK: subscription (silent push — the live cross-device trigger)
-
-    public func subscribeToChanges() async throws {
-        guard configured else { throw DeviceSyncError.notConfigured }  // crash-guard: no CKContainer
-        do {
-            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.subscribeToChanges", onFailure: accountFailureReporter) {
-                // Both peers repair the shared legacy visible subscription.
-                // Direct APNS is the sole remote alert; CloudKit only wakes sync.
-                try await self.ensureSilentNotificationSubscription()
-                let sub = Self.makeSilentChatSubscription()
-                try await self.ensureSubscription(sub, id: sub.subscriptionID)
-            }
-        } catch is DeviceCKLandmineTimeout {
-            throw DeviceSyncError.transient(message: "CloudKit subscribe timed out")
-        }
-    }
-
-    /// Broad silent sync trigger for chat/state records.
-    ///
-    /// Keep this predicate schema-independent. A production build using a
-    /// compound optional-`kind` predicate stopped receiving alerts, and its
-    /// serial registration order allowed any silent-lane failure to prevent
-    /// notification registration. Explicit alerts are owned by direct APNS;
-    /// both CloudKit subscriptions only wake sync.
-    static func makeSilentChatSubscription() -> CKQuerySubscription {
-        let sub = CKQuerySubscription(
-            recordType: NADeviceSyncRecordType.chatMessage,
-            predicate: NSPredicate(value: true),
-            subscriptionID: DeviceCloudKitSubscriptionID.chat,
-            options: [.firesOnRecordCreation, .firesOnRecordUpdate]
-        )
-        let info = CKSubscription.NotificationInfo()
-        info.shouldSendContentAvailable = true
-        sub.notificationInfo = info
-        return sub
-    }
-
-    /// Wake sync for explicit notification records without a second alert.
-    private func ensureSilentNotificationSubscription() async throws {
-        let sub = Self.makeSilentNotificationSubscription()
-        try await ensureSubscription(sub, id: sub.subscriptionID)
-        try await retireSubscription(id: "NAChatMessage.notifications.visible")
-    }
-
-    static func makeSilentNotificationSubscription() -> CKQuerySubscription {
-        let sub = CKQuerySubscription(
-            recordType: NADeviceSyncRecordType.notification,
-            predicate: NSPredicate(value: true),
-            subscriptionID: DeviceCloudKitSubscriptionID.visibleNotifications,
-            options: [.firesOnRecordCreation]
-        )
-        let info = CKSubscription.NotificationInfo()
-        info.shouldSendContentAvailable = true
-        // Preserve the deployed subscription ID so upgrades remove its alert.
-        info.desiredKeys = [
-            "notificationScreen",
-            "notificationEventId",
-            "kind",
-        ]
-        info.collapseIDKey = "notificationEventId"
-        sub.notificationInfo = info
-        return sub
-    }
-
-    /// Remove the pre-split visual projection. Leaving it installed would let
-    /// legacy `NAChatMessage(kind=notification)` writes keep competing with the
-    /// silent chat subscription on upgraded accounts.
-    private func retireSubscription(id: CKSubscription.ID) async throws {
-        do {
-            _ = try await database.deleteSubscription(withID: id)
-        } catch let error as CKError where error.code == .unknownItem {
-            return
-        } catch {
-            throw Self.mapError(error)
-        }
-    }
-
-    /// Durable silent-push subscription for the peer's pairing writes. Same broad
-    /// value:true predicate as the chat subscription (no queryable-field/index
-    /// dependency); drainPairing() filters to the peer's record locally.
-    public func subscribeToPairingChanges() async throws {
-        try await registerBroadSubscription(
-            recordType: NADeviceSyncRecordType.pairingDevice,
-            subscriptionID: DeviceCloudKitSubscriptionID.pairing,
-            label: "subscribeToPairingChanges"
-        )
-    }
-
-    /// Durable silent-push subscription for the peer's status writes.
-    public func subscribeToStatusChanges() async throws {
-        try await registerBroadSubscription(
-            recordType: NADeviceSyncRecordType.status,
-            subscriptionID: DeviceCloudKitSubscriptionID.status,
-            label: "subscribeToStatusChanges"
-        )
-    }
-
-    /// Shared broad-subscription registration (value:true predicate,
-    /// shouldSendContentAvailable). Fails loud — the caller NSLogs; nothing is
-    /// swallowed with try?. Treats "already exists" as success (durable).
-    private func registerBroadSubscription(
-        recordType: String,
-        subscriptionID: String,
-        label: String
-    ) async throws {
-        guard configured else { throw DeviceSyncError.notConfigured }  // crash-guard: no CKContainer
-        do {
-            try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.\(label)", onFailure: accountFailureReporter) {
-                let predicate = NSPredicate(value: true)
-                let sub = CKQuerySubscription(
-                    recordType: recordType,
-                    predicate: predicate,
-                    subscriptionID: subscriptionID,
-                    options: [.firesOnRecordCreation, .firesOnRecordUpdate]
-                )
-                let info = CKSubscription.NotificationInfo()
-                info.shouldSendContentAvailable = true  // silent push
-                sub.notificationInfo = info
-                try await self.ensureSubscription(sub, id: subscriptionID)
-            }
-        } catch is DeviceCKLandmineTimeout {
-            throw DeviceSyncError.transient(message: "CloudKit \(label) timed out")
-        }
-    }
-
-    /// Idempotently installs one subscription without confusing a production
-    /// schema rejection with "already exists." CloudKit uses
-    /// `serverRejectedRequest` when a subscription shape was never created in
-    /// Development and promoted to Production, so accepting that code blindly
-    /// leaves the silent-push lane dead while reporting success.
-    ///
-    /// Fetch first. An ID match alone is not success: an older visible
-    /// subscription would still alert alongside direct APNS. Compare the
-    /// complete shape and save the expected silent subscription when it drifted.
-    ///
-    /// If a concurrent process wins the create/repair race, fetch again after a
-    /// failed save and accept only an exact shape match. Every other failure
-    /// remains visible.
-    private func ensureSubscription(_ subscription: CKSubscription, id: CKSubscription.ID) async throws {
-        var verified = false
-        defer {
-            if verified {
-                devicePushLog.notice("Subscription verified role=\(self.role.rawValue, privacy: .public) id=\(id, privacy: .public)")
-            } else {
-                devicePushLog.error("Subscription not verified role=\(self.role.rawValue, privacy: .public) id=\(id, privacy: .public)")
-            }
-        }
-        do {
-            let existing = try await database.subscription(for: id)
-            if Self.subscription(existing, matches: subscription) {
-                verified = true
-                return
-            }
-            let zoneMatches = (existing as? CKQuerySubscription)?.zoneID
-                == (subscription as? CKQuerySubscription)?.zoneID
-            devicePushLog.notice("Subscription repair role=\(self.role.rawValue, privacy: .public) id=\(id, privacy: .public) zoneMatches=\(zoneMatches)")
-            nativeLog("[ck-device] repairing stale subscription shape for \(id)")
-        } catch let error as CKError where error.code == .unknownItem {
-            // Absent is the only state that authorizes a create attempt.
-        } catch {
-            throw Self.mapError(error)
-        }
-
-        do {
-            let saved = try await database.save(subscription)
-            guard Self.subscription(saved, matches: subscription) else {
-                throw DeviceSyncError.underlying(
-                    message: "CloudKit saved subscription \(id) with an unexpected shape"
-                )
-            }
-            verified = true
-        } catch {
-            if let existing = try? await database.subscription(for: id),
-               Self.subscription(existing, matches: subscription) {
-                verified = true
-                return
-            }
-            if let syncError = error as? DeviceSyncError {
-                throw syncError
-            }
-            throw Self.mapError(error)
-        }
-    }
-
-    static func subscription(
-        _ existing: CKSubscription,
-        matches expected: CKSubscription
-    ) -> Bool {
-        guard existing.subscriptionID == expected.subscriptionID,
-              let existingQuery = existing as? CKQuerySubscription,
-              let expectedQuery = expected as? CKQuerySubscription,
-              existingQuery.recordType == expectedQuery.recordType,
-              // Sends use the default zone. A stale custom-zone subscription
-              // must not pass verification against our unscoped query.
-              existingQuery.zoneID == expectedQuery.zoneID,
-              existingQuery.predicate.predicateFormat == expectedQuery.predicate.predicateFormat,
-              existingQuery.querySubscriptionOptions == expectedQuery.querySubscriptionOptions
-        else {
-            return false
-        }
-
-        switch (existing.notificationInfo, expected.notificationInfo) {
-        case (nil, nil):
-            return true
-        case let (existingInfo?, expectedInfo?):
-            return existingInfo.shouldSendContentAvailable
-                    == expectedInfo.shouldSendContentAvailable
-                && existingInfo.shouldSendMutableContent
-                    == expectedInfo.shouldSendMutableContent
-                && existingInfo.shouldBadge == expectedInfo.shouldBadge
-                && existingInfo.alertBody == expectedInfo.alertBody
-                && existingInfo.title == expectedInfo.title
-                && existingInfo.alertLocalizationKey
-                    == expectedInfo.alertLocalizationKey
-                && existingInfo.alertLocalizationArgs
-                    == expectedInfo.alertLocalizationArgs
-                && existingInfo.titleLocalizationKey
-                    == expectedInfo.titleLocalizationKey
-                && existingInfo.titleLocalizationArgs
-                    == expectedInfo.titleLocalizationArgs
-                && existingInfo.soundName == expectedInfo.soundName
-                && Set(existingInfo.desiredKeys ?? [])
-                    == Set(expectedInfo.desiredKeys ?? [])
-                && existingInfo.collapseIDKey == expectedInfo.collapseIDKey
-        default:
-            return false
-        }
-    }
-
-    // MARK: pull (cursor-paginated)
-
-    /// The deployed container does not permit range predicates on either the
-    /// private `___modTime` field or our ISO-string `createdAt` field. Filter by
-    /// the indexed direction, sort newest-first by the server modificationDate
-    /// (the same clock as the watermark — see `pullPages`), and page until a
-    /// page crosses the durable server-date watermark. This keeps quiet polls
-    /// to one bounded page while still draining bursts larger than one page.
-    static func makePullPredicate(inboundDirection: String) -> NSPredicate {
-        NSPredicate(format: "direction == %@", inboundDirection)
-    }
-
-    /// 2026-09-06: the paging stop compares each record's SERVER modificationDate
-    /// against the durable watermark, so the page order has to be that same
-    /// clock. Ordered by the client `createdAt`, a record created while the peer
-    /// was offline and uploaded later sorts BEHIND records the stop already
-    /// matched, so paging halted before reaching it and the advancing watermark
-    /// made the miss permanent. Order by modificationDate; if the deployed
-    /// container has no sortable index on `___modTime` the query is rejected
-    /// once and we fall back to the previous createdAt order for the rest of the
-    /// process, for that record type only.
-    private func serverModDateSortAvailable(recordType: String) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        return !serverModDateSortRejected.contains(recordType)
-    }
-
-    private func markServerModDateSortRejected(recordType: String) {
-        lock.lock(); serverModDateSortRejected.insert(recordType); lock.unlock()
-    }
-
-    private func pull(
-        recordType: String,
-        since: Date?,
-        inboundDirection: String
-    ) async throws -> DeviceCKPullResult {
-        guard configured else { throw DeviceSyncError.notConfigured }  // crash-guard: no CKContainer
-        do {
-            return try await withDeviceCKTimeoutThrowing("CloudKitDeviceTransport.pull", onFailure: accountFailureReporter) {
-                if self.serverModDateSortAvailable(recordType: recordType) {
-                    do {
-                        return try await self.pullPages(
-                            recordType: recordType,
-                            since: since,
-                            inboundDirection: inboundDirection,
-                            orderByServerModDate: true
-                        )
-                    } catch is DeviceCKUnsortableField {
-                        nativeLog("[ck-device] pull: %@ has no sortable ___modTime index; falling back to createdAt order", recordType)
-                        self.markServerModDateSortRejected(recordType: recordType)
-                    }
-                }
-                return try await self.pullPages(
-                    recordType: recordType,
-                    since: since,
-                    inboundDirection: inboundDirection,
-                    orderByServerModDate: false
-                )
-            }
-        } catch is DeviceCKLandmineTimeout {
-            throw DeviceSyncError.transient(message: "CloudKit pull timed out")
-        }
-    }
-
-    private func pullPages(
-        recordType: String,
-        since: Date?,
-        inboundDirection: String,
-        orderByServerModDate: Bool
-    ) async throws -> DeviceCKPullResult {
-        let query = CKQuery(
-            recordType: recordType,
-            predicate: Self.makePullPredicate(inboundDirection: inboundDirection)
-        )
-        query.sortDescriptors = [
-            NSSortDescriptor(key: orderByServerModDate ? "modificationDate" : "createdAt", ascending: false)
-        ]
-        let assetSecret = await loadAssetSecretProvider()?()
-
-        let checkpointKey = recordType + ":" + inboundDirection
-        let owner = UUID()
-        let checkpoint = orderByServerModDate ? nil : beginFallbackPull(checkpointKey, owner: owner)
-        var combined = checkpoint?.result ?? DeviceCKPullResult()
-        var nextCursor = checkpoint?.cursor
-        var firstPage = checkpoint == nil
-
-        repeat {
-            guard NADeviceSyncRecoveryBudget.hasTime else { throw CancellationError() }
-            let op: CKQueryOperation
-            // 2026-09-06: only the FIRST operation carries the sort descriptor,
-            // so only the first operation can be rejected for it.
-            let carriesSortDescriptor = firstPage
-            if firstPage {
-                op = CKQueryOperation(query: query); firstPage = false
-            } else if let c = nextCursor {
-                op = CKQueryOperation(cursor: c)
-            } else {
-                break
-            }
-            op.qualityOfService = .userInitiated
-            // The container cannot filter by the watermark, so every poll's
-            // first page is fetched whole; a quiet poll's first page almost
-            // always reaches it. Keep that page small; a burst pages on at 200.
-            op.resultsLimit = carriesSortDescriptor && orderByServerModDate ? 25 : 200
-
-            let holder = DeviceCKPullPageHolder()
-            let modHolder = DeviceCKModDateHolder()
-            op.recordMatchedBlock = { _, result in
-                switch result {
-                case .failure(let error):
-                    holder.fail(error)
-                case .success(let ck):
-                    modHolder.set(ck.recordID.recordName, ck.modificationDate)
-                    // Old records are paging evidence, not delivery candidates.
-                    // A previous pairing key must not be needed to pass them.
-                    if let since, let date = ck.modificationDate, date <= since { return }
-                    do {
-                        let fields = NAChatMessageFields(
-                            recordName: ck.recordID.recordName,
-                            direction: (ck["direction"] as? String) ?? "",
-                            sessionId: ck["sessionId"] as? String,
-                            text: (ck["text"] as? String) ?? "",
-                            payloadJSON: try Self.payload(in: ck, secret: assetSecret),
-                            createdAt: (ck["createdAt"] as? String) ?? "",
-                            senderDevice: (ck["senderDevice"] as? String) ?? "",
-                            kind: ck["kind"] as? String,
-                            notificationTitle: ck["notificationTitle"] as? String,
-                            notificationScreen: ck["notificationScreen"] as? String,
-                            notificationEventID: ck["notificationEventId"] as? String
-                        )
-                        holder.add(fields)
-                    } catch {
-                        nativeLog("[ck-device] chat payload unavailable for %@: %@", ck.recordID.recordName, error.localizedDescription)
-                        holder.failPayload(Self.mapError(error))
-                    }
-                }
-            }
-
-            // Return BOTH page + cursor through the continuation (mirrors
-            // MemoryV2's fix): never mutate the captured `nextCursor` from
-            // inside the @Sendable queryResultBlock — that was a real
-            // callback data race.
-            let page: (records: [NAChatMessageFields], payloadError: DeviceSyncError?, cursor: CKQueryOperation.Cursor?) =
-                try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(records: [NAChatMessageFields], payloadError: DeviceSyncError?, cursor: CKQueryOperation.Cursor?), Error>) in
-                    op.queryResultBlock = { result in
-                        switch result {
-                        case .success(let cursor):
-                            do {
-                                let snapshot = try holder.snapshot()
-                                cont.resume(returning: (snapshot.records, snapshot.payloadError, cursor))
-                            } catch {
-                                cont.resume(throwing: Self.mapError(error))
-                            }
-                        case .failure(let err):
-                            if !orderByServerModDate,
-                               (err as? CKError)?.code == .invalidArguments {
-                                self.saveFallbackPull(nil, key: checkpointKey, owner: owner)
-                            }
-                            // 2026-09-06: an .invalidArguments on a CURSOR
-                            // continuation is a cursor failure (an expired or
-                            // rejected cursor), NOT a missing sort index — the
-                            // cursor operation never carried the descriptor.
-                            // Classifying it as one restarted the whole pull in
-                            // the createdAt order the paging stop cannot trust,
-                            // and latched that order for the rest of the
-                            // process. A cursor failure is surfaced as itself;
-                            // the watermark has not advanced, so the next drain
-                            // restarts the pull from it.
-                            if carriesSortDescriptor,
-                               orderByServerModDate,
-                               Self.rejectsServerModDateSort(err) {
-                                cont.resume(throwing: DeviceCKUnsortableField())
-                            } else {
-                                cont.resume(throwing: Self.mapError(err))
-                            }
-                        }
-                    }
-                    self.database.add(op)
-                }
-            guard NADeviceSyncRecoveryBudget.hasTime else { throw CancellationError() }
-            for f in page.records {
-                combined.records.append((f, modHolder.get(f.recordName)))
-            }
-            combined.payloadError = combined.payloadError ?? page.payloadError
-            let crossedWatermark = Self.pullPageCrossesWatermark(
-                orderByServerModDate: orderByServerModDate,
-                since: since,
-                modificationDates: modHolder.dates()
-            )
-            nextCursor = crossedWatermark ? nil : page.cursor
-            if !orderByServerModDate {
-                saveFallbackPull(nextCursor.map {
-                    DeviceCKPullCheckpoint(result: combined, cursor: $0)
-                }, key: checkpointKey, owner: owner)
-            }
-        } while nextCursor != nil
-
-        return combined
-    }
-
-    static func pullPageCrossesWatermark(
-        orderByServerModDate: Bool, since: Date?, modificationDates: [Date?]
-    ) -> Bool {
-        guard orderByServerModDate, let since else { return false }
-        return modificationDates.contains { $0.map { $0 <= since } ?? false }
-    }
-
-    private func beginFallbackPull(_ key: String, owner: UUID) -> DeviceCKPullCheckpoint? {
-        lock.lock(); defer { lock.unlock() }
-        fallbackPullOwners[key] = owner
-        return fallbackPullCheckpoints[key]
-    }
-
-    private func saveFallbackPull(_ checkpoint: DeviceCKPullCheckpoint?, key: String, owner: UUID) {
-        lock.lock(); defer { lock.unlock() }
-        // A timed-out or concurrent cancellation read cannot overwrite a newer pull.
-        guard fallbackPullOwners[key] == owner else { return }
-        fallbackPullCheckpoints[key] = checkpoint
-    }
-
     // MARK: helpers
 
     // MARK: locked state accessors (synchronous — never call lock from an async
@@ -1999,22 +386,22 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         lock.lock(); incomingHandler = h; lock.unlock()
     }
 
-    private func setPairingHandler(_ h: @escaping @Sendable (Data) async -> Bool) {
+    func setPairingHandler(_ h: @escaping @Sendable (Data) async -> Bool) {
         lock.lock(); pairingHandler = h; lock.unlock()
     }
 
-    private func setStatusHandler(key: String, _ h: @escaping @Sendable (String, Date?) async -> Bool) {
+    func setStatusHandler(key: String, _ h: @escaping @Sendable (String, Date?) async -> Bool) {
         lock.lock(); statusHandlers[key] = h; lock.unlock()
     }
 
-    private func loadPairingHandler() -> (@Sendable (Data) async -> Bool)? {
+    func loadPairingHandler() -> (@Sendable (Data) async -> Bool)? {
         lock.lock(); defer { lock.unlock() }
         return pairingHandler
     }
 
     /// Snapshot copy of the status handlers so we never hold the lock across the
     /// awaits in drainStatus (matches the never-lock-across-await rule).
-    private func loadStatusHandlers() -> [String: @Sendable (String, Date?) async -> Bool] {
+    func loadStatusHandlers() -> [String: @Sendable (String, Date?) async -> Bool] {
         lock.lock(); defer { lock.unlock() }
         return statusHandlers
     }
@@ -2022,7 +409,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     /// Per-key LWW freshness check for status singletons. It does NOT consume
     /// the record: `commitStatusDate` is what marks it seen, and only a handler
     /// that applied it may call that.
-    private func statusIsNewer(key: String, _ modDate: Date?) -> Bool {
+    func statusIsNewer(key: String, _ modDate: Date?) -> Bool {
         lock.lock(); defer { lock.unlock() }
         if let modDate, let last = lastStatusModDates[key] {
             return modDate > last
@@ -2030,7 +417,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         return true
     }
 
-    private func commitStatusDate(key: String, _ modDate: Date?) {
+    func commitStatusDate(key: String, _ modDate: Date?) {
         guard let modDate else { return }
         lock.lock()
         if let last = lastStatusModDates[key] {
@@ -2041,12 +428,12 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         lock.unlock()
     }
 
-    private func loadHandlerAndCursor() -> ((@Sendable (BridgeMessage) async -> Bool)?, Date?) {
+    func loadHandlerAndCursor() -> ((@Sendable (BridgeMessage) async -> Bool)?, Date?) {
         lock.lock(); defer { lock.unlock() }
         return (incomingHandler, lastPullDate)
     }
 
-    private func setLastPullDate(_ date: Date, persistImmediately: Bool) {
+    func setLastPullDate(_ date: Date, persistImmediately: Bool) {
         let shouldPersist: Bool = {
             lock.lock()
             defer { lock.unlock() }
@@ -2061,16 +448,14 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
             return persist
         }()
         guard shouldPersist else { return }
-        // CK-3c: persist so the cursor survives a restart (see init). role +
-        // containerIdentifier are immutable lets — no lock needed; UserDefaults
-        // is thread-safe.
+        // Cursor persistence is thread-safe; its role and container key components are immutable.
         UserDefaults.standard.set(date.timeIntervalSince1970,
                                   forKey: Self.cursorKey(role: role, container: containerIdentifier))
     }
 
     /// Transport acknowledgement applies to these bytes, never to an
     /// unauthenticated message identity. A corrected record remains eligible.
-    private static func deliveryClaimKey(_ fields: NAChatMessageFields) -> String {
+    static func deliveryClaimKey(_ fields: NAChatMessageFields) -> String {
         let digest = SHA256.hash(data: Data(fields.payloadJSON.utf8))
             .map { String(format: "%02x", $0) }.joined()
         return fields.recordName + ":" + digest
@@ -2079,17 +464,17 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     /// Atomic check-and-claim: inserts `id` into the seen set and returns true
     /// iff it was newly claimed. Prevents two concurrent drains from both
     /// delivering the same message id (the check + insert are one locked op).
-    private func isSeen(_ id: String) -> Bool {
+    func isSeen(_ id: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return seenMessageIDs.contains(id)
     }
 
-    private func claimIfUnseen(_ id: String) -> Bool {
+    func claimIfUnseen(_ id: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return claimWhileLocked(id)
     }
 
-    private func claimForSerialDrain(_ id: String) -> Bool? {
+    func claimForSerialDrain(_ id: String) -> Bool? {
         lock.lock(); defer { lock.unlock() }
         guard !controlDrainInFlight else { return nil }
         return claimWhileLocked(id)
@@ -2108,7 +493,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
 
     /// Release a claim taken by `claimIfUnseen` when delivery is rejected, so
     /// the message is retried on the next drain.
-    private func releaseClaim(_ id: String) {
+    func releaseClaim(_ id: String) {
         lock.lock(); defer { lock.unlock() }
         guard seenMessageIDs.remove(id) != nil else { return }
         if let i = seenMessageIDsOrdered.lastIndex(of: id) {
@@ -2116,13 +501,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         }
     }
 
-    private func isoNow() -> String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f.string(from: Date())
-    }
-
-    private static func data(fromHex hex: String) -> Data? {
+    static func data(fromHex hex: String) -> Data? {
         let clean = hex.trimmingCharacters(in: .whitespacesAndNewlines)
         guard clean.count % 2 == 0 else { return nil }
         var out = Data(capacity: clean.count / 2)
@@ -2136,7 +515,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         return out
     }
 
-    private func performModifyRecords(_ op: CKModifyRecordsOperation) async throws {
+    func performModifyRecords(_ op: CKModifyRecordsOperation) async throws {
         op.configuration.timeoutIntervalForResource = 15
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
@@ -2152,7 +531,7 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
         } onCancel: { op.cancel() }
     }
 
-    private static func mapError(_ err: Error) -> DeviceSyncError {
+    static func mapError(_ err: Error) -> DeviceSyncError {
         if let error = err as? DeviceSyncError { return error }
         if let failure = accountFailure(in: err) { return .account(failure) }
         if let ck = err as? CKError {
@@ -2200,37 +579,23 @@ public final class CloudKitDeviceTransport: DeviceSyncTransport, @unchecked Send
     }
 }
 
-// MARK: - Safe factory (the second half of the crash-guard)
+// MARK: - Entitled construction
 
 public extension DeviceSyncTransportResolver {
-    /// Build the CloudKit device transport for this role — honoring BOTH the
-    /// `NATIVE_AGENT_DEVICE_SYNC` selection AND the CloudKit entitlement
-    /// crash-guard. Returns:
-    ///   • `nil` when the selected kind is `.kvs` (caller keeps the legacy
-    ///     KVS/ubiquity bridge), OR
-    ///   • `nil` when `.cloudkit` is selected but the CloudKit entitlement is
-    ///     ABSENT — a loud `NSLog` + graceful degradation to the legacy path,
-    ///     NEVER a `CloudKitDeviceTransport` that would trap on first use (the
-    ///     2026-06-03 `_os_crash` guard), OR
-    ///   • a live `CloudKitDeviceTransport` when `.cloudkit` is selected AND the
-    ///     entitlement is granted.
-    ///
-    /// The transport ALSO guards itself internally (every method short-circuits
-    /// when unconfigured), so a direct construction is safe too — this factory is
-    /// the outer, graceful-degradation layer of a defense-in-depth pair.
+    /// Constructs only when CloudKit is selected and the service and exact container are entitled.
     static func makeCloudKitTransport(
         role: NADeviceRole,
         containerIdentifier: String,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         hasEntitlement: () -> Bool = DeviceCloudKitPreflight.hasCloudKitEntitlement,
         grantsContainer: (String) -> Bool = DeviceCloudKitPreflight.entitlementGrantsContainer
-    ) -> DeviceSyncTransport? {
+    ) -> CloudKitDeviceTransport? {
         guard runsCloudKit(
             containerIdentifier: containerIdentifier, environment: environment,
             hasEntitlement: hasEntitlement, grantsContainer: grantsContainer
         ) else { return nil }
         return CloudKitDeviceTransport(
-            role: role, containerIdentifier: containerIdentifier, configured: true)
+            role: role, containerIdentifier: containerIdentifier)
     }
 
     /// The effective transport decision behind `makeCloudKitTransport`: true
@@ -2244,7 +609,7 @@ public extension DeviceSyncTransportResolver {
     ) -> Bool {
         guard resolvedKind(environment: environment) == .cloudkit else { return false }
         guard hasEntitlement() else {
-            nativeLog("[ck-device] NATIVE_AGENT_DEVICE_SYNC=cloudkit but the CloudKit entitlement is ABSENT — staying on the legacy KVS/ubiquity transport (no CKContainer is touched). This is the 2026-06-03 launch-crash guard.")
+            nativeLog("[ck-device] NATIVE_AGENT_DEVICE_SYNC=cloudkit but the CloudKit entitlement is ABSENT — staying on the KVS/ubiquity transport (no CKContainer is touched).")
             return false
         }
         guard grantsContainer(containerIdentifier) else {
@@ -2257,17 +622,7 @@ public extension DeviceSyncTransportResolver {
 
 /// Sendable value carriers for the pairing/status singleton drains (returned
 /// across the withDeviceCKTimeout race boundary).
-private enum PairingSlot: Sendable { case empty, holds(Data) }
-private struct PeerStatusHit: Sendable { let value: String; let modDate: Date? }
-
-/// Thread-safe recordName → modificationDate map for a single pull page (the
-/// recordMatchedBlock fires on CloudKit's queue).
-private final class DeviceCKModDateHolder: @unchecked Sendable {
-    private let lock = NSLock()
-    private var map: [String: Date?] = [:]
-    func set(_ id: String, _ date: Date?) { lock.lock(); map.updateValue(date, forKey: id); lock.unlock() }
-    func get(_ id: String) -> Date? { lock.lock(); defer { lock.unlock() }; return map[id] ?? nil }
-    func dates() -> [Date?] { lock.lock(); defer { lock.unlock() }; return Array(map.values) }
-}
+enum PairingSlot: Sendable { case empty, holds(Data) }
+struct PeerStatusHit: Sendable { let value: String; let modDate: Date? }
 
 #endif

@@ -11,6 +11,7 @@ import ProviderRouting
 import ToolRegistry
 import TrustCenter
 import Dispatcher
+import Desk
 import MacControl
 import SwarmRuns
 import MacIntegration
@@ -19,117 +20,10 @@ import Studio
 import Senses
 import Research
 import TurnTrace
-// Blueprint: | `SwiftToolDispatcher+Dispatch.swift` | `SwiftToolDispatcher`: `withWebScheme`, `dispatch`, `preApprovalRefusal`; due-reminders passes the requesting dispatcher's data root through its Mac bridge; image generation binds its native receipt's exact output paths for Make registration, and keeps completed generation artifacts and metadata top-level beside `make_registration_failed` so every reply surface retains the artifacts; `mac_location` answers with the fix the kept CoreLocation owner holds, and its age, or requests its ordinary Location permission card |
-
-// 2026-09-18: strict providers fill unused optionals with null. Normalize from
-// the native schema before approval and execution, including nested objects;
-// required nulls and explicit false remain the caller's values.
-public enum ToolArguments {
-    @TaskLocal static var current: (tool: String, input: [String: JSONValue])?
-
-    public static func normalized(_ input: [String: JSONValue], schema: JSONValue, preserving: Set<String> = [], recordShims: Bool = true) -> [String: JSONValue] {
-        guard case .object(let schema) = schema,
-              case .object(let properties)? = schema["properties"] else { return input }
-        let required: [JSONValue]
-        if case .array(let values)? = schema["required"] { required = values } else { required = [] }
-        var result = input
-        for (key, value) in input {
-            guard let field = properties[key] else { continue }
-            if preserving.contains(key), case .object(let shape) = field, shape["type"] == nil { continue }
-            let normalized = normalizedValue(value, schema: field, recordShims: recordShims)
-            if !required.contains(.string(key)), value == .null {
-                result.removeValue(forKey: key)
-                if recordShims { TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("T01"), "site": .string("SwiftToolDispatcher+Dispatch.swift:normalized")])) }
-            } else {
-                result[key] = normalized
-            }
-        }
-        // A tool that clears a field declares
-        // clear_fields: each optional field its enum lists, named there and
-        // not also given a value, is passed on as "". Every pass re-applies it, so a second
-        // normalization cannot drop the clear.
-        if case .object(let clear)? = properties["clear_fields"], case .object(let items)? = clear["items"],
-           case .array(let allowed)? = items["enum"], case .array(let names)? = result["clear_fields"] {
-            for case .string(let name) in names where allowed.contains(.string(name)) && properties[name] != nil
-                && !required.contains(.string(name)) && result[name] == nil {
-                result[name] = .string("")
-            }
-        }
-        return result
-    }
-
-    // Recurse through the declared object/array shape for optional nulls.
-    private static func normalizedValue(_ value: JSONValue, schema: JSONValue, recordShims: Bool = true) -> JSONValue {
-        guard case .object(let field) = schema else { return value }
-        if case .object(let object) = value { return .object(normalized(object, schema: schema, recordShims: recordShims)) }
-        if case .array(let values) = value, let items = field["items"] {
-            return .array(values.map { normalizedValue($0, schema: items, recordShims: recordShims) })
-        }
-        // JSON has one number type: 1.0 is the integer 1 a declared integer
-        // field reads. Protocol, not a model habit, so no receipt.
-        if case .double(let number) = value, field["type"] == .string("integer") || field["type"] == .array([.string("integer"), .string("null")]),
-           let integer = Int64(exactly: number) {
-            return .int(integer)
-        }
-        return value
-    }
-}
-
-public extension ToolDispatchClient {
-    func withToolArguments(
-        tool: String, input: [String: JSONValue],
-        body: ([String: JSONValue]) async throws -> JSONValue
-    ) async throws -> JSONValue {
-        let identity = tool.replacingOccurrences(of: ".", with: "_")
-        if let current = ToolArguments.current, current.tool == identity, current.input == input { return try await body(input) }
-        let schemas = try await listAvailableToolSchemas()
-        let canonical = ToolNameAliases.canonical(tool) { name in schemas.contains { $0.name == name } }
-        if canonical != tool {
-            TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("T04"), "site": .string("SwiftToolDispatcher+Dispatch.swift:canonical")]))
-        }
-        let input = ToolNameAliases.hostArgs(canonical, ToolNameAliases.doorArgs(canonical, input, reportShim: true), reportShim: true)
-        if canonical == "desk_close" {
-            try SwiftToolDispatcher.validateDeskClose(input)
-            return try await body(input)
-        }
-        let schema = schemas.first { $0.name == canonical || $0.name.replacingOccurrences(of: ".", with: "_") == canonical }
-        let authoring = canonical == "sense_make" || (canonical == "ability_manage" && input["verb"] == .string("save"))
-        let normalized = schema.flatMap { try? JSONValue.parse($0.parametersJSON) }
-            .map { ToolArguments.normalized(input, schema: $0, preserving: authoring ? ["learned", "choices"] : []) } ?? input
-        return try await ToolArguments.$current.withValue((identity, normalized)) { try await body(normalized) }
-    }
-}
-
-/// A dispatcher that can refuse a call BEFORE the approval membrane files a
-/// card for it. Everything cheap and certain — is this tool even loaded, do its
-/// arguments parse — belongs here: a person should never approve a call that was
-/// always going to fail, and a model should hear about a bad call in the same
-/// turn it made it (2026-09-13, the 0.4.12 drive).
-public protocol PreApprovalToolValidating: Sendable {
-    func preApprovalRefusal(
-        tool: String, input: [String: JSONValue], surface: String
-    ) async -> JSONValue?
-
-    /// The words the person should read on the card for THIS call, when the
-    /// generic "autonomy=confirm" reason cannot say what is about to happen.
-    /// A setup that writes into another program's settings has to disclose the
-    /// exact file, the exact entry and the exact access before anyone presses
-    /// anything, and only the implementation knows those. Nil keeps the
-    /// caller's own reason, which is every existing tool.
-    func approvalCardReason(
-        tool: String, input: [String: JSONValue], surface: String
-    ) async -> String?
-}
-
-public extension PreApprovalToolValidating {
-    func approvalCardReason(
-        tool: String, input: [String: JSONValue], surface: String
-    ) async -> String? { nil }
-}
-
+// Blueprint: | `SwiftToolDispatcher+Dispatch.swift` | One normalized dispatch ingress, pure argument validation and part-write receipts with unchanged routes and artifact results |
 extension SwiftToolDispatcher {
     /// A bare address as a person types it ("example.com", "x.com/home") gets
-    /// https:// (desk recheck 09-25: both Chrome and read_page refused it).
+    /// https:// before Chrome or page-read dispatch.
     /// Anything else, a scheme, not a domain ("back") or a file name
     /// ("notes.txt"), is returned as given; https:// typed out still works.
     static func withWebScheme(_ raw: String) -> String {
@@ -139,7 +33,6 @@ extension SwiftToolDispatcher {
         let host = text.prefix { !":/?#".contains($0) }.lowercased()
         return fileSuffixes.contains(String(host.split(separator: ".").last ?? "")) ? raw : "https://" + text
     }
-
     private static let fileSuffixes: Set<String> = ["txt", "md", "json", "jsonl", "pdf", "png", "jpg", "jpeg", "gif", "heic",
         "webp", "svg", "swift", "js", "ts", "py", "rb", "rs", "sh", "html", "css", "csv", "tsv", "log", "zip", "gz", "tar",
         "dmg", "pkg", "app", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "key", "pages", "numbers", "mov", "mp3", "mp4",
@@ -150,11 +43,10 @@ extension SwiftToolDispatcher {
             try await dispatchNormalized(tool: requestedTool, input: input, surface: surface)
         }, tool: CanonicalToolNameDispatcher.canonical(requestedTool))
     }
-
     private func dispatchNormalized(tool requestedTool: String, input rawInput: [String: JSONValue], surface: String) async throws -> JSONValue {
         let tool = CanonicalToolNameDispatcher.canonical(requestedTool)
         var input = ChatToolSessionInjection.apply(toolName: tool, input: rawInput)
-        if ToolCallParser.isIgnorableToolName(tool, recordShim: true) {
+        if ToolCallParser.isIgnorableToolName(tool) {
             return .object([
                 "status": .string("ignored"),
                 "reason": .string("placeholder_tool_name"),
@@ -174,7 +66,7 @@ extension SwiftToolDispatcher {
         // Keep the mac_* organs callable by direct diagnostics (which do not)
         // while refusing stale model calls from an old persisted loadout.
         if Self.legacyMacModelToolNames.contains(tool),
-           !Self.extractSessionId(from: input).isEmpty {
+           !ChatToolSessionInjection.explicitSessionId(in: input).isEmpty {
             return .object([
                 "status": .string("failed"),
                 "effects": .string("none"),
@@ -184,10 +76,14 @@ extension SwiftToolDispatcher {
                 "replacement": .array(Self.fourVerbToolNames.map { .string($0) }),
             ])
         }
-        // An item another conversation is working is theirs (desk.3402).
-        if Self.deskItemTools.contains(tool), let taskSession = ChatToolSessionInjection.currentSession,
-           let held = await deskHeld(input, session: taskSession) {
-            return held
+        var deskState: DeskState?
+        if Self.deskItemTools.contains(tool) {
+            let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
+            deskState = state
+            let handle = try resolveDeskHandle(input, in: state)
+            input["handle"] = .string(handle)
+            if let session = ChatToolSessionInjection.currentSession,
+               let refusal = try await deskHeld(handle, session: session) { return refusal }
         }
         // A contributed tool runs in its owner's executor.
         if let appTools, executorOwnedToolNames.contains(tool) {
@@ -200,6 +96,9 @@ extension SwiftToolDispatcher {
                 }
             }
             return try await appTools.execute(tool: tool, input: input, surface: surface)
+        }
+        if Self.fileAccessGatedToolNames.contains(tool), await !fullMacToolAccess(surface: surface).fileOpsAllowed {
+            return builderFullMacRequired(tool: tool, input: input)
         }
         switch tool {
         case "maps_search":
@@ -238,12 +137,35 @@ extension SwiftToolDispatcher {
                   parsed.host?.isEmpty == false, parsed.user == nil, parsed.password == nil else {
                 throw AutonomyGateError.toolDenied(reason: "read_page requires a public http(s) URL.")
             }
+            let find: String?
+            switch input["find"] {
+            case nil, .null?: find = nil
+            case .string(let words)? where !words.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
+                find = words.trimmingCharacters(in: .whitespacesAndNewlines)
+            default: throw AutonomyGateError.toolDenied(reason: "find must contain the words to locate in the page.")
+            }
+            let around: Int
+            switch input["around"] {
+            case nil, .null?: around = 1
+            case .int(let value)? where (0...3).contains(value): around = Int(value)
+            default: throw AutonomyGateError.toolDenied(reason: "around must be an integer from 0 through 3 surrounding paragraphs.")
+            }
+            let full: Bool
+            switch input["full"] {
+            case nil, .null?: full = false
+            case .bool(let value)?: full = value
+            default: throw AutonomyGateError.toolDenied(reason: "full must be true or false.")
+            }
             let fetched: JSONValue
-            do { fetched = try await self.pageReader.fetchURL(url).toJSON() }
+            do { fetched = try await self.pageReader.fetchURL(url).readJSON(find: find, around: around, full: full) }
             catch ResearchClientError.httpStatus(let status) {
                 return .object(["status": .string("failed"), "http_status": .int(Int64(status)),
                     "url": .string(url), "effects": .string("none"),
                     "message": .string("HTTP \(status) refused this public read.")])
+            }
+            catch let error as ResearchClientError where error.failureReason != nil {
+                return .object(["status": .string("failed"), "reason": .string(error.failureReason!),
+                    "url": .string(url), "effects": .string("none"), "message": .string(error.localizedDescription)])
             }
             let observedURL: String = if case .object(let fields) = fetched, case .object(let coverage)? = fields["coverage"],
                 case .string(let finalURL)? = coverage["final_url"] { finalURL } else { url }
@@ -271,14 +193,11 @@ extension SwiftToolDispatcher {
         // the workspace lane cannot reach is not a fact to report in prose —
         // it is one switch away, and asking for it is the honest move.
         case "read_file":
-            if await fullMacToolAccess(surface: surface).fileOpsAllowed {
-                return try await impl_full_mac_read_file(input: input, surface: surface)
-            }
             do {
-                return try await impl_read_file(input: input)
+                return try await impl_read_file(input: input, surface: surface)
             } catch {
                 guard let need = fileOpsNeedEnvelope(
-                    tool: tool, mode: .read, path: jsonString(input["path"]), error: error
+                    tool: tool, mode: .read, path: input["path"]?.stringValue, error: error
                 ) else { throw error }
                 return need
             }
@@ -292,40 +211,36 @@ extension SwiftToolDispatcher {
                 return try await impl_file_metadata(tool: tool, input: input)
             } catch {
                 guard let need = fileOpsNeedEnvelope(
-                    tool: tool, mode: .read, path: jsonString(input["path"]), error: error
+                    tool: tool, mode: .read, path: input["path"]?.stringValue, error: error
                 ) else { throw error }
                 return need
             }
         case "write_file", "move_file", "copy_file", "trash_file":
             if await fullMacToolAccess(surface: surface).fileOpsAllowed {
-                return partWrote(try await impl_local_connector_tool(tool: tool, input: input, surface: surface), input: input)
+                return partWrote(try await impl_local_connector_tool(tool: tool, input: input, surface: surface))
             }
             do {
-                return partWrote(try await impl_trusted_file_mutation(tool: tool, input: input), input: input)
+                return partWrote(try await impl_trusted_file_mutation(tool: tool, input: input))
             } catch {
                 guard let need = fileOpsNeedEnvelope(
-                    tool: tool, mode: .write, path: jsonString(input["path"]), error: error
+                    tool: tool, mode: .write, path: input["path"]?.stringValue, error: error
                 ) else { throw error }
                 return need
             }
         case "bot_create", "bot_update", "bot_pause", "bot_run_once", "bot_list", "shelf_read", "shelf_entry", "bot_ask", "bot_delete":
             return try await impl_standingBots(tool: tool, input: input, surface: surface)
         case "recall_memory":   return try await impl_recall_memory(input: input, surface: surface)
-        case "recall_search":   return try await impl_recall_memory(input: input, surface: surface)
         case "commit_memory":   return try await impl_commit_memory(input: input)
-        // The moments lane (2026-09-02): her review seat over the moment
-        // proposals the post-turn promoter stages. Both refuse any id whose
-        // lane is not "moment".
-        case "memory_moments_pending": return try await impl_memory_moments_pending(input: input, surface: surface)
-        case "memory_moment_review": return try await impl_memory_moment_review(input: input, surface: surface)
+        // Her review seat over the memory proposals still waiting on her.
+        case "memory_proposals_pending": return try await impl_memory_proposals_pending(input: input, surface: surface)
+        case "memory_proposal_review": return try await impl_memory_proposal_review(input: input, surface: surface)
         case "forget_memory":   return try await impl_forget_memory(input: input)
         case "rebuild_knowledge_graph": return try await impl_rebuild_knowledge_graph(input: input)
         case "workshop_submit": return try await impl_workshop_submit(input: input)
         case "workshop_status": return try await impl_workshop_status(input: input)
         case "task_ledger_post": return try await impl_task_ledger_post(input: input)
         case "task_ledger_list": return try await impl_task_ledger_list(input: input)
-        // delegation_status (W2, 2026-08-11): read-only projection over the
-        // claude/codex wake-job stores. No write, no spawn, no network.
+        // delegation_status reads wake-job stores without writes, spawns or network access.
         case "delegation_status": return try await impl_delegation_status(input: input)
         case "agent_contacts", "agent_connect", "agent_message", "agent_read", "agent_cancel":
             let result = try await impl_agentCommunication(tool: tool, input: input, surface: surface)
@@ -334,7 +249,8 @@ extension SwiftToolDispatcher {
             return result
         case "desk_read": return try await impl_desk_read(input: input)
         case "desk_add_item": return try await impl_desk_add_item(input: input)
-        case "desk_set_status": return try await impl_desk_set_status(input: input)
+        case "desk_set_status": return try await impl_desk_set_status(input: input, state: deskState!)
+        case "desk_wait": return try await impl_desk_wait(input: input, state: deskState!)
         case "desk_update_item": return try await impl_desk_update_item(input: input)
         case "desk_note": return try await impl_desk_note(input: input)
         case "desk_add_ref": return try await impl_desk_add_ref(input: input)
@@ -342,7 +258,7 @@ extension SwiftToolDispatcher {
         case "desk_set_notify": return try await impl_desk_set_notify(input: input)
         case "desk_close": return try await impl_desk_close(input: input)
         case "desk_archive": return try await impl_desk_archive(input: input)
-        case "desk_blocked_on": return try await impl_desk_blocked_on(input: input)
+        case "desk_blocked_on": return try await impl_desk_blocked_on(input: input, state: deskState!)
         case "desk_defer": return try await impl_desk_defer(input: input)
         case "desk_breakdown": return try await impl_desk_breakdown(input: input)
         case "desk_nag_control": return try await impl_desk_nag_control(input: input)
@@ -373,7 +289,6 @@ extension SwiftToolDispatcher {
             return .object(["status": .string("prepared"), "execution": .string("requires_workspace_runtime")])
         case "work_context": return try await impl_work_context(input: input, surface: surface)
         case "artifact_find": return try await impl_artifact_find(input: input)
-        case "session_search": return try await impl_search_chat_history(input: input, invokedAs: tool)
         case "read_chat_message": return try await impl_read_chat_message(input: input, invokedAs: tool)
         case "get_persona_doc": return try await impl_get_persona_doc(input: input)
         case "persona_read": return try await impl_persona_read(input: input)
@@ -387,76 +302,34 @@ extension SwiftToolDispatcher {
         case "scratchpad_read": return try await impl_scratchpad_read(input: input)
         case "recent_trace_summary": return try await impl_recent_trace_summary(input: input)
         case "time_now": return ClockReply.read(input) { $0.chat }
-        // Personality depth item 3 (2026-09-02): a PURE read of her own inner
-        // state. No mutation, no persistence, no provider call — reading never
-        // changes what it reads (substrate design law 5).
+        // Reading inner state never mutates, persists or calls a provider.
         case "inner_state": return await impl_inner_state(input: input, surface: surface)
-        // ── Builder tools (2026-06-08 agent-builder-tools) ──
-        // Process-based CLI execution. Trust Center Full Mac file_ops_allowed
-        // REQUIRED upstream; default autonomy is `confirm` so every call
-        // queues an approval. Audit trail at data/builder_audit/<uuid>.json.
-        // Available on the claude/codex bridge as of the user's 2026-06-13 "open the
-        // bridges" call, yolo-gated like local chat.
+        // Builder CLI calls require the Full Mac file-operations gate and write data/builder_audit/<uuid>.json.
         case "shell":
-            if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return builderFullMacRequired(tool: "shell")
-            }
             return await Self.impl_shell(input: input, dataRoot: dataRoot)
         case "bash":
-            if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return builderFullMacRequired(tool: "bash")
-            }
-            return await Self.impl_bash(input: input, dataRoot: dataRoot)
+            return await Self.impl_shell(input: input, dataRoot: dataRoot, executable: "/bin/bash", toolName: "bash")
         case "git":
-            if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return builderFullMacRequired(tool: "git")
-            }
             return await Self.impl_git(input: input, dataRoot: dataRoot)
         case "apply_patch":
-            if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return builderFullMacRequired(tool: "apply_patch")
-            }
             return await Self.impl_apply_patch(input: input, dataRoot: dataRoot)
         case "swift_build":
-            if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return builderFullMacRequired(tool: "swift_build")
-            }
-            return await Self.impl_swift_build(input: input, dataRoot: dataRoot)
+            return await Self.impl_swift_package(command: "build", input: input, dataRoot: dataRoot)
         case "swift_test":
-            if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return builderFullMacRequired(tool: "swift_test")
-            }
-            return await Self.impl_swift_test(input: input, dataRoot: dataRoot)
+            return await Self.impl_swift_package(command: "test", input: input, dataRoot: dataRoot)
         case "remote_node_list":
-            if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return builderFullMacRequired(tool: "remote_node_list")
-            }
             return try await impl_remote_node_list()
         case "remote_node_execute":
-            if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return builderFullMacRequired(tool: "remote_node_execute")
-            }
             return try await impl_remote_node_execute(input: input)
         case "install_app":
-            if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return builderFullMacRequired(tool: "install_app")
-            }
             return await Self.impl_install_app(input: input, dataRoot: dataRoot)
-        // restart_app (2026-06-10) — Agent's self-restart, restored from the
-        // daemon-era Telegram /restart. Same Full Mac policy gate as the
-        // builder tools; the heavy lifting (cooldown flock, audit, detached
-        // relauncher, grace-period terminate sized to outlive the final
-        // reply LLM call) lives ONCE in AppRestartCoordinator, shared with
-        // the Telegram /restart path.
+        // restart_app shares the builder gate and AppRelaunch cooldown, audit and relaunch with Telegram /restart.
         case "restart_app":
-            if !(await fullMacToolAccess(surface: surface).fileOpsAllowed) {
-                return builderFullMacRequired(tool: "restart_app")
-            }
             let reason: String = {
                 if case .string(let r)? = input["reason"] { return r }
                 return ""
             }()
-            return await AppRestartCoordinator.shared.requestRestart(
+            return await AppRelaunch.shared.requestRestart(
                 reason: reason,
                 source: "chat:\(surface)"
             )
@@ -465,7 +338,7 @@ extension SwiftToolDispatcher {
             let generated = await impl_image_generate(input: input, surface: surface)
             guard case .object(let generation) = generated, generation["status"] == .string("ok") else { return generated }
             let paths = (generation["images"]?.arrayValue ?? []).compactMap { image -> String? in
-                guard let path = jsonString(image.objectValue?["path"]) else { return nil }
+                guard let path = (image.objectValue?["path"])?.stringValue else { return nil }
                 return URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
             }
             // Provider execution stays native; the part composes its raw
@@ -473,8 +346,8 @@ extension SwiftToolDispatcher {
             // output provenance, not the part's returned or supplied JSON.
             let registration = await MakeStudio.$generatedImagePaths.withValue(Set(paths)) {
                 await Parts(root: dataRoot).call(id: "make-generated", input: .object([
-                    "generated": generated, "prompt": .string(jsonString(input["prompt"]) ?? jsonString(input["description"]) ?? ""),
-                    "ref": jsonString(input["__make_ref"]).map(JSONValue.string) ?? .null]),
+                    "generated": generated, "prompt": .string(input["prompt"]?.stringValue ?? input["description"]?.stringValue ?? ""),
+                    "ref": input["__make_ref"]?.stringValue.map(JSONValue.string) ?? .null]),
                     within: .init(actions: ["make.add"], capabilities: []), as: JSONValue.self)
             }
             switch registration {
@@ -489,98 +362,25 @@ extension SwiftToolDispatcher {
                 response["effects"] = .string("unknown")
                 return .object(response)
             }
-        // ── Mac integration chat tools (2026-06-07) ──
-        // Each tool is permission-gated through MacIntegrationPermissionStore.
-        // The real backend (EventKit / UserNotifications / Spotlight) is
-        // injected as a MacIntegrationToolBridge — see protocol at top of file.
-        case "mac_calendar_list_upcoming":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.calendar,
-                mode: .read,
-                fixHint: "Open Trust → Mac → Calendar and enable Read.",
-                input: input,
-                run: { bridge, input in HerLifePulse.noted("calendar", try await bridge.calendarListUpcoming(input: input)) }
-            )
-        case "mac_calendar_calendars", "mac_calendar_free_busy":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface, integration: MacIntegrationID.calendar, mode: .read,
-                fixHint: "Enable Calendar Read permission.", input: input,
-                run: { bridge, input in
-                    if tool == "mac_calendar_calendars" { return try await bridge.calendarCalendars(input: input) }
-                    return try await bridge.calendarFreeBusy(input: input)
-                }
-            )
-        case "mac_reminders_query":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.reminders,
-                mode: .read,
-                fixHint: "Open Trust → Mac → Reminders and enable Read.",
-                input: input,
-                run: { bridge, input in try await bridge.remindersQuery(input: input) }
-            )
-        case "mac_reminders_read":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.reminders,
-                mode: .read,
-                fixHint: "Open Trust → Mac → Reminders and enable Read.",
-                input: input,
-                run: { bridge, input in try await bridge.remindersRead(input: input) }
-            )
-        case "mac_reminders_update":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.reminders,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Reminders and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.remindersUpdate(input: input) }
-            )
-        case "mac_reminders_list_due_today":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.reminders,
-                mode: .read,
-                fixHint: "Open Trust → Mac → Reminders and enable Read.",
-                input: input,
-                run: { bridge, input in HerLifePulse.noted("reminders", try await bridge.remindersListDueToday(input: input, dataRoot: dataRoot)) }
-            )
-        case "mac_notify":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.notifyMac,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Mac Notifications and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.macNotify(input: input) }
-            )
+        case let name where MacIntegrationGates.byTool[name] != nil:
+            return try await dispatchMacIntegrationTool(tool: name, surface: surface, input: input)
         case "claude_message":
-            // 2026-06-08 her→me return channel for ClaudeBridge. Agent
-            // calls this when she wants to flag something to Claude for
-            // follow-up. Appends a JSONL entry to
-            // ~/.config/claude-bridge/claude-inbox.jsonl (mode 0600 dir +
-            // file), which her live session reads. Nothing is launched.
+            // Claude messages append to the private JSONL inbox without launching a process.
             return try await runClaudeMessage(
                 input: input,
                 surface: surface,
                 configRootOverride: agentBridgeConfigRoot
             )
         case "codex_message":
-            // 2026-06-08 Agent -> Codex async return channel. Same durable
-            // inbox shape as claude_message, plus a best-effort local Mac
-            // notification when the app-side integration bridge is wired.
+            // Codex messages use the durable inbox and optionally notify through the Mac integration bridge.
             return try await runCodexMessage(input: input, surface: surface)
         case "omp_message":
             return try await runOMPMessage(input: input, surface: surface)
         case "invoke_codex":
-            // 2026-06-08 Agent -> Codex real-time invocation. Spawns
-            // `codex exec` as a bounded subprocess and audits the reply at
-            // data/from_codex/<uuid>.json. Trust decides its sandbox.
+            // codex exec runs a bounded subprocess with a Trust-selected sandbox and a data/from_codex/<uuid>.json audit.
             return PeerDataTaintDispatcher.labelled(try await Self.runInvokeCodex(input: input, dataRoot: dataRoot,
                 launch: await Self.drivenAgentLaunch(
-                tool: tool, surface: surface, contact: Self.drivenAgentContact(host: "codex", dataRoot: dataRoot),
+                surface: surface, contact: Self.drivenAgentContact(host: "codex", dataRoot: dataRoot),
                 name: "Codex", dataRoot: dataRoot)), agent: "codex", dataRoot: dataRoot)
         case "mac_location":
             // The fix the Mac holds answers first, whatever the permission now.
@@ -594,410 +394,25 @@ extension SwiftToolDispatcher {
                 "why": .string("I need Location Services to read where this Mac is."),
                 "decline_consequence": .string("I can ask the paired iPhone for location or use a place you give me.")
             ], dataRoot: dataRoot)
-        case "phone_request":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.notifyMobile, mode: .write,
-                fixHint: "Open Trust → Mac → iPhone Notifications and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.phoneRequest(input: input) }
-            )
-        case "mobile_notify":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.notifyMobile,
-                mode: .write,
-                fixHint: "Open Trust → Mac → iPhone Notifications and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.mobileNotify(input: input, surface: surface) }
-            )
-        case "mac_spotlight_search":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.spotlight,
-                mode: .read,
-                fixHint: "Open Trust → Mac → Spotlight Search and enable Read.",
-                input: input,
-                run: { bridge, input in try await bridge.spotlightSearch(input: input) }
-            )
-        // ── Phase 2 (2026-06-07) — Contacts + Mail + Messages + Notes + Music ──
-        // Same permission-gate-then-bridge shape as Phase 1. Writes are gated
-        // through MacIntegrationPermissionStore which defaults the sensitive 5
-        // (contacts.write / mail.write / messages.write / notes.write / music.write)
-        // OFF until the user flips them in Settings → Mac Integration.
-        case "contacts_search":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.contacts,
-                mode: .read,
-                fixHint: "Open Trust → Mac → Contacts and enable Read.",
-                input: input,
-                run: { bridge, input in try await bridge.contactsSearch(input: input) }
-            )
-        case "contacts_create_or_update":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.contacts,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Contacts and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.contactsCreateOrUpdate(input: input) }
-            )
-        case "mail_save_attachment":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface, integration: MacIntegrationID.mail, mode: .read,
-                fixHint: "Open Trust → Mac → Mail and enable Read.", input: AgentWorkspace.bindMail(input, dataRoot: dataRoot),
-                run: { bridge, input in
-                    if let error = input["binding_error"] { return .object(["status": .string("failed"), "message": error]) }
-                    let attachment = try await bridge.mailAttachment(input: input)
-                    var fileInput = input
-                    fileInput["path"] = input["destination"] ?? .string("~/Downloads")
-                    if await self.fullMacToolAccess(surface: surface).fileOpsAllowed {
-                        return try await self.impl_local_connector_tool(tool: tool, input: fileInput, surface: surface, attachment: attachment)
-                    }
-                    return try await self.impl_trusted_file_mutation(tool: tool, input: fileInput, attachment: attachment)
-                })
-        case "mail_list_recent":
-            let inbox = try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.mail,
-                mode: .read,
-                fixHint: "Open Trust → Mac → Mail and enable Read.",
-                input: input,
-                run: { bridge, input in try await bridge.mailListRecent(input: input) }
-            )
-            HerMailStatus.shared.note(inbox, dataRoot: dataRoot) // home's mail count, no read of its own
-            return AgentWorkspace.attachReadReferences(tool: tool, input: input, result: inbox, dataRoot: dataRoot)
-        case "mail_read_batch", "mail_triage_batch":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.mail,
-                mode: tool == "mail_read_batch" ? .read : .write,
-                fixHint: "Grant Mail access for the selected batch.",
-                input: AgentWorkspace.bindMail(input, dataRoot: dataRoot),
-                run: { bridge, input in
-                    if tool == "mail_read_batch" { return try await bridge.mailReadBatch(input: input) }
-                    return try await bridge.mailTriageBatch(input: input)
-                }
-            )
-        case "mail_search", "mail_senders":
-            let result = try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.mail,
-                mode: .read,
-                fixHint: "Open Trust → Mac → Mail and enable Read.",
-                input: input,
-                run: { bridge, input in
-                    if tool == "mail_senders" { return try await bridge.mailSenders(input: input) }
-                    return try await bridge.mailSearch(input: input)
-                }
-            )
-            HerMailStatus.shared.note(result, dataRoot: dataRoot)
-            return AgentWorkspace.attachReadReferences(tool: tool, input: input, result: result, dataRoot: dataRoot)
-        case "mail_send":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.mail,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Mail and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.mailSend(input: input) }
-            )
-        case "messages_recent_threads":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.messages,
-                mode: .read,
-                fixHint: "Open Trust → Mac → Messages and enable Read.",
-                input: input,
-                run: { bridge, input in try await bridge.messagesRecentThreads(input: input) }
-            )
-        case "messages_send":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.messages,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Messages and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.messagesSend(input: input) }
-            )
-        case "notes_search":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.notes,
-                mode: .read,
-                fixHint: "Open Trust → Mac → Notes and enable Read.",
-                input: input,
-                run: { bridge, input in try await bridge.notesSearch(input: input) }
-            )
-        case "notes_create":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.notes,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Notes and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.notesCreate(input: input) }
-            )
-        case "music_now_playing":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.music,
-                mode: .read,
-                fixHint: "Open Trust → Mac → Music and enable Read.",
-                input: input,
-                run: { bridge, input in try await bridge.musicNowPlaying(input: input) }
-            )
-        case "music_control":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.music,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Music and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.musicControl(input: input) }
-            )
-        // ── Phase 3 (2026-06-07) — complete read+write coverage on every
-        // Mac Integration toggle. Same permission-gate-then-bridge shape.
-        // Sensitive writes default OFF in MacIntegrationPermissionStore.
-        case "mac_calendar_create_event":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.calendar,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Calendar and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.calendarCreateEvent(input: input) }
-            )
-        case "mac_calendar_modify_event":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.calendar,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Calendar and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.calendarModifyEvent(input: input) }
-            )
-        case "mac_calendar_delete_event":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.calendar,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Calendar and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.calendarDeleteEvent(input: input) }
-            )
-        case "mac_reminders_create", "mac_reminders_list_rename", "mac_reminders_list_create":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.reminders,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Reminders and enable Write.",
-                input: input,
-                run: { bridge, input in
-                    switch tool {
-                    case "mac_reminders_list_rename": return try await bridge.remindersListRename(input: input)
-                    case "mac_reminders_list_create": return try await bridge.remindersListCreate(input: input)
-                    default: return try await bridge.remindersCreate(input: input)
-                    }
-                }
-            )
-        case "mac_reminders_complete":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.reminders,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Reminders and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.remindersComplete(input: input) }
-            )
-        case "mac_reminders_delete":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.reminders,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Reminders and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.remindersDelete(input: input) }
-            )
-        case "mail_mark_read":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.mail,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Mail and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.mailMarkRead(input: input) }
-            )
-        case "mail_archive":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.mail,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Mail and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.mailArchive(input: input) }
-            )
-        case "mail_delete":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.mail,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Mail and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.mailDelete(input: input) }
-            )
-        case "mail_reply", "mail_draft":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.mail,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Mail and enable Write.",
-                input: input,
-                run: { bridge, input in
-                    if tool == "mail_draft" { return try await bridge.mailDraft(input: input) }
-                    return try await bridge.mailReply(input: input)
-                }
-            )
-        case "notes_update", "notes_delete":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.notes,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Notes and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.notesModify(input: input, deleting: tool == "notes_delete") }
-            )
-        case "music_search_library":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.music,
-                mode: .read,
-                fixHint: "Open Trust → Mac → Music and enable Read.",
-                input: input,
-                run: { bridge, input in try await bridge.musicSearchLibrary(input: input) }
-            )
-        case "music_list_library":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.music,
-                mode: .read,
-                fixHint: "Open Trust → Mac → Music and enable Read.",
-                input: input,
-                run: { bridge, input in try await bridge.musicListLibrary(input: input) }
-            )
-        case "music_list_playlists":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.music,
-                mode: .read,
-                fixHint: "Open Trust → Mac → Music and enable Read.",
-                input: input,
-                run: { bridge, input in try await bridge.musicListPlaylists(input: input) }
-            )
-        case "contacts_delete":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.contacts,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Contacts and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.contactsDelete(input: input) }
-            )
-        // Scheduler has no read axis — all scheduler tools gate on .write per
-        // MacIntegrationID.supportsRead(scheduler)==false. The W1 substrate
-        // already defaults scheduler.write ON (the user trusts it).
-        case "scheduler_list_jobs":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.scheduler,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Scheduler and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.schedulerListJobs(input: input) }
-            )
-        case "scheduler_create_job":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.scheduler,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Scheduler and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.schedulerCreateJob(input: input) }
-            )
-        case "scheduler_cancel_job", "scheduler_delete_job":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.scheduler,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Scheduler and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.schedulerCancelJob(input: input) }
-            )
-        case "scheduler_pause_job", "scheduler_resume_job":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.scheduler,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Scheduler and enable Write.",
-                input: input,
-                run: { bridge, input in
-                    try await bridge.schedulerSetJobEnabled(input: input, enabled: tool == "scheduler_resume_job")
-                }
-            )
-        case "scheduler_update_job":
-            return try await dispatchMacIntegrationTool(
-                tool: tool, surface: surface,
-                integration: MacIntegrationID.scheduler,
-                mode: .write,
-                fixHint: "Open Trust → Mac → Scheduler and enable Write.",
-                input: input,
-                run: { bridge, input in try await bridge.schedulerUpdateJob(input: input) }
-            )
         case "mac_screenshot_save":
             return try await impl_mac_screenshot_save(input: input, surface: surface)
         case let name where Self.fullMacFileToolNames.contains(name):
             return try await impl_local_connector_tool(tool: name, input: input, surface: surface)
         case let name where Self.fullMacSystemToolNames.contains(name):
             return try await impl_local_connector_tool(tool: name, input: input, surface: surface)
-        // W1b — READ-ONLY accessibility perception. Separate route from the
-        // app-control case above: same gate CATEGORY, read TIER, no approval.
+        // Four verbs own their composed execution before the raw routes.
         case let name where Self.fourVerbToolNames.contains(name):
-            // Must precede the read/injection list cases: `screen`/`wait` sit
-            // in the read list and `act`/`go` in the injection list for
-            // loading/visibility, but they ROUTE here.
             return try await impl_mac_four_verbs_tool(tool: name, input: input, surface: surface)
-        case let name where Self.fullMacAccessibilityReadToolNames.contains(name):
-            return try await impl_mac_accessibility_read_tool(tool: name, input: input, surface: surface)
-        // fable51 item 30 — THE CLIPBOARD ORGAN. Its own route, because its
-        // gate is split down the middle: the read clears the accessibility READ
-        // tier, the write clears app control. Neither needs an injection
-        // capability, so it must not reach `impl_mac_injection_tool`.
-        case let name where Self.macClipboardToolNames.contains(name):
-            return try await impl_mac_clipboard_tool(tool: name, input: input, surface: surface)
-        // fable51 item 29 — THE MENU BAR ORGAN. Its own route for the same
-        // reason: the walk is read tier, the press is the full injection
-        // contract, and one route that knows the difference is clearer than
-        // splitting one organ across two neighbours' lists.
-        case let name where Self.macMenuToolNames.contains(name):
-            return try await impl_mac_menu_tool(tool: name, input: input, surface: surface)
-        // fable51 item 33 — THE READ ORGAN. Its own route because its gate is
-        // CONDITIONAL: read tier always, plus file_ops when — and only when —
-        // the call names a path of its own. No neighbour's list can express
-        // "the gate depends on an argument", so it gets its own case.
+        case let name where Self.fullMacAccessibilityReadToolNames.contains(name)
+            || Self.fullMacAccessibilityInjectionToolNames.contains(name)
+            || Self.macClipboardToolNames.contains(name) || Self.macMenuToolNames.contains(name):
+            return try await impl_mac_control_tool(tool: name, input: input, surface: surface)
+        // Document reads also apply file authority when their route uses a path.
         case let name where Self.macReadToolNames.contains(name):
             return try await impl_mac_read_tool(tool: name, input: input, surface: surface)
-        // W7 — the ambient activity watcher's query tool. Its own route because
-        // its gate is not a Mac-control category at all: the impl reads the
-        // Trust Center capture toggle and refuses when it is off, and refuses
-        // outright on remote surfaces (the tool is Mac-local by decision).
+        // Activity queries use capture preferences and remain Mac-local.
         case let name where Self.activityQueryToolNames.contains(name):
             return try await impl_activity_query_tool(tool: name, input: input, surface: surface)
-        // W2/W3 — INJECTION. Third route under the same gate category: the
-        // impl adds the approval attestation MacControl requires, which the two
-        // routes above deliberately never do.
-        case let name where Self.fullMacAccessibilityInjectionToolNames.contains(name):
-            return try await impl_mac_injection_tool(tool: name, input: input, surface: surface)
         default:
             // Authored calls use Parts.run with the selected fingerprint.
             // Parts verifies admission on every run; keeping follows its
@@ -1012,10 +427,8 @@ extension SwiftToolDispatcher {
                         "fix": .string("Part '\(tool)' has no codeFingerprint in its selected abilities/<id>.js file. Read it with ability.read, then keep it with ability.enable."),
                     ])
                 }
-                // The admitted fingerprint is threaded through so a registry
-                // or manifest swap between this check and the run fails as
-                // fingerprintMismatch instead of downgrading to unverified
-                // (review round-2 TOCTOU finding).
+                // Pin execution to the selected fingerprint; a registry or manifest
+                // swap between selection and run must fail with fingerprintMismatch.
                 return try await Parts(root: dataRoot)
                     .run(id: tool, input: .object(input.filter { $0.key != "__session_id" }),
                          requiredFingerprint: OwnedProgramInvocation.valueCall.flatMap { $0.id == tool ? $0.version : nil } ?? fingerprint)
@@ -1027,125 +440,7 @@ extension SwiftToolDispatcher {
             )
         }
     }
-
 }
-
-extension SwiftToolDispatcher: PreApprovalToolValidating {
-    /// Everything that must be true before a tool call is worth a person's
-    /// attention: its arguments are ones the
-    /// implementation will accept. Returns the tool error to hand back to the
-    /// model, or nil to go on and file the approval.
-    public func preApprovalRefusal(
-        tool requestedTool: String, input rawInput: [String: JSONValue], surface: String
-    ) async -> JSONValue? {
-        let tool = CanonicalToolNameDispatcher.canonical(requestedTool)
-        let input = ChatToolSessionInjection.apply(toolName: tool, input: rawInput)
-        if let refusal = await argumentRefusal(tool: tool, input: input) { return refusal }
-        if tool == "studio_canon_resolve",
-           case .failure(let refusal) = StudioCanonSeatGate.liveTurnProvenance(dispatchSurface: surface) {
-            return .object(["status": .string("refused"), "refusal": .string(refusal.rawValue),
-                "reason": .string("\(tool): \(refusal.spoken). It is done from inside your own conversation, in your own turn.")])
-        }
-        if tool == "studio_shelf_set" {
-            let result = await impl_studio_shelf(input: input, surface: surface, set: true, preview: true)
-            if case .object(let fields) = result, fields["status"] != .string("would") { return result }
-        }
-        if let refusal = agentHostSetupRefusal(tool: tool, input: input) { return refusal }
-        if let refusal = await standingBotsArgumentRefusal(tool: tool, input: input) { return refusal }
-        // A tool whose own gate needs a Mac-control category that is off is
-        // answered by that category's card, the one the tool itself would hand
-        // back, never by a card for a call that cannot run (fresh-root drive
-        // 10-17: under Work, approving 'go' ran into the screen-control card
-        // inside the replay, where nobody saw it; shell under Work the same
-        // with file access). The same access answer the tool reads (admitted
-        // Full Mac, the surface's trigger).
-        if Self.screenControlToolNames.contains(tool), await !fullMacToolAccess(surface: surface).accessibilityAllowed,
-           let need = macControlCategoryNeedEnvelope(
-               categories: ["accessibility"], mode: Self.screenControlReadToolNames.contains(tool) ? .read : .write,
-               why: "Screen control lets me read and control apps on your Mac.") {
-            return need
-        }
-        if Self.fileAccessGatedToolNames.contains(tool), await !fullMacToolAccess(surface: surface).fileOpsAllowed {
-            return builderFullMacRequired(tool: tool)
-        }
-        return nil
-    }
-
-    /// Every chat tool whose own gate is `builderFullMacRequired` whatever
-    /// its input (dispatch: shell, bash, git, apply_patch, the build and
-    /// remote-node tools, install and restart).
-    static let fileAccessGatedToolNames: Set<String> = ["shell", "bash", "git", "apply_patch", "swift_build", "swift_test",
-        "remote_node_list", "remote_node_execute", "install_app", "restart_app"]
-
-    /// Every chat tool whose own gate needs the accessibility category, and
-    /// those of them that only read. A part's hands on its watch are act's.
-    static let screenControlReadToolNames = Set(fullMacAccessibilityReadToolNames + macMenuReadToolNames
-        + macClipboardReadToolNames + macReadToolNames)
-    static let screenControlToolNames = screenControlReadToolNames.union(["act", "go"] + fullMacAccessibilityInjectionToolNames
-        + macClipboardWriteToolNames + macMenuPressToolNames).union(AuthoredToolEffects.handOperations)
-
-    /// Connect-by-name, before a card exists. An agent this build has no row
-    /// for, or one that is not installed, is a certain "no" — the person should
-    /// never be asked to approve a setup that was always going to fail.
-    private func agentHostSetupRefusal(tool: String, input: [String: JSONValue]) -> JSONValue? {
-        guard let proposal = agentHostProposal(tool: tool, input: input) else { return nil }
-        switch proposal {
-        case .success: return nil
-        case .failure(let error):
-            return .object(["status": .string("not_supported"),
-                            "tool": .string(tool),
-                            "changed": .bool(false),
-                            "known_agents": .array(AgentHostDirectory.knownNames.map(JSONValue.string)),
-                            "detail": .string(error.localizedDescription)])
-        }
-    }
-
-    /// Nil unless this really is an `agent_connect` with a name and nothing
-    /// else — the by-name setup path and no other shape of the call.
-    private func agentHostProposal(tool: String, input: [String: JSONValue])
-        -> Result<AgentHostConnection.Proposal, AgentHostConnection.Refusal>? {
-        guard usesCanonicalBody, AgentHostConnection.isNamedConnect(tool: tool, input: input),
-              case .string(let name)? = input["name"] else { return nil }
-        let folder: String?
-        if case .string(let path)? = input["working_directory"] { folder = path } else { folder = nil }
-        let workspace: String?
-        if case .string(let value)? = input["workspace"] { workspace = value } else { workspace = nil }
-        do { return .success(try AgentHostConnection.propose(name: name, store: AgentPeerStore(dataRoot: dataRoot), dataRoot: dataRoot, workspace: workspace, workingDirectory: folder)) }
-        catch let refusal as AgentHostConnection.Refusal { return .failure(refusal) }
-        catch { return nil }
-    }
-
-    /// ONE approval card covers the disclosed setup and nothing else, in the
-    /// words `AgentHostConnection.cardText` writes.
-    public func approvalCardReason(
-        tool requestedTool: String, input: [String: JSONValue], surface: String
-    ) async -> String? {
-        let tool = CanonicalToolNameDispatcher.canonical(requestedTool)
-        // ACP's live connect card binds the exact resolved executable; its
-        // version is read only after approval. It is also required when ordinary tool trust allows.
-        if tool == "agent_connect", case .string(let name)? = input["name"],
-           AgentHostDirectory.row(named: name)?.acp != nil { return nil }
-        if let sentence = standingBotApprovalReason(tool: tool, input: input) {
-            return sentence
-        }
-        guard case .success(var proposal)? = agentHostProposal(tool: tool, input: input),
-              proposal.existing == nil || proposal.row.route == .grokBot else { return nil }
-        // The approved replay carries this exact observation, not a later PATH lookup.
-        if case .string(let path)? = input["executable_path"] { proposal.executablePath = path }
-        else { proposal.executablePath = nil }
-        return AgentHostConnection.cardText(proposal, appName: Self.appDisplayName)
-    }
-
-    /// The product's own name for the card's title. Not a persona name.
-    public static var appDisplayName: String {
-        let bundle = Bundle.main
-        let name = (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
-            ?? (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String)
-        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return trimmed.isEmpty ? "this app" : trimmed
-    }
-}
-
 extension SwiftToolDispatcher: PureToolArgumentValidating {
     public func argumentRefusal(tool: String, input: [String: JSONValue]) async -> JSONValue? {
         let tool = CanonicalToolNameDispatcher.canonical(tool)
@@ -1156,7 +451,7 @@ extension SwiftToolDispatcher: PureToolArgumentValidating {
         if let appTools, executorOwnedToolNames.contains(tool) {
             return await (appTools as? any PureToolArgumentValidating)?.argumentRefusal(tool: tool, input: input)
         }
-        if tool == "apply_patch" { return Self.applyPatchArgumentRefusal(input: input) }
+        if tool == "apply_patch" { return Self.builderValidatePatch(input: input).refusal }
         if ["mail_mark_read", "mail_archive", "mail_delete", "mail_reply", "mail_draft"].contains(tool),
            !(tool == "mail_mark_read" && input["messages"] != nil), !(tool == "mail_draft" && input["to"] != nil) {
             let hasLocator = ["message_id", "expected_message_id"].contains { input[$0] != nil && input[$0] != .null }
@@ -1170,15 +465,12 @@ extension SwiftToolDispatcher: PureToolArgumentValidating {
         return await (macIntegrationBridge as? any PureToolArgumentValidating)?.argumentRefusal(tool: tool, input: input)
     }
 }
-
 extension SwiftToolDispatcher {
     /// A part's own file write, told to its run as it stands right after the write.
-    func partWrote(_ result: JSONValue, input: [String: JSONValue]) -> JSONValue {
-        guard let wrote = SkillRunContext.wrote, ChatToolOutcome.outputLooksSuccessful(result) else { return result }
-        let resolved: String? = if case .object(let fields) = result, case .string(let path)? = fields["path"] { path } else { nil }
-        if let path = resolved ?? jsonString(input["path"]) {
-            wrote(URL(fileURLWithPath: NSString(string: path).expandingTildeInPath))
-        }
+    func partWrote(_ result: JSONValue) -> JSONValue {
+        guard let wrote = SkillRunContext.wrote, ChatToolOutcome.outputLooksSuccessful(result),
+              case .object(let fields) = result, case .string(let path)? = fields["path"] else { return result }
+        wrote(URL(fileURLWithPath: path))
         return result
     }
 }

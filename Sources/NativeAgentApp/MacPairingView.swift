@@ -42,7 +42,7 @@ struct MacPairingView: View {
                 // The connection is three facts, never one: pairing, iCloud and
                 // the last accepted exchange, each with who can fix it and how.
                 VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-                    PairingSectionLabel(text: "Connection")
+                    AliveEyebrow("Connection")
                     AliveGroupCard {
                         if let connection = sync.connection {
                             ForEach(connection.facts, id: \.label) { item in
@@ -70,7 +70,7 @@ struct MacPairingView: View {
                 // has it; moving it here is the person's act, not a launch's.
                 if sync.phonePairedElsewhere {
                     VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-                        PairingSectionLabel(text: "Your iPhone")
+                        AliveEyebrow("Your iPhone")
                         AliveGroupCard {
                             VStack(alignment: .leading, spacing: 12) {
                                 Text("Your iPhone is paired with another Mac (or an earlier install of NativeAgent) on this Apple Account. Moving it here disconnects it from that one.")
@@ -89,7 +89,7 @@ struct MacPairingView: View {
 
                 // One group card, a row per phone with its status pill.
                 VStack(alignment: .leading, spacing: AliveMetrics.eyebrowGap) {
-                    PairingSectionLabel(text: "Paired devices")
+                    AliveEyebrow("Paired devices")
                     Text("Match the phone’s code before choosing Pair. Removing a phone stops it from deciding approvals.")
                         .font(ShellType.label)
                         .foregroundStyle(NativeAgentShell.secondary)
@@ -138,9 +138,8 @@ struct MacPairingView: View {
                             text: "The pairing key is a secret. Do not screenshot it, share it, or photograph it — anyone holding it can sign messages to this Mac.",
                             systemImage: "lock.shield.fill"
                         )
-                        PairingSectionLabel(text: "The pairing key")
-                        PairingCard {
-                            VStack(alignment: .leading, spacing: 12) {
+                        AliveEyebrow("The pairing key")
+                        VStack(alignment: .leading, spacing: 12) {
                                 HStack(spacing: 8) {
                                     // S.4: hide behind Reveal button; auto-hide after 30s
                                     if keyRevealed {
@@ -199,8 +198,8 @@ struct MacPairingView: View {
                                         .font(ShellType.caption)
                                         .foregroundStyle(NativeAgentShell.secondary)
                                 }
-                            }
                         }
+                        .padding(16).settingsCardSurface()
                     }
                     .padding(.top, 12)
                 }
@@ -213,7 +212,7 @@ struct MacPairingView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 12) {
-                    PairingSectionLabel(text: "Start over")
+                    AliveEyebrow("Start over")
                     // S.3: confirmation dialog before regenerate
                     Button(role: .destructive) { showRegenConfirm = true } label: {
                         Text("Regenerate the pairing key")
@@ -260,34 +259,12 @@ struct MacPairingView: View {
 
 // MARK: - Page kit
 //
-// The page's own small vocabulary: the eyebrow that heads a run, the card the
-// controls sit in, and the one notice shape. Everything else on this page is
-// plain text on the sheet ShellPageFrame already draws.
+// Pairing notices and code values use the shared page kit.
 
 /// 13 monospaced, for a value that is a code. `ShellType` has no monospaced
 /// face, so this derives one from the token size rather than a literal.
 private enum PairingType {
     static let code = Font.system(size: ShellType.labelSize, design: .monospaced)
-}
-
-private struct PairingSectionLabel: View {
-    let text: String
-
-    var body: some View {
-        AliveEyebrow(text)
-    }
-}
-
-private struct PairingCard<Content: View>: View {
-    @ViewBuilder var content: Content
-
-    var body: some View {
-        content
-            .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .aliveCard()
-            .accessibilityElement(children: .contain)
-    }
 }
 
 /// One fact of the connection: what is true, its state, and the way on when
@@ -331,8 +308,7 @@ private struct PairingNoticeCard: View {
     let systemImage: String
 
     var body: some View {
-        PairingCard {
-            HStack(alignment: .top, spacing: 8) {
+        HStack(alignment: .top, spacing: 8) {
                 Image(systemName: systemImage)
                     .font(ShellType.labelSemibold)
                     .foregroundStyle(NativeAgentShell.trouble)
@@ -341,7 +317,7 @@ private struct PairingNoticeCard: View {
                     .foregroundStyle(NativeAgentShell.trouble)
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
-            }
         }
+        .padding(16).settingsCardSurface()
     }
 }

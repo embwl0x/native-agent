@@ -83,12 +83,8 @@ enum MobileIntentRuntime {
             }
             waiters.signal(id)
         }
-        // A notification preceding the reply must have its normal consumer on
-        // cold launch, otherwise the ordered CloudKit drain cannot reach it.
-        let notifications = bridge.observeNotifications { await NativeAgentBridgeNotificationScheduler.schedule($0) }
         defer {
             bridge.removeIncomingObserver(observer)
-            bridge.removeNotificationObserver(notifications)
             waiters.disarm(id)
         }
         let client = MacBridgeClient()
@@ -111,7 +107,7 @@ enum MobileIntentRuntime {
             let sync = iCloudSyncEngine.shared
             await sync.refreshApprovalsSnapshot()
             guard sync.approvalsSnapshotLoaded else { throw failure("Approvals have not synced from the Mac yet.") }
-            return sync.approvals.filter { $0.status == "pending" }
+            return sync.approvals.filter { $0.outcome == .pending }
         }
     }
 
@@ -132,10 +128,8 @@ enum MobileIntentRuntime {
     private static func withDeliveryConsumers<T>(_ operation: () async throws -> T) async rethrows -> T {
         let bridge = iCloudBridge.shared
         let messages = bridge.observeIncomingMessages { receiveRetainedChatMessage($0) }
-        let notifications = bridge.observeNotifications { await NativeAgentBridgeNotificationScheduler.schedule($0) }
         defer {
             bridge.removeIncomingObserver(messages)
-            bridge.removeNotificationObserver(notifications)
         }
         return try await operation()
     }

@@ -3,7 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import Transcripts
 import CognitiveSubstrate
-// Blueprint: | `DreamCycleRunner+Messages.swift` | `DreamCycleRunner`: `gatherRecentMessagesAcrossSessions`, `feltRankIndex`, `parseDaemonISO` |
+// Blueprint: | `DreamCycleRunner+Messages.swift` | `DreamCycleRunner`: `gatherRecentMessagesAcrossSessions`, `feltRankIndex`; timestamps read through ChatSessionRecollections |
 
 extension DreamCycleRunner {
     private static let convCharBudget: Int = 80_000
@@ -40,21 +40,17 @@ extension DreamCycleRunner {
         let names: [String]
         do { names = try fm.contentsOfDirectory(atPath: messagesDir.path) }
         catch CocoaError.fileReadNoSuchFile { return ([], nil, [], [:]) }
-        struct Row { let at: Date; let sid: String; let mid: String?; let runID: String?; let role: String; let content: String; let peers: [String]? }
+        let conversations = try SessionConversation(dataRoot: dataRoot, includingArchived: true)
+        struct Row { let at: Date; let sid: String; let mid: String?; let runID: String?; let role: String; let content: String; let peers: [String]?; var lived = true }
         var all: [Row] = []
         for name in names where name.hasSuffix(".jsonl") {
             let url = messagesDir.appendingPathComponent(name)
             let attrs = try fm.attributesOfItem(atPath: url.path)
             let mtime = (attrs[.modificationDate] as? Date) ?? .distantPast
-            // Cheap prefilter: skip files clearly older than the mark so a
-            // months-old session archive isn't re-parsed every night. A 1h
-            // slack absorbs the rare case where a row's createdAt runs slightly
-            // AHEAD of the file mtime (clock skew on append) — without it the
-            // whole file could be skipped while holding a genuinely-new row
-            // (gpt-5.5 review, 2026-06-16). The per-row `at <= mark` check below
-            // is the real gate; this only avoids needless reads.
+            // File prefiltering allows one hour of clock skew; the exchange timestamp remains the real gate.
             if mtime.addingTimeInterval(3600) <= mark { continue }
             let sid = (name as NSString).deletingPathExtension
+            guard conversations.kind(sid)?.isOwnWork != true, !conversations.isHelper(sid) else { continue }
             let text = try String(contentsOf: url, encoding: .utf8)
             for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
                 let s = String(line).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -63,30 +59,14 @@ extension DreamCycleRunner {
                 guard case .object(let obj) = parsed else {
                     throw PersistenceCoreError.ioFailure("transcript row is not an object: \(url.path)")
                 }
-                // ONE consolidation owner (NORTHSTAR clause 1, sweep item 45).
-                // The chat lane distills a session's older turns into
-                // recollection rows as they age — those raw turns are GONE from
-                // the transcript, and the recollection is what remains of them.
-                // The dream reads that row instead of re-summarizing the same
-                // stretch of life a second time.
-                //
-                // The mark comparison uses `consolidatedThrough` — the newest
-                // turn the recollection COVERS — never the row's own write
-                // time. A recollection written today can stand for turns from
-                // last week; comparing against its write time would re-dream
-                // material this lane already consumed raw.
+                // Recollections replace aged turns; gate them by consolidatedThrough, never by their write time.
                 if let recollection = ChatSessionRecollections.recollection(
                     fromTranscriptRow: parsed,
                     sessionId: sid
                 ) {
                     let coveredThrough = recollection.consolidatedThrough ?? mtime
                     if coveredThrough <= mark { continue }
-                    // DEFENSIVE (the writer clamps so this row is never made):
-                    // a recollection that STRADDLES the mark would be admitted
-                    // whole, re-dreaming the pre-mark stretch this lane already
-                    // consumed raw. Refuse it and say so, rather than double
-                    // count. A legacy straddling row loses its post-mark tail —
-                    // cheaper than counting its head twice.
+                    // Reject recollections straddling the mark to avoid dreaming consumed material twice.
                     if ChatSessionRecollections.straddles(recollection, mark: mark) {
                         FileHandle.standardError.write(Data(
                             "DreamCycleRunner: skipped recollection straddling the dream mark (session \(sid), row \(recollection.rowId ?? "?"))\n".utf8
@@ -100,14 +80,14 @@ extension DreamCycleRunner {
                         runID: nil,
                         role: Self.recollectionRole,
                         content: recollection.text,
-                        peers: DreamEntryProvenance.transcriptCause(obj, session: sid)?.sourcePeerIds
+                        peers: DreamEntryProvenance.transcriptCause(obj, session: sid, dataRoot: dataRoot)?.sourcePeerIds
                     ))
                     continue
                 }
-                var role = "user"
+                var role = "unknown"
                 var content = ""
                 var messageId: String?
-                if case .string(let r)? = obj["role"] { role = r }
+                if case .string(let r)? = obj["role"] { role = r.lowercased() }
                 if case .string(let c)? = obj["content"] { content = c }
                 // The row's own id — the join key back to the substrate's felt
                 // origins (`metadata["messageId"]` / `subject.id`) and to the
@@ -116,33 +96,35 @@ extension DreamCycleRunner {
                 if content.isEmpty { continue }
                 // Only her + the user's turns shape identity (tool/system rows dropped).
                 if !Self.identityRoles.contains(role.lowercased()) { continue }
+                let metadata: [String: JSONValue]
+                switch obj["metadata"] {
+                case .object(let value)?: metadata = value
+                case .string(let text)?:
+                    guard case .object(let value) = try JSONValue.parse(Data(text.utf8)) else {
+                        throw PersistenceCoreError.ioFailure("transcript metadata is not an object: \(url.path)")
+                    }
+                    metadata = value
+                default: metadata = [:]
+                }
+                let runID: String? = if case .string(let id)? = obj["runId"], !id.isEmpty { id } else { nil }
+                let lived = !CognitiveMechanicalRowKind.marksMechanicalRow(metadata)
                 let at: Date = {
-                    if case .string(let ca)? = obj["createdAt"], let p = Self.parseDaemonISO(ca) {
+                    if let p = ChatSessionRecollections.parseTimestamp(obj["createdAt"]) {
                         return p
                     }
                     return mtime
                 }()
-                if at <= mark { continue }   // already dreamed — skip
-                let runID: String? = if case .string(let id)? = obj["runId"], !id.isEmpty { id } else { nil }
+                // Keep admitted origins until exchanges are formed. A new
+                // reply can belong to an origin just before the watermark.
                 all.append(Row(at: at, sid: sid, mid: messageId, runID: runID, role: role, content: content,
-                    peers: DreamEntryProvenance.transcriptCause(obj, session: sid)?.sourcePeerIds))
+                    peers: DreamEntryProvenance.transcriptCause(obj, session: sid, dataRoot: dataRoot)?.sourcePeerIds, lived: lived))
             }
         }
-        all.sort { $0.at < $1.at }
-        // SELECTION — "diverse for reach, weighted for meaning" (Agent,
-        // 2026-09-13). The old walk was newest-first until the budget filled,
-        // so one verbose evening erased every quieter conversation of the day
-        // from the material that eventually shapes GROWTH. A day is not evenly
-        // distributed either, so this does not flatten it to an even spread:
-        //   1. REACH — one exchange from every session that has new material,
-        //      strongest-felt in that session first.
-        //   2. MEANING — the rest of the budget goes to the remaining exchanges
-        //      in descending feeling weight (ties break toward recent).
-        // The unit is an EXCHANGE (a user line with the replies that follow it),
-        // never a lone row, so the dream never reads half a turn. Ordering is
-        // total and value-derived at every step — no RNG, so the same window
-        // always produces the same selection without a seed to carry. Budgets,
-        // the tool-row exclusion and the mark arithmetic below are unchanged.
+        let paired = ChatSessionRecollections.pairExchanges(all.map { ($0.sid, $0.runID, $0.role, $0.lived) })
+        let ordered = paired.map { (exchange: $0.exchange, row: all[$0.row]) }.sorted { $0.row.at < $1.row.at }
+        let exchangeByIndex = ordered.map(\.exchange)
+        all = ordered.map(\.row)
+        // Select whole exchanges deterministically: strongest felt per session first, then feeling weight with recent ties.
         //
         // One indexed unit of conversation, kept whole.
         struct Exchange {
@@ -170,46 +152,18 @@ extension DreamCycleRunner {
             rowsBySession[row.sid, default: []].append((index, row))
         }
         var exchanges: [Exchange] = []
+        let grouped = Dictionary(grouping: all.enumerated(), by: { exchangeByIndex[$0.offset] })
+        for entries in grouped.values {
+            let rows = entries.map { (index: $0.offset, row: $0.element) }
+            guard let first = rows.first else { continue }
+            exchanges.append(Exchange(sid: first.row.sid, start: first.index, rows: rows,
+                at: rows.map { $0.row.at }.max() ?? first.row.at,
+                weight: rows.reduce(0) { $0 + weight(of: $1.row) }, length: rows.reduce(0) { $0 + rowLength($1.row) }))
+        }
+        exchanges.removeAll { $0.at <= mark }
         var exchangeIndicesBySession: [String: [Int]] = [:]
-        for sid in rowsBySession.keys.sorted() {
-            var current: Exchange?
-            for entry in rowsBySession[sid] ?? [] {
-                let role = entry.row.role.lowercased()
-                let isRecollection = entry.row.role == Self.recollectionRole
-                let breaks: Bool = {
-                    guard let open = current else { return true }
-                    // A recollection stands for a whole stretch of life; it is
-                    // its own unit on both sides.
-                    if isRecollection { return true }
-                    if open.rows.last?.row.role == Self.recollectionRole { return true }
-                    // A new user line opens a new exchange once the open one has
-                    // already been answered.
-                    return role == "user" && open.rows.contains { $0.row.role.lowercased() != "user" }
-                }()
-                if breaks {
-                    if let open = current {
-                        exchangeIndicesBySession[open.sid, default: []].append(exchanges.count)
-                        exchanges.append(open)
-                    }
-                    current = Exchange(
-                        sid: sid,
-                        start: entry.index,
-                        rows: [entry],
-                        at: entry.row.at,
-                        weight: weight(of: entry.row),
-                        length: rowLength(entry.row)
-                    )
-                } else {
-                    current?.rows.append(entry)
-                    current?.at = entry.row.at
-                    current?.weight += weight(of: entry.row)
-                    current?.length += rowLength(entry.row)
-                }
-            }
-            if let open = current {
-                exchangeIndicesBySession[open.sid, default: []].append(exchanges.count)
-                exchanges.append(open)
-            }
+        for index in exchanges.indices {
+            exchangeIndicesBySession[exchanges[index].sid, default: []].append(index)
         }
         // Felt first, then recent, then a stable structural tiebreak.
         func moreMeaningful(_ lhs: Exchange, _ rhs: Exchange) -> Bool {
@@ -257,18 +211,8 @@ extension DreamCycleRunner {
             if count >= Self.convCountLimit { break }
             take(exchangeIndex)
         }
-        // FALLBACK — a window whose every exchange is individually too large
-        // would otherwise read as "nothing new" and burn the night. Fall back to
-        // the old newest-first row walk rather than lose the dream.
-        if pickedEntries.isEmpty {
-            for (index, row) in all.enumerated().reversed() {
-                if count >= Self.convCountLimit { break }
-                let lineLen = rowLength(row)
-                if used + lineLen > Self.convCharBudget { break }
-                pickedEntries.append((index, row))
-                used += lineLen
-                count += 1
-            }
+        if pickedEntries.isEmpty, !exchanges.isEmpty {
+            throw DreamREMCycleError.oversizedConversationInput
         }
         // Restore chronological order — the dream reads a day, not a ranking.
         pickedEntries.sort { $0.index < $1.index }
@@ -287,12 +231,8 @@ extension DreamCycleRunner {
             material[source.reference] = CognitiveReflectionCause(text: "\(row.role):\n\(row.content)", sourcePeerIds: row.peers)
         }
         let sources = pickedEntries.compactMap { sourcesByIndex[$0.index] }
-        // MARK ARITHMETIC IS UNCHANGED. The old walk always included the newest
-        // row in the window, so its `picked.last?.at` WAS `all.last?.at`; the
-        // mark advanced past everything older that the budget dropped. Sampling
-        // can leave the newest row out, so the newest row IN THE WINDOW is named
-        // explicitly here. Same value as before, same intentional drop: omitted
-        // older material is not re-dreamed on the next pass.
+        // The mark covers the newest eligible row, including material the
+        // budget omitted, so omitted older material is not dreamed next pass.
         return (
             pickedEntries.map { ($0.row.sid, $0.row.role, $0.row.content, sourcesByIndex[$0.index]?.reference) },
             picked.isEmpty ? nil : all.last?.at,
@@ -308,12 +248,12 @@ extension DreamCycleRunner {
     /// node carries the pair in `subject.id`, in metadata, or in both.
     /// Origins with no message to point at (studio entries, say) rank nothing —
     /// they are cited elsewhere and there is no transcript row to weight.
-    static func feltRankIndex(from origins: [DreamFeltOrigin]) -> [String: Int] {
+    static func feltRankIndex(from origins: [CognitiveFeltOrigin]) -> [String: Int] {
         var index: [String: Int] = [:]
         for (rank, origin) in origins.enumerated() {
             var keys: [String] = []
-            if let subjectID = origin.subjectID?.trimmingCharacters(in: .whitespacesAndNewlines),
-               subjectID.contains(":") {
+            let subjectID = origin.subjectID.trimmingCharacters(in: .whitespacesAndNewlines)
+            if subjectID.contains(":") {
                 keys.append(subjectID)
             }
             let sessionID = origin.metadata["sessionId"]?
@@ -338,38 +278,5 @@ extension DreamCycleRunner {
     /// prompt. Deliberately NOT "assistant": it is her own memory of a stretch
     /// of life, not a turn she took, and the World half should read it as such.
     static let recollectionRole = "recollection"
-
-    /// Parse the daemon's ISO8601 createdAt shape. Live JSONL uses
-    /// microsecond precision (`2026-05-07T11:33:32.167835+00:00`), but
-    /// `ISO8601DateFormatter.withFractionalSeconds` only accepts 3-digit
-    /// fractions. Try fractional, plain, then truncate to milliseconds.
-    /// Returns nil only on truly unparseable input — that case keeps the
-    /// row, mirroring the daemon's "no createdAt → don't filter" rule.
-    /// Public so the BackgroundLoopsAssembly Self-half provider can reuse
-    /// it without duplicating the regex (the duplicate inline copy drifted
-    /// — see pass-3 review).
-    public static func parseDaemonISO(_ raw: String) -> Date? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let d = NativeTimestampFormat.parseISO8601FractionalFirst(trimmed) { return d }
-        // Microsecond fallback: truncate the fractional component to 3
-        // digits and retry the fractional parser. Match the timezone
-        // suffix (`Z` or `±HH:MM`/`±HHMM`) so we splice cleanly.
-        if let dotRange = trimmed.range(of: "."),
-           let tzMatch = trimmed.range(
-               of: #"([Zz]|[+-]\d{2}:?\d{2})$"#,
-               options: .regularExpression
-           ),
-           tzMatch.lowerBound > dotRange.upperBound {
-            let fracStart = dotRange.upperBound
-            let frac = trimmed[fracStart..<tzMatch.lowerBound]
-            if frac.count > 3 {
-                let truncated = String(trimmed[..<fracStart])
-                    + String(frac.prefix(3))
-                    + String(trimmed[tzMatch.lowerBound...])
-                return NativeTimestampFormat.parseISO8601FractionalFirst(truncated)
-            }
-        }
-        return nil
-    }
 
 }

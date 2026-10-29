@@ -7,25 +7,7 @@ import MacControl
 
 // MARK: - Per-turn tool session context
 
-/// Carries the per-turn verified session id down the tool-dispatch chain so
-/// inner app-side dispatchers can reconstruct the SAME security origin (and
-/// thus the same trust resolution) that the authoritative `AutonomyGatedDispatcher`
-/// already computed.
-///
-/// Why this exists: `ToolDispatchClient.dispatch(tool:input:surface:)` threads
-/// only the surface, not the session. `AutonomyGatedDispatcher` captures the
-/// verified session id at construction (per-turn) and is the authoritative
-/// security gate. But `AppChatToolDispatcher` (app target) sits BELOW it and is
-/// constructed once per client — with no session, its own `evaluateTool` call
-/// hardcoded `sessionId: nil`, so for a TRUSTED remote surface (allowlisted
-/// Telegram) it could not resolve the chatId, failed the allowlist match, and
-/// FALSE-BLOCKED an invoke the authoritative gate had already approved
-/// (security/audit.jsonl 2026-06-09 19:24, surface=telegram, sessionId nil).
-///
-/// `AutonomyGatedDispatcher` binds this TaskLocal around its `inner.dispatch`
-/// call, so any downstream dispatcher reads the real session and resolves trust
-/// identically. Nil when no gated chain is in play (e.g. read-only catalog
-/// refresh), which is correct — those paths carry no remote session.
+/// Downstream dispatchers use the gate-bound session ID to resolve the same trust origin.
 public enum ChatToolSessionContext {
     public struct ReplyRoute: Sendable, Equatable {
         public let surface: String
@@ -52,6 +34,12 @@ public enum ChatToolSessionContext {
             self.replyTo = replyTo
             self.correlationId = correlationId
             self.requesterUserId = requesterUserId
+        }
+
+        public var stringFields: [String: String] {
+            ["surface": surface, "destinationId": destinationId, "threadId": threadId,
+             "sourceKey": sourceKey, "replyTo": replyTo, "correlationId": correlationId,
+             "requesterUserId": requesterUserId].compactMapValues { $0 }
         }
 
         /// Whether this route ends at a surface that can DRAW an inline card.
@@ -114,16 +102,10 @@ public enum ChatToolSessionContext {
     /// The current request only; history and tool results never populate this.
     @TaskLocal public static var userText: String?
 
-    public static func forbidsSending(_ text: String) -> Bool {
-        text.range(of: #"(?i)\b(?:don['’]t\s+send|do\s+not\s+send|just\s+draft|save\s+as\s+draft|not\s+yet)\b"#,
-                   options: .regularExpression) != nil
-    }
-
     /// Nil rejects the quote; otherwise says whether this restores her last switch change.
     @TaskLocal public static var settingRequestEvidence: (@Sendable (String, JSONValue, JSONValue, String) async -> Bool?)?
 
-    /// The filing turn's file access, bound by the gate while it files a card
-    /// so the card's follow-up runs with the same hands (Wave 2 #8).
+    /// The gate binds the filing turn's file access so the card's follow-up uses the same access.
     @TaskLocal public static var fileAccess: String?
 
     /// The transport-verified remote chat identifier (e.g. Telegram chatId),
@@ -137,12 +119,7 @@ public enum ChatToolSessionContext {
     /// policy-based, not id-based) — both correct.
     @TaskLocal public static var verifiedChatId: String?
 
-    /// The transport-verified remote USER identifier (e.g. Slack user id),
-    /// set by the remote transport around its `chat()` call. Trust resolution
-    /// for Slack can match the user allowlist on this id — without it the
-    /// origin builders set userId=nil and a user-only allowlisted sender
-    /// transport-accepts but stays high-risk-untrusted (gpt-5.5 review
-    /// 2026-07-21). Nil where no per-user trust root exists.
+    /// User allowlists match the transport-verified user ID; it is nil where no per-user trust root exists.
     @TaskLocal public static var verifiedUserId: String?
 
     /// True when the inbound remote transport has already verified provenance
@@ -161,18 +138,15 @@ public enum ChatToolSessionContext {
     /// turn-trace context in one call, so the rows this turn writes name the
     /// conversation it came from.
     ///
-    /// 2026-09-13: the trace row was the only record of where Agent last was,
-    /// and it carried surface and session but never destination or thread — so
-    /// a knock that could have gone back to the Telegram topic or Slack thread
-    /// it came from always fell back to the phone. Binding both together is
-    /// what keeps a surface from setting one and forgetting the other.
+    /// Bind the route and trace destination together, including explicit clearing.
     public static func withReplyRoute<T>(
-        _ route: ReplyRoute,
+        _ route: ReplyRoute?,
+        isolation: isolated (any Actor)? = #isolation,
         operation: () async throws -> T
     ) async rethrows -> T {
         try await $replyRoute.withValue(route) {
-            try await TurnTraceContext.$destinationId.withValue(route.destinationId) {
-                try await TurnTraceContext.$threadId.withValue(route.threadId) {
+            try await TurnTraceContext.$destinationId.withValue(route?.destinationId) {
+                try await TurnTraceContext.$threadId.withValue(route?.threadId) {
                     try await operation()
                 }
             }
@@ -295,12 +269,7 @@ public struct TurnEnvelope: Sendable, Equatable {
             answerExperienceID: answerExperienceID)
     }
 
-    /// The delivery projection. `ReplyRoute` predates the envelope and has
-    /// many consumers; keeping it as a projection rather than replacing it is
-    /// what lets Phase 1 land without touching them.
-    ///
-    /// Falls back to a route carrying just the surface so a caller that bound
-    /// an envelope but no explicit route still gets an honest surface tag.
+    /// The delivery route carries the envelope's surface when no explicit route is bound.
     public var replyRoute: DeliveryRoute {
         deliveryRoute ?? DeliveryRoute(surface: surface)
     }
@@ -359,12 +328,7 @@ public struct TurnEnvelope: Sendable, Equatable {
         )
     }
 
-    /// Assemble the envelope for the turn in flight.
-    ///
-    /// Prefers an explicitly bound envelope; otherwise composes one from the
-    /// individual `ChatToolSessionContext` task-locals the pre-envelope
-    /// adapters already bind. That fallback is what makes Phase 1 additive:
-    /// nothing has to migrate on the same day.
+    /// Uses the bound envelope or composes the current turn's identity from its task-locals.
     public static func current(surface: String) -> TurnEnvelope {
         if let bound = ChatToolSessionContext.envelope {
             return bound
@@ -385,22 +349,13 @@ public struct TurnEnvelope: Sendable, Equatable {
     }
 }
 
-/// Exact, single-dispatch evidence that a human already approved the persisted
-/// chat-tool request being replayed. This is deliberately not a general
-/// autonomy override: it only prevents `PersonaWriteGuard` from asking the
-/// same confirmation question twice when every approved payload and verified
-/// origin field still matches. SecurityCenter, file access, and the tool's own
-/// effect-time validation continue to run normally.
-///
-/// W2/W3-FIX-R2 1 — THIS TYPE CARRIES NO AUTHORITY OF ITS OWN. It is a public
-/// value type with a public init (the post-approval executor lives in the app
-/// target and has to be able to build one), so `matches` proves only that the
-/// CALLER's fields agree with the CALLER's call. For an injection tool that is
-/// not enough and never was: the dispatcher now takes this struct as a POINTER
-/// to an approval record and asks `InjectionApprovalVerifying` whether that
-/// record exists, is resolved-approved, is for this tool + surface + body, and
-/// is unspent — before the floor exemption and before the mint. A forged
-/// struct with a made-up id gets no exemption and mints nothing.
+/// Replay data for a persisted, human-approved chat-tool request. This public
+/// value carries no authority: `matches` checks only call and verified origin equality.
+/// For injection replays, `AutonomyGatedDispatcher` calls the concrete
+/// `ApprovalInboxInjectionApprovalVerifier` before exemption or minting;
+/// that owner verifies the canonical record and enforces permanent single-use spend.
+/// Failed record verification refuses replay. SecurityCenter, file access and effect-time
+/// validation still run.
 public struct ApprovedChatToolReplay: Sendable, Equatable {
     public let approvalID: String
     public let tool: String

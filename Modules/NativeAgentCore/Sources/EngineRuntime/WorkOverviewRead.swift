@@ -21,87 +21,85 @@ public enum WorkOverviewRead {
     /// Needs you is `OwnerAttentionPolicy`, applied once here.
     static func project(board: DeskBoardRead, approvals: [ApprovalRecord], inbox: [InboxItemRecord],
                         experiences: [Experience] = [], unavailable: [String], now: Date) -> WorkOverview {
-        let executions = board.executions.items.sorted { $0.updatedAt > $1.updatedAt }
         let pending = approvals.filter { OwnerAttentionPolicy.approvalWaits(status: $0.status, agentOwned: $0.isAgentsOwnDecision) }
-        func approvalIDs(_ item: DeskItem) -> Set<String> {
-            Set(item.refs.compactMap { ref in
-                if case .approval(let id, _) = ref.kind { return id }
-                return nil
+        let pendingByID = Dictionary(grouping: pending, by: \.id)
+        var executionSteps: [String: Set<String>] = [:]
+        for approval in pending {
+            guard ExecutionEventVocabulary.matches(approval.action, WorkshopStepApprovalAction.canonical),
+                  case .object(let payload) = approval.payload,
+                  case .string(let stepID)? = payload["step_id"], !stepID.isEmpty,
+                  let executionID = WorkshopStepApprovalPayload.executionId({ key in
+                      if case .string(let value)? = payload[key] { return value }
+                      return nil
+                  }) else { continue }
+            executionSteps[executionID, default: []].insert(stepID)
+        }
+        typealias Candidate = (reference: WorkOverviewReference, updatedAt: String, render: () -> WorkOverviewRow)
+        var needs: [Candidate] = pending.map { approval in
+            (.init(kind: .approval, id: approval.id), approval.lastRequestedAt ?? approval.createdAt, {
+                // Redact retained asks before phone publication.
+                row(.approval, approval.id, approval.title,
+                    TurnSecretRedactor.redactText(NativeAppSecretRedactor.redactText(approval.readableAsk)), "Decision needed",
+                    approval.lastRequestedAt ?? approval.createdAt, detail: 1_000)
             })
         }
-        func executionApprovalIDs(_ execution: WorkshopExecutionRecord) -> Set<String> {
-            guard !execution.currentStepId.isEmpty else { return [] }
-            return Set(pending.filter { approval in
-                guard ExecutionEventVocabulary.matches(approval.action, WorkshopStepApprovalAction.canonical),
-                      case .object(let payload) = approval.payload,
-                      payload["step_id"] == .string(execution.currentStepId) else { return false }
-                return WorkshopStepApprovalPayload.executionId { key in
-                    if case .string(let value)? = payload[key] { return value }
-                    return nil
-                } == execution.id
-            }.map(\.id))
+        let linkedExecutionIDs = Set(board.executions.items.filter {
+            requiresApproval(status: $0.status) && executionSteps[$0.id]?.contains($0.currentStepId) == true
+        }.map(\.id))
+        for execution in board.executions.items where requiresApproval(status: execution.status) && !linkedExecutionIDs.contains(execution.id) {
+            needs.append((.init(kind: .execution, id: execution.id), execution.updatedAt, {
+                row(.execution, execution.id, execution.title, execution.objective, "Decision needed", execution.updatedAt, detail: 1_000)
+            }))
         }
-        var needs = pending.map {
-            // Redacted before it leaves for the phone: a lesson can quote anything.
-            row(.approval, $0.id, $0.title,
-                TurnSecretRedactor.redactText(NativeAppSecretRedactor.redactText($0.readableAsk)), "Decision needed",
-                $0.lastRequestedAt ?? $0.createdAt, detail: 1_000)
-        }
-        let approvalExecutions = executions.filter { requiresApproval(status: $0.status) }
-        let linkedExecutionIDs = Set(approvalExecutions.filter { !executionApprovalIDs($0).isEmpty }.map(\.id))
-        for execution in approvalExecutions where !linkedExecutionIDs.contains(execution.id) {
-            needs.append(row(.execution, execution.id, execution.title, execution.objective,
-                             "Decision needed", execution.updatedAt, detail: 1_000))
-        }
-        var mirroredDeskIDs: Set<String> = []
+        var needsDeskIDs: Set<String> = []
         for item in board.items where item.requiresOwnerInput {
+            needsDeskIDs.insert(item.handle)
             // A reference can also be background context for another ask.
             // Collapse a wrapper only when its exact link AND request agree.
             let request = (item.blockedReason ?? item.summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-            let mirrorsApproval = pending.contains {
-                approvalIDs(item).contains($0.id) && !request.isEmpty
-                    && request == $0.reason.trimmingCharacters(in: .whitespacesAndNewlines)
+            let approvalIDs = Set(item.refs.compactMap { ref -> String? in
+                if case .approval(let id, _) = ref.kind { return id }; return nil
+            })
+            let mirrorsApproval = !request.isEmpty && approvalIDs.contains { id in
+                (pendingByID[id] ?? []).contains { request == $0.reason.trimmingCharacters(in: .whitespacesAndNewlines) }
             }
-            if mirrorsApproval { mirroredDeskIDs.insert(item.handle); continue }
-            needs.append(Self.row(for: item, now: now))
+            if mirrorsApproval { continue }
+            needs.append((.init(kind: .desk, id: item.handle), item.updatedAt, { Self.row(for: item, now: now) }))
         }
         for item in inbox where item.requiresOwnerInput {
             // The approval owns both its wait and its settlement. Its old
             // inbox face must not become a new ask once it leaves pending.
             if item.id == item.related_approval_id { continue }
             // Contextual links do not establish that a note is the same ask.
-            needs.append(row(.inbox, item.id, item.title, item.detail ?? item.summary,
-                             "Needs you", item.created_at, detail: 1_000))
+            needs.append((.init(kind: .inbox, id: item.id), item.created_at, {
+                row(.inbox, item.id, item.title, item.detail ?? item.summary, "Needs you", item.created_at, detail: 1_000)
+            }))
         }
 
-        var current: [WorkOverviewRow] = []
-        var recent: [WorkOverviewRow] = []
-        let needsDeskIDs = Set(needs.filter { $0.reference.kind == .desk }.map { $0.reference.id })
+        var current: [Candidate] = [], recent: [Candidate] = []
         let terminalDeskIDs = Set(board.items.filter { $0.status.isTerminal }.map(\.handle))
-        let executionDeskIDs = Set(executions.filter {
-            !["completed", "failed", "cancelled"].contains($0.status)
+        let executionDeskIDs = Set(board.executions.items.filter {
+            !$0.isTerminal
                 || ($0.result != .null && $0.deskHandle.map(terminalDeskIDs.contains) == true)
         }.compactMap(\.deskHandle))
-        for execution in executions {
+        for execution in board.executions.items {
             if requiresApproval(status: execution.status) { continue }
-            let terminal = ["completed", "failed", "cancelled"].contains(execution.status)
-            let result = Self.row(for: execution, now: now)
-            if terminal { recent.append(result) } else { current.append(result) }
+            let result: Candidate = (.init(kind: .execution, id: execution.id), execution.updatedAt, { Self.row(for: execution, now: now) })
+            if execution.isTerminal { recent.append(result) } else { current.append(result) }
         }
         for item in board.items {
-            guard !executionDeskIDs.contains(item.handle), !needsDeskIDs.contains(item.handle),
-                  !mirroredDeskIDs.contains(item.handle) else { continue }
-            let result = Self.row(for: item, now: now)
+            guard !executionDeskIDs.contains(item.handle), !needsDeskIDs.contains(item.handle) else { continue }
+            let result: Candidate = (.init(kind: .desk, id: item.handle), item.closedAt ?? item.updatedAt, { Self.row(for: item, now: now) })
             if item.status.isTerminal { recent.append(result) } else { current.append(result) }
         }
-        func sorted(_ rows: [WorkOverviewRow]) -> [WorkOverviewRow] {
-            rows.sorted { $0.updatedAt == $1.updatedAt ? $0.id < $1.id : $0.updatedAt > $1.updatedAt }
+        func selected(_ rows: [Candidate], limit: Int) -> [WorkOverviewRow] {
+            rows.sorted { $0.updatedAt == $1.updatedAt
+                ? "\($0.reference.kind.rawValue):\($0.reference.id)" < "\($1.reference.kind.rawValue):\($1.reference.id)"
+                : $0.updatedAt > $1.updatedAt }.prefix(limit).map { $0.render() }
         }
-        let captureFormatter = ISO8601DateFormatter()
-        captureFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        var overview = WorkOverview(capturedAt: captureFormatter.string(from: now),
-                     now: Array(sorted(current).prefix(24)), needsYou: Array(sorted(needs).prefix(needsYouLimit)),
-                     recentlyDone: Array(sorted(recent).prefix(12)), unavailable: unavailable,
+        var overview = WorkOverview(capturedAt: NativeTimestampFormat.fractionalZulu(now),
+                     now: selected(current, limit: 24), needsYou: selected(needs, limit: needsYouLimit),
+                     recentlyDone: selected(recent, limit: 12), unavailable: unavailable,
                      omittedNow: max(0, current.count - 24), omittedNeedsYou: max(0, needs.count - needsYouLimit),
                      omittedRecentlyDone: max(0, recent.count - 12))
         overview.experiences = experiences.map(\.mobile)
@@ -109,20 +107,17 @@ public enum WorkOverviewRead {
         return overview
     }
 
-    private static func bounded(_ text: String, _ limit: Int = 4_000) -> String {
-        MobileDeskProjectionBounds.clipped(text, to: limit)
-    }
     private static func row(_ kind: WorkOverviewReference.Kind, _ id: String, _ title: String,
              _ text: String, _ state: String, _ updated: String,
              location: String? = nil, movement: String? = nil, detail: Int = 4_000) -> WorkOverviewRow {
-        .init(reference: .init(kind: kind, id: id), title: bounded(title, 240),
-              summary: bounded(text, 360), detail: bounded(text, detail), state: state,
+        .init(reference: .init(kind: kind, id: id), title: MobileDeskProjectionBounds.clipped(title, to: 240),
+              summary: MobileDeskProjectionBounds.clipped(text, to: 360), detail: MobileDeskProjectionBounds.clipped(text, to: detail), state: state,
               updatedAt: updated, location: location, movementAt: movement)
     }
 
     /// The overview and ID-based details describe the same execution revision.
     public static func row(for execution: WorkshopExecutionRecord, now: Date) -> WorkOverviewRow {
-        let terminal = ["completed", "failed", "cancelled"].contains(execution.status)
+        let terminal = execution.isTerminal
         let text = Self.text(for: execution)
         var state = execution.status == "running" ? "running"
             : DeskActivityState.execution(.init(deskHandle: execution.deskHandle,
@@ -161,7 +156,7 @@ public enum WorkOverviewRead {
            case .string(let error)? = result["error"] {
             return MobileDeskProjectionBounds.clipped(error, to: 4_000)
         }
-        guard ["completed", "failed", "cancelled"].contains(execution.status) else {
+        guard execution.isTerminal else {
             var text = execution.objective
             if !execution.plan.isEmpty {
                 let completed = min(execution.stepsCompleted.count, execution.plan.count)

@@ -1,31 +1,21 @@
-// PATCH-2026-05-19: ui-pull-together MemoryView — Memories / Proposals only.
-// Skills have their own primary tab, so this view stays focused on memory.
 import SwiftUI
 import CloudKit
 import NativeAgentShared
-// Blueprint: | `MemoryView.swift` | Memory presentation and submission state; memories and proposals read the shared sync projection without local suppression |
+// Blueprint: | `MemoryView.swift` | Memory page and proposal rows read the shared sync projection; composes mutation and local search owners |
 
 // MARK: - MemoryView
 
 struct MemoryView: View {
     @StateObject private var store = MemoryStore()
     private let sync = iCloudSyncEngine.shared
-    @EnvironmentObject private var bridgeClient: MacBridgeClient
     @EnvironmentObject private var pairingStore: PairingStore
     @State private var showsConnection = false
     @State private var hasNoCloudAccount = false
     @Environment(\.scenePhase) private var scenePhase
     @State private var segment: MemorySegment
-    /// Sweep 2026-09-01 item 36 — local filter over the memory snapshot the
-    /// phone has ALREADY synced. The Mac's semantic recall runs in-process
-    /// against SwiftNativeMemoryV2 and is not exposed on the action channel,
-    /// so there is no Mac search API to prefer here; inventing one would be a
-    /// new remote surface, not a search box.
+    /// Search filters only the memory snapshot already synced to this phone.
     @State private var searchQuery = ""
-    /// `false` when pushed as a navigationDestination from another
-    /// NavigationStack (e.g. ActivityView → Memory Proposals). Nesting
-    /// NavigationStacks causes the destination to render and immediately
-    /// pop back. Default `true` keeps the Memory tab root working.
+    /// Tab roots own navigation; pushed destinations use the caller’s stack.
     private let embedInNavigationStack: Bool
 
     enum MemorySegment: String, CaseIterable {
@@ -174,7 +164,11 @@ struct MemoryView: View {
                     actionTitle: "Open Settings",
                     actionHint: "Sign in to Apple Account in Settings, then return to refresh memories."
                 ) {
-                    UIApplication.shared.open(URL(string: UIApplication.openSettingsURLString)!)
+                    guard let url = URL(string: UIApplication.openSettingsURLString) else {
+                        SystemToastCenter.shared.push(error: "The iPhone Settings address is unavailable.")
+                        return
+                    }
+                    UIApplication.shared.open(url)
                 }
             } else if attention {
                 // The page note every page wears: what is true, and one way on.
@@ -199,7 +193,7 @@ struct MemoryView: View {
 }
 
 /// Plain words for the page: counts spelled out, kinds named for people.
-private enum MemoryWords {
+enum MemoryWords {
     static func memoriesLine(_ n: Int) -> String {
         switch n {
         case 0: return "What I keep from our conversations."
@@ -246,7 +240,7 @@ private enum MemoryWords {
 
 /// View-only fixtures for `-memorySample`; never inserted into the store or
 /// sent to the Mac.
-private enum MemorySamples {
+enum MemorySamples {
     static var isOn: Bool {
         #if DEBUG
         ProcessInfo.processInfo.arguments.contains("-memorySample")
@@ -312,306 +306,6 @@ private struct MemoryErrorLine: View {
         .padding(.horizontal)
         .padding(.bottom, 6)
         .accessibilityElement(children: .contain)
-    }
-}
-
-// NOTE (2026-06-06): `MemoryStackStatus` + the `memory_stack.json` read were
-// removed — no writer for that file exists anywhere on disk, so the iOS view
-// was reading a phantom. The Memory Stack summary card came out with it.
-
-@MainActor
-final class MemoryStore: ObservableObject {
-    var memories: [MemoryRecord] { iCloudSyncEngine.shared.memories }
-    var memoryProposals: [MemoryProposalRecord] { iCloudSyncEngine.shared.memoryProposals }
-    @Published var decidingMemoryProposalIDs: Set<String> = []
-    @Published var deletingMemoryIDs: Set<String> = []
-    @Published var isLoading = false
-    @Published var error: String?
-
-    private let refreshMemorySnapshot: () async -> Void
-    private let syncErrorProvider: () -> String?
-
-    init(
-        refreshMemorySnapshot: @escaping () async -> Void = {
-            await iCloudSyncEngine.shared.refreshMemorySnapshot()
-        },
-        syncErrorProvider: @escaping () -> String? = {
-            iCloudSyncEngine.shared.syncError
-        }
-    ) {
-        self.refreshMemorySnapshot = refreshMemorySnapshot
-        self.syncErrorProvider = syncErrorProvider
-    }
-
-    func refresh(preservingActionError: Bool = false) async {
-        isLoading = true
-        if !preservingActionError { error = nil }
-        await refreshMemorySnapshot()
-        if !preservingActionError || error == nil {
-            error = MemoryErrorLinePresentation.visibleMessage(syncErrorProvider())
-        }
-        isLoading = false
-    }
-
-    func dismissError() {
-        error = nil
-    }
-
-    func approveMemoryProposal(_ proposal: MemoryProposalRecord) {
-        decideMemoryProposal(proposal, approve: true)
-    }
-
-    func rejectMemoryProposal(_ proposal: MemoryProposalRecord) {
-        decideMemoryProposal(proposal, approve: false)
-    }
-
-    private func decideMemoryProposal(_ proposal: MemoryProposalRecord, approve: Bool) {
-        Task { @MainActor in
-            await performMemoryProposalDecision(
-                proposal,
-                approve: approve,
-                submit: { approve, proposalID in
-                    if approve {
-                        try await iCloudSyncEngine.shared.approveMemoryProposal(proposalId: proposalID)
-                    } else {
-                        try await iCloudSyncEngine.shared.rejectMemoryProposal(proposalId: proposalID)
-                    }
-                },
-                refresh: { await self.refresh(preservingActionError: true) }
-            )
-        }
-    }
-
-    /// The sync owner adopts the Mac's confirmed memory and proposal readback.
-    func performMemoryProposalDecision(
-        _ proposal: MemoryProposalRecord,
-        approve: Bool,
-        submit: (Bool, String) async throws -> Void,
-        refresh: () async -> Void
-    ) async {
-        guard !decidingMemoryProposalIDs.contains(proposal.id) else { return }
-        error = nil
-        decidingMemoryProposalIDs.insert(proposal.id)
-
-        do {
-            try await submit(approve, proposal.id)
-        } catch {
-            if iCloudSyncEngine.isMacResponseTimeout(error) {
-                self.error = "Decision sent; waiting for Mac/iCloud to publish the result."
-            } else {
-                self.error = error.localizedDescription
-            }
-        }
-        decidingMemoryProposalIDs.remove(proposal.id)
-        if error != nil { await refresh() }
-    }
-
-    func deleteMemory(_ memory: MemoryRecord) {
-        guard !deletingMemoryIDs.contains(memory.id) else { return }
-        error = nil
-        deletingMemoryIDs.insert(memory.id)
-
-        Task {
-            do {
-                try await iCloudSyncEngine.shared.deleteMemory(id: memory.id)
-            } catch {
-                self.error = error.localizedDescription
-                await refresh(preservingActionError: true)
-            }
-            self.deletingMemoryIDs.remove(memory.id)
-        }
-    }
-}
-
-// MARK: - Memories list
-
-/// Sweep 2026-09-01 item 36. Memory was delete-only with no way to find the
-/// row you meant to delete. This is a pure local filter over rows the phone
-/// has already synced — it never claims to have searched anything the Mac
-/// holds and the phone has not received.
-enum MemorySearchPresentation {
-    /// Empty means "no filter", never "no rows". Whitespace is not a query.
-    static func normalizedQuery(_ raw: String) -> String {
-        raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    }
-
-    /// Why the list is empty. A filtered-to-nothing list must never borrow the
-    /// "waiting for iCloud" copy — that would blame the sync for the query.
-    enum EmptyState: Equatable {
-        case noSyncedMemories
-        case noMatches(String)
-    }
-
-    static func emptyState(visibleCount: Int, syncedCount: Int, query: String) -> EmptyState? {
-        guard visibleCount == 0 else { return nil }
-        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty, syncedCount > 0 { return .noMatches(trimmed) }
-        return .noSyncedMemories
-    }
-}
-
-struct MemoryListView: View {
-    @ObservedObject var store: MemoryStore
-    var searchQuery: String = ""
-    var header: AnyView = AnyView(EmptyView())
-    @State private var pendingDeleteMemory: MemoryRecord?
-    @State private var searchIndex = MobileSearchIndex<MemoryRecord>()
-    @State private var searchResults: [MemoryRecord] = []
-
-    private var isSample: Bool { MemorySamples.isOn }
-
-    private var sourceMemories: [MemoryRecord] {
-        isSample ? MemorySamples.memories : store.memories
-    }
-
-    private var visibleMemories: [MemoryRecord] {
-        MemorySearchPresentation.normalizedQuery(searchQuery).isEmpty ? sourceMemories : searchResults
-    }
-
-    private var isDeleteConfirmationPresented: Binding<Bool> {
-        Binding(
-            get: { pendingDeleteMemory != nil },
-            set: { isPresented in
-                if !isPresented { pendingDeleteMemory = nil }
-            }
-        )
-    }
-
-    var body: some View {
-        let visibleMemories = visibleMemories
-        return ScrollViewReader { proxy in
-        List {
-            header.aliveListRow(top: 0, bottom: 10)
-            if let emptyState = MemorySearchPresentation.emptyState(
-                visibleCount: visibleMemories.count,
-                syncedCount: sourceMemories.count,
-                query: searchQuery
-            ) {
-                switch emptyState {
-                case .noSyncedMemories:
-                    AliveCalmState(
-                        title: "Nothing here yet.",
-                        line: "What I learn with you on the Mac arrives here once iCloud syncs."
-                    )
-                    .aliveListRow()
-                case .noMatches(let query):
-                    AliveCalmState(
-                        title: "Nothing matches \u{201c}\(query)\u{201d}.",
-                        line: "I only search the memories already on this iPhone."
-                    )
-                    .aliveListRow()
-                }
-            } else {
-                ForEach(visibleMemories) { memory in
-                    let isDeleting = store.deletingMemoryIDs.contains(memory.id)
-                    MemoryCard(memory: memory, isDeleting: isDeleting)
-                        .id(memory.id)
-                        .aliveListRow(top: 5, bottom: 5)
-                        .swipeActions(edge: .trailing) {
-                            Button(
-                                role: ButtonRole.destructive,
-                                action: { pendingDeleteMemory = memory },
-                                label: { Label("Delete", systemImage: "trash") }
-                            )
-                            .disabled(isDeleting || isSample)
-                        }
-                }
-            }
-        }
-        .listStyle(.plain)
-        .contentMargins(.top, 0, for: .scrollContent)
-        .contentMargins(.bottom, 24, for: .scrollContent)
-        .scrollContentBackground(.hidden)
-        .scrollDismissesKeyboard(.immediately)
-        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { _ in
-            #if DEBUG
-            if isSample, let i = ProcessInfo.processInfo.arguments.firstIndex(of: "-memorySampleRow"),
-               ProcessInfo.processInfo.arguments.indices.contains(i + 1) {
-                proxy.scrollTo(ProcessInfo.processInfo.arguments[i + 1], anchor: .top)
-            }
-            // Account status can arrive after the first layout. Reposition the
-            // fixture after the status changes the actual list viewport.
-            if isSample && ProcessInfo.processInfo.arguments.contains("-memorySampleEnd"), let last = visibleMemories.last {
-                proxy.scrollTo(last.id, anchor: .bottom)
-            }
-            #endif
-        }
-        .onAppear {
-            #if DEBUG
-            if isSample, let i = ProcessInfo.processInfo.arguments.firstIndex(of: "-memorySampleRow"),
-               ProcessInfo.processInfo.arguments.indices.contains(i + 1) {
-                proxy.scrollTo(ProcessInfo.processInfo.arguments[i + 1], anchor: .top)
-            }
-            if isSample && ProcessInfo.processInfo.arguments.contains("-memorySampleEnd"), let last = visibleMemories.last {
-                proxy.scrollTo(last.id, anchor: .bottom)
-            }
-            #endif
-        }
-        .task(id: MobileSearchInput(rows: sourceMemories, query: searchQuery)) {
-            let input = MobileSearchInput(rows: sourceMemories, query: MemorySearchPresentation.normalizedQuery(searchQuery))
-            let result = await searchIndex.search(input, maximum: input.rows.count,
-                fields: { [$0.text.lowercased(), $0.layer.lowercased()] + ($0.tags ?? []).map { $0.lowercased() } },
-                matches: { $0.contains($1) })
-            guard !Task.isCancelled else { return }
-            searchResults = result
-        }
-        .confirmationDialog(
-            "Delete memory?",
-            isPresented: isDeleteConfirmationPresented,
-            titleVisibility: .visible
-        ) {
-            if let memory = pendingDeleteMemory {
-                Button("Delete Memory", role: .destructive) {
-                    store.deleteMemory(memory)
-                }
-            }
-        } message: {
-            if let memory = pendingDeleteMemory {
-                Text(MemoryDeleteConfirmationPresentation.message(for: memory))
-            }
-        }
-        }
-    }
-}
-
-/// One memory, as I would say it: the words first and large, what kind of
-/// thing it is and its tags as quiet small words under it.
-private struct MemoryCard: View {
-    let memory: MemoryRecord
-    let isDeleting: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text(memory.text)
-                .font(.system(.title3, design: .serif))
-                .foregroundStyle(AlivePalette.text)
-                .lineSpacing(3)
-                .fixedSize(horizontal: false, vertical: true)
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(MemoryWords.meta(kind: MemoryWords.kind(memory.layer),
-                                      pinned: memory.pinned == true,
-                                      importance: memory.importance,
-                                      extra: memory.tags ?? []))
-                    .font(.footnote)
-                    .foregroundStyle(AlivePalette.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 0)
-                if isDeleting {
-                    ProgressView().controlSize(.small)
-                }
-            }
-        }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .aliveCard()
-        .accessibilityElement(children: .combine)
-    }
-}
-
-enum MemoryDeleteConfirmationPresentation {
-    static func message(for memory: MemoryRecord) -> String {
-        "Delete \u{201c}\(memory.text)\u{201d} from durable memory? This writes a tombstone so it does not come back."
     }
 }
 
@@ -708,39 +402,5 @@ struct MemoryProposalRow: View {
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
         .aliveCard()
-    }
-}
-
-// NOTE (2026-06-06): The "Apple-native memory stack" summary card
-// (`MemoryStackPanelCard`) was removed along with `MemoryStackStatus` and the
-// `memory_stack.json` read — no writer for that snapshot exists on disk, so
-// the card was always showing placeholder defaults.
-
-struct MobileSearchInput<Row: Equatable & Sendable>: Equatable, Sendable {
-    let rows: [Row]
-    let query: String
-}
-
-actor MobileSearchIndex<Row: Equatable & Sendable> {
-    private var source: [Row] = []
-    private var searchable: [[String]] = []
-
-    func search(_ input: MobileSearchInput<Row>, maximum: Int,
-                fields: @Sendable (Row) -> [String],
-                matches: @Sendable (String, String) -> Bool) -> [Row] {
-        if source != input.rows {
-            source = input.rows
-            searchable = source.map(fields)
-        }
-        guard !input.query.isEmpty else { return Array(source.prefix(maximum)) }
-        var result: [Row] = []
-        for (row, text) in zip(source, searchable) {
-            if Task.isCancelled { return [] }
-            if text.contains(where: { matches($0, input.query) }) {
-                result.append(row)
-                if result.count == maximum { break }
-            }
-        }
-        return result
     }
 }

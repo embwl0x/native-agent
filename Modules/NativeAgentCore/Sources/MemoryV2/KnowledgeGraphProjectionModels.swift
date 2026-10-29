@@ -34,37 +34,6 @@ public struct AgentGraphEdge: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
-public struct AgentGraphCounts: Codable, Hashable, Sendable {
-    public var nodes: Int
-    public var edges: Int
-    public var executions: Int?
-    public var capabilities: Int?
-
-    enum CodingKeys: String, CodingKey {
-        case nodes, edges, capabilities
-        case executions = "missions" // compatibility wire ID (persisted graphs/index.json)
-    }
-    public init(nodes: Int, edges: Int, executions: Int? = nil, capabilities: Int? = nil) {
-        self.nodes = nodes
-        self.edges = edges
-        self.executions = executions
-        self.capabilities = capabilities
-    }
-}
-
-public struct AgentGraph: Codable, Hashable, Sendable {
-    public var nodes: [AgentGraphNode]
-    public var edges: [AgentGraphEdge]
-    public var summary: AgentGraphCounts
-    public var createdAt: String?
-    public init(nodes: [AgentGraphNode], edges: [AgentGraphEdge], summary: AgentGraphCounts, createdAt: String? = nil) {
-        self.nodes = nodes
-        self.edges = edges
-        self.summary = summary
-        self.createdAt = createdAt
-    }
-}
-
 public struct GraphSearchResult: Identifiable, Codable, Hashable, Sendable {
     public var id: String
     public var node: AgentGraphNode

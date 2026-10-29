@@ -1,32 +1,3 @@
-// MacMenuBar.swift — THE MENU BAR ORGAN (fable51 sweep item 29).
-//
-// Every Mac app publishes its complete functionality, in words, in a tree that
-// never moves: File › Export › PDF…. It is the cheapest deterministic route to
-// anything an app can do — no coordinate, no scroll, no guessing which toolbar
-// glyph means "export". And `AXMenuBar` was EXPLICITLY EXCLUDED from every walk
-// in this module (`MacAccessibilityReader` refuses to descend into one;
-// `MacTransientMenus` says in its own doc comment that it is "not a hidden
-// menu-bar expansion"), so File › Export › PDF was unreachable.
-//
-// The exclusion was right for the walks it guarded. A window walk that
-// wandered into the menu bar would spend its whole node budget on 400 menu
-// items nobody asked about, on every single look. This organ is the other
-// answer to the same problem: ON DEMAND, bounded, and separate.
-//
-// THE BOUNDS, and why each one:
-//   • `maxPathDepth` = 3 NAMED levels (File › Export › PDF…). Beyond three, a
-//     Mac menu is a preference tree, and the cost of walking it is paid on
-//     every menu read for a path nobody speaks.
-//   • `maxItems` — a hard ceiling on leaves returned, reported when it bites.
-//   • ONE walk. No secondary walk, no "expand this submenu" round trip: an
-//     organ that needs a second call to answer the first is a corridor, and
-//     the reason `mac_look`'s glance exists is that Agent should pay for the
-//     answer, not for the parsing.
-//
-// AND THE REFUSALS ARE WORDS. A disabled item is not a missing item: "Export is
-// there but greyed out right now" is a fact about the app's state and the only
-// answer that stops a model from re-trying the same press forever.
-
 import Foundation
 import NativeAgentCore
 import PersistenceCore
@@ -34,17 +5,13 @@ import PersistenceCore
 // Blueprint: | `MacMenuBar.swift` | `MacMenuBar`: bounded native menu reads, path resolution and safe semantic presentation |
 
 public enum MacMenuBar {
-    /// Named levels in a path. `File › Export › PDF…` is three.
+    /// Named levels returned by a listing.
     public static let maxPathDepth = 3
-    /// Named levels a FIND or a press walks. A bare name is unique only when
-    /// the walk saw every item, and real apps nest to five (TextEdit's
-    /// Format › Text › Writing Direction › …, Chrome, Xcode); measured 10-07
-    /// at 50–510 ms for a whole menu bar. Listings keep `maxPathDepth`.
+    /// Named levels searched by find and press.
     public static let findPathDepth = 5
-    /// Leaves returned by one read.
+    /// Items returned per top-level menu; hitting a bound marks the read truncated.
     public static let maxItems = 160
-    /// Children considered under any one menu. A menu with more than this is
-    /// a list, and this organ says so rather than walking it.
+    /// Children considered per menu, including unnamed AX wrappers.
     public static let maxChildrenPerMenu = 60
     /// Characters of one item's title. Menu titles are short by design; a
     /// longer one is a document name that wandered into a Window menu.
@@ -119,11 +86,8 @@ public enum MacMenuBar {
     /// named levels: it is the thing a person counts when they say
     /// "File › Export › PDF".
     ///
-    /// Her-screen 09-24 — TARGETED. The item cap is PER top-level menu (a
-    /// long Edit menu used to spend the whole budget before Format was ever
-    /// reached). `top` walks only the top-level menus whose name contains it
-    /// (a path's first level); `until` stops the walk at the first item it
-    /// accepts (a bare-name find).
+    /// `top` restricts the walk to top-level names containing it;
+    /// `until` stops at the first item it accepts.
     public static func read(
         source: any MacAXElementSource,
         pid: Int32,
@@ -146,27 +110,39 @@ public enum MacMenuBar {
         var done = false
         let wantedTop = top.map(normalized)
 
-        func descend(_ element: MacAXElementRef, titles: [String], indices: [Int]) {
-            guard !done else { return }
-            guard titles.isEmpty || inMenu < maxItems else {
-                truncated = true
-                return
-            }
+        let namedDepth = max(1, min(depth, findPathDepth))
+        // Bound unnamed wrappers and total visits as well as named levels.
+        let structuralDepth = namedDepth * 2 + 1
+        let maxNodes = maxChildrenPerMenu * (maxItems * 2 + 1) + 1
+        var pending: [(element: MacAXElementRef, titles: [String], indices: [Int])] = []
+        var visited: [Int: [MacAXElementRef]] = [:]
+        var nodeCount = 0
+
+        func enqueueChildren(_ element: MacAXElementRef, titles: [String], indices: [Int]) {
+            guard indices.count < structuralDepth else { truncated = true; return }
             let children = source.children(of: element, limit: maxChildrenPerMenu + 1)
             if children.count > maxChildrenPerMenu { truncated = true }
-            for (offset, child) in children.prefix(maxChildrenPerMenu).enumerated() {
-                guard !done else { return }
-                guard titles.isEmpty || inMenu < maxItems else {
+            for (offset, child) in children.prefix(maxChildrenPerMenu).enumerated().reversed() {
+                pending.append((child, titles, indices + [offset]))
+            }
+        }
+
+        enqueueChildren(root, titles: [], indices: [])
+        while let next = pending.popLast(), !done {
+                guard nodeCount < maxNodes else { truncated = true; break }
+                nodeCount += 1
+                let (child, titles, indexPath) = next
+                guard titles.isEmpty || inMenu < maxItems else { truncated = true; continue }
+                let hash = source.elementHash(child) ?? child.id
+                guard visited[hash]?.contains(where: { source.sameElement($0, child) }) != true else {
                     truncated = true
-                    return
+                    continue
                 }
+                visited[hash, default: []].append(child)
                 guard let attributes = source.attributes(of: child), !attributes.isHiddenMenuItem else { continue }
-                let indexPath = indices + [offset]
                 switch attributes.role {
                 case "AXMenu":
-                    // An unnamed wrapper: it costs tree depth, never a named
-                    // level, so descending through it is free of the cap.
-                    descend(child, titles: titles, indices: indexPath)
+                    enqueueChildren(child, titles: titles, indices: indexPath)
                 case "AXMenuBarItem", "AXMenuItem":
                     let title = cleanTitle(attributes.title ?? attributes.value)
                     // A separator publishes no title. It is furniture, not an
@@ -199,14 +175,10 @@ public enum MacMenuBar {
                     inMenu += 1
                     if stop?(item) == true {
                         done = true
-                        return
+                        break
                     }
-                    if let submenu, names.count < depth {
-                        descend(
-                            submenu.element,
-                            titles: names,
-                            indices: indexPath + [submenu.offset]
-                        )
+                    if let submenu, names.count < namedDepth {
+                        pending.append((submenu.element, names, indexPath + [submenu.offset]))
                     } else if submenu != nil {
                         // The cap stopped the descent, and saying so is the
                         // difference between "this app has no PDF export" and
@@ -216,10 +188,7 @@ public enum MacMenuBar {
                 default:
                     continue
                 }
-            }
         }
-
-        descend(root, titles: [], indices: [])
         return Reading(items: items, truncated: truncated)
     }
 
@@ -266,10 +235,8 @@ public enum MacMenuBar {
 
     /// Resolve a spoken path against one reading.
     ///
-    /// Three passes, narrowest first, exactly like the background-sight
-    /// resolver and for the same reason: an exact "Export" must never lose to a
-    /// substring match on "Export Selection…". A pass finding several is an
-    /// ANSWER (the candidates), never a coin flip.
+    /// Execution requires every normalized title component exactly. Partial
+    /// names remain discovery suggestions, never a different command to press.
     public static func resolve(_ raw: String, among items: [Item]) -> Resolution {
         // BOTH SIDES are normalized, and that is not a detail: a menu title
         // carries a trailing ellipsis ("Export…") that a person never types,
@@ -280,18 +247,12 @@ public enum MacMenuBar {
         func levels(_ item: Item) -> [String] { item.titlePath.map(normalized) }
 
         let sameDepth = items.filter { $0.titlePath.count == wanted.count }
-        let passes: [(Item) -> Bool] = [
-            { levels($0) == wanted },
-            { zip(levels($0), wanted).allSatisfy { $0.hasPrefix($1) } },
-            { zip(levels($0), wanted).allSatisfy { $0.contains($1) } },
-        ]
-        for pass in passes {
             // The same path AND the same command identity is one command listed
             // twice (Keynote's File › New…: one identifier, one ⌘N): the first
             // stands for all. Same-titled items without that identity — two
             // windows named alike under Window — stay an answer, never a guess.
             var seen = Set<[String]>()
-            let hits = sameDepth.filter(pass).filter { item in
+            let hits = sameDepth.filter { levels($0) == wanted }.filter { item in
                 guard let key = item.commandKey else { return true }
                 return seen.insert(levels(item) + [key]).inserted
             }
@@ -301,7 +262,6 @@ public enum MacMenuBar {
             if hits.count > 1 {
                 return .ambiguous(candidates: hits.map(\.display).sorted())
             }
-        }
         return .notFound(nearest: nearest(to: wanted, among: items))
     }
 

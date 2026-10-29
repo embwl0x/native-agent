@@ -2,6 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Synchronization
+import NativeAgentShared
 // Blueprint: | `MemoryV2.swift` | `SwiftNativeMemoryV2` actor; `emitDiagnostic` |
 
 // MARK: - Subsystem #8+9: MemoryV2
@@ -12,14 +13,7 @@ import Synchronization
 
 // MARK: - MemoryRecord
 
-/// Mirrors the daemon's on-disk memory dict losslessly. The typed fields
-/// match the actual keys emitted by `Runtime.add_memory` /
-/// `Runtime.update_memory` (text/layer/sourceRunId/createdAt/...) plus the
-/// v2 metadata that consolidation / hygiene attach
-/// (schemaVersion/memoryKind/sourceQuality/decay/correction/
-/// correctionHistory/lastUsedAt). Anything else the daemon ships rides in
-/// `extras` so this struct doesn't have to change every time Python adds a
-/// key.
+/// Preserve on-disk memory keys losslessly, including unknown fields in `extras`.
 public struct MemoryRecord: Sendable, Codable, Equatable, Identifiable {
     public var id: String
     public var text: String
@@ -114,39 +108,25 @@ public struct MemoryRecord: Sendable, Codable, Equatable, Identifiable {
         "correctionHistory", "provenance", "validFrom", "validTo", "observedAt", "evidence", "extras",
     ]
 
-    private struct AnyKey: CodingKey, Hashable {
-        var stringValue: String
-        var intValue: Int? { nil }
-        init(_ s: String) { self.stringValue = s }
-        init?(stringValue: String) { self.stringValue = stringValue }
-        init?(intValue: Int) { return nil }
-    }
-
     public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: AnyKey.self)
+        let c = try decoder.container(keyedBy: JSONKey.self)
         func str(_ k: String) throws -> String? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
-            return try c.decodeIfPresent(String.self, forKey: key)
+            return try c.decodeIfPresent(String.self, forKey: JSONKey(k))
         }
         func dbl(_ k: String) throws -> Double? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
-            return try c.decodeIfPresent(Double.self, forKey: key)
+            return try c.decodeIfPresent(Double.self, forKey: JSONKey(k))
         }
         func intV(_ k: String) throws -> Int? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
-            return try c.decodeIfPresent(Int.self, forKey: key)
+            return try c.decodeIfPresent(Int.self, forKey: JSONKey(k))
         }
         func boolV(_ k: String) throws -> Bool? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
-            return try c.decodeIfPresent(Bool.self, forKey: key)
+            return try c.decodeIfPresent(Bool.self, forKey: JSONKey(k))
         }
         func arr(_ k: String) throws -> [String]? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
-            return try c.decodeIfPresent([String].self, forKey: key)
+            return try c.decodeIfPresent([String].self, forKey: JSONKey(k))
         }
         func jv(_ k: String) throws -> JSONValue? {
-            guard let key = AnyKey(stringValue: k) else { return nil }
-            return try c.decodeIfPresent(JSONValue.self, forKey: key)
+            return try c.decodeIfPresent(JSONValue.self, forKey: JSONKey(k))
         }
 
         self.id = (try str("id")) ?? ""
@@ -176,12 +156,7 @@ public struct MemoryRecord: Sendable, Codable, Equatable, Identifiable {
         self.evidence = try jv("evidence")
 
         // Capture every unknown key into extras so forward-compat survives.
-        var unknown: [String: JSONValue] = [:]
-        for key in c.allKeys where !Self.knownKeys.contains(key.stringValue) {
-            if let v = try? c.decode(JSONValue.self, forKey: key) {
-                unknown[key.stringValue] = v
-            }
-        }
+        var unknown = c.unknownFields(excluding: Self.knownKeys)
         if let explicit = try jv("extras") {
             if case .object(let obj) = explicit {
                 for (k, v) in obj { unknown[k] = v }
@@ -193,54 +168,44 @@ public struct MemoryRecord: Sendable, Codable, Equatable, Identifiable {
     }
 
     public func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: AnyKey.self)
-        try c.encode(id, forKey: AnyKey("id"))
-        try c.encode(text, forKey: AnyKey("text"))
-        try c.encodeIfPresent(layer, forKey: AnyKey("layer"))
-        try c.encodeIfPresent(memoryKind, forKey: AnyKey("memoryKind"))
-        try c.encodeIfPresent(personaId, forKey: AnyKey("personaId"))
-        try c.encodeIfPresent(lifecycle, forKey: AnyKey("lifecycle"))
-        try c.encode(createdAt, forKey: AnyKey("createdAt"))
-        try c.encodeIfPresent(updatedAt, forKey: AnyKey("updatedAt"))
-        try c.encodeIfPresent(sourceRunId, forKey: AnyKey("sourceRunId"))
-        try c.encodeIfPresent(status, forKey: AnyKey("status"))
-        try c.encodeIfPresent(pinned, forKey: AnyKey("pinned"))
-        try c.encodeIfPresent(confidence, forKey: AnyKey("confidence"))
-        try c.encodeIfPresent(importance, forKey: AnyKey("importance"))
-        try c.encodeIfPresent(tags, forKey: AnyKey("tags"))
-        try c.encodeIfPresent(schemaVersion, forKey: AnyKey("schemaVersion"))
-        try c.encodeIfPresent(sourceQuality, forKey: AnyKey("sourceQuality"))
-        try c.encodeIfPresent(lastUsedAt, forKey: AnyKey("lastUsedAt"))
-        try c.encodeIfPresent(decay, forKey: AnyKey("decay"))
-        try c.encodeIfPresent(correction, forKey: AnyKey("correction"))
-        try c.encodeIfPresent(correctionHistory, forKey: AnyKey("correctionHistory"))
-        try c.encodeIfPresent(provenance, forKey: AnyKey("provenance"))
-        try c.encodeIfPresent(validFrom, forKey: AnyKey("validFrom"))
-        try c.encodeIfPresent(validTo, forKey: AnyKey("validTo"))
-        try c.encodeIfPresent(observedAt, forKey: AnyKey("observedAt"))
-        try c.encodeIfPresent(evidence, forKey: AnyKey("evidence"))
-        if case .object(let obj)? = extras {
-            for (k, v) in obj where !Self.knownKeys.contains(k) {
-                try c.encode(v, forKey: AnyKey(k))
-            }
-        }
+        var c = encoder.container(keyedBy: JSONKey.self)
+        try c.encode(id, forKey: JSONKey("id"))
+        try c.encode(text, forKey: JSONKey("text"))
+        try c.encodeIfPresent(layer, forKey: JSONKey("layer"))
+        try c.encodeIfPresent(memoryKind, forKey: JSONKey("memoryKind"))
+        try c.encodeIfPresent(personaId, forKey: JSONKey("personaId"))
+        try c.encodeIfPresent(lifecycle, forKey: JSONKey("lifecycle"))
+        try c.encode(createdAt, forKey: JSONKey("createdAt"))
+        try c.encodeIfPresent(updatedAt, forKey: JSONKey("updatedAt"))
+        try c.encodeIfPresent(sourceRunId, forKey: JSONKey("sourceRunId"))
+        try c.encodeIfPresent(status, forKey: JSONKey("status"))
+        try c.encodeIfPresent(pinned, forKey: JSONKey("pinned"))
+        try c.encodeIfPresent(confidence, forKey: JSONKey("confidence"))
+        try c.encodeIfPresent(importance, forKey: JSONKey("importance"))
+        try c.encodeIfPresent(tags, forKey: JSONKey("tags"))
+        try c.encodeIfPresent(schemaVersion, forKey: JSONKey("schemaVersion"))
+        try c.encodeIfPresent(sourceQuality, forKey: JSONKey("sourceQuality"))
+        try c.encodeIfPresent(lastUsedAt, forKey: JSONKey("lastUsedAt"))
+        try c.encodeIfPresent(decay, forKey: JSONKey("decay"))
+        try c.encodeIfPresent(correction, forKey: JSONKey("correction"))
+        try c.encodeIfPresent(correctionHistory, forKey: JSONKey("correctionHistory"))
+        try c.encodeIfPresent(provenance, forKey: JSONKey("provenance"))
+        try c.encodeIfPresent(validFrom, forKey: JSONKey("validFrom"))
+        try c.encodeIfPresent(validTo, forKey: JSONKey("validTo"))
+        try c.encodeIfPresent(observedAt, forKey: JSONKey("observedAt"))
+        try c.encodeIfPresent(evidence, forKey: JSONKey("evidence"))
+        try c.encodeUnknownFields(extras, excluding: Self.knownKeys)
     }
 }
 
-/// One hit from `/v1/memory/recall`. Daemon emits search-result rows
-/// (score / session_id / role / ts / preview / source / rankingSignals), NOT
-/// full MemoryRecord dicts. Unknown keys land in `extras`.
+/// A recall search-result row; unknown keys are preserved in `extras`.
 public struct MemoryRecallHit: Sendable, Codable, Equatable {
     public var score: Double
     public var sessionId: String?
     public var role: String?
     public var ts: String?
     public var preview: String
-    /// U3 wave-1 item 1: the (sentence-safe capped) FULL memory text. The
-    /// felt "memory truncation" was read-side — recall surfaced only the
-    /// 200-char preview. `preview` stays for compactness; consumers that
-    /// want the real content read this. nil on producers that don't carry
-    /// full text (e.g. KG fallback rows).
+    /// Sentence-safe capped full memory text; nil when the producer supplies only a preview.
     public var content: String?
     public var source: String?
     public var rankingSignals: JSONValue?
@@ -361,18 +326,18 @@ public enum MemoryV2Error: Error, LocalizedError {
 /// SwiftNative MemoryV2 actor. Use ``SwiftNativeMemoryV2.shared``
 /// for production so storage/embedder are wired.
 public actor SwiftNativeMemoryV2 {
-    // Embedder (Core ML MiniLM in production, MockEmbeddingProvider in tests)
+    // Embedder (Core ML bge-large-en-v1.5 in production, explicit mock for development)
     // plus SQLite-backed MemoryStorage. Optional so tests can construct an
     // unwired actor and assert it fails closed.
     internal var embedder: (any EmbeddingProvider)?
-    internal var storage: MemoryStorageBridge?
+    internal var storage: MemoryStorage?
     internal var canonicalDataRoot: URL?
     internal var canonicalAttachmentReady: Task<Void, Never>?
     internal var userProjectionBinding: (dataRoot: URL, personaRoot: URL?, debounceInterval: TimeInterval)?
     internal var memoryProjectionsStopped = false
     var actionIndexSource: (@Sendable () async throws -> [String])?
     var actionIndexWatcher: FileChangeWatcher?
-    let actionIndexObservers = Mutex<[NSObjectProtocol]>([])
+    var actionIndexObservers: ObservationNotifications?
     var actionIndexUpdate: Task<Void, Never>?
     var actionIndexDirty = false
     var actionIndexFailure: String?
@@ -407,7 +372,6 @@ public actor SwiftNativeMemoryV2 {
     }
 
     deinit {
-        actionIndexObservers.withLock { $0.forEach { NotificationCenter.default.removeObserver($0) } }
         actionIndexWatcher?.cancel()
         actionIndexUpdate?.cancel()
         embeddingEpochReconcile?.cancel()
@@ -421,7 +385,7 @@ public actor SwiftNativeMemoryV2 {
 
     public init(
         embedder: any EmbeddingProvider,
-        storage: MemoryStorageBridge
+        storage: MemoryStorage
     ) {
         self.embedder = embedder
         self.storage = storage
@@ -430,7 +394,10 @@ public actor SwiftNativeMemoryV2 {
     public func listMemory(kind: String?) async throws -> [MemoryRecord] {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
-        return try await storage.listMemory(kind: kind)
+        return try await storage.listMemories(persona: nil, status: nil, limit: nil)
+            .filter { MemoryLifecycle.isRecallEligible($0.lifecycle)
+                && (kind == nil || MemoryRecallScoring.kind(of: $0.metadata) == kind) }
+            .map(MemoryRecord.init(stored:))
     }
 
     /// The rows behind a turn's chosen atoms, by id, so the turn never speaks
@@ -438,7 +405,7 @@ public actor SwiftNativeMemoryV2 {
     public func memoryRecords(ids: [String]) async throws -> [MemoryRecord] {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
-        return try await storage.lookupMemoryRecords(ids: ids)
+        return try await storage.memories(ids: ids).map(MemoryRecord.init(stored:))
     }
 
 
@@ -447,10 +414,10 @@ public actor SwiftNativeMemoryV2 {
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         var existing: MemoryRecord?
         if case .object(let patch) = update, patch["text"] != nil || patch["content"] != nil {
-            guard let row = try await storage.lookupMemoryRecord(id: id) else {
+            guard let row = try await storage.memory(id: id) else {
                 throw MemoryV2Error.recordNotFound
             }
-            existing = row
+            existing = MemoryRecord(stored: row)
         }
         let update = Self.sanitizedMemoryUpdate(
             update, existingKind: existing.flatMap { $0.memoryKind ?? MemoryRecallScoring.kind(of: $0.extras) })
@@ -466,40 +433,11 @@ public actor SwiftNativeMemoryV2 {
             throw MemoryStorageError.searchFailure("Memory unchanged: the memory search model is not loaded to check new wording against forgotten content.",
                 code: "memory_search_model_not_loaded", instruction: "Read Doctor and repair any reported model load error before rewriting.")
         }
-        try await gateUpdatedContentAgainstTombstones(update: update, embedding: newEmbedding, storage: storage)
-        let updated = try await storage.updateMemory(
+        guard let updated = try await storage.updateMemory(
             id: id,
-            patch: update,
-            newEmbedding: newEmbedding?.vector,
-            embeddingEpoch: newEmbedding?.epoch
-        )
-        return updated
-    }
-
-    /// Edits go through the same denylist gates as inserts: without this, a
-    /// "correction" could rewrite an existing memory INTO a deleted/rejected
-    /// fact (gpt-5.5 wave1 finding 2). Only fires when the patch changes
-    /// text/content (embedding non-nil — reuses the vector already computed).
-    private func gateUpdatedContentAgainstTombstones(
-        update: JSONValue,
-        embedding: (vector: [Float], epoch: MemoryEmbeddingEpoch)?,
-        storage: MemoryStorageBridge
-    ) async throws {
-        guard let embedding, case .object(let obj) = update else { return }
-        let newText: String? = {
-            if case .string(let s)? = obj["text"] { return s }
-            if case .string(let s)? = obj["content"] { return s }
-            return nil
-        }()
-        if let newText, try await storage.isTombstoned(content: newText) {
-            throw MemoryV2Error.forgottenContent("Updated content matches a forgotten or rejected memory.")
-        }
-        if try await storage.matchesTombstone(
-            embedding: embedding.vector,
-            embeddingEpoch: embedding.epoch
-        ) {
-            throw MemoryV2Error.forgottenContent("Updated content paraphrases a forgotten or rejected memory.")
-        }
+            patch: MemoryPatch(update: update, embedding: newEmbedding?.vector, epoch: newEmbedding?.epoch)
+        ) else { throw MemoryV2Error.recordNotFound }
+        return MemoryRecord(stored: updated)
     }
 
     /// Foreground callers that distinguish a missing row use the atomic
@@ -509,6 +447,7 @@ public actor SwiftNativeMemoryV2 {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         let deleted = try await storage.deleteMemory(id: id)
+        if deleted { requestEmbeddingEpochReconcile() }
         return deleted
     }
 
@@ -543,10 +482,20 @@ public actor SwiftNativeMemoryV2 {
         return managed.residentEmbeddingEpoch
     }
 
-    /// Phase 5 D: vectors from the already-resident model, or nil. Never loads.
-    public func embedIfWarm(_ texts: [String]) async -> [[Float]]? {
+    /// The resident vector space's identity, or nil while cold. Vectors kept
+    /// outside memory (her habits' examples) are valid only within it.
+    public func warmEmbeddingEpoch() -> String? {
+        residentEmbeddingEpoch()?.rawValue
+    }
+
+    /// Vectors from the already-resident model, or nil; never loads.
+    public func embedIfWarm(_ texts: [String], requireFullText: Bool = false) async -> [[Float]]? {
         guard let managed = embedder as? ManagedEmbeddingProvider else { return nil }
-        return await managed.embedIfResident(texts)
+        return await managed.embedIfResident(texts, requireFullText: requireFullText)
+    }
+
+    func coversCompleteTextsIfWarm(_ texts: [String]) -> Bool? {
+        (embedder as? ManagedEmbeddingProvider)?.coversCompleteTextsIfResident(texts)
     }
 
     public func managedEmbeddingRuntime() async throws -> ManagedEmbeddingProvider {
@@ -559,11 +508,7 @@ public actor SwiftNativeMemoryV2 {
         if let managed = embedder as? ManagedEmbeddingProvider {
             return managed.snapshot()
         }
-        // 2026-07-21 audit fix: a fail-closed embedder (modelId "fail-closed"
-        // — CoreML requested but unloadable, mock not opted in) used to fall
-        // into the non-mock branch below and report coreMLLoaded=true /
-        // effectiveBackend=coreml while every embed() throws. Report it
-        // honestly as not-loaded.
+        // A fail-closed embedder reports not loaded.
         let isMock = embedder.modelId == "mock"
         let isFailClosed = embedder.modelId == ManagedEmbeddingProvider.failClosedBackend
         let coreMLUp = !isMock && !isFailClosed
@@ -585,23 +530,11 @@ public actor SwiftNativeMemoryV2 {
             unloadReason: nil,
             lastLoadError: nil,
             loadCount: coreMLUp ? 1 : 0,
-            unloadCount: 0,
-            idleUnloadSeconds: nil
+            unloadCount: 0
         )
     }
 
-    public func configureEmbeddingBackend(enabled: Bool) async throws {
-        guard let managed = embedder as? ManagedEmbeddingProvider else {
-            throw MemoryV2Error.underlying("embedding runtime is not configurable")
-        }
-        try await managed.setBackend(enabled: enabled)
-        requestActionIndexUpdate()
-    }
-
-    /// 2026-06-07 task #88: force-load the embedder by issuing a trivial
-    /// embed call. Used by app launch when the user has Fast mode selected
-    /// — without this, Fast mode only kicked in AFTER first use, so the
-    /// first chat turn paid the ~6-12s warm-up tax.
+    /// Warm the embedder at launch with a trivial embed call when Fast mode is selected.
     ///
     /// Returns silently if no embedder is wired. If the model is already
     /// resident, the underlying provider's lock-protected fast path still
@@ -655,10 +588,10 @@ public actor SwiftNativeMemoryV2 {
 
     public func memoryEmbeddingEpochState() async throws -> MemoryEmbeddingEpochState {
         try await ensureCanonicalAttachment()
-        guard let bridge = storage else {
+        guard let storage else {
             throw MemoryV2Error.storageUnavailable
         }
-        return try await bridge.underlyingStorage().embeddingEpochState()
+        return try await storage.embeddingEpochState()
     }
 
     /// Embeds every canonical memory/proposal/tombstone in bounded
@@ -668,17 +601,23 @@ public actor SwiftNativeMemoryV2 {
     public func reindexAllMemoryEmbeddingsForCurrentProvider(
         batchSize: Int = 64
     ) async throws -> MemoryEmbeddingEpochActivationReport {
+        guard let embedder else { throw MemoryV2Error.storageUnavailable }
+        return try await reindexMemoryEmbeddings(using: embedder, batchSize: batchSize)
+    }
+
+    /// A prepared provider can build its space without publishing a selection.
+    func reindexMemoryEmbeddings(
+        using embedder: any EmbeddingProvider, batchSize: Int = 64
+    ) async throws -> MemoryEmbeddingEpochActivationReport {
         try await ensureCanonicalAttachment()
         try Task.checkCancellation()
-        guard let embedder,
-              let bridge = storage else {
+        guard let concreteStorage = storage else {
             throw MemoryV2Error.storageUnavailable
         }
         let invocation = UUID()
         embeddingReindexID = invocation
         var reusable = embeddingRetryVectors
         embeddingRetryVectors = [:]
-        let concreteStorage = await bridge.underlyingStorage()
         try Task.checkCancellation()
         let corpus = try await concreteStorage.embeddingCorpusSnapshot()
         try Task.checkCancellation()
@@ -722,10 +661,11 @@ public actor SwiftNativeMemoryV2 {
                     vectors[EmbeddingRetryKey(epoch: batch.epoch, row: row)] = vector
                 }
             }
-            staged = corpus.map { row in
-                MemoryEmbeddingStagedRow(
-                    row: row, vector: vectors[EmbeddingRetryKey(epoch: providerEpoch, row: row)]!
-                )
+            staged = try corpus.map { row in
+                guard let vector = vectors[EmbeddingRetryKey(epoch: providerEpoch, row: row)] else {
+                    throw MemoryV2Error.underlying("A staged memory embedding is missing for \(row.id).")
+                }
+                return MemoryEmbeddingStagedRow(row: row, vector: vector)
             }
         }
         guard let candidateEpoch else {
@@ -767,7 +707,7 @@ public actor SwiftNativeMemoryV2 {
 
     /// Only a patch carrying new `text`/`content` needs a vector; otherwise
     /// the existing embedding stays valid.
-    private static func patchText(_ update: JSONValue) -> String? {
+    static func patchText(_ update: JSONValue) -> String? {
         guard case .object(let obj) = update else { return nil }
         if case .string(let s)? = obj["text"] { return s }
         if case .string(let s)? = obj["content"] { return s }

@@ -6,6 +6,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT/script/lib/sparkle_tools.sh"
 
 fail() {
   echo "ERROR: $*" >&2
@@ -44,7 +45,7 @@ require_file "$TEST_RECEIPT" "NATIVEAGENT_PUBLISH_TEST_RECEIPT"
 require_file "$ATTESTATION" "NATIVEAGENT_PUBLISH_ATTESTATION"
 
 VERSION="$(xmllint --xpath \
-  'string((//*[local-name()="version"])[1])' "$APPCAST" 2>/dev/null || true)"
+  'string(/rss/channel/item/*[local-name()="version" and namespace-uri()="http://www.andymatuschak.org/xml-namespaces/sparkle"])' "$APPCAST" 2>/dev/null || true)"
 [[ "$VERSION" =~ ^[0-9]+([.][0-9A-Za-z-]+)+$ ]] \
   || fail "could not read a valid Sparkle version from $APPCAST"
 
@@ -82,10 +83,9 @@ jq -e --arg target "$TARGET" \
   '.schema_version == 1
    and .source_revision == $target
    and .source_dirty == false
-   and ((.canonical_gate == "script/test.sh" and .ios_required == true and .ios_result == "passed")
-        or (.canonical_gate == "script/release.sh --artifact-only" and .ios_required == false and .ios_result == "not_run"))' \
+   and (.canonical_gate == "script/release.sh --artifact-only" and .ios_required == false and .ios_result == "not_run")' \
   "$TEST_RECEIPT" >/dev/null \
-  || fail "release test receipt does not prove the exact clean source and required iOS gate."
+  || fail "release receipt does not prove the exact clean source and artifact gate."
 jq -e \
   --arg version "$VERSION" \
   --arg target "$TARGET" \
@@ -99,8 +99,7 @@ jq -e \
    and (.internal_build != true)
    and .source_revision == $target
    and .test_receipt.source_dirty == false
-   and ((.test_receipt.canonical_gate == "script/test.sh" and .test_receipt.ios_required == true and .test_receipt.ios_result == "passed")
-        or (.test_receipt.canonical_gate == "script/release.sh --artifact-only" and .test_receipt.ios_required == false and .test_receipt.ios_result == "not_run"))
+   and (.test_receipt.canonical_gate == "script/release.sh --artifact-only" and .test_receipt.ios_required == false and .test_receipt.ios_result == "not_run")
    and .test_receipt.sha256 == $receipt_sha256
    and .dmg.name == $dmg_name
    and .dmg.sha256 == $dmg_sha256
@@ -140,32 +139,12 @@ if [[ "$EMBEDDING_DISTRIBUTION" == separate-download ]]; then
   done
   RELEASE_ASSETS+=( "$MODEL_ASSET" )
 fi
-DELTA_COUNT="$(xmllint --xpath 'count(//*[local-name()="deltas"]/*[local-name()="enclosure"])' "$APPCAST")"
-[[ "$EMBEDDING_DISTRIBUTION" != bundled || "$DELTA_COUNT" == 0 ]] \
+sparkle_validate_deltas "$APPCAST" "${EXPECTED_DOWNLOAD_URL%/*}/" \
+  "${NATIVEAGENT_SPARKLE_ED_PRIV_KEY:-${NATIVE_AGENT_SPARKLE_ED_PRIV_KEY:-}}" \
+  || fail 'Sparkle delta validation failed'
+[[ "$EMBEDDING_DISTRIBUTION" != bundled || "$SPARKLE_DELTA_COUNT" == 0 ]] \
   || fail "bundled releases publish only the full DMG, appcast, attestation and test receipt"
-if [[ "$DELTA_COUNT" != 0 ]]; then
-  source "$ROOT/script/lib/sparkle_tools.sh"
-  DELTA_SIGN_TOOL="$(sparkle_tool_path_or_die sign_update "$ROOT")"
-  DELTA_KEY="${NATIVEAGENT_SPARKLE_ED_PRIV_KEY:-${NATIVE_AGENT_SPARKLE_ED_PRIV_KEY:-}}"
-  require_file "$DELTA_KEY" "Sparkle key for delta verification"
-fi
-for ((delta_index=1; delta_index<=DELTA_COUNT; delta_index++)); do
-  delta_node="(//*[local-name()='deltas']/*[local-name()='enclosure'])[$delta_index]"
-  delta_url="$(xmllint --xpath "string($delta_node/@url)" "$APPCAST")"
-  delta_name="${delta_url##*/}"
-  [[ "$delta_name" =~ ^[A-Za-z0-9_.-]+\.delta$ && "$delta_url" == "${EXPECTED_DOWNLOAD_URL%/*}/$delta_name" ]] \
-    || fail "delta URL is outside this release: $delta_url"
-  delta_file="$(dirname "$APPCAST")/$delta_name"
-  require_file "$delta_file" "Sparkle delta"
-  [[ "$(xmllint --xpath "string($delta_node/@length)" "$APPCAST")" == "$(wc -c < "$delta_file" | tr -d '[:space:]')" ]] \
-    || fail "delta size mismatch: $delta_name"
-  delta_signature="$(xmllint --xpath "string($delta_node/@*[local-name()='edSignature'])" "$APPCAST")"
-  [[ -n "$delta_signature" ]] \
-    || fail "unsigned Sparkle delta: $delta_name"
-  "$DELTA_SIGN_TOOL" --verify --ed-key-file "$DELTA_KEY" "$delta_file" "$delta_signature" >/dev/null \
-    || fail "delta signature mismatch: $delta_name"
-  RELEASE_ASSETS+=( "$delta_file" )
-done
+RELEASE_ASSETS+=( ${SPARKLE_DELTA_PATHS[@]+"${SPARKLE_DELTA_PATHS[@]}"} )
 if [[ "$DRY_RUN" == true ]]; then
   echo "==> Offline publication rehearsal passed for $TAG; no remote calls or tag writes."
   printf '    asset: %s\n' "${RELEASE_ASSETS[@]}"

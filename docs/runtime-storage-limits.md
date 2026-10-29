@@ -1,7 +1,8 @@
 # Runtime diagnostic storage limits
 
 `PersistenceCore/FeedPolicy.swift` defines shared feed limits;
-`PersistenceCore/JSONLRetention.swift` enforces them under the append lock.
+`PersistenceCore/JSONLRetention.swift` selects rows once under the append lock,
+applying the line policy before the byte policy and publishing the result once.
 
 | Feed | Row rotation | Byte rotation |
 |---|---|---|
@@ -18,7 +19,7 @@ cross the ceiling are refused.
 
 `TurnTraceRetention.swift` removes date-named turn ledgers older than its
 14-day window. Each persisted turn-trace row is bounded to 12 KiB by
-`TurnTrace.swift`, except `llm.call` rows, which keep the 8 MiB allowance
+`TurnTraceEvent.swift`, except `llm.call` rows, which keep the 8 MiB allowance
 `PersistenceCore` grants a model exchange.
 
 `Browser/BrowserCaptureCache.swift` owns temporary page text, links and
@@ -46,9 +47,7 @@ their own five-per-session policy; see [Data bounds](data-bounds.md).
 Neither path is selected for local backup, production export or a raw phone
 snapshot; PrivacyMap inventories their parent folders. They are recovery and
 diagnostic review candidates, not proven orphans merely because no dedicated
-in-app content reader exists. The sweep lists existing candidates for User
-without deleting, moving or rewriting them, and adds no launch cleanup or
-migration. `traces/events.jsonl` and `user_prefs.json` retain live readers and
-are not orphan stores.
+in-app content reader exists. `traces/events.jsonl` and `user_prefs.json`
+retain live readers and are not orphan stores.
 
 Source paths above are under `Modules/NativeAgentCore/Sources/`.

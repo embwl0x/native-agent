@@ -1,19 +1,5 @@
 #!/usr/bin/env bash
-# A2.1-2026-07-24: generate + EdDSA-sign the Sparkle appcast for a release artifact.
-#
-# WHY THIS EXISTS
-#   Every full release before today stamped a REQUIRED SUFeedURL into the app while
-#   no appcast had ever been published at that URL. The app therefore shipped a
-#   "Check for Updates…" affordance that resolved into a 404. Half of the fix is in
-#   UpdateController.swift (do not claim updates work unless a feed was published);
-#   this script is the other half — the machinery that lets the feed actually exist.
-#
-# HARD RULE
-#   A malformed or unsigned feed is WORSE than no feed: Sparkle's generate_appcast
-#   emits an UNSIGNED enclosure with only a *warning* when the signing key does not
-#   match the app's SUPublicEDKey (verified empirically 2026-07-24 against
-#   dist/NativeAgent-0.2.0.dmg). This script therefore refuses to produce output
-#   that is unsigned, placeholder-signed, version-mismatched, or wrongly-addressed.
+# Generate, cryptographically verify and optionally publish the Sparkle appcast.
 #
 # Usage:
 #   script/generate_appcast.sh --dmg dist/NativeAgent-0.2.0.dmg --version 0.2.0 \
@@ -45,7 +31,7 @@
 #                                    via NATIVEAGENT_PUBLISH_APPCAST/_DMG/_URL env
 #   NATIVEAGENT_APPCAST_VERIFY_ATTEMPTS / _DELAY
 #                                    bounded retry while the host propagates
-#                                    (default 6 attempts, 5s apart). Running out
+#                                    (default 12 attempts, 15s apart). Running out
 #                                    of attempts FAILS the publish — after the
 #                                    publish command exits 0, this script fetches
 #                                    the feed and the DMG from their advertised
@@ -68,13 +54,8 @@ PUBLISH=false
 # the two bundle<->feed cross-checks; every signature/version/URL/length guard
 # below still runs, and publishing is refused.
 REHEARSAL=false
-# Release notes to embed in the feed item as <description> (sweep R4 C12).
-# Sparkle shows the item's description in its update dialog; with no notes,
-# every update dialog this project has ever shown was blank.
 NOTES_FILE=""
-# Escape hatch for the VERSION-file gate below. Synthetic-version runs (the
-# script test suites sign a 9.9.9 fixture DMG) are the only legitimate users.
-# Refused together with --publish: a real publish must match VERSION.
+# Version drift is permitted only for synthetic local runs; publishing must match VERSION.
 ALLOW_VERSION_DRIFT=false
 PREVIOUS_DMG="${NATIVEAGENT_SPARKLE_PREVIOUS_DMG:-}"
 
@@ -211,10 +192,7 @@ cleanup() {
       rm -f "$APPCAST_XML"
       echo "    (discarded the rejected $APPCAST_XML)" >&2
     fi
-    # The DMG staged for Sparkle's generate_appcast is a full copy/hardlink of the
-    # release image. On the success path it is removed below; on every rejection
-    # path it used to survive as dist/appcast/NativeAgent-<v>.dmg — a shippable
-    # disk image, in a directory a human is about to upload. Remove it here too.
+    # Rejection must also remove the staged DMG so the feed directory cannot ship it.
     if [[ -n "${OUT_DIR:-}" && -n "${DMG_BASENAME:-}" && -f "$OUT_DIR/$DMG_BASENAME" ]]; then
       rm -f "$OUT_DIR/$DMG_BASENAME"
       echo "    (discarded the staged $OUT_DIR/$DMG_BASENAME)" >&2
@@ -243,12 +221,7 @@ BUNDLE_FEED_PUBLISHED="$(plist_value "$APP_INFO" NativeAgentUpdateFeedPublished)
        Sparkle cannot verify any update this feed offers. Rebuild the release with
        NATIVEAGENT_SPARKLE_PUBLIC_KEY set (see script/release.sh)."
 
-# A2.1 round 2 (gpt-5.5 MED): prove the signing key IS the key this build trusts,
-# by arithmetic rather than by Sparkle's warning prose. The later
-# `sign_update --verify` step only proves the signature matches the key we signed
-# with — it can never notice that the *bundle* trusts a different key. Deriving
-# the public half here closes exactly that gap, and keeps working if Sparkle
-# rewords or drops the "does not match key" warning we still grep for below.
+# The signing key's public half must equal the key trusted by the bundled app.
 DERIVED_PUB_KEY="$(sparkle_ed_public_key_from_file "$PRIV_KEY" "$ROOT")" \
   || fail "could not derive the public half of NATIVEAGENT_SPARKLE_ED_PRIV_KEY ($PRIV_KEY).
        Without it there is no way to prove the signing key matches the app's
@@ -263,20 +236,7 @@ if [[ "$DERIVED_PUB_KEY" != "$BUNDLE_PUB_KEY" ]]; then
 fi
 echo "==> Signing key verified: its public half IS the app's SUPublicEDKey ($BUNDLE_PUB_KEY)."
 
-# ---------------------------------------------------------------------------
-# 3b. Version identity (internal-build-seat-hygiene item 1, 2026-08-21).
-#
-#     CFBundleVersion is what Sparkle's comparator reads, so it must ALWAYS be
-#     the bare repo version — on every lane, without exception.
-#
-#     CFBundleShortVersionString is the HUMAN-visible string. Non-publish lanes
-#     (build_and_run.sh, install_app.sh, release.sh without --publish-appcast)
-#     now suffix it with -dev.<short8sha>[.dirty] so an internal build can never
-#     be mistaken for the shipped release by a person, an About box, an honesty
-#     dialog, or an audit. That suffix is therefore ALLOWED here on rehearsal /
-#     local runs, and FORBIDDEN with --publish: publishing a feed whose enclosure
-#     is an internal build is exactly the VM-seat clobber this fixes.
-# ---------------------------------------------------------------------------
+# Sparkle compares the bare CFBundleVersion; internal short-version suffixes forbid publication.
 INTERNAL_DEV_SUFFIX_RE='^-dev\.([0-9a-f]{8}|nogit)(\.dirty)?$'
 [[ "$BUNDLE_VERSION" == "$VERSION" ]] \
   || fail "version mismatch: VERSION=$VERSION but the bundle carries
@@ -377,15 +337,6 @@ set -e
 cat "$GEN_LOG"
 [[ $GEN_STATUS -eq 0 ]] || fail "generate_appcast failed (exit $GEN_STATUS); see $GEN_LOG"
 
-# generate_appcast DOWNGRADES a key mismatch to a warning and writes an UNSIGNED
-# enclosure. Treat that warning as fatal. Belt-and-braces only: the derived-key
-# check above already made a mismatch impossible without relying on this prose.
-if grep -qi "does not match key" "$GEN_LOG"; then
-  fail "the signing key does not match the app's SUPublicEDKey ($BUNDLE_PUB_KEY).
-       Sparkle would have emitted an UNSIGNED enclosure. Refusing.
-       Sign with the key whose public half is baked into this build."
-fi
-
 # ---------------------------------------------------------------------------
 # 5. Verify the produced feed. Every assertion here is a way a feed can parse
 #    and still be useless or dangerous.
@@ -393,29 +344,26 @@ fi
 [[ -f "$APPCAST_XML" ]] || fail "generate_appcast produced no $APPCAST_XML"
 xmllint --noout "$APPCAST_XML" 2>/dev/null || fail "produced appcast.xml is not well-formed XML"
 
-# Only the current version is requested; the previous archive is delta input.
-# The feed must describe exactly one update. With more than
-# one <item>, every extraction below would silently report the first one only.
-ITEM_COUNT="$(grep -c '<item>' "$APPCAST_XML" || true)"
+# Exactly one actual update item and its direct full-update enclosure.
+ITEM='/rss/channel/item'
+ENCLOSURE="$ITEM/enclosure"
+ITEM_COUNT="$(xmllint --xpath "count($ITEM)" "$APPCAST_XML")"
 [[ "$ITEM_COUNT" == "1" ]] \
   || fail "expected exactly 1 <item> in the generated feed, found $ITEM_COUNT."
 
-ENCLOSURE_LINE="$(grep '<enclosure' "$APPCAST_XML" | head -1)"
-[[ -n "$ENCLOSURE_LINE" ]] || fail "the generated appcast has no <enclosure> element."
-attr() { printf '%s' "$ENCLOSURE_LINE" | sed -n "s/.*[[:space:]]$1=\"\([^\"]*\)\".*/\1/p"; }
-tag()  { sed -n "s@.*<$1>\([^<]*\)</$1>.*@\1@p" "$APPCAST_XML" | head -1; }
+[[ "$(xmllint --xpath "count($ENCLOSURE)" "$APPCAST_XML")" == 1 ]] || fail 'expected exactly one direct full-update enclosure'
+attr() { xmllint --xpath "string($ENCLOSURE/@*[local-name()='$1'])" "$APPCAST_XML"; }
+tag() { xmllint --xpath "string($ITEM/*[local-name()='$1' and namespace-uri()='http://www.andymatuschak.org/xml-namespaces/sparkle'])" "$APPCAST_XML"; }
 
 ENCLOSURE_URL="$(attr 'url')"
 ENCLOSURE_LEN="$(attr 'length')"
-ED_SIGNATURE="$(attr 'sparkle:edSignature')"
-FEED_VERSION="$(tag 'sparkle:version')"
-FEED_SHORT_VERSION="$(tag 'sparkle:shortVersionString')"
+ED_SIGNATURE="$(attr 'edSignature')"
+FEED_VERSION="$(tag 'version')"
+FEED_SHORT_VERSION="$(tag 'shortVersionString')"
 
 [[ -n "$ED_SIGNATURE" ]] \
   || fail "the generated appcast has NO sparkle:edSignature on its enclosure.
        An unsigned feed is refused — Sparkle clients cannot install from it."
-[[ "$ED_SIGNATURE" != *'$'* && "$ED_SIGNATURE" != *"PLACEHOLDER"* ]] \
-  || fail "refusing a placeholder signature: $ED_SIGNATURE"
 [[ "$ENCLOSURE_URL" == "$DOWNLOAD_URL" ]] \
   || fail "enclosure URL is $ENCLOSURE_URL but the DMG will live at $DOWNLOAD_URL"
 ACTUAL_LEN="$(stat -f%z "$DMG_PATH")"
@@ -425,11 +373,7 @@ ACTUAL_LEN="$(stat -f%z "$DMG_PATH")"
   || fail "feed advertises version=$FEED_VERSION short=$FEED_SHORT_VERSION, expected
        version=$VERSION short=$EXPECTED_SHORT_VERSION"
 
-# Sweep R4 C1: the check above only proves the feed matches whatever --version
-# was handed in. The failure that actually shipped was a feed left advertising
-# 0.3.2 while the repo had moved to 0.3.7 — every user five releases behind and
-# told they were current. The single source of truth is the VERSION file, so the
-# feed must match IT, not just its own argument.
+# VERSION is authoritative; matching the --version argument alone cannot establish currency.
 if [[ -f "$ROOT/VERSION" ]]; then
   REPO_VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
   if [[ "$FEED_VERSION" != "$REPO_VERSION" ]]; then
@@ -448,61 +392,20 @@ if grep -Eqi "$PLACEHOLDER_RE" "$APPCAST_XML"; then
   fail "the generated appcast still contains a placeholder URL; refusing to publish."
 fi
 
-# Independent cryptographic re-check: prove the signature in the feed actually
-# verifies against the DMG bytes with the release key. Combined with the
-# derived-public-key equality proven above (derived == the app's SUPublicEDKey),
-# this transitively proves the signature verifies under the key the SHIPPED APP
-# will check it with — which is the property that actually matters.
+# The feed's signature must verify against the DMG bytes with the trusted key.
 "$SIGN_UPDATE" --verify --ed-key-file "$PRIV_KEY" "$DMG_PATH" "$ED_SIGNATURE" >/dev/null \
   || fail "the sparkle:edSignature in the generated feed does NOT verify against $DMG_BASENAME."
 
 # Sparkle's own BinaryDelta implementation chooses whether a patch saves space.
 # Keep full-DMG fallback when the baseline is incompatible or a delta is larger.
-DELTA_COUNT="$(xmllint --xpath 'count(//*[local-name()="deltas"]/*[local-name()="enclosure"])' "$APPCAST_XML")"
-for ((delta_index=1; delta_index<=DELTA_COUNT; delta_index++)); do
-  delta_node="(//*[local-name()='deltas']/*[local-name()='enclosure'])[$delta_index]"
-  delta_url="$(xmllint --xpath "string($delta_node/@url)" "$APPCAST_XML")"
-  delta_name="${delta_url##*/}"
-  [[ "$delta_name" =~ ^[A-Za-z0-9_.-]+\.delta$ && "$delta_url" == "$DOWNLOAD_PREFIX$delta_name" ]] \
-    || fail "delta URL does not name a local release asset: $delta_url"
-  delta_path="$OUT_DIR/$delta_name"
-  [[ -s "$delta_path" ]] || fail "delta asset is missing: $delta_name"
-  delta_length="$(xmllint --xpath "string($delta_node/@length)" "$APPCAST_XML")"
-  [[ "$delta_length" == "$(stat -f%z "$delta_path")" ]] || fail "delta size mismatch: $delta_name"
-  delta_signature="$(xmllint --xpath "string($delta_node/@*[local-name()='edSignature'])" "$APPCAST_XML")"
-  [[ -n "$delta_signature" ]] || fail "unsigned delta: $delta_name"
-  "$SIGN_UPDATE" --verify --ed-key-file "$PRIV_KEY" "$delta_path" "$delta_signature" >/dev/null \
-    || fail "delta signature does not verify: $delta_name"
-done
+sparkle_validate_deltas "$APPCAST_XML" "$DOWNLOAD_PREFIX" "$PRIV_KEY" "$SIGN_UPDATE" \
+  || fail 'Sparkle delta validation failed'
+DELTA_COUNT="$SPARKLE_DELTA_COUNT"
 echo "==> Verified $DELTA_COUNT Sparkle delta(s); full DMG remains available."
 
-# ---------------------------------------------------------------------------
-# 5b. Release notes (sweep R4 C12). Sparkle renders the item's <description> in
-#     its update dialog; without one, every dialog this project ever showed was
-#     blank — "install this binary, we won't say what changed."
-#
-#     Deliberately done HERE, after every signature/version/URL/length guard
-#     above has PASSED, so notes text can never influence a guard (a notes file
-#     mentioning example.com must not trip the placeholder scan, and must not be
-#     able to smuggle an <enclosure> or <item> past the counts). Everything that
-#     could change is re-asserted immediately afterwards: the enclosure line
-#     must be byte-identical, the item count still 1, and the XML still
-#     well-formed. The EdDSA signature covers the DMG bytes, not the feed, so
-#     editing the XML here cannot invalidate it.
-# ---------------------------------------------------------------------------
-# Which branch a notes file takes must be DETERMINISTIC, not a substring lottery.
-# The old test was `grep -qi '<html\|<p>\|<ul>\|<h[1-6]>'` over the whole file, so
-# a markdown release note that merely MENTIONS a tag in backticks — "wrap it in
-# `<p>`" — was routed to the raw-HTML branch. Its markdown then shipped as raw
-# markers, unescaped and unstyled, and every downstream guard still passed
-# because the payload lives inside CDATA where xmllint cannot see it.
-#
-# Selection order:
-#   1. Extension keyed. A .md/.markdown/.txt file is markdown no matter what it
-#      quotes; a .html/.htm file is HTML no matter how plain it looks.
-#   2. Only for an extensionless/unknown file: sniff the PROSE — fenced code
-#      blocks and backtick spans stripped first, and only LINE-LEADING tags
-#      count, so a tag named inside a sentence never decides the branch.
+# Insert notes after artifact guards, then recheck XML, item count and the unchanged enclosure.
+# EdDSA covers the DMG bytes, so notes do not alter its signature.
+# Notes extensions decide format; unknown extensions use line-leading prose tags with code stripped.
 notes_is_raw_html() { # $1 = notes file; 0 = raw HTML branch, 1 = markdown converter
   local f="$1" base ext
   base="$(basename -- "$f")"
@@ -527,22 +430,16 @@ if [[ -n "$NOTES_FILE" ]]; then
     NOTES_MODE="converted"
   fi
   echo "    notes mode: $NOTES_MODE"
-  ENCLOSURE_BEFORE="$ENCLOSURE_LINE"
+  ENCLOSURE_BEFORE="$(xmllint --xpath "$ENCLOSURE" "$APPCAST_XML")"
   NOTES_TMP="$OUT_DIR/.release-notes.fragment"
   {
-    # Explicit format: Sparkle currently defaults a nil descriptionFormat to
-    # html, but this path depends on HTML rendering — say so (gpt-5.5 NIT).
+    # Declare HTML rendering explicitly.
     printf '        <description sparkle:descriptionFormat="html"><![CDATA[\n'
     # CDATA cannot contain the terminator; split it if the notes ever do.
     if [[ "$NOTES_MODE" == "raw-html" ]]; then
       sed 's/]]>/]]]]><![CDATA[>/g' "$NOTES_FILE"
     else
-      # update-dialog-polish (2026-08-20): markdown notes render as styled,
-      # appearance-following HTML instead of raw markers in a white <pre>.
-      # The converter escapes & < > FIRST (which also neutralises any "]]>"
-      # as "]]&gt;", keeping the CDATA terminator unreachable) and emits only
-      # its own tags. A converter failure fails the run — no silent fallback
-      # to the old <pre> path; ugly-notes-by-surprise is how this bug shipped.
+      # The converter escapes input before emitting styled HTML, keeping CDATA terminators unreachable.
       swift "$ROOT/script/release_notes_html.swift" < "$NOTES_FILE" \
         || fail "release_notes_html.swift failed to convert $NOTES_FILE."
     fi
@@ -563,13 +460,13 @@ if [[ -n "$NOTES_FILE" ]]; then
   # Re-assert every invariant the insertion could have broken.
   xmllint --noout "$APPCAST_XML" 2>/dev/null \
     || fail "the appcast is no longer well-formed XML after embedding $NOTES_FILE."
-  ITEM_COUNT_AFTER="$(grep -c '<item>' "$APPCAST_XML" || true)"
+  ITEM_COUNT_AFTER="$(xmllint --xpath "count($ITEM)" "$APPCAST_XML")"
   [[ "$ITEM_COUNT_AFTER" == "1" ]] \
     || fail "embedding release notes changed the <item> count to $ITEM_COUNT_AFTER."
-  ENCLOSURE_AFTER="$(grep '<enclosure' "$APPCAST_XML" | head -1)"
+  ENCLOSURE_AFTER="$(xmllint --xpath "$ENCLOSURE" "$APPCAST_XML")"
   [[ "$ENCLOSURE_AFTER" == "$ENCLOSURE_BEFORE" ]] \
-    || fail "embedding release notes altered the signed <enclosure> line. Refusing."
-  [[ "$(tag 'sparkle:version')" == "$VERSION" ]] \
+    || fail "embedding release notes altered the signed <enclosure> metadata. Refusing."
+  [[ "$(tag 'version')" == "$VERSION" && "$(tag 'shortVersionString')" == "$EXPECTED_SHORT_VERSION" ]] \
     || fail "embedding release notes altered the advertised feed version. Refusing."
 
   # PAYLOAD guard. Every assertion above is structural — the notes text lives
@@ -675,9 +572,7 @@ elif [[ $VERIFY_STATUS -eq 2 ]]; then
 elif [[ $VERIFY_STATUS -ne 0 ]]; then
   VERIFY_ATTEMPTS="$NATIVEAGENT_APPCAST_PUBLISH_VERIFY_ATTEMPTS"
   verify_note="$NATIVEAGENT_APPCAST_PUBLISH_VERIFY_REASON"
-  # The signed feed on disk is valid for the artifact it describes, so it is not
-  # deleted — but it describes a build whose DMG is NOT live, so hand-uploading it
-  # would recreate the 404. Say so where a human would find it.
+  # Keep the valid local feed with a warning: its advertised DMG was not verified live.
   cat > "$OUT_DIR/.PUBLISH-FAILED-DO-NOT-UPLOAD.txt" <<TXT
 Publication of this feed was attempted and could NOT be verified live.
 

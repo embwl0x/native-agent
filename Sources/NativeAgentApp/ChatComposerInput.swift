@@ -1,29 +1,14 @@
 import Dispatcher
 import SwiftUI
-import ToolRegistry
 import AppKit
 import ChatTurnRuntime
 import ChatSessionWork
+import NativeAgentShared
 
 // Blueprint: | `ChatComposerInput.swift` | `ChatComposerInput`: draft-local text entry, slash menu, recipient chip and command-key handling |
 
-/// The composer: the text field, its slash menu, and the control strip around
-/// it.
-///
-/// User, 2026-09-13 (typing lag). This is the only view a keystroke invalidates.
-/// It is split out of `ChatView.body` because it is the only place the
-/// in-progress text is READ during a body evaluation — `canSend` needs it, the
-/// text field is bound to it, and the slash menu watches it. With the draft
-/// living in an `@Observable` `ChatComposerDraft` and every read of it confined
-/// here, SwiftUI's observation graph stops at this struct: the transcript
-/// (`ChatMessageListView` / `MessageBubble`) and the conversation list
-/// (`ChatShellConversationRow`) are siblings whose inputs did not change, so
-/// their bodies are not re-run and `ChatMessage.==` is not called.
-///
-/// Everything else — slash menu, voice draft, Stop/Steer, drag-drop, Tab focus
-/// — is the same code, moved, with the focus state still owned by `ChatView`
-/// (passed as a `@FocusState` binding) so `focusComposer` and the keyboard
-/// reach of the receipts rail keep working.
+/// Draft reads stay inside the composer so keystrokes leave transcript and
+/// conversation rows untouched; `ChatView` owns focus and keyboard reach.
 struct ChatComposerInput: View {
     let draft: ChatComposerDraft
     let placeholder: String
@@ -31,9 +16,7 @@ struct ChatComposerInput: View {
     /// "To: <agent>" before the field (Simple view); nil hides it.
     var recipient: String? = nil
     let voiceInput: VoiceInputCapture
-    let capabilitiesStore: ToolsFacade
-    /// The conversation dictation started in, and the one on screen. Speech may
-    /// only write into the composer it started in (2026-09-06).
+    /// Speech may only write into the conversation's composer where dictation started.
     let voiceSessionId: String
     let activeSessionId: String
     let screenCaptureAllowed: Bool
@@ -72,11 +55,11 @@ struct ChatComposerInput: View {
             && (ChatTranscriptPresentation.hasVisibleText(draft.text) || hasPendingAttachments)
     }
 
-    private var slashCommands: [SlashCommandMenu.SlashCmd] {
-        SlashCommandMenu.commands(filter: slashFilter, extraTools: capabilitiesStore.slashTools)
+    private var slashCommands: [ChatSlashCommandDescriptor] {
+        SlashCommandMenu.commands(filter: slashFilter)
     }
 
-    private var selectedSlashCommand: SlashCommandMenu.SlashCmd? {
+    private var selectedSlashCommand: ChatSlashCommandDescriptor? {
         slashCommands.first { $0.id == selectedSlashCommandID } ?? slashCommands.first
     }
 
@@ -158,16 +141,15 @@ struct ChatComposerInput: View {
                     inputFocused = false
                     return true
                 },
-                suggestionKey: handleSlashKey
+                suggestionKey: handleSlashKey,
+                onPaste: onDrop
             )
             .foregroundStyle(voiceInput.isListening ? .secondary : .primary)
             .italic(voiceInput.isListening)
             .onSubmit { if canSend { onSend() } }
-            .onPasteCommand(of: ChatComposerSupport.attachmentContentTypes, perform: onDrop)
-            .background(ChatAttachmentPasteHandler(isFocused: isActive && inputFocused, onPaste: onDrop))
+            .onPasteCommand(of: ChatAttachmentTypeResolver.attachmentContentTypes, perform: onDrop)
             .onChange(of: voiceInput.transcript) { _, newVal in
-                // Only the conversation that started dictating may be written
-                // to (2026-09-06).
+                // Dictation stays bound to its starting conversation.
                 guard voiceSessionId == activeSessionId else { return }
                 if ChatTranscriptPresentation.hasVisibleText(newVal) {
                     composeVoiceDraft(newVal)
@@ -179,11 +161,9 @@ struct ChatComposerInput: View {
                     let hasArgsAlready = afterSlash.rangeOfCharacter(from: .whitespacesAndNewlines) != nil
                     let firstToken = afterSlash.components(separatedBy: .whitespacesAndNewlines).first ?? afterSlash
                     let lowerToken = firstToken.lowercased()
-                    let dynamicCommandNames = capabilitiesStore.slashCommandNames
                     let prefixMatch = !hasArgsAlready && (
                         lowerToken.isEmpty
                         || ChatSlashCommandRegistry.commandNames.contains { $0.hasPrefix(lowerToken) }
-                        || dynamicCommandNames.contains { $0.hasPrefix(lowerToken) }
                     )
                     if prefixMatch {
                         slashFilter = afterSlash
@@ -198,20 +178,17 @@ struct ChatComposerInput: View {
                     slashFilter = ""
                 }
             }
-            // Drawn in the window, not a popover: a macOS popover takes key
-            // focus, so typing stopped the moment the menu appeared (User
-            // 09-27). The field keeps the keyboard; the list filters as you
-            // type and still takes a click.
+            // An in-window overlay keeps keyboard focus in the field while the menu filters.
             .overlay(alignment: .topLeading) {
                 if showSlashMenu {
                     SlashCommandMenu(filter: slashFilter, selectedCommand: selectedSlashCommand?.id,
                                      onSelect: selectSlashCommand, onDismiss: {
                         showSlashMenu = false
-                    }, extraTools: capabilitiesStore.slashTools)
+                    })
                     .fixedSize()
                     .houseSurface(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { slashMenuHeight = $0 }
-                    // Above the box, clear of the draft (User 09-27, like Claude Code).
+                    // Keep the menu above the box, clear of the draft.
                     .offset(y: -(slashMenuHeight + 22))
                     .zIndex(10)
                 }

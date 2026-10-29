@@ -18,9 +18,13 @@ extension ChatStore {
     func applyMacTranscriptRead(_ read: MacTranscriptRead, sessionID: String?) {
         guard Self.cleanSessionID(sessionID) == Self.cleanSessionID(selectedSessionID ?? mainSessionID),
               case .published(let rows, _) = read else { return }
-        for run in liveTurnBubbles.keys where rows.contains(where: {
-            $0.runId == run && ($0.isTerminalReply || $0.completionState == "failed")
-        }) { liveTurnBubbles.removeValue(forKey: run) }
-        _ = resolvePendingReplyFromMac(rows)
+        let publishedIDs = pendingICloudPlaceholders.isEmpty && timedOutPendingIds.isEmpty ? [] : macPublishedMessageIDs
+        var repliesByRun: [String: ChatMessage] = [:]
+        for row in rows where row.isTerminalReply {
+            guard let run = row.runId else { continue }
+            liveTurnBubbles.removeValue(forKey: run)
+            if publishedIDs.contains(row.id) { repliesByRun[run] = row }
+        }
+        resolvePendingReplyFromMac(repliesByRun)
     }
 }

@@ -1,7 +1,9 @@
 import Foundation
+import NativeAgentShared
 import AppKit
 import ChromeControl
 import Browser
+import Dispatcher
 import ChatTurnRuntime
 import ChatTurnContracts
 import AgentWorkspace
@@ -16,7 +18,7 @@ import ToolRegistry
 import Senses
 import SQLite3
 import TrustCenter
-// Blueprint: | `AppToolExecutor+Browser.swift` | `AppToolExecutor`: `runBrowserTool`, `freshChromePage`, `chromeFollowUpAllowed`, `runChromeHistory`; history reads a private SQLite copy of Chrome's Default profile under Full Mac/file-read authority, with bounded rows and query deadline; `RetainedBrowserRead` keeps the visible read's full capture and receipt beside its rejected view; scroll readback carries the tab-bound viewport observation, with no timed delta retries |
+// Blueprint: | `AppToolExecutor+Browser.swift` | `AppToolExecutor`: `runBrowserTool`, `freshChromePage`, `chromeFollowUpAllowed`, `runChromeHistory`; Chrome internal reads return one text line with read_mode none; chrome.look and DOM-inaccessible Chrome/PDF snapshot reads deliver the owned tab's bounded picture through the shared file-reader image slot, with source dimensions, explicit picture mode and raw Chrome provenance; PDF snapshots retain the unverified independent HTTP transcript beside the verified picture in one receipt; action readback preserves non-DOM receipts; history reads a private SQLite copy of Chrome's Default profile under Full Mac/file-read authority, with bounded rows and query deadline; `RetainedBrowserRead` keeps the visible read's full capture and receipt beside its rejected view; scroll readback carries the tab-bound viewport observation, with no timed delta retries |
 
 /// The browser family: Chrome through the extension, and the visible
 /// NativeAgent browser. Every page act rereads the page on the same tab and
@@ -24,10 +26,12 @@ import TrustCenter
 extension AppToolExecutor {
     @MainActor
     func runChromeHistory(input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        guard let mode = Self.inputString(input["mode"]), ["top_domains", "search", "recent"].contains(mode) else {
-            return Self.failure("invalid_mode", "mode must be top_domains, search or recent.")
+        // No mode asked is the plain read: recent pages (drive wave 10-28).
+        let mode = input["mode"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "recent"
+        guard ["top_domains", "search", "recent"].contains(mode) else {
+            return Self.failure("invalid_mode", "mode must be top_domains, search or recent (recent when omitted).")
         }
-        let query = Self.inputString(input["query"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let query = input["query"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if mode == "search", query.isEmpty { return Self.failure("missing_query", "search requires nonempty query text to match titles or URLs.") }
         var since: Date?
         if let value = input["since"] {
@@ -49,7 +53,7 @@ extension AppToolExecutor {
         let envelope = await securityCenter.evaluateTool(tool: "read_file", input: ["path": .string(source.path)],
             origin: origin, enforceAutonomy: enforceAutonomySecurity)
         try await securityCenter.record(envelope)
-        let admission = await securityCenter.fullMacYoloAuthority(tool: "mac_control", origin: origin)
+        let admission = await securityCenter.fullMacYoloAuthority(origin: origin)
         guard admission.admitted, envelope.fullMacYoloAuthority == .admitted,
               envelope.decision != .block, !envelope.requiresApproval else {
             return Self.failure("history_read_denied", "Chrome history requires admitted Full Mac and file-read permission. Check Trust and file access at the Mac; no history was read and no card was raised.")
@@ -162,7 +166,7 @@ extension AppToolExecutor {
         }.value
     }
 
-    /// Page actions whose result carries the fresh page (Phase 3).
+    /// Page actions whose result carries the fresh page.
     private static let chromePageActions: Set<String> = [
         "browser.chrome_navigate", "browser.chrome_click", "browser.chrome_fill", "browser.chrome_type",
         "browser.chrome_select", "browser.chrome_keypress", "browser.chrome_set_checked",
@@ -175,18 +179,21 @@ extension AppToolExecutor {
 
     public func runBrowserTool(actionId: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
         let dryRun = Self.inputBool(input["dryRun"] ?? input["dry_run"], default: false)
+        let fields: ChromeFields?
+        if ["browser.chrome_fill", "browser.chrome_navigate"].contains(actionId) { fields = try Self.chromeFields(input) }
+        else { fields = nil }
         // The browser's own back/forward chords are history, not page keys.
         if actionId == "browser.chrome_keypress",
-           let history = ["Meta+[": "back", "BrowserBack": "back", "Meta+]": "forward", "BrowserForward": "forward"][Self.inputString(input["key"]) ?? ""],
+           let history = ["Meta+[": "back", "BrowserBack": "back", "Meta+]": "forward", "BrowserForward": "forward"][input["key"]?.scalarText ?? ""],
            await chromeFollowUpAllowed("browser.chrome_navigate", surface: surface) {
             var go: [String: JSONValue] = ["url": .string(history)]
             for key in ["tab_id", "dryRun", "dry_run", "expected_user_sequence"] { go[key] = input[key] }
             return try await runBrowserTool(actionId: "browser.chrome_navigate", input: go, surface: surface)
         }
-        // 09-24: a key pressed at no row. Page keys mean "move the page": that
+        // Page keys mean "move the page": that
         // is a scroll (verified by how far it moved); any other key needs a row.
-        if actionId == "browser.chrome_keypress", (Self.inputString(input["node_id"]) ?? "").isEmpty {
-            let key = Self.inputString(input["key"]) ?? ""
+        if actionId == "browser.chrome_keypress", (input["node_id"]?.scalarText ?? "").isEmpty {
+            let key = input["key"]?.scalarText ?? ""
             let steps: [String: Int] = ["PageDown": 1_200, "Space": 1_200, " ": 1_200, "PageUp": -1_200, "ArrowDown": 120, "ArrowUp": -120]
             guard let delta = steps[key], await chromeFollowUpAllowed("browser.chrome_scroll", surface: surface) else {
                 return .object(["ok": .bool(false), "error": .string("key_needs_row"),
@@ -199,18 +206,14 @@ extension AppToolExecutor {
         }
         let origin = AppChatToolDispatcher.securityOrigin(surface: surface)
         func run(_ id: String, _ input: [String: JSONValue]) async throws -> JSONValue {
-            let result = try await ChromeControlInvocationContext.$origin.withValue(origin) {
-                try await ChromeControlInvocationContext.$tool.withValue(id) {
-                    try await browserActionRunner(id, dryRun, input)
-                }
+            return try await ChromeControlInvocationContext.$origin.withValue(origin) {
+                try await browserActionRunner(id, dryRun, input)
             }
-            let read = id == "browser.chrome_snapshot" && !dryRun ? try await ChromePageText.readDocument(result) : result
-            return read
         }
         // Direct calls include the fresh page; workspace calls keep structured results.
         let direct = !dryRun && MacLookFrameStore.source != "workspace"
         var input = input
-        if actionId == "browser.chrome_snapshot", let more = Self.inputString(input["more"]), more.hasPrefix("site:") {
+        if actionId == "browser.chrome_snapshot", let more = input["more"]?.scalarText, more.hasPrefix("site:") {
             let scope = ChatToolSessionContext.verifiedSessionId ?? ""
             let grown = SenseDoorViews.shared.latest.reversed().first {
                 $0.scope == scope && $0.record.language != .native && $0.page.more == more
@@ -234,17 +237,17 @@ extension AppToolExecutor {
                 input["max_nodes"] = .int(150)
             }
         }
-        // 09-24: a row by its label, a missing snapshot_id, option labels —
+        // A row by its label, a missing snapshot_id, option labels —
         // from the last page read on this tab; a form in one call (fields).
-        if let refusal = Self.resolveChromeTarget(actionId, &input) { return refusal }
-        if !dryRun, ["browser.chrome_fill", "browser.chrome_navigate"].contains(actionId), let fields = Self.chromeFields(input) {
+        if let refusal = resolveChromeTarget(actionId, &input) { return refusal }
+        if !dryRun, let fields {
             return try await runChromeFieldsCall(actionId: actionId, input: input, fields: fields, direct: direct, surface: surface, run: run)
         }
         // A keypress is judged by what it did: the page it acted on, as read.
         // and a scroll shows only the rows it brought into view.
-        let lastRead = ChromePageMirror.page(tab: Self.chromeTabID(input["tab_id"]), session: ChatToolSessionContext.verifiedSessionId)
+        let lastRead = ChromePageMirror.page(tab: Self.chromeTabID(input["tab_id"]), dataRoot: securityCenter.dataRoot, session: ChatToolSessionContext.verifiedSessionId)
         let before = ["browser.chrome_keypress", "browser.chrome_click", "browser.chrome_double_click"].contains(actionId)
-            ? lastRead.flatMap { $0.snapshotID == Self.inputString(input["snapshot_id"]) ? $0 : nil }
+            ? lastRead.flatMap { $0.snapshotID == input["snapshot_id"]?.scalarText ? $0 : nil }
             : actionId == "browser.chrome_scroll" ? lastRead : nil
         let visibleRead = !dryRun && ["browser.read_text", "browser.read_links"].contains(actionId)
             ? RetainedBrowserRead() : nil
@@ -254,31 +257,28 @@ extension AppToolExecutor {
             { @Sendable capture in retained.remember(capture) }
         }) { try await run(actionId, input) }
         let projection = ChromePageText.project(result)
-        Self.mirrorChromePage(result, projection: projection, closedBy: actionId, input: input)
+        mirrorChromePage(result, projection: projection, closedBy: actionId)
         guard case .object(var obj) = result else {
             return result
         }
+        if let mode = obj["read_mode"]?.scalarText, ["picture", "none"].contains(mode) { return result }
         if direct, actionId == "browser.chrome_snapshot", let page = projection.text {
             return try await browserSenseRead(snapshot: result, raw: .string(page), input: input, projection: projection)
         }
         if direct, Self.chromePageActions.contains(actionId), case .object(let receipt)? = obj["receipt"],
            case .int(let tab)? = receipt["tabId"] {
-            var latestSnapshot: JSONValue?
-            func readRun(_ id: String, _ args: [String: JSONValue]) async throws -> JSONValue {
-                if id == "browser.chrome_snapshot" { latestSnapshot = nil }
-                let result = try await run(id, args)
-                if id == "browser.chrome_snapshot" { latestSnapshot = result }
-                return result
-            }
-            var page = await freshChromePage(after: actionId, tab: tab,
+            let fresh = await freshChromePage(after: actionId, tab: tab,
                 sequence: receipt["userSequence"], input: input, surface: surface,
-                scrollCursor: actionId == "browser.chrome_scroll" ? obj["readCursor"] : nil, run: readRun)
+                navigationVerified: actionId == "browser.chrome_navigate"
+                    && receipt["outcome"] == .string("succeeded") && receipt["verification"] == .string("verified"),
+                scrollCursor: actionId == "browser.chrome_scroll" ? obj["readCursor"] : nil, run: run)
+            var page = fresh.text
             if actionId == "browser.chrome_scroll", let before {
                 // Text already read is not proof that the viewport stayed the
                 // same. The page compares the exact scrolled viewport during
                 // this read, including any load after the action's reply.
                 let viewportChanged: Bool?
-                if case .object(let snapshot)? = latestSnapshot,
+                if case .object(let snapshot)? = fresh.snapshot,
                    case .object(let reading)? = snapshot["reading"],
                    case .bool(let changed)? = reading["viewportChanged"] {
                     viewportChanged = changed
@@ -290,8 +290,10 @@ extension AppToolExecutor {
             // Verification compares the original page. Senses change only the
             // view returned to her, after those comparisons have been made.
             let displayed: JSONValue
-            if let latestSnapshot {
-                displayed = try await browserSenseRead(snapshot: latestSnapshot, raw: .string(page), input: input)
+            if case .object(let read)? = fresh.snapshot, let mode = read["read_mode"]?.scalarText, ["picture", "none"].contains(mode) {
+                displayed = .object(read)
+            } else if let snapshot = fresh.snapshot {
+                displayed = try await browserSenseRead(snapshot: snapshot, raw: .string(page), input: input, projection: fresh.projection)
             } else {
                 displayed = SenseDoor.signedRaw(.string(page), line: "raw view · builtin-chrome · action readback unavailable")
             }
@@ -329,15 +331,18 @@ extension AppToolExecutor {
     }
 
     /// The slim page after an act, read on the same tab.
-    public func freshChromePage(
+    func freshChromePage(
         after actionId: String, tab: Int64, sequence: JSONValue?, input: [String: JSONValue], surface: String,
+        navigationVerified: Bool = false,
         scrollCursor: JSONValue? = nil,
         run: (String, [String: JSONValue]) async throws -> JSONValue
-    ) async -> String {
+    ) async -> (snapshot: JSONValue?, text: String, projection: ChromePageText.VisiblePageText?) {
         let followUp = await chromeFollowUpCheck("browser.chrome_snapshot", surface: surface)
-        if let stop = followUp.stop { return "No page attached: " + stop }
-        if Self.chromeMayNavigate.contains(actionId),
+        if let stop = followUp.stop { return (nil, "No page attached: " + stop, nil) }
+        if !navigationVerified, Self.chromeMayNavigate.contains(actionId),
            await chromeFollowUpAllowed("browser.chrome_wait", surface: surface) {
+            // Verified navigation already observed completion. Other acts
+            // can start a load after their reply, so retain that observation.
             // Twice at most: a quiet window can close before a slow load starts.
             // The read itself waits for the load and says when it had not finished.
             for _ in 0..<2 {
@@ -350,43 +355,39 @@ extension AppToolExecutor {
         }
         do {
             // Read the page's semantic content by default, or the named scope.
-            let scope = Self.inputString(input["scope"])
+            let scope = input["scope"]?.scalarText
             var read: [String: JSONValue] = ["tab_id": .int(tab), "max_nodes": .int(150),
                 "scope": .string(scope == "page" ? "page" : "main_content")]
             if actionId == "browser.chrome_scroll" {
                 guard let scrollCursor, case .object(let cursor) = scrollCursor,
                       case .string? = cursor["viewportObservationId"] else {
-                    return "The scroll viewport could not be read: the action supplied no viewport address. Call browser.chrome_snapshot."
+                    return (nil, "The scroll viewport could not be read: the action supplied no viewport address. Call browser.chrome_snapshot.", nil)
                 }
                 read["more"] = .string(try scrollCursor.serialize(pretty: false))
             }
-            func readPage() async throws -> JSONValue {
-                try await run("browser.chrome_snapshot", read)
-            }
-            var snapshot = try await readPage()
-            // 09-24 (X profile): a first read that is only a spinner waits for
-            // real content, 3 s at most.
-            for _ in 0..<4 where actionId != "browser.chrome_scroll" && Self.chromeStillLoading(snapshot)
-                && !ChromePageText.loadUnfinished(snapshot) {
-                try? await Task.sleep(nanoseconds: 750_000_000)
-                snapshot = try await readPage()
-            }
+            let snapshot = try await run("browser.chrome_snapshot", read)
             let projection = ChromePageText.project(snapshot)
-            Self.mirrorChromePage(snapshot, projection: projection)
-            guard let page = projection.text else {
-                return "The fresh page could not be read. Call browser.chrome_snapshot."
+            if case .object(let read) = snapshot {
+                if read["read_mode"] == .string("none"), let text = read["text"]?.scalarText { return (snapshot, text, projection) }
+                if read["read_mode"] == .string("picture") {
+                    return (snapshot, read["note"]?.scalarText ?? "This page is read as a picture; no DOM text is available.", projection)
+                }
             }
-            return page
+            mirrorChromePage(snapshot, projection: projection)
+            guard let page = projection.text else {
+                return (snapshot, "The fresh page could not be read. Call browser.chrome_snapshot.", projection)
+            }
+            return (snapshot, page, projection)
         } catch {
-            return "The fresh page could not be read (" + ChromePageText.safe(error.localizedDescription)
-                + "). Call browser.chrome_snapshot."
+            return (nil, "The fresh page could not be read (" + ChromePageText.safe(error.localizedDescription)
+                + "). Call browser.chrome_snapshot.", nil)
         }
     }
 
     private func browserSenseRead(snapshot: JSONValue, raw: JSONValue, input: [String: JSONValue],
                                   actionID: String = "browser.chrome_snapshot",
                                   visibleCapture: BrowserVisibleCapture? = nil,
-                                  projection: ChromePageText.Projection? = nil) async throws -> JSONValue {
+                                  projection: ChromePageText.VisiblePageText? = nil) async throws -> JSONValue {
         guard case .object(let fields) = snapshot else {
             return SenseDoor.signedRaw(raw, line: "raw view · \(actionID) · snapshot unavailable")
         }
@@ -406,14 +407,14 @@ extension AppToolExecutor {
             if case .object(let original) = raw, original["nodes"] != nil, case .object(let fields) = receipt {
                 servedRaw = .object(original.merging(fields) { _, new in new })
             } else { servedRaw = receipt }
-            if output["document"] != nil {
+            if case .object(let document)? = output["document"], document["kind"] == .string("pdf") {
                 return SenseDoor.signedRaw(servedRaw, line: "raw view · builtin-document · independent HTTP PDF read; unverified against Chrome")
             }
             if case .object(let receiptFields) = receipt, receiptFields["ok"] == .bool(false) {
                 return SenseDoor.signedRaw(servedRaw, line: "raw view · builtin-chrome · no readable content in this window")
             }
         }
-        let url = Self.inputString(output["url"])
+        let url = output["url"]?.scalarText
         let host = url.flatMap { URL(string: $0)?.host?.lowercased() }
         guard host != nil else {
             return SenseDoor.signedRaw(raw, line: "raw view · \(actionID) · snapshot has no site host")
@@ -468,18 +469,17 @@ extension AppToolExecutor {
             tool: tool, input: [:], origin: AppChatToolDispatcher.securityOrigin(surface: surface),
             enforceAutonomy: enforceAutonomy ?? enforceAutonomySecurity)
         try? await securityCenter.record(envelope)
-        let autonomy = enforceAutonomy == true ? AutonomyGate.map(level: envelope.autonomyLevel, toolName: tool) : .allow
-        let autonomyBlocked: String? = if case .deny(let reason) = autonomy { envelope.autonomyReason ?? reason } else { nil }
-        let autonomyApproval: String? = if case .requireApproval(let reason) = autonomy { envelope.autonomyReason ?? reason } else { nil }
-        if envelope.decision == .block || autonomyBlocked != nil {
-            let cause = envelope.decision == .block ? envelope.primaryReason : autonomyBlocked ?? envelope.primaryReason
+        if envelope.decision == .block {
+            let cause = envelope.primaryReason
             let instruction = "Ask the owner to review this block in Trust; no follow-up ran."
             let stop = "browser_follow_up_blocked: \(cause) \(instruction)"
             return (stop, Self.failure("browser_follow_up_blocked", cause, extra: ["remedy": envelope.remedy
                 ?? Repair.why(owner: tool, tap: "Trust", instruction: instruction)]))
         }
-        if envelope.requiresApproval || autonomyApproval != nil {
-            let cause = autonomyApproval ?? envelope.primaryReason
+        if envelope.requiresApproval {
+            // Explicit autonomy enforcement presents its cause before any origin cause.
+            let cause = (enforceAutonomy == true ? envelope.reasons.first(where: { $0.kind == .cause })?.sentence : nil)
+                ?? envelope.primaryReason
             let instruction = "Call \(tool) explicitly to request approval; no follow-up ran."
             return ("browser_follow_up_approval_required: \(cause) \(instruction)",
                 Self.doorRefusal("browser_follow_up_approval_required", cause,
@@ -579,27 +579,30 @@ extension AppToolExecutor {
         }
         let explicitClose = actionId == "browser.chrome_close_tab"
         let effect: ChromeControlEffect
-        let requestPayload: [String: JSONValue]
+        let payload: [String: JSONValue]
         do {
-            (effect, requestPayload) = try chromeControlRequest(actionId: actionId, input: input, macPersonAway: macPersonAway)
+            (effect, payload) = try chromeControlRequest(actionId: actionId, input: input, macPersonAway: macPersonAway)
         } catch {
             guard explicitClose, case .object(var failure) = ChatToolOutcome.failure(error: error, tool: actionId) else { throw error }
             failure["effects"] = .string("none")
             failure["provenance"] = .string("raw view · Chrome explicit tab ownership control; no page was served")
             return .object(failure)
         }
-        var payload = requestPayload
-        // Missing optional proof may use this chat's observed sequence. An
-        // explicit invalid value remains invalid; never repair a supplied proof.
-        if (input["expected_user_sequence"] == nil || input["expected_user_sequence"] == .null),
-           payload["expectedUserSequence"] != nil {
-            payload.removeValue(forKey: "expectedUserSequence")
-        }
         do {
             let response = try await chrome().performInConversation(
                 effect, payload: payload, verifiedSessionID: ChatToolSessionContext.verifiedSessionId)
             guard case .object(let object) = response,
                   let result = object["result"] else { throw ChromeControlRuntimeError.invalidResponse }
+            if effect == .look {
+                return try chromeReadResult(result, actionId: actionId)
+            }
+            if effect == .snapshot, case .object(let capture) = result {
+                let mode: JSONValue? = if case .object(let reading)? = capture["reading"] { reading["mode"] } else { nil }
+                if capture["format"] == .string("jpeg") || mode == .string("none") {
+                    let read = try await ChromePageText.readDocument(result)
+                    return try chromeReadResult(read, actionId: actionId)
+                }
+            }
             // Admit the extension's actual action receipt as a motor consequence.
             if let model = chromeReceiptMotorActionReadModel(result) {
                 await motorActionObserver(model)
@@ -617,13 +620,56 @@ extension AppToolExecutor {
                 return .object(failure)
             }
             // A page read can fail after dispatch without changing the page.
-            guard effect == .snapshot || effect == .wait else { throw error }
+            guard effect == .snapshot || effect == .look || effect == .wait else { throw error }
             if case ChromeControlRuntimeError.outcomeUnknown = error { throw error }
             guard case .object(var failure) = ChatToolOutcome.failure(error: error, tool: actionId) else { throw error }
             failure["effects"] = .string("none")
             failure["provenance"] = .string("raw view · Chrome native messaging read reply; no page was served")
-            return .object(failure)
+            return effect == .look
+                ? SenseDoor.signedRaw(.object(failure), line: "raw view · builtin-chrome · no picture was served")
+                : .object(failure)
         }
+    }
+
+    private static func chromeReadResult(_ result: JSONValue, actionId: String) throws -> JSONValue {
+        if case .object(let capture) = result, case .object(let reading)? = capture["reading"], reading["mode"] == .string("none") {
+            guard case .int(let tab)? = capture["tabId"], tab >= 0, reading["domAccessible"] == .bool(false),
+                  case .string(let reason)? = reading["reason"], case .string(let url)? = capture["url"],
+                  case .string(let title)? = capture["title"] else { throw ChromeControlRuntimeError.invalidResponse }
+            let line = [title, url, reason].filter { !$0.isEmpty }.map(ChromePageText.safe).joined(separator: " — ")
+            return SenseDoor.signedRaw(.object(["ok": .bool(true), "status": .string("completed"),
+                "tool": .string(actionId), "read_mode": .string("none"), "reading": .object(reading),
+                "text": .string(line), "url": .string(url), "title": .string(title), "tab_id": .int(tab),
+                "user_sequence": capture["userSequence"] ?? .null, "effect": .string("read"), "read_only": .bool(true)]),
+                line: "raw view · builtin-chrome · internal page has no reader")
+        }
+        guard case .object(let capture) = result,
+              case .int(let tab)? = capture["tabId"], tab >= 0,
+              capture["format"] == .string("jpeg"),
+              case .string(let base64)? = capture["data"],
+              let data = Data(base64Encoded: base64) else { throw ChromeControlRuntimeError.invalidResponse }
+        let name = "chrome-tab-\(tab)-\(NativeTimestampFormat.plainZulu(Date())).jpg"
+        let delivered = VerifiedImageRead.deliver(data: data, name: name)
+        guard case .object(var fields) = delivered else { throw ChromeControlRuntimeError.invalidResponse }
+        fields["tool"] = .string(actionId)
+        fields["read_mode"] = .string("picture")
+        fields["reading"] = capture["reading"]
+        fields["effect"] = .string("read")
+        fields["read_only"] = .bool(true)
+        fields["tab_id"] = .int(tab)
+        fields["url"] = capture["url"]
+        fields["title"] = capture["title"]
+        fields["user_sequence"] = capture["userSequence"]
+        if case .object(let document)? = capture["document"], document["kind"] == .string("pdf") {
+            fields["document"] = .object(document.filter { $0.key != "text" })
+            fields["text"] = ChromePageText.project(result).text.map(JSONValue.string)
+            fields["chrome_view_verified"] = .bool(fields["status"] == .string("ok"))
+        }
+        if fields["status"] == .string("ok") {
+            let reason: String = if case .object(let reading)? = capture["reading"], case .string(let reason)? = reading["reason"] { reason + " " } else { "" }
+            fields["note"] = .string(reason + "Actual image follows this tool result: your tab as Chrome renders it now; not a text description.")
+        }
+        return SenseDoor.signedRaw(.object(fields), line: "raw view · builtin-chrome · owned tab picture")
     }
 
     /// Pure provider-input boundary; optional empty strings mean omitted, not
@@ -638,7 +684,7 @@ extension AppToolExecutor {
         func string(_ key: String) -> String? {
             // Visible row numbers are resolved from the served page before
             // this boundary. A bare number is never an internal node identity.
-            return inputString(input[key])
+            return input[key]?.scalarText
         }
         func integer(_ key: String) -> Int? {
             switch input[key] {
@@ -655,13 +701,9 @@ extension AppToolExecutor {
             if let seconds = input["seconds"], seconds != .null { payload["seconds"] = seconds }
         case "browser.chrome_close_tab":
             effect = .closeTab
-            if let sequence = input["expected_user_sequence"], sequence != .null { payload["expectedUserSequence"] = sequence }
         case "browser.chrome_navigate":
             effect = .navigate
-            payload = [
-                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
-                "url": .string(string("url") ?? ""),
-            ]
+            payload["url"] = .string(string("url") ?? "")
         case "browser.chrome_snapshot":
             effect = .snapshot
             // Explicit limits remain capped. Omitted limits use this tab's
@@ -672,33 +714,20 @@ extension AppToolExecutor {
             if let value = string("scope") { payload["scope"] = .string(value) }
             if let value = string("more") {
                 guard case .object(let cursor) = try JSONValue.parse(Data(value.utf8)) else {
-                    throw SenseFailure(code: "invalid_address", message: "Chrome more must be the supplied structural continuation.")
+                    throw SenseFailure(code: "invalid_address", message: "Chrome more must be the supplied page-position continuation.")
                 }
                 payload["readCursor"] = .object(cursor)
             }
+        case "browser.chrome_look":
+            effect = .look
         case "browser.chrome_click":
             effect = .click
-            payload = [
-                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
-                "snapshotId": .string(string("snapshot_id") ?? ""),
-                "nodeId": .string(string("node_id") ?? ""),
-            ]
         case "browser.chrome_fill":
             effect = .fill
-            payload = [
-                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
-                "snapshotId": .string(string("snapshot_id") ?? ""),
-                "nodeId": .string(string("node_id") ?? ""),
-                "value": .string(string("value") ?? ""),
-            ]
+            payload["value"] = .string(string("value") ?? "")
         case "browser.chrome_type":
             effect = .type
-            payload = [
-                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
-                "snapshotId": .string(string("snapshot_id") ?? ""),
-                "nodeId": .string(string("node_id") ?? ""),
-                "text": .string(string("text") ?? ""),
-            ]
+            payload["text"] = .string(string("text") ?? "")
             if let value = integer("delay_ms") { payload["delayMs"] = .int(Int64(value)) }
         case "browser.chrome_select":
             effect = .select
@@ -706,62 +735,32 @@ extension AppToolExecutor {
                   values.allSatisfy({ if case .string = $0 { return true }; return false }) else {
                 throw ChromeControlRuntimeError.invalidResponse
             }
-            payload = [
-                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
-                "snapshotId": .string(string("snapshot_id") ?? ""),
-                "nodeId": .string(string("node_id") ?? ""),
-                "values": .array(values),
-            ]
+            payload["values"] = .array(values)
         case "browser.chrome_keypress":
             effect = .keypress
-            payload = [
-                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
-                "snapshotId": .string(string("snapshot_id") ?? ""),
-                "nodeId": .string(string("node_id") ?? ""),
-                "key": .string(string("key") ?? ""),
-            ]
+            payload["key"] = .string(string("key") ?? "")
         case "browser.chrome_set_checked":
             effect = .setChecked
-            payload = [
-                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
-                "snapshotId": .string(string("snapshot_id") ?? ""),
-                "nodeId": .string(string("node_id") ?? ""),
-                "checked": .bool(inputBool(input["checked"], default: false)),
-            ]
+            payload["checked"] = .bool(inputBool(input["checked"], default: false))
         case "browser.chrome_double_click":
             effect = .doubleClick
-            payload = [
-                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
-                "snapshotId": .string(string("snapshot_id") ?? ""),
-                "nodeId": .string(string("node_id") ?? ""),
-            ]
         case "browser.chrome_drag":
             effect = .drag
-            payload = [
-                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
-                "snapshotId": .string(string("snapshot_id") ?? ""),
-                "nodeId": .string(string("node_id") ?? ""),
-                "targetNodeId": .string(string("target_node_id") ?? ""),
-            ]
+            payload["targetNodeId"] = .string(string("target_node_id") ?? "")
         case "browser.chrome_wait":
             effect = .wait
-            payload = [
-                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
-                "condition": .string(string("condition") ?? ""),
-            ]
+            payload["condition"] = .string(string("condition") ?? "")
             if let value = string("snapshot_id") { payload["snapshotId"] = .string(value) }
             if let value = string("node_id") { payload["nodeId"] = .string(value) }
             if let value = string("state") { payload["state"] = .string(value) }
-            // 09-24: a long wait asked for is the longest one allowed, not a refusal.
+            // Requested waits are capped at the longest allowed duration.
             if let value = integer("timeout_ms") { payload["timeoutMs"] = .int(Int64(min(max(value, 100), 10_000))) }
             if let value = integer("settle_ms") { payload["settleMs"] = .int(Int64(min(max(value, 0), 2_000))) }
         case "browser.chrome_scroll":
             effect = .scroll
             payload = [
-                // 09-24 (User): a background tab renders for a scroll only while
-                // he is away — its debugging bar never shows while he works.
+                // A background scroll renders only while the person is away.
                 "renderHidden": .bool(macPersonAway()),
-                "expectedUserSequence": .int(Int64(integer("expected_user_sequence") ?? -1)),
                 "deltaX": .int(Int64(integer("delta_x") ?? 0)),
                 "deltaY": .int(Int64(integer("delta_y") ?? 0)),
             ]
@@ -776,12 +775,17 @@ extension AppToolExecutor {
         default:
             throw ChromeControlRuntimeError.invalidResponse
         }
+        if effect.rawValue.hasPrefix("page.element.") {
+            payload["snapshotId"] = .string(string("snapshot_id") ?? "")
+            payload["nodeId"] = .string(string("node_id") ?? "")
+        }
         if let supplied = input["tab_id"], supplied != .null {
             guard case .int(let id) = supplied, id >= 0 else {
                 throw SenseFailure(code: "invalid_tab", message: "tab_id must be the integer tab number from chrome.status. Nothing was sent.")
             }
             payload["tabId"] = .int(id)
         }
+        // Missing proof may bind to this chat's observation; supplied proof stays exact.
         if let sequence = input["expected_user_sequence"], sequence != .null {
             payload["expectedUserSequence"] = sequence
         }
@@ -815,17 +819,10 @@ extension AppToolExecutor {
         let verification: MotorVerificationState
         switch receipt["verification"] {
         case .string("verified"): verification = .satisfied
-        // 2026-09-06: `page_acknowledged` is the page saying it received the
-        // act, not anybody observing that it happened — the extension's own
-        // protocol keeps the two apart. A click on a control that ignored it
-        // acknowledges just as loudly, so this is evidence still owed
-        // (`.pending`), never verification satisfied.
+        // Page acknowledgement leaves verification pending until the effect is observed.
         case .string("page_acknowledged"): verification = .pending
         case .string("not_verified"):
-            // 2026-09-06: `not_quiet` is a navigation that was still moving
-            // when the wait's deadline arrived — evidence still OWED, not a
-            // checked negative. `.pending`, so the turn reads it as unfinished
-            // and looks again rather than concluding the page did not settle.
+            // A `not_quiet` deadline leaves navigation verification pending, not negatively verified.
             verification = outcome == "not_quiet" ? .pending : .unverified
         default: verification = .unknown
         }
@@ -858,24 +855,10 @@ extension AppToolExecutor {
     }
 
     private static func inputBool(_ raw: JSONValue?, default defaultValue: Bool) -> Bool {
-        switch raw {
-        case .bool(let b):
-            return b
-        case .string(let s):
-            switch s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-            case "1", "true", "yes", "y", "on":
-                return true
-            case "0", "false", "no", "n", "off":
-                return false
-            default:
-                return defaultValue
-            }
-        case .int(let i):
-            return i != 0
-        case .double(let d):
-            return d != 0
-        default:
-            return defaultValue
+        switch raw?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "y": return true
+        case "n": return false
+        default: return ConnectorInputValue.bool(raw, default: defaultValue)
         }
     }
 }

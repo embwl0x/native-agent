@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import PersistenceCore
 
 // Blueprint: | `ContextSourceMonitoring.swift` | `ContextSourceRegistry`, monitor and coalescer: explicit source allowlists, owner inventories and bounded directory invalidations |
@@ -8,23 +9,17 @@ public struct ContextSourceRegistration: Sendable, Equatable {
     public let fileURL: URL
     public let allowedRoot: URL
     public let maximumUTF8Bytes: Int
-    public let requiredPersonaDocument: RequiredPersonaDocumentKind?
-    public let personaID: ContextPersonaID?
 
     public init(
         descriptor: ContextSourceDescriptor,
         fileURL: URL,
         allowedRoot: URL,
-        maximumUTF8Bytes: Int = 1_048_576,
-        requiredPersonaDocument: RequiredPersonaDocumentKind? = nil,
-        personaID: ContextPersonaID? = nil
+        maximumUTF8Bytes: Int = 1_048_576
     ) {
         self.descriptor = descriptor
         self.fileURL = fileURL
         self.allowedRoot = allowedRoot
         self.maximumUTF8Bytes = max(1, maximumUTF8Bytes)
-        self.requiredPersonaDocument = requiredPersonaDocument
-        self.personaID = personaID
     }
 }
 
@@ -48,18 +43,6 @@ public actor ContextSourceRegistry {
 
     public func addAllowedRoot(_ root: URL) throws {
         allowedRoots.insert(try Self.canonicalFileURL(root))
-    }
-
-    public func register(_ registration: ContextSourceRegistration) throws {
-        let normalized = try normalizedRegistration(registration)
-        guard registrations[registration.descriptor.id] == nil else {
-            throw ContextSourceRegistryError.duplicateSource(registration.descriptor.id.rawValue)
-        }
-        registrations[registration.descriptor.id] = normalized
-    }
-
-    public func replace(_ registration: ContextSourceRegistration) throws {
-        registrations[registration.descriptor.id] = try normalizedRegistration(registration)
     }
 
     public func replaceOwned(
@@ -86,9 +69,8 @@ public actor ContextSourceRegistry {
         authoritativeOwners.insert(owner)
     }
 
-    /// Only `replaceOwned` declares a complete inventory. Ordinary individual
-    /// registrations must not retire unrelated stored or projected sources.
-    /// Empty inventories are retained so a removed owner's last source can be
+    /// `replaceOwned` declares each owner's complete inventory, including an
+    /// empty inventory so a removed owner's last source can be
     /// retired even when discovery starts against a persisted generation.
     public func authoritativeSourceIDsByOwner() -> [String: Set<ContextSourceID>] {
         var result = Dictionary(uniqueKeysWithValues: authoritativeOwners.map {
@@ -101,14 +83,6 @@ public actor ContextSourceRegistry {
         return result
     }
 
-    public func remove(_ sourceID: ContextSourceID) -> ContextSourceRegistration? {
-        registrations.removeValue(forKey: sourceID)
-    }
-
-    public func registration(for sourceID: ContextSourceID) -> ContextSourceRegistration? {
-        registrations[sourceID]
-    }
-
     public func allRegistrations() -> [ContextSourceRegistration] {
         registrations.values.sorted { $0.descriptor.id < $1.descriptor.id }
     }
@@ -118,9 +92,8 @@ public actor ContextSourceRegistry {
         return registrations.values
             .filter { registration in
                 let parent = registration.fileURL.deletingLastPathComponent()
-                return parent == canonicalDirectory
-                    || Self.isDescendant(parent, of: canonicalDirectory)
-                    || Self.isDescendant(canonicalDirectory, of: parent)
+                return NativeAgentWorkspaceRoot.relativePath(parent.path, under: canonicalDirectory.path) != nil
+                    || NativeAgentWorkspaceRoot.relativePath(canonicalDirectory.path, under: parent.path) != nil
             }
             .sorted { $0.descriptor.id < $1.descriptor.id }
     }
@@ -139,12 +112,8 @@ public actor ContextSourceRegistry {
         guard url.isFileURL else {
             throw ContextSourceRegistryError.nonFileURL(url.absoluteString)
         }
-        let standardized = url.standardizedFileURL
-        if FileManager.default.fileExists(atPath: standardized.path) {
-            return standardized.resolvingSymlinksInPath()
-        }
-        let resolvedParent = standardized.deletingLastPathComponent().resolvingSymlinksInPath()
-        return resolvedParent.appendingPathComponent(standardized.lastPathComponent).standardizedFileURL
+        return NativeAgentWorkspaceRoot.canonicalFileURL(url,
+            followFinalLink: FileManager.default.fileExists(atPath: url.standardizedFileURL.path))
     }
 
     private func normalizedRegistration(
@@ -155,7 +124,7 @@ public actor ContextSourceRegistry {
         guard allowedRoots.contains(declaredRoot) else {
             throw ContextSourceRegistryError.rootNotAllowed(declaredRoot.path)
         }
-        guard Self.isDescendant(source, of: declaredRoot) else {
+        guard NativeAgentWorkspaceRoot.relativePath(source.path, under: declaredRoot.path) != nil else {
             throw ContextSourceRegistryError.sourceOutsideRoot(
                 source: source.path,
                 root: declaredRoot.path
@@ -165,46 +134,24 @@ public actor ContextSourceRegistry {
             descriptor: registration.descriptor,
             fileURL: source,
             allowedRoot: declaredRoot,
-            maximumUTF8Bytes: registration.maximumUTF8Bytes,
-            requiredPersonaDocument: registration.requiredPersonaDocument,
-            personaID: registration.personaID
+            maximumUTF8Bytes: registration.maximumUTF8Bytes
         )
     }
-
-    private static func isDescendant(_ candidate: URL, of root: URL) -> Bool {
-        let candidateComponents = candidate.standardizedFileURL.pathComponents
-        let rootComponents = root.standardizedFileURL.pathComponents
-        guard candidateComponents.count >= rootComponents.count else { return false }
-        return Array(candidateComponents.prefix(rootComponents.count)) == rootComponents
-    }
-}
-
-public struct ContextDirectoryEvent: Sendable, Equatable {
-    public let directory: URL
-    public let rawFlags: UInt
-    public let observedAt: Date
-
-    public init(directory: URL, rawFlags: UInt, observedAt: Date = Date()) {
-        self.directory = directory
-        self.rawFlags = rawFlags
-        self.observedAt = observedAt
-    }
-
 }
 
 /// Process-owned directory watcher group. It emits only dirty-directory
 /// signals; the coordinator rereads registered canonical sources afterward.
 public actor ContextSourceMonitor {
-    public typealias EventHandler = @Sendable (ContextDirectoryEvent) async -> Void
+    public typealias DirectoryChangeSink = @Sendable (URL) async -> Void
 
-    private let handler: EventHandler
+    private let handler: DirectoryChangeSink
     private var watches: [URL: FileChangeWatcher] = [:]
-    private let events: AsyncStream<ContextDirectoryEvent>
-    private let continuation: AsyncStream<ContextDirectoryEvent>.Continuation
+    private let events: AsyncStream<URL>
+    private let continuation: AsyncStream<URL>.Continuation
     private var delivery: Task<Void, Never>?
     private var stopped = false
 
-    public init(handler: @escaping EventHandler) {
+    public init(handler: @escaping DirectoryChangeSink) {
         self.handler = handler
         (events, continuation) = AsyncStream.makeStream()
     }
@@ -213,20 +160,20 @@ public actor ContextSourceMonitor {
         guard !stopped else { return }
         if delivery == nil {
             delivery = Task { [events, handler] in
-                for await event in events {
+                for await directory in events {
                     guard !Task.isCancelled else { return }
-                    await handler(event)
+                    await handler(directory)
                 }
             }
         }
         let desired = Set(directories.map { $0.standardizedFileURL.resolvingSymlinksInPath() })
-        for (directory, watch) in watches where !desired.contains(directory) {
+        for (directory, watch) in Array(watches) where !desired.contains(directory) {
             watch.cancel()
             watches[directory] = nil
         }
         for directory in desired.sorted(by: { $0.path < $1.path }) where watches[directory] == nil {
-            watches[directory] = FileChangeWatcher(paths: [directory], eventHandler: { [continuation] path, flags in
-                continuation.yield(ContextDirectoryEvent(directory: path, rawFlags: flags.rawValue))
+            watches[directory] = FileChangeWatcher(paths: [directory], eventHandler: { [continuation] path, _ in
+                continuation.yield(path)
             })
         }
     }
@@ -249,10 +196,10 @@ public actor ContextSourceMonitor {
 
 /// Debounces bursts from atomic editor saves without adding a polling loop.
 public actor ContextSourceEventCoalescer {
-    public typealias FlushHandler = @Sendable (Set<URL>) async -> Void
+    public typealias DirtyDirectoriesSink = @Sendable (Set<URL>) async -> Void
 
     private let delay: Duration
-    private let handler: FlushHandler
+    private let handler: DirtyDirectoriesSink
     private var dirtyDirectories: Set<URL> = []
     private var timer = StoreReloadDebouncer.Timer()
     private var activeFlush: Task<Void, Never>?
@@ -260,14 +207,9 @@ public actor ContextSourceEventCoalescer {
 
     public init(
         delay: Duration = .milliseconds(150),
-        handler: @escaping FlushHandler
+        handler: @escaping DirtyDirectoriesSink
     ) {
-        let components = delay.components
-        let seconds = max(0, components.seconds)
-        let attoseconds = max(0, components.attoseconds)
-        let nanosFromSeconds = UInt64(clamping: seconds) * 1_000_000_000
-        let nanosFromAttoseconds = UInt64(clamping: attoseconds / 1_000_000_000)
-        self.delay = .nanoseconds(nanosFromSeconds &+ nanosFromAttoseconds)
+        self.delay = max(.zero, delay)
         self.handler = handler
     }
 

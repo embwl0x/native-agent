@@ -2,22 +2,15 @@ import AppToolRuntime
 import SwiftUI
 import NativeAgentShared
 import TrustCenter
-import NativeAgentShared
 
 // Blueprint: | `ShellRailPages.swift` | `ShellRailTab` and rail page wrappers: per-page remembered tab selection and canonical route-to-tab projection |
 
-// User, 2026-09-04: the rail pages that carry tabs. Which tab is open is
-// remembered per page, and a route to something that is now a tab (Telegram,
-// the knowledge graph, Mac integration, Dreams, Skills and tools) lands on
-// its page with that tab open — see `SidebarItem.shellHome(for:)` and
-// `ContentView.selectSidebarItem`.
+// Each page remembers its tab; routes to tabs select their owning page and tab.
 
 enum ShellRailTab {
     static func storageKey(_ item: SidebarItem) -> String { "shell.tab.\(item.rawValue)" }
 
-    /// Every rail page's tabs as the layout shows them, for ⌘K. A tab opens
-    /// by writing its key here before the page is selected, as a route to a
-    /// former page does.
+    /// Every rail page's visible tabs in layout order, for page routes and ⌘K.
     @MainActor static func all(_ layout: SurfaceLayout) -> [(page: SidebarItem, tabs: [ShellTab<String>])] {
         [(.memories, shown(.memories, MemoriesRailPage.tabs, layout)), (.personality, shown(.personality, PersonalityRailPage.tabs, layout)),
          (.trust, shown(.trust, TrustRailPage.tabs, layout)), (.connectors, shown(.connectors, ConnectorsRailPage.tabs, layout)),
@@ -36,9 +29,22 @@ extension View {
     /// whenever what it shows changes; a key the page maps itself (Trust's old
     /// "control") is left to it.
     @MainActor func keepsShownTab(_ page: SidebarItem, _ tabs: [ShellTab<String>], _ selection: Binding<String>, _ layout: SurfaceLayout) -> some View {
-        onChange(of: ShellRailTab.shown(page, tabs, layout).map(\.key), initial: true) { _, keys in
-            if let first = keys.first, !keys.contains(selection.wrappedValue), tabs.contains(where: { $0.key == selection.wrappedValue }) {
-                selection.wrappedValue = first
+        modifier(ShownRailTab(page: page, tabs: tabs, selection: selection, layout: layout))
+    }
+}
+
+private struct ShownRailTab: ViewModifier {
+    let page: SidebarItem
+    let tabs: [ShellTab<String>]
+    @Binding var selection: String
+    let layout: SurfaceLayout
+    @Environment(\.quietOffscreenRead) private var quietOffscreenRead
+
+    func body(content: Content) -> some View {
+        content.onChange(of: ShellRailTab.shown(page, tabs, layout).map(\.key), initial: true) { _, keys in
+            guard !quietOffscreenRead else { return }
+            if let first = keys.first, !keys.contains(selection), tabs.contains(where: { $0.key == selection }) {
+                selection = first
             }
         }
     }
@@ -87,7 +93,7 @@ struct MemoriesRailPage: View {
             Group {
                 switch key {
                 case "knowledge": KnowledgeGraphView()
-                default: MemoriesPageView(embedded: true)
+                default: MemoriesPageView()
                 }
             }
             // One sentence for both tabs, from the read the rail page's
@@ -149,12 +155,12 @@ struct TrustRailPage: View {
         ) { key in
             switch key {
             case "mac", TrustTab.macAndBrowser.rawValue:
-                MacIntegrationView(showsMacControl: true)
+                MacIntegrationView()
             default: TrustCenterView(tab: TrustTab(rawValue: key) ?? .access)
             }
         }
         .keepsShownTab(.trust, Self.tabs, $tab, appModel.engine.layout.layout)
-        .onAppear { if tab == TrustTab.macAndBrowser.rawValue { tab = "mac" } }
+        .liveOnAppear { if tab == TrustTab.macAndBrowser.rawValue { tab = "mac" } }
     }
 }
 
@@ -194,8 +200,7 @@ struct DiagnosticsRailPage: View {
 
     static var tabs: [ShellTab<String>] {
         DiagnosticsView.DiagnosticsMode.allCases.map { ShellTab(key: $0.rawValue, title: $0.title) }
-            // Skills and Tools are tabs here, not a segmented control
-            // under the tab row (the reviewer's catch, 2026-09-04).
+            // Skills and Tools share the Diagnostics tab row.
             + [ShellTab(key: "skills", title: "Skills"), ShellTab(key: "tools", title: "Tools")]
     }
 
@@ -217,8 +222,7 @@ struct DiagnosticsRailPage: View {
                     .alivePageLine(DiagnosticsView.headerLine(appModel), id: "diagnostics.line")
             default:
                 DiagnosticsView(
-                    initialMode: DiagnosticsView.DiagnosticsMode(rawValue: key) ?? .doctor,
-                    showsModePicker: false
+                    mode: DiagnosticsView.DiagnosticsMode(rawValue: key) ?? .doctor
                 )
             }
         }

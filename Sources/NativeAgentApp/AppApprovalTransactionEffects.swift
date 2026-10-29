@@ -13,36 +13,29 @@ import ChatTurnRuntime
 import ChatTurnContracts
 import TrustCenter
 import WorkshopExecution
-// Blueprint: | `AppApprovalTransactionEffects.swift` | `AppApprovalTransactionEffects` struct and `ApprovalTransactionCoordinator.app`: app-bound approval factory and live executor/platform bindings; `AppApprovalTransactionEffects` struct; `ApprovalTransactionCoordinator.app` |
+// Blueprint: | `AppApprovalTransactionEffects.swift` | `AppApprovalTransactionEffects` struct and `ApprovalExecution.app`: app-bound approval factory and live executor/platform bindings; `AppApprovalTransactionEffects` struct; `ApprovalExecution.app` |
 
-extension ApprovalTransactionCoordinator {
-    /// The approval coordinator over this app's effects, for one root.
-    static func app(dataRootOverride: URL? = nil) -> ApprovalTransactionCoordinator {
-        ApprovalTransactionCoordinator(
-            effects: AppApprovalTransactionEffects(dataRootOverride: dataRootOverride),
-            dataRootOverride: dataRootOverride
-        )
+extension ApprovalExecution {
+    /// The approval coordinator over the live app's effects.
+    static func app() -> ApprovalExecution {
+        ApprovalExecution(effects: AppApprovalTransactionEffects(), dataRootOverride: NativeAgentEngine.live.dataRoot)
     }
 
     static func resolveWorkshopStep(
         executionId: String,
         stepId: String,
         decision: String,
-        provenance: ApprovalResolutionProvenance = .local(decidedBy: "mac_ui"),
-        dataRootOverride: URL? = nil
+        provenance: ApprovalResolutionProvenance = .local(decidedBy: "mac_ui")
     ) async throws -> WorkshopExecutionRecord {
-        let root = dataRootOverride ?? SwiftNativeApprovalInbox.defaultDataRoot()
-        return try await app(dataRootOverride: dataRootOverride).resolveWorkshopStep(
+        return try await app().resolveWorkshopStep(
             executionId: executionId, stepId: stepId, decision: decision, provenance: provenance,
-            runner: NativeAgentEngine.makeWorkshopExecutionRunner(dataRoot: root))
+            runner: NativeAgentEngine.makeWorkshopExecutionRunner(dataRoot: NativeAgentEngine.live.dataRoot))
     }
 }
 
 /// Host bindings for approval effects and mounted conversation refresh.
 struct AppApprovalTransactionEffects: ApprovalTransactionEffects {
-    let dataRootOverride: URL?
-
-    private var dataRoot: URL { dataRootOverride ?? PersistenceCore.defaultDataRoot() }
+    private var dataRoot: URL { NativeAgentEngine.live.dataRoot }
 
     func disableSkill(name: String) async throws {
         try await NativeSkillRegistryActions.disableSkill(name: name, dataRoot: dataRoot)
@@ -56,14 +49,13 @@ struct AppApprovalTransactionEffects: ApprovalTransactionEffects {
     }
 
     func runConnectorAction(descriptor: ConnectorActionDescriptor, dryRun: Bool, input: [String: JSONValue],
-                            approvedReplayApprovalID: String, dataRoot: URL) async throws -> ApprovalConnectorActionResult {
+                            approvedReplayApprovalID: String, dataRoot: URL) async throws -> ConnectorActionReceipt {
         let engine = NativeAgentEngine.forRoot(dataRoot)
-        let receipt = try await engine.tools.withPartDoor(envelope: .native("approval:connector_action:" + approvedReplayApprovalID)) {
+        return try await engine.tools.withPartDoor(envelope: .native("approval:connector_action:" + approvedReplayApprovalID)) {
             try await ConnectorActions(platform: AppConnectorActionPlatform(engine: engine))
                 .runConnectorAction(descriptor: descriptor, dryRun: dryRun, input: input,
                                     approvedReplayApprovalID: approvedReplayApprovalID, dataRoot: dataRoot)
         }
-        return ApprovalConnectorActionResult(id: receipt.id, status: receipt.status)
     }
 
     func toolDispatchClient(enforceAppAutonomy: Bool) -> any ToolDispatchClient {
@@ -97,9 +89,8 @@ struct AppApprovalTransactionEffects: ApprovalTransactionEffects {
         try await BrowserActionRoutes.app.finishRejectedBrowserRun(from: record, status: status, dataRoot: dataRoot)
     }
 
-    /// The published executor is the live root's; another root gets its own.
+    /// Use the published live executor when it is available.
     func workshopExecutor() -> WorkshopExecutorLoop {
-        guard dataRootOverride == nil else { return NativeAgentEngine.makeWorkshopExecutor(dataRoot: dataRoot) }
         return WorkshopExecutorRef.shared.current() ?? NativeAgentEngine.makeWorkshopExecutor()
     }
 

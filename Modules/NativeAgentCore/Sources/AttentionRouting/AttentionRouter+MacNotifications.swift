@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import UserNotifications
 import NativeAgentCore
 import PersistenceCore
@@ -20,39 +21,11 @@ public enum NativeAgentNotificationRoute {
     }
 }
 
-/// The OS adapter returns observations; admission and receipt meaning stay here.
-public protocol MacNotificationDelivery {
-    static func notificationSettings() async -> MacNotificationSettings
-    static func requestAuthorizationError() async -> String?
-    static func addNotification(
-        identifier: String, title: String, body: String, category: String,
-        userInfo: [String: String], soundName: String?
-    ) async -> String?
-}
-
-public struct MacNotificationSettings: Sendable {
-    public let authorizationStatus: String
-    public let alertSetting: String
-    public let soundSetting: String
-    public let badgeSetting: String
-
-    public init(authorizationStatus: String, alertSetting: String, soundSetting: String, badgeSetting: String) {
-        self.authorizationStatus = authorizationStatus
-        self.alertSetting = alertSetting
-        self.soundSetting = soundSetting
-        self.badgeSetting = badgeSetting
-    }
-
-    var isNotDetermined: Bool { authorizationStatus == "not_determined" }
-    var isAuthorized: Bool { ["authorized", "provisional", "ephemeral"].contains(authorizationStatus) }
-    var alertsEnabled: Bool { alertSetting == "enabled" }
-}
-
-extension AttentionRouter {
-    public static func postMacNotification(
-        title: String, body: String, userInfo: [String: String], soundName: String?,
-        root: URL, delivery: any MacNotificationDelivery.Type
+extension NativeAgentNotifications {
+    private static func postAccepted(
+        title: String, body: String, userInfo: [String: String], soundName: String?
     ) async -> NativeAgentNotificationPostResult {
+        let root = PersistenceCore.defaultDataRoot()
         // Her resident wake runs in his quiet hours; its banners wait in the
         // inbox until they end (AttentionRouter.releaseHeld).
         if AttentionRouter.holdsResidentWake(session: userInfo[NativeAgentNotificationActions.sessionKey], dataRoot: root) {
@@ -69,31 +42,37 @@ extension AttentionRouter {
                 badgeSetting: "", error: nil)
         }
         let notificationTitle = NativeAgentNotificationDefaults.title(title)
-        var settings = await delivery.notificationSettings()
+        var settings = await notificationSettings()
         var authError: String?
-        if settings.isNotDetermined {
-            authError = await delivery.requestAuthorizationError()
-            settings = await delivery.notificationSettings()
+        if settings.authorizationStatus == .notDetermined {
+            authError = await requestAuthorizationError()
+            settings = await notificationSettings()
         }
 
         let identifier = UUID().uuidString
-        let visibleAlertsEnabled = settings.alertsEnabled
-        guard settings.isAuthorized else {
+        let visibleAlertsEnabled = settings.alertSetting == .enabled
+        guard [.authorized, .provisional].contains(settings.authorizationStatus) else {
             return NativeAgentNotificationPostResult(
                 identifier: identifier,
                 status: "blocked",
                 delivery: "macos_notifications_not_authorized",
                 posted: false,
                 visibleAlertsEnabled: false,
-                authorizationStatus: settings.authorizationStatus,
-                alertSetting: settings.alertSetting,
-                soundSetting: settings.soundSetting,
-                badgeSetting: settings.badgeSetting,
+                authorizationStatus: string(settings.authorizationStatus),
+                alertSetting: string(settings.alertSetting),
+                soundSetting: string(settings.soundSetting),
+                badgeSetting: string(settings.badgeSetting),
                 error: authError ?? "NativeAgent does not have permission to show notifications. Open System Settings > Notifications > NativeAgent to allow them."
             )
         }
 
-        let addError = await delivery.addNotification(
+        guard !Task.isCancelled else {
+            return NativeAgentNotificationPostResult(identifier: identifier, status: "cancelled", delivery: "task_cancelled",
+                posted: false, visibleAlertsEnabled: visibleAlertsEnabled, authorizationStatus: string(settings.authorizationStatus),
+                alertSetting: string(settings.alertSetting), soundSetting: string(settings.soundSetting), badgeSetting: string(settings.badgeSetting),
+                error: CancellationError().localizedDescription)
+        }
+        let addError = await addNotification(
             identifier: identifier, title: notificationTitle, body: body,
             category: NativeAgentNotificationActions.category(for: userInfo),
             userInfo: userInfo, soundName: soundName
@@ -105,10 +84,10 @@ extension AttentionRouter {
                 delivery: "macos_notification_add_failed",
                 posted: false,
                 visibleAlertsEnabled: visibleAlertsEnabled,
-                authorizationStatus: settings.authorizationStatus,
-                alertSetting: settings.alertSetting,
-                soundSetting: settings.soundSetting,
-                badgeSetting: settings.badgeSetting,
+                authorizationStatus: string(settings.authorizationStatus),
+                alertSetting: string(settings.alertSetting),
+                soundSetting: string(settings.soundSetting),
+                badgeSetting: string(settings.badgeSetting),
                 error: addError
             )
         }
@@ -121,24 +100,22 @@ extension AttentionRouter {
                 : "posted_to_macos_notification_center_alerts_disabled",
             posted: true,
             visibleAlertsEnabled: visibleAlertsEnabled,
-            authorizationStatus: settings.authorizationStatus,
-            alertSetting: settings.alertSetting,
-            soundSetting: settings.soundSetting,
-            badgeSetting: settings.badgeSetting,
+            authorizationStatus: string(settings.authorizationStatus),
+            alertSetting: string(settings.alertSetting),
+            soundSetting: string(settings.soundSetting),
+            badgeSetting: string(settings.badgeSetting),
             error: nil
         )
     }
 }
 
-public enum NativeAgentNotifications: MacNotificationDelivery {
-    private static let deliveryLock = NSLock()
-    nonisolated(unsafe) private static var stopped = false
-    nonisolated(unsafe) private static var posts: [UUID: Task<Void, Never>] = [:]
+public enum NativeAgentNotifications {
+    private static let delivery = Mutex<(stopped: Bool, posts: [UUID: Task<Void, Never>])>((false, [:]))
 
     /// Already accepted banners finish and retire at the OS callback, including
     /// errors. Close admission immediately; never join the OS during shutdown.
     public static func shutdown() {
-        deliveryLock.withLock { stopped = true }
+        delivery.withLock { $0.stopped = true }
     }
 
     /// Tool-authored messages can be answered. Bind the route at posting time,
@@ -153,12 +130,12 @@ public enum NativeAgentNotifications: MacNotificationDelivery {
     }
 
     public static func post(title: String, body: String, userInfo: [String: String] = [:]) {
-        deliveryLock.withLock {
-            guard !stopped else { return }
+        delivery.withLock { state in
+            guard !state.stopped else { return }
             let id = UUID()
-            posts[id] = Task {
+            state.posts[id] = Task {
                 _ = await postAccepted(title: title, body: body, userInfo: userInfo, soundName: nil)
-                _ = deliveryLock.withLock { posts.removeValue(forKey: id) }
+                _ = delivery.withLock { $0.posts.removeValue(forKey: id) }
             }
         }
     }
@@ -172,7 +149,7 @@ public enum NativeAgentNotifications: MacNotificationDelivery {
         userInfo: [String: String] = [:],
         soundName: String? = nil
     ) async -> NativeAgentNotificationPostResult {
-        guard deliveryLock.withLock({ !stopped }) else {
+        guard !Task.isCancelled, delivery.withLock({ !$0.stopped }) else {
             return NativeAgentNotificationPostResult(
                 identifier: UUID().uuidString, status: "cancelled", delivery: "engine_shutdown",
                 posted: false, visibleAlertsEnabled: false, authorizationStatus: "", alertSetting: "",
@@ -181,26 +158,8 @@ public enum NativeAgentNotifications: MacNotificationDelivery {
         return await postAccepted(title: title, body: body, userInfo: userInfo, soundName: soundName)
     }
 
-    private static func postAccepted(
-        title: String, body: String, userInfo: [String: String], soundName: String?
-    ) async -> NativeAgentNotificationPostResult {
-        await AttentionRouter.postMacNotification(
-            title: title, body: body, userInfo: userInfo, soundName: soundName,
-            root: PersistenceCore.defaultDataRoot(), delivery: Self.self
-        )
-    }
-
-    public static func notificationSettings() async -> MacNotificationSettings {
-        await withCheckedContinuation { continuation in
-            UNUserNotificationCenter.current().getNotificationSettings { settings in
-                continuation.resume(returning: MacNotificationSettings(
-                    authorizationStatus: string(settings.authorizationStatus),
-                    alertSetting: string(settings.alertSetting),
-                    soundSetting: string(settings.soundSetting),
-                    badgeSetting: string(settings.badgeSetting)
-                ))
-            }
-        }
+    public static func notificationSettings() async -> UNNotificationSettings {
+        await UNUserNotificationCenter.current().notificationSettings()
     }
 
     public static func requestAuthorizationError() async -> String? {

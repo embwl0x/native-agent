@@ -1,13 +1,6 @@
 import Foundation
 // Blueprint: | `MobileTelegramSnapshot.swift` | `MobileTelegramSnapshot` struct |
 
-/// The same trust-widening confirmation on Mac and phone.
-public enum TelegramAccessConfirmation {
-    public static let title = "Allow more Telegram replies?"
-    public static let action = "Allow replies"
-    public static let message = "Telegram can reply to allowed chats and users when enabled. If group mentions are not required, it can reply in allowed groups without being mentioned."
-}
-
 /// Credential-free readback of the Mac's Telegram settings and live loop state.
 public struct MobileTelegramSnapshot: Codable, Equatable, Sendable {
     public var observedAt: Double
@@ -36,9 +29,4 @@ public struct MobileTelegramSnapshot: Codable, Equatable, Sendable {
         self.pollStatusMessage = pollStatusMessage
         self.lastSuccessfulPollAt = lastSuccessfulPollAt
     }
-}
-
-/// Deliberately has no credential or allowlist mutation field.
-public enum MobileTelegramChange: Sendable {
-    case disconnect
 }

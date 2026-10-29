@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Synchronization
@@ -13,21 +14,14 @@ extension SwiftNativeResearchClient {
         return out
     }
 
-    /// Build a URL preserving query-item INSERTION ORDER. Python's
-    /// `urllib.parse.urlencode({"q": ..., "format": ...})` serializes dict
-    /// items in insertion order (`q=...&format=json`); receipt JSON `url`
-    /// fields must match byte-for-byte across the cutover, so we cannot
-    /// use `[String: String]` (which is unordered) or sort by key
-    /// (which would invert to `format=json&q=...`). Pass an ordered list
-    /// of `(key, value)` pairs instead.
+    /// Preserve query-item insertion order in URLs and receipts.
     func makeURL(base: String, path: String, query: [(String, String)]) -> URL? {
         var comps = URLComponents(string: base + path)
         comps?.queryItems = query.map { URLQueryItem(name: $0.0, value: $0.1) }
         return comps?.url
     }
 
-    /// Match Python's `now_iso()`: `datetime.now(timezone.utc).isoformat()` —
-    /// ISO-8601 with fractional seconds, `+00:00` suffix (not `Z`).
+    /// ISO-8601 with fractional seconds and a `+00:00` UTC suffix.
     public nonisolated static func isoTimestamp(_ date: Date) -> String {
         NativeTimestampFormat.fractionalUTCOffset(date)
     }
@@ -36,7 +30,7 @@ extension SwiftNativeResearchClient {
         PersistenceCore.defaultDataRoot()
     }
 
-    // MARK: Receipt retention (2026-07-21 audit)
+    // MARK: Receipt retention
 
     /// Bound on fetched-source receipts and retained legacy search receipts
     /// in `receiptsDir`; search results are returned without a duplicate file.

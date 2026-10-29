@@ -11,18 +11,18 @@ public enum ChatSessionScratch {
     }
 
     public static func read(dataRoot: URL, sessionID: String) async throws -> JSONValue {
-        try await SwiftNativePersistenceCore().readJSON(path(dataRoot: dataRoot, sessionID: sessionID), ifMissing: .object([:]))
+        try await SwiftNativePersistenceCore.readJSON(path(dataRoot: dataRoot, sessionID: sessionID), ifMissing: .object([:]))
     }
 
     public static func write(dataRoot: URL, sessionID: String, key: String, value: String) async throws {
         let path = path(dataRoot: dataRoot, sessionID: sessionID)
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
-            let current = try await persistence.readJSON(path, ifMissing: .object([:]))
-            var root: [String: JSONValue]
-            if case .object(let object) = current { root = object } else { root = [:] }
+        try await SwiftNativePersistenceCore.withFileLock(path) {
+            let current = try await SwiftNativePersistenceCore.readJSON(path, ifMissing: .object([:]))
+            guard case .object(var root) = current else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
             root[key] = .string(value)
-            try await persistence.writeJSON(.object(root), to: path)
+            try await SwiftNativePersistenceCore.writeJSON(.object(root), to: path)
         }
     }
 }

@@ -2,6 +2,7 @@ import AgentLinkTransport
 import AgentWorkspace
 import Darwin
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `AgentPeerStore.swift` | Canonical contact decoding, identity projections and proof; authenticated inbound proof connects hosts without a command line too. `isReady` checks route/key proof, unavailable mark and ACP startability, while `AgentContactHealth` owns version/digest freshness. `list` prepares/chmods its directory before reading; summaries retain every contact with reachability and owner trust separately |
@@ -537,18 +538,14 @@ public struct AgentPeerStore: Sendable {
         }
     }
 
-    /// Lift an "unavailable" mark written at or after `since` — the one a
-    /// restart wrote while cutting a reply off, not a real startup failure.
+    /// Clear unavailable marks at or after `since`, retaining ambiguous same-second timestamps.
     public func clearUnavailable(peerID: String, since: Date) {
         try? CredentialFileLock.withLock(fileURL) {
             var peers = try read()
             guard let index = peers.firstIndex(where: { $0.id == peerID }),
                   let stamp = peers[index].unavailableAt else { return }
-            let formatter = ISO8601DateFormatter()
             let fractional = stamp.contains(".")
-            if fractional { formatter.formatOptions.insert(.withFractionalSeconds) }
-            // 2026-09-28: Compare exactly; retain ambiguous same-second legacy marks.
-            guard let marked = formatter.date(from: stamp), marked >= since,
+            guard let marked = NativeTimestampFormat.parseISO8601FractionalFirst(stamp), marked >= since,
                   fractional || marked > since else { return }
             peers[index].unavailableAt = nil
             try write(peers)
@@ -560,9 +557,7 @@ public struct AgentPeerStore: Sendable {
         try? CredentialFileLock.withLock(fileURL) {
             var peers = try read()
             guard let index = peers.firstIndex(where: { $0.id == peerID }) else { return }
-            let formatter = ISO8601DateFormatter()
-            formatter.formatOptions.insert(.withFractionalSeconds)
-            peers[index].unavailableAt = formatter.string(from: Date())
+            peers[index].unavailableAt = NativeTimestampFormat.fractionalZulu(Date())
             try write(peers)
         }
     }
@@ -748,16 +743,7 @@ public struct AgentPeerStore: Sendable {
             guard data.count <= Self.maximumConfigurationBytes else { throw AgentPeerStoreError.configurationTooLarge.failure(file: fileURL) }
         }
         do {
-            let allowed = Set(["id", "name", "who", "handles", "endpoint", "transport", "ability", "credentialKey", "conversationLabel",
-                               "approvedExecutablePath", "acpWorkingDirectory", "acpExecutable",
-                                "hostWorkspace", "grokSetup", "grokConversation", "grokBootstrapConfirmed",
-                                "allowElevation", "provenInboundAt", "provenOutboundAt",
-                                "roundTripProof", "mcpReturnProof", "connectionProbe", "unavailableAt"])
-            guard let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]],
-                  rows.allSatisfy({ Set($0.keys).isSubset(of: allowed) }) else {
-                throw AgentPeerStoreError.invalidConfiguration.failure(file: fileURL)
-            }
-            let peers = try JSONDecoder().decode([AgentPeerContact].self, from: data)
+            let peers = try JSONValue.parse(data).decodedExactly(as: [AgentPeerContact].self)
             guard peers.count <= Self.maximumContacts, Set(peers.map(\.id)).count == peers.count else {
                 throw AgentPeerStoreError.invalidConfiguration.failure(file: fileURL)
             }
@@ -776,8 +762,8 @@ public struct AgentPeerStore: Sendable {
 }
 
 extension AgentContactIdentity {
-    public init(dataRoot: URL) {
-        let contacts = (try? AgentPeerStore(dataRoot: dataRoot).read()) ?? []
+    public init(dataRoot: URL, peers: [AgentPeerContact]? = nil) {
+        let contacts = peers ?? (try? AgentPeerStore(dataRoot: dataRoot).read()) ?? []
         self.init(peers: contacts.map { peer in
             ["id": peer.id, "name": peer.name, "who": peer.who, "endpoint": peer.endpoint.absoluteString,
              "transport": peer.transport.rawValue].compactMapValues { $0 }

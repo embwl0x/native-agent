@@ -57,6 +57,11 @@ public enum OAuthRefreshBinding {
         return object
     }
 
+    static func hasInvalidExpiry(_ object: [String: Any], provider: String) -> Bool {
+        guard let raw = object["expires_at"] ?? tokenSet(object, provider: provider)["expires_at"] else { return false }
+        return parseExpiresAt(raw) == nil
+    }
+
     public static func permitsRefresh(_ object: [String: Any], provider: String) -> Bool {
         let tokens = tokenSet(object, provider: provider)
         guard let account = string(tokens["oauth_account_identity"]),
@@ -91,6 +96,10 @@ final class OAuthRequestAccount: @unchecked Sendable {
     func check(_ object: [String: Any], provider: String, rejectedToken: String? = nil,
                allowUnboundIdentity: Bool = false) throws {
         let tokens = OAuthRefreshBinding.tokenSet(object, provider: provider)
+        if OAuthRefreshBinding.hasInvalidExpiry(object, provider: provider) {
+            throw LLMError.authRejected(provider: provider,
+                detail: "Saved expires_at is invalid. Repair the credential expiry or sign in again.")
+        }
         let account = OAuthRefreshBinding.string(tokens["oauth_account_identity"])
             ?? (allowUnboundIdentity ? OAuthRefreshBinding.identity(tokens, provider: provider) : nil)
         let access = OAuthRefreshBinding.string(tokens["access_token"])

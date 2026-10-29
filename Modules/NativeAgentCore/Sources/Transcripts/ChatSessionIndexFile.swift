@@ -1,9 +1,10 @@
 import Foundation
+import os
+import NativeAgentCore
 import Darwin
 import PersistenceCore
 import NativeAgentShared
-import TurnTrace
-// Blueprint: | `ChatSessionIndexFile.swift` | Canonical durable index writer and checked index schema and message-index, projection-generation, transcript-rewrite and retention-removal transactions; count/acknowledgment reads under index → transcript locks, retention on every message within the index transaction; `recordContinuityParticipant`, `recordConversationChange`; backup/export/sync/privacy decisions live here |
+// Blueprint: | `ChatSessionIndexFile.swift` | Canonical durable index writer, creator-declared conversation kinds and exact-owner corrections, checked index schema and message-index, projection-generation, transcript-rewrite and retention-removal transactions; count/acknowledgment reads under index → transcript locks, retention on every message within the index transaction; `recordContinuityParticipant`, `recordConversationChange`; backup/export/sync/privacy decisions live here |
 
 public enum ChatSessionIndexFileError: Error, LocalizedError, Sendable, Equatable {
     case unreadable(path: String, reason: String)
@@ -12,10 +13,7 @@ public enum ChatSessionIndexFileError: Error, LocalizedError, Sendable, Equatabl
     case expectedArray(path: String)
     case nonObjectRow(path: String, index: Int)
 
-    /// 2026-09-06: the message names the FILE, not its absolute path. These
-    /// descriptions are forwarded to remote surfaces (iPhone error banners),
-    /// and a Mac filesystem path is not theirs to see. The full path stays in
-    /// the associated value for Mac-local logs.
+    /// Remote error descriptions expose only the filename; associated values retain the local path.
     public var errorDescription: String? {
         switch self {
         case .unreadable(let path, let reason):
@@ -47,11 +45,44 @@ public enum ChatSessionIndexFileError: Error, LocalizedError, Sendable, Equatabl
 /// Storage: local/off-disk backup and PrivacyMap/chat include it; data export
 /// excludes it. DeviceSync publishes selected session rows, not this raw file.
 public enum ChatSessionIndexFile {
+    /// Keep index publication, destination binding and retention under one lock.
+    public static func ensureSession(
+        id: String, title: String, source: String, sourceKey: String, kind: ChatThreadKind,
+        dataRoot: URL, context: String,
+        commitBinding: @Sendable () async throws -> Void = {}
+    ) async throws {
+        let path = dataRoot.appendingPathComponent("chat/sessions.json")
+        try await SwiftNativePersistenceCore.withFileLock(path) {
+            var rows = try loadObjectRowsForMutation(at: path)
+            if rows.contains(where: { $0["id"] == .string(id) }) {
+                try await commitBinding()
+                return
+            }
+            let now = NativeTimestampFormat.fractionalZulu(Date())
+            let row = try await ChatSessionRetention.restoreArchivedRow(sessionId: id, dataRoot: dataRoot) ?? [
+                "id": .string(id), "title": .string(title), "source": .string(source),
+                "threadKind": .string(kind.rawValue), "sourceKey": .string(sourceKey),
+                "createdAt": .string(now), "updatedAt": .string(now),
+                "archived": .bool(false), "messageCount": .int(0),
+            ]
+            rows.insert(row, at: 0)
+            try write(rows, to: path)
+            do {
+                try await commitBinding()
+            } catch {
+                // An unbound row cannot escape the index transaction.
+                rows.removeFirst()
+                try write(rows, to: path)
+                throw error
+            }
+            ChatSessionRetention.enforceBestEffort(dataRoot: dataRoot, rows: rows, now: Date(), context: context)
+        }
+    }
+
     public static func mutate<T: Sendable>(
-        at path: URL, using persistence: PersistenceCoreProtocol = SwiftNativePersistenceCore(),
-        _ mutation: @Sendable (inout [[String: JSONValue]]) async throws -> T
+        at path: URL, _ mutation: @Sendable (inout [[String: JSONValue]]) async throws -> T
     ) async throws -> T {
-        try await persistence.withFileLock(path) {
+        try await SwiftNativePersistenceCore.withFileLock(path) {
             var rows = try loadObjectRowsForMutation(at: path)
             let original = rows
             let result = try await mutation(&rows)
@@ -72,30 +103,25 @@ public enum ChatSessionIndexFile {
         }
     }
 
-    private static let pendingSyncLock = NSLock()
-    nonisolated(unsafe) private static var pendingSyncs: [String: Int] = [:]
+    private static let pendingSyncs = OSAllocatedUnfairLock(initialState: [String: Int]())
 
     /// An overlapping sync may observe another writer's bytes. Keep its
     /// transcript hot until every admitted writer has finished its own index
     /// commit; after a crash, the persisted exact-version guard takes over.
     public static func beginTranscriptIndexSync(at path: URL) {
-        pendingSyncLock.lock()
-        defer { pendingSyncLock.unlock() }
-        pendingSyncs[path.standardizedFileURL.path, default: 0] += 1
+        pendingSyncs.withLock { $0[path.standardizedFileURL.path, default: 0] += 1 }
     }
 
     public static func endTranscriptIndexSync(at path: URL) {
-        pendingSyncLock.lock()
-        defer { pendingSyncLock.unlock() }
-        let key = path.standardizedFileURL.path
-        if let count = pendingSyncs[key], count > 1 { pendingSyncs[key] = count - 1 }
-        else { pendingSyncs.removeValue(forKey: key) }
+        pendingSyncs.withLock { counts in
+            let key = path.standardizedFileURL.path
+            if let count = counts[key], count > 1 { counts[key] = count - 1 }
+            else { counts.removeValue(forKey: key) }
+        }
     }
 
     public static func hasPendingTranscriptIndexSync(at path: URL) -> Bool {
-        pendingSyncLock.lock()
-        defer { pendingSyncLock.unlock() }
-        return pendingSyncs[path.standardizedFileURL.path] != nil
+        pendingSyncs.withLock { $0[path.standardizedFileURL.path] != nil }
     }
 
     /// Exact filesystem version acknowledged while holding the transcript lock.
@@ -115,13 +141,15 @@ public enum ChatSessionIndexFile {
     }
 
     /// Unknown or mixed participants stay unavailable. Legacy transcripts are
-    /// not relabeled from their latest turn; only a new conversation binds.
+    /// not relabeled from their latest turn. An assistant-led opening binds
+    /// only when the whole transcript proves the first user's provenance.
     public static func recordContinuityParticipant(
-        in row: inout [String: JSONValue], participant: String?, scope: String?, messageCount: Int
+        in row: inout [String: JSONValue], participant: String?, scope: String?, messageCount: Int,
+        verifiedOpening: Bool = false
     ) {
         let incoming = participant.map(JSONValue.string) ?? .null
         if row["continuityParticipant"] == nil {
-            row["continuityParticipant"] = messageCount == 1 ? incoming : .null
+            row["continuityParticipant"] = messageCount == 1 || verifiedOpening ? incoming : .null
             row["continuityScope"] = scope.map(JSONValue.string) ?? .null
         } else if row["continuityParticipant"] != incoming
                     || row["continuityScope"] != (scope.map(JSONValue.string) ?? .null) {
@@ -186,24 +214,43 @@ public enum ChatSessionIndexFile {
     /// Count and filesystem acknowledgment are read inside index → transcript
     /// locks; retention remains inside the same index transaction on every message.
     package static func recordMessage(
-        sessionId: String, role normalizedRole: String, source: String, sourceKey: String?,
+        sessionId: String, role normalizedRole: String, source: String, sourceKey: String?, kind: ChatThreadKind?, ownedSessionID: String?,
         timestamp: String, syncedAt: String, preview: String, stamp: TranscriptRowStamp,
         title: String?, continuityParticipant: String?, continuityScope: String?,
-        dataRoot: URL, messagesPath: URL, persistence: any PersistenceCoreProtocol,
-        countMessages: @escaping @Sendable (URL) -> Int,
+        dataRoot: URL, messagesPath: URL, countMessages: @escaping @Sendable (URL) -> Int,
         clock retentionClock: @escaping @Sendable () -> Date
     ) async throws {
         let sessionsPath = dataRoot.appendingPathComponent("chat/sessions.json")
-        try await persistence.withFileLock(sessionsPath) {
-            let snapshot = try await persistence.withFileLock(messagesPath) {
-                (count: countMessages(messagesPath),
-                 version: ChatSessionIndexFile.transcriptVersion(at: messagesPath))
+        try await SwiftNativePersistenceCore.withFileLock(sessionsPath) {
+            let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
+            let needsOpeningProof = !rows.contains {
+                $0["id"] == .string(sessionId) && $0["continuityParticipant"] != nil
+            }
+            let snapshot = try await SwiftNativePersistenceCore.withFileLock(messagesPath) {
+                let count = countMessages(messagesPath)
+                var verifiedOpening = false
+                if needsOpeningProof, normalizedRole == "user", count > 1, let continuityParticipant {
+                    let (transcript, report) = try await SwiftNativePersistenceCore.readJSONLReporting(messagesPath)
+                    let users = transcript.filter {
+                        guard case .object(let fields) = $0 else { return false }
+                        return fields["role"] == .string("user")
+                    }
+                    verifiedOpening = report.isClean && transcript.count == count && users.count == 1 && transcript.allSatisfy {
+                        guard case .object(let fields) = $0,
+                              case .string(let role)? = fields["role"],
+                              case .object(let metadata)? = fields["metadata"] else { return false }
+                        return ["user", "assistant"].contains(role)
+                            && ChatSessionRecollections.admitsContinuity(
+                                role: role, metadata: metadata, participant: continuityParticipant,
+                                source: source, scope: continuityScope)
+                    }
+                }
+                return (count: count, version: ChatSessionIndexFile.transcriptVersion(at: messagesPath),
+                        verifiedOpening: verifiedOpening)
             }
             let messageCount = snapshot.count
             let parent = sessionsPath.deletingLastPathComponent()
             try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-            let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
-
             var updated: [String: JSONValue]? = nil
             var remaining: [[String: JSONValue]] = []
             for var row in rows {
@@ -227,16 +274,14 @@ public enum ChatSessionIndexFile {
                 }
                 if normalizedRole == "user" {
                     ChatSessionIndexFile.recordContinuityParticipant(
-                        in: &row, participant: continuityParticipant, scope: continuityScope, messageCount: messageCount)
+                        in: &row, participant: continuityParticipant, scope: continuityScope, messageCount: messageCount,
+                        verifiedOpening: snapshot.verifiedOpening)
                 }
-                if row["threadKind"] == nil {
-                    let existingSource: String = {
-                        if case .string(let value)? = row["source"] { return value }
-                        return source
-                    }()
-                    row["threadKind"] = .string(
-                        ChatThreadKind.inferred(fromSource: existingSource).rawValue
-                    )
+                if ownedSessionID == sessionId, let kind {
+                    row["threadKind"] = .string(kind.rawValue)
+                } else if row["threadKind"] == nil {
+                    let existingSource: String = if case .string(let value)? = row["source"] { value } else { source }
+                    row["threadKind"] = .string(ChatThreadKind.inferred(fromSource: existingSource).rawValue)
                 }
                 updated = row
             }
@@ -246,7 +291,7 @@ public enum ChatSessionIndexFile {
                     "id": .string(sessionId),
                     "title": .string(title ?? "New Chat"),
                     "source": .string(source),
-                    "threadKind": .string(ChatThreadKind.inferred(fromSource: source).rawValue),
+                    "threadKind": .string((kind ?? ChatThreadKind.inferred(fromSource: source)).rawValue),
                     "createdAt": .string(timestamp),
                     "updatedAt": .string(syncedAt),
                     "archived": .bool(false),
@@ -257,7 +302,8 @@ public enum ChatSessionIndexFile {
                 if let sourceKey { row["sourceKey"] = .string(sourceKey) }
                 if normalizedRole == "user" {
                     ChatSessionIndexFile.recordContinuityParticipant(
-                        in: &row, participant: continuityParticipant, scope: continuityScope, messageCount: messageCount)
+                        in: &row, participant: continuityParticipant, scope: continuityScope, messageCount: messageCount,
+                        verifiedOpening: snapshot.verifiedOpening)
                 }
                 if !preview.isEmpty { row["lastMessagePreview"] = .string(preview); row[TranscriptRowStamp.previewKey] = stamp.json }
                 updated = row
@@ -268,10 +314,10 @@ public enum ChatSessionIndexFile {
                     updated["firstMessageAt"] = .string(timestamp)
                 }
                 let previous = updated["lastMessageAt"].flatMap { value -> Date? in
-                    if case .string(let stamp) = value { return dateFromISO8601(stamp) }
+                    if case .string(let stamp) = value { return NativeTimestampFormat.parseISO8601FractionalFirst(stamp) }
                     return nil
                 } ?? .distantPast
-                if (dateFromISO8601(timestamp) ?? .distantPast) >= previous {
+                if (NativeTimestampFormat.parseISO8601FractionalFirst(timestamp) ?? .distantPast) >= previous {
                     updated["lastMessageAt"] = .string(timestamp)
                 }
                 updated[ChatSessionIndexFile.acknowledgedTranscriptKey] = snapshot.version
@@ -281,6 +327,7 @@ public enum ChatSessionIndexFile {
             try write(remaining, to: sessionsPath)
             ChatSessionRetention.enforceBestEffort(
                 dataRoot: dataRoot,
+                rows: remaining,
                 now: retentionClock(),
                 context: "ChatOrchestrationClient.syncSessionIndex"
             )
@@ -289,11 +336,10 @@ public enum ChatSessionIndexFile {
 
     /// Projection-only changes preserve every other index field.
     package static func recordProjectionChanges(
-        sessionIDs: Set<String>, dataRoot: URL,
-        persistence: any PersistenceCoreProtocol
+        sessionIDs: Set<String>, dataRoot: URL
     ) async throws {
         let path = dataRoot.appendingPathComponent("chat/sessions.json")
-        try await persistence.withFileLock(path) {
+        try await SwiftNativePersistenceCore.withFileLock(path) {
             var rows = try loadObjectRowsForMutation(at: path)
             var changed = false
             for index in rows.indices {
@@ -307,16 +353,15 @@ public enum ChatSessionIndexFile {
 
     /// A rewritten transcript acknowledges its exact filesystem version and count.
     package static func recordTranscriptRewrite(
-        sessionID: String, dataRoot: URL, persistence: any PersistenceCoreProtocol,
-        countMessages: @escaping @Sendable (URL) -> Int
+        sessionID: String, dataRoot: URL, countMessages: @escaping @Sendable (URL) -> Int
     ) async throws {
         let sessionsPath = dataRoot.appendingPathComponent("chat/sessions.json")
-        try await persistence.withFileLock(sessionsPath) {
+        try await SwiftNativePersistenceCore.withFileLock(sessionsPath) {
             var rows = try loadObjectRowsForMutation(at: sessionsPath)
             guard let index = rows.firstIndex(where: { $0["id"] == .string(sessionID) }) else { return }
             bumpTranscriptGeneration(in: &rows[index])
             let messagesPath = dataRoot.appendingPathComponent("chat/messages/\(sessionID).jsonl")
-            let snapshot = try await persistence.withFileLock(messagesPath) {
+            let snapshot = try await SwiftNativePersistenceCore.withFileLock(messagesPath) {
                 (count: countMessages(messagesPath), version: transcriptVersion(at: messagesPath))
             }
             rows[index]["messageCount"] = .int(Int64(snapshot.count))
@@ -342,12 +387,6 @@ public enum ChatSessionIndexFile {
         return trimmed.isEmpty || trimmed == "New Chat"
     }
 
-    private static func dateFromISO8601(_ raw: String) -> Date? {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
-    }
-
     public static func serializedData(
         for rows: [[String: JSONValue]],
         pretty: Bool = true
@@ -355,17 +394,7 @@ public enum ChatSessionIndexFile {
         try JSONValue.array(rows.map(JSONValue.object)).serializedData(pretty: pretty)
     }
 
-    /// 2026-09-06: the session row's monotonic transcript version.
-    ///
-    /// `updatedAt` is a wall-clock stamp and cannot order two transcript
-    /// states: a clock that steps back, two writers a millisecond apart, or a
-    /// row restamped for a reason that isn't a transcript write all produce
-    /// stamps that lie about which transcript is newer. The phone uses this
-    /// version to decide whether an EMPTY published transcript is allowed to
-    /// wipe its copy of a chat, so it has to be a counter, never a clock:
-    /// incremented on every clear and every transcript write, and only ever
-    /// upward. A row with no counter yet is `nil`, and the phone never clears
-    /// on `nil` — legacy Macs keep the pre-2026-09-06 behaviour.
+    /// Transcript generations advance on clears and writes; the phone never clears on an absent generation.
     public static let transcriptGenerationKey = "transcriptGeneration"
 
     public static func transcriptGeneration(in row: [String: JSONValue]) -> Int64? {
@@ -384,16 +413,7 @@ public enum ChatSessionIndexFile {
         }
     }
 
-    /// Advance the row's transcript version. Absent or unreadable starts at 1,
-    /// which is still strictly greater than "no version at all".
-    ///
-    /// 2026-09-06: saturating, never wrapping. `&+ 1` on a row already at
-    /// `Int64.max` yields `Int64.min`, and this counter's whole job is that it
-    /// only ever moves upward — a wrap would make every subsequent transcript
-    /// write look older than the clear that preceded it. A row at the ceiling
-    /// stops moving instead and reports `false`, so a caller that needs the
-    /// bump to mean something (a clear, which publishes an empty transcript a
-    /// remote reader may only act on when it is provably newest) can refuse.
+    /// Advance without wrapping; absent or unreadable starts at 1, and `Int64.max` returns false.
     @discardableResult
     public static func bumpTranscriptGeneration(in row: inout [String: JSONValue]) -> Bool {
         let current = transcriptGeneration(in: row) ?? 0
@@ -427,56 +447,35 @@ public extension ChatSession {
     /// its exact type (integers accept an integral JSON float); anything else
     /// fails the row, and so the listing.
     init(row o: [String: JSONValue]) throws {
-        func string(_ key: String) throws -> String? {
-            switch o[key] {
-            case nil, .null?: return nil
-            case .string(let s)?: return s
-            default: throw ChatSessionRowError(field: key)
-            }
+        do {
+            let row = try JSONRow(.object(o))
+            self.init(
+                id: try row.string("id"),
+                title: try row.string("title"),
+                source: try row.optionalString("source"),
+                sourceKey: try row.optionalString("sourceKey"),
+                createdAt: try row.string("createdAt"),
+                updatedAt: try row.optionalString("updatedAt"),
+                archived: try row.optionalBool("archived"),
+                messageCount: try row.optionalInt("messageCount"),
+                lastMessagePreview: try row.optionalString("lastMessagePreview"),
+                summary: try row.optionalString("summary"),
+                parentSessionId: try row.optionalString("parentSessionId"),
+                rootSessionId: try row.optionalString("rootSessionId"),
+                forkedAtMessageId: try row.optionalString("forkedAtMessageId"),
+                projectSpaceId: try row.optionalString("projectSpaceId"),
+                worktreePath: try row.optionalString("worktreePath"),
+                providerId: try row.optionalString("providerId"),
+                modelId: try row.optionalString("modelId"),
+                transcriptGeneration: try row.optionalInt(ChatSessionIndexFile.transcriptGenerationKey)
+            )
+            firstMessageAt = try row.optionalString("firstMessageAt")
+            lastMessageAt = try row.optionalString("lastMessageAt")
+            threadKind = try row.optionalString("threadKind")
+            helperID = try row.optionalString("helperID")
+        } catch JSONRow.Malformed.field(let key) {
+            throw ChatSessionRowError(field: key)
         }
-        func required(_ key: String) throws -> String {
-            guard let s = try string(key) else { throw ChatSessionRowError(field: key) }
-            return s
-        }
-        func int(_ key: String) throws -> Int? {
-            switch o[key] {
-            case nil, .null?: return nil
-            case .int(let n)?: return Int(n)
-            case .double(let d)?:
-                guard let n = Int(exactly: d) else { throw ChatSessionRowError(field: key) }
-                return n
-            default: throw ChatSessionRowError(field: key)
-            }
-        }
-        func bool(_ key: String) throws -> Bool? {
-            switch o[key] {
-            case nil, .null?: return nil
-            case .bool(let b)?: return b
-            default: throw ChatSessionRowError(field: key)
-            }
-        }
-        self.init(
-            id: try required("id"),
-            title: try required("title"),
-            source: try string("source"),
-            sourceKey: try string("sourceKey"),
-            createdAt: try required("createdAt"),
-            updatedAt: try string("updatedAt"),
-            archived: try bool("archived"),
-            messageCount: try int("messageCount"),
-            lastMessagePreview: try string("lastMessagePreview"),
-            summary: try string("summary"),
-            parentSessionId: try string("parentSessionId"),
-            rootSessionId: try string("rootSessionId"),
-            forkedAtMessageId: try string("forkedAtMessageId"),
-            projectSpaceId: try string("projectSpaceId"),
-            worktreePath: try string("worktreePath"),
-            providerId: try string("providerId"),
-            modelId: try string("modelId"),
-            transcriptGeneration: try int(ChatSessionIndexFile.transcriptGenerationKey)
-        )
-        firstMessageAt = try string("firstMessageAt")
-        lastMessageAt = try string("lastMessageAt")
     }
 }
 

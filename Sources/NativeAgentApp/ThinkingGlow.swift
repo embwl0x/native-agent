@@ -1,13 +1,10 @@
+import NativeAgentShared
 import AppToolRuntime
 import SwiftUI
 
 // Blueprint: | `ThinkingGlow.swift` | `ThinkingGlow`: leaf-layer working shimmer and composer rim driven by turn state, fading when reply text begins |
 
-// "Alive glass" (User, 2026-09-23): while she is working on a turn and has not
-// started her reply, light moves in the glass — a caustic shimmer in the
-// composer and the rail, and a line of light travelling round the composer's
-// edge. Agent, same day: it stops (0.4s fade) the moment reply text starts
-// streaming, and stays off while it streams; the words are the signal then.
+// Thinking light fades over 0.4 seconds when reply text begins.
 //
 // Performance: everything here is a leaf. The signal is read in `ThinkingGlow`
 // itself, never in ChatView or the composer, so a lifecycle tick invalidates
@@ -21,13 +18,12 @@ import SwiftUI
 /// Put `.shimmer` under content (a background, before `glassEffect`) and
 /// `.rim` over it (an overlay).
 struct ThinkingGlow: View {
-    enum Kind { case shimmer, rim }
+    enum Kind { case shimmer, rim, workingRim }
     let kind: Kind
     let cornerRadius: CGFloat
     /// Detached composers supply their session; other surfaces follow the open chat.
     var sessionId: String? = nil
-    /// Lit for the whole turn (thinking, tools and replying) until it
-    /// settles, not only before the reply: Simple's name card (User, 10-04).
+    /// Lit for the whole turn, including tools and replying, until it settles.
     var wholeTurn = false
     /// Absent in snapshots and panels without the model: then it never shows.
     @Environment(AppModel.self) private var appModel: AppModel?
@@ -101,9 +97,7 @@ private struct ThinkingGlowLayer: View {
 }
 
 /// The moving light, on Core Animation: animations the render server runs, so
-/// a thinking turn costs the main thread nothing per frame (a TimelineView
-/// redrew every glow's Canvas each display frame). Both run on the wall
-/// clock, so every glow on screen is in step.
+/// composer lights share wall-clock phase; avatar rims start their own revolution.
 private struct ThinkingLightLayer: NSViewRepresentable {
     let kind: ThinkingGlow.Kind
     let cornerRadius: CGFloat
@@ -139,13 +133,14 @@ private struct ThinkingLightLayer: NSViewRepresentable {
             self.kind = kind
             super.init(frame: .zero)
             wantsLayer = true
-            content.masksToBounds = true
+            content.masksToBounds = kind != .workingRim
             layer?.addSublayer(content)
             switch kind {
-            case .rim:
-                glow.shadowOpacity = 0.5
-                glow.shadowRadius = 6
-                for (holder, mask, gradient) in [(glowRing, glowMask, glowComet), (ring, ringMask, comet)] {
+            case .rim, .workingRim:
+                let avatar = kind == .workingRim
+                glow.shadowOpacity = avatar ? 0.9 : 0.5
+                glow.shadowRadius = avatar ? 4 : 6
+                for (holder, mask, gradient) in rimLayers {
                     mask.fillColor = nil
                     mask.strokeColor = NSColor.black.cgColor
                     holder.mask = mask
@@ -153,15 +148,15 @@ private struct ThinkingLightLayer: NSViewRepresentable {
                     // clockwise: the stops are reversed to draw the same comet.
                     gradient.type = .conic
                     gradient.startPoint = CGPoint(x: 0.5, y: 0.5)
-                    gradient.endPoint = CGPoint(x: 1, y: 0.5)
-                    gradient.locations = Self.cometStops.reversed().map { NSNumber(value: 1 - $0.location) }
+                    gradient.endPoint = avatar ? CGPoint(x: 0.5, y: 0) : CGPoint(x: 1, y: 0.5)
+                    gradient.locations = cometStops.map { NSNumber(value: $0.location) }
                     holder.addSublayer(gradient)
                 }
                 glowMask.lineWidth = 4
-                ringMask.lineWidth = 2
-                glow.addSublayer(glowRing)
+                ringMask.lineWidth = avatar ? 2.5 : 2
+                glow.addSublayer(avatar ? ring : glowRing)
                 content.addSublayer(glow)
-                content.addSublayer(ring)
+                if !avatar { content.addSublayer(ring) }
             case .shimmer:
                 content.mask = clip
                 for pool in pools {
@@ -175,12 +170,18 @@ private struct ThinkingLightLayer: NSViewRepresentable {
         required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
         override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
-        private static let arc = 130.0 / 360.0, lead = 4.0 / 360.0
-        /// The comet's gradient as SwiftUI draws it: location clockwise from
-        /// the start angle, and the light's opacity there.
-        private static let cometStops: [(location: Double, alpha: Double)] = [
-            (0, 0), (0.5 - arc, 0), (0.5 - arc * 0.4, 0.35), (0.5, 1), (0.5 + lead, 0), (1, 0),
-        ]
+        private var rimLayers: [(CALayer, CAShapeLayer, CAGradientLayer)] {
+            kind == .workingRim ? [(ring, ringMask, comet)] : [(glowRing, glowMask, glowComet), (ring, ringMask, comet)]
+        }
+
+        private var cometStops: [(location: Double, alpha: Double)] {
+            let avatar = kind == .workingRim
+            let arc = (avatar ? 70.0 : 130.0) / 360.0, lead = 4.0 / 360.0
+            let stops: [(location: Double, alpha: Double)] = [
+                (0, 0), (0.5 - arc, 0), (0.5 - arc * 0.4, avatar ? 0.6 : 0.35), (0.5, 1), (0.5 + lead, 0), (1, 0),
+            ]
+            return avatar ? stops : stops.reversed().map { (1 - $0.location, $0.alpha) }
+        }
 
         func apply(haze: HazeColor, cornerRadius: CGFloat) {
             if let applied, applied.0 == haze, applied.1 == cornerRadius { return }
@@ -188,10 +189,11 @@ private struct ThinkingLightLayer: NSViewRepresentable {
             let light = NSColor(haze.edgeLight)
             CATransaction.begin(); CATransaction.setDisableActions(true)
             switch kind {
-            case .rim:
-                let colors = Self.cometStops.reversed().map { light.withAlphaComponent($0.alpha).cgColor }
-                glowComet.colors = colors
-                comet.colors = colors
+            case .rim, .workingRim:
+                for (_, _, gradient) in rimLayers {
+                    gradient.colors = cometStops.map { light.withAlphaComponent($0.alpha).cgColor }
+                }
+                if kind == .workingRim { ring.backgroundColor = light.withAlphaComponent(0.22).cgColor }
                 glow.shadowColor = light.cgColor
             case .shimmer:
                 for pool in pools { pool.colors = [light.cgColor, light.withAlphaComponent(0).cgColor] }
@@ -215,35 +217,41 @@ private struct ThinkingLightLayer: NSViewRepresentable {
             }
             content.frame = bounds
             switch kind {
-            case .rim: layoutRim(cornerRadius: applied.1)
+            case .rim, .workingRim: layoutRim(cornerRadius: applied.1)
             case .shimmer: layoutShimmer(cornerRadius: applied.1)
             }
             CATransaction.commit()
         }
 
         private func layoutRim(cornerRadius: CGFloat) {
-            let line: CGFloat = 2
-            let inset = ThinkingGlowLayer.rimBleed + line / 2
-            let path = RoundedRectangle(cornerRadius: max(0, cornerRadius - line / 2), style: .continuous)
+            let avatar = kind == .workingRim
+            let inset = avatar ? WorkingRim.bleed - 1 : ThinkingGlowLayer.rimBleed + 1
+            let path = RoundedRectangle(cornerRadius: avatar ? cornerRadius + 1 : max(0, cornerRadius - 1), style: .continuous)
                 .path(in: bounds.insetBy(dx: inset, dy: inset)).cgPath
-            let away = bounds.width + 64
+            let away = avatar ? 0 : bounds.width + 64
             glow.frame = bounds.offsetBy(dx: -away, dy: 0)
             glow.shadowOffset = CGSize(width: away, height: 0)
             // A square the ring never leaves while the comet turns.
             let side = hypot(bounds.width, bounds.height)
-            for (holder, mask, gradient) in [(glowRing, glowMask, glowComet), (ring, ringMask, comet)] {
+            for (holder, mask, gradient) in rimLayers {
                 holder.frame = bounds
                 mask.frame = bounds
                 mask.path = path
                 gradient.bounds = CGRect(x: 0, y: 0, width: side, height: side)
                 gradient.position = CGPoint(x: bounds.midX, y: bounds.midY)
-                // Clockwise, as SwiftUI's angle turns: negative about z here.
+                // Avatar phase survives layout; composer rims follow wall-clock phase.
+                if avatar, gradient.animation(forKey: "turn") != nil { continue }
                 let spin = CABasicAnimation(keyPath: "transform.rotation.z")
                 spin.fromValue = 0
                 spin.toValue = -2 * Double.pi
                 spin.duration = ThinkingGlowLayer.rimPeriod
                 spin.repeatCount = .infinity
-                spin.timeOffset = Self.phase(ThinkingGlowLayer.rimPeriod)
+                if avatar {
+                    spin.timingFunction = CAMediaTimingFunction(name: .linear)
+                    spin.preferredFrameRateRange = CAFrameRateRange(minimum: 15, maximum: 30, preferred: 30)
+                } else {
+                    spin.timeOffset = Self.phase(ThinkingGlowLayer.rimPeriod)
+                }
                 gradient.add(spin, forKey: "turn")
             }
         }
@@ -279,8 +287,7 @@ private struct ThinkingLightLayer: NSViewRepresentable {
             }
         }
 
-        /// Where the wall clock is in a loop of `period`: the phase the
-        /// TimelineView drew, shared by every glow.
+        /// Where the wall clock is in a loop of `period`.
         private static func phase(_ period: Double) -> Double {
             Date().timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: period)
         }
@@ -310,10 +317,9 @@ struct HazeBottomGlow: View {
 /// with a soft glow. Mount it only while that avatar's contact, helper or crew
 /// is working; idle is no view at all. Reduce Motion gets a still, soft rim.
 ///
-/// Core Animation, not SwiftUI: one rotation the render server runs, so a
-/// working avatar costs the main thread nothing per frame (a SwiftUI
-/// repeatForever pinned Simple view's CPU; see SimpleBreathingOrb).
+/// Core Animation runs the rotation in the render server.
 struct WorkingRim: View {
+    fileprivate static let bleed: CGFloat = 6
     /// The avatar's own corner radius: half its side for a circle.
     let cornerRadius: CGFloat
     @AppStorage(HazeColor.storageKey) private var hazeRaw = HazeColor.defaultValue.rawValue
@@ -327,103 +333,11 @@ struct WorkingRim: View {
                     .strokeBorder(haze.edgeLight.opacity(0.42), lineWidth: 1.5)
                     .padding(-2)
             } else {
-                WorkingRimLayer(haze: haze, cornerRadius: cornerRadius)
-                    .padding(-WorkingRimLayer.bleed)
+                ThinkingLightLayer(kind: .workingRim, cornerRadius: cornerRadius, haze: haze)
+                    .padding(-Self.bleed)
             }
         }
         .allowsHitTesting(false)
         .accessibilityHidden(true)
-    }
-}
-
-private struct WorkingRimLayer: NSViewRepresentable {
-    /// Room past the avatar for the ring and its glow.
-    static let bleed: CGFloat = 6
-    var haze: HazeColor
-    var cornerRadius: CGFloat
-
-    func makeNSView(context: Context) -> RimView { RimView() }
-    func updateNSView(_ view: RimView, context: Context) { view.apply(haze: haze, cornerRadius: cornerRadius) }
-
-    final class RimView: NSView {
-        /// Carries the shadow: the comet's own blurred light.
-        private let glow = CALayer()
-        /// Clipped to the ring.
-        private let ring = CALayer()
-        private let ringMask = CAShapeLayer()
-        /// A conic comet that turns; the ring shows it only where it passes.
-        private let comet = CAGradientLayer()
-        private var applied: (HazeColor, CGFloat)?
-
-        init() {
-            super.init(frame: .zero)
-            wantsLayer = true
-            glow.shadowOffset = .zero
-            glow.shadowRadius = 4
-            glow.shadowOpacity = 0.9
-            ringMask.fillColor = nil
-            ringMask.strokeColor = NSColor.black.cgColor
-            ringMask.lineWidth = 2.5
-            ring.mask = ringMask
-            comet.type = .conic
-            comet.startPoint = CGPoint(x: 0.5, y: 0.5)
-            comet.endPoint = CGPoint(x: 0.5, y: 0)
-            let arc = 70.0 / 360.0, lead = 4.0 / 360.0
-            comet.locations = [0, 0.5 - arc, 0.5 - arc * 0.4, 0.5, 0.5 + lead, 1].map { NSNumber(value: $0) }
-            ring.addSublayer(comet)
-            glow.addSublayer(ring)
-            layer?.addSublayer(glow)
-        }
-        required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-        override func hitTest(_ point: NSPoint) -> NSView? { nil }
-
-        override func layout() {
-            super.layout()
-            CATransaction.begin(); CATransaction.setDisableActions(true)
-            glow.frame = bounds
-            ring.frame = bounds
-            ringMask.frame = bounds
-            // Snug outside the avatar's edge: 2pt of light, 1pt proud of it.
-            let radius = applied?.1 ?? 0
-            let avatar = bounds.insetBy(dx: WorkingRimLayer.bleed, dy: WorkingRimLayer.bleed)
-            ringMask.path = RoundedRectangle(cornerRadius: radius + 1, style: .continuous)
-                .path(in: avatar.insetBy(dx: -1, dy: -1)).cgPath
-            // A square the ring never leaves while it turns.
-            let side = hypot(bounds.width, bounds.height)
-            comet.bounds = CGRect(x: 0, y: 0, width: side, height: side)
-            comet.position = CGPoint(x: bounds.midX, y: bounds.midY)
-            CATransaction.commit()
-        }
-        override func setFrameSize(_ newSize: NSSize) { super.setFrameSize(newSize); needsLayout = true }
-
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            if window != nil { turn() }
-        }
-
-        func apply(haze: HazeColor, cornerRadius: CGFloat) {
-            if let applied, applied.0 == haze, applied.1 == cornerRadius { return }
-            applied = (haze, cornerRadius)
-            let light = NSColor(haze.edgeLight)
-            let clear = light.withAlphaComponent(0).cgColor
-            comet.colors = [clear, clear, light.withAlphaComponent(0.6).cgColor, light.cgColor, clear, clear]
-            // A faint whole outline under the comet, so the avatar reads as lit.
-            ring.backgroundColor = light.withAlphaComponent(0.22).cgColor
-            glow.shadowColor = light.cgColor
-            needsLayout = true
-            turn()
-        }
-
-        private func turn() {
-            guard comet.animation(forKey: "turn") == nil else { return }
-            let spin = CABasicAnimation(keyPath: "transform.rotation.z")
-            spin.fromValue = 0
-            spin.toValue = -2 * Double.pi
-            spin.duration = 2.6
-            spin.repeatCount = .infinity
-            spin.timingFunction = CAMediaTimingFunction(name: .linear)
-            spin.preferredFrameRateRange = CAFrameRateRange(minimum: 15, maximum: 30, preferred: 30)
-            comet.add(spin, forKey: "turn")
-        }
     }
 }

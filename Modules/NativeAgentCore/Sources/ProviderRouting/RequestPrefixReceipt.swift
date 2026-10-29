@@ -1,36 +1,52 @@
 import Foundation
 import CryptoKit
 import PersistenceCore
+import NativeAgentShared
 
 // Blueprint: | `RequestPrefixReceipt.swift` | `RequestPrefixReceipt`: hashes exact encoded request byte slices without reserializing tools or exposing request text |
 
 /// Hash slices of the encoded request, never a second serialization of its tools.
 /// No request text leaves this value. Turn/history facts stay in the turn receipt.
 enum RequestPrefixReceipt {
-    static func payload(_ data: Data, prefix: ConversationPrefixTelemetrySnapshot) -> [String: JSONValue] {
-        let json = Slices(bytes: Array(data))
-        let root = json.members(0..<json.bytes.count)
-        let tools = root["tools"].map { Data(json.bytes[$0]) } ?? Data()
+    static func payload(_ data: Data, prefix: ConversationPrefixTelemetrySnapshot) throws -> [String: JSONValue] {
+        let bytes = Array(data)
+        func members(_ range: Range<Int>) throws -> [String: Range<Int>] {
+            guard bytes.indices.contains(range.lowerBound), bytes[range.lowerBound] == 123 else { return [:] }
+            return try JSONByteScanner.members(bytes, from: range.lowerBound).members.reduce(into: [:]) {
+                $0[$1.key] = $1.valueStart..<$1.end
+            }
+        }
+        let root = try members(0..<bytes.count)
+        let tools = root["tools"].map { Data(bytes[$0]) } ?? Data()
         var stable: [Range<Int>] = []
         if let system = root["system"] {
-            let blocks = json.elements(system)
+            let blocks = try JSONByteScanner.elements(bytes, from: system.lowerBound)
             // Anthropic's last system breakpoint ends the stable block. The
             // following dynamic block is deliberately outside this measurement.
-            if let end = blocks.lastIndex(where: { json.members($0)["cache_control"] != nil }) {
+            if let end = try blocks.lastIndex(where: { try members($0)["cache_control"] != nil }) {
                 stable = Array(blocks[...end])
             } else {
                 stable = [system]
             }
         } else if let instructions = root["instructions"] {
             stable = [instructions]
-        } else if let messages = root["messages"], let first = json.elements(messages).first,
-                  let role = json.members(first)["role"],
-                  ["system", "developer"].contains(json.string(role)) {
+        } else if let messages = root["messages"],
+                  let first = try JSONByteScanner.elements(bytes, from: messages.lowerBound).first,
+                  let role = try members(first)["role"],
+                  ["system", "developer"].contains((try? JSONSerialization.jsonObject(with: Data(bytes[role]), options: .fragmentsAllowed)) as? String ?? "") {
             stable = [first]
         }
-        let stableHash = digest(stable.map { Data(json.bytes[$0]) })
+        let stableHash = digest(stable.map { Data(bytes[$0]) })
         let toolsHash = digest([tools])
+        // Each conversation item exactly as sent (Responses `input`, Messages
+        // `messages`), 12 hex each: the first one that differs between two
+        // turns is where a provider's cache stops matching.
+        let items = try (root["input"] ?? root["messages"]).map {
+            try JSONByteScanner.elements(bytes, from: $0.lowerBound)
+        } ?? []
+        let wireItems = items.prefix(400).map { JSONValue.string(String(digest([Data(bytes[$0])]).prefix(12))) }
         return [
+            "wireItemDigests": .array(Array(wireItems)),
             "component.toolsSHA256": .string(toolsHash),
             "tools.wireSchemaBytes": .int(Int64(tools.count)),
             "component.stablePrefixSHA256": .string(stableHash),
@@ -48,78 +64,5 @@ enum RequestPrefixReceipt {
             hash.update(data: part)
         }
         return hash.finalize().map { String(format: "%02x", $0) }.joined()
-    }
-
-    /// The input is JSON already encoded by the adapter. Walk values to retain
-    /// their exact byte ranges, including escaped quotes and nested schemas.
-    private struct Slices {
-        let bytes: [UInt8]
-
-        func skipSpace(_ i: inout Int) {
-            while i < bytes.count && [9, 10, 13, 32].contains(bytes[i]) { i += 1 }
-        }
-
-        func value(_ i: inout Int) -> Range<Int> {
-            skipSpace(&i)
-            let start = i
-            guard i < bytes.count else { return start..<i }
-            if bytes[i] == 34 {
-                i += 1
-                while i < bytes.count {
-                    let byte = bytes[i]
-                    i += 1
-                    if byte == 92 { i = min(i + 1, bytes.count) }
-                    else if byte == 34 { break }
-                }
-            } else if bytes[i] == 91 || bytes[i] == 123 {
-                let end: UInt8 = bytes[i] == 91 ? 93 : 125
-                i += 1
-                while i < bytes.count {
-                    skipSpace(&i)
-                    guard i < bytes.count else { break }
-                    if bytes[i] == end { i += 1; break }
-                    if bytes[i] == 44 || bytes[i] == 58 { i += 1 }
-                    else { _ = value(&i) }
-                }
-            } else {
-                while i < bytes.count && ![9, 10, 13, 32, 44, 58, 93, 125].contains(bytes[i]) { i += 1 }
-            }
-            return start..<i
-        }
-
-        func string(_ range: Range<Int>) -> String {
-            (try? JSONSerialization.jsonObject(with: Data(bytes[range]), options: .fragmentsAllowed)) as? String ?? ""
-        }
-
-        func members(_ range: Range<Int>) -> [String: Range<Int>] {
-            guard bytes.indices.contains(range.lowerBound), bytes[range.lowerBound] == 123 else { return [:] }
-            var i = range.lowerBound + 1
-            var result: [String: Range<Int>] = [:]
-            while i < range.upperBound {
-                skipSpace(&i)
-                guard i < range.upperBound, bytes[i] == 34 else { break }
-                let key = string(value(&i))
-                skipSpace(&i)
-                i += 1 // colon
-                result[key] = value(&i)
-                skipSpace(&i)
-                if i < range.upperBound, bytes[i] == 44 { i += 1 } else { break }
-            }
-            return result
-        }
-
-        func elements(_ range: Range<Int>) -> [Range<Int>] {
-            guard bytes.indices.contains(range.lowerBound), bytes[range.lowerBound] == 91 else { return [] }
-            var i = range.lowerBound + 1
-            var result: [Range<Int>] = []
-            while i < range.upperBound {
-                skipSpace(&i)
-                guard i < range.upperBound, bytes[i] != 93 else { break }
-                result.append(value(&i))
-                skipSpace(&i)
-                if i < range.upperBound, bytes[i] == 44 { i += 1 } else { break }
-            }
-            return result
-        }
     }
 }

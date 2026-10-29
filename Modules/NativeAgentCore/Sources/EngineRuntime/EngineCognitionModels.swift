@@ -7,10 +7,9 @@ import NativeAgentShared
 import PersistenceCore
 import DeviceSync
 import DreamREMCycle
-// Blueprint: | `EngineCognitionModels.swift` | `LivingStatusSnapshot` and `DreamRunResult` completion and status interpretation |
+// Blueprint: | `EngineCognitionModels.swift` | `LivingStatusSnapshot` and `DreamReport` completion and status interpretation |
 
 public struct LivingStatusSnapshot: Sendable, Equatable {
-    public var enabled: Bool
     public var posture: String
     public var postureStatus: String
     public var bodyState: String
@@ -23,23 +22,6 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
     public var approvalsSummary: String
     public var lastDreamSummary: String
     public var needsText: String
-    public var showsOrganismDetails: Bool
-
-    public var visibleText: [String] {
-        [
-            posture,
-            bodyState,
-            behaviorLine,
-            homeLine,
-            whyLine,
-            carryLine,
-            innerLine,
-            deskSummary,
-            approvalsSummary,
-            lastDreamSummary,
-            needsText,
-        ]
-    }
 
     public static func make(
         organism: OrganismSnapshot,
@@ -57,7 +39,6 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
         let posture = Self.posture(for: organism)
         let behaviorLine = Self.behaviorLine(for: organism)
         return LivingStatusSnapshot(
-            enabled: organism.enabled,
             posture: posture,
             postureStatus: (needsUser || needsAttention) ? "warn" : (organism.enabled ? "ok" : "disabled"),
             bodyState: Self.bodyState(for: organism),
@@ -81,8 +62,7 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
             approvalsSummary: pendingApprovals > 0
                 ? "\(pendingApprovals) approval\(pendingApprovals == 1 ? "" : "s") pending" : "no approvals pending",
             lastDreamSummary: latestDream.map { "last dream \($0.date)" } ?? "no dream entry yet",
-            needsText: needsUser ? "needs you" : (needsAttention ? "no action needed" : "needs nothing"),
-            showsOrganismDetails: organism.enabled
+            needsText: needsUser ? "needs you" : (needsAttention ? "no action needed" : "needs nothing")
         )
     }
 
@@ -144,7 +124,7 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
         let body = organism.bodySchema
         if !body.providersHealthy || !body.toolHandsAvailable { return "Provider or tool path is brittle, so completion claims tighten." }
         if !body.notificationPathHealthy || !body.iPhoneReachable { return "Phone path is stale, so delivery needs receipts." }
-        if body.resourcePressure != .nominal { return "Resource pressure is shaping loop budget." }
+        if body.resourcePressure != .nominal { return "Resource pressure is present in her body state." }
         if !body.memoryHealthy || !body.dreamHealthy || !body.approvalChannelsOpen {
             return "A local body path needs \(agentDisplayName)'s attention, but no user action is requested."
         }
@@ -198,7 +178,6 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
         return String(oneLine.prefix(157)) + "..."
     }
     public init(
-        enabled: Bool,
         posture: String,
         postureStatus: String,
         bodyState: String,
@@ -210,10 +189,8 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
         deskSummary: String,
         approvalsSummary: String,
         lastDreamSummary: String,
-        needsText: String,
-        showsOrganismDetails: Bool
+        needsText: String
     ) {
-        self.enabled = enabled
         self.posture = posture
         self.postureStatus = postureStatus
         self.bodyState = bodyState
@@ -226,23 +203,22 @@ public struct LivingStatusSnapshot: Sendable, Equatable {
         self.approvalsSummary = approvalsSummary
         self.lastDreamSummary = lastDreamSummary
         self.needsText = needsText
-        self.showsOrganismDetails = showsOrganismDetails
     }
 
 }
 
-extension DreamRunResult {
+extension DreamReport {
     public static func completionFailure(_ result: [String: Any]) -> String? {
         let errors = result["errors"] as? [String] ?? []
-        guard DoctorStatusProjection.boolValue(result["ok"]) == true, errors.isEmpty else {
+        guard DoctorReadout.boolValue(result["ok"]) == true, errors.isEmpty else {
             return errors.isEmpty ? "The dream run did not complete successfully." : errors.joined(separator: "; ")
         }
         return nil
     }
 
     public static func statusText(_ result: [String: Any]) -> String {
-        let entries = DoctorStatusProjection.intValue(result["entriesWritten"]) ?? 0
-        let disabled = DoctorStatusProjection.boolValue(result["disabled"]) ?? false
+        let entries = DoctorReadout.intValue(result["entriesWritten"]) ?? 0
+        let disabled = DoctorReadout.boolValue(result["disabled"]) ?? false
         if disabled { return "Dream cycle disabled" }
         if let reason = result["skipReason"] as? String {
             switch reason {

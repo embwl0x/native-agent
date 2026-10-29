@@ -39,58 +39,19 @@ public enum PersonaEngineError: Error, LocalizedError {
     }
 }
 
-// MARK: - PersonaDoc
-
-/// A single persona doc loaded from disk. Read-only — mutation of persona
-/// docs is out of scope for subsystem #5a (USER.md cap, GROWTH.md cap,
-/// REM-cycle writes, and memory consolidation are deliberately carved out
-/// for subsystems #10 DreamREMCycle and #11 SelfImprovement).
-///
-/// `id` is the filename without the `.md` suffix (e.g. `SOUL`, `VOICE`,
-/// `SOUL.template`). `sizeBytes` is the UTF-8 byte length of `content` —
-/// always equal to the file size on disk for well-formed UTF-8 markdown.
-/// `mtime` is the filesystem modification time at read-time.
-public struct PersonaDoc: Sendable, Equatable, Codable {
-    public let id: String
-    public let content: String
-    public let sizeBytes: Int
-    public let mtime: Date
-
-    public init(id: String, content: String, sizeBytes: Int, mtime: Date) {
-        self.id = id
-        self.content = content
-        self.sizeBytes = sizeBytes
-        self.mtime = mtime
-    }
-}
-
 // MARK: - Persona-root resolver
 
 public enum PersonaRootResolver {
     /// Resolve persona strictly inside an injected data root.
     ///
-    /// Secondary runtimes and hermetic tests must not fall through to the
-    /// process environment, a stamped repository, or the developer checkout:
-    /// those are production seed sources and can expose the personal persona
-    /// to an otherwise isolated body. Always `<dataRoot>/persona`.
+    /// Isolated bodies never use checkout persona seeds: always `<dataRoot>/persona`.
     public static func resolveIsolated(dataRoot: URL) -> URL {
         dataRoot.standardizedFileURL.appendingPathComponent("persona", isDirectory: true)
     }
-
-    /// The persona root this process runs: `PersistenceCore.defaultPersonaRoot`
-    /// for the given data root.
-    public static func resolve(
-        fileManager: FileManager = .default,
-        dataRootProvider: () -> URL = { PersistenceCore.defaultDataRoot() }
-    ) -> URL {
-        PersistenceCore.defaultPersonaRoot(dataRoot: dataRootProvider(), fileManager: fileManager)
-    }
 }
 
-/// Result of a `personaWrite` / `personaAppendSection` mutation, mirroring the
-/// daemon tool's `{ok, kind, path, backup_path, bytes_*}` dict. `bytesWritten`
-/// carries the full-file byte count for a replace; `bytesAppended` the appended
-/// section byte count for an append (the other is `nil`).
+/// Mutation receipt: `bytesWritten` counts a full replacement; `bytesAppended`
+/// counts the appended section. The unused count is `nil`.
 public struct PersonaToolWriteResult: Sendable, Equatable {
     public let kind: String
     public let path: String
@@ -116,13 +77,11 @@ public struct PersonaToolWriteResult: Sendable, Equatable {
 public actor SwiftNativePersonaEngine {
     private let root: URL
     private let fileManager: FileManager
-    /// Data root used to resolve `<dataRoot>/memory/profile.json` when
-    /// rendering personality-doc defaults. Defaults to the same path the
-    /// daemon uses; tests pass a temp dir to seed a custom profile.
+    /// Data root for profile-backed personality-document defaults.
     private let dataRoot: URL
 
     public init(
-        root: URL = PersonaRootResolver.resolve(),
+        root: URL = PersistenceCore.defaultPersonaRoot(),
         fileManager: FileManager = .default,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) {
@@ -143,75 +102,8 @@ public actor SwiftNativePersonaEngine {
 
     public var personaRoot: URL { root }
 
-    /// Data root used to resolve `<dataRoot>/memory/profile.json` for the
-    /// write-side `savePersonality` path (PersonaEngine+Writes.swift). Exposed
-    /// so the write extension can locate the profile file the daemon's
-    /// `personality_path()` points at.
+    /// Shared data root for profile reads and writes.
     public var dataRootURL: URL { dataRoot }
-
-    public func listPersonaDocs() async throws -> [PersonaDoc] {
-        // Missing root → empty list (matches Python's behavior when the
-        // resolver lands on a nonexistent legacy fallback).
-        guard fileManager.fileExists(atPath: root.path) else { return [] }
-
-        let entries: [URL]
-        do {
-            entries = try fileManager.contentsOfDirectory(
-                at: root,
-                includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey, .fileSizeKey],
-                options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants]
-            )
-        } catch {
-            throw PersonaEngineError.rootUnreadable(reason: error.localizedDescription)
-        }
-
-        var docs: [PersonaDoc] = []
-        for entry in entries {
-            let name = entry.lastPathComponent
-            // Filter rules — mirror the daemon's "persona doc" intent:
-            //   - must end with `.md` (case-sensitive — matches Python's
-            //     `glob("*.md")` behavior on case-sensitive FS, and the
-            //     daemon's `Path.suffix == ".md"` check).
-            //   - skip `.bak` backup files. `USER.md.bak`, `SOUL.md.pre-...bak`
-            //     etc. are the rollback backups the daemon writes pre-cap.
-            //   - skip dotfiles (.DS_Store etc.) — also caught by
-            //     skipsHiddenFiles but defended here too.
-            //   - skip anything inside subdirs (skipsSubdirectoryDescendants
-            //     handles this above).
-            //   - template.md files (SOUL.template.md) ARE included — the
-            //     daemon treats them as part of the persona surface for
-            //     first-run onboarding.
-            guard name.hasSuffix(".md") else { continue }
-            if name.hasPrefix(".") { continue }
-            if name.contains(".bak") { continue }
-            // Resource values for size + mtime.
-            guard let values = try? entry.resourceValues(
-                forKeys: [.isRegularFileKey, .contentModificationDateKey]
-            ),
-                  values.isRegularFile == true else { continue }
-
-            let content: String
-            do {
-                content = try Self.readPersonaDocument(at: entry)
-            } catch {
-                // Unreadable file (perms / encoding) — skip silently rather
-                // than fail the whole listing. The daemon does the same.
-                continue
-            }
-            let mtime = values.contentModificationDate ?? Date(timeIntervalSince1970: 0)
-            let bytes = content.utf8.count
-            let id = String(name.dropLast(3)) // strip ".md"
-            docs.append(PersonaDoc(
-                id: id,
-                content: content,
-                sizeBytes: bytes,
-                mtime: mtime
-            ))
-        }
-
-        docs.sort { $0.id < $1.id }
-        return docs
-    }
 
     /// Every persona reader excludes legacy episodic logs from GROWTH context.
     static func readPersonaDocument(at url: URL) throws -> String {
@@ -228,49 +120,19 @@ public actor SwiftNativePersonaEngine {
             .joined(separator: "\n")
     }
 
-    // MARK: - Wire-shape adapter for /v1/personality/docs
-    //
-    // Daemon parity:
-    // ALWAYS returns one entry per fixed spec id (SOUL/VOICE/GROWTH/USER/
-    // AGENTS) — never a dir-scan. Missing files surface as `content: ""` and
-    // `updatedAt: null`, matching `path.exists() ? iso(stat.st_mtime) : None`.
-    // Top-level `updatedAt` is the response timestamp (`now_iso()`).
-    //
-    // The previous implementation delegated to `listPersonaDocs()` (a dir
-    // scan), which (a) returned zero rows when the persona dir was empty,
-    // (b) returned arbitrary `*.md` rows when extras existed, and (c)
-    // computed top-level updatedAt as max(mtime) instead of "now". All
-    // three diverged from the daemon contract; the daemon's contract is
-    // the source of truth across surfaces.
+    // MARK: - Persona document listing
+
+    /// Scaffold profile-backed defaults, then list fixed specs with file mtimes; the listing timestamp is now.
     public func listPersonaDocSpecs() async throws -> PersonaDocListing {
-        // Scaffold first so content and updatedAt describe persisted defaults
-        // (SOUL.md gates, USER.md skipped, each write locked; failures propagate).
         _ = try await scaffoldMissingDocs()
-        // Local helper avoids capturing a non-Sendable ISO8601DateFormatter
-        // in the loop body (Swift 6 strict-concurrency would flag sending
-        // a class instance into an actor-isolated closure body).
-        func isoString(_ d: Date) -> String {
-            let iso = ISO8601DateFormatter()
-            iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            return iso.string(from: d)
-        }
-        // A missing root is the legitimate first-run state and therefore
-        // produces the fixed, empty document specs below. A root *file* is
-        // different: it cannot contain a persona and must not be rendered as
-        // a fresh account, because doing so would offer onboarding over a
-        // corrupted existing path. Surface that distinction to the mounted
-        // loader so it can retain a known-good document set or show an
-        // unavailable state instead of a false Create card.
+        // A missing root permits first-run specs; a root file is an error, never an onboarding state.
         var rootIsDirectory = ObjCBool(false)
         if fileManager.fileExists(atPath: root.path, isDirectory: &rootIsDirectory),
            !rootIsDirectory.boolValue {
             throw PersonaEngineError.rootUnreadable(reason: "persona root is not a directory")
         }
 
-        // Once SOUL.md exists (the canonical "persona is initialized"
-        // sentinel), missing mutable persona docs return their default content.
-        // USER.md is different: it is a MemoryV2 projection. If it is missing,
-        // leave it empty until MemoryV2 regenerates it from SQLite.
+        // SOUL.md gates defaults; missing USER.md stays empty until MemoryV2 regenerates it.
         let soulURL = root.appendingPathComponent("SOUL.md")
         let soulInitialized = fileManager.fileExists(atPath: soulURL.path)
 
@@ -286,13 +148,10 @@ public actor SwiftNativePersonaEngine {
                     forKeys: [.contentModificationDateKey]
                 ),
                    let mtime = values.contentModificationDate {
-                    updatedAt = isoString(mtime)
+                    updatedAt = NativeTimestampFormat.fractionalZulu(mtime)
                 }
             } else if soulInitialized && spec.id != "SOUL" && spec.id != "USER" {
-                // Persona is initialized but this mutable doc is missing.
-                // Surface the default content but leave updatedAt nil to signal
-                // "this is the default, not a persisted write". USER is skipped
-                // because MemoryV2 owns that file.
+                // Unpersisted defaults retain a nil updatedAt.
                 content = Self.defaultPersonalityDocContent(
                     id: spec.id,
                     profile: PersonaCompiler.loadProfile(dataRoot: dataRoot)
@@ -307,21 +166,10 @@ public actor SwiftNativePersonaEngine {
                 updatedAt: updatedAt
             ))
         }
-        // Top-level updatedAt: daemon uses `now_iso()` — mirror that exactly.
-        return PersonaDocListing(docs: docs, updatedAt: isoString(Date()))
+        return PersonaDocListing(docs: docs, updatedAt: NativeTimestampFormat.fractionalZulu(Date()))
     }
 
-    // MARK: - Bug 4 fix: daemon-default personality doc content
-    //
-    // Mirrors `default_personality_doc_content(doc_id)` at
-    // the retired daemon. The daemon parameterizes the
-    // body with the user's loaded personality profile (name, personaKind,
-    // essence, voice, examples, forbiddenPatterns). Swift's
-    // listPersonaDocSpecs is READ-ONLY and does not load profile.json,
-    // so we render with the daemon's `default_personality()` defaults
-    // (name="NativeAgent", personaKind="AI", essence/voice/examples from
-    // L34989-35033). Tests pin exact-bytes equality between the daemon
-    // and Swift forms.
+    // MARK: - Profile-backed document defaults
     nonisolated static func defaultPersonalityDocContent(
         id: String,
         profile: CompiledPersonalityProfile = .defaults,
@@ -331,13 +179,7 @@ public actor SwiftNativePersonaEngine {
         let personaKind = profile.personaKind
         let essence = profile.essence
         let voice = profile.voice
-        // Bug D fix (2026-05-31, 4th-round review): when profile fields
-        // are empty, mirror the daemon's exact fallback strings (see
-        // the retired daemon in `default_personality_doc_content`):
-        // `"- Lead with the useful answer."` for examples and
-        // `"- Generic assistant filler."` for forbiddenPatterns.
-        // The prior version reached for CompiledPersonalityProfile.defaults
-        // which has DIFFERENT multi-line text — drift relative to Python.
+        // Empty style lists use document-specific placeholders, distinct from profile defaults.
         let examplesBody: String
         if profile.examples.isEmpty {
             examplesBody = "- Lead with the useful answer."
@@ -392,13 +234,7 @@ public actor SwiftNativePersonaEngine {
 
             """
         case "GROWTH":
-            // Bug D fix (2026-05-31, 4th-round review): mirror Python's
-            // `now_iso()` stamp in the baseline entry (daemon L34424).
-            // Tests tolerate the timestamp via regex match. Uses the
-            // same formatter shape as `listPersonaDocSpecs.isoString`.
-            let iso = ISO8601DateFormatter()
-            iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-            let stamp = iso.string(from: now)
+            let stamp = NativeTimestampFormat.fractionalZulu(now)
             return """
             # \(name) Growth
 

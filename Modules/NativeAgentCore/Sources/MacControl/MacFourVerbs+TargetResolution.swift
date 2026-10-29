@@ -6,16 +6,8 @@ import Foundation
 extension MacFourVerbs {
     // MARK: - Resolution
     //
-    // The ladder, and it NEVER falls back to "just click the first match":
-    //
-    //   1. exact label, case/whitespace-insensitive
-    //   2. ordinal address — "row 3", "button 2", "text area 1", "3" — the
-    //      content or role ordinals the render printed
-    //   3. unique label containing the whole request (one way only)
-    //   4. a ROLE HINT in the phrase ("the Send button") narrows a multi-match
-    //      at every rung, never widens one
-    //
-    // Unique, or ask.
+    // Handles, literal labels and rendered ordinals precede whole-request containment.
+    // Role hints only narrow matches. Each rung requires uniqueness or reports ambiguity.
 
     enum Resolution {
         case hit(ActTarget)
@@ -26,10 +18,7 @@ extension MacFourVerbs {
     /// `actionable` (every verb but scroll): when a control and a container
     /// (sheet, window, group, any region) share the name, the control wins.
     static func resolve(_ target: String, among targets: [ActTarget], actionable: Bool = true, pressing: Bool = false) -> Resolution {
-        // Her-screen 09-24 — a symbol names the control whose AX label is its
-        // word (Calculator's "=" is the button "Equals"). Only when no AX
-        // control carries the symbol itself; an AX control beats a pixel guess
-        // of the same glyph.
+        // Use a symbol's word alias only when no AX control carries the literal symbol.
         if let words = symbolAliasWords(target) {
             let raw = target.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             if !targets.contains(where: { !$0.isSupplemental && ($0.label ?? "").lowercased() == raw }) {
@@ -61,9 +50,7 @@ extension MacFourVerbs {
             return tiebreak(candidates).map { .hit($0) } ?? .ambiguous(candidates)
         }
 
-        // 2026-09-22: a control and its own caption/window routinely share a
-        // name. Two decisive cues only: the strictly longest matched span of
-        // her words, else the lone control among plain text/containers.
+        // Prefer the strictly longest name match, then a lone control over plain text or containers sharing its name.
         func tiebreak(_ candidates: [ActTarget]) -> ActTarget? {
             let spans = candidates.map { candidate -> Int in
                 let label = normalize(candidate.label ?? "")
@@ -83,8 +70,7 @@ extension MacFourVerbs {
                     || ($0.kind == presses[0].kind && $0.actions.isEmpty && $0.frame == nil)
             }) { return presses[0] }
             let picked = candidates.filter { controls.contains($0.kind) }
-            // Her-screen 09-24 — a window's title repeated by its own
-            // descendants (TextEdit's ruler row, scroll area) names the window.
+            // A lone window wins when only its descendants repeat its title.
             let windows = candidates.filter { $0.kind == "window" }
             if picked.isEmpty, windows.count == 1 {
                 let window = windows[0]
@@ -105,12 +91,8 @@ extension MacFourVerbs {
             return picked[0]
         }
 
-        // Her-screen 09-24 — a bare number. A real (AX) control literally
-        // named it wins (Calculator's "1" key); else it is the row the render
-        // numbered it. A pixel/OCR "1" is only a last resort when neither
-        // exists (the exact rungs below), never over a numbered row.
-        // Content rows (ordinal set) are not "controls named 1": a row 2
-        // labeled "1" must not beat numbered row 1.
+        // A non-row AX control literally named by the number wins, then its rendered row.
+        // Pixel/OCR labels enter only later exact matching; a row's label cannot override its number.
         if hint == nil, qualifier == nil, let number = Int(needle) {
             if let hit = narrow(targets.filter {
                 !$0.isSupplemental && $0.ordinal == nil && normalize($0.label ?? "") == needle
@@ -175,9 +157,7 @@ extension MacFourVerbs {
                 let ordinalMatches = address.kind == "row"
                     ? candidate.ordinal == address.ordinal
                     : candidate.kind == address.kind && candidate.roleOrdinal == address.ordinal
-                // 2026-09-22: live labels grow a value suffix ("Home - Memory
-                // usage - 78.0 MB"); a copied prefix agrees only when the rest is
-                // such a suffix, so a stale "Delete" never reaches "Delete All".
+                // Accept a copied label prefix only with a value suffix; `Delete` must never resolve to `Delete All`.
                 let label = candidate.label.map(normalize) ?? ""
                 let raw = (candidate.label ?? "").lowercased()
                     .split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
@@ -194,14 +174,11 @@ extension MacFourVerbs {
         if let hit = narrow(targets.filter { normalize($0.label ?? "") == needle && !needle.isEmpty && answers(target, $0) }) {
             return hit
         }
-        // Walk 4 — a field answers to the placeholder a person reads in it
-        // ("Search Maps"), only after every exact label on the screen.
+        // A field's placeholder answers only after every exact label on the screen.
         if let hit = narrow(targets.filter { !needle.isEmpty && $0.placeholder.map(normalize) == needle && answers(target, $0) }) {
             return hit
         }
-        // A short or numeric name is exact-only (her-screen 09-23: "7" became
-        // row 7 = the Apple menu, "6" became Help). No fuzzy rung, and a bare
-        // number is not an ordinal — "row 7" / "button 7" still are.
+        // Short and numeric names never enter fuzzy matching; numeric rows resolved above.
         if isExactOnlyName(needle) {
             return .none(nearest: nearest(to: needle, among: targets))
         }
@@ -212,8 +189,7 @@ extension MacFourVerbs {
         return .none(nearest: nearest(to: needle, among: targets))
     }
 
-    /// Her-screen 09-23 — does the element acted on ANSWER to what was asked?
-    /// Independent of which resolver rung picked it: an explicit address
+    /// Authorization is independent of the resolver rung: an explicit address
     /// ("row 3", "button 2 Remove"), an exact alias or kind, or the exact label.
     /// Fuzzy resolution never authorizes a named action; `exact` also refuses
     /// the one-way contains rung and a copied address whose label only
@@ -285,7 +261,6 @@ extension MacFourVerbs {
         "÷": ["divide"], "/": ["divide"],
         "+": ["add", "plus"],
         "−": ["subtract", "minus"], "-": ["subtract", "minus"],
-        "ac": ["all clear", "clear"], "c": ["clear", "all clear"],
         "%": ["percent"],
         "±": ["negate", "change sign"], "+/-": ["negate", "change sign"], "+/−": ["negate", "change sign"],
         ".": ["decimal", "point", "decimal point"],
@@ -612,6 +587,9 @@ extension MacFourVerbs {
     /// "right side" does not accidentally target a resize edge.
     static func safeAimPoint(for target: ActTarget, in frame: MacAXFrame,
                             describedBy phrase: String) -> MacPointerPosition? {
+        // A whole exact alias names the object, including any directional words.
+        let identity = normalize(phrase)
+        let phrase = target.aliases.contains { normalize($0) == identity } ? "" : phrase
         let aim = aimPoint(in: frame, describedBy: phrase)
         guard let preferred = MacPointerPosition(x: aim.x, y: aim.y) else { return nil }
         let words = aimWords(in: phrase)

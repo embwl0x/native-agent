@@ -1,7 +1,9 @@
 import ProviderRouting
+import NativeAgentShared
 import Foundation
 import AppKit
 import AuthenticationServices
+import NativeAgentCore
 // Blueprint: | `NativeOAuthPlatform+SessionRunner.swift` | `NativeOAuthPlatform`: `runAuthSession` |
 
 extension NativeOAuthPlatform {
@@ -9,120 +11,73 @@ extension NativeOAuthPlatform {
 
     @MainActor
     static func runAuthSession(authURL: URL,
-                                       expectedState: String,
-                                       providerId: String) async throws -> URL {
+                               expectedState: String,
+                               providerId: String) async throws -> URL {
         print("[oauth] starting ASWebAuthenticationSession for \(providerId)")
-        let gate = OAuthContinuationGate()
-        let sessionBox = OAuthSessionBox()
-        return try await withTaskCancellationHandler {
-          try Task.checkCancellation()
-          return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<URL, Error>) in
-            gate.install(cont)
-            let completion = makeAuthSessionCompletion(
-                expectedState: expectedState,
-                gate: gate,
-                sessionBox: sessionBox
-            )
-            let session = ASWebAuthenticationSession(
-                url: authURL,
-                callbackURLScheme: NativeOAuthFlow.callbackURLScheme,
-                completionHandler: completion
-            )
-            sessionBox.set(session)
-            session.presentationContextProvider = OAuthSignInPresenter.shared
-            // Keep existing browser-session cookies / autofill / 2FA.
-            session.prefersEphemeralWebBrowserSession = false
-
-            // Register a fallback so onOpenURL can resolve the continuation if
-            // the OS routes the redirect outside the ASWebAuth sheet.
-            PendingCallbacks.shared.register(
-                state: expectedState,
-                resolver: makeCallbackFallback(gate: gate, sessionBox: sessionBox)
-            )
-
-            OAuthSignInPresenter.shared.retain(session)
-            if !session.start() {
-                PendingCallbacks.shared.forget(state: expectedState)
-                OAuthSignInPresenter.shared.release(session)
-                gate.resume(throwing: NSError(
-                    domain: "NativeOAuthFlow", code: -11,
-                    userInfo: [NSLocalizedDescriptionKey:
-                        "ASWebAuthenticationSession.start() returned false."]))
-            }
-          }
-        } onCancel: {
-            gate.resume(throwing: CancellationError())
-            Task { @MainActor in
-                PendingCallbacks.shared.forget(state: expectedState)
-                if let session = sessionBox.session() {
-                    session.cancel()
-                    OAuthSignInPresenter.shared.release(session)
-                }
-            }
+        let gate = ContinuationOnce<Result<URL, Error>>()
+        var session: ASWebAuthenticationSession?
+        let deadline = Task {
+            do { try await Task.sleep(for: .seconds(600)) }
+            catch { return }
+            gate.resume(.failure(NSError(
+                domain: "NativeOAuthFlow", code: -12,
+                userInfo: [NSLocalizedDescriptionKey: "Browser sign-in timed out after ten minutes."])))
         }
-    }
+        let outcome: Result<URL, Error>
+        do {
+            let callback = try await withTaskCancellationHandler {
+                try Task.checkCancellation()
+                return await withCheckedContinuation { (cont: CheckedContinuation<Result<URL, Error>, Never>) in
+                    gate.install(cont)
+                    let authSession = ASWebAuthenticationSession(
+                        url: authURL,
+                        callbackURLScheme: NativeOAuthFlow.callbackURLScheme,
+                        completionHandler: { callbackURL, error in
+                            if let error { gate.resume(.failure(error)) }
+                            else if let callbackURL { gate.resume(.success(callbackURL)) }
+                            else {
+                                gate.resume(.failure(NSError(
+                                    domain: "NativeOAuthFlow", code: -10,
+                                    userInfo: [NSLocalizedDescriptionKey: "Auth session returned no URL and no error."])))
+                            }
+                        }
+                    )
+                    session = authSession
+                    authSession.presentationContextProvider = OAuthSignInPresenter.shared
+                    // Keep existing browser-session cookies / autofill / 2FA.
+                    authSession.prefersEphemeralWebBrowserSession = false
 
-    private static func makeAuthSessionCompletion(
-        expectedState: String,
-        gate: OAuthContinuationGate,
-        sessionBox: OAuthSessionBox
-    ) -> (URL?, Error?) -> Void {
-        { callbackURL, error in
+                    // Let onOpenURL resolve the same outcome if
+                    // the OS routes the redirect outside the ASWebAuth sheet.
+                    PendingCallbacks.shared.register(
+                        state: expectedState,
+                        resolver: { gate.resume(.success($0)) }
+                    )
+
+                    guard !Task.isCancelled else {
+                        gate.resume(.failure(CancellationError()))
+                        return
+                    }
+                    if !authSession.start() {
+                        gate.resume(.failure(NSError(
+                            domain: "NativeOAuthFlow", code: -11,
+                            userInfo: [NSLocalizedDescriptionKey:
+                                "ASWebAuthenticationSession.start() returned false."])))
+                    }
+                }
+            } onCancel: {
+                gate.resume(.failure(CancellationError()))
+            }
+            outcome = callback
+        } catch { outcome = .failure(error) }
+        // All exits join the same cleanup. Cancellation selects an outcome;
+        // it cannot let the caller return ahead of callback/session release.
+        await settle { @MainActor [session] in
+            deadline.cancel()
+            await deadline.value
             PendingCallbacks.shared.forget(state: expectedState)
-            releaseAuthSession(sessionBox)
-            if let error = error {
-                gate.resume(throwing: error)
-                return
-            }
-            guard let callbackURL = callbackURL else {
-                gate.resume(throwing: NSError(
-                    domain: "NativeOAuthFlow", code: -10,
-                    userInfo: [NSLocalizedDescriptionKey:
-                        "Auth session returned no URL and no error."]))
-                return
-            }
-            gate.resume(returning: callbackURL)
+            session?.cancel()
         }
-    }
-
-    private static func makeCallbackFallback(
-        gate: OAuthContinuationGate,
-        sessionBox: OAuthSessionBox
-    ) -> (URL) -> Void {
-        { url in
-            // Claim the callback before cancel() can report canceledLogin.
-            gate.resume(returning: url)
-            if let session = sessionBox.session() {
-                Task { @MainActor in
-                    session.cancel()
-                    OAuthSignInPresenter.shared.release(session)
-                }
-            }
-        }
-    }
-
-    private static func releaseAuthSession(_ sessionBox: OAuthSessionBox) {
-        guard let session = sessionBox.session() else { return }
-        Task { @MainActor in
-            OAuthSignInPresenter.shared.release(session)
-        }
-    }
-
-}
-
-final class OAuthSessionBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private weak var value: ASWebAuthenticationSession?
-
-    func set(_ session: ASWebAuthenticationSession) {
-        lock.lock()
-        value = session
-        lock.unlock()
-    }
-
-    func session() -> ASWebAuthenticationSession? {
-        lock.lock()
-        defer { lock.unlock() }
-        return value
+        return try outcome.get()
     }
 }

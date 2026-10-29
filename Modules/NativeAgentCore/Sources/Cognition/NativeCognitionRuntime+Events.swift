@@ -2,6 +2,7 @@ import Privacy
 import Foundation
 import CognitiveSubstrate
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import TurnTrace
 
@@ -20,11 +21,7 @@ enum NativeCognitiveEventFactory {
 
         let status = response["status"] ?? response["ok"] ?? "unknown"
         let lowerAction = normalizedAction.lowercased()
-        let lowerStatus = status.lowercased()
-        let isError = lowerStatus == "error"
-            || lowerStatus == "failed"
-            || lowerStatus == "blocked"
-            || response["ok"] == "false"
+        let isError = ["failed", "refused", "timeout"].contains(InboxAction.responseResultClass(response))
 
         let inboxAction = (payload["actionId"] ?? payload["action"] ?? "").lowercased()
         let isCorrection = lowerAction.hasPrefix("reject")
@@ -280,7 +277,7 @@ enum NativeCognitiveEventFactory {
     }
 
     private static func timestampID(_ date: Date) -> String {
-        String(Int64(date.timeIntervalSince1970 * 1000))
+        String(format: "%.0f", (date.timeIntervalSince1970 * 1000).rounded(.towardZero) + 0)
     }
 }
 

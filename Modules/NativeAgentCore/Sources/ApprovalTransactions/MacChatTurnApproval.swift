@@ -8,23 +8,6 @@ import NativeAgentShared
 /// A turn's approval projected from the canonical inbox, with only proven
 /// decisions represented as approved or denied.
 public struct MacChatTurnCardApproval: Sendable, Equatable {
-    /// What we can PROVE about the request. `approved` is reserved for a row
-    /// that says so in its own decision field; everything unreadable,
-    /// half-written, or resolved-without-a-decision lands in `unresolved`.
-    public enum Outcome: Sendable, Equatable {
-        /// Waiting for a person. The tool has not run.
-        case pending
-        /// A human decision is recorded: approved.
-        case approved
-        /// A human decision is recorded: denied.
-        case denied
-        /// Withdrawn or timed out before anyone decided.
-        case expired
-        /// Settled in some way we cannot read as a decision. Never rendered as
-        /// success.
-        case unresolved
-    }
-
     public let approvalId: String
     /// The action the inbox record names (its `action` field, e.g. the tool).
     public let toolName: String
@@ -35,13 +18,13 @@ public struct MacChatTurnCardApproval: Sendable, Equatable {
     /// bridge, named as the person named it in Trust → Connected agents.
     /// Nil for the person's own approvals, which is every ordinary turn.
     public var requester: String? = nil
-    public let outcome: Outcome
+    public let outcome: ApprovalRequest.Outcome
 
     /// Only a pending request can be decided from here.
     public var isActionable: Bool { outcome == .pending }
 }
 
-public enum MacChatTurnApprovalProjection {
+public enum TurnApprovalRead {
     /// An exact-turn approval carries this session and was requested no earlier
     /// than the turn opened. Deduplicated rows use lastRequestedAt, since their
     /// creation can belong to an earlier turn. Unreadable provenance fails closed.
@@ -65,7 +48,7 @@ public enum MacChatTurnApprovalProjection {
         guard !candidates.isEmpty else { return nil }
 
         let chosen = candidates
-            .map { (candidate: $0, outcome: outcome(for: $0.row)) }
+            .map { (candidate: $0, outcome: ApprovalRequest.Outcome(status: $0.row.status, decision: $0.row.decision)) }
             .sorted { lhs, rhs in
                 let lhsPending = lhs.outcome == .pending
                 let rhsPending = rhs.outcome == .pending
@@ -191,37 +174,6 @@ public enum MacChatTurnApprovalProjection {
         return String(trimmed.prefix(inputSummaryLimit)) + "\u{2026}"
     }
 
-    /// Reads a row's outcome. The default arm is `.unresolved` on purpose: a
-    /// status this projection does not understand must never be rendered as a
-    /// decision that was never made.
-    private static func outcome(for row: ApprovalRecord) -> MacChatTurnCardApproval.Outcome {
-        let status = row.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let decision = row.decision?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-
-        switch decision {
-        case "approved":
-            return .approved
-        case "denied", "rejected":
-            return .denied
-        case "canceled", "cancelled", "expired":
-            return .expired
-        default:
-            break
-        }
-        switch status {
-        case "pending":
-            // Pending is only pending while nothing has been decided; a row
-            // carrying an unreadable decision already left the waiting state.
-            return decision == nil ? .pending : .unresolved
-        case "canceled", "cancelled", "expired", "withdrawn":
-            return .expired
-        default:
-            // "resolved" with no readable decision, "orphaned", or anything
-            // this build has never seen.
-            return .unresolved
-        }
-    }
-
     private static func displayAction(_ row: ApprovalRecord) -> String {
         nonEmpty(row.action).map(ToolActivityPresentation.title) ?? nonEmpty(row.title) ?? "this action"
     }
@@ -243,36 +195,5 @@ extension MacChatTurnCardApproval {
         case .pending, .expired, .unresolved: return true
         case .approved, .denied: return false
         }
-    }
-
-}
-
-/// The inline approval card is a safety control, so it has an explicit state
-/// for missing authority rather than presenting disabled actions as though the
-/// card were merely busy. This also keeps an absent/stale approvals refresh
-/// from turning a still-pending request into a resolved-looking card.
-public enum InlineApprovalPresentation {
-    public enum State: Equatable, Sendable {
-        case unavailable
-        case pending
-        case resolved(decision: String)
-    }
-
-    public static func state(
-        approvalID: String,
-        externalStatus: String?,
-        externalDecision: String?
-    ) -> State {
-        guard !approvalID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return .unavailable
-        }
-        let status = externalStatus?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        guard let status, !status.isEmpty, status != "pending" else {
-            return .pending
-        }
-        return .resolved(decision: externalDecision?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "")
     }
 }

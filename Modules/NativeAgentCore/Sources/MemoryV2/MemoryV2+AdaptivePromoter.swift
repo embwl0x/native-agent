@@ -1,4 +1,6 @@
+import Transcripts
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
@@ -6,224 +8,64 @@ import CognitiveSubstrate
 import ChatTurnContracts
 import TurnTrace
 
-// Blueprint: | `MemoryV2+AdaptivePromoter.swift` | `AdaptiveMemoryPromoter`: after-turn fact interpretation and held moment lanes, bounded staging and memory-manager outcomes |
+// Blueprint: | `MemoryV2+AdaptivePromoter.swift` | `AdaptiveMemoryPromoter` actor and live interpretation; meaning before apply, trusted fact acceptance by operation identity, learned complete-no-op deferral and labels under the judging model |
 
-// MARK: - AdaptiveMemoryPromoter
-//
-// The after-turn promotion path: observe a (user, assistant) turn and stage
-// what is worth keeping as a proposal for the person to approve.
-//
-// One interpretation feeds the existing fact and moment lanes:
-//   • THE FACT LANE is the memory manager (MemoryV2+MemoryManager.swift,
-//     2026-09-11). It sees the exchange, the top-K memories already kept, and
-//     what is already pending, and returns add/update/skip decisions. It
-//     replaced a regex template extractor plus an on-device Foundation Models
-//     pass plus a pile of rejection regexes — all deleted, because every fix to
-//     that shape was one more regex.
-//   • THE MOMENTS LANE (MemoryV2+Moments.swift) is unchanged.
-//
-// Neither lane has a rule-based fallback, deliberately: a memory invented by a
-// pattern match is worse than a memory missed.
+// Only the shared interpretation judges facts and care movements from the exchange and known memories.
+// Facts from the owner, trusted peers or her reply are kept; other facts await review.
 
-public struct AdaptiveCandidate: Sendable, Equatable {
-    public let content: String
-    public let score: Double
-    public let kind: String
-
-    public init(content: String, score: Double, kind: String) {
-        self.content = content
-        self.score = score
-        self.kind = kind
-    }
-}
-
-public enum MemorySemanticExtractionStatus: String, Sendable {
-    case unavailable, disabled, emptyInput, succeeded, failed, timedOut, unreported, skipped
-}
-
-/// Payload-free evidence, not a claim that an extracted candidate is true.
-public struct AdaptiveExtractionReport: Sendable {
-    public let candidates: [AdaptiveCandidate]
-    public let semanticStatus: MemorySemanticExtractionStatus
-    public let semanticCandidateCount: Int
-    public let failure: AfterTurnMemoryFailure?
-
-    public init(candidates: [AdaptiveCandidate], semanticStatus: MemorySemanticExtractionStatus,
-                semanticCandidateCount: Int = 0, failure: AfterTurnMemoryFailure? = nil) {
-        self.candidates = candidates
-        self.semanticStatus = semanticStatus
-        self.semanticCandidateCount = max(0, semanticCandidateCount)
-        self.failure = failure
-    }
-}
-
-public struct AdaptiveMemoryObservation: Sendable {
-    public let proposals: [ProposalRecord]
-    public let extraction: AdaptiveExtractionReport
-    /// What the moment pass did this turn, one word, for the turn trace:
-    /// disabled / noExtractor / capped / abstained / extractionFailed /
-    /// extractorUnavailable / cancelled / belowSalience / noQuote /
-    /// gated / ungrounded / tombstoned / staged / failed; peer-seat turns
-    /// never run the pass and report unreported. A moment that silently never stages is
-    /// the drift this exists to make visible.
-    public let momentOutcome: String
-    /// Decisions the fact lane refused this turn: below the confidence floor,
-    /// refused by `MemoryManagerLane.statementRejectionReason`, an embedding
-    /// near-duplicate of something already kept or pending, tombstoned, or a
-    /// staging error.
-    public let hygieneRejectedCount: Int
-    public let savedCorrectionCount: Int
-    public let pendingCorrectionCount: Int
-    public let failedCorrectionCount: Int
-    /// Why the novelty gate skipped the memory call this turn, or nil when it
-    /// ran (Phase 5A). Rides to the turn trace so the skip rate is measurable.
-    public var noveltySkipReason: String?
-
-    init(
-        proposals: [ProposalRecord],
-        extraction: AdaptiveExtractionReport,
-        momentOutcome: String = "unreported",
-        hygieneRejectedCount: Int = 0,
-        savedCorrectionCount: Int = 0,
-        pendingCorrectionCount: Int = 0,
-        failedCorrectionCount: Int = 0
-    ) {
-        self.proposals = proposals
-        self.extraction = extraction
-        self.momentOutcome = momentOutcome
-        self.hygieneRejectedCount = max(0, hygieneRejectedCount)
-        self.savedCorrectionCount = savedCorrectionCount
-        self.pendingCorrectionCount = pendingCorrectionCount
-        self.failedCorrectionCount = failedCorrectionCount
-    }
-}
-
-// MARK: - Shared candidate vocabulary
-
-/// What the agent goes by, and the word-stem folding the lanes ground on.
-///
-/// This USED to hold the fact lane's rejection gate as well — first-person,
-/// about-assistant and grounding regexes over regex-extracted captures. That
-/// extractor is gone (2026-09-11: the memory manager replaced it) and so is the
-/// gate; `MemoryManagerLane.statementRejectionReason` is the one shape check on
-/// the manager's answer, and it reads the two members kept below.
-public enum AdaptiveCandidateHygiene {
-    /// Names the assistant goes by, lowercased. The app adds the persona's
-    /// display name at launch; "assistant" is always in.
-    ///
-    /// Written from MainActor (the app teaching the persona's name) and read
-    /// from the memory pipeline off-main, so the set lives behind a lock and
-    /// is only ever reached through `insertAssistantName` / `assistantNames`.
-    private static let assistantNamesLock = NSLock()
-    nonisolated(unsafe) private static var _assistantNames: Set<String> = ["assistant"]
-
-    /// A locked snapshot; iterate this, never the storage.
-    public static var assistantNames: Set<String> {
-        assistantNamesLock.lock()
-        defer { assistantNamesLock.unlock() }
-        return _assistantNames
-    }
-
-    /// Teach hygiene one more name the assistant goes by.
-    public static func insertAssistantName(_ name: String) {
-        let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !normalized.isEmpty else { return }
-        assistantNamesLock.lock()
-        _assistantNames.insert(normalized)
-        assistantNamesLock.unlock()
-    }
-    private static let stopwords: Set<String> = [
-        "user", "users", "user's", "the", "and", "that", "this", "with", "from", "into",
-        "have", "has", "had", "was", "were", "been", "being", "are", "is", "its", "it's",
-        "for", "not", "but", "they", "them", "their", "there", "when", "then", "than",
-        "what", "which", "who", "how", "why", "about", "also", "just", "like", "likes",
-        "very", "really", "some", "more", "most", "such", "over", "only", "still",
-        "because", "cause", "does", "did", "will", "would", "could", "should",
-    ]
-
-    /// Lowercased word stems (letters, digits, apostrophes), stopwords out,
-    /// short words out, common suffixes shaved so "works" grounds on "work".
-    static func contentStems(_ text: String) -> Set<String> {
-        var out = Set<String>()
-        for raw in text.split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "'" && $0 != "’" }) {
-            var word = String(raw).replacingOccurrences(of: "’", with: "'")
-            if word.hasSuffix("'s") { word.removeLast(2) }
-            guard word.count >= 4, !stopwords.contains(word) else { continue }
-            for suffix in ["ing", "ies", "ed", "es", "s"] where word.count - suffix.count >= 4 && word.hasSuffix(suffix) {
-                word.removeLast(suffix.count)
-                break
-            }
-            out.insert(word)
-        }
-        return out
-    }
-}
-
-// MARK: - AdaptiveMemoryPromoter
-
-/// moments_held.json is recovery state: local backup/export and memory
-/// PrivacyMap, no phone sync. Diagnostic moment receipts are no longer written.
+/// The journal owns unfinished turns; the retired held file is import-only.
 public actor AdaptiveMemoryPromoter {
     public static let shared = AdaptiveMemoryPromoter()
 
-    private var memory: SwiftNativeMemoryV2?
-    /// The fact lane (2026-09-11). nil = off, and off stages no facts at all —
-    /// there is no regex conformer to fall back to, by design.
-    private var memoryManager: (any MemoryManaging)?
+    var memory: SwiftNativeMemoryV2?
+    /// A nil memory manager stages no facts.
+    var memoryManager: (any MemoryManaging)?
     /// The person's configured name, read fresh so a rename shows up.
-    private var personName: (@Sendable () -> String?)? = nil
-    /// Given the turn's origin and her reply.
-    private var prepareInterpretation: (@Sendable (AfterTurnOrigin, String) async -> AfterTurnContext?)?
-    /// The Bool is true when the novelty gate skipped the call (Phase 5A).
-    private var finishInterpretation: (@Sendable (AfterTurnContext, AfterTurnInterpretation?, Bool) async -> Void)?
-    private var observationTail: Task<AdaptiveMemoryObservation, Never>?
-    private var observationID: UUID?
-    private var stopped = false
-    private var heldDrainInFlight = false
-    private var heldDrainIsIdle: (@Sendable () async -> Bool)?
-    /// The Setup page's "Moments she keeps" switch, injected as a closure so
-    /// this module never reads UserDefaults. nil = no owner configured, which
-    /// means ON — an embedder that never wires the switch keeps the lane's
-    /// pre-switch behavior exactly.
-    private var momentsEnabled: (@Sendable () -> Bool)?
-    /// Settings ▸ "Recurring memories are proposed as facts", injected as a closure so
-    /// this module never reads the trust policy itself. nil = no owner
-    /// configured, which means ON — byte-identical to the pre-switch promoter.
-    /// The moments lane above has its OWN switch and is not affected by this.
-    private var adaptivePromotionEnabled: (@Sendable () -> Bool)?
-    /// Daily-cap bookkeeping. Rebuilt from storage on the first moment of a
-    /// new calendar day, then counted in memory — so the cap costs one scan a
-    /// day, not one a turn. A restart re-scans, which is the honest direction.
-    private var momentDayKey: String?
-    /// Slots SPENT today. This is a reservation counter, not an observation:
-    /// it is incremented before the model call and released if nothing stages.
-    private var momentDayCount = 0
-    /// True while the once-a-day storage scan is in flight. The day's quota is
-    /// held at zero until it lands, so a burst of concurrent turns starts ONE
-    /// scan and the losers skip the turn instead of racing a stale quota.
-    private var momentDayScanInFlight = false
-    /// Normalized content of every moment staged today. Her review turn
-    /// quotes the moment back, and the extractor re-staged the same sentence
-    /// from the quote (live, 2026-09-02, one turn after she accepted it).
-    /// Same-shape repeats within the day never stage twice.
-    private var momentDayContentKeys: Set<String> = []
+    var personName: (@Sendable () -> String?)? = nil
+    /// The fold. The String identifies the recorded moment; true when every
+    /// piece of her landed.
+    var finishInterpretation: (@Sendable (AfterTurnContext, AfterTurnInterpretation?, String?) async -> Bool)?
+    /// The door her lived moments come in by (`LivedMomentDoor`), installed by
+    /// the cognition runtime. Without a recorded row nothing is applied.
+    var door: LivedMomentDoor?
+    /// Moments recorded by this process whose interpretation is queued or
+    /// running on the live path; the owed-moment drain leaves them alone.
+    var inFlightMoments: Set<String> = []
+    /// Accepted transcript settlements, including ones still reaching the door.
+    /// Sleep joins these recordings independently of the interpretation tail.
+    private var owedRecordings: [UUID: Task<String?, Never>] = [:]
+    /// The owed-row retry cursor: attempts, when the row is next due, and
+    /// when it was last tried (RAM: a relaunch starts every row due).
+    var owedRetry: [String: (attempts: Int, notBefore: Date, lastTried: Date)] = [:]
+    /// The one scheduled idle drain pass.
+    var owedDrainTimer: (id: UUID, deadline: Date, task: Task<Void, Never>)?
+    /// Live observations waiting on or running under the shared tail.
+    var pendingLiveObservations = 0
+    var heldImported = false
+    var observationTail: Task<AdaptiveMemoryObservation, Never>?
+    /// Every observation or drain still running (the tail and the ones it waits
+    /// on), so sleep can stop them all.
+    var liveOperations: [UUID: Task<AdaptiveMemoryObservation, Never>] = [:]
+    var observationID: UUID?
+    var stopped = false
+    var owedDrain: Task<AdaptiveMemoryObservation, Never>?
+    var heldDrainIsIdle: (@Sendable () async -> Bool)?
+    /// Injected fact-promotion policy; no configured owner means enabled.
+    var adaptivePromotionEnabled: (@Sendable () -> Bool)?
 
     public init(
         memory: SwiftNativeMemoryV2? = nil,
         memoryManager: (any MemoryManaging)? = nil,
-        momentsEnabled: (@Sendable () -> Bool)? = nil,
         adaptivePromotionEnabled: (@Sendable () -> Bool)? = nil
     ) {
         self.memory = memory
         self.memoryManager = memoryManager
-        self.momentsEnabled = momentsEnabled
         self.adaptivePromotionEnabled = adaptivePromotionEnabled
     }
 
     public func configure(
         memory: SwiftNativeMemoryV2?,
         memoryManager: (any MemoryManaging)? = nil,
-        momentsEnabled: (@Sendable () -> Bool)? = nil,
         adaptivePromotionEnabled: (@Sendable () -> Bool)? = nil,
         personName: (@Sendable () -> String?)? = nil
     ) {
@@ -231,7 +73,6 @@ public actor AdaptiveMemoryPromoter {
         self.memory = memory
         if let memoryManager { self.memoryManager = memoryManager }
         if let personName { self.personName = personName }
-        if let momentsEnabled { self.momentsEnabled = momentsEnabled }
         if let adaptivePromotionEnabled {
             self.adaptivePromotionEnabled = adaptivePromotionEnabled
         }
@@ -252,8 +93,12 @@ public actor AdaptiveMemoryPromoter {
         let previous = observationTail
         let id = UUID()
         observationID = id
+        // Live work waiting or running: recovery admits no next row meanwhile.
+        pendingLiveObservations += 1
         let operation = Task {
             defer {
+                self.pendingLiveObservations -= 1
+                self.liveOperations[id] = nil
                 if observationID == id { observationTail = nil; observationID = nil }
             }
             _ = await previous?.value
@@ -263,6 +108,7 @@ public actor AdaptiveMemoryPromoter {
                 standingAgentName: standingAgentName, turnId: turnId ?? origin?.runId)
         }
         observationTail = operation
+        liveOperations[id] = operation
         let observation = await withTaskCancellationHandler {
             await operation.value
         } onCancel: {
@@ -272,20 +118,77 @@ public actor AdaptiveMemoryPromoter {
         return observation
     }
 
+    /// Record accepted transcript settlements as owed under the turn's provenance,
+    /// before earlier promotions finish, even during sleep. Her own work is not a moment.
+    @discardableResult
+    public func recordOwedTurn(
+        userMessage: String,
+        assistantMessage: String,
+        sessionId: String,
+        surface: String = "chat",
+        standingAgentName: String? = nil,
+        turnId: String? = nil
+    ) async -> String? {
+        guard let door else { return nil }
+        let origin = AfterTurnSource.origin
+        let turn = CognitiveMomentTurn(
+            sessionId: sessionId, surface: surface, user: userMessage,
+            asked: origin?.userMessage ?? userMessage, assistant: assistantMessage,
+            turnId: turnId ?? origin?.runId, runId: origin?.runId, messageId: origin?.messageId,
+            occurredAt: origin?.occurredAt, took: origin?.took, standingAgentName: standingAgentName,
+            envelope: TurnEnvelope.current(surface: surface).persistedMetadata(),
+            sourceCheckpoint: MemoryDataProvenance.sources(in: MemoryDataProvenance.stamping(nil)),
+            elevatedSources: PeerDataTaint.current?.elevatedSources ?? [])
+        let recordingID = UUID()
+        let recording = Task<String?, Never> {
+            defer { owedRecordings[recordingID] = nil }
+            guard await conversationKind(sessionId)?.isOwnWork != true else { return nil }
+            // Everything the door needs is in the captured turn; settlement
+            // does not inherit task locals or the caller's cancellation.
+            let id = await settle { await door.recordOwed(turn) }
+            if let id, !stopped { inFlightMoments.insert(id) }
+            return id
+        }
+        owedRecordings[recordingID] = recording
+        return await recording.value
+    }
+
+    /// The recorded moment this live promotion is, when the door recorded it.
+    private func liveMomentID(sessionId: String, origin: AfterTurnOrigin?) -> String? {
+        guard door != nil, let origin else { return nil }
+        let id = CognitiveLivedMoment.turnID(sessionId: sessionId, messageId: origin.messageId)
+        return inFlightMoments.contains(id) ? id : nil
+    }
+
+    /// Stop producing and cancel interpretations, joining the fold in flight.
+    /// Settled turns still record owed; returned judgments are already meant.
+    public func sleep() async {
+        stopped = true
+        heldDrainIsIdle = nil
+        owedDrainTimer?.task.cancel()
+        owedDrainTimer = nil
+        for operation in liveOperations.values { operation.cancel() }
+        let recordings = Array(owedRecordings.values)
+        for recording in recordings { _ = await recording.value }
+        _ = await observationTail?.value
+    }
+
     /// No new turns or passive recovery after stop. Already accepted turn
     /// interpretation and its canonical writes keep their original result.
     public func shutdown() async {
         stopped = true
         heldDrainIsIdle = nil
+        let recordings = Array(owedRecordings.values)
+        for recording in recordings { _ = await recording.value }
         _ = await observationTail?.value
     }
 
     public func configureInterpretation(
-        prepare: @escaping @Sendable (AfterTurnOrigin, String) async -> AfterTurnContext?,
         isIdle: @escaping @Sendable () async -> Bool,
-        finish: @escaping @Sendable (AfterTurnContext, AfterTurnInterpretation?, Bool) async -> Void
+        finish: @escaping @Sendable (AfterTurnContext, AfterTurnInterpretation?, String?) async -> Bool,
+        door: LivedMomentDoor? = nil
     ) {
-        prepareInterpretation = prepare
+        self.door = door
         heldDrainIsIdle = isIdle
         finishInterpretation = finish
     }
@@ -301,6 +204,11 @@ public actor AdaptiveMemoryPromoter {
         }
     }
 
+    func conversationKind(_ sessionID: String) async -> ChatThreadKind? {
+        guard let memory, let root = await memory.surpriseDataRoot() else { return nil }
+        return SessionConversation.kind(sessionID, dataRoot: root, includingArchived: true)
+    }
+
     private func interpretAndObserve(userMessage: String, assistantMessage: String,
                                      sessionId: String,
                                      surface: String, origin: AfterTurnOrigin?,
@@ -308,808 +216,57 @@ public actor AdaptiveMemoryPromoter {
         let skipped = AdaptiveMemoryObservation(proposals: [], extraction: .init(
             candidates: [], semanticStatus: .skipped
         ))
+        let momentID = liveMomentID(sessionId: sessionId, origin: origin)
+        defer { if let momentID { inFlightMoments.remove(momentID) } }
         // ResidentWake's dedicated session carries app-authored arrivals.
-        guard sessionId != "resident-wake", !Task.isCancelled, let memory else { return skipped }
+        guard let momentID, await conversationKind(sessionId)?.isOwnWork != true,
+              !Task.isCancelled, let memory else { return skipped }
         let standingAgent = standingAgentName != nil
         let peerSeat = Self.isAgentSeatUserMessage(userMessage)
         let peerSpeaker = standingAgent ? (standingAgentName ?? "standing agent")
             : (peerSeat ? Self.bridgeSender(userMessage) : nil)
-        let hasReply = !assistantMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let requestedMoments = hasReply && (momentsEnabled?() ?? true)
-        let requestedFacts = hasReply && (adaptivePromotionEnabled?() ?? true)
-        let reservedMoment = requestedMoments ? await reserveMomentSlot(memory: memory, now: Date()) : false
-        lastMomentOutcome = requestedMoments ? (reservedMoment ? "unreported" : "capped") : "disabled"
-        let managerResult = await runMemoryManager(
+        var observation = await runMemoryManager(
             speaker: peerSpeaker, memory: memory, userMessage: userMessage,
             assistantMessage: assistantMessage, sessionId: sessionId, surface: surface,
-            momentsAllowed: reservedMoment, origin: origin, turnId: turnId, standingAgent: standingAgent, factsAllowed: requestedFacts)
-        let momentAuthor = MemoryMoments.author(surface: surface, peer: standingAgent || managerResult.peerAuthority)
-        let momentProposal = await stageMomentIfAny(
-            memory: memory,
-            userMessage: userMessage,
-            assistantMessage: assistantMessage,
-            sessionId: sessionId,
-            surface: surface,
-            author: momentAuthor,
-            outcome: managerResult.moment,
-            reserved: reservedMoment,
-            friction: AfterTurnNoveltyGate.frictionSignal(
-                userMessage: userMessage, assistantMessage: assistantMessage)
-                ?? (managerResult.savedCorrectionCount + managerResult.pendingCorrectionCount > 0
-                    ? "correction" : nil),
-            origin: origin, turnId: turnId
-        )
-        if managerResult.noveltySkipReason != nil { lastMomentOutcome = "noveltySkipped" }
-        // Preserve every requested lane even when the moment quota was full,
-        // and a moment whose staging failed after a good interpretation.
-        if !Task.isCancelled, requestedFacts || requestedMoments,
-           managerResult.noveltySkipReason == nil,
-           managerResult.report.failure != nil || managerResult.stagingFailed || (requestedMoments && !reservedMoment)
-            || lastMomentOutcome == "failed" {
-            lastMomentOutcome = holdMoment(HeldMoment(sessionId: sessionId, surface: surface, user: userMessage,
-                asked: origin?.userMessage ?? userMessage, assistant: assistantMessage,
-                turnId: turnId, runId: origin?.runId, messageId: origin?.messageId, occurredAt: origin?.occurredAt,
-                speaker: peerSpeaker, standingAgent: standingAgent,
-                factsEnabled: requestedFacts && (!managerResult.factsProcessed || managerResult.stagingFailed),
-                momentsEnabled: requestedMoments && (managerResult.report.failure != nil || !reservedMoment
-                    || lastMomentOutcome == "failed"), failure: managerResult.report.failure,
-                humanName: managerResult.humanName, peerAuthority: managerResult.peerAuthority,
-                momentDeferredDay: requestedMoments && !reservedMoment ? MemoryMoments.dayKey(Date()) : nil,
-                envelope: TurnEnvelope.current(surface: surface).persistedMetadata(),
-                sourceCheckpoint: MemoryDataProvenance.sources(in: MemoryDataProvenance.stamping(nil)),
-                elevatedSources: PeerDataTaint.current?.elevatedSources ?? []))
+            origin: origin, turnId: turnId, standingAgent: standingAgent,
+            momentID: momentID)
+        if adaptivePromotionEnabled?() == false && observation.extraction.failure == nil {
+            observation.extraction = .init(candidates: [], semanticStatus: .skipped)
         }
-        let staged = (momentProposal.map { [$0] } ?? []) + managerResult.proposals
-        var observation = AdaptiveMemoryObservation(
-            proposals: staged,
-            extraction: adaptivePromotionEnabled?() == false && managerResult.report.failure == nil
-                ? .init(candidates: [], semanticStatus: .skipped) : managerResult.report,
-            momentOutcome: lastMomentOutcome,
-            hygieneRejectedCount: managerResult.rejectedCount,
-            savedCorrectionCount: managerResult.savedCorrectionCount,
-            pendingCorrectionCount: managerResult.pendingCorrectionCount,
-            failedCorrectionCount: managerResult.failedCorrectionCount
-        )
-        observation.noveltySkipReason = managerResult.noveltySkipReason
         return observation
     }
 
-    // MARK: - Held moments
+    /// The proposal metadata key carrying a fact decision's operation identity
+    /// (life | moment | ordinal).
+    static let momentOperationKey = "moment_op"
 
-    /// A turn whose enabled memory opportunities the model could not judge.
-    struct HeldMoment: Codable {
-        var at = Date()
-        let sessionId, surface, user, asked, assistant: String
-        var turnId, runId, messageId: String?
-        var occurredAt: Date?
-        var speaker: String?
-        var standingAgent, factsEnabled, momentsEnabled: Bool?
-        var failure: AfterTurnMemoryFailure?
-        var humanName: String?
-        var peerAuthority: Bool?
-        var momentDeferredDay: String?
-        var envelope: JSONValue?
-        var sourceCheckpoint, elevatedSources: [String]?
-
-        var origin: AfterTurnOrigin? {
-            guard let messageId else { return nil }
-            return AfterTurnOrigin(sessionId: sessionId, runId: runId, messageId: messageId,
-                                   occurredAt: occurredAt, userMessage: asked)
-        }
+    public static func encodedMeaning(_ interpretation: AfterTurnInterpretation) -> JSONValue? {
+        guard let data = try? JSONEncoder().encode(interpretation) else { return nil }
+        return try? JSONValue.parse(data)
     }
 
-    /// Held turns wait durably in `memory/moments_held.json` for the configured
-    /// memory model, without discarding opportunities during an outage.
-    static func heldPath(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> URL {
-        dataRoot.appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("moments_held.json")
+    public static func decodedMeaning(_ value: JSONValue) -> AfterTurnInterpretation? {
+        guard let data = try? value.serializedData(pretty: false) else { return nil }
+        return try? JSONDecoder().decode(AfterTurnInterpretation.self, from: data)
     }
 
-    static func readHeld(dataRoot: URL = PersistenceCore.defaultDataRoot()) throws -> [HeldMoment] {
-        let path = heldPath(dataRoot: dataRoot)
-        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
-        return try JSONDecoder().decode([HeldMoment].self, from: Data(contentsOf: path))
-    }
-
-    private func heldMoments() -> [HeldMoment]? {
-        do { return try Self.readHeld() }
-        catch {
-            nativeLog("MemoryV2: held turns unreadable; preserved without mutation: %@", String(describing: error))
-            return nil
+    /// mind.why, the "interpretation" lane: what became of a turn's
+    /// interpretation (deferred, judged in a batch, left owed), with
+    /// the prediction and its standing.
+    static func whyInterpretation(turn: String, session: String, surface: String,
+                                  route: ChatToolSessionContext.ReplyRoute?, outcome: String,
+                                  check: AfterTurnMemorySurprise?) {
+        var fields: [String: JSONValue] = ["lane": .string("interpretation"), "outcome": .string(outcome)]
+        if let check {
+            fields["prediction"] = .string(check.verdict.rawValue)
+            fields["evidence"] = .string(check.reason)
+            fields["standing"] = .bool(check.standing == true)
+            fields["lower"] = .double(check.lowerBound ?? 0)
+            fields["bar"] = .double(check.costBar ?? 1)
+            fields["tries"] = .int(Int64(check.tries ?? 0))
+            fields["hits"] = .int(Int64(check.hits ?? 0))
         }
-    }
-
-    private func writeHeld(_ held: [HeldMoment]) -> Bool {
-        do {
-            try FileManager.default.createDirectory(at: Self.heldPath().deletingLastPathComponent(), withIntermediateDirectories: true)
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(held), to: Self.heldPath())
-            return true
-        } catch {
-            nativeLog("MemoryV2 moments: held turns not written: %@", String(describing: error))
-            return false
-        }
-    }
-
-    /// The receipt word: "held" once it is on disk, and the failure's own
-    /// word when it could not be written.
-    private func holdMoment(_ turn: HeldMoment) -> String {
-        guard let held = heldMoments() else { return MomentExtractionOutcome.failed.receiptOutcome }
-        if let turnId = turn.turnId, held.contains(where: { $0.sessionId == turn.sessionId && $0.turnId == turnId }) { return "held" }
-        return writeHeld(held + [turn]) ? "held" : MomentExtractionOutcome.failed.receiptOutcome
-    }
-
-    /// Reconsider held turns through the same manager and proposal gates.
-    /// Disabled lanes stay held. Recovery never replays tools or doses affect.
-    public func drainHeldAtIdle(isIdle: @escaping @Sendable () async -> Bool) async {
-        guard !stopped, !heldDrainInFlight else { return }
-        heldDrainInFlight = true
-        let previous = observationTail
-        let id = UUID()
-        observationID = id
-        let operation = Task {
-            defer {
-                self.heldDrainInFlight = false
-                if observationID == id { observationTail = nil; observationID = nil }
-            }
-            let observation = await previous?.value
-            if !stopped, await isIdle(), !stopped, let memory = self.memory {
-                await self.askHeldMoments(memory: memory)
-            }
-            return observation ?? AdaptiveMemoryObservation(proposals: [], extraction: .init(candidates: [], semanticStatus: .skipped))
-        }
-        observationTail = operation
-        _ = await operation.value
-    }
-
-    private func askHeldMoments(memory: SwiftNativeMemoryV2) async {
-        guard memoryManager != nil, var held = heldMoments(), !held.isEmpty else { return }
-        let today = MemoryMoments.dayKey(Date())
-        let batch = held
-        var reconsidered = 0
-        for pending in batch {
-            if pending.sessionId == "resident-wake" {
-                held.removeAll { $0.sessionId == "resident-wake" }
-                guard writeHeld(held) else { return }
-                continue
-            }
-            // At most one recovery interpretation at idle, after queued observations.
-            guard !Task.isCancelled, reconsidered < 1 else { return }
-            guard let position = held.firstIndex(where: {
-                $0.sessionId == pending.sessionId && $0.at == pending.at && $0.turnId == pending.turnId
-            }) else { continue }
-            var turn = held[position]
-            guard let turnId = turn.turnId, !turnId.isEmpty else { continue }
-            let facts = (turn.factsEnabled ?? false) && (adaptivePromotionEnabled?() ?? true)
-            let wantsMoment = (turn.momentsEnabled ?? true) && (momentsEnabled?() ?? true)
-                && turn.momentDeferredDay != today
-            let reserved = wantsMoment ? await reserveMomentSlot(memory: memory, now: Date()) : false
-            if wantsMoment && !reserved {
-                turn.momentDeferredDay = today
-                held[position] = turn
-                guard writeHeld(held) else { return }
-            }
-            guard facts || reserved else { continue }
-            reconsidered += 1
-            let isStandingAgent = turn.standingAgent == true
-            let speaker = turn.speaker ?? (isStandingAgent ? "standing agent"
-                : (Self.isAgentSeatUserMessage(turn.user) ? Self.bridgeSender(turn.user) : nil))
-            let checkpoint = PeerDataTaint(restoring: turn.sourceCheckpoint ?? ["untrusted stored content"],
-                                           elevated: turn.elevatedSources ?? [])
-            let result = await TurnTraceContext.$turnId.withValue(turnId) {
-                await LLMCallContext.$sessionId.withValue(turn.sessionId) {
-                await PeerDataTaint.$current.withValue(checkpoint) {
-                await ChatToolSessionContext.$envelope.withValue(TurnEnvelope.fromPersistedMetadata(turn.envelope)) {
-                    let result = await runMemoryManager(speaker: speaker, memory: memory,
-                        userMessage: turn.asked, assistantMessage: turn.assistant, sessionId: turn.sessionId,
-                        surface: turn.surface, momentsAllowed: reserved, origin: turn.origin, turnId: turn.turnId,
-                        standingAgent: isStandingAgent,
-                        factsAllowed: facts, recovery: true, humanName: turn.humanName, peerAuthority: turn.peerAuthority)
-                    if result.report.semanticStatus == .succeeded, !Task.isCancelled {
-                        lastMomentOutcome = reserved ? "unreported" : "disabled"
-                        _ = await stageMomentIfAny(
-                            memory: memory, userMessage: turn.user, assistantMessage: turn.assistant,
-                            sessionId: turn.sessionId, surface: turn.surface,
-                            author: MemoryMoments.author(surface: turn.surface, peer: isStandingAgent || result.peerAuthority),
-                            outcome: result.moment, reserved: reserved,
-                            friction: AfterTurnNoveltyGate.frictionSignal(userMessage: turn.user, assistantMessage: turn.assistant),
-                            origin: turn.origin, turnId: turn.turnId)
-                    }
-                    return result
-                }
-                }
-                }
-            }
-            if let failure = result.report.failure {
-                if reserved { releaseMomentSlot() }
-                turn.failure = failure
-                held.remove(at: position)
-                held.append(turn)
-                guard writeHeld(held) else { return }
-                continue
-            }
-            guard !Task.isCancelled else {
-                if reserved { releaseMomentSlot() }
-                return
-            }
-            guard result.report.semanticStatus == .succeeded else {
-                if reserved { releaseMomentSlot() }
-                continue
-            }
-            if result.factsProcessed && !result.stagingFailed { turn.factsEnabled = false }
-            if reserved && !["failed", "cancelled", "disabled"].contains(lastMomentOutcome) { turn.momentsEnabled = false }
-            if turn.factsEnabled != true && turn.momentsEnabled == false { held.remove(at: position) }
-            else {
-                held.remove(at: position)
-                held.append(turn)
-            }
-            guard writeHeld(held) else { return }
-        }
-    }
-
-    // MARK: - The fact lane: the memory manager
-
-    struct MemoryManagerOutcome {
-        let proposals: [ProposalRecord]
-        let report: AdaptiveExtractionReport
-        let rejectedCount: Int
-        var moment: MomentExtractionOutcome = .failed
-        var noveltySkipReason: String?
-        var savedCorrectionCount = 0
-        var pendingCorrectionCount = 0
-        var failedCorrectionCount = 0
-        var stagingFailed = false
-        var factsProcessed = false
-        var peerAuthority = false
-        var humanName: String?
-    }
-
-    /// One manager pass over one turn.
-    ///
-    /// The shape, in order: show it what is already known (so it can say "already
-    /// covered" instead of re-minting), ask once, then gate what came back on
-    /// confidence, shape, embedding near-duplication and the tombstone list.
-    /// Every survivor stages for human review. Free-form model output cannot
-    /// prove that an apparent fact or rule leaves identity untouched.
-    private func runMemoryManager(
-        speaker: String? = nil,
-        memory: SwiftNativeMemoryV2,
-        userMessage: String,
-        assistantMessage: String,
-        sessionId: String,
-        surface: String,
-        momentsAllowed: Bool,
-        origin: AfterTurnOrigin?,
-        turnId: String?,
-        standingAgent: Bool = false,
-        factsAllowed: Bool = true,
-        recovery: Bool = false,
-        humanName: String? = nil,
-        peerAuthority: Bool? = nil
-    ) async -> MemoryManagerOutcome {
-        func empty(_ status: MemorySemanticExtractionStatus) -> MemoryManagerOutcome {
-            MemoryManagerOutcome(
-                proposals: [],
-                report: AdaptiveExtractionReport(candidates: [], semanticStatus: status),
-                rejectedCount: 0,
-                moment: status == .failed ? (Task.isCancelled ? .cancelled : .failed) : .unavailable
-            )
-        }
-        guard let memoryManager else { return empty(.unavailable) }
-        guard sessionId != "resident-wake" else { return empty(.skipped) }
-        let user = origin?.userMessage ?? userMessage
-        let assistant = assistantMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !user.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return empty(.emptyInput) }
-
-        // What is already known about this exchange. `recordingUsage: false`:
-        // reading the store to decide what to keep is not the agent USING a
-        // memory, and use_count is the signal that vetoes eviction.
-        let context: AfterTurnContext?
-        if !recovery, let origin, origin.sessionId == sessionId {
-            context = await prepareInterpretation?(origin, assistant)
-        } else { context = nil }
-        let author = MemoryMoments.author(surface: surface,
-            peer: peerAuthority ?? (speaker != nil || context?.event.sourceClass == .imported))
-        let isPeer = author != "user"
-        let originalHumanName = humanName ?? personName?()
-        // Novelty governs storage, never whether the exchange gets appraised.
-        let priorUserTurns = context?.caring?.context.filter { $0.speaker == .person }.map(\.text) ?? []
-        let noveltySkip = recovery ? nil
-            : AfterTurnNoveltyGate.skipReason(userMessage: user, priorUserTurns: priorUserTurns)
-        let factsEnabled = noveltySkip == nil && factsAllowed && !assistant.isEmpty && (adaptivePromotionEnabled?() ?? true)
-        let keepsMoments = noveltySkip == nil && momentsAllowed
-        guard factsEnabled || keepsMoments || context != nil else {
-            var skipped = empty(.skipped)
-            skipped.noveltySkipReason = noveltySkip
-            return skipped
-        }
-        // What is known and what waits on the person (pending rows WITH ids,
-        // 2026-09-11, so an update naming one retires it; moments are another
-        // lane). An unreadable past is never an empty one: the fact lane sits
-        // this pass out and the turn is held until the store answers.
-        var existing: [MemoryManagerExistingMemory] = []
-        var pendingRows: [ProposalRecord] = []
-        var factsReadable = true
-        if factsEnabled {
-            do {
-                existing = try await memory.recall(
-                    MemoryV2RecallRequest(text: "\(user)\n\(assistant)", topK: MemoryManagerLane.recallTopK),
-                    recordingUsage: false
-                ).scored.map {
-                    MemoryManagerExistingMemory(id: $0.record.id, content: $0.record.text,
-                        correctionSubject: MemoryMoments.metadataString($0.record.extras, "correction_subject"),
-                        kind: $0.record.memoryKind)
-                }
-                for record in try await memory.listMemory(kind: "correction")
-                    .filter({ ($0.status ?? "active") == "active"
-                        && !MemoryStorage.metadataFlag($0.extras, MemoryStorage.pendingAdmissionKey) })
-                    .sorted(by: { ($0.createdAt ?? "") > ($1.createdAt ?? "") }).prefix(24) {
-                    let subject = MemoryMoments.metadataString(record.extras, "correction_subject")
-                    let known = MemoryManagerExistingMemory(id: record.id, content: record.text,
-                                                            correctionSubject: subject, kind: record.memoryKind)
-                    if let index = existing.firstIndex(where: { $0.id == record.id }) { existing[index] = known }
-                    else { existing.append(known) }
-                }
-                pendingRows = Array(try await memory.listProposals(status: "pending")
-                    .filter { !MemoryMoments.isMoment($0.metadata) }
-                    .sorted { $0.createdAt > $1.createdAt }
-                    .prefix(MemoryManagerLane.pendingCap))
-            } catch {
-                factsReadable = false
-                existing = []
-                nativeLog("MemoryV2: fact lane held this turn, the memory store could not be read: \(error.localizedDescription)")
-            }
-        }
-        // The PROMPT sees ids; every COMPARISON sees content only (Astra comb
-        // finding 2: "[id] text" was being screened against "text", so a
-        // correction's own target never left its duplicate screen).
-        let pendingPrompt: [String] = pendingRows.map { "[\($0.id)] \($0.content)" }
-        let pending: [String] = pendingRows.map(\.content)
-
-        let interpretation: AfterTurnInterpretation?
-        do {
-            interpretation = try await LLMCallContext.$purpose.withValue(recovery ? "memory_held" : "memory_interpret") {
-            try await memoryManager.interpret(MemoryManagerRequest(
-                userMessage: user,
-                assistantMessage: assistant,
-                existing: existing,
-                pending: pendingPrompt,
-                personName: author == "app" ? "NativeAgent" : speaker ?? originalHumanName,
-                standingAgent: standingAgent, appAuthored: author == "app"
-            ), context: context, factsEnabled: factsEnabled && factsReadable, momentsEnabled: keepsMoments)
-            }
-        } catch {
-            if let context { await finishInterpretation?(context, nil, false) }
-            let reason: AfterTurnMemoryFailure.Reason
-            if Task.isCancelled || error is CancellationError { reason = .cancelled }
-            else {
-                switch error as? AfterTurnInterpretationFailure {
-                case .authentication: reason = .authExpired
-                case .deadline: reason = .deadline
-                case .cancellation: reason = .cancelled
-                case .envelope: reason = .invalidJSON
-                case .caring: reason = .invalidCaring
-                case .affect: reason = .invalidAffect
-                case .memories: reason = .invalidMemories
-                case .moment: reason = .invalidMoment
-                case .cares: reason = .invalidCares
-                default: reason = .provider
-                }
-            }
-            let failure = (error as? AfterTurnMemoryFailure) ?? AfterTurnMemoryFailure(
-                reason: reason,
-                recovery: "Check the selected memory model in Settings; held turns are reconsidered after its next successful answer.",
-                model: nil, surface: surface)
-            return MemoryManagerOutcome(proposals: [], report: .init(candidates: [],
-                semanticStatus: failure.reason == .deadline ? .timedOut : .failed, failure: failure),
-                rejectedCount: 0, moment: failure.reason == .cancelled ? .cancelled : .failed,
-                peerAuthority: isPeer, humanName: originalHumanName)
-        }
-        if let context { await finishInterpretation?(context, Task.isCancelled ? nil : interpretation, false) }
-        guard !Task.isCancelled, let interpretation else {
-            let failure = AfterTurnMemoryFailure(reason: Task.isCancelled ? .cancelled : .missingSections,
-                recovery: "Check the selected memory model in Settings; held turns are reconsidered after its next successful answer.",
-                model: nil, surface: surface)
-            return MemoryManagerOutcome(proposals: [], report: .init(candidates: [],
-                semanticStatus: .failed, failure: failure), rejectedCount: 0,
-                moment: Task.isCancelled ? .cancelled : .failed, peerAuthority: isPeer, humanName: originalHumanName)
-        }
-        let factsProcessed = factsEnabled && factsReadable && (adaptivePromotionEnabled?() ?? true)
-        let decisions = factsProcessed ? interpretation.memories : []
-
-        var staged: [ProposalRecord] = []
-        var accepted: [AdaptiveCandidate] = []
-        var rejected = 0
-        var pendingCorrections = 0
-        var failedCorrections = 0
-        var stagingFailed = false
-        // Everything the statement must not merely repeat: what is kept, what is
-        // pending, and what this same pass already minted this turn.
-        var comparisons = existing.map(\.content) + pending
-        for raw in decisions {
-            // An `update` must name one of the memories the model was shown;
-            // anything else degrades to `add` (MemoryManagerLane.reconciled).
-            // A correction of a PENDING statement: retire that row now, then stage
-            // the correction as an ordinary add (nothing kept is being replaced).
-            let supersededPending: ProposalRecord? = (raw.action == .update)
-                ? pendingRows.first(where: { $0.id == raw.updatesId }) : nil
-            let (decision, updateTarget) = MemoryManagerLane.reconciled(raw, existing: existing)
-            guard decision.action != .skip else { continue }
-            guard decision.confidence >= MemoryManagerLane.confidenceFloor else {
-                rejected += 1
-                continue
-            }
-            let isCorrection = decision.kind == "correction"
-            if isCorrection, origin?.occurredAt == nil || origin?.sessionId != sessionId {
-                rejected += 1
-                failedCorrections += 1
-                nativeLog("MemoryV2: standing correction not saved: originating turn timestamp unavailable")
-                continue
-            }
-            if isCorrection, let updateTarget,
-               updateTarget.kind != "correction"
-                || (updateTarget.correctionSubject != nil && updateTarget.correctionSubject != decision.correctionSubject) {
-                rejected += 1
-                continue
-            }
-            if isCorrection, let old = supersededPending {
-                guard MemoryMoments.metadataString(old.metadata, "kind") == "correction",
-                      MemoryMoments.metadataString(old.metadata, "correction_subject") == decision.correctionSubject,
-                      let timestamp = MemoryMoments.metadataString(old.metadata, "observed_at"),
-                      let priorDate = MemoryRecallScoring.parseTimestamp(timestamp),
-                      let sourceDate = origin?.occurredAt, priorDate <= sourceDate else {
-                    rejected += 1
-                    failedCorrections += 1
-                    nativeLog("MemoryV2: standing correction not saved: pending rule chronology or subject unavailable or newer")
-                    continue
-                }
-            }
-            let refusal = isCorrection
-                ? MemoryManagerLane.correctionRejectionReason(decision, userMessage: user,
-                    isPeer: isPeer, personName: originalHumanName)
-                : MemoryManagerLane.statementRejectionReason(decision.statement, userMessage: user, assistantMessage: assistant)
-            if refusal != nil {
-                rejected += 1
-                continue
-            }
-            if isCorrection, let kept = existing.first(where: {
-                $0.correctionSubject == decision.correctionSubject
-                    && MemoryManagerLane.contentFingerprint($0.content) == MemoryManagerLane.contentFingerprint(decision.statement)
-            }) {
-                // The same correction given again: its row keeps this turn as a
-                // repeat, the way a collapsed commit does, so the miss counts.
-                do {
-                    if let row = try await memory.authorityRecord(id: kept.id) {
-                        _ = try await memory.updateMemory(id: kept.id, update: .object(SwiftNativeMemoryV2.duplicateProvenancePatch(
-                            existing: row, newSource: "standing-correction:\(sessionId)",
-                            newMetadata: .object(MemoryMoments.turnMetadata(turnId: turnId, origin: origin)))))
-                    }
-                } catch {
-                    stagingFailed = true
-                    nativeLog("MemoryV2: repeated standing correction's turn not kept: \(error)")
-                }
-                continue
-            }
-            // The row an update REPLACES is not competition for it: screening a
-            // correction against the statement it corrects rejects exactly the
-            // work the manager was asked to do (2026-09-11 audit, finding 4).
-            // Everything else kept or pending still screens.
-            let replacedContent = updateTarget?.content ?? supersededPending?.content
-            let screened: [String] = replacedContent.map { target in
-                comparisons.filter { $0 != target }
-            } ?? comparisons
-            do {
-                try Task.checkCancellation()
-                if !isCorrection, try await Self.nearDuplicate(
-                    decision.statement, of: screened, memory: memory
-                ) != nil {
-                    rejected += 1
-                    continue
-                }
-                if try await memory.isRejected(content: decision.statement) {
-                    rejected += 1
-                    continue
-                }
-                let proposal = try await memory.propose(
-                    content: decision.statement,
-                    source: "\(isCorrection ? "standing-correction" : MemoryManagerLane.sourcePrefix):\(sessionId)",
-                    confidence: decision.confidence,
-                    kind: decision.kind,
-                    supportingSessionIDs: [sessionId],
-                    recurrenceCount: 1,
-                    extraMetadata: MemoryManagerLane.metadata(
-                        for: decision, sessionId: sessionId, surface: surface,
-                        updateTarget: updateTarget,
-                        observedAt: origin?.occurredAt
-                    ).merging(MemoryMoments.turnMetadata(turnId: turnId, origin: origin)) { current, _ in current }
-                )
-                staged.append(proposal)
-                comparisons.append(decision.statement)
-                if let old = supersededPending, old.id != proposal.id {
-                    // Both rows stay pending until this lands; the held turn retries it.
-                    do {
-                        guard try await memory.supersedeProposal(id: old.id, by: proposal.id) else {
-                            throw MemoryV2Error.recordNotFound
-                        }
-                    } catch {
-                        stagingFailed = true
-                        nativeLog("MemoryV2: pending statement \(old.id) not retired by its correction: \(error)")
-                    }
-                }
-                let candidate = AdaptiveCandidate(
-                    content: decision.statement,
-                    score: decision.confidence,
-                    kind: decision.kind
-                )
-                accepted.append(candidate)
-                if isCorrection {
-                    pendingCorrections += 1
-                }
-            } catch {
-                stagingFailed = true
-                if isCorrection { failedCorrections += 1 }
-                continue
-            }
-        }
-        return MemoryManagerOutcome(
-            proposals: staged,
-            report: AdaptiveExtractionReport(
-                candidates: accepted,
-                semanticStatus: .succeeded,
-                semanticCandidateCount: decisions.count
-            ),
-            rejectedCount: rejected,
-            moment: keepsMoments ? interpretation.moment.map(MomentExtractionOutcome.candidate) ?? .abstained : .unavailable,
-            noveltySkipReason: noveltySkip,
-            savedCorrectionCount: 0,
-            pendingCorrectionCount: pendingCorrections,
-            failedCorrectionCount: failedCorrections,
-            stagingFailed: stagingFailed || !factsReadable,
-            factsProcessed: factsProcessed,
-            peerAuthority: isPeer,
-            humanName: originalHumanName
-        )
-    }
-
-    /// The index of the first of `others` that says what `statement` says, by
-    /// embedding cosine. The store's own embedder answers, so "already in there"
-    /// means the same thing here as it does at recall time. An embedder that
-    /// cannot answer throws: a check that did not run is not "no duplicate".
-    static func nearDuplicate(
-        _ statement: String,
-        of others: [String],
-        memory: SwiftNativeMemoryV2
-    ) async throws -> Int? {
-        guard !others.isEmpty else { return nil }
-        let fold: (String) -> String = { MemoryMoments.wordFold($0) }
-        let needle = fold(statement)
-        if let exact = others.firstIndex(where: {
-            fold($0) == needle && MemoryStorage.sameQuantityAndNegation(statement, $0)
-        }) { return exact }
-        let vectors = try await memory.embedForDerivedContext([statement] + others)
-        guard vectors.count == others.count + 1, let query = vectors.first, !query.isEmpty else {
-            throw MemoryV2Error.underlying("the duplicate check received \(vectors.count) of \(others.count + 1) vectors")
-        }
-        for (index, (other, vector)) in zip(others, vectors.dropFirst()).enumerated() {
-            if MemoryStorage.semanticDuplicate(statement, other, similarity: VectorMath.cosine(query, vector), mode: .promotion) { return index }
-        }
-        return nil
-    }
-
-    // MARK: - The moments lane
-
-    /// The moment section of the shared interpretation stages at most one proposal.
-    ///
-    /// ORDER MATTERS: the daily cap is checked BEFORE the model call, because
-    /// the cheap gate belongs in front of the expensive one.
-    /// Set by every exit of `stageMomentIfAny`; read once into the observation.
-    private var lastMomentOutcome = "unreported"
-
-    private func stageMomentIfAny(
-        memory: SwiftNativeMemoryV2,
-        userMessage: String,
-        assistantMessage: String,
-        sessionId: String,
-        surface: String,
-        author: String,
-        outcome: MomentExtractionOutcome,
-        reserved: Bool,
-        friction: String? = nil,
-        origin: AfterTurnOrigin? = nil,
-        turnId: String? = nil,
-        now: Date = Date()
-    ) async -> ProposalRecord? {
-        guard reserved else { return nil }
-        var staged = false
-        defer { if !staged { releaseMomentSlot() } }
-        guard !Task.isCancelled else { lastMomentOutcome = "cancelled"; return nil }
-        // The switch comes FIRST, ahead of the extractor and the day-slot
-        // reservation: off means nothing is read, nothing is reserved and no
-        // model is called — the same "not installed" shape her hour uses.
-        if let momentsEnabled, !momentsEnabled() {
-            lastMomentOutcome = "disabled"
-            return nil
-        }
-        // RESERVE FIRST. An actor is reentrant across `await`, so a
-        // check-then-await-then-increment shape lets every concurrent turn read
-        // the same stale quota and all of them stage — the cap would hold only
-        // when turns happened to be serial. The slot is taken synchronously
-        // here and released on every path that does not stage.
-        // The outcome is now the EXTRACTOR'S word, not a placeholder set before
-        // the call (lane5 finding 3): "abstained" means the model read the hour
-        // and said there was no moment in it; "extractionFailed" means no answer
-        // was obtained. The ledger could not tell those apart while both wrote
-        // `none`.
-        lastMomentOutcome = "unreported"
-
-        guard let candidate = outcome.candidate else {
-            lastMomentOutcome = outcome.receiptOutcome
-            return nil
-        }
-        lastMomentOutcome = "belowSalience"
-        guard candidate.salience >= MemoryMoments.salienceFloor else { return nil }
-        // A quote the model did not actually copy is a fabricated line of
-        // dialogue. Drop it and keep the moment.
-        let quote = MemoryMoments.validatedQuote(
-            candidate.quote,
-            userMessage: userMessage,
-            assistantMessage: assistantMessage
-        )
-        // User, 2026-09-03: no line of his, no moment. Eight of her own
-        // sentences reached the review card as moments overnight; a moment
-        // is what happened between them, and his words are the proof.
-        lastMomentOutcome = "noQuote"
-        guard let quote else { return nil }
-        let content = MemoryMoments.composedContent(candidate.content, quote: quote)
-        // The turn text reached an LLM and came back as prose that is about to
-        // be written into durable memory. The prompt told the model that text
-        // was data; this checks that what it handed back still looks like a
-        // person narrating an hour, and not an instruction wearing one.
-        lastMomentOutcome = "gated"
-        guard MemoryMoments.contentRejectionReason(content) == nil else { return nil }
-        lastMomentOutcome = "ungrounded"
-        guard MemoryMoments.groundednessRejectionReason(
-            candidate.content, userMessage: userMessage, assistantMessage: assistantMessage
-        ) == nil else { return nil }
-        lastMomentOutcome = "failed"
-        do {
-            try Task.checkCancellation()
-            if try await memory.isRejected(content: content) {
-                lastMomentOutcome = "tombstoned"
-                return nil
-            }
-            let source = "\(MemoryMoments.sourcePrefix):\(sessionId)"
-            let metadata = MemoryMoments.metadata(
-                for: candidate,
-                quote: quote,
-                sessionId: sessionId,
-                surface: surface,
-                author: author
-            ).merging(friction.map { ["friction": .string($0)] } ?? [:]) { current, _ in current }
-                .merging((origin?.occurredAt).map { ["observed_at": .string($0.ISO8601Format())] } ?? [:]) { current, _ in current }
-                .merging(MemoryMoments.turnMetadata(turnId: turnId, origin: origin)) { current, _ in current }
-            // One event, one moment (10-10): checked by meaning against the
-            // moments she keeps and the ones waiting on her, with the fact
-            // lane's own check, before the same-day key so a retelling's
-            // evidence always reaches the surviving row. A retelling joins that
-            // row as evidence; nothing is staged and the day slot is released.
-            let kept = try await memory.listMemory(kind: MemoryMoments.kind).filter { ($0.status ?? "active") == "active" }
-            let rows = kept + (try await memory.listProposals(status: "pending")).filter { MemoryMoments.isMoment($0.metadata) }
-                .map { MemoryRecord(id: $0.id, text: $0.content, createdAt: $0.createdAt, sourceRunId: $0.source, extras: $0.metadata) }
-            if let index = try await Self.nearDuplicate(content, of: rows.map(\.text), memory: memory) {
-                try await memory.recordRetelling(of: rows[index], pending: index >= kept.count, source: source, metadata: metadata)
-                lastMomentOutcome = "retold"
-                return nil
-            }
-            lastMomentOutcome = "duplicate"
-            let contentKey = MemoryMoments.contentKey(candidate.content)
-            guard !momentDayContentKeys.contains(contentKey) else { return nil }
-            lastMomentOutcome = "failed"
-            let proposal = try await memory.propose(
-                content: content,
-                source: source,
-                confidence: candidate.salience,
-                kind: MemoryMoments.kind,
-                supportingSessionIDs: [sessionId],
-                recurrenceCount: 1,
-                extraMetadata: metadata
-            )
-            // Kept whatever the dedup path did with it: a re-staged moment
-            // still consumed a model call and a day slot.
-            staged = true
-            momentDayContentKeys.insert(contentKey)
-            lastMomentOutcome = "staged"
-            return proposal
-        } catch {
-            // Held like the fact lane: an unanswered read or check is retried.
-            lastMomentOutcome = "failed"
-            return nil
-        }
-    }
-
-    /// Take one of today's moment slots, or refuse. Everything after the
-    /// (at most once a day) storage scan is synchronous, so the read of
-    /// `momentDayCount` and its increment cannot be interleaved by another turn.
-    ///
-    /// Counts pending + accepted + rejected — what she did with a moment does
-    /// not give the day another one.
-    private func reserveMomentSlot(memory: SwiftNativeMemoryV2, now: Date) async -> Bool {
-        let key = MemoryMoments.dayKey(now)
-        if momentDayKey != key, !momentDayScanInFlight {
-            // Claim the day and CLOSE the quota before yielding, so turns that
-            // arrive during the scan refuse rather than stage on a zeroed
-            // counter. Missing a moment is the safe direction; overshooting the
-            // cap is not.
-            momentDayKey = key
-            momentDayCount = MemoryMoments.dailyCap
-            momentDayScanInFlight = true
-            let scanned = await Self.stagedMomentsToday(memory: memory, dayKey: key)
-            momentDayScanInFlight = false
-            // An unread day keeps its quota closed and is read again next turn.
-            guard let scanned else {
-                if momentDayKey == key { momentDayKey = nil }
-                return false
-            }
-            // Another turn may have rolled the day over while the scan ran; only
-            // apply the result if it still describes today.
-            if momentDayKey == key {
-                momentDayCount = scanned.count
-                momentDayContentKeys = Set(scanned.map {
-                    MemoryMoments.storedContentKey(content: $0.content, metadata: $0.metadata)
-                })
-            }
-        }
-        guard momentDayKey == key, momentDayCount < MemoryMoments.dailyCap else { return false }
-        momentDayCount += 1
-        return true
-    }
-
-    /// Give the slot back. Only ever called for a reservation this actor made,
-    /// and floored at zero so a released-twice bug can never mint free quota.
-    private func releaseMomentSlot() {
-        momentDayCount = max(0, momentDayCount - 1)
-    }
-
-    static func stagedMomentsToday(memory: SwiftNativeMemoryV2, dayKey: String) async -> [ProposalRecord]? {
-        guard let all = try? await memory.listProposals(status: nil) else { return nil }
-        return all.filter { proposal in
-            guard MemoryMoments.isMoment(proposal.metadata) else { return false }
-            guard let staged = MemoryMoments.parseTimestamp(proposal.createdAt) else { return false }
-            return MemoryMoments.dayKey(staged) == dayKey
-        }
-    }
-
-    /// How many moments are waiting on her. The nudge line's whole read, and it
-    /// runs on the turn path — so it is a storage-level COUNT, never a listing.
-    /// A count it could not read throws: an unread count is never zero.
-    public func pendingMomentCount() async throws -> Int {
-        guard let memory else { throw MemoryV2Error.storageUnavailable }
-        return try await memory.countMomentProposals(status: "pending")
-    }
-
-    /// True when the turn's user-seat text was machine-tagged as coming from
-    /// another agent over a local bridge. The prefix is affixed at the single
-    /// bridge entry points (ClaudeBridge / codex bridge), same convention
-    /// StructuredChat's trusted-bridge-envelope detection relies on.
-    static func isAgentSeatUserMessage(_ text: String) -> Bool {
-        if PeerTurnEffectPolicy.peerName(inTurnHeader: text.trimmingCharacters(in: .whitespacesAndNewlines)) != nil {
-            return true
-        }
-        let t = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return t.range(
-            of: #"^\[from: [^\]]{1,64}, via bridge\]"#,
-            options: .regularExpression
-        ) != nil
-    }
-
-    /// The sender a bridge entry point stamped on the turn ("[from: claude,
-    /// via bridge]" → "Claude"), so the memory manager can name who spoke.
-    static func bridgeSender(_ text: String) -> String? {
-        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let peer = PeerTurnEffectPolicy.peerName(inTurnHeader: t) { return peer }
-        guard let match = t.range(of: #"^\[from: ([^\],]{1,64}), via bridge\]"#, options: .regularExpression) else { return nil }
-        let inside = t[match].dropFirst("[from: ".count)
-        let name = inside.prefix { $0 != "," }.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let first = name.first else { return nil }
-        return String(first).uppercased() + name.dropFirst()
+        TurnTraceBus.fire(TurnTraceEvent(turnId: turn, kind: "mind.why", sessionId: session, surface: surface,
+            destinationId: route?.destinationId, threadId: route?.threadId, payload: .object(fields)))
     }
 }

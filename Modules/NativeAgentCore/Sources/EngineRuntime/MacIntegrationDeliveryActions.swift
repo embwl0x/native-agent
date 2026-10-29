@@ -19,15 +19,15 @@ import ToolExecution
 
 public struct MacIntegrationDeliveryActions: MacIntegrationToolBridge, PureToolArgumentValidating {
     private var dataRoot: URL { deviceSync().dataRoot }
-    private let postMessage: @Sendable (String, String) async -> [String: JSONValue]
+    private let connectorActions: @Sendable () -> ConnectorActions
     private let router: @Sendable () -> AttentionRouter
     private let deviceSync: @Sendable () -> DeviceSync
     private let scheduler: @Sendable () -> SchedulerDueJobRunner
 
-    public init(postMessage: @escaping @Sendable (String, String) async -> [String: JSONValue],
+    public init(connectorActions: @escaping @Sendable () -> ConnectorActions,
                 router: @escaping @Sendable () -> AttentionRouter, deviceSync: @escaping @Sendable () -> DeviceSync,
                 scheduler: @escaping @Sendable () -> SchedulerDueJobRunner) {
-        self.postMessage = postMessage
+        self.connectorActions = connectorActions
         self.router = router
         self.deviceSync = deviceSync
         self.scheduler = scheduler
@@ -57,6 +57,10 @@ public struct MacIntegrationDeliveryActions: MacIntegrationToolBridge, PureToolA
         try await LocalPIMConnectorActions.remindersRead(input: input)
     }
 
+    public func remindersLists(input: [String: JSONValue]) async throws -> JSONValue {
+        try await LocalPIMConnectorActions.remindersLists(input: input)
+    }
+
     public func remindersUpdate(input: [String: JSONValue]) async throws -> JSONValue {
         try await LocalPIMConnectorActions.remindersUpdate(input: input)
     }
@@ -66,7 +70,7 @@ public struct MacIntegrationDeliveryActions: MacIntegrationToolBridge, PureToolA
     }
 
     public func macNotify(input: [String: JSONValue]) async throws -> JSONValue {
-        try await Self.macNotify(input: input, postMessage: postMessage)
+        try await connectorActions().runMacNotify(input: input, toolName: "mac_notify")
     }
 
     public func mobileNotify(input: [String: JSONValue], surface: String) async throws -> JSONValue {
@@ -256,8 +260,8 @@ public struct MacIntegrationDeliveryActions: MacIntegrationToolBridge, PureToolA
         return try await schedulerJobWriter().updateJob(jobId: id, changes: changes)
     }
 
-    private func schedulerJobWriter() -> any SchedulerJobWriter {
-        makeSchedulerJobWriter(connectorActionIDs: Set(connectorActionDescriptors().map(\.id)))
+    private func schedulerJobWriter() -> SwiftNativeTriggerScheduler {
+        makeSchedulerJobWriter()
     }
 
     private func schedulerJobID(_ input: [String: JSONValue]) -> String {
@@ -265,60 +269,14 @@ public struct MacIntegrationDeliveryActions: MacIntegrationToolBridge, PureToolA
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    // MARK: - Phase 1
-
     public func spotlightSearch(input rawInput: [String: JSONValue]) async throws -> JSONValue {
         var input = rawInput
-        // name: filename contains, case-insensitive — content words drown filename hits (10-08).
+        // name: filename contains, case-insensitive — content words drown filename hits.
         if let name = input["name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
             input["query"] = .string("kMDItemFSName == \"*\(name.replacingOccurrences(of: "\"", with: "").replacingOccurrences(of: "*", with: ""))*\"cd")
             input["name"] = nil; input["q"] = nil
         }
-        let query = (input["query"]?.stringValue ?? input["q"]?.stringValue ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !query.isEmpty else {
-            throw NSError(domain: "NativeAgentMacIntegrationBridge", code: -400, userInfo: [
-                NSLocalizedDescriptionKey: "mac_spotlight_search requires query",
-            ])
-        }
-        // Dispatch through MacControl's spotlight action (same path the
-        // connector-action route uses). gpt-5.5 review BLOCKING fix: thread
-        // the TrustCenter policy provider + audit path so the in-process
-        // preflight runs and refusals get logged to the shared audit file —
-        // matches ConnectorActions.runMacSpotlightSearch. Bare
-        // makeMacControl() disabled the policy preflight and was a security
-        // regression vs the connector-action route.
-        let auditPath = PersistenceCore.defaultDataRoot()
-            .appendingPathComponent("mac_control_audit.jsonl")
-        let impl = makeMacControl(
-            policyProvider: TrustCenterMacControlPolicyProvider(),
-            auditAppendPath: auditPath
-        )
-        let result = try await impl.dispatch(action: "spotlight", body: input)
-        let partial = if case .object(let output) = result.output, output["partial"] == .bool(true) { true } else { false }
-        var obj: [String: JSONValue] = [
-            "status": .string(!result.ok ? "failed" : partial ? "partial" : "completed"),
-            "action": .string(result.action),
-            "ok": .bool(result.ok),
-            "durationMs": .int(Int64(result.durationMs)),
-            "viaSwift": .bool(result.viaSwift),
-            "output": result.output,
-        ]
-        if let error = result.error { obj["error"] = .string(error) }
-        if let httpStatus = result.httpStatus { obj["httpStatus"] = .int(Int64(httpStatus)) }
-        return NativeAppSecretRedactor.redactValue(.object(obj))
-    }
-
-    public static func macNotify(input: [String: JSONValue], postMessage: (String, String) async -> [String: JSONValue]) async throws -> JSONValue {
-        // Mirror the shape ConnectorActions.runMacNotify uses so the chat-tool
-        // path returns the same envelope the connector-action path does.
-        let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: "mac_notify")
-        var obj = await postMessage(title, message)
-        obj.merge([
-            "title": .string(NativeAppSecretRedactor.redactText(title)),
-            "messagePreview": .string(String(NativeAppSecretRedactor.redactText(message).prefix(200))),
-        ]) { _, new in new }
-        return .object(obj)
+        return try await connectorActions().runMacSpotlightSearch(input: input, toolName: "mac_spotlight_search")
     }
 
 
@@ -369,23 +327,10 @@ public struct MacIntegrationDeliveryActions: MacIntegrationToolBridge, PureToolA
 
 }
 
-// MARK: - JSONValue convenience
-
-private extension JSONValue {
-    var stringValue: String? {
-        if case .string(let s) = self { return s }
-        return nil
-    }
-}
-
 /// MacControl's `notify` action posts through the app's one banner exit
 /// instead of its own copy of the UserNotifications calls.
-public struct NativeAgentMacControlNotificationAdapter: NotificationCenterAdapter {
+public struct MacNotificationPosting: NotificationPosting {
     public init() {}
-    public func postNotification(title: String, message: String, soundName: String?) async throws {
-        _ = try await postNotificationReceipt(title: title, message: message, soundName: soundName)
-    }
-
     public func postNotificationReceipt(
         title: String,
         message: String,

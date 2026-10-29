@@ -39,10 +39,10 @@ extension CognitiveSQLiteStore {
                 arguments: [bounded]
             )
             return try rows.map { row in
-                let rowID: String = row["id"] ?? "<unknown>"
+                let rowID: String = try row.decode(forColumn: "id") ?? "<unknown>"
                 guard let id = UUID(uuidString: rowID),
-                      let kind: String = row["kind"],
-                      let createdAt: Double = row["created_at"],
+                      let kind: String = try row.decode(forColumn: "kind"),
+                      let createdAt: Double = try row.decode(forColumn: "created_at"),
                       createdAt.isFinite else {
                     throw CognitiveSQLiteReadError.malformedRow(
                         table: "cognitive_receipts",
@@ -70,7 +70,7 @@ extension CognitiveSQLiteStore {
                    activation, salience, confidence, source_class,
                    created_at, last_activated_at, decay_half_life,
                    summary, metadata_json, updated_at,
-                   emotional_valence, emotional_arousal, emotional_warmth
+                   emotional_valence, emotional_arousal, emotional_warmth, lived_seq
             FROM cognitive_nodes
             ORDER BY salience DESC, activation DESC, last_activated_at DESC, id ASC
             """
@@ -81,7 +81,7 @@ extension CognitiveSQLiteStore {
         decayAnchors.reserveCapacity(rows.count)
         for row in rows {
             let node = try node(from: row)
-            guard let updatedAt: Double = row["updated_at"], updatedAt.isFinite else {
+            guard let updatedAt: Double = try row.decode(forColumn: "updated_at"), updatedAt.isFinite else {
                 throw CognitiveSQLiteReadError.malformedRow(
                     table: "cognitive_nodes",
                     id: node.id.uuidString,
@@ -113,8 +113,8 @@ extension CognitiveSQLiteStore {
             arguments: [whole ? kindPrefix : "\(kindPrefix)%", bounded]
         )
         return try rows.map { row in
-            let id: String = row["id"] ?? "<unknown>"
-            guard let raw: String = row["payload_json"] else {
+            let id: String = try row.decode(forColumn: "id") ?? "<unknown>"
+            guard let raw: String = try row.decode(forColumn: "payload_json") else {
                 throw CognitiveSQLiteReadError.malformedRow(
                     table: "cognitive_artifacts",
                     id: id,
@@ -143,8 +143,8 @@ extension CognitiveSQLiteStore {
     }
 
     private static func receiptPayload(from row: Row) throws -> JSONValue {
-        let id: String = row["id"] ?? "<unknown>"
-        guard let raw: String = row["payload_json"] else {
+        let id: String = try row.decode(forColumn: "id") ?? "<unknown>"
+        guard let raw: String = try row.decode(forColumn: "payload_json") else {
             throw CognitiveSQLiteReadError.malformedRow(
                 table: "cognitive_receipts",
                 id: id,
@@ -163,26 +163,26 @@ extension CognitiveSQLiteStore {
     }
 
     private static func node(from row: Row) throws -> CognitiveNode {
-        let rowID: String = row["id"] ?? "<unknown>"
-        guard let idRaw: String = row["id"],
+        let rowID: String = try row.decode(forColumn: "id") ?? "<unknown>"
+        guard let idRaw: String = try row.decode(forColumn: "id"),
               let id = UUID(uuidString: idRaw),
-              let kindRaw: String = row["kind"],
+              let kindRaw: String = try row.decode(forColumn: "kind"),
               let kind = CognitiveNodeKind(rawValue: kindRaw),
-              let type: String = row["subject_type"],
-              let subjectId: String = row["subject_id"],
-              let sourceRaw: String = row["source_class"],
+              let type: String = try row.decode(forColumn: "subject_type"),
+              let subjectId: String = try row.decode(forColumn: "subject_id"),
+              let sourceRaw: String = try row.decode(forColumn: "source_class"),
               let source = CognitiveSourceClass(rawValue: sourceRaw),
-              let activation: Double = row["activation"],
-              let salience: Double = row["salience"],
-              let confidence: Double = row["confidence"],
-              let createdAt: Double = row["created_at"],
-              let lastActivatedAt: Double = row["last_activated_at"],
-              let decayHalfLife: Double = row["decay_half_life"],
-              let summary: String = row["summary"],
-              let metadataRaw: String = row["metadata_json"],
-              let emotionalValence: Double = row["emotional_valence"],
-              let emotionalArousal: Double = row["emotional_arousal"],
-              let emotionalWarmth: Double = row["emotional_warmth"] else {
+              let activation: Double = try row.decode(forColumn: "activation"),
+              let salience: Double = try row.decode(forColumn: "salience"),
+              let confidence: Double = try row.decode(forColumn: "confidence"),
+              let createdAt: Double = try row.decode(forColumn: "created_at"),
+              let lastActivatedAt: Double = try row.decode(forColumn: "last_activated_at"),
+              let decayHalfLife: Double = try row.decode(forColumn: "decay_half_life"),
+              let summary: String = try row.decode(forColumn: "summary"),
+              let metadataRaw: String = try row.decode(forColumn: "metadata_json"),
+              let emotionalValence: Double = try row.decode(forColumn: "emotional_valence"),
+              let emotionalArousal: Double = try row.decode(forColumn: "emotional_arousal"),
+              let emotionalWarmth: Double = try row.decode(forColumn: "emotional_warmth") else {
             throw CognitiveSQLiteReadError.malformedRow(
                 table: "cognitive_nodes",
                 id: rowID,
@@ -206,13 +206,13 @@ extension CognitiveSQLiteStore {
                 detail: "metadata_json is not an object"
             )
         }
-        return CognitiveNode(
+        var node = CognitiveNode(
             id: id,
             kind: kind,
             subjectReference: CognitiveSubjectReference(
                 type: type,
                 id: subjectId,
-                label: row["subject_label"]
+                label: try row.decode(forColumn: "subject_label")
             ),
             activation: activation,
             salience: salience,
@@ -227,6 +227,9 @@ extension CognitiveSQLiteStore {
             emotionalArousal: emotionalArousal,
             emotionalWarmth: emotionalWarmth
         )
+        let lived: Int64? = try row.decode(forColumn: "lived_seq")
+        node.livedSeq = lived.map { UInt64(max(0, $0)) }
+        return node
     }
 
     private static func parseJSONStrict(_ raw: String) throws -> JSONValue {

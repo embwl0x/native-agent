@@ -4,12 +4,13 @@ import ApprovalInbox
 import Desk
 import Transcripts
 import StandingBots
+import ChatToolParsing
 // Blueprint: | `AgentWorkspaceFind.swift` | Exact owned contact/helper, Desk, session, approval and message IDs enter their canonical readers before topic search; `project` |
 
 /// One explicit search over existing bounded readers. No index, disk crawl,
 /// provider reasoning, background work, or inferred action routing lives here.
 enum AgentWorkspaceFind {
-    static func project(query: String, dataRoot: URL, perform: AgentWorkspace.Perform) async throws -> AgentWorkspaceProjection {
+    static func project(query: String, dataRoot: URL, perform: AgentWorkspace.Perform) async throws -> WorkspacePage {
         if let exact = try await exact(query: query, dataRoot: dataRoot, perform: perform) { return exact }
         var items: [AgentWorkspaceItem] = []
         var sources: [JSONValue] = []
@@ -27,10 +28,9 @@ enum AgentWorkspaceFind {
             do {
                 let ownerValue = try await perform(tool, input)
                 let value = tool == "recall_memory" ? rankedMemory(ownerValue, query: query) : ownerValue
-                let projection = await AgentWorkspaceProjection.project(location: location, result: value, dataRoot: dataRoot)
+                let projection = await WorkspacePage.project(location: location, result: value, dataRoot: dataRoot, evidence: AgentWorkspaceDocument.evidence(location: location, value: value))
                 let status = AgentWorkspaceEnvironment.outcome(value)
-                let failed = ![JSONValue.string("ok"), .string("completed"), .string("not_found")].contains(status)
-                partial = partial || failed
+                partial = partial || ChatToolOutcome.exactResultClass(ownerValue) != .succeeded
                 var source: [String: JSONValue] = ["name": .string(name), "status": status,
                     "shown": .int(Int64(min(projection.items.count, tool == "work_context" ? 6 : 3)))]
                 if case .object(let row) = value {
@@ -73,11 +73,12 @@ enum AgentWorkspaceFind {
         ])
     }
 
-    private static func exact(query: String, dataRoot: URL, perform: AgentWorkspace.Perform) async throws -> AgentWorkspaceProjection? {
+    private static func exact(query: String, dataRoot: URL, perform: AgentWorkspace.Perform) async throws -> WorkspacePage? {
         guard !query.contains(where: \.isWhitespace) else { return nil }
-        func read(_ tool: String, _ input: [String: JSONValue], _ title: String) async throws -> AgentWorkspaceProjection {
+        func read(_ tool: String, _ input: [String: JSONValue], _ title: String) async throws -> WorkspacePage {
             let value = try await perform(tool, input)
-            return await AgentWorkspaceProjection.project(location: .record(tool: tool, input: input, title: title), result: value, dataRoot: dataRoot)
+            let location = AgentWorkspaceLocation.record(tool: tool, input: input, title: title)
+            return await WorkspacePage.project(location: location, result: value, dataRoot: dataRoot, evidence: AgentWorkspaceDocument.evidence(location: location, value: value))
         }
         if let peer = try AgentWorkspacePorts.current.conversations.peers(dataRoot: dataRoot).first(where: { query == $0.id || query == "peer:" + $0.id }) {
             return try await read("agent_contacts", ["discover": .string("peer:" + peer.id)], peer.name)
@@ -90,7 +91,7 @@ enum AgentWorkspaceFind {
         }
         if let session = try ChatSessionIndexFile.loadObjectRowsForMutation(at: dataRoot.appendingPathComponent("chat/sessions.json"))
             .first(where: { $0["id"] == .string(query) }) {
-            return try await read("chat_conversations", ["conversation_session_id": .string(query)], HumanConversationIndex.string(session["title"]) ?? "Conversation")
+            return try await read("chat_conversations", ["conversation_session_id": .string(query)], session["title"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? "Conversation")
         }
         if UUID(uuidString: query) != nil {
             if let approval = try SwiftNativeApprovalInbox(root: dataRoot).recordsUnlocked()
@@ -108,7 +109,8 @@ enum AgentWorkspaceFind {
         if UUID(uuidString: query) != nil || query.hasPrefix("msg_") || query.hasPrefix("agent-conversation:") {
             let value = try await perform("read_chat_message", ["message_id": .string(query)])
             if case .object(let row) = value, row["status"] != .string("not_found") {
-                return await AgentWorkspaceProjection.project(location: .record(tool: "read_chat_message", input: ["message_id": .string(query)], title: "Message"), result: value, dataRoot: dataRoot)
+                let location = AgentWorkspaceLocation.record(tool: "read_chat_message", input: ["message_id": .string(query)], title: "Message")
+                return await WorkspacePage.project(location: location, result: value, dataRoot: dataRoot, evidence: AgentWorkspaceDocument.evidence(location: location, value: value))
             }
         }
         return nil

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Compose the shared sources into the single ES2020 file the plug accepts.
+# Compose shared helpers and the selected format reader into one ES2020 file.
 # Authoring/build operation only; does not execute senses or contact the app.
 set -eu
 cd "$(dirname "$0")"

@@ -1,26 +1,11 @@
-// PATCH-2026-05-07: ios-parity ContentView — focused bottom TabView.
-// Primary tabs stay below iOS overflow; advanced/workspace surfaces live behind More.
-// Design-system pass: accent tint applied to TabView selection color.
-// PATCH-2026-05-09: proactive-inbox-ios — Inbox tab added (InboxView + InboxStore)
-// PATCH-2026-05-10: sidebar-flatten — collapse the former 6-tab layout
-// Approvals / Inbox / Settings / More) into 5 (Chat / Activity / Memories /
-// Skills / More).  Activity links to separate Approvals / Inbox / Memory
-// Proposals / Self-Improvement queues.  More becomes a flat NavigationLink list of
-// single-purpose destinations (no nested hubs).
-// PATCH-2026-06-07: mac-integration-tab-ios — route "mac_integration" and
-// "macintegration" launch-arg / notification-screen aliases land on the More
-// tab (where the new MacIntegrationView lives under Manage). The view itself
-// is reached one tap deeper; collapsing it into a primary tab would break the
-// 5-tab geometry and the Tab-enum-driven badge/notification routing.
-// PATCH-2026-08-27: Desk replaces Skills as the fourth primary tab. Skills &
-// Tools remains available from More so the live work surface is one tap away.
 import SwiftUI
+import NativeAgentShared
 import UIKit
 import UserNotifications
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
-    @ObservedObject private var phoneRequests = PhoneRequestCoordinator.shared
+    @ObservedObject private var phoneRequests = PhoneRequests.shared
     @Environment(ChatStore.self) private var chatStore
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage(HazeColor.key) private var hazeColorRaw = HazeColor.defaultValue.rawValue
@@ -34,12 +19,14 @@ struct ContentView: View {
     @State private var selection: Tab = ContentView.initialTabFromLaunchArgs()
     @State private var isRefreshingActivityBadges = false
     @State private var skipNextActivityInitialRefresh = false
-    @State private var openedFromNotificationLaunch = NativeAgentNotificationLaunchIntent.hasPendingOpenActivity
+    @State private var openedFromNotificationLaunch = NativeAgentNotificationLaunchIntent.isPending
     @State private var notificationOpenRefreshTask: Task<Void, Never>? = nil
     @State private var lastNotificationOpenAt: Date = .distantPast
     @State private var suppressActivityRefreshUntil: Date = .distantPast
     @State private var activityNavigationTarget: ActivitySection?
-    @State private var deskTaskNavigationTarget: MobileDeskTaskNotificationIntent?
+    @State private var notifiedSessionID: String?
+    @State private var notifiedDeskHandle: String?
+    @State private var deskTaskNavigationTarget: NativeAgentNotificationLaunchIntent?
 
     enum Tab: Hashable {
         case chat, activity, memories, desk, more
@@ -50,28 +37,16 @@ struct ContentView: View {
         return overview.needsYouCount
     }
 
-    /// Parse `-initialTab <name>` from process arguments.  Legacy names route
-    /// to their new homes so existing UI tests keep landing in the right place.
+    /// Parse `-initialTab <name>`, retaining legacy screen aliases.
     private static func initialTabFromLaunchArgs() -> Tab {
         initialTab(fromLaunchArguments: ProcessInfo.processInfo.arguments)
     }
 
-    /// The launch-argument router is pure so it can be verified without
-    /// mutating process-global arguments shared by parallel iOS tests.
     static func initialTab(fromLaunchArguments arguments: [String]) -> Tab {
         guard let idx = arguments.firstIndex(of: "-initialTab"), idx + 1 < arguments.count else {
             return .chat
         }
-        switch arguments[idx + 1].lowercased() {
-        case "chat": return .chat
-        case "activity", "approvals", "inbox": return .activity
-        case "memory", "memories": return .memories
-        case "desk": return .desk
-        case "skills": return .more
-        case "missions", "workshop", "more", "advanced", "settings": return .more
-        case "mac_integration", "macintegration", "mac-integration": return .more
-        default: return .chat
-        }
+        return tab(forScreen: arguments[idx + 1]) ?? .chat
     }
 
     private func openSharedChatIfNeeded() {
@@ -114,7 +89,8 @@ struct ContentView: View {
 
     private var tabContent: some View {
         TabView(selection: $selection) {
-            ChatView()
+            ChatView(notifiedSessionID: $notifiedSessionID)
+                .environmentObject(approvalsStore)
                 .tabItem {
                     Label("Chat", systemImage: "bubble.left.and.bubble.right")
                     .environment(\.symbolVariants, .none)
@@ -145,7 +121,7 @@ struct ContentView: View {
                 // More → Desk pushes WorkshopView inside More's navigation stack
                 // for directed work; this tab opens the canonical Desk board.
                 // The More route keeps More selected and does not switch to this tab.
-                MobileDeskView()
+                MobileDeskView(notifiedHandle: $notifiedDeskHandle)
             }
                 .tabItem {
                     Label("Desk", systemImage: "rectangle.3.group")
@@ -162,10 +138,7 @@ struct ContentView: View {
                 .tag(Tab.more)
         }
         .tint(HazeColor(stored: hazeColorRaw).control(dark: colorScheme == .dark, labelled: false))
-        // 2026-09-11 craft trial (User: Chrome's bar reads finer; Agent: less
-        // ink, preserved character). Outlined glyphs at one weight for all five
-        // tabs, the selected one included: the teal and the selection pill
-        // already say which tab is on, the filled silhouette only added mass.
+        // Outlined tab glyphs keep one weight; tint and the selection pill indicate the active tab.
         .environment(\.symbolVariants, .none)
         .onAppear {
             openSharedChatIfNeeded()
@@ -181,33 +154,21 @@ struct ContentView: View {
             }
         }
         .overlay(alignment: .top) {
-            // PATCH-2026-06-06: iOS SystemToast parity. iOSSystemToastCenter
-            // .shared is pushed from any view surfacing a transient banner
-            // (inline approval decisions, remote model-picker changes, and
-            // action results). 2026-09-25: the toasts drop in from the top,
-            // under the status bar, like a system banner. At the bottom they
-            // landed on the floating tab bar and the chat composer (glass on
-            // glass). An overlay takes no layout, so an empty queue moves
-            // nothing; the bar's own gate skips hit-testing when it is empty.
-            iOSSystemToastBar(center: iOSSystemToastCenter.shared)
+            // Top toasts avoid the tab bar and composer; an empty overlay neither shifts layout nor intercepts taps.
+            iOSSystemToastBar(center: SystemToastCenter.shared)
         }
         .onAppear {
             consumePendingNotificationOpenIfNeeded()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .nativeagentOpenActivity)) { note in
-            let screen = (note.userInfo?["screen"] as? String) ?? "activity"
-            openActivityFromNotification(screen: screen)
+        .onReceive(NotificationCenter.default.publisher(for: .nativeagentOpenActivity)) { _ in
+            consumePendingNotificationOpenIfNeeded()
         }
         .onChange(of: sync.approvals) { _, _ in
             approvalsStore.applySyncedApprovalsFromSnapshot(
-                animated: true,
                 notifyNewPending: true
             )
             Task {
-                await NativeAgentActivityNotificationCleaner.pruneDeliveredNotifications(
-                    activeInboxItems: inboxStore.items,
-                    pendingApprovalIDs: Set(approvalsStore.approvals.filter { $0.status.lowercased() == "pending" }.map(\.id))
-                )
+                await pruneActivityNotifications()
             }
         }
         .onChange(of: activityBadgeCount, initial: true) { _, count in
@@ -219,18 +180,13 @@ struct ContentView: View {
         }
         .onChange(of: sync.inboxItems) { _, _ in
             approvalsStore.applySyncedApprovalsFromSnapshot(
-                animated: true,
                 notifyNewPending: true
             )
             inboxStore.applySyncedInboxFromSnapshot(
-                animated: true,
                 notifyNewArrivals: true
             )
             Task {
-                await NativeAgentActivityNotificationCleaner.pruneDeliveredNotifications(
-                    activeInboxItems: inboxStore.items,
-                    pendingApprovalIDs: Set(approvalsStore.approvals.filter { $0.status.lowercased() == "pending" }.map(\.id))
-                )
+                await pruneActivityNotifications()
             }
         }
         .task {
@@ -250,13 +206,13 @@ struct ContentView: View {
 
     @MainActor
     private func consumePendingNotificationOpenIfNeeded() {
-        if let screen = NativeAgentNotificationLaunchIntent.consumePendingScreen() {
-            openActivityFromNotification(screen: screen)
+        if let destination = NativeAgentNotificationLaunchIntent.consume() {
+            openActivityFromNotification(destination)
         }
     }
 
-    /// F7: maps a notification payload `screen` to a top-level tab.
-    private func tab(forNotificationScreen screen: String) -> Tab {
+    /// Known destinations share aliases; each ingress owns its unknown-input default.
+    private static func tab(forScreen screen: String) -> Tab? {
         switch screen.lowercased() {
         case "chat": return .chat
         case "memories", "memory": return .memories
@@ -266,16 +222,17 @@ struct ContentView: View {
         case "more", "settings", "advanced": return .more
         case "mac_integration", "macintegration", "mac-integration": return .more
         case "activity", "approvals", "inbox": return .activity
-        default: return .activity
+        default: return nil
         }
     }
 
     @MainActor
-    private func openActivityFromNotification(screen: String = "activity") {
-        _ = NativeAgentNotificationLaunchIntent.consumeOpenActivityPending()
-        let deskTaskIntent = MobileDeskTaskNotificationIntent.consume()
-        let target = deskTaskIntent == nil ? tab(forNotificationScreen: screen) : .more
-        if let deskTaskIntent { deskTaskNavigationTarget = deskTaskIntent }
+    private func openActivityFromNotification(_ destination: NativeAgentNotificationLaunchIntent) {
+        let screen = destination.screen
+        let target = Self.tab(forScreen: screen) ?? .activity
+        notifiedSessionID = destination.sessionID
+        notifiedDeskHandle = screen == "desk" ? destination.taskID : nil
+        if screen == "workshop" { deskTaskNavigationTarget = destination }
         activityNavigationTarget = target == .activity
             ? ActivityScreenPresentation.activityDestination(for: screen)
             : nil
@@ -294,7 +251,7 @@ struct ContentView: View {
         notificationOpenRefreshTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 2_250_000_000)
             guard !Task.isCancelled else { return }
-            await refreshActivityBadges(pruneNotifications: false, animated: false, notifyNewActivity: false)
+            await refreshActivityBadges(pruneNotifications: false, notifyNewActivity: false)
             openedFromNotificationLaunch = false
         }
     }
@@ -308,7 +265,6 @@ struct ContentView: View {
     @MainActor
     private func refreshActivityBadges(
         pruneNotifications: Bool = true,
-        animated: Bool = true,
         notifyNewActivity: Bool = true
     ) async {
         guard !isRefreshingActivityBadges else { return }
@@ -317,42 +273,40 @@ struct ContentView: View {
         await sync.refreshActivitySnapshot()
         if pairingStore.usesICloudTransport {
             approvalsStore.applySyncedApprovalsFromSnapshot(
-                animated: animated,
                 notifyNewPending: notifyNewActivity
             )
             inboxStore.applySyncedInboxFromSnapshot(
-                animated: animated,
                 notifyNewArrivals: notifyNewActivity
             )
         }
         if pruneNotifications {
-            await NativeAgentActivityNotificationCleaner.pruneDeliveredNotifications(
-                activeInboxItems: inboxStore.items,
-                pendingApprovalIDs: Set(approvalsStore.approvals.filter { $0.status.lowercased() == "pending" }.map(\.id))
-            )
+            await pruneActivityNotifications()
         }
+    }
+
+    @MainActor
+    private func pruneActivityNotifications() async {
+        await NativeAgentActivityNotificationCleaner.pruneDeliveredNotifications(
+            activeInboxItems: sync.inboxSnapshotLoaded ? inboxStore.items : nil,
+            pendingApprovalIDs: sync.approvalsSnapshotLoaded
+                ? Set(approvalsStore.approvals.filter { $0.outcome == .pending }.map(\.id))
+                : nil
+        )
     }
 }
 
 enum NativeAgentActivityNotificationCleaner {
-    struct DeliveredNotification {
-        let identifier: String
-        let userInfo: [AnyHashable: Any]
-    }
-
-    static func pruneDeliveredNotifications(activeInboxItems: [InboxItemRecord], pendingApprovalIDs: Set<String>) async {
-        let activeItemIDs = Set(activeInboxItems.filter { $0.isUnread }.map(\.id))
+    /// A missing queue is unavailable; only a successfully read empty queue
+    /// proves that its delivered notifications have resolved.
+    static func pruneDeliveredNotifications(activeInboxItems: [InboxItemRecord]?, pendingApprovalIDs: Set<String>?) async {
+        guard activeInboxItems != nil || pendingApprovalIDs != nil else { return }
+        let activeItemIDs = activeInboxItems.map { Set($0.filter { $0.isUnread }.map(\.id)) }
         let center = UNUserNotificationCenter.current()
         let delivered = await center.deliveredNotifications()
         let idsToRemove = notificationIDsToRemove(
             activeItemIDs: activeItemIDs,
             pendingApprovalIDs: pendingApprovalIDs,
-            deliveredNotifications: delivered.map {
-                DeliveredNotification(
-                    identifier: $0.request.identifier,
-                    userInfo: $0.request.content.userInfo
-                )
-            }
+            deliveredNotifications: delivered
         )
 
         if !idsToRemove.isEmpty {
@@ -360,48 +314,38 @@ enum NativeAgentActivityNotificationCleaner {
         }
     }
 
-    static func notificationIDsToRemove(
-        activeInboxItems: [InboxItemRecord],
-        pendingApprovalIDs: Set<String>,
-        deliveredNotifications: [DeliveredNotification]
-    ) -> [String] {
-        notificationIDsToRemove(
-            activeItemIDs: Set(activeInboxItems.filter { $0.isUnread }.map(\.id)),
-            pendingApprovalIDs: pendingApprovalIDs,
-            deliveredNotifications: deliveredNotifications
-        )
-    }
-
     private static func notificationIDsToRemove(
-        activeItemIDs: Set<String>,
-        pendingApprovalIDs: Set<String>,
-        deliveredNotifications: [DeliveredNotification]
+        activeItemIDs: Set<String>?,
+        pendingApprovalIDs: Set<String>?,
+        deliveredNotifications: [UNNotification]
     ) -> [String] {
         var removeIDs: [String] = []
 
         for notification in deliveredNotifications {
-            let info = normalizedNativeAgentInfo(notification.userInfo)
+            let info = normalizedNativeAgentInfo(notification.request.content.userInfo)
             guard isNativeAgentActivityNotification(info) else { continue }
 
             if let approvalID = infoString("approvalId", in: info), !approvalID.isEmpty {
-                if !pendingApprovalIDs.contains(approvalID) {
-                    removeIDs.append(notification.identifier)
+                if let pendingApprovalIDs, !pendingApprovalIDs.contains(approvalID) {
+                    removeIDs.append(notification.request.identifier)
                 }
                 continue
             }
 
             if let itemID = infoString("itemId", in: info), !itemID.isEmpty {
-                if !activeItemIDs.contains(itemID) {
-                    removeIDs.append(notification.identifier)
+                if let activeItemIDs, !activeItemIDs.contains(itemID) {
+                    removeIDs.append(notification.request.identifier)
                 }
                 continue
             }
 
             // A NativeAgent activity notification without an inbox identity
-            // cannot be reconciled to the current snapshot. Retaining it via a
-            // source-prefix allowlist leaks stale alerts whenever a new Mac
-            // publisher is introduced.
-            removeIDs.append(notification.identifier)
+            // cannot be reconciled once the inbox snapshot is available.
+            // Retaining it via a source-prefix allowlist leaks stale alerts
+            // whenever a new Mac publisher is introduced.
+            if activeItemIDs != nil {
+                removeIDs.append(notification.request.identifier)
+            }
         }
 
         return removeIDs

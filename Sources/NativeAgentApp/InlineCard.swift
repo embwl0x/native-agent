@@ -1,46 +1,21 @@
-import EngineRuntime
-import MacIntegration
-import ChatToolRuntime
-import NativeAgentCore
+import NativeAgentShared
+import AppKit
 import SwiftUI
 
-// Blueprint: | `InlineCard.swift` | Inline card view family: shared visual grammar and action closures for needs, approvals and receipts; no store or work lifecycle ownership |
+// Blueprint: | `InlineCard.swift` | Inline card visual grammar: surfaces, controls, symbols and receipts; no store or work lifecycle ownership |
 
-/// The inline card family — one grammar for every moment where Agent needs the
-/// person before she can carry on: a connection, a permission, a model choice,
-/// an API key, a capability, a plain decision, an approval, and the receipt a
-/// finished run leaves behind.
-///
-/// This file is the VIEW half. It owns no approval store, no routing store and
-/// no work lifecycle: a card is handed a value and an action closure, and the
-/// owner of the interaction decides what a click means. The value below is the
-/// display model the mechanism's shared interaction projects into
-/// (`kind` / `target` / `title` / `why` / labels / `consequence` / `state` /
-/// persistence note / optional field and choices) — nothing else crosses.
-///
-/// Agent's design call, binding:
-///   * A LIVE card is the silver fill plus its hairline. A SETTLED receipt is
-///     the hairline only — one line, symbol + outcome — at the same horizontal
-///     inset, so the receipt's symbol sits in the live card's icon column.
-///   * One glyph, one meaning. "→" appears only on the consequence line;
-///     links are plain links.
-///   * Three symbols, three colours, no fourth: green ✓ done, white ✕ declined
-///     (declined is not failure), yellow ? unknown. A failure is not a receipt —
-///     it keeps the live card, its explanation and its retry, under the yellow
-///     mark, because "this did not work" is the same family of news as "I do
-///     not know whether it worked".
-///   * Every card states the consequence of declining, and every permission
-///     card says how long the permission lasts.
-///   * At narrow widths the title never truncates; metadata drops to a gray
-///     second line instead.
+/// Cards render supplied values and actions; the interaction owner decides effects.
+/// Live cards use fill and hairline; receipts use hairline with the same symbol inset.
+/// The consequence alone uses “→”; links remain plain.
+/// Receipt marks are green ✓ done, white ✕ declined and yellow ? unknown.
+/// Failures keep the live card, explanation and safe retry under the yellow mark.
+/// Declining consequences and permission durations are explicit.
+/// Titles wrap at narrow widths; metadata moves to a gray second line.
 
 // MARK: - Tokens
 
 enum InlineCardPalette {
-    /// The shared foreground for the primary button: dark ink on the bright
-    /// dark-mode teal, white on the darker light-mode teal. The old approval
-    /// card paired fixed dark ink with a dynamic teal and lost its contrast in
-    /// light; this is the pairing that holds in both.
+    /// Primary buttons use dark ink on dark-mode teal, white on light-mode teal.
     static let onNeedsYou = Color(nsColor: NSColor(name: nil) { appearance in
         appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
             ? NSColor(srgbRed: 0x0B / 255, green: 0x10 / 255, blue: 0x13 / 255, alpha: 1)
@@ -77,10 +52,7 @@ extension View {
             case .quiet: framed
             }
         }
-        // Mood in the tint, 2026-09-14: a card sits inside the transcript's
-        // prose guard, where the window pass is punched out, and its own
-        // fill is clear — so what should warm is the room showing through
-        // it. It takes the warmth here instead. One tint, never two.
+        // Cards inside the window's prose mask receive one local mood tint.
         .moodTintSurface(in: shape)
         .frame(maxWidth: NativeAgentShellLayout.replyMaxWidth, alignment: .leading)
     }
@@ -110,52 +82,6 @@ enum InlineCardMark {
         }
     }
 }
-
-extension InlineCardKind {
-    var symbol: String {
-        switch self {
-        case .needsConnector: return "link"
-        case .needsPermission: return "lock.open"
-        case .needsModelChoice: return "sparkles"
-        case .needsAPIKey: return "key"
-        case .needsCapability: return "switch.2"
-        case .choose: return "questionmark.circle"
-        case .confirm: return "paperplane"
-        case .work: return "gearshape"
-        }
-    }
-}
-
-extension InlineCardModel {
-    /// Which mark a terminal card wears. A failure is not a receipt, so it
-    /// never reaches here as one — see `InlineCardView`.
-    var mark: InlineCardMark {
-        switch state {
-        case .settled: return .done
-        case .declined: return .declined
-        case .failed, .stopped, .unknown: return .unknown
-        case .pending, .running, .superseded: return .done
-        }
-    }
-}
-
-/// What the person did. Resolution belongs to the mechanism; the view only
-/// says which command was taken and with what.
-enum InlineCardAction: Sendable, Equatable {
-    /// The primary command, carrying whatever the card collected: `value` is
-    /// the first field, `values` every field by id.
-    case primary(value: String?, choice: String?, values: [String: String] = [:])
-    /// The quiet "Open full setup" link.
-    case fullSetup
-    /// The quiet secondary: "Not now", "Don't send", "Decide later".
-    case secondary
-    /// Retry after a safe failure.
-    case retry
-    /// Stop the work this card is showing.
-    case stop
-}
-
-typealias InlineCardActionHandler = @MainActor (InlineCardAction) -> Void
 
 // MARK: - Parts
 
@@ -241,9 +167,7 @@ struct InlineCardSecondaryButton: View {
     }
 }
 
-/// One primary command, one quiet secondary, and the consequence of taking the
-/// quiet one. The secondary never stands alone (Agent): "→" is used here and
-/// nowhere else.
+/// One primary, one quiet secondary and its consequence; “→” belongs only here.
 struct InlineCardActions: View {
     let primary: String
     var primaryEnabled: Bool = true
@@ -263,9 +187,7 @@ struct InlineCardActions: View {
                 InlineCardSecondaryButton(title: secondary, action: onSecondary)
             }
             if !consequence.isEmpty {
-                // Agent, 2026-09-13: this is the most important line on the
-                // card — what saying no costs. It reads at the subtitle's own
-                // weight and one contrast step up from a caption.
+                // The cost of declining uses subtitle weight with contrast above captions.
                 Text(consequence)
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
@@ -281,115 +203,16 @@ struct InlineCardDetails<Content: View>: View {
     let label: String
     @ViewBuilder var content: Content
     @State private var open = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-            Button {
-                withAnimation(NativeAgentMotion.respecting(
-                    NativeAgentMotion.arrive, reduceMotion: reduceMotion
-                )) { open.toggle() }
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 9, weight: .semibold))
-                        .rotationEffect(.degrees(open ? 90 : 0))
-                    Text(label).font(ShellType.label)
-                }
-                .foregroundStyle(NativeAgentShell.tertiary)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .focusable()
-            // VoiceOver has no other way to know a disclosure moved: the
-            // chevron's rotation is the only visual state.
-            .accessibilityLabel(label)
-            .accessibilityIdentifier("inline-card.details")
-            .accessibilityValue(open ? "Expanded" : "Collapsed")
-            .accessibilityHint(open ? "Hides these details." : "Shows these details.")
-            if open {
-                content.transition(NativeAgentMotion.arrivalFade)
-            }
-        }
-    }
-}
-
-/// Radio rows. Selecting a row never executes the choice — the primary does.
-struct InlineCardChoiceList: View {
-    let choices: [InlineCardChoice]
-    @Binding var selection: String?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            ForEach(choices) { choice in
-                Button {
-                    selection = choice.id
-                } label: {
-                    HStack(spacing: NativeAgentSpacing.sm) {
-                        Image(systemName: selection == choice.id ? "largecircle.fill.circle" : "circle")
-                            .font(.system(size: 13))
-                            .foregroundStyle(selection == choice.id
-                                             ? NativeAgentShell.needsYou : NativeAgentShell.tertiary)
-                        Text(choice.title)
-                            .font(ShellType.label)
-                            .foregroundStyle(NativeAgentShell.text)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Spacer(minLength: NativeAgentSpacing.sm)
-                        if let note = choice.note {
-                            Text(note)
-                                .font(ShellType.caption)
-                                .foregroundStyle(NativeAgentShell.tertiary)
-                        }
-                    }
-                    .padding(.horizontal, 10)
-                    .frame(minHeight: 34)
-                    .background(selection == choice.id ? NativeAgentShell.softFill : Color.clear,
-                                in: RoundedRectangle(cornerRadius: NativeAgentRadius.control, style: .continuous))
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .focusable()
-                .accessibilityIdentifier("inline-card.choice.\(choice.id)")
-                .accessibilityAddTraits(selection == choice.id ? [.isSelected] : [])
-            }
-        }
-    }
-}
-
-/// A labelled field. A secret is typed into a `SecureField` and goes to the
-/// action closure, never into transcript content.
-struct InlineCardSecretField: View {
-    let field: InlineCardField
-    @Binding var value: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
-            Text(field.label)
+        DisclosureGroup(isExpanded: $open) {
+            content.transition(NativeAgentMotion.arrivalFade)
+        } label: {
+            Text(label)
                 .font(ShellType.label)
-                .foregroundStyle(NativeAgentShell.secondary)
-            Group {
-                if field.isSecret {
-                    SecureField(field.placeholder, text: $value)
-                } else {
-                    TextField(field.placeholder, text: $value)
-                }
-            }
-            .textFieldStyle(.plain)
-            .accessibilityLabel(field.label)
-            .accessibilityIdentifier("inline-card.field")
-            .font(ShellType.code)
-            .padding(.horizontal, 10)
-            .frame(minHeight: 30)
-            .background(NativeAgentShell.quietFill,
-                        in: RoundedRectangle(cornerRadius: NativeAgentRadius.control, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: NativeAgentRadius.control, style: .continuous)
-                .strokeBorder(NativeAgentShell.hairline, lineWidth: 1))
-            if let helper = field.helper {
-                Text(helper)
-                    .font(ShellType.caption)
-                    .foregroundStyle(NativeAgentShell.tertiary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+                .foregroundStyle(NativeAgentShell.tertiary)
+                .togglesDisclosure($open)
+                .accessibilityIdentifier("inline-card.details")
         }
     }
 }
@@ -474,8 +297,7 @@ struct InlineCardReceipt<Details: View>: View {
     let outcome: String
     var meta: String? = nil
     var detailsLabel: String? = nil
-    /// A decline is not an object in scrollback: no hairline box, gray ink,
-    /// one line (Agent, 2026-09-13).
+    /// Quiet declines use one gray line without a box.
     var quiet: Bool = false
     @ViewBuilder var details: Details
 
@@ -563,345 +385,5 @@ struct InlineCardSupersededLine: View {
         .inlineCardSurface(.quiet)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(text)
-    }
-}
-
-// MARK: - The model-driven card
-
-/// One card for one interaction, through every state it passes: ready, in
-/// flight, settled, declined, failed. It appears in place and settles in
-/// place — no bounce, no shimmer, and no modal anywhere.
-struct InlineCardView: View {
-    let model: InlineCardModel
-    let action: InlineCardActionHandler
-
-    @State private var fieldValues: [String: String] = [:]
-    @State private var selection: String?
-    @State private var relaunchError: String?
-
-    /// A card that collects something keeps its controls while it submits: the
-    /// primary takes the spinner and the busy label ("Connecting…"), the quiet
-    /// secondary stays live, and the dimensions do not move. A card that is
-    /// merely showing work in flight has nothing to submit, so it gets the busy
-    /// line and its Stop instead.
-    private var collectsInput: Bool {
-        !model.fields.isEmpty || !model.choices.isEmpty
-    }
-
-    private func typed(_ field: InlineCardField) -> String {
-        (fieldValues[field.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    /// Nothing typed and a sign-in offered: the primary signs in.
-    private var signsIn: Bool {
-        model.signInLabel != nil && model.fields.allSatisfy { typed($0).isEmpty }
-    }
-
-    private var primaryEnabled: Bool {
-        if !model.choices.isEmpty && selection == nil { return false }
-        if signsIn { return true }
-        // The fields are there from the start (User, 2026-09-23: no reveal
-        // click), and the primary stays disabled until the required ones are
-        // filled: it must never submit an empty key.
-        return model.fields.allSatisfy { $0.isOptional || !typed($0).isEmpty }
-    }
-
-    private func fieldBinding(_ id: String) -> Binding<String> {
-        Binding(get: { fieldValues[id] ?? "" }, set: { fieldValues[id] = $0 })
-    }
-
-    /// Every field the card shows, before its buttons in the key-view order.
-    private var fieldRows: some View {
-        ForEach(model.fields, id: \.id) { field in
-            InlineCardSecretField(field: field, value: fieldBinding(field.id))
-        }
-    }
-
-    /// Values travel in the action, never in the transcript.
-    private func submit() {
-        var values: [String: String] = [:]
-        for field in model.fields where !typed(field).isEmpty { values[field.id] = typed(field) }
-        action(.primary(value: model.field.flatMap { values[$0.id] },
-                        choice: selection, values: values))
-    }
-
-    @ViewBuilder
-    private var fullSetupLink: some View {
-        if let label = model.fullSetupLabel {
-            // Secondary text, underlined: a link without system blue, which
-            // would be a second accent on the card.
-            Button { action(.fullSetup) } label: {
-                Text(label).underline().foregroundStyle(NativeAgentShell.secondary)
-            }
-            .buttonStyle(.plain)
-            .font(ShellType.label)
-            .accessibilityIdentifier("inline-card.full-setup")
-        }
-    }
-
-    /// The outcome the primary buys. With a list on the card that is the row
-    /// the person picked — "Use GPT-5.6 Sol" — and otherwise the card's own.
-    private var primaryLabel: String {
-        if signsIn, let signIn = model.signInLabel { return signIn }
-        if let picked = selection,
-           let choice = model.choices.first(where: { $0.id == picked }),
-           let label = choice.actionLabel, !label.isEmpty {
-            return label
-        }
-        return model.primaryLabel
-    }
-
-    var body: some View {
-        // 2026-09-25: a card becomes its receipt in place, no crossfade — the
-        // two share a spot and drew over each other for a frame.
-        switch model.state {
-        case .pending, .running:
-            liveCard.transition(.identity)
-        case .failed, .stopped:
-            failedCard.transition(.identity)
-        case .settled, .declined, .unknown:
-            receipt.transition(.identity)
-        case .superseded:
-            InlineCardSupersededLine()
-                .accessibilityIdentifier("inline-card.\(model.kind.rawValue).superseded")
-                .transition(.identity)
-        }
-    }
-
-    // A live card: the fill, the ask, the control, and what declining costs.
-    private var liveCard: some View {
-        InlineCard(symbol: model.kind.symbol,
-                   symbolTint: NativeAgentShell.needsYou,
-                   title: model.state == .running && !collectsInput
-                       ? (model.busyLabel ?? model.title) : model.title,
-                   reason: model.why) {
-            VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
-                scope
-                fieldRows.disabled(model.state == .running)
-                if !model.choices.isEmpty {
-                    InlineCardChoiceList(choices: model.choices, selection: $selection)
-                        .disabled(model.state == .running)
-                }
-                if model.state == .running && !collectsInput {
-                    runningRow
-                } else {
-                    // What a running sign-in asks of the person (a device code) shows beside its fields too.
-                    if model.state == .running, let note = model.busyNote { InlineCardBusyLine(text: note) }
-                    InlineCardActions(
-                        primary: model.state == .running
-                            ? (model.busyLabel ?? primaryLabel) : primaryLabel,
-                        primaryEnabled: model.state == .running || primaryEnabled,
-                        busy: model.state == .running,
-                        secondary: model.secondaryLabel,
-                        consequence: model.consequence,
-                        onPrimary: submit,
-                        onSecondary: { action(.secondary) }
-                    )
-                    fullSetupLink
-                }
-                details
-                screenRecordingRelaunch
-            }
-        }
-        .accessibilityIdentifier("inline-card.\(model.kind.rawValue)")
-    }
-
-    @ViewBuilder
-    private var screenRecordingRelaunch: some View {
-        if (model.state == .running || model.state == .failed),
-           model.systemPermissions.contains(.screenRecording),
-           SystemPermissionPreflight.status(.screenRecording) != .granted {
-            Text("If you've allowed Screen Recording, relaunch to finish. Your work will continue.")
-                .font(ShellType.caption).foregroundStyle(NativeAgentShell.secondary)
-            Button("Relaunch to finish") {
-                AppRestartCoordinator.relaunchApp(terminate: { AppDelegate.terminateForRestart() },
-                    onSpawnFailure: { relaunchError = "Could not relaunch NativeAgent: \($0.localizedDescription)" })
-            }
-            if let relaunchError { Text(relaunchError).font(ShellType.caption) }
-        }
-    }
-
-    // Still, not shimmering: one indicator, the honest note beside it, and Stop
-    // wherever the owning operation supports it.
-    private var runningRow: some View {
-        HStack(spacing: NativeAgentSpacing.sm) {
-            InlineCardBusyLine(text: model.busyNote ?? (model.busyLabel ?? "Working…"))
-            Spacer(minLength: NativeAgentSpacing.sm)
-            if model.canStop {
-                InlineCardSecondaryButton(title: "Stop") { action(.stop) }
-            }
-        }
-    }
-
-    // A failure keeps the card — the entered values, the explanation, and a
-    // retry only when retrying is safe.
-    private var failedCard: some View {
-        InlineCard(symbol: model.kind.symbol,
-                   symbolTint: NativeAgentShell.trouble,
-                   title: model.outcome ?? model.title,
-                   reason: model.outcomeMeta ?? model.why) {
-            VStack(alignment: .leading, spacing: NativeAgentSpacing.md) {
-                fieldRows
-                // A failure keeps what the card COLLECTS, not just what was
-                // typed into it: a remount has no selection, so a failed
-                // choice card with no list has nothing to answer with and
-                // "Try again" submits nil for ever.
-                if !model.choices.isEmpty {
-                    InlineCardChoiceList(choices: model.choices, selection: $selection)
-                }
-                if model.canRetry {
-                    InlineCardActions(
-                        primary: model.state == .stopped ? "Resume" : "Try again",
-                        primaryEnabled: primaryEnabled,
-                        secondary: model.secondaryLabel,
-                        consequence: model.consequence,
-                        // A failure keeps what was typed, so the retry carries
-                        // it: a key the provider rejected is corrected in place
-                        // rather than re-entered from nothing.
-                        onPrimary: {
-                            if collectsInput {
-                                submit()
-                            } else {
-                                action(.retry)
-                            }
-                        },
-                        onSecondary: { action(.secondary) }
-                    )
-                }
-                fullSetupLink
-                details
-                screenRecordingRelaunch
-            }
-        }
-        .accessibilityIdentifier("inline-card.\(model.kind.rawValue).failed")
-    }
-
-    private var receipt: some View {
-        InlineCardReceipt(mark: model.mark,
-                          outcome: model.outcome ?? model.title,
-                          meta: model.outcomeMeta,
-                          detailsLabel: model.detailsBody == nil ? nil : (model.detailsLabel ?? "Details"),
-                          // A decline is the quietest thing in the transcript.
-                          quiet: model.state == .declined) {
-            if let body = model.detailsBody {
-                Text(body)
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .accessibilityIdentifier("inline-card.\(model.kind.rawValue).\(model.state.rawValue)")
-    }
-
-    @ViewBuilder
-    private var scope: some View {
-        if !model.scopeLines.isEmpty || model.identifier != nil {
-            VStack(alignment: .leading, spacing: 6) {
-                ForEach(Array(model.scopeLines.enumerated()), id: \.offset) { _, line in
-                    InlineCardScopeLine(text: line)
-                }
-                if let identifier = model.identifier {
-                    Text(identifier)
-                        .font(ShellType.code)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-        }
-    }
-
-    /// "What happens", and — Agent, 2026-09-13 — how long it lasts. The
-    /// persistence note is true and it is not what the person is deciding in
-    /// the second before they press the button, so it sits with the rest of
-    /// the mechanics rather than taking a row above the controls.
-    @ViewBuilder
-    private var details: some View {
-        let note = model.persistenceNote
-        if model.detailsBody != nil || note != nil {
-            InlineCardDetails(label: model.detailsLabel ?? "What happens") {
-                VStack(alignment: .leading, spacing: NativeAgentSpacing.xs) {
-                    if let body = model.detailsBody {
-                        Text(body)
-                            .font(ShellType.label)
-                            .foregroundStyle(NativeAgentShell.secondary)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    if let note {
-                        Text(note)
-                            .font(ShellType.label)
-                            .foregroundStyle(NativeAgentShell.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-            }
-        }
-    }
-}
-
-// MARK: - The transcript host
-
-/// Anchors a card to the turn it belongs to, inside the transcript, at the tool
-/// row where the interaction lives. It appears in place and settles in place:
-/// the entrance animation fires once, on insertion, and Reduce Motion turns it
-/// off. Nothing here scrolls the reader anywhere.
-struct ChatInlineCardHost: View {
-    let cards: [InlineCardModel]
-    let action: @MainActor (InlineCardModel, InlineCardAction) -> Void
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        if !cards.isEmpty {
-            VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                ForEach(cards) { card in
-                    InlineCardView(model: card) { taken in action(card, taken) }
-                        // Identity is the request, so a re-observation of the
-                        // same blocked request updates this card instead of
-                        // stacking a second one.
-                        .id(card.id)
-                        .transition(NativeAgentMotion.fade)
-                }
-            }
-            .animation(NativeAgentMotion.respecting(NativeAgentMotion.standard,
-                                                    reduceMotion: reduceMotion),
-                       value: cards.map(\.id))
-        }
-    }
-}
-
-/// Where the transcript asks for the cards belonging to one tool row. The
-/// mechanism supplies them; with nothing injected the transcript renders
-/// exactly as it does today.
-struct InlineCardSourceKey: EnvironmentKey {
-    static let defaultValue: @Sendable @MainActor (String) -> [InlineCardModel] = { _ in [] }
-}
-
-/// Where a card's action goes. Default: nowhere.
-struct InlineCardActionKey: EnvironmentKey {
-    static let defaultValue: @Sendable @MainActor (InlineCardModel, InlineCardAction) -> Void = { _, _ in }
-}
-
-extension EnvironmentValues {
-    var inlineCardSource: @Sendable @MainActor (String) -> [InlineCardModel] {
-        get { self[InlineCardSourceKey.self] }
-        set { self[InlineCardSourceKey.self] = newValue }
-    }
-
-    var inlineCardAction: @Sendable @MainActor (InlineCardModel, InlineCardAction) -> Void {
-        get { self[InlineCardActionKey.self] }
-        set { self[InlineCardActionKey.self] = newValue }
-    }
-}
-
-/// Mounts whatever cards belong to one transcript row, directly under it.
-struct InlineCardsForRow: View {
-    let rowID: String
-    @Environment(\.inlineCardSource) private var source
-    @Environment(\.inlineCardAction) private var action
-
-    var body: some View {
-        ChatInlineCardHost(cards: source(rowID)) { model, taken in action(model, taken) }
     }
 }

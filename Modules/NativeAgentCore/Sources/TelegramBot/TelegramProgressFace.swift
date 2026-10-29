@@ -24,11 +24,11 @@ final class TelegramProgressFace {
         case .ready:
             if let text = snapshot.face?.sections.flatMap(\.rows).first(where: { $0.id == row })?.title,
                !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return TelegramPollLoop._tgRedactToken(TurnTraceRedactor.redactText(String(text.prefix(3_500))))
+                return TurnTraceRedactor.redactText(String(text.prefix(3_500)))
             }
             return "Telegram progress part failed: missing \(row) row."
         case .unavailable, .failed:
-            return "Telegram progress part \(snapshot.status.rawValue): \(TelegramPollLoop._tgRedactToken(TurnTraceRedactor.redactText(snapshot.error?.message ?? snapshot.status.rawValue)))"
+            return "Telegram progress part \(snapshot.status.rawValue): \(TurnTraceRedactor.redactText(snapshot.error?.message ?? snapshot.status.rawValue))"
         }
     }
 

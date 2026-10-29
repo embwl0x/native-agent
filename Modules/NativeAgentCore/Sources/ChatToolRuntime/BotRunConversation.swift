@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 import StandingBots
 // Blueprint: | `BotRunConversation.swift` | `BotRunConversation` enum; `enqueueRequestedCheck`, `dispatch` |
@@ -30,9 +31,25 @@ public enum BotRunConversation {
     static func dispatch(input: [String: JSONValue], surface: String, scope: String,
                          dataRoot: URL, perform: Dispatch) async throws -> JSONValue {
         let definitions = BotDefinitionStore(dataRoot: dataRoot)
-        let bot = try definitions.get(botReference(input, definitions: definitions))
+        let bot: BotDefinition
+        do {
+            let allowed: Set<String> = ["id", "bot_id", "bot", "name", "question", "session_id", "__session_id"]
+            let unknown = Set(input.keys).subtracting(allowed)
+            guard unknown.isEmpty else {
+                throw StandingBotsError.invalidValue("Unknown fields: " + unknown.sorted().joined(separator: ", "))
+            }
+            if let question = input["question"], question != .null {
+                guard case .string(let text) = question, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    throw StandingBotsError.invalidValue("question must be a nonblank string")
+                }
+            }
+            bot = try definitions.get(botReference(input, definitions: definitions))
+        } catch {
+            throw ToolFailureError(ChatToolOutcome.errorMessage(error), argumentPath: "$.id",
+                accepted: "id: a helper UUID or exact name from bot.list; optional question: a nonblank string.", effects: .none)
+        }
         guard !BotRunQueue.ancestry.contains(bot.id) else {
-            throw StandingBotsError.invalidValue(BotRunQueue.alreadyExecutingWords)
+            throw ToolFailureError(BotRunQueue.alreadyExecutingWords, effects: .none)
         }
         let store = AgentConversationStore(dataRoot: dataRoot)
         let agent = "bot-run:" + bot.id.uuidString
@@ -40,12 +57,12 @@ public enum BotRunConversation {
            ["sending", "waiting"].contains(old.phase) || old.deliveryState == "delivering" {
             if old.automaticRead {
                 guard case .string(let request)? = old.readInput?["message_id"], UUID(uuidString: request) != nil else {
-                    throw StandingBotsError.invalidValue("The earlier check has no exact run reference. Inspect the helper's saved work; no second check was queued.")
+                    throw ToolFailureError("The earlier check has no exact run reference. Inspect the helper's saved work; no second check was queued.", effects: .none)
                 }
                 return .object(["status": .string("joined"), "with": .string(bot.name),
                     "id": .string(bot.id.uuidString), "requestId": .string(request),
                     "automatic_return": .bool(true), "return_session": .string(old.scopeSessionID),
-                    "read_with": .object(["action": .string("shelf.entry"), "args": .object([
+                    "read_with": .object(["action": .string("bot.reply"), "args": .object([
                         "id": .string(request), "bot_id": .string(bot.id.uuidString)])]),
                     "detail": .string("Joined run \(request). Its result will return to conversation \(old.scopeSessionID) and be saved on the helper's shelf; no second check was queued.")])
             }

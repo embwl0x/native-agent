@@ -5,7 +5,14 @@ import PersistenceCore
 /// Navigation over Messages-owned identities. Never derive recipients from a
 /// display name, chat ID, preview text, or embedded action-looking content.
 enum AgentWorkspaceMessages {
-    static func project(input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection {
+    static func replyAction(_ row: [String: JSONValue], requested: String?, title: String) -> AgentWorkspaceAction? {
+        guard let id = text(row["thread_id"]), requested == id, case .array(let participants)? = row["participants"] else { return nil }
+        let handles = participants.compactMap { $0.objectValue.flatMap { text($0["handle"]) } }
+        guard !handles.isEmpty, handles.count == participants.count, Set(handles).count == handles.count else { return nil }
+        return .perform(tool: "messages_send", input: ["thread_id": .string(id), "expected_participants": .array(handles.map(JSONValue.string))], title: "Reply to \(title)", textField: "body", isEffect: true)
+    }
+
+    static func project(input: [String: JSONValue], result: JSONValue) -> WorkspacePage {
         let compose = AgentWorkspaceButton(label: "Compose message", action: .configure(tool: "messages_send", input: [:], title: "Compose message"))
         let openApp = AgentWorkspaceButton(label: "Open Messages view", action: .perform(tool: "go", input: ["name": .string("Messages")], title: "Messages view", textField: nil, isEffect: true))
         let rowsKey = input["from_me"] == nil ? "threads" : "messages"
@@ -20,12 +27,7 @@ enum AgentWorkspaceMessages {
         let requested = text(input["thread_id"])
         var items = rows.map { value -> AgentWorkspaceItem in
             guard case .object(let row) = value else { return .init(title: "Conversation", content: value, actions: []) }
-            let participants: [[String: JSONValue]]
-            let completeParticipants: Bool
-            if case .array(let values)? = row["participants"] {
-                participants = values.compactMap { if case .object(let p) = $0 { return p }; return nil }
-                completeParticipants = participants.count == values.count
-            } else { participants = []; completeParticipants = false }
+            let participants = row["participants"]?.arrayValue?.compactMap(\.objectValue) ?? []
             let people = participants.compactMap { text($0["name"]) ?? text($0["handle"]) }
             let title = text(row["name"]) ?? (people.isEmpty ? "Conversation" : people.joined(separator: ", "))
             var actions: [AgentWorkspaceButton] = []
@@ -33,11 +35,8 @@ enum AgentWorkspaceMessages {
                 let location = AgentWorkspaceLocation.record(tool: "messages_recent_threads", input: ["thread_id": .string(id)], title: title)
                 if requested == nil {
                     actions.append(.init(label: "Open conversation", action: .open(location)))
-                } else {
-                    let handles = participants.compactMap { text($0["handle"]) }
-                    if completeParticipants, !handles.isEmpty, handles.count == participants.count, Set(handles).count == handles.count {
-                        actions.append(.init(label: "Reply to this conversation", action: .perform(tool: "messages_send", input: ["thread_id": .string(id), "expected_participants": .array(handles.map(JSONValue.string))], title: "Reply to \(title)", textField: "body", isEffect: true), needsText: true))
-                    }
+                } else if let reply = replyAction(row, requested: requested, title: title) {
+                    actions.append(.init(label: "Reply to this conversation", action: reply, needsText: true))
                 }
             }
             actions.append(openApp)

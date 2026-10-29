@@ -7,24 +7,22 @@ import Darwin
 //
 // NativeActionDispatch uses the shipped read-only selection unconditionally.
 // SwiftNativeDispatcher runs registered handlers in-process and writes a dispatch
-// receipt. An absent registry or missing handler fails closed; no HTTP fallback.
+// receipt. An absent registry or missing handler fails closed.
 
-/// A single native action handler. Pure-ish: takes the input dict + a
-/// connector context, returns the result payload (the value that becomes
-/// `Receipt.output` / the `output` field of a DispatchResult).
-public typealias ConnectorActionHandler =
+/// A native action maps input and connector context to the payload retained as DispatchResult.output.
+public typealias ConnectorInvocation =
     @Sendable (_ input: [String: JSONValue], _ ctx: ConnectorActionContext) -> JSONValue
 
 /// Registry of natively-executable connector actions, keyed by tool name.
 public struct LocalConnectorActions: Sendable {
-    private let handlers: [String: ConnectorActionHandler]
+    private let handlers: [String: ConnectorInvocation]
     /// Tool names whose handler mutates the filesystem and needs autonomy admission.
     private let sideEffecting: Set<String>
     /// Read-only handlers whose successful result is sufficient verification.
     private let trivialVerify: Set<String>
 
     public init(
-        handlers: [String: ConnectorActionHandler],
+        handlers: [String: ConnectorInvocation],
         sideEffecting: Set<String> = [],
         trivialVerify: Set<String> = []
     ) {
@@ -48,7 +46,8 @@ public struct LocalConnectorActions: Sendable {
 
     public static func saveAttachment(_ attachment: (filename: String, data: Data),
         input: [String: JSONValue], ctx: ConnectorActionContext) -> JSONValue {
-        let folder = FileSystemActions.resolvePath(FileSystemActions.stringField(input, "path"), repoRoot: ctx.repoRoot)
+        let folder = NativeAgentWorkspaceRoot.resolveFileMutationPath(input["path"]?.stringValue ?? "",
+            dataRoot: ctx.dataRoot ?? PersistenceCore.defaultDataRoot())
         let filename = attachment.filename
         guard !filename.isEmpty, filename != ".", filename != "..", !filename.contains("/"), !filename.contains("\0") else {
             return FileSystemActions.errResult("Attachment filename is not a safe file name.", code: "bad_input")
@@ -81,7 +80,6 @@ public struct LocalConnectorActions: Sendable {
 
     public static let fileSystemDefault = LocalConnectorActions(
         handlers: [
-            // Wave 29 W3
             "read_file":    { FileSystemActions.readFile($0, $1) },
             "file_excerpt": { FileSystemActions.fileExcerpt($0, $1) },
             "write_file":   { FileSystemActions.writeFile($0, $1) },
@@ -91,13 +89,11 @@ public struct LocalConnectorActions: Sendable {
             "list_dir":     { FileSystemActions.listDir($0, $1) },
             "file_info":    { FileSystemActions.fileInfo($0, $1) },
             "system_info":  { FileSystemActions.systemInfo($0, $1) },
-            // Wave 32 W08 — read-only repo introspection
             "grep":               { FileSystemActions.grep($0, $1) },
             "git_status":         { FileSystemActions.gitStatus($0, $1) },
             "git_diff":           { FileSystemActions.gitDiff($0, $1) },
             "git_log":            { FileSystemActions.gitLog($0, $1) },
             "repo_dirty_summary": { FileSystemActions.repoDirtySummary($0, $1) },
-            // Wave 34 W06 — read-only persona/system introspection
             "persona_read":        { PersonaSystemActions.personaRead($0, $1) },
             "persona_list_skills": { PersonaSystemActions.personaListSkills($0, $1) },
             "workspace_list":      { PersonaSystemActions.workspaceList($0, $1) },

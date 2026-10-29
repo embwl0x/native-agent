@@ -8,9 +8,7 @@ public enum MemoryV2Defaults {
 }
 
 /// Hard bound on canonical MemoryV2 fact rows. Enforced inside every canonical
-/// insert/accept transaction, during store open for legacy overflow, and inside
-/// approved consolidation table swaps. This is storage physiology, not a
-/// periodic cleanup promise.
+/// insert/accept transaction and during store open for legacy overflow.
 public let memoryStoredRowCap = 2_000
 
 public enum MemoryLifecycle {
@@ -68,17 +66,15 @@ public struct StoredMemory: Sendable {
     public var embeddingEpoch: String?
     public var status: String
     public var lifecycle: String
-    /// Descriptive validity bounds, validated on write; recall does not expire
-    /// rows or derive context freshness from these dates.
+    /// Truth interval, validated on write. A passed validTo excludes the row
+    /// from current recall, disclosure and USER.md while retaining history.
     public var validFrom: String?
     public var validTo: String?
     public var observedAt: String?
     public var evidence: JSONValue?
     public var metadata: JSONValue?
-    /// Access counter — incremented by `recordRecallHits` when this memory is
-    /// returned by recall. DISTINCT from `metadata.recall_count` (merge
-    /// corroboration): a recall is access, a merge is evidence (Agent's ruling,
-    /// 2026-06-09). `archiveStale` consults both. Real column for atomic +1.
+    /// `recordRecallHits` atomically counts access; `metadata.recall_count` counts merge evidence.
+    /// Capacity retention uses access recency; disuse alone never archives a row.
     public var useCount: Int64
     public var lastUsedAt: String?
 
@@ -120,19 +116,6 @@ public struct StoredMemory: Sendable {
         self.metadata = metadata
         self.useCount = useCount
         self.lastUsedAt = lastUsedAt
-    }
-
-    /// Metadata view for derived graph/device projections. Canonical temporal
-    /// and evidence columns remain first-class; this is a rebuildable outward
-    /// representation for consumers whose schema is metadata-shaped.
-    public var projectionMetadata: JSONValue? {
-        var object: [String: JSONValue] = [:]
-        if case .object(let existing)? = metadata { object = existing }
-        if let validFrom { object["valid_from"] = .string(validFrom) }
-        if let validTo { object["valid_to"] = .string(validTo) }
-        if let observedAt { object["observed_at"] = .string(observedAt) }
-        if let evidence { object["evidence"] = evidence }
-        return object.isEmpty ? nil : .object(object)
     }
 }
 
@@ -176,35 +159,6 @@ public struct StoredProposal: Sendable {
     }
 }
 
-public struct StoredTombstone: Sendable {
-    public var contentHash: String
-    public var content: String
-    public var rejectedAt: String
-    public var reason: String?
-    /// Embedding of the rejected/deleted claim. Enables the semantic tombstone
-    /// gate (Agent's canon: a deletion is the CLAIM, not the topic — paraphrases
-    /// block at a high cosine threshold; contradictions walk in). Nullable:
-    /// legacy tombstones without one stay exact-hash-only.
-    public var embedding: [Float]?
-    public var embeddingEpoch: String?
-
-    public init(
-        contentHash: String,
-        content: String,
-        rejectedAt: String,
-        reason: String?,
-        embedding: [Float]? = nil,
-        embeddingEpoch: String? = nil
-    ) {
-        self.contentHash = contentHash
-        self.content = content
-        self.rejectedAt = rejectedAt
-        self.reason = reason
-        self.embedding = embedding
-        self.embeddingEpoch = embeddingEpoch
-    }
-}
-
 public struct MemoryPatch: Sendable {
     public var content: String?
     public var source: String?
@@ -220,7 +174,7 @@ public struct MemoryPatch: Sendable {
     public var metadata: JSONValue?
     /// Keys merged into the row's current metadata inside the same SQLite
     /// transaction as the rest of the patch. Narrow metadata updates use this
-    /// so a bridge-side read/replace cannot overwrite a concurrent owner write.
+    /// so a service-side read/replace cannot overwrite a concurrent owner write.
     public var metadataMerge: [String: JSONValue]?
 
     public init(
@@ -269,12 +223,7 @@ public enum MemoryStorageError: Error, LocalizedError {
     case capacityExceeded
     case pinOrderExhausted
 
-    /// 2026-09-06: why an activation was refused. The launch reconciler retries
-    /// a refusal by re-embedding the entire corpus, which is the right answer
-    /// only for `corpusDrift` — the rows moved under the candidate snapshot, so
-    /// a fresh snapshot can succeed. `unusableCandidate` says the vectors
-    /// themselves (or the retained rollback set) are wrong; retrying spends
-    /// three full corpus embeddings to reach the same refusal.
+    /// Only `corpusDrift` warrants re-embedding on refusal; `unusableCandidate` requires fixing the vectors.
     public enum EmbeddingActivationRefusal: String, Sendable {
         case corpusDrift
         case unusableCandidate
@@ -376,7 +325,6 @@ public struct MemoryEmbeddingEpochState: Sendable, Equatable {
     public let activeEpoch: String?
     public let previousEpoch: String?
     public let activatedAt: String?
-    public let rollbackAvailable: Bool
 
     public var protected: Bool { activeEpoch != nil }
 }

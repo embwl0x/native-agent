@@ -1,46 +1,52 @@
 import Foundation
 import os
 
-// Blueprint: | `ModuleLogging.swift` | `nativeLog`: shared module diagnostics with local credential scrubbing before public logging, without importing Core |
+// Blueprint: | `ModuleLogging.swift` | `ModuleLog`: shared public diagnostic formatting and credential scrubbing; `nativeLog` retains the Shared category |
 
-private let nativeModuleLogger = Logger(
-    subsystem: "com.example.nativeagent",
-    category: "NativeAgentShared"
-)
+/// Public diagnostics preserve category and severity while masking credentials.
+public struct ModuleLog: Sendable {
+    public static let app = ModuleLog(category: "NativeAgentApp")
+    private let logger: Logger
+    /// A measurement also lands in a file I can read: `<data root>/diagnostics/<category>.log`, kept under 512 KB.
+    private var trail: URL?
 
-// Shared cannot import the core redactor. CloudKit errors can include record
-// fields, so scrub credential text before making the diagnostic public.
-private let nativeLogSecretPatterns: [NSRegularExpression] = [
-    #"\\+"(?!(?:next|pagination)_token(?![\w-]))(?:[\w-]*(?:password|passwd|token|secret)|(?:[\w-]*[_-])?(?:api[_-]?key|private[_-]?key)|authorization)\\+"\s*:\s*\\+".*?(?:\\+"(?=\s*[,}\]]|$)|$)"#,
-    #"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----"#,
-    #"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{30,})\b"#,
-    #"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"#,
-    #"\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}\b"#,
-    #"\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\b"#,
-    #"\bxox[baprs]-[A-Za-z0-9-]{20,}\b"#,
-    #"\bAIza[0-9A-Za-z_-]{25,}\b"#,
-    #"\bBearer\s+[A-Za-z0-9._~+/=-]+"#,
-    #"(?:\bbot\d+|\b\d{6,})(?::|%3[Aa])[A-Za-z0-9_-]+"#,
-    #"["'](?!(?:next|pagination)_token(?![\w-]))(?:[\w-]*(?:password|passwd|token|secret)|(?:[\w-]*[_-])?(?:api[_-]?key|private[_-]?key)|authorization)["']\s*[:=]\s*(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s,}\]]+)"#,
-    #"(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_-]){0,3}(?:api[_-]?key|key|token|secret|password|passwd|openai|anthropic|github)(?![A-Za-z0-9])\s*[=:]\s*(?!(?:https?|ftp)://)[^\s"']{8,}"#,
-].map { pattern in
-    do {
-        return try NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .dotMatchesLineSeparators])
-    } catch {
-        preconditionFailure("Invalid logging redaction pattern")
+    public init(subsystem: String = Bundle.main.bundleIdentifier ?? "NativeAgent", category: String) {
+        logger = Logger(subsystem: subsystem, category: category)
+    }
+
+    public init(category: String, trail: Bool) {
+        self.init(category: category)
+        if trail {
+            self.trail = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+                .appendingPathComponent("NativeAgent/diagnostics/\(category).log")
+        }
+    }
+
+    public func callAsFunction(_ format: String, _ arguments: CVarArg..., level: OSLogType = .default) {
+        let message = arguments.isEmpty ? format : String(format: format, arguments: arguments)
+        let safeMessage = TurnSecretRedactor.redactText(message)
+        logger.log(level: level, "\(safeMessage, privacy: .public)")
+        if let trail { ModuleLogTrail.append(safeMessage, to: trail) }
     }
 }
 
-/// Module diagnostics. Callers must keep credential values out of messages.
-func nativeLog(_ format: String, _ arguments: CVarArg...) {
-    let message = arguments.isEmpty ? format : String(format: format, arguments: arguments)
-    var safeMessage = message
-    for pattern in nativeLogSecretPatterns {
-        safeMessage = pattern.stringByReplacingMatches(
-            in: safeMessage,
-            range: NSRange(safeMessage.startIndex..., in: safeMessage),
-            withTemplate: "[REDACTED]"
-        )
+private enum ModuleLogTrail {
+    private static let lock = NSLock()
+    static func append(_ line: String, to url: URL) {
+        lock.lock(); defer { lock.unlock() }
+        let fm = FileManager.default
+        try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let size = (try? fm.attributesOfItem(atPath: url.path)[.size] as? Int) ?? nil, size > 512 * 1024 {
+            try? fm.removeItem(at: url)
+        }
+        let stamped = ISO8601DateFormatter().string(from: Date()) + " " + line + "\n"
+        if let handle = try? FileHandle(forWritingTo: url) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd(); try? handle.write(contentsOf: Data(stamped.utf8))
+        } else {
+            try? Data(stamped.utf8).write(to: url)
+        }
     }
-    nativeModuleLogger.log("\(safeMessage, privacy: .public)")
 }
+
+let nativeLog = ModuleLog(category: "NativeAgentShared")

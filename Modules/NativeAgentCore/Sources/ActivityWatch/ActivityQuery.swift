@@ -1,24 +1,14 @@
 import Foundation
+import NativeAgentShared
+import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `ActivityQuery.swift` | `ActivityQueryService.run`: gated activity reads, current-policy re-filtering, bounded rows and honest truncation |
+// Blueprint: | `ActivityQuery.swift` | `ActivityQueries.run`: gated activity reads, current-policy re-filtering, bounded rows and honest truncation |
 
-/// W7 — the ONLY read path into the activity store.
-///
-/// Deliberately a plain value type in THIS module rather than logic living in
-/// the dispatcher: the tool impl in ChatToolRuntime is a thin adapter that
-/// hands over a dictionary and gets a `JSONValue` back, so every rule that
-/// matters (the capture gate, the query-time exclusion re-filter, the row cap,
-/// the honest truncation, the refusal text) is testable headlessly without a
-/// chat turn, a model, or a dispatcher.
-///
-/// ZERO INFERENCE. Everything below is `Calendar`, SQL and arithmetic. There is
-/// no summarizer, no embedding, no model call — see
-/// `ActivityWatchArchitectureTests.noInferenceInTheWatcher`, which greps this
-/// module for the ways one could arrive.
-public struct ActivityQueryService: Sendable {
-    /// Hard ceiling on rows in ANY answer, whatever the caller asks for. The
-    /// build plan's acceptance criterion, as a constant.
+/// The activity store's read path owns capture, exclusions, row caps and
+/// refusals. Queries use only Calendar, SQL and arithmetic, with no inference.
+public struct ActivityQueries: Sendable {
+    /// Hard ceiling on rows in any answer, whatever the caller asks for.
     public static let maxRows = ActivityRollups.answerRowCap
 
     public enum QueryError: Error, CustomStringConvertible, Equatable {
@@ -59,13 +49,16 @@ public struct ActivityQueryService: Sendable {
         self.dataRoot = dataRoot
     }
 
-    // MARK: - Surface gate (W7 decision: the bridge REFUSES, it does not 404)
+    // MARK: - Surface gate
 
-    /// Identifies remote surfaces for callers without admitted Full Mac.
-    /// The dispatcher checks actual-origin Full Mac admission first; this
-    /// classification alone neither grants nor revokes activity access.
+    /// Only these local surfaces may read history without admitted Full Mac.
+    /// The dispatcher checks actual-origin Full Mac admission first.
     public static func isRefusedSurface(_ surface: String) -> Bool {
-        ConversationSurfaceProfileShim(surface).isRemote
+        let id = surface
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: "-")
+        return !["chat", "mac", "observatory", "workshop", ""].contains(id)
     }
 
     // MARK: - The query
@@ -80,7 +73,7 @@ public struct ActivityQueryService: Sendable {
         public init(
             from: Double, to: Double, bundleID: String? = nil,
             timezone: TimeZone = .current,
-            rowCap: Int = ActivityQueryService.maxRows
+            rowCap: Int = ActivityQueries.maxRows
         ) {
             self.from = from
             self.to = to
@@ -112,10 +105,7 @@ public struct ActivityQueryService: Sendable {
         }
 
         let store = try await ActivitySpanStore.acquire(dataRoot: dataRoot)!
-        // W5 LAYER 2 — query-time exclusion. The policy is passed to the store,
-        // which re-filters on read, because exclusion lists change: adding
-        // 1Password today must make yesterday unanswerable even for rows that
-        // were legal when written.
+        // Current exclusions also govern history recorded under older policies.
         let rollups = ActivityRollups(store: store, policy: policy)
         let bundle: ActivityAnswerBundle
         do {
@@ -261,11 +251,7 @@ public struct ActivityQueryService: Sendable {
         if let epoch = Double(trimmed), epoch.isFinite,
            epoch >= minimumSupportedEpoch, epoch <= maximumSupportedEpoch { return epoch }
 
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = iso.date(from: trimmed) { return date.timeIntervalSince1970 }
-        iso.formatOptions = [.withInternetDateTime]
-        if let date = iso.date(from: trimmed) { return date.timeIntervalSince1970 }
+        if let date = NativeTimestampFormat.parseISO8601FractionalFirst(trimmed) { return date.timeIntervalSince1970 }
 
         let dayFormatter = DateFormatter()
         dayFormatter.calendar = Calendar(identifier: .gregorian)
@@ -280,51 +266,4 @@ public struct ActivityQueryService: Sendable {
     public static let maximumRangeSeconds: Double = 366 * 86_400
     private static let minimumSupportedEpoch: Double = 0
     private static let maximumSupportedEpoch: Double = 32_503_680_000 // 3000-01-01 UTC
-}
-
-/// Local mirror of `TrustCenter.ConversationSurfaceProfile`'s remote set.
-///
-/// It is COPIED rather than imported on purpose: importing TrustCenter here
-/// would give the watcher module a dependency on the policy layer, and this
-/// module's whole architectural argument is that it depends on as little as
-/// possible and is depended on by nothing. `ActivityWatchArchitectureTests`
-/// pins the two sets equal, so the copy cannot drift into being narrower than
-/// the real one (which is the direction that would leak).
-struct ConversationSurfaceProfileShim {
-    let id: String
-
-    init(_ rawValue: String) {
-        self.id = rawValue
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .replacingOccurrences(of: "_", with: "-")
-    }
-
-    /// FAIL CLOSED (gpt-5.5 BLOCKING, 2026-08-14).
-    ///
-    /// This was a denylist — a set of surfaces to refuse, with everything else
-    /// treated as local. That is fail-OPEN, and it had already failed open: the
-    /// app's own local HTTP bridges (`claude-bridge`, `codex-bridge`) were in
-    /// nobody's denylist, so `POST /claude/tool {name: "activity_query"}`
-    /// returned activity rows over HTTP while the guard reported success.
-    ///
-    /// A denylist is the wrong shape for this decision. The set of surfaces that
-    /// may read where the human has been is small, closed, and known; the set of
-    /// ways a future transport might reach the dispatcher is neither. So the
-    /// question is inverted: name the surfaces allowed to answer, and refuse
-    /// everything else — including surfaces that do not exist yet, which is
-    /// precisely the class that produced this bug.
-    var isRemote: Bool { !Self.localSurfaceIDs.contains(id) }
-
-    /// The ONLY surfaces that may answer `activity_query`: the Mac app's own
-    /// chat, and the in-process paths that are the same window on the same
-    /// machine. Anything else — Telegram, Slack, iOS, iCloud, the HTTP bridges,
-    /// and anything added later — is refused by default.
-    static let localSurfaceIDs: Set<String> = [
-        "chat",           // the Mac app's chat window
-        "mac",            // in-process Mac surface
-        "observatory",    // local inspector UI
-        "workshop",       // local workshop execution
-        "",               // unset/in-process default
-    ]
 }

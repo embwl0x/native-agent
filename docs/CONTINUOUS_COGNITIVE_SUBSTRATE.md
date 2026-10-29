@@ -1,6 +1,5 @@
 # NativeAgent Continuous Cognitive Substrate
 
-> One structure (docs/NORTHSTAR.md, first law): this doc is part of one whole. A change here is molded into every doc that states the same thing, in the same commit, with what comes out named; a contradiction is a defect.
 ## Engineering and Research Blueprint for a Persistent Artificial Subject
 
 ## 0. Purpose
@@ -11,9 +10,9 @@ language and reasoning; the continuing state has Swift owners inside
 NativeAgent's core.
 
 This document defines the current engineering boundaries. The
-[Subconscious map](SUBCONSCIOUS.md) explains the layers; the
-[traceability ledger](COGNITIVE_SUBSTRATE_TRACEABILITY.md) identifies source
-support and limits. Research objectives are not claims of consciousness or
+[Subconscious map](SUBCONSCIOUS.md) explains mechanisms and evidence limits;
+[Cognition Wiring](COGNITION_WIRING.md) connects their owners.
+Research objectives are not claims of consciousness or
 measured cognitive benefit.
 
 ## Implementation Status
@@ -35,8 +34,11 @@ of two calls. This initialization preserves saved choices.
 The source supports event ingestion, persistence, workspace selection,
 capsules, affect, cares, replay and reflection. It does not support the
 old text-extracted task prediction/commitment system.
-`CognitiveSubstrate+Research.swift` returns no score for provider-swap or
-self-model-accuracy experiments because those outcomes are not measured.
+The live Observatory remains available at **Diagnostics → Cognition**, including
+its workspace inclusion controls. The count-based experiment lifecycle, faculty
+ratings, research checks panel and research-export controls are retired. SQLite migration
+`v6_retire_cognitive_experiments` removes only their `experiment` artifacts;
+living cognition, canonical memory/persona and other receipts retain their format.
 
 All source paths below are under `Modules/NativeAgentCore/Sources/` unless
 marked as app or script paths.
@@ -63,167 +65,21 @@ These boundaries are represented by `CognitiveSubstrate.swift`,
 `CognitiveSubstrate+Reflection.swift`, `CognitiveSQLiteStore.swift` and
 `TrustCenter/SecurityCenter.swift`.
 
-## 2. Event and turn flow
+## 2. Mechanism owners
 
-1. `ChatTurnRuntime/ChatOrchestrationClient+MessagePersistence.swift` emits
-   bounded, redacted message/tool observations.
-   `Cognition/NativeCognitionRuntime+Events.swift` adapts other ingress.
-2. `NativeCognitionRuntime.observe` passes accepted events to the substrate
-   and somatic bus. `CognitiveSubstrate+Ingest.swift` checks duplicate events
-   before mutation and publishes resident attention. Eligible conversation
-   interpretation completes through the after-turn appraisal callback.
-3. Accepted changes schedule a dirty microcycle. Ordinary attention reads use
-   `Cognition/CognitiveAttentionResidentProjection.swift`.
-4. `NativeCognitionRuntime.prepareTurnProjection` samples body and canonical
-   affect at one timestamp, obtains a frozen organism read, and prepares the
-   capsule with that projection.
-5. `ChatTurnRuntime/ChatOrchestrationClient+StructuredChat.swift` appends the
-   prepared runtime context. Its `commitDeliveredCognitiveTurnProjection`
-   commits presentation after a successful turn; thrown turns leave the
-   presentation window unconsumed.
+[SUBCONSCIOUS](SUBCONSCIOUS.md) owns event admission, state bounds, checked
+restore, frozen capsules, reflection and inspection. [COGNITION_WIRING](COGNITION_WIRING.md)
+owns turn connections, background admission and authority boundaries.
+`CognitiveSubstrate.frozenRead` and `NativeCognitionRuntime.prepareTurnProjection`
+are the fixed-time read owners; the loop's confirmed-delivery boundary commits presentation.
 
-`CognitiveSubstrate+Workspace.swift` freezes the capsule's auxiliary inputs,
-including Sound scores and presentation state. Touched and pressing cares are
-resolved before the synchronous frozen render.
-Read-only inspection must not consume live presentation cadence.
+## 3. Evidence limits
 
-## 3. State and bounds
+Inner-state and diagnostic readings expose the mechanisms they read. They
+do not establish consciousness, causal behavioral benefit or provider agreement.
+The removed experiment ratings had no measured before/after outcome.
 
-The current app configuration in `NativeCognitionRuntime.loadConfiguration`
-sets:
-
-| Value | Limit |
-|---|---:|
-| Active continuity nodes | 256 |
-| Workspace items | 12 |
-| Capsule characters | 4,000 |
-
-`CognitiveSubstrate+Capsule.swift` takes the smaller of the configured
-ceiling and the caller's requested ceiling. `ContinuityField.swift` bounds
-summary/metadata, decays nodes and maintains associations.
-`CognitiveSubstrate+Workspace.swift` scores eligible nodes, inhibits
-redundancy and returns reasons for selected items.
-
-Affect, mood, disposition and cares share the substrate actor.
-Personality dynamics supply numeric rates and thresholds
-(`PersonalityDynamicsConfiguration.swift`); capsule helpers render the
-bounded result. Somatic predictions belong to
-`CognitiveSubstrate/Organism/OrganismPrediction.swift`, not a duplicate
-task ledger inferred from assistant prose.
-
-Appraisal stakes read the live cares the event's words touch at cosine 0.40
-or more, including the four life seeds. A cold embedder supplies no match;
-no path kind grants a stake by itself. `CognitiveSubstrate+SemanticAppraisal.swift`
-uses the signed real charge of the closest touched care with a stance for
-the numeric worldview lens. The selected care cue carries the stance's words.
-Keyword concerns and the view-derived relationship warmth lean are retired;
-base affect and the organism's tenderness remain with their existing owners.
-
-## 4. Persistence and lifecycle
-
-`CognitiveSQLiteStore` uses GRDB under
-`<dataRoot>/cognition/cognition.sqlite`. Its migrations define node,
-artifact, receipt, schema-marker and motor-replay-guard tables. Node/artifact
-transitions and pruning use database write transactions.
-
-`CognitiveSubstrate+Restore.swift` loads and validates a restore bundle
-before applying it. Failure produces degraded persistence health and blocks
-state writes; a successful retry restores the bundle before reopening them.
-`CognitiveSubstrate+Persistence.swift` owns the writes, not MemoryV2.
-Retired `standing_view` and `thought_seed` rows are protected from pruning
-and never loaded; their bytes stay on disk.
-
-`NativeCognitionRuntime.bootstrap` restores state; `flushForTermination`
-drains runtime work and persists continuity. `script/verify_release_artifact.sh`
-rejects bundled private cognition state.
-
-## 5. Event-driven background work
-
-The runtime coalesces event bursts and settles only dirty substrate work.
-Maintenance opportunities derive from discrete lifecycle boundaries in
-`CognitiveSubstrate+Workspace.swift`; runtime deadlines live in
-`Cognition/NativeCognitionRuntime+Deadlines.swift`.
-Analytic decay needs no repeating checkpoint.
-
-Dream/REM somatic signals trigger replay and reflection admission through
-`NativeCognitionRuntime+Organism.swift`. The app's
-`EngineRuntime/EngineLaunch.swift` retains
-daily recovery registrations implemented by `Cognition/CognitiveBackgroundLoops.swift`.
-A reflection sweep requests spontaneous admission, so a quiet state need not
-spend a call.
-
-They are always on while the Mac is on (User 10-24): their model calls run at the provider, so no power, heat or tiredness gate defers or throttles any background lane.
-
-## 6. Replay and reflection
-
-Replay reads bounded Dream diary and REM proposal records through
-`NativeCognitionRuntime+Replay.swift`.
-`CognitiveSubstrate+Replay.swift` deduplicates external evidence and commits
-episode references, schema projections, timeline entries and a receipt
-together. It does not run the canonical Dream/REM scheduler.
-
-`CognitiveSubstrate+Reflection.swift` admits a call only when enabled,
-under its rolling 24-hour ceiling and without a current reservation.
-Spontaneous calls additionally require unresolved load, read as the summed
-pressure of live open cares; explicit requests bypass only that load test.
-The bounded prompt uses the capsule's provenance,
-adds IDs for quoted source excerpts and records external material provenance.
-
-`NativeCognitionRuntime+Reflection.swift` executes through checked provider
-routing and records success, failure or cancellation. The reflection surface
-is `cognition_reflection`; no model is pinned by this blueprint.
-Reflection's `view:`, `because:` and `unless:` lines set a care's stance
-through `applyCares`, by them. The closest live care at cosine 0.40 or more
-receives it; otherwise they grows a new care. Untrusted-fed reflections write
-no care stance. A replaced stance stays in the care's story. Their opt-in hour reads
-open cares and writes its question back to one. The retired `standing_view`
-family is never loaded and remains byte-preserved on disk; no standing-view
-actions, bridge routes or experiment setting remain.
-Reflection's takeaway sets `open` through `applyReflectionCare` on the
-closest live care at cosine 0.40 or more, else a new care of theirs; the same
-taint check blocks care writes. The live-turn-gated `mind.pin_concern` uses
-`applyCares` by their to keep an open concern on that same matching rule.
-After-turn `closes` and the night settle it. Desk tasks do not feed their mind.
-The automatic Desk proposer may cite only a live, non-seed, life-depth care
-with a stance: `care.life` approval precedes eligibility, and existing Desk
-deduplication, capacity and unattended-work gates remain.
-The reflection receipt's yield score measures proposal production relative to
-estimated cost, not improved judgment or a validated personality benefit.
-
-## 7. Inspection and authority
-
-`app` is Agent's single tool. Its home, page/item reads, action discovery
-and action/script execution are owned by
-`AppToolRuntime/AppToolExecutor+AppDoor.swift`,
-`AppActionRegistry.swift` and `AppScriptRunner.swift`.
-For cognition, use `app {"action":"mind.inner_state"}` or inspect the
-Personality page. The internal workspace above is attention state, not an
-additional agent tool.
-
-Trust remains an execution boundary. Full Mac admits autonomous action for
-authorized origins under checked policy; macOS privacy permission resets
-still require the owner. A turn is peer-steered only when an agent you have not trusted started it with its message; that turn's first effect of any kind files one card quoting what the agent asked, and your answer covers the rest of the turn. Reading any agent's words steers nothing; conversing with agents and telling them what to do asks nothing.
-Agents enabled in Trust → Connected agents carry the owner's authority on
-authenticated turns; ordinary Trust and domain checks still apply. The relevant owners are
-`TrustCenter/SecurityCenter.swift`, `SecurityCenter+FullMacPolicy.swift`
-and `PeerTurnEffectPolicy.swift`.
-
-`Sources/NativeAgentApp/CognitionObservatoryView.swift` subscribes to runtime
-invalidations and presents state and controls. A capsule preview, a counter
-or an export is evidence about its recorded mechanism, not evidence that a
-human or model experienced a claimed benefit.
-
-## 8. Evidence limits
-
-`CognitiveSubstrate+Research.swift` exports bounded actual state separately
-from generated explanations. Its continuity sampler reports state counts;
-its ablation sampler reports intervention settings. Neither measures causal
-behavioral benefit. Provider-swap and self-model-accuracy sampling return
-no result.
-
-The ledger preserves the IDs required by
-`script/check_architecture_blueprint.swift`. Source inspection supports its
-mechanism rows; it does not replace installed verification or justify
-reintroducing deleted tests. Documentation changes require text readback.
+Source inspection does not replace installed verification.
+Documentation changes require text readback.
 Runtime changes follow the repository's build, install and bounded
 working-app check rule.

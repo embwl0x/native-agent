@@ -1,4 +1,5 @@
 import SwiftUI
+import NativeAgentShared
 import UIKit
 
 /// The Live Activity's Mac-projected working state. Core Animation owns every frame.

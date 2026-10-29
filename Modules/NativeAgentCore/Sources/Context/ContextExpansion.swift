@@ -184,10 +184,11 @@ public struct ContextExpander: Sendable {
             throw ContextExpansionError.atomNotExpandable(policy: atom.draft.injectionPolicy)
         }
 
-        let sourceRangeByteCount = atom.draft.sourceRange.utf8End
-            - atom.draft.sourceRange.utf8Start
+        let (sourceRangeByteCount, overflow) = atom.draft.sourceRange.utf8End
+            .subtractingReportingOverflow(atom.draft.sourceRange.utf8Start)
         let bodyUTF8ByteCount = atom.draft.body.utf8.count
-        guard sourceRangeByteCount == bodyUTF8ByteCount else {
+        guard !overflow, atom.draft.sourceRange.utf8Start >= 0,
+              sourceRangeByteCount == bodyUTF8ByteCount else {
             throw ContextExpansionError.invalidSourceUTF8Range(
                 atom: atom.draft.id,
                 range: atom.draft.sourceRange,

@@ -2,15 +2,7 @@ import Foundation
 import SwiftUI
 import Observation
 
-/// A Desk note written on the phone, held until the Mac confirms it.
-///
-/// 2026-09-13: writing a note used to mean standing still with the sheet open
-/// until an iCloud round trip came back. Away from the desk that is the whole
-/// interaction — you have a thought, you want it on the item, you want to put
-/// the phone away. The note is therefore saved the moment it is submitted,
-/// carries the SIGNED action identity it will be delivered under, and is
-/// reconciled when the Mac confirms. Delivery is retried only under that same
-/// retained identity, so a Desk item can never collect the same note twice.
+/// Save a submitted note with its signed action identity and reuse that identity until Mac confirmation.
 struct MobileDeskPendingNote: Codable, Identifiable, Sendable {
     /// Stable across a pre-execution replacement of `submission`.
     let localID: UUID
@@ -24,6 +16,8 @@ struct MobileDeskPendingNote: Codable, Identifiable, Sendable {
     /// Mac yet is still waiting — it is never described as lost.
     var lastError: String?
     var rejectedByMac: Bool? = nil
+    /// Missing legacy provenance stays held; a new pairing never adopts it.
+    var pairingFingerprint: String? = nil
 
     var statusLine: String {
         if rejectedByMac == true { return "Your Mac did not add this note" }
@@ -101,13 +95,15 @@ final class MobileDeskNoteOutbox {
     /// Saves the note immediately under a durable signed identity and starts
     /// delivering it. The caller is free to dismiss straight away.
     func submit(handle: String, text: String, engine: iCloudSyncEngine = .shared) {
+        guard let pairing = AgentNameCache.fingerprint(engine.pairingStore?.iCloudPairingSecret) else { return }
         let note = MobileDeskPendingNote(
             localID: UUID(),
             handle: handle,
             text: text,
             createdAt: Date(),
             submission: .make(action: "appendDeskItemNote", payload: ["handle": handle, "text": text]),
-            lastError: nil
+            lastError: nil,
+            pairingFingerprint: pairing
         )
         pending.append(note)
         drafts.removeValue(forKey: handle)
@@ -121,11 +117,19 @@ final class MobileDeskNoteOutbox {
 
     private func deliver(_ note: MobileDeskPendingNote, engine: iCloudSyncEngine) {
         guard note.rejectedByMac != true, !inFlight.contains(note.id) else { return }
+        guard let pairing = note.pairingFingerprint,
+              pairing == AgentNameCache.fingerprint(engine.pairingStore?.iCloudPairingSecret) else {
+            noteFailure(id: note.id, message: "Saved for another pairing. Submit a new note to send it to this Mac.", rejected: false)
+            return
+        }
         inFlight.insert(note.id)
         Task { @MainActor in
             defer { inFlight.remove(note.id) }
             do {
                 try await storage.flush()
+                guard pairing == AgentNameCache.fingerprint(engine.pairingStore?.iCloudPairingSecret) else {
+                    throw SyncError.sendFailed("This note belongs to another pairing. Submit a new note to send it here.")
+                }
                 _ = try await engine.appendDeskItemNote(
                     handle: note.handle,
                     text: note.text,

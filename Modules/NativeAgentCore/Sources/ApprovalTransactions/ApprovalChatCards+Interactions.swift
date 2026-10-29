@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import NativeAgentCore
 import NativeAgentShared
 import NotificationInbox
@@ -8,11 +9,9 @@ import TelegramBot
 
 // Blueprint: | `ApprovalChatCards+Interactions.swift` | `ApprovalChatCards`: mirrors inline interactions into the person's conversation and Telegram while answers retain the origin card's identity and settlement |
 
-/// User, 10-03: an inline card she raises in a thread he never opens (an agent
-/// contact's, her wake) waited there unseen. The same rule as approvals: one
-/// mirror in the conversation he is in, bound to the card's id. The card stays
-/// where it was raised — its revision, verification and continuation are the
-/// origin's — and every surface answers THAT card, so both places settle as one.
+/// Inline cards mirror into the person's active conversation, bound to the
+/// origin's id, revision, verification and continuation. Every surface answers
+/// the origin card, so both places settle as one.
 ///
 /// The claim is the card's inbox note (`interaction:<id>`, filed by the app's
 /// delivery): the destination is retained until its deduplicated row is durable,
@@ -51,7 +50,7 @@ extension ApprovalChatCards {
         let buttons = reach.buttons && !picks.isEmpty
         let title = NativeAppSecretRedactor.redactText(card.title)
         let why = NativeAppSecretRedactor.redactText(card.why)
-        let inbox = LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
+        let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
         let noteID = "interaction:\(card.id)"
         guard !Task.isCancelled else { return .skipped }
         // One transcript row and its receipt settle together. Telegram owns
@@ -115,7 +114,7 @@ extension ApprovalChatCards {
     }
 
     static func promptPendingInteractions(dataRoot: URL, telegram: TelegramApprovalFiler) async {
-        let inbox = LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
+        let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
         guard let notes = try? await inbox.rows() else { return }
         for case .object(let note) in notes {
             guard !Task.isCancelled else { return }
@@ -150,7 +149,7 @@ extension ApprovalChatCards {
     }
 
     static func mirrorNote(_ id: String, dataRoot: URL) async -> [String: JSONValue]? {
-        let inbox = LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
+        let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
         guard let rows = try? await inbox.rows(),
               case .object(let note)? = rows.last(where: {
                   guard case .object(let row) = $0 else { return false }
@@ -159,13 +158,13 @@ extension ApprovalChatCards {
         return note
     }
 
-    /// The running Telegram filer, set by the app when Telegram starts.
-    nonisolated(unsafe) private static var telegramFiler: TelegramApprovalFiler?
-    private static let telegramFilerLock = NSLock()
-    public static func useTelegram(_ filer: TelegramApprovalFiler?) { telegramFilerLock.withLock { telegramFiler = filer } }
+    /// One Telegram filer, registered at assembly and cleared only by its own stop.
+    private static let telegramFiler = Mutex<TelegramApprovalFiler?>(nil)
+    public static var runningTelegram: TelegramApprovalFiler? { telegramFiler.withLock { $0 } }
+    public static func useTelegram(_ filer: TelegramApprovalFiler?) { telegramFiler.withLock { $0 = filer } }
     static func stopTelegram(_ filer: TelegramApprovalFiler) {
-        telegramFilerLock.withLock {
-            if telegramFiler === filer { telegramFiler = nil }
+        telegramFiler.withLock {
+            if $0 === filer { $0 = nil }
         }
     }
 
@@ -186,7 +185,7 @@ extension ApprovalChatCards {
         // and the card's next change tries it again.
         do {
             try await filer.settleChatCard(chatId: chatId, messageId: messageId, text: text)
-            let inbox = LiveNotificationInbox(path: LiveNotificationInbox.livePath(dataRoot: dataRoot))
+            let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
             _ = try await inbox.patch(id: "interaction:\(id)", unlessPresent: "telegram_card_settled", ["telegram_card_settled": .bool(true)])
         } catch {
             nativeLog("[approval-chat-card] Telegram settle failed: %@", error.localizedDescription)
@@ -195,7 +194,7 @@ extension ApprovalChatCards {
 
     static func publishInteractionChange(id: String, sessionID: String, dataRoot: URL) async {
         // Off the UI path: the app's own views never wait on Telegram.
-        if let filer = telegramFilerLock.withLock({ telegramFiler }) {
+        if let filer = runningTelegram {
             _ = await filer.enqueueInteractionSettlement(id: id, sessionID: sessionID, dataRoot: dataRoot)
         }
         var sessions: Set<String> = [sessionID]

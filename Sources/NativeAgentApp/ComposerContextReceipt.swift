@@ -1,6 +1,8 @@
 import SwiftUI
+import ChatTurnRuntime
 import EngineRuntime
 import NativeAgentCore
+import NativeAgentShared
 // Blueprint: | `ComposerContextReceipt.swift` | `ComposerContextReceiptBody`, `ComposerContextReceiptCard` views; `LatestRead` on the shell (or standalone card) orders receipt publication |
 
 // MARK: - The receipt body, shared by the composer card and the classic panel
@@ -16,7 +18,7 @@ struct ComposerContextReceiptBody: View {
             case .noTurn:
                 caption("No turn yet. Send a message and the receipt lands here.")
             case .outsideSearch:
-                caption("No receipt found in today's or yesterday's trace. Older turns are outside this search.")
+                caption("No receipt found in the newest trace rows. Older turns are outside this search.")
             case .unavailable(let reason):
                 caption("The turn trace could not be read: \(reason)")
             case .receipt(let receipt):
@@ -135,45 +137,37 @@ struct ComposerContextReceiptBody: View {
     }
 }
 
-/// The card the composer's context ring opens. It owns only its own read.
+/// The composer's context card reads and publishes through its shell owner.
 struct ComposerContextReceiptCard: View {
     let sessionId: String
-    /// The shell this card is a pane of, when it is one. The card publishes
-    /// what it loaded here so a page read of the open pane lists the same
-    /// rows; nil for the classic panel, which nothing reads that way.
-    var shell: ComposerShellState? = nil
+    /// Publishes the receipt to the mounted composer so quiet reads list
+    /// the same rows as its native popover.
+    let shell: ComposerShellState
     /// A bot conversation's own model; nil is the chat model.
     var model: String? = nil
     @Environment(AppModel.self) private var appModel
-    @State private var state: ComposerContextReceiptState = .loading
-    @State private var receiptRead = LatestRead()
     private var windowModel: String { model ?? appModel.chatModel }
     // Settings › Context window: a change re-sizes the window at once.
     @AppStorage("nativeagent.contextWindowMode") private var windowMode = ""
     @AppStorage("nativeagent.compactionThresholdTokens") private var windowSize = 0
-    /// Bumped by a completed turn, so a receipt that is already open moves on
-    /// to the turn that just finished instead of standing still (Sol).
+    /// A completed turn refreshes the receipt already open in the shell.
     @State private var refreshToken = 0
 
     var body: some View {
-        ComposerContextReceiptBody(state: shell?.contextReceipt ?? state)
-            // `quietReadTask`, not `.task`: this only fetches and assigns, and
-            // the offscreen copy a quiet page read mounts must WAIT for it —
-            // otherwise the screenshot of an open context pane is a picture of
-            // the word "Reading the last turn…". The selected model is in the
-            // id so a model pick re-scales every percent at once.
+        VStack(alignment: .leading, spacing: 8) {
+            ComposerContextReceiptBody(state: shell.contextReceipt)
+            if case .receipt = shell.contextReceipt {
+                ComposerContextFedText(sessionId: sessionId, dataRoot: appModel.engine.dataRoot, refresh: refreshToken)
+            }
+        }
+            // Quiet reads await publication; model and window changes refresh the receipt.
             .quietReadTask(id: "\(sessionId):\(refreshToken):\(windowModel):\(windowMode):\(windowSize)") {
-                // Sol, 2026-09-17: switching conversations used to leave the
-                // previous one's receipt on screen for the length of two
-                // reads, and a fresh conversation showed the old turn. The
-                // card empties FIRST; what replaces it belongs to this id.
-                state = .loading
-                shell?.contextReceipt = .loading
-                _ = await (shell?.contextReceiptRead ?? receiptRead).read({ await ContextReceiptProjection.read(
+                // Clear the previous receipt before reading this conversation.
+                shell.contextReceipt = .loading
+                _ = await shell.contextReceiptRead.read({ await ContextReceipts.read(
                     sessionId: sessionId, selectedModel: windowModel, dataRoot: appModel.engine.dataRoot
                 ) }, publish: { loaded in
-                state = loaded
-                shell?.contextReceipt = loaded
+                    shell.contextReceipt = loaded
                 })
             }
             .onReceive(NotificationCenter.default.publisher(for: .chatTurnCompleted)) { note in
@@ -186,5 +180,56 @@ struct ComposerContextReceiptCard: View {
                 guard let updated = note.object as? String, updated == sessionId else { return }
                 refreshToken += 1
             }
+    }
+}
+
+
+/// The text the last turn was fed, whole: what the "Fed this turn" row counts.
+/// Read from the record the turn saved, only when opened.
+struct ComposerContextFedText: View {
+    let sessionId: String
+    let dataRoot: URL
+    /// A completed turn reloads an open view.
+    let refresh: Int
+    @State private var open = false
+    @State private var text: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                open.toggle()
+            } label: {
+                Label(open ? "Hide what I was given" : "Show what I was given",
+                      systemImage: open ? "chevron.down" : "chevron.right")
+                    .font(ShellType.label)
+                    .foregroundStyle(NativeAgentShell.secondary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("chat.composer.context.fed.toggle")
+            if open {
+                ScrollView {
+                    Text(text ?? "Reading…")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(NativeAgentShell.text)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                // A fixed height: inside a popover a scroll view with only a
+                // maximum measures to zero and opens empty.
+                .frame(height: 300)
+                .task(id: "\(sessionId):\(refresh)") { await load() }
+            }
+        }
+    }
+
+    private func load() async {
+        let sessionId = sessionId, dataRoot = dataRoot
+        let record = await Task.detached { ContextFedRecord.load(sessionId: sessionId, dataRoot: dataRoot) }.value
+        guard let record else {
+            text = "Nothing saved yet for this conversation. It is kept from the next turn on."
+            return
+        }
+        let brief = record.brief.isEmpty ? "" : "\n\n— Turn brief —\n" + record.brief
+        text = record.fed + brief
     }
 }

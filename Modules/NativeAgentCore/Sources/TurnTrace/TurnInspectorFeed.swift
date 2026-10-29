@@ -1,5 +1,6 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import Observation
 import PersistenceCore
 // Blueprint: | `TurnInspectorFeed.swift` | Engine-owned persisted today/yesterday evidence, exact file observation, `LatestRead` publication with checked read failures, grouped Mac cards, bounded phone summaries and immutable selected-date replay reads |
@@ -53,7 +54,7 @@ public final class TurnInspectorFeed {
         guard watchedDay != today else { return }
         watcher?.cancel()
         watchedDay = today
-        let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: Date()) ?? Date()
+        let yesterday = TurnTracePersistLane.dayCalendar.date(byAdding: .day, value: -1, to: Date()) ?? Date()
         watcher = FileChangeWatcher(paths: [
             today, lane.path(for: yesterday), today.deletingLastPathComponent(),
         ]) { [weak self] _ in
@@ -79,8 +80,7 @@ public final class TurnInspectorFeed {
         start()
         let result = await readGroups()
         guard case .success(let groups) = result else { return nil }
-        let encoder = TurnSummaryComputer.makeEncoder()
-        return try? encoder.encode(TurnSummaryComputer.compute(from: TurnInspectorGrouping.cards(groups), encoder: encoder))
+        return try? TurnSummaryComputer.compute(from: groups)
     }
 
     private func readGroups() async -> Result<[TurnTraceGroup], Error> {
@@ -98,8 +98,7 @@ public final class TurnInspectorFeed {
         }
     }
 
-    /// Existing 0.1s presentation coalescing now follows persisted writes,
-    /// rather than racing the bus's detached persistence.
+    /// Coalesce persisted-file changes for 0.1s before refreshing.
     private func scheduleRefresh() {
         refreshRequested = true
         guard refreshTask == nil else { return }

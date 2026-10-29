@@ -1,8 +1,8 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `CognitiveSomaticSignalAdapter.swift` | `CognitiveSomaticSignalAdapter` enum; `signal`, `safeSourceComponent` |
+// Blueprint: | `CognitiveSomaticSignalAdapter.swift` | `CognitiveSomaticSignals` enum; `signal`, `safeSourceComponent` |
 
-public enum CognitiveSomaticSignalAdapter {
+public enum CognitiveSomaticSignals {
     /// Closed producer/adapter contract for cognitive evidence whose somatic
     /// consequence is already owned by the exact ProviderRouting lifecycle.
     /// The cognitive event still circulates through the substrate; only the
@@ -10,13 +10,8 @@ public enum CognitiveSomaticSignalAdapter {
     public static let somaticOwnerMetadataKey = "somaticOwner"
     public static let providerLifecycleSomaticOwner = "provider_lifecycle"
 
-    /// Phase 5 E3 (User, Agent 10-03): infrastructure is health, not feeling.
-    /// Provider calls, tool results, phone delivery and reachability, memory
-    /// upkeep, the Mac's wake and thermal state still update the body schema,
-    /// predictions and ops posture, but no longer move the feeling axes.
-    /// Feelings move on human causes: User's words and corrections, caring,
-    /// moments (through warmth), Desk work, approvals, sleep, her interests
-    /// and opinions.
+    /// Infrastructure evidence updates body health and posture; human causes,
+    /// caring, work, sleep and interests move feelings.
     public static func movesFeelings(_ kind: SomaticSignalKind) -> Bool {
         switch kind {
         case .toolStarted, .toolSucceeded, .toolFailed, .toolCancelled,
@@ -31,7 +26,7 @@ public enum CognitiveSomaticSignalAdapter {
         }
     }
 
-    /// Phase 5 E3: her OWN outcomes are human causes for agency and
+    /// Her own outcomes are human causes for agency and
     /// confidence, though their signals are transport-shaped: a verified
     /// action of hers that landed (the motor owner's `verification:
     /// satisfied`), an effectful tool call of hers that succeeded (a canonical
@@ -66,8 +61,9 @@ public enum CognitiveSomaticSignalAdapter {
         id: UUID,
         bounds: OrganismMetadataBounds = .defaults
     ) -> SomaticSignal? {
-        guard event.turnKind != .debug, event.turnKind != .verification else { return nil }
+        guard event.turnKind.contributesToLivedState else { return nil }
         guard let kind = somaticKind(for: event) else { return nil }
+        let valence = kind.canonicalValence
 
         return SomaticSignal(
             id: id,
@@ -75,7 +71,7 @@ public enum CognitiveSomaticSignalAdapter {
             sourceOrgan: sourceOrgan(for: event),
             occurredAt: event.occurredAt,
             intensity: event.importance,
-            valence: valence(for: event, somaticKind: kind),
+            valence: valence == 0 ? nil : valence,
             arousal: arousal(for: event, somaticKind: kind),
             metadata: metadata(from: event),
             bounds: bounds
@@ -157,14 +153,13 @@ public enum CognitiveSomaticSignalAdapter {
         case .organismResolutionFelt:
             return "organism"
         case .userMessageReceived, .assistantTurnCompleted:
-            // Item 8 (2026-09-02): a peer's turn is not User's turn, and the body
-            // should not record it under the same organ. The agent name comes
-            // from the out-of-band origin record the persistence seam wrote —
-            // never from the message text, which can claim anything. User's turns
-            // keep "chat"/"chat.<surface>" byte-for-byte.
+            // Peer organs use out-of-band origin, never message claims; User retains chat/chat.<surface> names.
             if case .peer(let agent) = CognitiveSubstrate.relationalSource(for: event),
                let safePeer = safeSourceComponent(agent) {
                 return "chat.peer.\(safePeer)"
+            }
+            if CognitiveSubstrate.relationalSource(for: event) == .unknown {
+                return "chat.unknown"
             }
             if let surface = safeSourceComponent(stringValue(event.metadata["surface"])) {
                 return "chat.\(surface)"
@@ -192,17 +187,6 @@ public enum CognitiveSomaticSignalAdapter {
         case .appWake, .appSleep:
             return "app"
         }
-    }
-
-    private static func valence(for event: CognitiveEvent, somaticKind: SomaticSignalKind) -> Double? {
-        // Single source of truth: SomaticSignalKind.canonicalValence (audit C10 —
-        // the field-fallback table used to drift, e.g. toolFailed −0.55 here vs
-        // −0.50 there). The adapter keeps its intentional nils: for the suppressed
-        // kinds (userSpoke/assistantSpoke chat felt-meaning is owned by the
-        // substrate's semantic-appraisal path; neutral lifecycle markers carry no
-        // intrinsic bodily valence) the produced signal has nil valence and the
-        // organism field's canonicalValence fallback applies downstream.
-        somaticKind.adapterSuppressesIntrinsicValence ? nil : somaticKind.canonicalValence
     }
 
     private static func arousal(for event: CognitiveEvent, somaticKind: SomaticSignalKind) -> Double? {
@@ -268,23 +252,10 @@ public enum CognitiveSomaticSignalAdapter {
         "motorActionIdentity",
         "verification",
         "trustRisk",
-        // Item 46 (2026-09-01): the two keys the semantic prediction lane
-        // rides. The appraisal owner (CognitiveSubstrate) stamps them on the
-        // cognitive event; the organism cannot derive either one, because it
-        // cannot read cares and runs no appraisal. Absent keys mean no
-        // expectation was formed — the common case, and byte-identical to the
-        // behaviour before this lane existed.
+        // CognitiveSubstrate supplies semantic expectation keys; absent keys mean no expectation.
         OrganismSemanticExpectation.mintMetadataKey,
         OrganismSemanticExpectation.reactionMetadataKey,
-        // Item 8 (2026-09-02) deliberately adds NOTHING here. The peer
-        // distinction it needs is read off the cognitive event directly in
-        // `sourceOrgan(for:)` above and lands in the signal's `sourceOrgan`
-        // FIELD, which is outside the metadata key budget. Forwarding `origin`
-        // as a thirteenth key would have been the obvious move and the wrong
-        // one: `OrganismMetadataBounds.maximumKeys` is 12 and a live chat turn
-        // already fills it, so the alphabetical cut would have silently evicted
-        // somebody else's forwarded key on exactly the bridge turns this cares
-        // about.
+        // Peer identity travels in sourceOrgan, preserving the twelve-key metadata budget.
     ]
 
     private static func stringValue(_ value: JSONValue?) -> String? {

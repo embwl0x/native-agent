@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Shared development build/install boundaries; callers own exemptions and diagnostics.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/release_bundle_gates.sh"
 # REPO_PATH identifies the live data checkout; a deleted checkout is not a conflict.
 nativeagent_require_installed_checkout() {
   local bundle="$1" root="$2" force="$3" prefix="$4" consequence="$5"
@@ -16,19 +17,5 @@ nativeagent_require_installed_checkout() {
     echo "$consequence" >&2
     echo "Pass --force-checkout-switch to switch the installed app to this checkout." >&2
     exit 2
-  fi
-}
-
-nativeagent_assert_no_python_artifacts() {
-  local bundle="$1" prefix="$2" placement="$3" artifact_kind="$4" hit
-  hit="$(find "$bundle/Contents/Resources" \
-    \( -type d \( -name python -o -name __pycache__ \) \
-       -o -type f \( -name '*.py' -o -name '*.pyc' -o -name '*.pyo' -o -name '*python*' \) \
-       -o -type l -name '*python*' \) \
-    -print -quit 2>/dev/null || true)"
-  if [[ -n "$hit" ]]; then
-    echo "$prefix ERROR: Python artifact $placement in app bundle: $hit" >&2
-    echo "$prefix NativeAgent $artifact_kind artifacts must be Swift-native and zero-Python." >&2
-    exit 1
   fi
 }

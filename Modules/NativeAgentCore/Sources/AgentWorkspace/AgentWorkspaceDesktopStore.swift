@@ -71,24 +71,8 @@ struct AgentWorkspaceDesktopStore: Sendable {
             // Refuse to replace an unreadable/corrupt existing desktop. Its
             // evidence remains available for recovery rather than being erased.
             _ = try read(fd)
-            let temporary = "." + scopeHash + "." + UUID().uuidString + ".tmp"
-            let output = openat(fd, temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
-            guard output >= 0 else { throw Failure.io }
-            var closed = false
-            defer { if !closed { close(output) }; unlinkat(fd, temporary, 0) }
-            try data.withUnsafeBytes { bytes in
-                guard let base = bytes.baseAddress else { throw Failure.invalid }
-                var written = 0
-                while written < bytes.count {
-                    let count = Darwin.write(output, base.advanced(by: written), bytes.count - written)
-                    if count < 0, errno == EINTR { continue }
-                    guard count > 0 else { throw Failure.io }
-                    written += count
-                }
-            }
-            guard fsync(output) == 0 else { throw Failure.io }
-            let result = close(output); closed = true
-            guard result == 0, renameat(fd, temporary, fd, scopeHash + ".json") == 0, fsync(fd) == 0 else { throw Failure.io }
+            do { try SwiftNativePersistenceCore.atomicWrite(data, to: fileURL, parentFD: fd) }
+            catch { throw Failure.io }
         }
     }
 
@@ -130,7 +114,7 @@ struct AgentWorkspaceDesktopStore: Sendable {
             case "read_file", "list_dir": keys = ["path"]; required = keys
             case "agent_read": keys = ["agent", "conversation", "history_before", "history_exchange"]; required = ["agent"]
             case "chat_conversations": keys = ["conversation_session_id"]; required = []
-            case "desk_read": keys = ["handle", "query", "updated_on"]; required = []
+            case "desk_read": keys = ["handle", "query", "updated_on", "sort"]; required = []
             case "work_context": keys = ["query", "session_id"]; required = ["query"]
             case "read_page": keys = ["url"]; required = keys
             case "read_chat_message": keys = ["message_id", "session_id"]; required = keys
@@ -195,7 +179,7 @@ struct AgentWorkspaceDesktopStore: Sendable {
             switch tool {
             case "read_file": numericKeys = ["offset", "max_bytes"]
             case "read_chat_message": numericKeys = ["offset", "limit"]
-            case "recall_memory": numericKeys = arguments["memory_id"] != nil ? ["offset", "max_characters"] : []
+            case "recall_memory", "recall_search": numericKeys = arguments["memory_id"] != nil ? ["offset", "max_characters"] : ["offset", "k", "limit"]
             case "desk_read": numericKeys = ["offset", "notes_offset", "refs_offset", "detail_offset", "limit"]
             case "work_context": numericKeys = ["desk_offset", "history_offset", "limit"]
             case "mail_list_recent": numericKeys = ["body_offset", "offset", "position"]

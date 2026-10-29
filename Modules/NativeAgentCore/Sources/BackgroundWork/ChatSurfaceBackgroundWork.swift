@@ -27,37 +27,10 @@ public enum ChatSurfaceBackgroundWork {
         client: SwiftNativeChatOrchestrationClient,
         turnCompleted: @escaping @Sendable (String) -> Void
     ) -> TelegramProgressChatHandlerWithAttachments {
-        // chat-smoothness phase 5: lock-guarded incremental→accumulated text
-        // bridge for the Telegram growing draft (the progress closure is
-        // @Sendable; deltas arrive on the chat engine's executor).
-        final class TelegramDeltaAccumulator: @unchecked Sendable {
-            private let lock = NSLock()
-            private var text = ""
-            func append(_ chunk: String) -> String {
-                lock.lock(); defer { lock.unlock() }
-                text += chunk
-                return text
-            }
-        }
-        // telegram-vision-in: attachment-aware handler. `attachments` carry
-        // already-downloaded inbound images (TelegramMediaAttachment.bytes set);
-        // convert each to ChatOrchestration's MultimodalAttachment — the SAME
-        // {type:"image", base64, mime, byteSize} shape the Mac UI builds in
-        // ChatView.swift — so the vision pass works for whichever provider/model
-        // the telegram surface resolves to.
+        // Telegram images use the same MultimodalAttachment shape as Mac chat.
         let handler: TelegramProgressChatHandlerWithAttachments = { chatId, text, mediaAttachments, progress, context in
-            // chat-smoothness phase 5: chat deltas arrive INCREMENTAL; the
-            // bot's growing draft wants accumulated text-so-far. One
-            // accumulator per turn (this closure runs once per turn).
-            let deltaAccumulator = TelegramDeltaAccumulator()
-            // 2026-09-06: an approval continuation names the session its
-            // interrupted turn ran in. Honour it — resolving the chat's active
-            // binding here put the replayed tool result into whatever session
-            // a /new or /resume had bound in the meantime.
-            // 2026-09-06: a Telegram forum topic is its own conversation, so
-            // the session is keyed on (chat, topic). `context.threadId` is nil
-            // for a DM, an ordinary group, and a forum's General topic — all of
-            // which keep the chat-only key they already have on disk.
+            // Approval continuations stay in the interrupted turn's session.
+            // Forum topics key sessions by (chat, topic); nil topics retain chat-only keys.
             let destination = TelegramDestination(chatId: chatId, threadId: context.threadId)
             let sessionId: String
             if let pinnedSessionId = context.sessionId {
@@ -129,8 +102,6 @@ public enum ChatSurfaceBackgroundWork {
                     on: client,
                     progress: { event in
                         switch event {
-                        case .replyTextSettled(let settled):
-                            await progress(.replyTextSettled(settled))
                         case .toolUse(let name, let input):
                             let call = shown.use(name, input: input)
                             await progress(.toolUse(name: call.name, input: call.input))
@@ -141,18 +112,14 @@ public enum ChatSurfaceBackgroundWork {
                             // Telegram so the user sees live progress instead of a silent
                             // multi-minute hang. Carry `kind` so the bot throttles
                             // heartbeats but always delivers the terminal timeout.
-                            // (2026-06-09 — completes notify-don't-hang on Telegram.)
                             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
                             if !trimmed.isEmpty {
                                 await progress(.notice(kind: kind, text: trimmed))
                             }
-                        case .delta(let chunk):
-                            // chat-smoothness phase 5: forward text-so-far to
-                            // the bot's growing-draft streamer (it throttles
-                            // the actual Telegram edits to ~2s).
-                            await progress(.textDelta(accumulated: deltaAccumulator.append(chunk)))
                         case .final, .error:
                             break
+                        default:
+                            await progress(event)
                         }
                     }
                 )
@@ -173,18 +140,9 @@ public enum ChatSurfaceBackgroundWork {
     /// stacking a new row per message.
     public static let systemPermissionsSpeechCardId = "system-permissions-speech"
 
-    /// PATCH-2026-08-18: surface a headless TCC denial to the human at the Mac.
-    ///
-    /// The Telegram sender already gets a chat notice; this is the other half —
-    /// the person who can actually flip the switch is not in the chat. Mirrors
-    /// the established `fileDiskHygieneNotice` shape
-    /// (BackgroundLoopsAssembly+Maintenance.swift:205): stable id, upsert,
-    /// severity "actionable", then push only when the row is newly inserted.
-    ///
-    /// The card carries the real route rather than a bare Dismiss: the exact
-    /// System Settings deep link in `related_paths`, and the in-app row
-    /// (Mac Integration → System Permissions → Speech Recognition) named in the
-    /// detail. See the report note about the one-click Act button.
+    /// Surface a headless TCC denial to the person who can grant it at the Mac.
+    /// Upsert one actionable card and push only on insertion.
+    /// Include the System Settings deep link and the in-app Speech Recognition route.
     public static func fileSystemPermissionNotice(
         capability: String,
         dataRoot: URL,
@@ -255,35 +213,13 @@ public enum ChatSurfaceBackgroundWork {
             "status": .string("unread"),
             "read_at": .null,
         ])
-        // Sticky-status upsert, mirroring upsertDiskHygieneCard. A plain
-        // LiveNotificationInbox.upsert replaces the whole row — including
-        // status: "unread" — so a card the user already archived or dismissed
-        // would be resurrected by the very next denied voice note. Since the
-        // underlying condition persists until someone flips a System Settings
-        // switch, that is a guaranteed nag loop. Preserve the user's disposition
-        // whenever the detail text is unchanged; a CHANGED detail (the status
-        // moved notDetermined -> denied) is genuinely new information and does
-        // re-surface the card.
-        let inboxPath = dataRoot
-            .appendingPathComponent("notifications", isDirectory: true)
-            .appendingPathComponent("inbox.jsonl")
-        let persistence = SwiftNativePersistenceCore()
+        // Preserve disposition while the permission detail is unchanged.
         do {
-            let inserted = try await persistence.withFileLock(inboxPath) { () async throws -> Bool in
-                let lines = try LiveNotificationInbox.readLines(inboxPath)
-                var mutated: [Data] = []
-                mutated.reserveCapacity(lines.count + 1)
-                var found = false
-                for line in lines {
-                    guard case .object(let obj)? = line.row,
-                          case .string(let id)? = obj["id"],
-                          id == systemPermissionsSpeechCardId else {
-                        // Other rows AND undecodable lines: verbatim.
-                        mutated.append(line.raw)
-                        continue
-                    }
+            let inserted = try await LiveNotificationInbox.live(dataRoot: dataRoot)
+                .upsert(id: systemPermissionsSpeechCardId) { existing in
                     var replacement = card
-                    if case .object(var newObj) = card,
+                    if case .object(let obj)? = existing,
+                       case .object(var newObj) = card,
                        case .string(let newDetail)? = newObj["detail"],
                        case .string(let oldDetail)? = obj["detail"],
                        newDetail == oldDetail {
@@ -291,13 +227,8 @@ public enum ChatSurfaceBackgroundWork {
                         newObj["read_at"] = obj["read_at"] ?? .null
                         replacement = .object(newObj)
                     }
-                    mutated.append(Data(try replacement.serialize(pretty: false).utf8))
-                    found = true
+                    return (replacement, existing == nil)
                 }
-                if !found { mutated.append(Data(try card.serialize(pretty: false).utf8)) }
-                try LiveNotificationInbox.write(mutated, to: inboxPath)
-                return !found
-            }
             if inserted {
                 await notify(
                     dataRoot,
@@ -327,42 +258,10 @@ public enum ChatSurfaceBackgroundWork {
         permissionStatus: @escaping @Sendable () -> SpeechPermissionSnapshot
     ) async {
         guard permissionStatus().isGranted else { return }
-        let inboxPath = dataRoot
-            .appendingPathComponent("notifications", isDirectory: true)
-            .appendingPathComponent("inbox.jsonl")
-        let persistence = SwiftNativePersistenceCore()
         let now = ISO8601DateFormatter().string(from: Date())
         do {
-            try await persistence.withFileLock(inboxPath) { () async throws -> Void in
-                let lines = try LiveNotificationInbox.readLines(inboxPath)
-                guard !lines.isEmpty else { return }
-                var changed = false
-                var mutated: [Data] = []
-                mutated.reserveCapacity(lines.count)
-                for line in lines {
-                    guard case .object(var obj)? = line.row,
-                          case .string(let id)? = obj["id"],
-                          id == systemPermissionsSpeechCardId else {
-                        mutated.append(line.raw)
-                        continue
-                    }
-                    let status: String
-                    if case .string(let raw)? = obj["status"] {
-                        status = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                    } else {
-                        status = "unread"
-                    }
-                    if status == "archived" || status == "dismissed" {
-                        mutated.append(line.raw)
-                        continue
-                    }
-                    obj["status"] = .string("archived")
-                    obj["read_at"] = .string(now)
-                    mutated.append(Data(try JSONValue.object(obj).serialize(pretty: false).utf8))
-                    changed = true
-                }
-                if changed { try LiveNotificationInbox.write(mutated, to: inboxPath) }
-            }
+            try await LiveNotificationInbox.live(dataRoot: dataRoot)
+                .archiveActive(ids: [systemPermissionsSpeechCardId], readAt: now)
         } catch {
             FileHandle.standardError.write(Data(
                 "SystemPermissionNotice: card retire failed: \(error)\n".utf8))

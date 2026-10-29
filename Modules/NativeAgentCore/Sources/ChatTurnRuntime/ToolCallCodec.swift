@@ -9,16 +9,16 @@ import ProviderRouting
 
 /// How the streaming tool loop offers tools to a provider and reads its output
 /// back as prose + tool calls. The loop owns everything else (budgets, bounces,
-/// dispatch, recovery); the codec owns only the wire encoding of tool calls.
+/// dispatch, recovery); the codec owns the wire encoding of calls and results.
 enum ToolCallCodec: Sendable, Equatable {
     /// Provider-native tool calling: `tools[]` on the request, calls as
     /// `.toolCall` stream events. XML/JSON markers in the text are still
     /// held back from the surface and parsed when a round streamed no call.
     case native
-    /// A transport with no tool calling (Codex CLI, `buffered_text`). The
+    /// A transport with no tool calling (Codex CLI). The
     /// offered array still reaches the client, whose capability admission
     /// records the text-only note, and the adapter never forwards it; the
-    /// stream is one text delta read exactly as `.native` reads text.
+    /// incremental text is read exactly as `.native` reads text.
     case none
     /// The text-compatibility marker protocol (`TextMarkerCodec`): no
     /// `tools[]`, the catalog as prose in the system prompt, calls as markers
@@ -31,20 +31,11 @@ enum ToolCallCodec: Sendable, Equatable {
     /// or a call that fails before any adapter — keeps the native reading.
     static func forProvider(_ providerID: String?) -> ToolCallCodec {
         guard let providerID, !providerID.isEmpty else { return .native }
-        if speaksTextMarkers(providerID) { return .textMarkers }
-        return ProviderToolCapability.supportsTools(providerID: providerID) ? .native : .none
-    }
-
-    /// An Anthropic-wire provider that cannot take a native tools[] array
-    /// (the Claude subscription, NativeToolCapability) speaks tool markers in
-    /// text.
-    static func speaksTextMarkers(_ providerID: String) -> Bool {
-        providerID
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-            .replacingOccurrences(of: "-", with: "_")
-            .hasPrefix("anthropic_")
-            && !NativeToolCapability.providerSupportsNativeTools(providerID)
+        switch ProviderToolCapability.wire(providerID: providerID) {
+        case .native: return .native
+        case .textMarkers: return .textMarkers
+        case .unsupported: return .none
+        }
     }
 
     /// The `tools` argument for this round's request.
@@ -54,6 +45,35 @@ enum ToolCallCodec: Sendable, Equatable {
         // The catalog rides the system prompt.
         case .textMarkers: nil
         }
+    }
+
+    /// Callers prepare their own prose; call IDs pair the native round by position.
+    static func assistantMessage(prose: [LLMContentBlock], calls: [ParsedToolCall], pairedIDs: [String],
+                                 markerCodec: TextMarkerCodec?) throws -> LLMMessage {
+        let uses: [LLMContentBlock] = markerCodec == nil ? try zip(calls, pairedIDs).map { call, id in
+            .toolUse(id: id, name: call.name, inputJSON: try JSONValue.object(call.input).serializedData(pretty: false))
+        } : []
+        return LLMMessage(role: .assistant, content: prose + uses)
+    }
+
+    /// Marker results share one closed carrier; pixels follow it in their original order.
+    static func resultBlocks(_ blocks: [LLMContentBlock], toolNames: [String],
+                             markerCodec: TextMarkerCodec?) -> [LLMContentBlock] {
+        guard let markerCodec else { return blocks }
+        var carrier = ""
+        var images: [LLMContentBlock] = []
+        var index = 0
+        for block in blocks {
+            guard case .toolResult(_, let content, let isError) = block else {
+                images.append(block)
+                continue
+            }
+            markerCodec.appendResult(index: index, toolName: toolNames[index], ok: !isError,
+                                     content: content, to: &carrier)
+            index += 1
+        }
+        if index > 0 { markerCodec.closeRound(&carrier) }
+        return (carrier.isEmpty ? [] : [.text(carrier)]) + images
     }
 
     /// Moves the prose in `pending` that can safely reach the surface out of
@@ -116,8 +136,8 @@ enum ToolCallCodec: Sendable, Equatable {
 
     /// Prose before the earliest potential call marker — what a stopped,
     /// failed or cut-off turn keeps.
-    func visiblePrefix(in text: String, recordShims: Bool = true) -> String {
-        ChatRichContentParser.visibleText(ToolCallParser.visiblePrefix(in: text, recordShims: recordShims))
+    func visiblePrefix(in text: String) -> String {
+        ChatRichContentParser.visibleText(ToolCallParser.visiblePrefix(in: text))
     }
 
     /// One streamed tool-call event as a call to dispatch; nil for a call
@@ -125,7 +145,7 @@ enum ToolCallCodec: Sendable, Equatable {
     func decode(_ call: LLMStreamToolCall) throws -> ParsedToolCall? {
         // Nothing offered, so nothing streamed is a call.
         if self == .textMarkers { return nil }
-        guard !ToolCallParser.isIgnorableToolName(call.name, recordShim: true) else { return nil }
+        guard !ToolCallParser.isIgnorableToolName(call.name) else { return nil }
         guard let parsed = try? JSONValue.parse(call.inputJSON),
               case .object(let input) = parsed else {
             throw LLMError.providerError(message: "streamed tool batch contains invalid object arguments")
@@ -141,7 +161,7 @@ enum ToolCallCodec: Sendable, Equatable {
     ) -> [ParsedToolCall] {
         switch self {
         case .native, .none:
-            ToolCallParser.executableCalls(streamed.isEmpty ? ToolCallParser.parse(text, recordShims: recordShims) : streamed, recordShims: recordShims)
+            ToolCallParser.executableCalls(streamed.isEmpty ? ToolCallParser.parse(text, recordShims: recordShims) : streamed)
         case .textMarkers:
             TextMarkerCodec(schemas: schemas, turnActiveTools: []).calls(in: text, recordShims: recordShims)
         }

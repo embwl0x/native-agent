@@ -6,7 +6,7 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `AgentBridgeCompletionRouter.swift` | Completion-route adapters and destination validation; saved let-go delivery stops at admission before asking-chat rows or dispatch; cancellation exits retry backoff and fences the next send; `AgentBridgeCompletionRouter`: `validatedRoute`, `deliverAnswer` |
+// Blueprint: | `AgentBridgeCompletionRouter.swift` | Completion-route adapters and destination validation; saved let-go delivery stops at admission before asking-chat rows or dispatch; retained tasks own caller-result artifact idempotence under delivery admission; cancellation fences the append; `AgentBridgeCompletionRouter`: `validatedRoute`, `deliverAnswer` |
 
 extension AgentBridgeCompletionRoute {
   /// The door a contact's send was asked from, for an answer from a turn
@@ -100,7 +100,6 @@ public struct AgentBridgeCompletionArtifact: Sendable, Equatable {
 
   public let id: String
   public let kind: String
-  public let retrySafe: Bool
   public let logicalCount: Int
   public let payload: Payload
   public let attachmentExpectations: [AttachmentExpectation]
@@ -108,11 +107,11 @@ public struct AgentBridgeCompletionArtifact: Sendable, Equatable {
 
 public enum AgentBridgeTransportResult: Sendable, Equatable {
   case accepted
-  /// The transport proved no effect occurred. `retryable` means another
-  /// attempt with the same idempotency key is safe.
-  case rejected(reason: String, retryable: Bool)
-  /// The effect may have occurred. Never retry a non-idempotent artifact.
-  case ambiguous(reason: String)
+  case alreadyAccepted
+  case rejected(reason: String)
+  case preDispatchFailed(reason: String)
+  case outcomeUnknown(reason: String)
+  case settled(AgentBridgeCompletionDelivery)
 }
 
 public protocol AgentBridgeCompletionSending: Sendable {
@@ -192,9 +191,9 @@ public enum AgentBridgeCompletionRouter {
       case .attachment(let attachment):
         part = try AgentContactPart.output(attachment, taskID: "na3.\(route.threadId ?? "").\(route.correlationId ?? "")")
       }
-      try await tasks().appendCallerResult(part, artifactID: idempotencyKey, route: route)
-      return .accepted
-    } catch { return .rejected(reason: error.localizedDescription, retryable: false) }
+      return try await tasks().appendCallerResult(part, artifactID: idempotencyKey, route: route)
+        ? .accepted : .alreadyAccepted
+    } catch { return .rejected(reason: error.localizedDescription) }
   }
 
   private struct RouteValidationFailure: Error, Equatable {
@@ -242,7 +241,7 @@ public enum AgentBridgeCompletionRouter {
   }
 
 
-  /// User 10-01: a contact's conversation runs her turn in its own session,
+  /// A contact's conversation runs her turn in its own session,
   /// but when User asked from a chat at any door her answer reaches THAT chat:
   /// a visible row in the chat that asked and the route's own delivery. Phone
   /// rows wait for the native send verdict so a held answer stays unpublished.
@@ -252,7 +251,7 @@ public enum AgentBridgeCompletionRouter {
     text: String,
     attachments: [ChatTurnRuntime.MultimodalAttachment],
     route: AgentBridgeCompletionRoute,
-    client: any ChatOrchestrationClient,
+    client: SwiftNativeChatOrchestrationClient,
     sender: any AgentBridgeCompletionSending,
     lifecycle: CodexCompletionLifecycle,
     notifyRequestedResult: Bool = true
@@ -271,7 +270,7 @@ public enum AgentBridgeCompletionRouter {
     sender: any AgentBridgeCompletionSending,
     lifecycle: CodexCompletionLifecycle,
     notifyRequestedResult: Bool = true,
-    askingChatClient: (any ChatOrchestrationClient)? = nil
+    askingChatClient: (SwiftNativeChatOrchestrationClient)? = nil
   ) async -> AgentBridgeCompletionDelivery {
     let surface = route.surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     let admission: (response: ChatResponse?, priorVerdict: String?, letGo: AgentBridgeCompletionDelivery?)
@@ -389,7 +388,6 @@ public enum AgentBridgeCompletionRouter {
     do {
       artifacts = try Self.artifacts(
         deliveryId: deliveryId,
-        surface: surface,
         text: text,
         attachments: attachments
       )
@@ -438,161 +436,42 @@ public enum AgentBridgeCompletionRouter {
 
     var acceptedCount = 0
     var attempts = 0
-    var pendingCount = 0
     var rejectedReasons: [String] = []
     var unknownReasons: [String] = []
     var preDispatchReasons: [String] = []
     var lifecycleFailureReason: String?
     artifactLoop: for artifact in artifacts {
-      let decision: CodexCompletionLifecycle.ArtifactDecision
-      let attemptID: String
+      let verdict: AgentBridgeTransportResult
       do {
-        decision = try await lifecycle.beginArtifact(
-          deliveryId: deliveryId,
-          requestDigest: requestDigest,
-          artifactId: artifact.id,
-          artifactKind: artifact.kind,
-          retrySafe: artifact.retrySafe
-        )
+        verdict = try await lifecycle.admitCallerResult(deliveryId: deliveryId,
+          requestDigest: requestDigest, artifact: artifact) {
+          do { try await sender.preflight(surface: surface, route: route, artifacts: [artifact]) }
+          catch { return .preDispatchFailed(reason: String(describing: error)) }
+          guard !Task.isCancelled else { return .outcomeUnknown(reason: "completion_delivery_cancelled") }
+          return await sender.send(artifact: artifact,
+            idempotencyKey: stableUUID("\(deliveryId):\(artifact.id)"), surface: surface, route: route)
+        }
       } catch {
-        lifecycleFailureReason = "\(artifact.kind):settlement_begin_failed:\(error)"
+        lifecycleFailureReason = "\(artifact.kind):delivery_admission_failed:\(error)"
         break artifactLoop
       }
-
-      switch decision {
+      switch verdict {
       case .settled(let delivery):
         return delivery
+      case .accepted:
+        attempts += 1
+        acceptedCount += artifact.logicalCount
       case .alreadyAccepted:
         acceptedCount += artifact.logicalCount
-        continue artifactLoop
-      case .rejected:
-        rejectedReasons.append("\(artifact.kind):transport_rejected")
-        break artifactLoop
-      case .inProgress:
-        pendingCount += artifact.logicalCount
-        break artifactLoop
-      case .outcomeUnknown, .conflict:
-        unknownReasons.append("\(artifact.kind):\(decision)")
-        break artifactLoop
-      case .send(let id):
-        attemptID = id
-      }
-
-      do {
-        try await sender.preflight(surface: surface, route: route, artifacts: [artifact])
-      } catch {
-        let detail = String(describing: error)
-        do {
-          try await lifecycle.markArtifactPreDispatchFailed(
-            deliveryId: deliveryId,
-            requestDigest: requestDigest,
-            artifactId: artifact.id,
-            attemptID: attemptID,
-            detail: detail
-          )
-        } catch {
-          lifecycleFailureReason = "\(artifact.kind):preflight_receipt_failed:\(error)"
-          break artifactLoop
-        }
-        preDispatchReasons.append("\(artifact.kind):\(detail)")
-        break artifactLoop
-      }
-
-      do {
-        try await lifecycle.markArtifactDispatchStarted(
-          deliveryId: deliveryId,
-          requestDigest: requestDigest,
-          artifactId: artifact.id,
-          attemptID: attemptID
-        )
-      } catch {
-        lifecycleFailureReason = "\(artifact.kind):dispatch_start_receipt_failed:\(error)"
-        break artifactLoop
-      }
-
-      let maximumAttempts = 3
-      var accepted = false
-      var terminalRejected = false
-      var lastError = "unknown_completion_delivery_error"
-      for attempt in 1...maximumAttempts {
-        guard !Task.isCancelled else {
-          lastError = "completion_delivery_cancelled"
-          break
-        }
+      case .rejected(let reason):
         attempts += 1
-        var retryAfterDefiniteOrIdempotentFailure = false
-        let transport = await sender.send(
-            artifact: artifact,
-            idempotencyKey: stableUUID("\(deliveryId):\(artifact.id)"),
-            surface: surface,
-            route: route
-        )
-        switch transport {
-        case .accepted:
-          do {
-            try await lifecycle.markArtifactAccepted(
-              deliveryId: deliveryId,
-              requestDigest: requestDigest,
-              artifactId: artifact.id,
-              attemptID: attemptID
-            )
-            accepted = true
-            acceptedCount += artifact.logicalCount
-          } catch {
-            lastError = "accepted_but_receipt_failed:\(error)"
-          }
-        case .rejected(let reason, let retryable):
-          lastError = reason
-          if retryable && attempt < maximumAttempts {
-            retryAfterDefiniteOrIdempotentFailure = true
-          } else {
-            do {
-              try await lifecycle.markArtifactRejected(
-                deliveryId: deliveryId,
-                requestDigest: requestDigest,
-                artifactId: artifact.id,
-                attemptID: attemptID,
-                detail: reason
-              )
-              terminalRejected = true
-            } catch {
-              lastError = "rejection_receipt_failed:\(error)"
-            }
-          }
-        case .ambiguous(let reason):
-          lastError = reason
-          if artifact.retrySafe && attempt < maximumAttempts {
-            retryAfterDefiniteOrIdempotentFailure = true
-          }
-        }
-        if retryAfterDefiniteOrIdempotentFailure {
-          do {
-            try await Task.sleep(nanoseconds: UInt64(attempt) * 250_000_000)
-          } catch {
-            lastError = "completion_delivery_cancelled"
-            break
-          }
-          continue
-        }
-        break
-      }
-      if !accepted {
-        if terminalRejected {
-          rejectedReasons.append("\(artifact.kind):\(lastError)")
-        } else {
-          do {
-            try await lifecycle.markArtifactOutcomeUnknown(
-              deliveryId: deliveryId,
-              requestDigest: requestDigest,
-              artifactId: artifact.id,
-              attemptID: attemptID,
-              detail: lastError
-            )
-          } catch {
-            lastError += ":outcome_unknown_receipt_failed:\(error)"
-          }
-          unknownReasons.append("\(artifact.kind):\(lastError)")
-        }
+        rejectedReasons.append("\(artifact.kind):\(reason)")
+        break artifactLoop
+      case .preDispatchFailed(let reason):
+        preDispatchReasons.append("\(artifact.kind):\(reason)")
+        break artifactLoop
+      case .outcomeUnknown(let reason):
+        unknownReasons.append("\(artifact.kind):\(reason)")
         break artifactLoop
       }
     }
@@ -610,8 +489,6 @@ public enum AgentBridgeCompletionRouter {
     let status: String
     if !unknownReasons.isEmpty {
       status = "outcome_unknown"
-    } else if pendingCount > 0 {
-      status = "in_progress"
     } else if !preDispatchReasons.isEmpty {
       status = "failed_pre_dispatch"
     } else if !rejectedReasons.isEmpty {
@@ -663,7 +540,6 @@ public enum AgentBridgeCompletionRouter {
 
   public static func artifacts(
     deliveryId: String,
-    surface: String,
     text: String,
     attachments: [ChatTurnRuntime.MultimodalAttachment]
   ) throws -> [AgentBridgeCompletionArtifact] {
@@ -695,7 +571,6 @@ public enum AgentBridgeCompletionRouter {
       result.append(AgentBridgeCompletionArtifact(
         id: "\(deliveryId):text",
         kind: "text",
-        retrySafe: surface == "caller-result",
         logicalCount: 1,
         payload: .text(trimmed),
         attachmentExpectations: []
@@ -705,7 +580,6 @@ public enum AgentBridgeCompletionRouter {
       result.append(AgentBridgeCompletionArtifact(
         id: "\(deliveryId):attachment:\(index):\(item.0.id):\(item.1.digest)",
         kind: "attachment",
-        retrySafe: surface == "caller-result",
         logicalCount: 1,
         payload: .attachment(item.0),
         attachmentExpectations: [item.1]

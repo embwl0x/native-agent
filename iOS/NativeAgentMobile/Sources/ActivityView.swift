@@ -1,23 +1,8 @@
-// PATCH-2026-05-10: sidebar-flatten — top-level "Activity" tab that merges
-// Approvals + Inbox + Memory Proposals + Self-Improvement proposals into one
-// "needs your eyes" landing.
-//
-// PATCH-2026-06-06: activity-flatten iOS parity — show top 2 pending items
-// per section inline with approve/deny right on the landing page (mirrors
-// the Mac SidebarFlattenViews ActivityView). Each section header still
-// drills into its owning queue. Inline cards call the same iCloudSyncEngine
-// action methods as the full views.
-//
-// Counts come from:
-//   • WorkOverview   — owner attention, before list bounds
-//   • iCloudSyncEngine.memoryProposals
-//   • iCloudSyncEngine.trainingProposals
+// Activity previews use shared queue actions and WorkOverview's attention counts before list bounds.
 import SwiftUI
 import NativeAgentShared
 
-// Which sub-queue ActivityView is currently drilled into. iOS doesn't have
-// the Cmd+Shift shortcuts that Mac uses, but keeping the enum keeps the
-// navigation pattern symmetric and ready for deep-link plumbing.
+// Activity's current drill-in queue.
 enum ActivitySection: String, CaseIterable, Hashable {
     case approvals
     case inbox
@@ -38,32 +23,10 @@ enum ActivityScreenPresentation {
         return count > 0 ? .pending(count) : .clear
     }
 
-    /// Activity's Memory Proposals drill-in must enter the corresponding
-    /// segment, rather than the Memories default used by the root tab.
-    static func memoryInitialSegment(for section: ActivitySection) -> MemoryView.MemorySegment {
-        switch section {
-        case .memoryProposals: return .proposals
-        case .approvals, .inbox, .selfImprovement: return .memories
-        }
-    }
-
     /// Signed, paired iOS may decide owner cards regardless of origin or flags.
     /// Studio canon belongs to Agent; the Mac enforces the same exception.
     static func canDecideRemotely(action: String) -> Bool {
         action != "studio.canon"
-    }
-
-    /// Preserve wire order for ordinary actions, but make a resolving action
-    /// reachable even when a writer reorders the action array.
-    static func visibleInboxActions(_ actions: [InboxActionRecord], limit: Int = 2) -> [InboxActionRecord] {
-        let actionable = actions.filter { $0.id != "view" && $0.id != "read" }
-        let primary = actionable.filter { isPrimaryInboxAction($0.id) }
-        let secondary = actionable.filter { !isPrimaryInboxAction($0.id) }
-        return Array((primary + secondary).prefix(limit))
-    }
-
-    static func isPrimaryInboxAction(_ actionID: String) -> Bool {
-        ["act", "approve", "open_approvals", "repair"].contains(actionID)
     }
 
     /// Notification-open suppression is consumed once. Leaving the latch set
@@ -72,13 +35,6 @@ enum ActivityScreenPresentation {
         guard skipInitialRefresh else { return true }
         skipInitialRefresh = false
         return false
-    }
-
-    /// Activity owns the surrounding NavigationStack, so every pushed queue
-    /// must render as its content rather than creating a stack that can bounce
-    /// the destination back to the Activity list.
-    static func destinationEmbedsNavigationStack(for _: ActivitySection) -> Bool {
-        false
     }
 
     /// A review request from another iOS surface must open the queue that can
@@ -142,23 +98,13 @@ enum InlineMemoryProposalDecisionPresentation {
 struct ActivityView: View {
     @EnvironmentObject private var approvalsStore: ApprovalsStore
     @EnvironmentObject private var inboxStore: InboxStore
-    @EnvironmentObject private var bridgeClient: MacBridgeClient
-    @EnvironmentObject private var pairingStore: PairingStore
+    @StateObject private var memoryStore = MemoryStore()
     private let sync = iCloudSyncEngine.shared
     @Binding var skipInitialRefresh: Bool
     @Binding var navigationTarget: ActivitySection?
 
     @State private var path = NavigationPath()
-    // 2026-06-07: the inline inbox preview's "More" button used to push
-    // ActivitySection.inbox onto `path`, which renders an InboxView() that
-    // declares its OWN NavigationStack at the root. Pushing one
-    // NavigationStack inside another's navigationDestination interacts
-    // poorly with refresh-driven state churn on this branch — the user's
-    // symptom was the destination flashing in then bouncing back to
-    // Activity before he could read the dream. Avoid the fragile nested
-    // navigation entirely: the user actually wants to *read* the dream,
-    // not navigate to a list, so "More" now presents InboxDetailSheet
-    // directly with the item's current shared projection.
+    // Inbox previews open the item's detail sheet directly, without nesting navigation stacks.
     @State private var inboxDetailItemID: String?
 
     init(
@@ -171,10 +117,6 @@ struct ActivityView: View {
 
     // MARK: - Pending slices
 
-    private var pendingApprovals: [ApprovalRequest] {
-        MobileDesignSamples.rows(sync.approvals).filter { $0.status.lowercased() == "pending" }
-    }
-
     private var pendingInbox: [InboxItemRecord] {
         MobileDesignSamples.rows(sync.inboxItems).filter {
             let status = $0.status.lowercased()
@@ -184,10 +126,6 @@ struct ActivityView: View {
 
     private var pendingMemoryProposals: [MemoryProposalRecord] {
         sync.memoryProposals.filter(\.isPending)
-    }
-
-    private var pendingTrainingProposals: [TrainingProposalSummary] {
-        MobileDesignSamples.rows(sync.trainingProposals).filter(\.isHumanActionable)
     }
 
     /// Empty arrays before the first completed snapshot are an absence of
@@ -214,19 +152,6 @@ struct ActivityView: View {
         (sync.memoryProposalsSnapshotLoaded || isDesignSample) ? pendingMemoryProposals.count : nil
     }
 
-    private var pendingSelfImprovementCount: Int? {
-        (sync.selfImprovementSnapshotPublishedAt != nil || isDesignSample)
-            ? pendingTrainingProposals.count : nil
-    }
-
-    /// The first two of each queue, in one list, so the landing can answer
-    /// them in place. Each queue's full list is one row further down.
-    private var waitingItems: [ActivityWaitingItem] {
-        var items: [ActivityWaitingItem] = pendingMemoryProposals.prefix(2).map { .memory($0) }
-        items += pendingTrainingProposals.prefix(2).map { .training($0) }
-        return items
-    }
-
     /// The page's one line, and the only place sync state is said.
     private var headerLine: String {
         sync.workOverview?.headline ?? "The overview is unavailable. Refresh from your Mac to read it."
@@ -241,40 +166,30 @@ struct ActivityView: View {
                 // long scroll down, under work that only needs reading).
                 AliveSection("Everything") { queueRows }
                 MobileWorkOverviewView()
-                if !waitingItems.isEmpty {
+                if !pendingMemoryProposals.isEmpty {
                     AliveSection("Other reviews", surface: .waiting) {
-                        ForEach(Array(waitingItems.enumerated()), id: \.element.id) { index, item in
+                        ForEach(Array(pendingMemoryProposals.prefix(2).enumerated()), id: \.element.id) { index, item in
                             if index > 0 { AliveDivider() }
-                            waitingRow(item)
+                            InlineMemoryProposalPreviewCard(proposal: item, store: memoryStore)
                         }
                     }
                 }
             }
-            // Sweep R4 C11.3 / C11.4 — render-only surfacing of state this
-            // screen's own `sync` engine and the shared bridge client already
-            // publish. No new polling.
+            // Render sync errors from existing sync and bridge state without polling.
             .macSyncErrorBanner()
             .navigationDestination(for: ActivitySection.self) { section in
-                // `embedInNavigationStack: false` — these destinations live
-                // INSIDE Activity's NavigationStack; if they wrap themselves
-                // in another one, the destination renders briefly then pops
-                // back, leaving the user staring at a blank slide-out.
-                // AutonomyView already doesn't wrap, so it's unchanged here.
+                // Destinations share Activity's NavigationStack and must not embed another.
                 switch section {
                 case .approvals:
-                    ApprovalsView(
-                        embedInNavigationStack: ActivityScreenPresentation.destinationEmbedsNavigationStack(for: .approvals)
-                    )
-                                            .environmentObject(approvalsStore)
+                    ApprovalsView()
+                        .environmentObject(approvalsStore)
                 case .inbox:
-                    InboxView(
-                        embedInNavigationStack: ActivityScreenPresentation.destinationEmbedsNavigationStack(for: .inbox)
-                    )
-                                            .environmentObject(inboxStore)
+                    InboxView(embedInNavigationStack: false)
+                        .environmentObject(inboxStore)
                 case .memoryProposals:
                     MemoryView(
-                        initialSegment: ActivityScreenPresentation.memoryInitialSegment(for: section),
-                        embedInNavigationStack: ActivityScreenPresentation.destinationEmbedsNavigationStack(for: .memoryProposals)
+                        initialSegment: .proposals,
+                        embedInNavigationStack: false
                     )
                 case .selfImprovement:
                     AutonomyView()
@@ -296,10 +211,7 @@ struct ActivityView: View {
                 openRequestedSection(navigationTarget)
                 openDesignSampleScreen()
             }
-            // 2026-06-07: dream-card "More" → read the full dream right here.
-            // Reuses InboxDetailSheet (the same sheet InboxView presents),
-            // so dream / detail rendering stays consistent across both
-            // surfaces.
+            // Activity and Inbox share InboxDetailSheet for full item rendering.
             .sheet(isPresented: Binding(get: { inboxDetailItemID != nil }, set: { if !$0 { inboxDetailItemID = nil } })) {
                 if let id = inboxDetailItemID {
                 InboxDetailSheet(
@@ -338,33 +250,6 @@ struct ActivityView: View {
     // MARK: - Pieces
 
     @ViewBuilder
-    private func waitingRow(_ item: ActivityWaitingItem) -> some View {
-        switch item {
-        case .approval(let approval):
-            InlineApprovalPreviewCard(approval: approval) {
-                path.append(ActivitySection.approvals)
-            }
-        case .inbox(let inboxItem):
-            InlineInboxPreviewCard(item: inboxItem) {
-                // 2026-06-07: present the detail sheet directly with the
-                // tapped item instead of pushing onto the parent
-                // NavigationPath — see comment on inboxDetailItemID.
-                inboxDetailItemID = inboxItem.id
-            }
-        case .memory(let proposal):
-            InlineMemoryProposalPreviewCard(proposal: proposal)
-        case .training(let proposal):
-            InlineSelfImprovementPreviewCard(
-                title: proposal.title,
-                summary: proposal.proposed ?? proposal.rationale ?? "",
-                note: "You decide this training change on your Mac."
-            ) {
-                path.append(ActivitySection.selfImprovement)
-            }
-        }
-    }
-
-    @ViewBuilder
     private var queueRows: some View {
         ActivityQueueRow(section: .approvals, title: "Approvals",
                          line: "What I'll do once you say yes", count: pendingApprovalsCount)
@@ -376,23 +261,7 @@ struct ActivityView: View {
                          line: "What I'd like to remember", count: pendingMemoryProposalsCount)
         AliveDivider()
         ActivityQueueRow(section: .selfImprovement, title: "Improvements",
-                         line: "Changes I'd make to how I work", count: pendingSelfImprovementCount)
-    }
-}
-
-private enum ActivityWaitingItem: Identifiable {
-    case approval(ApprovalRequest)
-    case inbox(InboxItemRecord)
-    case memory(MemoryProposalRecord)
-    case training(TrainingProposalSummary)
-
-    var id: String {
-        switch self {
-        case .approval(let value): return "approval-\(value.id)"
-        case .inbox(let value): return "inbox-\(value.id)"
-        case .memory(let value): return "memory-\(value.id)"
-        case .training(let value): return "training-\(value.id)"
-        }
+                         line: "Managed on your Mac", count: nil)
     }
 }
 
@@ -440,173 +309,10 @@ private struct ActivityWaitingRow<Actions: View>: View {
     }
 }
 
-/// Approval with Approve / Deny in place. Mirrors the Mac
-/// `InlineApprovalPreviewCard` but uses iCloudSyncEngine.shared for the
-/// decision call (iOS has no AppModel).
-private struct InlineApprovalPreviewCard: View {
-    @EnvironmentObject private var approvalsStore: ApprovalsStore
-    @EnvironmentObject private var pairingStore: PairingStore
-    @EnvironmentObject private var bridgeClient: MacBridgeClient
-    @ObservedObject private var bridge = iCloudBridge.shared
-    let approval: ApprovalRequest
-    var onView: () -> Void
-
-    @State private var isDeciding = false
-    @State private var decisionStatusText: String?
-    @State private var decisionStatusIsError = false
-
-    private var canSendDecision: Bool {
-        pairingStore.isICloudSigned && bridge.available && bridgeClient.bridgeStatus != .deviceOffline
-    }
-
-    private var isAgentDecision: Bool {
-        !ActivityScreenPresentation.canDecideRemotely(action: approval.action)
-    }
-
-    private var kind: String {
-        let risk = approval.risk.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return risk.isEmpty ? "Before I go ahead" : "Before I go ahead · \(risk) risk"
-    }
-
-    private var note: String? {
-        if let decisionStatusText { return decisionStatusText }
-        if isAgentDecision { return ApprovalText.agentDecision }
-        if !canSendDecision { return "Pair with your Mac to answer from here." }
-        return nil
-    }
-
-    var body: some View {
-        ActivityWaitingRow(
-            kind: kind,
-            title: ApprovalText.title(approval),
-            detail: approval.reason.map(ApprovalText.readable).flatMap { $0.isEmpty ? nil : $0 }
-                ?? ApprovalText.kind(approval.action),
-            note: note,
-            noteIsError: decisionStatusIsError
-        ) {
-            AliveActionRow {
-                if !isAgentDecision {
-                    Button("Approve") { decide(approve: true) }
-                        .alivePrimaryButton()
-                        .disabled(isDeciding || !canSendDecision)
-                    Button("Deny") { decide(approve: false) }
-                        .aliveSecondaryButton()
-                        .disabled(isDeciding || !canSendDecision)
-                }
-                Button("Details") { onView() }
-                    .aliveSecondaryButton()
-                if isDeciding {
-                    ProgressView().controlSize(.small)
-                }
-            }
-        }
-    }
-
-    private func decide(approve: Bool) {
-        isDeciding = true
-        decisionStatusText = nil
-        decisionStatusIsError = false
-        let id = approval.id
-        Task {
-            do {
-                if approve {
-                    _ = try await iCloudSyncEngine.shared.approveApproval(id: id)
-                    iOSSystemToastCenter.shared.push(success: "Approval approved")
-                } else {
-                    _ = try await iCloudSyncEngine.shared.rejectApproval(id: id)
-                    iOSSystemToastCenter.shared.push(info: "Approval denied")
-                }
-                await iCloudSyncEngine.shared.refreshActivitySnapshot()
-                // gpt-5.5 review finding #3: re-hydrate the shared store so
-                // the tab badge + parent ActivityView count drop in lockstep
-                // with the inline preview disappearing.
-                approvalsStore.applySyncedApprovalsFromSnapshot(animated: false, notifyNewPending: false)
-            } catch {
-                if iCloudSyncEngine.isMacResponseTimeout(error) {
-                    decisionStatusText = ApprovalBannerPresentation.pendingDecisionMessage
-                    decisionStatusIsError = false
-                    iOSSystemToastCenter.shared.push(info: "Decision unconfirmed; check again after reconnecting")
-                    await iCloudSyncEngine.shared.refreshActivitySnapshot()
-                    approvalsStore.applySyncedApprovalsFromSnapshot(animated: false, notifyNewPending: false)
-                } else {
-                    decisionStatusText = "Failed: \(error.localizedDescription)"
-                    decisionStatusIsError = true
-                }
-            }
-            isDeciding = false
-        }
-    }
-}
-
-/// Inbox card with its top two actions plus "Read". The owning Activity view
-/// passes a callback that presents the InboxDetailSheet directly with this
-/// card's item (the previous "drill into InboxView" wiring bounced on iOS —
-/// see ActivityView.inboxDetailItemID).
-private struct InlineInboxPreviewCard: View {
-    @EnvironmentObject private var inboxStore: InboxStore
-    let item: InboxItemRecord
-    var onMore: () -> Void
-
-    @State private var runningActionID: String?
-    @State private var errorText: String?
-
-    private var topActions: [InboxActionRecord] {
-        ActivityScreenPresentation.visibleInboxActions(item.actions)
-    }
-
-    private var kind: String {
-        item.relativeCreatedAt.isEmpty ? item.sourceWords : "\(item.sourceWords) · \(item.relativeCreatedAt)"
-    }
-
-    var body: some View {
-        ActivityWaitingRow(kind: kind, title: item.title, detail: item.summary,
-                           note: errorText, noteIsError: true) {
-            AliveActionRow {
-                ForEach(topActions, id: \.id) { action in
-                    if ActivityScreenPresentation.isPrimaryInboxAction(action.id) {
-                        Button(action.label) { runAction(action.id) }
-                            .alivePrimaryButton()
-                            .disabled(runningActionID != nil)
-                    } else {
-                        Button(action.label) { runAction(action.id) }
-                            .aliveSecondaryButton()
-                            .disabled(runningActionID != nil)
-                    }
-                }
-                Button("Read") { onMore() }
-                    .aliveSecondaryButton()
-                    .disabled(runningActionID != nil)
-                if runningActionID != nil {
-                    ProgressView().controlSize(.small)
-                }
-            }
-        }
-    }
-
-    private func runAction(_ actionID: String) {
-        runningActionID = actionID
-        errorText = nil
-        let id = item.id
-        Task {
-            do {
-                _ = try await iCloudSyncEngine.shared.inboxAction(itemId: id, actionId: actionID)
-                await iCloudSyncEngine.shared.refreshActivitySnapshot()
-                // gpt-5.5 review finding #3: re-hydrate the shared store so
-                // the tab badge stays consistent with the inline card's
-                // disappearance.
-                inboxStore.applySyncedInboxFromSnapshot(animated: false, notifyNewArrivals: false)
-            } catch {
-                errorText = "Action failed: \(error.localizedDescription)"
-            }
-            runningActionID = nil
-        }
-    }
-}
-
-/// Memory proposal with Remember / Skip. Calls the same iCloudSyncEngine
-/// methods as the full Memory view.
+/// Memory proposal with Remember / Skip, submitted through MemoryStore.
 private struct InlineMemoryProposalPreviewCard: View {
     let proposal: MemoryProposalRecord
+    @ObservedObject var store: MemoryStore
 
     @State private var decisionState: InlineMemoryProposalDecisionPresentation.State = .ready
 
@@ -635,44 +341,28 @@ private struct InlineMemoryProposalPreviewCard: View {
     private func decide(approve: Bool) {
         guard decisionState.canDecide else { return }
         decisionState = .deciding
-        let id = proposal.id
         Task {
             do {
+                guard let result = await store.performMemoryProposalDecision(proposal, approve: approve) else {
+                    decisionState = .ready
+                    return
+                }
+                try result.get()
                 if approve {
-                    _ = try await iCloudSyncEngine.shared.approveMemoryProposal(proposalId: id)
-                    iOSSystemToastCenter.shared.push(success: "Memory accepted")
+                    SystemToastCenter.shared.push(success: "Memory accepted")
                 } else {
-                    _ = try await iCloudSyncEngine.shared.rejectMemoryProposal(proposalId: id)
-                    iOSSystemToastCenter.shared.push(info: "Memory rejected")
+                    SystemToastCenter.shared.push(info: "Memory rejected")
                 }
                 decisionState = InlineMemoryProposalDecisionPresentation.submitted(approve: approve)
                 await iCloudSyncEngine.shared.refreshActivitySnapshot()
             } catch {
-                if iCloudSyncEngine.isMacResponseTimeout(error) {
+                if case SyncError.responseUnconfirmed = error {
                     decisionState = InlineMemoryProposalDecisionPresentation.submitted(approve: approve)
-                    iOSSystemToastCenter.shared.push(info: "Decision sent; still waiting on the Mac")
+                    SystemToastCenter.shared.push(info: "Decision sent; still waiting on the Mac")
                     await iCloudSyncEngine.shared.refreshActivitySnapshot()
                 } else {
                     decisionState = .failed("Failed: \(error.localizedDescription)")
                 }
-            }
-        }
-    }
-}
-
-/// Self-improvement proposal. View-only: the change is decided on the Mac.
-private struct InlineSelfImprovementPreviewCard: View {
-    let title: String
-    let summary: String
-    let note: String
-    var onView: () -> Void
-
-    var body: some View {
-        ActivityWaitingRow(kind: "A change to how I work", title: title, detail: summary,
-                           note: note) {
-            AliveActionRow {
-                Button("Details") { onView() }
-                    .aliveSecondaryButton()
             }
         }
     }

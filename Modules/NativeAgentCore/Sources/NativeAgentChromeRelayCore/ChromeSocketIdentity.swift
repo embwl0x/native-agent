@@ -5,9 +5,7 @@ import Security
 // Blueprint: | `ChromeSocketIdentity.swift` | `ChromeSocketIdentity`: kernel audit-token peer validation against the running caller's designated signer; unsigned identity is refused |
 
 public enum ChromeSocketIdentity {
-    // 2026-09-06: inherit the running, signed caller's designated signer constraint,
-    // never a requirement read from the peer's replaceable executable on disk.
-    // App and nested relay have different identifiers but share that signer.
+    // Peer identity inherits the running caller's signer, never a peer file's requirement.
     private static func requireSuccess(_ status: OSStatus, _ check: String) throws {
         guard status == errSecSuccess else { throw ChromeHostIdentity.SigningFailure(check: check, status: status) }
     }
@@ -42,8 +40,7 @@ public enum ChromeSocketIdentity {
         return requirement
     }
 
-    // 2026-09-06: the audit token binds validation to the kernel's socket peer,
-    // including its PID generation, rather than a path or a reusable PID.
+    // The kernel audit token binds validation to the socket peer and its PID generation.
     public static func peerIsTrusted(descriptor: Int32, identifiers: [String]) -> Bool {
         (try? checkTrustedPeer(descriptor: descriptor, identifiers: identifiers)) != nil
     }

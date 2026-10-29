@@ -1,21 +1,9 @@
-// PATCH-2026-05-07: ios-parity iCloudSyncEngine — snapshot reader + inbox writer for iOS
-// Architecture:
-//   READ:  iCloud Drive `snapshots/*.json` — Mac's SnapshotWriter keeps these fresh.
-//          KVS key `snapshot_updated` pings iOS when a snapshot changes.
-//   WRITE: iOS drops an action envelope into `inbox/<msg_id>.json`.
-//          MacSyncEngine validates it, dispatches into the in-process Swift runtime,
-//          writes `responses/<msg_id>.json`, then pings `inbox_response_<msg_id>`.
-
 import Foundation
 import SwiftUI
 import NativeAgentShared
 
 extension iCloudSyncEngine {
-    private nonisolated static let workOverviewCacheLock = NSLock()
-
     private nonisolated static func writeWorkOverviewCache(_ data: Data, to url: URL) throws {
-        workOverviewCacheLock.lock()
-        defer { workOverviewCacheLock.unlock() }
         let incoming = try JSONDecoder().decode(WorkOverview.self, from: data)
         guard let incomingDate = DeskActivityState.movementDate(incoming.capturedAt) else {
             throw DeviceSyncError.underlying(message: "invalid work overview capture time")
@@ -40,45 +28,32 @@ extension iCloudSyncEngine {
         static let transactions = "transactions/ios"
     }
 
-    // 2026-09-06: the ephemeral-mailbox retention window and how often the
-    // prune is allowed to run. See `pruneEphemeralDirectoriesIfDue`.
+    // Ephemeral-mailbox retention and prune cadence.
     static var ephemeralRetentionSeconds: TimeInterval { 14 * 24 * 60 * 60 }
     static var ephemeralPruneIntervalSeconds: TimeInterval { 24 * 60 * 60 }
     static var ephemeralPruneStampKey: String { "NativeAgentMobile.ephemeralPrunedAt" }
 
-    // MARK: - Setup (called after iCloudBridge.setup() completes)
+    // MARK: - Drive setup
 
     func setup(docsURL: URL) async {
-        if isSetUp, !prefersCloudKitSnapshotCache,
-           driveSnapshotRoot == docsURL.appendingPathComponent(Folder.snapshots) {
+        if isSetUp, driveSnapshotRoot == docsURL.appendingPathComponent(Folder.snapshots) {
             return
         }
         tearDown()
         lifecycleGeneration &+= 1
         let generation = lifecycleGeneration
-        let snapshot: URL?, inbox: URL?, responses: URL, transactions: URL, driveRoot: URL?
-        if prefersCloudKitSnapshotCache {
-            let root = cloudKitCacheRoot()
-            snapshot = cloudKitSnapshotCacheDirectory(pairing: pairingStore?.iCloudPairingSecret)
-            inbox = nil
-            responses = root.appendingPathComponent(Folder.responses)
-            transactions = root.appendingPathComponent("transactions", isDirectory: true)
-            driveRoot = nil
-        } else {
-            let root = docsURL.appendingPathComponent(Folder.snapshots)
-            driveRoot = root
-            let secret = pairingStore?.iCloudPairingSecret
-            snapshot = AgentNameCache.fingerprint(secret) == nil
-                ? nil : Self.cachedSnapshotDirectory(in: root, pairing: secret)
-            inbox = docsURL.appendingPathComponent(Folder.inbox)
-            responses = docsURL.appendingPathComponent(Folder.responses)
-            transactions = docsURL.appendingPathComponent(Folder.transactions)
-        }
+        let driveRoot = docsURL.appendingPathComponent(Folder.snapshots)
+        let secret = pairingStore?.iCloudPairingSecret
+        let snapshot = AgentNameCache.fingerprint(secret) == nil
+            ? nil : Self.cachedSnapshotDirectory(in: driveRoot, pairing: secret)
+        let inbox = docsURL.appendingPathComponent(Folder.inbox)
+        let responses = docsURL.appendingPathComponent(Folder.responses)
+        let transactions = docsURL.appendingPathComponent(Folder.transactions)
         let directories = [snapshot, inbox, responses, transactions].compactMap { $0 }
         do {
-            try await Task.detached(priority: .utility) {
+            try await VolumeIO.run {
                 for directory in directories { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
-            }.value
+            }
         } catch { syncError = error.localizedDescription; return }
         guard generation == lifecycleGeneration else { return }
         snapshotDir = snapshot
@@ -88,15 +63,13 @@ extension iCloudSyncEngine {
         driveSnapshotRoot = driveRoot
         isSetUp = true
 
-        if !prefersCloudKitSnapshotCache {
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(kvsDidChange(_:)),
-                name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
-                object: kvs
-            )
-            Task { await PairingStore.synchronizeKVSWithTimeout() }
-        }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(kvsDidChange(_:)),
+            name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
+            object: kvs
+        )
+        Task { await PairingStore.synchronizeKVSWithTimeout() }
 
         pruneEphemeralDirectoriesIfDue()
 
@@ -105,25 +78,10 @@ extension iCloudSyncEngine {
         // transcript or memory payload into iPhone RAM.
     }
 
-    /// 2026-09-06: `responses/` and `transactions/` are ephemeral mailboxes —
-    /// a response is read once by the poll parked on it, a transaction row
-    /// records one action that has already finished — and NOTHING ever deleted
-    /// from either, so both grew for the life of the install. Prune what is
-    /// past the retention window at setup, and at most once a day after that.
-    ///
-    /// 2026-09-06 (second pass): age alone was the wrong test. A response the
-    /// poll had not read yet, and a transaction still `queued`/`sent`/
-    /// `pending_approval`, were deleted purely for being old — the phone lost
-    /// the answer it was parked on and the ledger row that says an action is
-    /// still outstanding. Only TERMINAL transactions and CONSUMED responses go
-    /// now: a response counts as consumed when a terminal transaction names it
-    /// (by `msgId`, or by id for rows written before that field existed).
-    ///
-    /// Off the main actor, best effort: a file that will not stat or will not
-    /// delete is left alone, and every removal re-stats first so a fresh file
-    /// written into the same name between the scan and the unlink is not
-    /// deleted in place of the old one. Snapshots and the inbox are untouched —
-    /// those are live state with owners of their own.
+    /// Prune old terminal transactions and consumed responses off-main, at setup and at most daily.
+    /// Terminal msgId/id marks consumption; an unledgered response's terminal row has already been reaped.
+    /// Recheck file identity before removal; unreadable or changed files survive.
+    /// Nonterminal transactions, snapshots and inbox files remain untouched.
     func pruneEphemeralDirectoriesIfDue(force: Bool = false) {
         let defaults = UserDefaults.standard
         let now = Date().timeIntervalSince1970
@@ -237,10 +195,6 @@ extension iCloudSyncEngine {
         workOverview = nil
         schedulerJobReceiptTimes = [:]
         schedulerError = nil
-        snapshotRefreshGeneration &+= 1
-        targetedRefreshGeneration &+= 1
-        chatTranscriptsRefreshGeneration &+= 1
-        chatSessionListRefreshGeneration &+= 1
         NotificationCenter.default.removeObserver(self)
         snapshotDir = nil
         driveSnapshotRoot = nil
@@ -261,10 +215,6 @@ extension iCloudSyncEngine {
     /// changes for public Mac builds that cannot use CloudDocuments.
     func enableCloudKitSnapshotCache() async {
         lifecycleGeneration &+= 1
-        snapshotRefreshGeneration &+= 1
-        targetedRefreshGeneration &+= 1
-        chatTranscriptsRefreshGeneration &+= 1
-        chatSessionListRefreshGeneration &+= 1
         refreshInFlight = false
         refreshQueued = false
         fullRefreshQueued = false
@@ -281,11 +231,11 @@ extension iCloudSyncEngine {
         let transactions = root.appendingPathComponent("transactions", isDirectory: true)
         let generation = lifecycleGeneration
         do {
-            try await Task.detached(priority: .utility) {
+            try await VolumeIO.run {
                 for directory in [snapshots, responses, transactions] {
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
                 }
-            }.value
+            }
         } catch { isSetUp = false; syncError = error.localizedDescription; return }
         guard generation == lifecycleGeneration else { return }
         snapshotDir = snapshots
@@ -296,12 +246,8 @@ extension iCloudSyncEngine {
         pruneEphemeralDirectoriesIfDue()
     }
 
-    /// 2026-09-06: returns whether the delivery was durably applied. The
-    /// transport claims the peer's generation only on `true`; a failure — an
-    /// undecodable payload, a write that could not land — now leaves the record
-    /// eligible for the next drain instead of being marked seen and lost.
-    /// A teardown between the decode and the write is not a failure to retry:
-    /// the engine that would have used the files no longer exists.
+    /// The transport claims a generation only after durable application; decode/write failures remain eligible.
+    /// Teardown after the write consumes the delivery because its engine has retired.
     @discardableResult
     func applyCloudKitSnapshotStatus(
         _ value: String,
@@ -314,7 +260,7 @@ extension iCloudSyncEngine {
         guard AgentNameCache.fingerprint(deliveryPairing) != nil else { return false }
         do {
             let directory = cloudKitSnapshotCacheDirectory(pairing: deliveryPairing)
-            try await Task.detached(priority: .utility) {
+            try await VolumeIO.run {
                 let files = try NAMobileSnapshotStatusCodec.decode(
                     value,
                     expectedGroup: group
@@ -333,20 +279,12 @@ extension iCloudSyncEngine {
                         options: .atomic
                     )
                 }
-            }.value
+            }
             guard deliveryPairing == pairingStore?.iCloudPairingSecret else { return false }
             guard generation == lifecycleGeneration else { return true }
             prefersCloudKitSnapshotCache = true
             snapshotDir = directory
-            // A group refresh reports its own failure through `syncError`, and
-            // it returns Void — so clearing the error unconditionally after it
-            // erased exactly the failure the screen needed to show. Only the
-            // delivery's own success is claimed here.
-            // 2026-09-12: the refresh reports success as a VALUE. Comparing
-            // syncError before and after erased a fresh failure whenever it
-            // happened to read the same as the previous one, and marked the
-            // transport fresh for a refresh that never landed. Only a refresh
-            // that reported success renews this group's delivery clock.
+            // Only an explicitly successful group refresh renews its delivery clock; preserve its error otherwise.
             let refreshed = await refreshSnapshotGroup(group)
             guard deliveryPairing == pairingStore?.iCloudPairingSecret else { return false }
             guard generation == lifecycleGeneration else { return true }
@@ -374,9 +312,6 @@ extension iCloudSyncEngine {
     }
 
     private func cloudKitCacheRoot() -> URL {
-        if let cloudKitSnapshotCacheRootOverride {
-            return cloudKitSnapshotCacheRootOverride
-        }
         let root = FileManager.default.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
@@ -388,9 +323,7 @@ extension iCloudSyncEngine {
 
     // MARK: - KVS ping handler
 
-    // 2026-05-09: nonisolated — KVS callbacks fire on com.apple.kvs.client.callback,
-    // not main.  Touching self.* on @MainActor class from off-main fatal-traps
-    // (_swift_task_checkIsolatedSwift / EXC_BREAKPOINT).  Hop to MainActor inside.
+    // KVS callbacks arrive off-main; only the MainActor hop may touch engine state.
     @objc private nonisolated func kvsDidChange(_ note: Notification) {
         let changed = note.userInfo?[NSUbiquitousKeyValueStoreChangedKeysKey] as? [String]
         Task { @MainActor in
@@ -453,7 +386,7 @@ extension iCloudSyncEngine {
             // Summaries and runs must both land. Older Macs do not publish helpers;
             // its views report their own refresh failures.
             let summaries = await refreshTurnSummariesSnapshot()
-            let runs = await refreshRunsSnapshot() == .refreshed
+            let runs = await refreshRunsSnapshot().outcome == .refreshed
             await refreshHelpersSnapshot()
             await refreshKnowledgeGraphSnapshot()
             return summaries && runs

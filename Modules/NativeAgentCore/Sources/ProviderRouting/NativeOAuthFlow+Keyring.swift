@@ -133,7 +133,7 @@ extension Keyring {
             throw Refusal(code: "permission_denied", message: "Secret \(name) is granted for \(line.isEmpty ? "nowhere" : line), not \(destination). "
                 + "Ask for it again naming \(destination); the card keeps where it already goes and adds this.")
         }
-        guard let renewal = entry.renewal, renewal.expires <= Date().addingTimeInterval(NativeOAuthSupport.renewalMargin) || rejected == entry.value else {
+        guard let renewal = entry.renewal, renewal.expires <= Date().addingTimeInterval(OAuthGrantOperations.renewalMargin) || rejected == entry.value else {
             return (entry.value, rejected.map { $0 != entry.value } ?? false, entry.at)
         }
         let read = entry
@@ -141,7 +141,7 @@ extension Keyring {
         form["client_secret"] = renewal.clientSecret
         var answered: String?
         do {
-            let tokens = try await NativeOAuthSupport.postToken(renewal.token, form, basic: renewal.clientAuth == "basic")
+            let tokens = try await OAuthGrantOperations.postToken(renewal.token, form, basic: renewal.clientAuth == "basic")
             guard let value = tokens["access_token"] as? String, !value.isEmpty else { throw Refusal(code: "not_connected", message: "no access token came back") }
             answered = account(tokens, hiding: [renewal.refreshToken, renewal.clientSecret])
             entry.value = value
@@ -184,7 +184,7 @@ extension Keyring {
     static func renewal(_ tokens: [String: Any], token: String, clientID: String, clientSecret: String?, clientAuth: String?,
                         refreshToken: String?) -> Renewal? {
         guard let refresh = tokens["refresh_token"] as? String ?? refreshToken else { return nil }
-        let seconds = NativeOAuthSupport.seconds(tokens["expires_in"])
+        let seconds = OAuthGrantOperations.seconds(tokens["expires_in"])
         return Renewal(token: token, clientID: clientID, clientSecret: clientSecret, clientAuth: clientAuth, refreshToken: refresh,
                        expires: seconds.map { Date().addingTimeInterval($0) } ?? .distantFuture)
     }
@@ -243,7 +243,7 @@ extension NativeOAuthFlow {
         }
         defer { server.cancel() }
         let redirect = signIn.redirect ?? server.redirectURI.absoluteString
-        let pkce = PKCE.generate(), state = NativeOAuthSupport.randomHex(16)
+        let pkce = PKCE.generate(), state = OAuthGrantOperations.randomHex(16)
         authorize.queryItems = (authorize.queryItems ?? []) + [
             URLQueryItem(name: "client_id", value: signIn.clientID), URLQueryItem(name: "response_type", value: "code"),
             URLQueryItem(name: "redirect_uri", value: redirect), URLQueryItem(name: "state", value: state),
@@ -271,7 +271,7 @@ extension NativeOAuthFlow {
                     "code_verifier": pkce.verifier, "client_id": signIn.clientID]
         form["client_secret"] = clientSecret
         let tokens: [String: Any]
-        do { tokens = try await NativeOAuthSupport.postToken(signIn.token, form, basic: signIn.clientAuth == "basic") }
+        do { tokens = try await OAuthGrantOperations.postToken(signIn.token, form, basic: signIn.clientAuth == "basic") }
         catch { return "oauth_token_exchange_failed: Browser approval finished, but sign-in is incomplete (\(Keyring.exchangeFailure(error))). Inspect sign_in.token and client authentication in app card.request before starting a new sign-in." }
         return await keep(tokens)
     }
@@ -282,11 +282,11 @@ extension NativeOAuthFlow {
     private static func deviceSignIn(_ name: String, _ signIn: InlineInteraction.SecretAsk.SignIn, device: String, client: [String: String],
                                      shown: @MainActor () async -> Void) async throws -> [String: Any] {
         let basic = signIn.clientAuth == "basic"
-        let code = try await NativeOAuthSupport.deviceCode(device, client: client, scopes: signIn.scopes, basic: basic)
+        let code = try await OAuthGrantOperations.deviceCode(device, client: client, scopes: signIn.scopes, basic: basic)
         Keyring.signingIn.withLock { $0[name] = "Enter \(code.userCode) at \(code.verificationURI.absoluteString)" }
         defer { Keyring.signingIn.withLock { $0[name] = nil } }
         _ = NSWorkspace.shared.open(code.verificationURIComplete ?? code.verificationURI)
         await shown()
-        return try await NativeOAuthSupport.deviceToken(code, endpoint: signIn.token, client: client, basic: basic)
+        return try await OAuthGrantOperations.deviceToken(code, endpoint: signIn.token, client: client, basic: basic)
     }
 }

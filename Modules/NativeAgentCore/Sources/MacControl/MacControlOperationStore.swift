@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 #if canImport(CryptoKit)
@@ -122,18 +123,15 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
     }
 
     private let path: URL
-    private let persistence: SwiftNativePersistenceCore
     private let now: @Sendable () -> Date
 
     public init(
         dataRoot: URL,
-        persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore(),
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.path = dataRoot
             .appendingPathComponent("mac_control", isDirectory: true)
             .appendingPathComponent("operations.json")
-        self.persistence = persistence
         self.now = now
     }
 
@@ -370,7 +368,7 @@ public actor MacControlOperationStore: MotorActionReadModelProviding {
     private func mutate<T: Sendable>(
         _ body: @Sendable (inout Snapshot) throws -> T
     ) async throws -> T {
-        try await persistence.withFileLock(path) { [path] in
+        try await SwiftNativePersistenceCore.withFileLock(path) { [path] in
             var snapshot = try await self.load()
             let result = try body(&snapshot)
             let encoded = try JSONEncoder.nativeAgent.encode(snapshot)

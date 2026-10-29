@@ -36,7 +36,7 @@ package enum AgentWorkspaceReadiness {
     /// Remove misleading active controls from every projected surface, including
     /// Mail reply items and generic capability forms. This never grants access;
     /// changes after presentation are still enforced by the actual dispatcher.
-    static func filter(_ projection: AgentWorkspaceProjection) -> AgentWorkspaceProjection {
+    static func filter(_ projection: WorkspacePage) -> WorkspacePage {
         var result = projection
         var hidden = 0
         func buttons(_ buttons: [AgentWorkspaceButton]) -> [AgentWorkspaceButton] {

@@ -5,7 +5,7 @@ import PersistenceCore
 /// Conversation controls retain the navigation owner's selected contact and
 /// conversation. Remote text/locators never choose a recipient or replay a send.
 enum AgentWorkspaceConversation {
-    static func project(input: [String: JSONValue], title: String, result: JSONValue) -> AgentWorkspaceProjection {
+    static func project(input: [String: JSONValue], title: String, result: JSONValue) -> WorkspacePage {
         guard case .string(let agent)? = input["agent"], !agent.isEmpty else {
             return .init(title: title, content: result, items: [], actions: [])
         }
@@ -39,10 +39,10 @@ enum AgentWorkspaceConversation {
             action: .open(.record(tool: "agent_read", input: detail, title: title))))
         // A contact with no saved exchange has nothing to refresh or diagnose.
         // Keep the one useful action rather than offering empty reply readers.
-        if phase == "not_opened" { actions.removeAll() }
+        if ["not_opened", "no_history", "unknown_contact"].contains(phase) { actions.removeAll() }
         var items: [AgentWorkspaceItem] = []
         if case .object(var history)? = content["session_history"] {
-            if let boundary = string(history.removeValue(forKey: "earlier_before")), ContactThread.isMessageID(boundary) {
+            if let boundary = history.removeValue(forKey: "earlier_before")?.stringValue, ContactThread.isMessageID(boundary) {
                 var earlier = latest; earlier["history_before"] = .string(boundary)
                 actions.append(.init(label: "Earlier messages", action: .open(.record(tool: "agent_read", input: earlier, title: title))))
             }
@@ -51,17 +51,16 @@ enum AgentWorkspaceConversation {
             }
             if case .array(let messages)? = history.removeValue(forKey: "messages") {
                 items = messages.compactMap { value in
-                    guard case .object(var message) = value, let id = string(message.removeValue(forKey: "message")),
+                    guard case .object(var message) = value, let id = message.removeValue(forKey: "message")?.stringValue,
                           ContactThread.isMessageID(id) else { return nil }
                     var selected = latest; selected["history_exchange"] = .string(id)
-                    return .init(title: (string(message["from"]) ?? title) + " — " + (string(message["at"]) ?? ""),
+                    return .init(title: (message["from"]?.stringValue ?? title) + " — " + (message["at"]?.stringValue ?? ""),
                         content: .object(message), actions: input["history_exchange"] == .string(id) ? [] : [
                             .init(label: "Read message", action: .open(.record(tool: "agent_read", input: selected, title: title)))
                         ])
                 }
             }
             history.removeValue(forKey: "selected_message")
-            // 2026-09-22: fixed text, the same on every read.
             history.removeValue(forKey: "coverage"); history.removeValue(forKey: "order")
             content["session_history"] = .object(history)
         }
@@ -70,11 +69,11 @@ enum AgentWorkspaceConversation {
         let advanced = ["conversation_id", "message_id", "task_id"].contains { input[$0] != nil }
         let unknown = ["outcome_unknown", "session_unavailable"].contains(phase)
             || content["status"] == .string("outcome_unknown")
-        if !waiting && !unknown && content["can_reply"] != .bool(false) && (!advanced || agent.hasPrefix("bot:")) {
+        if phase != "unknown_contact", !waiting && !unknown && content["can_reply"] != .bool(false) && (!advanced || agent.hasPrefix("bot:")) {
             let conversation: String?
             if case .string(let value)? = input["conversation"] { conversation = value }
             else { conversation = nil }
-            actions.insert(.init(label: phase == "not_opened" ? "Start talking" : "Reply",
+            actions.insert(.init(label: ["not_opened", "no_history"].contains(phase) ? "Start talking" : "Reply",
                 action: .message(agent: agent, conversation: conversation, name: title), needsText: true), at: 0)
         }
         if waiting || needsAttention {
@@ -83,7 +82,7 @@ enum AgentWorkspaceConversation {
                 : "Your conversation is preserved. Check its saved result before sending anything again.")
         }
         if needsAttention && ((content["last_send_needs_authentication"] ?? content["needs_authentication"]) == .bool(true)
-            || ["reconnect_required", "needs_setup", "unavailable", "no_outbound_route"].contains(string(content["status"]) ?? phase)) {
+            || ["reconnect_required", "needs_setup", "unavailable", "no_outbound_route"].contains(content["status"]?.stringValue ?? phase)) {
             actions.append(.init(label: "Check connections", action: .open(.area("connections"))))
         }
         // The same exact selection backs both actions. Diagnostics are one
@@ -119,9 +118,5 @@ enum AgentWorkspaceConversation {
             })
         }
         return .init(title: title, content: .object(content), items: items, actions: actions)
-    }
-
-    private static func string(_ value: JSONValue?) -> String? {
-        guard case .string(let text)? = value else { return nil }; return text
     }
 }

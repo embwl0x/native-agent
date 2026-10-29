@@ -1,4 +1,5 @@
 import Foundation
+import TurnTrace
 import NativeAgentCore
 import PersistenceCore
 import NativeAgentShared
@@ -7,13 +8,7 @@ import NativeAgentShared
 extension TelegramPollLoop {
     // MARK: - Inbound chat attachments
 
-    /// Default cap for an inbound image download. Telegram bot photos top out
-    /// around a few MB, but a user can "send as file" an arbitrarily large
-    /// image document. 10MB mirrors the daemon-era clamp to
-    /// MAX_CHAT_ATTACHMENT_BYTES (the chat-attachment validation ceiling on the
-    /// Mac path): anything larger would download here then be rejected
-    /// downstream as a bad attachment, so the two stages must agree. The poll
-    /// loop refuses a getFile-reported oversize BEFORE any byte transfer.
+    /// Image downloads share the 10 MB chat-attachment ceiling and reject declared oversize before transfer.
     public static let defaultPhotoMaxBytes = 10 * 1024 * 1024
 
     /// Extract a supported chat attachment. Telegram sends a `photo` as a LIST of size variants
@@ -34,9 +29,9 @@ extension TelegramPollLoop {
                       case .string(let fileId)? = obj["file_id"],
                       !fileId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 else { continue }
-                let w = _tgJSONInt(obj["width"]) ?? 0
-                let h = _tgJSONInt(obj["height"]) ?? 0
-                // 2026-09-06: skip malformed dimensions before ranking; overflow must not crash ingress.
+                let w = (obj["width"]?.integerValue.flatMap(Int.init(exactly:)) ?? obj["width"]?.stringValue.flatMap(Int.init)) ?? 0
+                let h = (obj["height"]?.integerValue.flatMap(Int.init(exactly:)) ?? obj["height"]?.stringValue.flatMap(Int.init)) ?? 0
+                // Skip malformed dimensions before ranking; overflow must not crash ingress.
                 guard w >= 0, h >= 0 else { continue }
                 let (px, overflow) = w.multipliedReportingOverflow(by: h)
                 guard !overflow else { continue }
@@ -50,7 +45,7 @@ extension TelegramPollLoop {
                     kind: "photo",
                     fileId: fileId,
                     mimeType: nil,   // photos have no mime; resolved from file_path suffix post-download
-                    sizeBytes: _tgJSONInt(best["file_size"]),
+                    sizeBytes: (best["file_size"]?.integerValue.flatMap(Int.init(exactly:)) ?? best["file_size"]?.stringValue.flatMap(Int.init)),
                     bytes: nil,
                     captureFilename: nil
                 )
@@ -65,10 +60,10 @@ extension TelegramPollLoop {
             let attachment = TelegramMediaAttachment(
                 kind: "document",
                 fileId: fileId,
-                mimeType: _tgJSONString(doc["mime_type"]),
-                sizeBytes: _tgJSONInt(doc["file_size"]),
+                mimeType: doc["mime_type"]?.stringValue,
+                sizeBytes: (doc["file_size"]?.integerValue.flatMap(Int.init(exactly:)) ?? doc["file_size"]?.stringValue.flatMap(Int.init)),
                 bytes: nil,
-                captureFilename: _tgJSONString(doc["file_name"])
+                captureFilename: doc["file_name"]?.stringValue
             )
             if attachment.chatTypeAndMime != nil { return attachment }
         }
@@ -104,7 +99,7 @@ extension TelegramPollLoop {
         )
         let notice = "I can't read that \(kind) in Telegram. Please send an image, PDF, TXT or MD file, or paste the relevant text."
         do {
-            try await sendMessage(token, message.destination, notice)
+            try await Self.defaultSendMessage(token, message.destination, notice)
             await recordReceipt(kind: "attachment_dropped", update: update, message: message,
                                 text: "", reply: notice)
         } catch {
@@ -113,10 +108,8 @@ extension TelegramPollLoop {
         }
     }
 
-    /// Resolve an image mime from the downloaded file's path suffix (Telegram
-    /// `file_path` carries the extension; photos themselves have no mime). Used
-    /// when the descriptor's mimeType is nil (the `photo` list path).
-    static func imageMime(forFilename name: String?, fallbackMime: String?) -> String {
+    /// Prefer an advertised image MIME; otherwise resolve a known filename extension.
+    static func imageMime(forFilename name: String?, fallbackMime: String?) -> String? {
         if let fallbackMime, fallbackMime.lowercased().hasPrefix("image/") {
             return fallbackMime.lowercased()
         }
@@ -128,7 +121,7 @@ extension TelegramPollLoop {
         case "webp": return "image/webp"
         case "bmp": return "image/bmp"
         case "heic": return "image/heic"
-        default: return "image/jpeg"
+        default: return nil
         }
     }
 
@@ -138,47 +131,22 @@ extension TelegramPollLoop {
             : photoMaxBytes
     }
 
-    /// Emit a `telegram.attachment_dropped` trace to traces/events.jsonl when an
-    /// inbound attachment exists but couldn't be processed (download failure,
-    /// oversize, unsupported). Mirrors emitMemoryCommitTrace's shape + the
-    /// shared path-owned cap discipline. The reason is token-redacted so
-    /// the bot token can never leak into a trace; raw image bytes are NEVER
-    /// written (only kind + byteSize + reason). This is the tripwire half — the
-    /// user-visible reply is sent separately by the caller.
+    /// Record attachment refusal with a token-redacted reason and no image bytes.
     func emitAttachmentDroppedTrace(
         kind: String,
         reason: String,
         chatId: Int,
         updateId: Int
     ) async {
-        let tracesPath = dataRoot
-            .appendingPathComponent("traces", isDirectory: true)
-            .appendingPathComponent("events.jsonl")
-        let row: JSONValue = .object([
-            "id": .string(UUID().uuidString.lowercased()),
-            "kind": .string("telegram.attachment_dropped"),
-            "title": .string("telegram_attachment_dropped"),
-            "status": .string("error"),
-            "payload": .object([
+        let event = TurnTraceEvent(kind: "telegram.attachment_dropped",
+            title: "telegram_attachment_dropped", status: "error", payload: .object([
                 "attachmentKind": .string(kind),
-                "reason": .string(Self._tgRedactToken(reason)),
+                "reason": .string(TurnSecretRedactor.redactText(reason)),
                 "chatId": .string(String(chatId)),
                 "updateId": .int(Int64(updateId)),
                 "surface": .string("telegram"),
-            ]),
-            "createdAt": .string(_tgNowString()),
-        ])
-        let persistence = SwiftNativePersistenceCore()
-        do {
-            try await appendPathOwnedJSONL(
-                row, to: tracesPath, using: persistence,
-                logLabel: "TelegramPollLoop.attachmentDropped"
-            )
-        } catch {
-            FileHandle.standardError.write(
-                Data("TelegramPollLoop: telegram.attachment_dropped trace append failed: \(Self._tgRedactToken(String(describing: error)))\n".utf8)
-            )
-        }
+            ]), createdAt: _tgNowString())
+        await TurnTracePersistLane(dataRootOverride: dataRoot).append(event)
     }
 
     /// Build a user-visible attachment refusal. The reason is
@@ -196,7 +164,7 @@ extension TelegramPollLoop {
                 return "attachment_response_malformed: Telegram's download response was malformed. Paste the relevant text in this conversation."
             }
         }
-        let redacted = _tgRedactToken(error.localizedDescription).trimmingCharacters(in: .whitespacesAndNewlines)
+        let redacted = TurnSecretRedactor.redactText(error.localizedDescription).trimmingCharacters(in: .whitespacesAndNewlines)
         return "attachment_download_failed: \(redacted). Check Telegram setup and file access before sending it again."
     }
 }

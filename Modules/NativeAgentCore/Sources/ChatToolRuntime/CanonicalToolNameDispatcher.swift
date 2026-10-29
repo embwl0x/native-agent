@@ -33,27 +33,14 @@ public enum AppDoorReentry {
     @TaskLocal public static var waitForInteraction: (@Sendable (InlineInteraction, String, [String: JSONValue]) async -> JSONValue)?
 }
 
-// MARK: - Dotted-alias canonicalization (outermost)
-
-/// 2026-09-06: the dispatcher's dotted-alias canonicalizer (`save.skill` →
-/// `save_skill`) ran INSIDE `SwiftToolDispatcher.dispatch`, i.e. after every
-/// gate had already judged the spelling the caller supplied. So `save.skill`
-/// matched neither `FileAccessGatedDispatcher`'s blocklist nor a Trust Center
-/// override keyed on `save_skill`, and `tool.catalog` slipped past the bridge
-/// guard's meta-result scrub — while Core still executed `save_skill` /
-/// `tool_catalog`. Canonicalize ONCE, outside every gate, so each gate judges
-/// the name that will actually execute. Idempotent: the inner dispatcher's own
-/// canonicalization then finds nothing left to rewrite. 2026-09-26: the name
-/// comes from the one alias table (`ToolNameAliases`), which also holds the
-/// app's browser/notify/self-admin spellings the Trust Center used to resolve
-/// differently.
-public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked Sendable {
+/// ToolNameAliases canonicalizes names before every gate so policy judges the name that executes.
+public final class CanonicalToolNameDispatcher: ToolDispatchClient {
     private let inner: any ToolDispatchClient
     private let peerDataRoot: URL?
     private let conversationScope: String?
 
     public init(inner: any ToolDispatchClient, peerDataRoot: URL? = nil,
-                builtInLanes: (any BuiltInAgentLaneProviding)? = nil, conversationScope: String? = nil) {
+                conversationScope: String? = nil) {
         self.inner = inner
         self.peerDataRoot = peerDataRoot
         self.conversationScope = conversationScope
@@ -165,8 +152,8 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
         if Self.canonical(tool) == "workspace" {
             guard let root = peerDataRoot,
                   let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope, !scope.isEmpty else {
-                throw ToolFailureError("Workspace needs a transport-bound chat session. No action was performed. Call app {} from a chat turn's tool chain; creating a transcript or supplying __session_id cannot bind this caller.",
-                    argumentPath: "context", accepted: "a chat turn's verified tool chain", effects: .none,
+                throw ToolFailureError("Workspace needs a runtime-bound originating door. No action was performed. Call app {} through a verified turn or native owner's door; creating a transcript or supplying __session_id cannot bind this caller.",
+                    argumentPath: "context", accepted: "a verified turn or native owner's tool chain", effects: .none,
                     nextCall: ToolFailureError.call("app"))
             }
             // Admission to the facade is checked first. Each selected read or
@@ -199,9 +186,7 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
         var input = try namingSavedContact(tool, input)
         if ["read_page", "browser.chrome_navigate", "browser_chrome_navigate"].contains(Self.canonical(tool)),
            case .string(let url)? = input["url"] { input["url"] = .string(SwiftToolDispatcher.withWebScheme(url)) }
-        // Agent 09-24: "agent_message connects if needed and hands back the
-        // thread, so it's one call." A known agent that is not a contact yet
-        // is connected first, through agent_connect's own gates and card.
+        // Known hosts connect through agent_connect's gates and card before messaging.
         if tool == "agent_message", !HelperContact.matches(input), PersonInitiatedSend.current == nil, !AgentRecipeStore.dryRun,
            case .string(let name)? = input["agent"], !name.contains(":"),
            let row = AgentHostDirectory.row(named: name), let root = peerDataRoot,
@@ -216,13 +201,9 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
                 try await self.dispatchExact(tool: tool, input: input, surface: surface)
             }
         }
-        // `wait` on a contact watches its conversation, not the screen (walk
-        // 09-25: waiting on OMP was refused as "my own app"). It reads nothing
-        // itself; what it returns is agent_read's, through agent_read's gates.
-        // agent_read's own wait_seconds is the same wait, with no Full Mac
-        // gate in front of it (09-26: `wait` is a Full Mac read tool).
-        // Models fill optional fields with "" (Maps walk 09-26: a screen wait
-        // with agent "" was refused as "Name the contact"): blank is absent.
+        // Contact waits return conversation reads through agent_read's gates;
+        // wait_seconds adds no Full Mac gate. Screen waits retain wait's admission.
+        // Blank optional contact selectors are absent.
         func blank(_ value: JSONValue) -> Bool {
             if case .string(let text) = value { return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             return value == .null
@@ -242,7 +223,9 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
                                    accepted: "app {action:\"agent.read\",args:{agent:\"<contact>\",wait_seconds:60}}", effects: .none)
         }
         if (Self.canonical(tool) == "wait" && input["agent"] != nil) || waitsOnRead {
-            guard let root = peerDataRoot, let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope, !scope.isEmpty else {
+            guard let root = peerDataRoot,
+                  let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope
+                    ?? (waitsOnRead ? Self.contactSession(input, dataRoot: root) : nil), !scope.isEmpty else {
                 if waitsOnRead { throw AgentConversationStore.Failure(message: "wait_seconds needs this chat's conversation, which this call does not have. Nothing was read.") }
                 return try await dispatchExact(tool: tool, input: input, surface: surface)
             }
@@ -252,10 +235,13 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
                 try await self.dispatchNormalized(tool: tool, input: input, surface: surface)
             }
         }
-        // A repair's dry run is no exchange of hers: no thread, no record.
+        // A repair's dry run is no exchange of hers: no thread, no record. A
+        // call no chat carries (a scheduled Workshop step) goes on in the
+        // contact's own session, where her side of that conversation lives.
         if !AgentConversationContext.isInternalRead, !AgentRecipeStore.dryRun,
            ["agent_message", "agent_read", "agent_cancel"].contains(tool), let root = peerDataRoot,
-           let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope, !scope.isEmpty {
+           let scope = ChatToolSessionContext.verifiedSessionId ?? conversationScope ?? Self.contactSession(input, dataRoot: root),
+           !scope.isEmpty {
             return try await AgentConversationSession.dispatch(tool: tool, input: input, surface: surface,
                 scope: scope, dataRoot: root) { tool, input in
                     try await AgentConversationContext.$isInternalRead.withValue(true) {
@@ -264,6 +250,13 @@ public final class CanonicalToolNameDispatcher: ToolDispatchClient, @unchecked S
                 }
         }
         return try await dispatchExact(tool: tool, input: input, surface: surface)
+    }
+
+    /// The saved contact's own session (`ContactThread.session`); nil for anything else.
+    private static func contactSession(_ input: [String: JSONValue], dataRoot: URL) -> String? {
+        guard case .string(let named)? = input["agent"] else { return nil }
+        let agent = AgentConversationDelivery.door(for: named, dataRoot: dataRoot)?.agent ?? named
+        return agent.hasPrefix("peer:") ? ContactThread.session(owner: String(agent.dropFirst(5))) : nil
     }
 
     /// Connect by name, then send the message to the saved contact in the same
@@ -341,10 +334,7 @@ extension ApprovedChatToolReplay {
         input: [String: JSONValue],
         verifiedSessionID: String?
     ) -> Bool {
-        // 2026-09-06: the executor builds this from the PERSISTED tool name
-        // (`save.skill`), and the outer canonicalizer rewrites the dispatched
-        // name (`save_skill`) before this comparison — a pre-upgrade dotted
-        // approval was consumed and then rejected. Compare canonical names.
+        // Compare canonical names for both persisted approvals and dispatched calls.
         !approvalID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && CanonicalToolNameDispatcher.canonical(self.tool)
                 == CanonicalToolNameDispatcher.canonical(tool)

@@ -25,74 +25,21 @@ import ToolRegistry
 import Transcripts
 import StandingBots
 import ChatTurnContracts
-// Blueprint: | `EngineDeviceSync+Snapshots.swift` | Phone snapshot/action adapter over engine owners: retained Desk board/overview and checked inbox/approval lanes, connectors through `engine.connectors`, persona through `engine.persona` (PersonaFacade), runs through `engine.runs`, skill inventory through engine.tools; shared transcript/card/navigation, other-room exchange and live layout projections; conversation rows carry engine classification and assistant rows carry persisted tool evidence; Trust serialization delegates to `engine.trust.snapshotData`; proposal first_seen/last_seen/staged_at project createdAt and resolved_at is unset; signed incoming-turn delivery and handoff ordering; approvals carry the selected Mac turn ID for transcript anchoring; native presentation and cross-area assembly through ports |
+// Blueprint: | `EngineDeviceSync+Snapshots.swift` | Phone snapshot/action adapter; remote Mac control translates through engine Trust and the platform native route; engine owners: retained Desk board/overview and checked inbox/approval lanes, connectors through `engine.connectors`, persona through `engine.persona` (PersonaFacade), runs through `engine.runs`, skill inventory through engine.tools; shared transcript/card/navigation, other-room exchange and live layout projections; conversation rows carry engine classification and assistant rows carry persisted tool evidence; Trust serialization delegates to `engine.trust.snapshotData`; proposal first_seen/last_seen/staged_at project createdAt and resolved_at is unset; signed incoming-turn delivery and handoff ordering; approvals carry the selected Mac turn ID for transcript anchoring; native presentation and cross-area assembly through ports |
 
 // The phone's memory_proposals.json row. Mac views read ProposalRecord.
 // Legacy wire timestamps: first_seen, last_seen and staged_at all project
 // createdAt; resolved_at is unset. They are not independent historical facts.
-public struct MemoryProposalRecord: Codable, Identifiable, Hashable, Sendable {
-    public var proposal_id: String
-    public var fact_text: String
-    public var display_text: String?
-    public var supporting_session_ids: [String]
-    public var recurrence_count: Int
-    public var first_seen: String
-    public var last_seen: String
-    public var status: String
-    public var staged_at: String
-    public var resolved_at: String?
-    public var rejection_reason: String?
-    public var id: String { proposal_id }
-
+extension MemoryProposalRecord {
     public init(_ proposal: ProposalRecord) {
-        let evidence = proposal.evidence
-        proposal_id = proposal.id
-        fact_text = proposal.content
-        display_text = nil
-        supporting_session_ids = evidence.sessionIDs
-        recurrence_count = evidence.recurrenceCount
-        first_seen = proposal.createdAt
-        last_seen = proposal.createdAt
-        status = proposal.status
-        staged_at = proposal.createdAt
-        resolved_at = nil
-        rejection_reason = proposal.rejectionReason
+        self.init(id: proposal.id, text: proposal.content,
+                  supportingSessionIds: proposal.evidence.sessionIDs,
+                  recurrenceCount: proposal.evidence.recurrenceCount, status: proposal.status,
+                  createdAt: proposal.createdAt, rejectionReason: proposal.rejectionReason)
     }
 }
 
-private struct MobileTranscriptToolEvent: Encodable, Sendable {
-    let name: String
-    let seq: Int
-    let activity: String
-    let outcome: String?
-    let resultDetail: String?
-}
-
-private struct MobileCardTranscriptMessage: DeviceSyncTranscriptMessage, Sendable {
-    var message: NativeAppChatMessage
-    var interactionJSON: String? = nil
-    var interactionDescriptorJSON: String? = nil
-    var interactionSessionID: String? = nil
-    var toolEvents: [MobileTranscriptToolEvent] = []
-    var id: String { message.id }
-    var createdAt: String { message.createdAt }
-    var content: String {
-        get { message.content }
-        set { message.content = newValue }
-    }
-    mutating func omitAttachmentPreviews() { message.omitAttachmentPreviews() }
-    private enum CodingKeys: String, CodingKey { case interactionJSON, interactionDescriptorJSON, interactionSessionID, toolEvents }
-    func encode(to encoder: Encoder) throws {
-        try message.encode(to: encoder)
-        var fields = encoder.container(keyedBy: CodingKeys.self)
-        try fields.encodeIfPresent(interactionJSON, forKey: .interactionJSON)
-        try fields.encodeIfPresent(interactionDescriptorJSON, forKey: .interactionDescriptorJSON)
-        try fields.encodeIfPresent(interactionSessionID, forKey: .interactionSessionID)
-        if !toolEvents.isEmpty { try fields.encode(toolEvents, forKey: .toolEvents) }
-    }
-}
-
-public enum MobileToolCatalogProjection {
+public enum MobileToolCatalog {
     public static func records(from catalog: ChatToolCatalogSnapshot) -> [MobileToolCatalogRecord] {
         catalog.tools.map { tool in
             MobileToolCatalogRecord(
@@ -137,12 +84,12 @@ extension NAProviderCatalogProvider {
 }
 
 extension NativeAgentEngine {
-    public func mobileChatMessages(sessionId: String) async throws -> [any DeviceSyncTranscriptMessage & Sendable] {
+    public func mobileChatMessages(sessionId: String) async throws -> [ChatMessageRecord] {
         let projection = try await transcripts.loadTranscript(sessionId: sessionId, cached: true)
         let cards = projection.cardsByRow
-        var result: [any DeviceSyncTranscriptMessage & Sendable] = []
+        var result: [ChatMessageRecord] = []
         let messages = projection.messages
-        var toolsByRun: [String: [MobileTranscriptToolEvent]] = [:]
+        var toolsByRun: [String: [ToolEvent]] = [:]
         let lastReplyByRun = Dictionary(messages.filter { $0.role == "assistant" }.compactMap { row in
             row.runId.map { ($0, row.id) }
         }, uniquingKeysWith: { _, last in last })
@@ -153,7 +100,7 @@ extension NativeAgentEngine {
                 let outcome = output.map { ChatToolOutcome.recordedResultClass($0) ?? ChatToolOutcome.exactResultClass($0) }?.rawValue ?? "unknown"
                 let detail = output.map { [ChatToolOutcome.explanation($0), ChatToolOutcome.remedy($0)].compactMap { $0 }.joined(separator: " · ") }
                 let seq = toolsByRun[run, default: []].count + 1
-                toolsByRun[run, default: []].append(MobileTranscriptToolEvent(name: name,
+                toolsByRun[run, default: []].append(ToolEvent(name: name,
                     seq: seq,
                     activity: ToolActivityPresentation.finished(name, outcome: outcome, detail: detail),
                     outcome: outcome, resultDetail: detail))
@@ -161,18 +108,20 @@ extension NativeAgentEngine {
         }
         for message in messages {
             let events = message.runId.flatMap { lastReplyByRun[$0] == message.id ? toolsByRun[$0] : nil } ?? []
+            var row = ChatMessageRecord(id: message.id, sessionId: message.sessionId, role: message.role,
+                content: message.content, createdAt: message.createdAt, runId: message.runId,
+                source: message.source, metadata: message.metadata, isPersonVisible: !message.isHerOwnTurnInput)
+            row.toolEvents = events.isEmpty ? nil : events
             if let projected = cards[message.id]?.first {
                 var card = projected.interaction
                 card.continuation = nil
                 let encoder = JSONEncoder()
                 encoder.dateEncodingStrategy = .iso8601
-                result.append(MobileCardTranscriptMessage(message: message,
-                    interactionJSON: String(decoding: try encoder.encode(card), as: UTF8.self),
-                    interactionDescriptorJSON: String(decoding: try encoder.encode(projected.descriptor), as: UTF8.self),
-                    interactionSessionID: projected.sessionID, toolEvents: events))
-            } else if !events.isEmpty {
-                result.append(MobileCardTranscriptMessage(message: message, toolEvents: events))
-            } else { result.append(message) }
+                row.interactionJSON = String(decoding: try encoder.encode(card), as: UTF8.self)
+                row.interactionDescriptorJSON = String(decoding: try encoder.encode(projected.descriptor), as: UTF8.self)
+                row.interactionSessionID = projected.sessionID
+            }
+            result.append(row)
         }
         return result
     }
@@ -221,16 +170,16 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
         try await engine.ports.macIntegration.schedulerCreateJob(input: input)
     }
 
-    public func getWorkshopExecutions() async throws -> DeviceSyncSnapshotRows { try await engine.desk.taskRows() }
     public func workOverview() async -> (
         overview: WorkOverview, deskItems: [DeskItem]?,
-        approvals: Result<[ApprovalRequest], Error>, inbox: Result<[InboxItemRecord], Error>
+        approvals: Result<[ApprovalRequest], Error>, inbox: Result<[InboxItemRecord], Error>,
+        executions: Result<[WorkshopTaskRecord], Error>
     ) {
         let board = await engine.desk.refreshPage().board!
         let lifecycles = await engine.turns.lifecycleBySession
         let approvals = board.approvals.map { records in
             let links = Dictionary(uniqueKeysWithValues: lifecycles.values.compactMap { state -> (String, String)? in
-                guard let approval = MacChatTurnCardProjection.approval(
+                guard let approval = TurnCardReadout.approval(
                     for: state, approvals: records,
                     parseTimestamp: UserDisplayFormatters.parseISOTimestamp
                 ) else { return nil }
@@ -242,13 +191,24 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
                 return row
             }
         }
-        return (board.overview!, board.deskState?.items,
-            approvals, board.inbox)
+        let executions: Result<[WorkshopTaskRecord], Error> = board.executions.unavailableReason.map {
+            .failure(NSError(domain: "Workshop", code: 1, userInfo: [NSLocalizedDescriptionKey: $0]))
+        } ?? .success(board.executions.items.map { row in
+            WorkshopTaskRecord(id: row.id, title: row.title, objective: row.objective,
+                status: row.status, phase: row.status, createdAt: row.createdAt,
+                updatedAt: row.updatedAt, currentStepId: row.currentStepId,
+                deskHandle: row.deskHandle.flatMap { $0.isEmpty ? nil : $0 },
+                projectSpaceId: row.projectSpaceId.flatMap { $0.isEmpty ? nil : $0 },
+                lastMovementAt: row.lastMovementAt,
+                requiresApproval: WorkOverviewRead.requiresApproval(status: row.status))
+        })
+        return (board.overview!, board.deskState?.items, approvals, board.inbox, executions)
     }
     public func getChatSessions() async throws -> [NativeAgentShared.ChatSession] { try await engine.transcripts.list() }
+    public func getChatTranscriptGenerations() async throws -> [String: Int?] { try await engine.transcripts.transcriptGenerations() }
     @MainActor public func sessionNavigation(for sessions: [NativeAgentShared.ChatSession]) -> ChatSessionNavigation { engine.transcripts.navigation(for: sessions) }
     @MainActor public func surfaceLayout() -> SurfaceLayout { engine.layout.layout }
-    public func getChatMessages(sessionId: String) async throws -> [any DeviceSyncTranscriptMessage & Sendable] {
+    public func getChatMessages(sessionId: String) async throws -> [ChatMessageRecord] {
         try await engine.mobileChatMessages(sessionId: sessionId)
     }
     public func getOtherRoomExchanges() async throws -> [OtherRoomExchange] {
@@ -256,15 +216,15 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
     }
     public func getHealth() async throws -> RuntimeHealth { engine.doctor.readHealth() }
     public func pendingMemoryProposals() async throws -> DeviceSyncSnapshotRows {
-        platform.memoryProposalRows(try await engine.memory.proposals(status: "pending"))
+        (try await engine.memory.proposals(status: "pending")).map(MemoryProposalRecord.init)
     }
     public func getSkills() async throws -> DeviceSyncSnapshotRows { try await engine.tools.refreshSkills() }
     public func activeMemories() async throws -> [MemoryV2.MemoryRecord] { try await engine.memory.activeMemories() }
-    public func getConnectors() async throws -> DeviceSyncSnapshotRows { try await engine.connectors.mobileConnectors(canToggle: platform.connectorCanToggle) }
+    public func getConnectors() async throws -> [MobileConnectorSnapshot] { try await engine.connectors.mobileConnectors() }
     public func mobileToolCatalog() async throws -> [MobileToolCatalogRecord] {
-        MobileToolCatalogProjection.records(from: try await engine.tools.loadCatalog())
+        MobileToolCatalog.records(from: try await engine.tools.loadCatalog())
     }
-    public func providers() async throws -> DeviceSyncSnapshotRows { try await engine.providers.list() }
+    public func providers() async throws -> (providers: DeviceSyncSnapshotRows, routing: ProviderRoutingSnapshot) { try await engine.providers.list() }
     public func providerCatalogSnapshot() async throws -> (providers: [NAProviderCatalogProvider], routing: ProviderRoutingSnapshot) {
         try await engine.mobileProviderCatalogSnapshot()
     }
@@ -275,20 +235,17 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
     public func getPersonality() async throws -> PersonalityProfile {
         try await engine.persona.loadProfile()
     }
-    public func knowledgeGraphSnapshotData() async throws -> Data { try await KnowledgeGraphReadProjection.canonicalKnowledgeGraphSnapshotData() }
+    public func knowledgeGraphSnapshotData() async throws -> Data { try await AgentGraphReads.canonicalKnowledgeGraphSnapshotData() }
     public func getRunsStrict() async -> [RunRecord]? { try? await engine.runs.refresh(dataRoot: engine.dataRoot) }
     public func submitWorkshopExecution(title: String, objective: String) async throws -> DeviceSyncWorkshopSubmission {
-        let result = try await platform.submitDeskTask(title: title, objective: objective)
+        let result = try await NativeAgentEngine.submitDeskTask(title: title, objective: objective)
         return DeviceSyncWorkshopSubmission(executionId: result.executionId, id: result.executionId,
                                             desk_handle: result.deskItem.handle, desk_alias: result.deskItem.alias)
     }
-    public func approveStep(executionId: String, stepId: String, provenance: ApprovalResolutionProvenance) async throws {
-        _ = try await platform.resolveWorkshopStep(
-            executionId: executionId, stepId: stepId, decision: "approve", provenance: provenance)
-    }
-    public func rejectStep(executionId: String, stepId: String, provenance: ApprovalResolutionProvenance) async throws {
-        _ = try await platform.resolveWorkshopStep(
-            executionId: executionId, stepId: stepId, decision: "reject", provenance: provenance)
+    public func resolveWorkshopStep(executionId: String, stepId: String, decision: String, provenance: ApprovalResolutionProvenance) async throws {
+        _ = try await engine.ports.backgroundWork.approvals.resolveWorkshopStep(
+            executionId: executionId, stepId: stepId, decision: decision, provenance: provenance,
+            runner: NativeAgentEngine.makeWorkshopExecutionRunner())
     }
     public func acceptMemoryProposal(proposalID: String) async throws -> MemoryV2.MemoryRecord {
         try await engine.memory.accept(proposalID: proposalID)
@@ -298,7 +255,7 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
     }
     public func deleteMemory(id: String) async throws { try await engine.memory.delete(id: id) }
     public func resolveApproval(id: String, decision: String, provenance: ApprovalResolutionProvenance) async throws -> ApprovalRecord {
-        try await platform.resolveApproval(id: id, decision: decision, provenance: provenance)
+        try await engine.ports.backgroundWork.approvals.resolveApproval(id: id, decision: decision, provenance: provenance)
     }
     public func inboxAction(_ id: String, action: String) async throws {
         try await platform.inboxAction(id, action: action)
@@ -319,24 +276,90 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
     public func setActiveProvider(surface: String, providerId: String) async throws {
         try await engine.providers.routing.setActiveProvider(surface: surface, providerId: providerId)
     }
-    public func configureModel(surface: String, model: String, reasoningEffort: String, serviceTier: String?, inferProvider: Bool) async throws {
-        _ = try await engine.providers.saveSurfaceSelection(
-            surface: surface, model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier,
-            providerID: inferProvider ? SwiftNativeProviderRouting.inferredProviderID(forModel: model) : nil)
-    }
-    public func setSurfaceModel(surface: String, model: String, inferProvider: Bool) async throws {
-        _ = try await engine.providers.saveSurfaceSelection(
-            surface: surface, model: model, reasoningEffort: nil, serviceTier: nil,
-            providerID: inferProvider ? SwiftNativeProviderRouting.inferredProviderID(forModel: model) : nil)
-    }
-    public func configureSurfaceSelection(surface: String, providerID: String, model: String, reasoningEffort: String, serviceTier: String?) async throws {
-        _ = try await engine.providers.saveSurfaceSelection(
+    public func saveSurfaceSelection(surface: String, model: String, reasoningEffort: String?, serviceTier: String?, providerID: String?) async throws -> ProviderRoutingSnapshot {
+        try await engine.providers.saveSurfaceSelection(
             surface: surface, model: model, reasoningEffort: reasoningEffort, serviceTier: serviceTier, providerID: providerID)
     }
     @MainActor public func pinnedChatSessionIDs() -> [String] { engine.transcripts.pinnedSessionIDs }
     @MainActor public func savePinnedChatSessionIDs(_ ids: [String]) throws { _ = try engine.transcripts.savePinnedSessionIDs(ids) }
+    @MainActor
     public func remoteMacControl(payload: [String: String]) async throws -> [String: String] {
-        try await MacSyncRemoteMacControl(port: EngineRemoteMacControlPort(engine: engine, platform: platform)).dispatch(payload: payload)
+        let method = payload["method"] ?? ""
+        guard let action = PhoneMacControlAction.resolve(payload) else {
+            return ["status": "error", "message": "Unknown mac_control method: \(method)"]
+        }
+        if Set(["runShell", "readFile", "writeFile", "listDirectory", "moveFile", "trashFile"]).contains(method) {
+            guard let policy = try? await engine.trust.load(),
+                  policy.macControlPolicy?.remoteFromIosAllowed == true,
+                  policy.filePolicy?.outsideWorkspaceDefault == "allow"
+                    || policy.permissionLevel == "full_mac_os"
+                    || policy.permissionLevel == "wide_open_receipts" else {
+                return [
+                    "status": "error",
+                    "message": "\(method) requires Full Mac access with iOS remote enabled on the Mac.",
+                ]
+            }
+        }
+
+        var body: [String: Any] = ["trigger": "ios"]
+        for (key, value) in payload where key != "method" && key != "trigger" {
+            body[key] = value
+        }
+        if action == .volume {
+            guard let level = payload["value"].flatMap(Int.init), (0...100).contains(level) else {
+                return ["status": "error", "message": "Volume must be between 0% and 100%."]
+            }
+            body.removeValue(forKey: "action")
+            body.removeValue(forKey: "value")
+            body["level"] = level
+        }
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+        let receipt = try await platform.runMacControl(path: action.path, bodyData: bodyData)
+        let result = receipt.foundationObject as? [String: Any] ?? [:]
+
+        let nestedOutput = result["output"] as? [String: Any]
+        func responseValue(_ key: String) -> Any? {
+            result[key] ?? nestedOutput?[key]
+        }
+
+        var passthrough: [String: String] = [:]
+        for (key, value) in result where !(value is NSNull) {
+            if let string = value as? String {
+                passthrough[key] = string
+            } else {
+                passthrough[key] = "\(value)"
+            }
+        }
+        if let nestedOutput {
+            for (key, value) in nestedOutput where passthrough[key] == nil && !(value is NSNull) {
+                if let string = value as? String {
+                    passthrough[key] = string
+                } else {
+                    passthrough[key] = "\(value)"
+                }
+            }
+        }
+
+        passthrough["status"] = (responseValue("status") as? String) ?? passthrough["status"] ?? "ok"
+        passthrough["result_class"] = ChatToolOutcome.exactResultClass(receipt).rawValue
+
+        let resultText: String
+        if (responseValue("output_kind") as? String) == "binary_data" {
+            resultText = (responseValue("stdout") as? String) ?? "<binary output>"
+        } else if let content = responseValue("content") as? String {
+            resultText = content
+        } else if let stdout = responseValue("stdout") as? String, !stdout.isEmpty {
+            resultText = stdout
+        } else if let stderr = responseValue("stderr") as? String, !stderr.isEmpty {
+            resultText = stderr
+        } else if let nestedOutput {
+            // Structured readers consume the output JSON without losing its keys.
+            resultText = String(decoding: try JSONSerialization.data(withJSONObject: nestedOutput, options: [.sortedKeys]), as: UTF8.self)
+        } else {
+            resultText = (responseValue("error") as? String) ?? ""
+        }
+        passthrough["result"] = resultText
+        return passthrough
     }
 
     public func knockNeedsUser(title: String, body: String, userInfo: [String: String]) async throws {
@@ -362,30 +385,12 @@ public struct EngineDeviceSyncHost: DeviceSyncHost {
 }
 
 public protocol EngineDeviceSyncPlatform: Sendable {
-    var connectorStatus: any ConnectorStatusPlatform { get }
-    func connectorCanToggle(_ row: ConnectorRecord) -> Bool
-    func memoryProposalRows(_ rows: [ProposalRecord]) -> DeviceSyncSnapshotRows
-    func restartTelegram() async -> Bool
     @MainActor func settingsHost() throws -> any QuietSettingsHost
     @MainActor var oauthPlatform: any NativeOAuthPlatformPort.Type { get }
     @MainActor func adoptProvider(_ id: String) async
-    func submitDeskTask(title: String, objective: String) async throws -> WorkshopDirectedTaskResult
-    func resolveWorkshopStep(executionId: String, stepId: String, decision: String, provenance: ApprovalResolutionProvenance) async throws -> WorkshopExecution.WorkshopExecutionRecord
-    func resolveApproval(id: String, decision: String, provenance: ApprovalResolutionProvenance) async throws -> ApprovalRecord
     func inboxAction(_ id: String, action: String) async throws
     @MainActor func interactionAction(payload: [String: String], actionID: String, clientID: String) async throws -> [String: String]
-    @MainActor func runMacControl(path: String, bodyData: Data) async throws -> MacControlRunResult
-}
-
-@MainActor
-private struct EngineRemoteMacControlPort: MacSyncRemoteMacControlPort {
-    let engine: NativeAgentEngine
-    let platform: any EngineDeviceSyncPlatform
-    func loadTrustPolicy() async throws -> TrustPolicy { try await engine.trust.load() }
-    func run(path: String, bodyData: Data) async throws -> MacSyncRemoteMacControlResult {
-        let result = try await platform.runMacControl(path: path, bodyData: bodyData)
-        return MacSyncRemoteMacControlResult(statusCode: result.statusCode, json: result.json, rawData: result.rawData)
-    }
+    @MainActor func runMacControl(path: String, bodyData: Data) async throws -> JSONValue
 }
 
 extension EngineDeviceSyncHost {
@@ -419,12 +424,12 @@ extension EngineDeviceSyncHost {
 extension EngineDeviceSyncHost {
     public func telegramSnapshot() async throws -> MobileTelegramSnapshot {
         try await TelegramFacade(dataRoot: engine.dataRoot).mobileTelegramSnapshot(
-            manager: BackgroundLoops.BackgroundLoopsManager.shared)
+            manager: BackgroundLoops.BackgroundLoopLifetimes.shared)
     }
 
-    public func changeTelegram(_ change: MobileTelegramChange) async throws -> MobileTelegramSnapshot {
-        try await TelegramFacade(dataRoot: engine.dataRoot).changeTelegramSettings(change) {
-            await platform.restartTelegram()
+    public func disconnectTelegram() async throws -> MobileTelegramSnapshot {
+        try await TelegramFacade(dataRoot: engine.dataRoot).disconnectTelegram {
+            await NativeAgentEngine.restartBackgroundLoop(id: "telegram_poll").didRestart
         }
         return try await telegramSnapshot()
     }
@@ -434,9 +439,9 @@ extension EngineDeviceSyncHost {
     public func applyMobileTrustAction(_ request: MobileTrustAction) async throws -> Data {
         let root = engine.dataRoot
         let saved = try await request.apply(dataRoot: root) { preset, confirmed in
-            try await TrustPolicyPreset.saveMobilePreset(preset, dataRoot: root, fullMacConfirmed: confirmed)
+            try await preset.save(dataRoot: root, fullMacConfirmed: confirmed)
         }
-        await MainActor.run { engine.trust.publishPolicy(saved) }
+        await engine.trust.publishPolicy(saved)
         return try await trustSnapshotData()
     }
 }
@@ -465,10 +470,10 @@ extension EngineDeviceSyncHost {
 
 extension EngineDeviceSyncHost {
     public func setConnectorEnabled(id: String, enabled: Bool) async throws -> DeviceSyncSnapshotRows {
-        try await engine.connectors.setMobileConnectorEnabled(id: id, enabled: enabled, canToggle: platform.connectorCanToggle)
+        try await engine.connectors.setMobileConnectorEnabled(id: id, enabled: enabled)
     }
     public func disconnectConnector(id: String) async throws -> DeviceSyncSnapshotRows {
-        try await engine.connectors.disconnectMobileConnector(id: id, canToggle: platform.connectorCanToggle)
+        try await engine.connectors.disconnectMobileConnector(id: id)
     }
 }
 
@@ -515,34 +520,12 @@ public struct EngineICloudIncomingTurnPort: ICloudIncomingTurnPort {
     }
 
     public func helperReply(message: String, sessionID: String, attachments: [NativeAgentShared.MultimodalAttachment], fileAccess: String,
-                            progress: ChatOrchestrationProgressHandler?) async throws -> ChatResponse {
-        guard let id = UUID(uuidString: String(sessionID.dropFirst(4))) else { throw BotRunnerError.cannotRun("invalid helper session id") }
+                            progress: TurnEventSink?) async throws -> ChatResponse {
+        guard let id = BotDefinition.id(forSession: sessionID) else { throw BotRunnerError.cannotRun("invalid helper session id") }
         let bot = try BotDefinitionStore(dataRoot: engine.dataRoot).get(id)
         let reply = try await engine.standingBotSession(admitted: true, attachments: attachments, fileAccess: fileAccess, progress: progress)(bot, message)
         return StandingBotContinuity.response(reply, sessionID: sessionID,
             runID: ChatPersistenceContext.pinnedTurnRunID ?? UUID().uuidString)
-    }
-
-    public func publishReply(text: String, sessionID: String?, correlationID: String,
-                      metadata: [String: String], attachments: [NativeAgentShared.MultimodalAttachment]) async throws -> BridgeMessage {
-        try await engine.deviceSync!.bridge.sendChatMessage(
-            text: text, sessionID: sessionID, correlationID: correlationID,
-            metadata: metadata, attachments: attachments
-        )
-    }
-
-    public func publishProgress(text: String, sessionID: String, correlationID: String,
-                         metadata: [String: String], key: String, mirrorKey: String?) async -> Bool {
-        await engine.deviceSync!.bridge.sendKVSChatProgress(
-            text: text, sessionID: sessionID, correlationID: correlationID,
-            metadata: metadata, key: key, mirrorKey: mirrorKey
-        )
-    }
-
-    public func sendICloudReplyPushNotification(text: String, sessionID: String?, correlationID: String, kind: String) async {
-        await engine.deviceSync!.relay.sendICloudReplyPushNotification(
-            text: text, sessionID: sessionID, correlationID: correlationID, kind: kind
-        )
     }
 
     public func received(in sessionID: String) {
@@ -551,11 +534,6 @@ public struct EngineICloudIncomingTurnPort: ICloudIncomingTurnPort {
 
     public func completed(sessionID: String?) {
         NotificationCenter.default.post(name: .chatTurnCompleted, object: sessionID)
-    }
-
-    public func signatureVerified(_ message: BridgeMessage) -> Bool {
-        (try? PairingSecretManager.loadOrGenerateSecret())
-            .map { message.verifySignature(secret: $0) } ?? false
     }
 
     public func controlHandoffGeneration(sessionID: String) -> Int {
@@ -600,19 +578,5 @@ public struct EngineICloudIncomingTurnPort: ICloudIncomingTurnPort {
             if let runID { _ = sync.engine.cancelActiveChatTask(for: sessionID, runIDs: [runID]) }
         }
         return UserMessageIntentSignals.controlHandoffReply(lastActivity: activity)
-    }
-
-    public func registerActiveChatTask(_ task: Task<(text: String, deltaSeq: Int, error: String?, toolEvents: Int), Never>,
-                                for sessionID: String, runID: String) {
-        engine.deviceSync!.engine.registerActiveChatTask(task, for: sessionID, runID: runID)
-    }
-
-    public func unregisterActiveChatTask(for sessionID: String,
-                                  expecting task: Task<(text: String, deltaSeq: Int, error: String?, toolEvents: Int), Never>) {
-        engine.deviceSync!.engine.unregisterActiveChatTask(for: sessionID, expecting: task)
-    }
-
-    public func requestChatSnapshotPublication(includeTranscripts: Bool) {
-        engine.deviceSync!.engine.requestChatSnapshotPublication(includeTranscripts: includeTranscripts)
     }
 }

@@ -7,24 +7,14 @@ import Observation
 import os
 // Blueprint: | `MultimodalTTS+VoiceSelection.swift` | voice authority/routing, native/cloud playback, generations/cancellation; `VoicePreference`: `quiet`, `name`; auto-read decision |
 
-public enum VoiceOutputMode: String, CaseIterable, Identifiable {
-    case local = "local"
-    case openai = "openai"
-    public var id: String { rawValue }
-}
-
-/// The selected playback route, or why it could not be read. An unreadable
-/// Trust policy reads nothing aloud — it no longer falls back to the Mac voice
-/// behind a notice (S12, 2026-09-26).
+/// An unreadable Trust policy prevents read-aloud and reports why.
 public enum VoiceOutputModeResolution: Equatable {
     case openAI
     case localConfigured
     case policyUnreadable(reason: String)
 }
 
-/// Read-aloud has one selection owner: the loaded Trust Center policy.  The
-/// old `voiceUseOpenAI` AppStorage mirror could outlive a denied policy write,
-/// leaving the settings screen and either chat read site on different modes.
+/// Read-aloud has one selection owner: the loaded Trust Center policy.
 public enum VoiceOutputModeSelection {
     public static func resolve(for trustPolicy: TrustPolicy) -> VoiceOutputModeResolution {
         trustPolicy.multimodalPolicy?.tts_openai == true ? .openAI : .localConfigured
@@ -50,25 +40,13 @@ public enum VoiceOutputModeSelection {
 }
 
 extension SwiftOpenAITTSClient {
-    /// Cloud read-aloud resolves under Chat's route: the provider the person
-    /// chose for the Chat group is the one asked to speak, and the model comes
-    /// from that route's catalog entry. A route with no speech model refuses
-    /// here — it never borrows another provider's voice or a model literal
-    /// (2026-09-13 rulings), and nothing is read aloud.
+    /// Cloud read-aloud uses only Chat's provider and its catalog speech model.
     public static func synthesizeChat(text: String, voice: @Sendable () -> String) async throws -> (audio: Data, unread: Int) {
         let dataRoot = PersistenceCore.defaultDataRoot()
-        let router = SwiftNativeProviderRouting(
-            dataRoot: dataRoot,
-            surfacesPathOverride: dataRoot
-                .appendingPathComponent("providers", isDirectory: true)
-                .appendingPathComponent("surfaces.json"),
-            activeProviderPathOverride: dataRoot
-                .appendingPathComponent("providers", isDirectory: true)
-                .appendingPathComponent("active.json")
-        )
+        let router = SwiftNativeProviderRouting(dataRoot: dataRoot)
         // An unreadable route is its own failure, never evidence about that route's voice.
         let snapshot = try await router.checkedRoutingSnapshot()
-        // S12a: Chat's chosen route only, never one inferred from its model.
+        // Chat's chosen route only, never one inferred from its model.
         guard let chatProvider = ProviderRoutingSurfaceLookup.value(snapshot.activeProviders, "chat"),
               let model = FirstPartyModelCatalog.speechModel(forProviderID: chatProvider) else {
             throw MultimodalTTSError.routeHasNoSpeech(route: "Chat's provider")
@@ -87,13 +65,12 @@ extension SwiftOpenAITTSClient {
 /// correctly so — it never opens an output device.
 ///
 /// `name` is empty by default, which means the Mac's chosen system voice
-/// locally and the route's default voice in the cloud — what shipped.
+/// locally and the route's default voice in the cloud.
 public enum VoicePreference {
     public static let quietKey = "nativeagent.voice.quiet"
     public static let nameKey = "nativeagent.voice.name"
 
-    /// The cloud voice used before this preference existed. Kept as the
-    /// fallback so an unset name renders exactly as it always has.
+    /// An unset cloud voice uses alloy.
     public static let cloudDefaultName = "alloy"
 
     public static func quiet(in defaults: UserDefaults = .standard) -> Bool {
@@ -112,9 +89,7 @@ public enum VoicePreference {
 }
 
 
-/// A selected OpenAI voice that cannot speak says so and reads nothing — it
-/// never switches to the Mac voice (S12, 2026-09-26). Preflight failures get a
-/// plain sentence; every other failure gets one plain line (raw in the log).
+/// OpenAI voice failures report plainly and read nothing; they never switch voices.
 private enum OpenAIVoiceFailure {
     static func message(for error: Error, failureMessage: (Error, String) -> String) -> String {
         switch error {
@@ -169,34 +144,6 @@ public final class VoiceOutputController: NSObject {
         return created
     }
 
-    public func speak(
-        text: String,
-        mode: VoiceOutputMode = .local,
-        ownerID: String? = nil
-    ) async {
-        guard !text.isEmpty else { return }
-        // Quiet mode is enforced HERE, at the one door both routes go through,
-        // so "no audio out" holds for every caller that exists and every one
-        // added later. stop() first: switching quiet on mid-utterance must
-        // silence what is already speaking, not merely decline the next thing.
-        guard !VoicePreference.quiet() else {
-            stop()
-            return
-        }
-        stop()
-        speechGeneration &+= 1
-        speechOwnerID = ownerID
-        errorMessage = nil
-        errorOwnerID = nil
-        isSpeaking = true
-        switch mode {
-        case .local:
-            speakLocal(text: text)
-        case .openai:
-            await speakOpenAI(text: text)
-        }
-    }
-
     /// Speak on the route `trust`'s policy selects. A stop() or a newer
     /// speak() while the policy is still being read wins: this request then
     /// plays nothing (dictation stopping playback must not be undone by a
@@ -223,10 +170,24 @@ public final class VoiceOutputController: NSObject {
         ownerID: String? = nil
     ) async {
         switch resolution {
-        case .openAI:
-            await speak(text: text, mode: .openai, ownerID: ownerID)
-        case .localConfigured:
-            await speak(text: text, mode: .local, ownerID: ownerID)
+        case .openAI, .localConfigured:
+            guard !text.isEmpty else { return }
+            // Quiet silences current playback before declining the new utterance.
+            guard !VoicePreference.quiet() else {
+                stop()
+                return
+            }
+            stop()
+            speechGeneration &+= 1
+            speechOwnerID = ownerID
+            errorMessage = nil
+            errorOwnerID = nil
+            isSpeaking = true
+            if resolution == .openAI {
+                await speakOpenAI(text: text)
+            } else {
+                speakLocal(text: text)
+            }
         case .policyUnreadable(let reason):
             stop()
             guard !text.isEmpty, !VoicePreference.quiet() else { return }
@@ -251,12 +212,7 @@ public final class VoiceOutputController: NSObject {
         pendingSynthesis?.cancel()
         pendingSynthesis = nil
         synthesizer?.stopSpeaking(at: .immediate)
-        // Wave 35 W18: detach the delegate BEFORE dropping the reference so a
-        // superseded player can never deliver a stale didFinish/decodeError that
-        // would stomp a newer playback's state. This is the sound supersession
-        // guard — it removes the stale-callback PATH entirely, rather than
-        // racing an ObjectIdentifier comparison (which an address-reused new
-        // player could theoretically false-match).
+        // Detach the delegate before releasing a player so it cannot publish stale playback state.
         audioPlayer?.delegate = nil
         audioPlayer?.stop()
         audioPlayer = nil
@@ -315,8 +271,7 @@ public final class VoiceOutputController: NSObject {
             guard generation == speechGeneration else { return }
             // Underlying synthesis may ignore cancellation and still return bytes.
             try Task.checkCancellation()
-            // Detach any prior player's delegate before replacing it, so a
-            // superseded player can't fire a stale callback (Wave 35 W18).
+            // Detach any prior player's delegate so it cannot fire a stale callback.
             audioPlayer?.delegate = nil
             let player = try AVAudioPlayer(data: audioData)
             player.delegate = self
@@ -348,12 +303,7 @@ public final class VoiceOutputController: NSObject {
 
 
 }
-// Same supersession guard as the wave 35 W18 audio-player fix, applied to the
-// synthesizer path: speak() after stop() let the OLD utterance's didCancel
-// (async MainActor hop) flip isSpeaking=false AFTER the new utterance set it
-// true, making the Stop button unreachable. The synthesizer delegate can't be
-// detached per-utterance, so each utterance carries the generation it was
-// created under; the state-clear is ignored once the generation has advanced.
+// Utterances carry their generation so stale synthesizer callbacks cannot clear newer speech.
 private final class GenerationTaggedUtterance: AVSpeechUtterance {
     let generation: Int
     init(string: String, generation: Int) {
@@ -364,10 +314,7 @@ private final class GenerationTaggedUtterance: AVSpeechUtterance {
         // Never decoded — utterances are only created via init(string:generation:).
         return nil
     }
-    // AVSpeechUtterance is NSCopying; if AVFoundation ever copies the
-    // utterance internally, a plain copy would strip the subclass tag and
-    // re-open the stale-callback stomp this class exists to prevent
-    // (gpt-5.5 review). Preserve the generation across copies.
+    // Copies preserve the generation so stale callbacks cannot clear newer speech.
     override func copy(with zone: NSZone? = nil) -> Any {
         let copied = GenerationTaggedUtterance(string: speechString, generation: generation)
         copied.rate = rate
@@ -391,12 +338,7 @@ extension VoiceOutputController: AVSpeechSynthesizerDelegate {
     }
 
     nonisolated public func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        let generation = (utterance as? GenerationTaggedUtterance)?.generation
-        Task { @MainActor in
-            if let generation, generation != self.speechGeneration { return }
-            self.isSpeaking = false
-            self.speechOwnerID = nil
-        }
+        speechSynthesizer(synthesizer, didFinish: utterance)
     }
 }
 
@@ -425,43 +367,30 @@ extension VoiceOutputController: AVAudioPlayerDelegate {
     }
 }
 
-/// The state transition behind the Voice Auto-Read setting. Keeping the
-/// decision separate from the speaker prevents SwiftUI re-renders from
-/// changing what "new reply" means and makes every refusal inspectable.
+/// The Voice Auto-Read gate keeps "new reply" stable across SwiftUI re-renders.
 extension VoiceOutputModeSelection {
-    public enum AutoReadDecision: Equatable {
-        case speak(messageID: String, text: String)
-        case disabled
-        case unprimedSession
-        case noMessage
-        case messageFromAnotherSession
-        case notAssistant
-        case emptyReply
-        case alreadyRead
-    }
-
     public static func autoReadDecision(
         enabled: Bool,
         sessionID: String,
         isSessionPrimed: Bool,
         lastMessage: (id: String, sessionId: String?, role: String, content: String)?,
         lastReadMessageID: String?
-    ) -> AutoReadDecision {
-        guard enabled else { return .disabled }
-        guard isSessionPrimed else { return .unprimedSession }
-        guard let lastMessage else { return .noMessage }
+    ) -> (messageID: String, text: String)? {
+        guard enabled else { return nil }
+        guard isSessionPrimed else { return nil }
+        guard let lastMessage else { return nil }
 
         let cleanSessionID = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanSessionID.isEmpty else { return .messageFromAnotherSession }
+        guard !cleanSessionID.isEmpty else { return nil }
         if let messageSessionID = lastMessage.sessionId {
             guard messageSessionID.trimmingCharacters(in: .whitespacesAndNewlines) == cleanSessionID else {
-                return .messageFromAnotherSession
+                return nil
             }
         }
-        guard lastMessage.role == "assistant" else { return .notAssistant }
+        guard lastMessage.role == "assistant" else { return nil }
         let text = lastMessage.content.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return .emptyReply }
-        guard lastMessage.id != lastReadMessageID else { return .alreadyRead }
-        return .speak(messageID: lastMessage.id, text: text)
+        guard !text.isEmpty else { return nil }
+        guard lastMessage.id != lastReadMessageID else { return nil }
+        return (messageID: lastMessage.id, text: text)
     }
 }

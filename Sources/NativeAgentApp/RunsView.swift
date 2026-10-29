@@ -1,38 +1,19 @@
 import SwiftUI
 import AppKit
-import CoreGraphics
-import ScreenCaptureKit
-import ScreenVision
-import Speech
-import AVFoundation
-import UniformTypeIdentifiers
 import NativeAgentShared
-import MemoryV2
 import PersistenceCore
-#if canImport(CoreSpotlight)
-import CoreSpotlight
-#endif
-#if canImport(CloudKit)
-import CloudKit
-#endif
 
 // Blueprint: | `RunsView.swift` | `RunsView`: shared ledger list/details and explicit unknown/failure badge vocabulary from canonical run rows |
 
 /// Presentation facts per run kind. Shared human-facing vocabulary lives in
-/// `RunKindVocabulary`; colour and symbol remain Mac presentation choices.
+/// `RunKindVocabulary`; colour and the unknown symbol remain Mac choices.
 private enum RunKindStyle {
     static func displayName(_ kind: String) -> String {
         RunKindVocabulary.displayName(kind, on: .mac)
     }
 
     static func icon(_ kind: String) -> String {
-        switch kind.lowercased() {
-        case "codex": return "terminal"
-        case "claude": return "sparkles"
-        case "swarm": return "circle.hexagongrid.fill"
-        case "mission": return "target"
-        default: return "gearshape.2"
-        }
+        RunKindVocabulary.symbol(kind) ?? "gearshape.2"
     }
 
     static func tint(_ kind: String) -> Color {
@@ -62,37 +43,29 @@ struct RunsView: View {
 
     var body: some View {
         Group {
-            switch RunsPresentation.state(
+            let state = RunsPresentation.state(
                 runs: appModel.engine.runs.rows,
                 readSucceeded: appModel.engine.runs.readSucceeded
-            ) {
+            )
+            switch state {
             case .loading:
                 ProgressView("Loading the run history…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .unavailable(let unavailable):
                 NativeEmptyState(
                     title: "Run history unavailable",
-                    detail: unavailable,
-                    systemImage: "exclamationmark.triangle"
+                    detail: unavailable
                 )
             case .empty:
                 NativeEmptyState(
                     title: "No runs yet",
-                    detail: "Desk tasks and other background runs land here as they finish.",
-                    systemImage: "list.bullet.clipboard"
+                    detail: "Desk tasks and other background runs land here as they finish."
                 )
-            case .rows(let runs):
-                List(runs) { run in
-                    Button {
-                        selectedRunID = run.id
-                    } label: {
-                        RunRow(run: run)
-                    }
-                    .buttonStyle(.plain)
-                }
-            case .stale(let runs, let notice):
+            case .rows(let runs), .stale(let runs, _):
                 VStack(alignment: .leading, spacing: 8) {
-                    StalePanelNotice(text: notice)
+                    if case .stale(_, let notice) = state {
+                        StalePanelNotice(text: notice)
+                    }
                     List(runs) { run in
                         Button {
                             selectedRunID = run.id

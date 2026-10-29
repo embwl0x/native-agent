@@ -86,6 +86,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             floor: window.floor,
             kinds: ["context.snapshot"]
         ) { row in
+            let payload = row.payload.objectValue ?? [:]
             guard let surface = row.surface, capsuleSurfaces.contains(surface) else { return }
             // One snapshot per turn is the norm; a re-assembled turn must not
             // count twice in any denominator.
@@ -93,8 +94,8 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
             guard seenTurns.insert(key).inserted else { return }
             eligibleTurns.insert(key)
 
-            let flag = row.payload["containsCognitiveSubstrate"]?.boolValue
-            let capsuleBytes = row.payload["cognitiveCapsuleBytes"]?.intValue
+            let flag = payload["containsCognitiveSubstrate"]?.boolValue
+            let capsuleBytes = payload["cognitiveCapsuleBytes"]?.intValue
             if flag == true || (capsuleBytes ?? 0) > 0 {
                 capsulePresent.insert(key)
             } else if flag == nil && capsuleBytes == nil {
@@ -102,7 +103,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                 capsuleUnjudged.insert(key)
             }
 
-            guard case .object(let cue)? = row.payload["cognitiveCue"],
+            guard case .object(let cue)? = payload["cognitiveCue"],
                   cue["truncated"]?.boolValue == false,
                   let kind = cue["kind"]?.stringValue,
                   let line = cue["line"]?.stringValue, !line.isEmpty else { return }
@@ -145,18 +146,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
                     shape: "This JSON object retains organism state, including a chemicalState object with finite numeric agency, confidence, coherence and warmth values. Recover only values supported by the retained bytes."))
         }
 
-        var coverageParts: [String] = []
-        if !summary.truncatedDays.isEmpty {
-            coverageParts.append(
-                "\(summary.truncatedDays.count) day file(s) were tailed to the read budget"
-                    + " (\(summary.truncatedDays.joined(separator: ", "))), so earlier turns"
-                    + " that day were not scanned"
-            )
-        }
-        if summary.malformedLines > 0 {
-            coverageParts.append("\(summary.malformedLines) trace line(s) did not parse")
-        }
-        let coverageDetail = coverageParts.isEmpty ? "" : "; " + coverageParts.joined(separator: "; ")
+        let coverageDetail = summary.coverageDetail
 
         if summary.isEmptyFeed {
             return CheckResult(source: "turn_traces/ and cognition/organism_state.json",
@@ -246,8 +236,8 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
         let chemLine = chemistryLine(chemistry)
         parts.append(chemLine.sentence)
 
-        if !coverageParts.isEmpty {
-            parts.append(contentsOf: coverageParts)
+        if !summary.coverageParts.isEmpty {
+            parts.append(contentsOf: summary.coverageParts)
             // A bounded read is coverage, not a fault; the detail names it.
         }
 
@@ -287,7 +277,7 @@ public struct SubconsciousVitalsCheck: DoctorCheck {
         var measured: [String: Double] = [:]
         for dimension in chemistryDimensions {
             guard let value = state[dimension] else { continue }
-            guard let number = value.doubleValue, number.isFinite else {
+            guard let number = value.numberValue(coercingStrings: false, finiteOnly: false), number.isFinite else {
                 return .unreadable("carries a non-numeric \(dimension) in chemicalState")
             }
             measured[dimension] = number

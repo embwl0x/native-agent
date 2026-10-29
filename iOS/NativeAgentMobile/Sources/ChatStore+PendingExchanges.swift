@@ -1,29 +1,15 @@
 import Foundation
 import NativeAgentShared
 
-/// The sentence shown under a bubble that is still waiting for the Mac.
-///
-/// 2026-09-13: the old line was elapsed-time theater — ten seconds of local
-/// clock produced "Still working on the Mac", which the phone had no evidence
-/// for, and a local timeout then replaced the bubble with failure text. Silence
-/// is allowed to change the STATUS word; it is never allowed to impersonate
-/// progress, and it is never allowed to read as abandonment. So:
-///
-/// - before the Mac has acknowledged anything, say only what is true: this
-///   phone is waiting for the Mac to receive the request;
-/// - after acknowledgement, repeat the last activity the Mac actually
-///   evidenced, with its age, so the age is the claim and not the activity;
-/// - when nothing has arrived for a long while, say there is no update — and
-///   keep the last evidenced activity beside it, because "no update" about a
-///   running turn is not the same thing as a failed one.
+/// Waiting repeats only evidenced Mac activity and its age; silence is not failure.
 enum ChatWaitStatusPresentation {
     static let unacknowledged = "Waiting for your Mac to receive this"
     static let silent = "No update yet"
 
     static func ageText(_ seconds: TimeInterval) -> String {
+        guard seconds.isFinite, let minutes = Int(exactly: (max(0, seconds) / 60).rounded(.towardZero)) else { return "age unavailable" }
         let clamped = max(0, seconds)
         if clamped < 60 { return "just now" }
-        let minutes = Int(clamped / 60)
         if minutes < 60 { return minutes == 1 ? "1 min ago" : "\(minutes) min ago" }
         let hours = minutes / 60
         return hours == 1 ? "1 hr ago" : "\(hours) hr ago"
@@ -39,37 +25,13 @@ enum ChatWaitStatusPresentation {
     }
 }
 
-/// One unfinished exchange: a request this phone handed to the Mac and has not
-/// yet seen a terminal result for. It is durable, so closing the app — or
-/// opening another conversation — does not erase the fact that something is
-/// still outstanding. It carries only what is needed to keep OBSERVING that
-/// same signed request: its correlation, where its bubble is, the partial
-/// answer already received and the last stage the Mac acknowledged. It is never
-/// a resend queue; nothing in here is ever sent again.
+/// Durable observation and request arguments; only a signed expiry permits "Send now".
 struct ChatPendingExchange: Codable, Equatable, Sendable {
-    /// 2026-09-13: what an exchange becomes when the Mac signs a refusal
-    /// because the request aged out unread. The turn provably never started,
-    /// so this record stops being an observation and becomes the retained
-    /// request behind "Send now" — durable, because the in-memory maps that
-    /// used to hold it are wiped by a session switch and by relaunch, and a
-    /// record left in the observing state came back as a streaming
-    /// placeholder polling a correlation that can never finish.
     struct ExpiredRequest: Codable, Equatable, Sendable {
-        let text: String
-        let controls: ChatRuntimeControls
-        let attachments: [MultimodalAttachment]
-        let appendedUserId: UUID?
         /// The sentence the Mac's signed refusal put in the bubble.
         let message: String
     }
 
-    /// What a resend would need, kept FROM THE MOMENT THE EXCHANGE OPENED.
-    /// 2026-09-13: this used to be written only when an expiry arrived, out of
-    /// `pendingSendArgs` — an in-memory map a session switch and a relaunch
-    /// both wipe. A restored ordinary exchange therefore had no args, so a late
-    /// expiry fell through to the generic rejection path, which closes the
-    /// record: the request was proven never started and "Send now" was gone
-    /// anyway. Durable from the start, it survives both.
     struct RetainedRequest: Codable, Equatable, Sendable {
         let text: String
         let controls: ChatRuntimeControls
@@ -77,7 +39,7 @@ struct ChatPendingExchange: Codable, Equatable, Sendable {
         let appendedUserId: UUID?
     }
 
-    let correlationID: String
+    var correlationID: String
     let sessionID: String?
     let placeholderID: UUID
     /// Retained request arguments; nil only for records written before this
@@ -99,12 +61,37 @@ struct ChatPendingExchange: Codable, Equatable, Sendable {
 
     var isExpired: Bool { expiredRequest != nil }
 
+    private enum CodingKeys: String, CodingKey {
+        case correlationID, sessionID, placeholderID, request, partialText, activity
+        case updatedAt, acknowledged, isSilent, expiredRequest
+    }
+
     func statusLine(now: Date = Date()) -> String {
         ChatWaitStatusPresentation.line(
             activity: acknowledged ? (activity ?? "Mac received it") : nil,
             age: now.timeIntervalSince(updatedAt),
             isSilent: isSilent
         )
+    }
+}
+
+extension ChatPendingExchange {
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        correlationID = try values.decode(String.self, forKey: .correlationID)
+        sessionID = try values.decodeIfPresent(String.self, forKey: .sessionID)
+        placeholderID = try values.decode(UUID.self, forKey: .placeholderID)
+        request = try values.decodeIfPresent(RetainedRequest.self, forKey: .request)
+        expiredRequest = try values.decodeIfPresent(ExpiredRequest.self, forKey: .expiredRequest)
+        // Older expired records kept the only request inside the refusal.
+        if request == nil, expiredRequest != nil {
+            request = try values.decode(RetainedRequest.self, forKey: .expiredRequest)
+        }
+        partialText = try values.decode(String.self, forKey: .partialText)
+        activity = try values.decodeIfPresent(String.self, forKey: .activity)
+        updatedAt = try values.decode(Date.self, forKey: .updatedAt)
+        acknowledged = try values.decode(Bool.self, forKey: .acknowledged)
+        isSilent = try values.decode(Bool.self, forKey: .isSilent)
     }
 }
 
@@ -125,14 +112,12 @@ extension ChatStore {
 
     // MARK: - The Mac's turn here
 
-    /// Every run of the Mac's in this conversation that has not ended, from
-    /// whichever door it came: a request this phone handed over (silent or
-    /// not), one still crossing, or a live turn another door started. Stop
-    /// and the header follow this, never the composer's own flag.
+    /// Unfinished runs in this conversation, across doors, drive Stop and the header.
     var activeTurnRunIDs: Set<String> {
         let session = Self.cleanSessionID(selectedSessionID)
         let handedOver = pendingExchanges.values.filter { $0.sessionID == session && !$0.isExpired }.map(\.correlationID)
-        let live = liveTurnBubbles.filter { entry in messages.contains { $0.id == entry.value } }.keys
+        let messageIDs = Set(messages.map(\.id))
+        let live = liveTurnBubbles.filter { messageIDs.contains($0.value) }.keys
         return Set(handedOver).union(pendingICloudPlaceholders.keys).union(inFlightSendIDs).union(live)
     }
 
@@ -151,18 +136,13 @@ extension ChatStore {
         correlationID: String,
         sessionID: String?,
         placeholderID: UUID,
-        args: ChatStore.PendingSendArgs
+        args: ChatPendingExchange.RetainedRequest
     ) {
         pendingExchanges[correlationID] = ChatPendingExchange(
             correlationID: correlationID,
             sessionID: Self.cleanSessionID(sessionID),
             placeholderID: placeholderID,
-            request: ChatPendingExchange.RetainedRequest(
-                text: args.text,
-                controls: args.controls,
-                attachments: args.attachments,
-                appendedUserId: args.appendedUserId
-            ),
+            request: args,
             partialText: "",
             activity: nil,
             updatedAt: Date(),
@@ -176,18 +156,7 @@ extension ChatStore {
     /// minted. Move the record rather than leaving two.
     func renamePendingExchange(from oldID: String, to newID: String) {
         guard oldID != newID, var record = pendingExchanges.removeValue(forKey: oldID) else { return }
-        record = ChatPendingExchange(
-            correlationID: newID,
-            sessionID: record.sessionID,
-            placeholderID: record.placeholderID,
-            request: record.request,
-            partialText: record.partialText,
-            activity: record.activity,
-            updatedAt: record.updatedAt,
-            acknowledged: record.acknowledged,
-            isSilent: record.isSilent,
-            expiredRequest: record.expiredRequest
-        )
+        record.correlationID = newID
         pendingExchanges[newID] = record
     }
 
@@ -197,31 +166,19 @@ extension ChatStore {
     /// resurrecting a streaming placeholder for a dead correlation.
     func markPendingExchangeExpired(
         correlationID: String,
-        placeholderID: UUID,
-        message: String,
-        args: ChatStore.PendingSendArgs
+        message: String
     ) {
         iCloudBridge.shared.stopDeliveryNudges(for: correlationID)
-        var record = pendingExchanges[correlationID] ?? ChatPendingExchange(
-            correlationID: correlationID,
-            sessionID: Self.cleanSessionID(args.sessionID),
-            placeholderID: placeholderID,
-            partialText: "",
-            activity: nil,
-            updatedAt: Date(),
-            acknowledged: true,
-            isSilent: false
-        )
-        record.expiredRequest = ChatPendingExchange.ExpiredRequest(
-            text: args.text,
-            controls: args.controls,
-            attachments: args.attachments,
-            appendedUserId: args.appendedUserId,
-            message: message
-        )
+        guard var record = pendingExchanges[correlationID] else { return }
+        record.expiredRequest = ChatPendingExchange.ExpiredRequest(message: message)
         record.isSilent = false
         record.updatedAt = Date()
         pendingExchanges[correlationID] = record
+    }
+
+    /// Only a signed expiry for a bubble in this transcript authorizes "Send now".
+    func expiredExchange(for placeholderID: UUID) -> ChatPendingExchange? {
+        pendingExchanges.values.first { $0.isExpired && $0.placeholderID == placeholderID && messages.contains(where: { $0.id == placeholderID }) }
     }
 
     /// Any signed event for this correlation is evidence the Mac has it.
@@ -246,31 +203,6 @@ extension ChatStore {
         showWaitStatus(correlationID: correlationID)
     }
 
-    /// The arguments a "Send now" would replay for this correlation. The
-    /// in-memory `pendingSendArgs` is authoritative while it has them; the
-    /// durable record is the fallback after a session switch or a relaunch.
-    func resendArgs(for correlationID: String) -> ChatStore.PendingSendArgs? {
-        if let args = pendingSendArgs[correlationID] { return args }
-        guard let record = pendingExchanges[correlationID] else { return nil }
-        if let retained = record.request {
-            return ChatStore.PendingSendArgs(
-                text: retained.text,
-                sessionID: record.sessionID,
-                controls: retained.controls,
-                attachments: retained.attachments,
-                appendedUserId: retained.appendedUserId
-            )
-        }
-        guard let expired = record.expiredRequest else { return nil }
-        return ChatStore.PendingSendArgs(
-            text: expired.text,
-            sessionID: record.sessionID,
-            controls: expired.controls,
-            attachments: expired.attachments,
-            appendedUserId: expired.appendedUserId
-        )
-    }
-
     /// A terminal result — reply, error, cancel or session retirement — closes
     /// the record. Nothing else does.
     func closePendingExchange(_ correlationID: String) {
@@ -289,23 +221,21 @@ extension ChatStore {
 
     // MARK: - Restore
 
-    /// Re-attaches the unfinished exchanges of the session now on screen: the
-    /// bubble goes back to waiting with whatever partial answer it had, the
-    /// correlation is observable again, and the durable record is untouched.
-    /// This starts no work on the Mac — it resumes watching work already sent.
+    /// Reattach unfinished exchanges with their partial answers and resume observation.
     @discardableResult
     func restorePendingExchanges(for sessionID: String?) -> [String] {
         let session = Self.cleanSessionID(sessionID)
         var restored: [String] = []
-        let records = pendingExchanges.values.filter { $0.sessionID == session }
-        for record in records {
-            pendingSendArgs[record.correlationID] = resendArgs(for: record.correlationID)
-        }
+        let transcript = messages
+        let firstPositions = Dictionary(transcript.enumerated().map { ($0.element.id, $0.offset) }, uniquingKeysWith: min)
+        let firstUserPositions: [String: Int] = Dictionary(transcript.enumerated().compactMap { index, message in
+            message.role == .user ? message.runId.map { ($0, index) } : nil
+        }, uniquingKeysWith: min)
         func position(_ record: ChatPendingExchange) -> Int {
-            guard let user = pendingUserMessage(for: record.correlationID) else { return messages.endIndex }
-            return messages.firstIndex(where: { $0.id == user.id || ($0.role == .user && $0.runId == record.correlationID) }) ?? messages.endIndex
+            guard let userID = record.request?.appendedUserId else { return transcript.endIndex }
+            return min(firstPositions[userID] ?? transcript.endIndex, firstUserPositions[record.correlationID] ?? transcript.endIndex)
         }
-        let ordered = records.sorted {
+        let ordered = pendingExchanges.values.filter { $0.sessionID == session }.sorted {
             let left = position($0), right = position($1)
             if left != right { return left < right }
             if $0.updatedAt != $1.updatedAt { return $0.updatedAt < $1.updatedAt }
@@ -336,7 +266,6 @@ extension ChatStore {
                 )
             }
             pendingICloudPlaceholders[record.correlationID] = record.placeholderID
-            pendingSendArgs[record.correlationID] = resendArgs(for: record.correlationID)
             // The record's own existence is the proof this turn never reached a
             // terminal state, so a live reply for it is welcome again.
             resolvedICloudReplyIds.remove(record.correlationID)
@@ -385,22 +314,12 @@ extension ChatStore {
         pendingICloudPlaceholders.removeValue(forKey: record.correlationID)
         streamingHintsByMessageId.removeValue(forKey: record.placeholderID)
         timedOutPendingIds.removeValue(forKey: record.correlationID)
-        pendingSendArgs[record.correlationID] = ChatStore.PendingSendArgs(
-            text: retained.text,
-            sessionID: record.sessionID,
-            controls: retained.controls,
-            attachments: retained.attachments,
-            appendedUserId: retained.appendedUserId
-        )
-        expiredPendingIds[record.correlationID] = record.placeholderID
     }
 
     /// Resumes observation of restored exchanges. Observation only: the signed
     /// request already crossed the bridge and is never sent a second time.
     func resumeObservingPendingExchanges(using client: MacBridgeClient) {
-        for correlationID in restorePendingExchanges(for: selectedSessionID) {
-            guard pendingPolls[correlationID] == nil else { continue }
-            armReplyPoll(for: correlationID, client: client)
-        }
+        restorePendingExchanges(for: selectedSessionID)
+        armReplyPoll(client: client)
     }
 }

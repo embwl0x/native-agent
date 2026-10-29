@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MemoryStorage+Comparison.swift` | `MemoryStorage`: comparison-key modes, duplicate modes, scope/epoch checks and quantity/polarity matching; callers own candidate execution |
+// Blueprint: | `MemoryStorage+Comparison.swift` | `MemoryStorage`: comparison-key modes, scope/epoch checks and quantity/polarity matching; callers own candidate execution |
 
 extension MemoryStorage {
     enum ComparisonMode { case recall, canonical, proposal }
@@ -20,27 +20,17 @@ extension MemoryStorage {
         return mode == .canonical ? text.trimmingCharacters(in: CharacterSet(charactersIn: ".!?,;:\"'` ")) : text
     }
 
-    enum DuplicateMode { case admission, promotion, proposal, hygiene }
-
     /// Callers retain candidate order, execution and admission's recency rule.
     static func semanticDuplicate(
-        _ left: String, _ right: String, similarity: Double, mode: DuplicateMode,
-        kinds: (String?, String?) = (nil, nil)
+        _ left: String, _ right: String, similarity: Double
     ) -> Bool {
-        let threshold: Double
-        switch mode {
-        case .admission, .promotion: threshold = MemoryManagerLane.duplicateSimilarity
-        case .proposal: threshold = memoryConsolidationDuplicateThreshold
-        case .hygiene: threshold = memoryConsolidationActiveDuplicateThreshold
-        }
-        guard similarity >= threshold, sameQuantityAndNegation(left, right) else { return false }
-        if mode == .hygiene {
-            return kinds.0 == kinds.1 && lexicalJaccard(left, right) >= memoryConsolidationActiveDuplicateJaccardFloor
-        }
-        return true
+        return similarity >= memoryNearVerbatimSimilarity && sameQuantityAndNegation(left, right)
     }
 
-    /// Similar wording cannot reassert or archive a changed quantity or polarity.
+    /// Similar wording cannot reassert a changed quantity or polarity.
+    /// This lexical check recognizes ASCII digits and English negation only;
+    /// it is not a multilingual proof of equivalent meaning. Semantic memory
+    /// interpretation remains responsible for judging changed claims.
     static func sameQuantityAndNegation(_ old: String, _ new: String) -> Bool {
         func matches(_ pattern: String, in text: String) -> [String] {
             guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
@@ -54,17 +44,8 @@ extension MemoryStorage {
             && matches(negations, in: old).count == matches(negations, in: new).count
     }
 
-    static func lexicalJaccard(_ left: String, _ right: String) -> Double {
-        func tokens(_ text: String) -> Set<String> {
-            Set(text.lowercased().split { !($0.isLetter || $0.isNumber) }.map(String.init))
-        }
-        let leftTokens = tokens(left), rightTokens = tokens(right)
-        guard !leftTokens.isEmpty, !rightTokens.isEmpty else { return 0 }
-        return Double(leftTokens.intersection(rightTokens).count) / Double(leftTokens.union(rightTokens).count)
-    }
-
     /// Persona and read-surface scope, independent of lifecycle. Undisclosable
-    /// rows retain a persona-local hygiene bucket.
+    /// rows retain a persona-local bucket.
     static func disclosureScopeKey(personaId: String, metadata: JSONValue?) -> String {
         let persona = personaId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         var tags: [String] = []

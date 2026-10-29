@@ -1,22 +1,13 @@
 import SwiftUI
 import AppKit
 import CoreGraphics
-import ScreenCaptureKit
 import ScreenVision
-import Speech
-import AVFoundation
 import UniformTypeIdentifiers
 import NativeAgentShared
 import ChatSessionWork
 import MemoryV2
 import PersistenceCore
 import ProviderRouting
-#if canImport(CoreSpotlight)
-import CoreSpotlight
-#endif
-#if canImport(CloudKit)
-import CloudKit
-#endif
 
 // Blueprint: | `ChatContextFillBar.swift` | `ContextFillPresentation` and context strip/ring: measured usage, model window and compaction controls; missing figures stay visibly unavailable |
 
@@ -28,7 +19,6 @@ enum ContextFillPresentation {
     struct Usage: Equatable {
         let percent: Double
         let fillFraction: Double
-        let isOverBudget: Bool
     }
 
     /// The window's size; 0 is a window no catalog row states, never a size.
@@ -41,13 +31,9 @@ enum ContextFillPresentation {
         return NumberFormatter.localizedString(from: NSNumber(value: value), number: .decimal)
     }
 
-    static func usage(usedTokens: Int, budget: Int) -> Usage {
-        let percent = budget > 0 ? (Double(usedTokens) / Double(budget)) * 100 : 0
-        return Usage(
-            percent: percent,
-            fillFraction: min(1, max(0, percent / 100)),
-            isOverBudget: budget > 0 && usedTokens > budget
-        )
+    static func roundedPercent(_ value: Double) -> String {
+        guard value.isFinite else { return "unavailable" }
+        return String(format: "%.0f%%", value.rounded())
     }
 
     /// The status's own percent, which holds a previous model's receipt at
@@ -56,8 +42,7 @@ enum ContextFillPresentation {
         let percent = status.budget > 0 ? status.percent : 0
         return Usage(
             percent: percent,
-            fillFraction: min(1, max(0, percent / 100)),
-            isOverBudget: percent > 100
+            fillFraction: min(1, max(0, percent / 100))
         )
     }
 }
@@ -88,26 +73,14 @@ enum ContextFillCompactionPresentation {
 
 struct ContextFillBar: View {
     let sessionId: String
-    typealias CompactAction = @MainActor (String, String, String, Bool) async throws -> ChatSessionCompactionOutcome
-
-    private let compactAction: CompactAction?
     @Environment(AppModel.self) private var appModel
     private var status: SessionContextStatus? { appModel.engine.providers.sessions[sessionId]?.context }
     @State private var isCompacting = false
     @State private var compactionError: String? = nil
     private var lastError: String? { compactionError ?? appModel.engine.providers.sessions[sessionId]?.error }
-    @State private var lastErrorWasCompaction = false
-
-    init(
-        sessionId: String,
-        compactAction: CompactAction? = nil
-    ) {
-        self.sessionId = sessionId
-        self.compactAction = compactAction
-    }
 
     private var usage: ContextFillPresentation.Usage {
-        guard let status else { return .init(percent: 0, fillFraction: 0, isOverBudget: false) }
+        guard let status else { return .init(percent: 0, fillFraction: 0) }
         return ContextFillPresentation.usage(status)
     }
     private var pct: Double { usage.percent }
@@ -211,7 +184,7 @@ struct ContextFillBar: View {
             }
 
             if let lastError {
-                let retryCompaction = lastErrorWasCompaction
+                let retryCompaction = compactionError != nil
                 let retryLabel = retryCompaction
                     ? "Compaction failed. Retry"
                     : "Context status unavailable. Retry"
@@ -250,8 +223,7 @@ struct ContextFillBar: View {
     }
 
     private func formatSignedTokens(_ n: Int) -> String {
-        let sign = n >= 0 ? "+" : "-"
-        return sign + formatExactTokens(abs(n))
+        (n >= 0 ? "+" : "") + formatExactTokens(n)
     }
 
     private func formatPercent(_ value: Double) -> String {
@@ -288,49 +260,32 @@ struct ContextFillBar: View {
         guard !isCompacting else { return }
         isCompacting = true; defer { isCompacting = false }
         compactionError = nil
-        lastErrorWasCompaction = false
         do {
-            let result: ChatSessionCompactionOutcome
-            if let compactAction {
-                result = try await compactAction(
-                    sessionId, status?.model ?? "", appModel.engine.providers.sessions[sessionId]?.choice?.provider ?? "", true
-                )
-            } else {
-                result = try await appModel
-                    .compactSession(
-                        sessionId: sessionId,
-                        model: status?.model,
-                        providerID: appModel.engine.providers.sessions[sessionId]?.choice?.provider,
-                        force: true
-                    )
-            }
+            let result = try await appModel.compactSession(
+                sessionId: sessionId,
+                model: status?.model,
+                providerID: appModel.engine.providers.sessions[sessionId]?.choice?.provider,
+                force: true
+            )
             if let failure = ContextFillCompactionPresentation.failureMessage(for: result) {
                 compactionError = failure
-                lastErrorWasCompaction = true
                 return
             }
             await refresh()
         } catch {
             compactionError = UserFacingError.cause(error, action: "compact this chat")
-            lastErrorWasCompaction = true
         }
     }
 }
 
-// PATCH-2026-05-08: wave3-health-card Feature A — always-visible health pill + popover
-
-/// The small context readout on the composer row (User, 2026-09-16: "something
-/// small that shows how much context is used"). A ring that fills as the
-/// session's context fills, the percent beside it, exact tokens on hover.
-/// Reads the same engine-owned session context as `ContextFillBar`; no
-/// compaction control here — the row stays quiet.
+/// Read-only context ring over the same engine-owned session context as ContextFillBar.
 struct ComposerContextRing: View {
     let sessionId: String
     @Environment(AppModel.self) private var appModel
     private var status: SessionContextStatus? { appModel.engine.providers.sessions[sessionId]?.context }
 
     private var usage: ContextFillPresentation.Usage {
-        guard let status else { return .init(percent: 0, fillFraction: 0, isOverBudget: false) }
+        guard let status else { return .init(percent: 0, fillFraction: 0) }
         return ContextFillPresentation.usage(status)
     }
 
@@ -345,7 +300,7 @@ struct ComposerContextRing: View {
         guard let status else { return "Context used this conversation" }
         let used = NumberFormatter.localizedString(from: NSNumber(value: status.used_tokens), number: .decimal)
         guard let window = ContextFillPresentation.window(status.budget) else { return "Context: \(used) tokens; window unknown" }
-        return "Context: \(used) of \(window) tokens (\(Int(usage.percent.rounded()))%)"
+        return "Context: \(used) of \(window) tokens (\(ContextFillPresentation.roundedPercent(usage.percent)))"
     }
 
     var body: some View {
@@ -360,7 +315,7 @@ struct ComposerContextRing: View {
             }
             .frame(width: 11, height: 11)
             if let status, status.budget > 0 {
-                Text("\(Int(usage.percent.rounded()))%")
+                Text(ContextFillPresentation.roundedPercent(usage.percent))
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .monospacedDigit()

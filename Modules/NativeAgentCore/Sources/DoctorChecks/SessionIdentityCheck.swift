@@ -54,7 +54,7 @@ public struct SessionIdentityCheck: DoctorCheck {
         if let path = tally.unreadablePaths.first {
             return CheckResult(source: tally.unreadablePaths.joined(separator: ", "),
                 id: id, title: title, status: "fail",
-                detail: "Session minting could not be measured because turn-trace day files could not be read: \(tally.unreadablePaths.joined(separator: ", ")).",
+                detail: "Session minting could not be measured because turn-trace day files could not be read completely: \(tally.unreadablePaths.joined(separator: ", ")).",
                 harm: "Session creation history cannot be checked from the saved turns.",
                 human_action: ToolFailureError.fileRepairInstruction(URL(fileURLWithPath: path),
                     shape: "This day file holds one persisted TurnTraceEvent JSON object per line, with its original event identity, timestamp and payload."))
@@ -101,8 +101,7 @@ public struct SessionIdentityCheck: DoctorCheck {
         }
 
         parts.append("\(report.mixedSourceSessionCount) mixed-source transcript(s)")
-        // 2026-09-06: informational, never a warning. A conversation started on
-        // one surface and continued mostly on another is a supported shape.
+        // Continuing a conversation on another surface is informational, never a warning.
         if report.continuedElsewhereSessionCount > 0 {
             parts.append(
                 "\(report.continuedElsewhereSessionCount) session(s) continued mostly"

@@ -7,18 +7,9 @@ import CryptoKit
 // Blueprint: | `MacInjectionRedaction.swift` | `MacInjectionArgRedaction` enum; `carriesSecretArgs`, `appDoorSecretKeys` |
 #endif
 
-// MARK: - Typed-secret redaction (W2/W3-FIX 4)
+// MARK: - Typed-secret redaction
 
-/// Text passed to a Mac action can be a password, a 2FA code, or a private
-/// message. The MacControl RESULT
-/// already reduces it to a count — but the approval record and the turn-trace
-/// bus were storing the raw string, and the approval record is
-/// `remoteResolvable`, so it syncs to the phone and to Telegram.
-///
-/// This redacts at every persistence/emission boundary: the raw characters are
-/// replaced by `{text_character_count, text_sha256}`. The approval card renders
-/// "type 7 characters"; the digest lets a reviewer confirm after the fact that
-/// what ran is what was approved, without the record ever holding the secret.
+/// Persisted and emitted secret text is replaced by `{text_character_count, text_sha256}`.
 public enum MacInjectionArgRedaction {
     /// Argument keys that carry literal user-visible secrets, per tool/action.
     /// `keys` is the only place to add one — every sink calls through here.
@@ -270,20 +261,9 @@ public enum MacInjectionArgRedaction {
     }
 }
 
-// MARK: - Typed-secret redaction, RESULT side (W2/W3-FIX-R2 3)
+// MARK: - Typed-secret result redaction
 
-/// The argument redactor above keeps the typed characters out of everything
-/// that stores a REQUEST. This keeps them out of everything that stores a
-/// RESULT.
-///
-/// `ax_act` re-reads the element it just wrote and returns both the element and
-/// a `post_state`, so a value the caller set — a password, a 2FA code — came
-/// straight back out through the tool result and from there into the turn-trace
-/// preview, the operation store, and the approval record's `resultPreview`
-/// (which is `remoteResolvable` and syncs to iOS/Telegram). The MacControl
-/// handler now redacts at the source; this type is the same redaction applied
-/// independently at each downstream preview boundary, so a future result shape
-/// that reintroduces the field does not silently reopen the leak.
+/// Echoed secrets are redacted at the source and every downstream result-preview boundary.
 public enum MacInjectionResultRedaction {
     /// Result keys that can echo an injected secret back. Deliberately the
     /// value-bearing names only: counts, digests, roles, and frames are safe.

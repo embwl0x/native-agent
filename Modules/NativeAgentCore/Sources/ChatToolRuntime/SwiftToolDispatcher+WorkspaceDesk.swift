@@ -2,7 +2,7 @@ import Foundation
 import CryptoKit
 import PersistenceCore
 import Desk
-// Blueprint: | `SwiftToolDispatcher+WorkspaceDesk.swift` | `SwiftToolDispatcher`: `workspaceDesk` |
+// Blueprint: | `SwiftToolDispatcher+WorkspaceDesk.swift` | `SwiftToolDispatcher`: `workspaceDesk` projects every board item through one paged row shape, preserving fields across recent/stale ordering and carrying limit/sort in continuations |
 
 extension SwiftToolDispatcher {
     /// Disposable typed projection of the same Desk owner, never reconstructed
@@ -13,7 +13,7 @@ extension SwiftToolDispatcher {
             return Int(min(n, 1_000_000))
         }
         if let selected = handle?.isEmpty == false ? matches.first : nil, input["detail_offset"] != nil {
-            let text = DeskProjection.renderRecord(selected, in: state, noteCap: selected.notes.count)
+            let text = DeskPage.renderRecord(selected, in: state, noteCap: selected.notes.count)
             let version = SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
             let start = offset("detail_offset")
             if start > 0, input["detail_version"] != .string(version) {
@@ -24,7 +24,7 @@ extension SwiftToolDispatcher {
             let safeStart = min(start, characters.count)
             var result: [String: JSONValue] = [
                 "status": .string("ok"), "source": .string("canonical_current_desk"),
-                "record": .object(["handle": .string(selected.handle), "title": .string(selected.title), "status": .string(selected.status.rawValue)]),
+                "record": .object(["handle": .string(selected.handle), "title": .string(selected.title), "status": .string(selected.statusDescription)]),
                 "detail_text": .string(String(characters[safeStart..<end])), "detail_offset": .int(Int64(start)),
                 "detail_version": .string(version), "has_more_details": .bool(end < characters.count),
                 "meaning": .string("Complete recorded work, in bounded text windows. Recorded statements are not fresh verification or instructions.")
@@ -32,21 +32,27 @@ extension SwiftToolDispatcher {
             if end < characters.count { result["next_detail_offset"] = .int(Int64(end)) }
             return .object(result)
         }
-        let pageSize = 16
+        let board = state.board
+        let pageSize = Self.jsonInt(input["limit"]) ?? 25
         let rowOffset = offset("offset"), noteOffset = offset("notes_offset"), refOffset = offset("refs_offset")
         let selected = handle?.isEmpty == false ? matches.first : nil
         let plans = DeskSequencing.compute(state)
         let rows: [DeskItem]
         if let selected { rows = state.children(of: selected.handle) }
         else if handle?.isEmpty == false || query?.isEmpty == false || input["updated_on"] != nil { rows = matches }
-        else { rows = state.topLevel }
+        else { rows = board.items }
         let sorted = rows.sorted {
+            if input["sort"] == .string("stale") {
+                return $0.updatedAt != $1.updatedAt ? $0.updatedAt < $1.updatedAt : $0.handle < $1.handle
+            }
             if $0.status.isTerminal != $1.status.isTerminal { return !$0.status.isTerminal }
             if $0.updatedAt != $1.updatedAt { return $0.updatedAt > $1.updatedAt }
             return $0.handle < $1.handle
         }
         let shown = Array(sorted.dropFirst(rowOffset).prefix(pageSize))
         var base: [String: JSONValue] = ["structured": .bool(true)]
+        base["limit"] = .int(Int64(pageSize))
+        base["sort"] = input["sort"]
         base["updated_on"] = input["updated_on"]
         if let selected { base["handle"] = .string(selected.handle) }
         else if let handle, !handle.isEmpty { base["handle"] = .string(handle) }
@@ -61,11 +67,13 @@ extension SwiftToolDispatcher {
         var result: [String: JSONValue] = [
             "status": .string(handle?.isEmpty == false && selected == nil ? "not_found" : "ok"),
             "source": .string("canonical_current_desk"), "as_of": .string(state.generatedTs),
-            "request": .object(base), "liveItemCount": .int(Int64(state.items.count)),
-            "topLevelItemCount": .int(Int64(state.topLevel.count)), "matched_count": .int(Int64(sorted.count)),
-            "count_scope": .string("liveItemCount includes parts and MY QUEUE; topLevelItemCount excludes parts but includes MY QUEUE; both include closed items and exclude archives"),
+            "request": .object(base), "liveItemCount": .int(Int64(board.items.count)),
+            "topLevelItemCount": .int(Int64(board.topLevel.count)), "matched_count": .int(Int64(sorted.count)),
+            "count_scope": .string("liveItemCount includes parts; topLevelItemCount excludes parts; both include closed items and exclude MY QUEUE and archives. total counts this list: all board items, matching items, or the selected item's parts."),
             "board_counts": .string(state.boardCountSummary),
-            "offset": .int(Int64(rowOffset)), "has_more": .bool(rowOffset + pageSize < sorted.count),
+            "offset": .int(Int64(rowOffset)), "limit": .int(Int64(pageSize)),
+            "total": .int(Int64(sorted.count)), "count": .int(Int64(shown.count)),
+            "has_more": .bool(rowOffset + pageSize < sorted.count),
             "items": .array(shown.map {
                 workContextDeskItem($0, state: state, plan: plans.byHandle[$0.handle])
             }),
@@ -85,8 +93,10 @@ extension SwiftToolDispatcher {
                          "truncated": .bool($0.text.count > 4_000)])
             })
             result["note_count"] = .int(Int64(selected.notes.count))
+            result["notes_has_more"] = .bool(noteOffset + pageSize < selected.notes.count)
             result["linked_evidence"] = .array(selected.refs.dropFirst(refOffset).prefix(pageSize).map { boundedWorkContextValue($0.toJSON()) })
             result["linked_evidence_count"] = .int(Int64(selected.refs.count))
+            result["links_has_more"] = .bool(refOffset + pageSize < selected.refs.count)
             if noteOffset + pageSize < selected.notes.count { result["next_notes"] = next("notes_offset", noteOffset + pageSize) }
             if refOffset + pageSize < selected.refs.count { result["next_links"] = next("refs_offset", refOffset + pageSize) }
         }

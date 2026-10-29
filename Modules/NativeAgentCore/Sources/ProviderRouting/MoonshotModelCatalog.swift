@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+import NativeAgentShared
 
 // Blueprint: | `MoonshotModelCatalog.swift` | `MoonshotModelCatalog`: authenticated model parsing/capabilities and checked offline cache, using shared TTL state machinery |
 
@@ -10,9 +11,7 @@ import PersistenceCore
 public enum MoonshotModelCatalog {
     public static let endpoint = URL(string: "https://api.moonshot.ai/v1/models")!
 
-    /// Shared TTL + backoff machinery (R-M3). Moonshot keeps only its own
-    /// parse / fetch / capability specifics; the read/refresh/backoff state
-    /// machine lives in `ModelCatalogTTLCache`.
+    /// ModelCatalogTTLCache owns TTL and backoff; Moonshot supplies fetching and capabilities.
     static let ttlCache = ModelCatalogTTLCache(
         cachePath: { cachePath(dataRoot: $0) },
         endpoint: endpoint,
@@ -25,7 +24,7 @@ public enum MoonshotModelCatalog {
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
         session: URLSession = .shared,
         refresh: Bool = false
-    ) async -> [ProviderModelDescriptor] {
+    ) async -> [ProviderModelInfo] {
         await ttlCache.models(dataRoot: dataRoot, session: session, refresh: refresh)
     }
 
@@ -51,10 +50,10 @@ public enum MoonshotModelCatalog {
         return readCache(dataRoot: dataRoot)?.contains { $0.id.lowercased() == needle } ?? false
     }
 
-    static func parseModelsResponse(_ data: Data) throws -> [ProviderModelDescriptor] {
+    static func parseModelsResponse(_ data: Data) throws -> [ProviderModelInfo] {
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let rows = root["data"] as? [[String: Any]] else { return [] }
-        var byID: [String: ProviderModelDescriptor] = [:]
+        var byID: [String: ProviderModelInfo] = [:]
         for row in rows {
             guard let rawID = row["id"] as? String else { continue }
             let id = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -62,14 +61,14 @@ public enum MoonshotModelCatalog {
             let context = positiveInt(row["context_length"])
                 ?? FirstPartyModelCatalog.moonshotModels.first(where: { $0.id == id })?.contextLength
                 ?? 0
-            byID[id] = ProviderModelDescriptor(
+            byID[id] = ProviderModelInfo(
                 id: id,
                 name: displayName(for: id),
-                contextLength: context,
-                supportsStreaming: true,
-                supportsVision: (row["supports_image_in"] as? Bool) ?? false,
-                supportsTools: true,
-                supportsJSONMode: true
+                context_length: context,
+                supports_streaming: true,
+                supports_vision: (row["supports_image_in"] as? Bool) ?? false,
+                supports_tools: true,
+                supports_json_mode: true
             )
         }
         // Declared rows first in their declared order, then the rest by name.
@@ -92,7 +91,7 @@ public enum MoonshotModelCatalog {
         FirstPartyModelCatalog.descriptor(for: modelID, providerID: "moonshot")?.supportedReasoningEfforts ?? ["none"]
     }
 
-    private static func fetchLiveModels(key: String?, session: URLSession) async throws -> [ProviderModelDescriptor] {
+    private static func fetchLiveModels(key: String?, session: URLSession) async throws -> [ProviderModelInfo] {
         guard let key, !key.isEmpty else {
             throw LLMError.notConfigured(provider: "moonshot")
         }
@@ -117,7 +116,7 @@ public enum MoonshotModelCatalog {
         modelCatalogFault(at: cachePath(dataRoot: dataRoot), read: readCache(dataRoot: dataRoot) != nil, owner: "Moonshot")
     }
 
-    static func readCache(dataRoot: URL) -> [ProviderModelDescriptor]? {
+    static func readCache(dataRoot: URL) -> [ProviderModelInfo]? {
         readDecodedCache(dataRoot: dataRoot)?.models
     }
 
@@ -130,16 +129,16 @@ public enum MoonshotModelCatalog {
     private static func decodeCache(_ data: Data) -> DecodedModelCatalog? {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let rows = root["models"] as? [[String: Any]] else { return nil }
-        let models = rows.compactMap { row -> ProviderModelDescriptor? in
+        let models = rows.compactMap { row -> ProviderModelInfo? in
             guard let id = row["id"] as? String, !id.isEmpty else { return nil }
-            return ProviderModelDescriptor(
+            return ProviderModelInfo(
                 id: id,
                 name: (row["name"] as? String) ?? displayName(for: id),
-                contextLength: positiveInt(row["context_length"]) ?? 0,
-                supportsStreaming: (row["supports_streaming"] as? Bool) ?? true,
-                supportsVision: (row["supports_vision"] as? Bool) ?? false,
-                supportsTools: (row["supports_tools"] as? Bool) ?? true,
-                supportsJSONMode: (row["supports_json_mode"] as? Bool) ?? true
+                context_length: positiveInt(row["context_length"]) ?? 0,
+                supports_streaming: (row["supports_streaming"] as? Bool) ?? true,
+                supports_vision: (row["supports_vision"] as? Bool) ?? false,
+                supports_tools: (row["supports_tools"] as? Bool) ?? true,
+                supports_json_mode: (row["supports_json_mode"] as? Bool) ?? true
             )
         }
         let fetchedAt = (root["updated_at"] as? String).flatMap { ISO8601DateFormatter().date(from: $0) }

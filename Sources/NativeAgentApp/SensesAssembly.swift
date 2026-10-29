@@ -1,4 +1,7 @@
 import Foundation
+import NativeAgentShared
+import Synchronization
+import ApprovalTransactions
 import Senses
 import AppToolRuntime
 import PersistenceCore
@@ -14,15 +17,11 @@ import TrustCenter
 
 /// Launch composition only. Runtime callers go through the shared hub.
 enum SensesAssembly {
-    private static let storage = Storage()
-    private final class Storage: @unchecked Sendable {
-        let lock = NSLock()
-        var installation: Task<Void, Error>?
-    }
+    private static let installation = Mutex<Task<Void, Error>?>(nil)
 
     static func install(dataRoot: URL) {
-        storage.lock.withLock {
-            guard storage.installation == nil else { return }
+        installation.withLock { installation in
+            guard installation == nil else { return }
             let registry = FileSenseRegistry(dataRoot: dataRoot)
             let runner = HelperSenseRunner(dataRoot: dataRoot, helperURL: SenseHostLocator.helperURL,
                 sandboxProfile: { record, _, scratch in
@@ -40,7 +39,7 @@ enum SensesAssembly {
                     guard case .object(let fields) = admission, fields["status"] == .string("admitted") else {
                         throw SenseFailure(code: "trust_refused", message: "App read refused by Trust: \(try admission.serialize(pretty: false))")
                     }
-                    return try await SystemAppleScriptAdapter().callApp(arguments, targets: targets)
+                    return try await AppleScriptExecution().callApp(arguments, targets: targets)
                 })
             let source = ExistingCornersSourceProvider(rawRead: { tool, input in
                 try await rawRead(tool: tool, input: input, dataRoot: dataRoot)
@@ -48,7 +47,7 @@ enum SensesAssembly {
             // No background growth: she makes a place's sense in her own turn
             // (app sense.make), and then it's built.
             SensesHub.shared.install(registry: registry, runner: runner, source: source)
-            storage.installation = Task {
+            installation = Task {
                 await SenseNewsBoard.shared.configure(dataRoot: dataRoot)
                 do {
                     let memory = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
@@ -63,15 +62,15 @@ enum SensesAssembly {
     }
 
     static func waitUntilReady() async throws {
-        let installation = storage.lock.withLock { storage.installation }
+        let installation = Self.installation.withLock { $0 }
         try await installation?.value
     }
 
     static func shutdown() async {
-        let installation = storage.lock.withLock { storage.installation }
+        let installation = Self.installation.withLock { $0 }
         installation?.cancel()
         _ = try? await installation?.value
-        await (SensesHub.shared.runner as? HelperSenseRunner)?.shutdown()
+        await SensesHub.shared.runner?.shutdown()
     }
 
     /// Re-enter the existing gates with the invoking turn's identity. Quiet

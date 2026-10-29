@@ -156,8 +156,7 @@ public struct SecurityReason: Codable, Sendable, Equatable {
         self.sentence = sentence
     }
 
-    // 2026-09-18 — Reasons stay strings on disk; only this boundary reads
-    // legacy prefixes. Live decisions carry their kind, never infer it from prose.
+    // Reasons persist as strings; only this boundary reads prefixes, while live decisions carry their kind.
     public var persistedValue: String { "\(kind.rawValue): \(sentence)" }
 
     public init(persistedValue: String) {

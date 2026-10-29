@@ -1,22 +1,5 @@
-// TrustGuardrailSummary.swift — Sweep R4 C10.
-//
-// "What Agent can do right now": a compact, plain-language answer to the one
-// question Trust Center never answered on arrival. The panel it feeds sits at
-// the very top of the page.
-//
-// WHY THIS IS DERIVED AND NOT WRITTEN
-// A "Guardrail Summary" panel used to live here and was deleted in the
-// 2026-07-22 tighten pass (TrustCenterView.swift records it) because its five
-// tiles were hand-written prose that restated controls further down the page —
-// so it went stale the moment either side changed, and a stale trust claim is
-// worse than no claim. Everything below is a pure function of the loaded
-// policy. There is no hardcoded capability sentence anywhere in this file: if
-// a row says the agent can do something, the policy currently says so.
-//
-// READ-ONLY. Nothing here writes policy, and the panel renders no controls —
-// every row's actual switch lives in a panel further down the same page.
-
 import SwiftUI
+import NativeAgentShared
 import TrustCenter
 
 // Blueprint: | `TrustGuardrailSummary.swift` | `TrustGuardrailSummary`: derived plain-language effective file/autonomy/backup/Mac/send reach, never another saved policy |
@@ -33,7 +16,7 @@ enum TrustGuardrailTone: String, Hashable, Sendable {
 
 /// One plain-language line in the summary.
 struct TrustGuardrailRow: Identifiable, Hashable, Sendable {
-    /// Stable key. Matches the concept, not the copy — tests pin these.
+    /// Stable key matching the concept, not the copy.
     let id: String
     /// The question this row answers, in the user's words.
     let title: String
@@ -41,11 +24,10 @@ struct TrustGuardrailRow: Identifiable, Hashable, Sendable {
     let value: String
     /// One sentence of consequence, for the person who stops on this row.
     let detail: String
-    let systemImage: String
     let tone: TrustGuardrailTone
 }
 
-/// Pure derivation. Unit-tested against policy fixtures; no view state, no I/O.
+/// Policy-derived rows; no view state or I/O.
 enum TrustGuardrailSummary {
     /// - Parameters:
     ///   - policy: the loaded trust policy, or `nil` before the first load.
@@ -68,11 +50,7 @@ enum TrustGuardrailSummary {
 
     // MARK: - Rows
 
-    // COPY RULE (2026-09-10, Agent's clarity pass): one statement per fact.
-    // "Files it can reach" says where it can reach and nothing else; "Before it
-    // changes something" says what runs without asking and what still waits.
-    // The two rows shared one derived sentence before this pass, so Full Mac
-    // printed the same clause twice.
+    // Each row states one fact: file reach, approval, or granted categories.
 
     private static func filesRow(policy: TrustPolicy, accessMode: String) -> TrustGuardrailRow {
         let value: String
@@ -103,7 +81,6 @@ enum TrustGuardrailSummary {
             title: "Files I can reach",
             value: value,
             detail: fileReachSentence(policy, accessMode: accessMode),
-            systemImage: "folder",
             tone: tone
         )
     }
@@ -173,7 +150,6 @@ enum TrustGuardrailSummary {
             title: "Before I change something",
             value: value,
             detail: detail,
-            systemImage: "hand.raised",
             tone: tone
         )
     }
@@ -187,7 +163,6 @@ enum TrustGuardrailSummary {
             detail: on
                 ? "Before an allowed file write, a backup is required so you can restore the previous version."
                 : "Allowed file writes do not require a backup. Turning \"Backup before workspace writes\" back on restores the safety net.",
-            systemImage: on ? "arrow.uturn.backward.circle" : "exclamationmark.triangle",
             tone: on ? .ok : .danger
         )
     }
@@ -200,31 +175,25 @@ enum TrustGuardrailSummary {
                 title: "Controlling your Mac",
                 value: "Off",
                 detail: "Mac control is off: app automation, terminal commands, and clicking are not available.",
-                systemImage: "macbook",
                 tone: .ok
             )
         }
         let loud = mac.shellAllowed || mac.systemControlAllowed || mac.accessibilityAllowed
-        guard !TrustAccessModeCapabilityCatalog.grantedMacCategories(mac).isEmpty else {
+        let granted = TrustAccessModeCapabilityCatalog.grantedMacCategories(mac)
+        guard !granted.isEmpty else {
             return TrustGuardrailRow(
                 id: "mac_control",
                 title: "Controlling your Mac",
                 value: "On, nothing granted",
                 detail: "Mac control is switched on but no category is allowed yet, so nothing runs.",
-                systemImage: "macbook",
                 tone: .ok
             )
         }
-        // 2026-09-10: the status used to be the whole granted inventory and the
-        // prose beneath repeated it. The status is now the one-glance verdict;
-        // the list is carried once, below.
-        let copy = macControlCopy(mac, policy: policy)
         return TrustGuardrailRow(
             id: "mac_control",
             title: "Controlling your Mac",
-            value: copy.value,
-            detail: copy.detail,
-            systemImage: "macbook",
+            value: "On",
+            detail: "\(sentenceList(granted)).\nYour access mode decides when I ask; file limits and tool permissions still apply.",
             tone: loud ? .danger : .caution
         )
     }
@@ -238,34 +207,6 @@ enum TrustGuardrailSummary {
         }.joined(separator: ", ")
     }
 
-    /// The short status word and the single readable list beneath it, from one
-    /// table so the two can never disagree. Category names are the same words
-    /// the Mac Control toggles use.
-    private static func macControlCopy(
-        _ mac: TrustMacControlPolicy, policy: TrustPolicy
-    ) -> (value: String, detail: String) {
-        let (automatic, asks, unavailable) = TrustAccessModeCapabilityCatalog.macControlApprovalGroups(mac)
-        let value: String
-        if asks.isEmpty {
-            value = "Runs without asking"
-        } else if automatic.isEmpty {
-            value = "Asks first"
-        } else {
-            value = "Some ask first"
-        }
-        var sentences: [String] = []
-        // The label the status already says is not said again: the list leads.
-        if !automatic.isEmpty {
-            sentences.append((asks.isEmpty ? "" : "Runs without asking: ") + "\(sentenceList(automatic)).")
-        }
-        if !asks.isEmpty {
-            sentences.append((automatic.isEmpty ? "" : "Asks first: ") + "\(sentenceList(asks)).")
-        }
-        if !unavailable.isEmpty { sentences.append("Not available: \(sentenceList(unavailable)).") }
-        sentences.append("File access limits\(TrustAccessModeCapabilityCatalog.fullMacGrantIsActive(policy) ? " and protected-action checks" : ", risk checks, and tool permissions") still apply.")
-        return (value, sentences.joined(separator: "\n"))
-    }
-
     private static func externalSendRow(policy: TrustPolicy) -> TrustGuardrailRow {
         if TrustAccessModeCapabilityCatalog.fullMacGrantIsActive(policy) {
             return TrustGuardrailRow(
@@ -274,7 +215,7 @@ enum TrustGuardrailSummary {
                 detail: "Under Full Mac I can send through your connected accounts without an additional app approval. Agents you enabled in Trust inherit your authority. Other agents do not, and their requests can require approval.",
                 // As loud as file reach: this is the one that reaches other
                 // people, so it never wears a quieter word than the files row.
-                systemImage: "paperplane.fill", tone: .danger
+                tone: .danger
             )
         }
         // A send is a write on the person's side: Work asks, Safe sends nothing.
@@ -286,7 +227,6 @@ enum TrustGuardrailSummary {
             detail: safe
                 ? "Safe sends nothing to other people."
                 : "Email, messages, and posts wait for your approval before they leave this Mac.",
-            systemImage: "paperplane",
             tone: .ok
         )
     }
@@ -312,7 +252,7 @@ struct TrustGuardrailSummaryPanel: View {
     }
 
     var body: some View {
-        NativePanel(title: policyReadFailed ? "Permissions unavailable" : "What I can do right now", systemImage: "eye") {
+        NativePanel(title: policyReadFailed ? "Permissions unavailable" : "What I can do right now") {
             if policyReadFailed {
                 Text("Your saved permissions could not be checked. Reload Trust to try again.")
                     .font(ShellType.label)
@@ -365,9 +305,7 @@ extension TrustGuardrailSummaryPanel {
     }
 }
 
-/// One line of the answer. The tinted plate and the warning triangle it used to
-/// wear made five rows read as five alarms; the state now lives in the colour of
-/// the answer itself, on the card's own ground (advanced-page kit, 2026-09-03).
+/// Guardrail state appears in the answer's colour on the card's own ground.
 private struct TrustGuardrailRowView: View {
     let row: TrustGuardrailRow
 

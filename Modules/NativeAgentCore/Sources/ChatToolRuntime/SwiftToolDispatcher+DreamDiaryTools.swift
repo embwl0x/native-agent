@@ -1,19 +1,9 @@
 // SwiftToolDispatcher+DreamDiaryTools.swift
-// dream_diary_read (0.4.14) — the diary she writes, readable by the one who
-// wrote it.
+// dream_diary_read — read the diary she writes.
 //
-// The Dreams page has read `dream_diary/*.md` (plus `archive/<year>/` since the
-// second-week round) since the native port. The agent had no way in at all:
-// asked what she dreamt about last Tuesday she could only say she did not know,
-// while the page beside her showed the entry. `inner_state` carries ONE dream
-// residue — last night's mood word and a date — which is the day's weather, not
-// the record.
+// `inner_state` carries last night's dream residue; this reads the record.
 //
-// ── WIRING CANON ─────────────────────────────────────────────────────────────
-// LAZY (docs/TOOL_LOADING.md), NOT in `alwaysOnCoreNames`, and in no preload
-// group: reading back a night is a deliberate pull, the way `studio_recall` is,
-// and it has no business costing prompt bytes on every turn. Same trust class
-// as `studio_recall` — `safe_read` / `.low`: a pure local read of her own files
+// A pure local read of her own files
 // under `<dataRoot>/dream_diary/`, no write, no spawn, no network.
 //
 // Reads go through `FileBackedDreamDiary`, the SAME reader the Dreams page
@@ -51,10 +41,7 @@ extension SwiftToolDispatcher {
         if let rawDate = optionalString(input, "date"),
            !rawDate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let key = rawDate.trimmingCharacters(in: .whitespacesAndNewlines)
-            // A READ FAILURE is not a missing night. Unwrapped, an unreadable
-            // entry escaped as a generic tool error with no `storage` line, so
-            // the one answer this tool must never give — "you did not dream" —
-            // was indistinguishable from a diary that could not be opened.
+            // A read failure is not a missing night; every answer names storage availability.
             let result: FileBackedDreamDiary.ByDateResult
             do {
                 result = try reader.getEntryResult(key)
@@ -70,24 +57,24 @@ extension SwiftToolDispatcher {
                 ])
             }
             switch result {
-            case .badPath:
+            case .badPath(let storage):
                 return .object([
                     "status": .string("refused"),
                     "reason": .string(
                         "'\(key)' is not a diary date. Pass one day as YYYY-MM-DD — "
                             + "a date is a single name, never a path."),
-                ].merging(Self.dreamDiaryStorageFields(dataRoot: dataRoot)) { current, _ in current })
-            case .notFound:
+                ].merging(Self.dreamDiaryStorageFields(storage)) { current, _ in current })
+            case .notFound(let storage):
                 return .object([
                     "status": .string("ok"),
                     "found": .bool(false),
                     "date": .string(key),
                     "note": .string("no diary entry for \(key) — you did not dream that night, or the night was never written"),
-                ].merging(Self.dreamDiaryStorageFields(dataRoot: dataRoot)) { current, _ in current })
-            case .entry(let entry):
+                ].merging(Self.dreamDiaryStorageFields(storage)) { current, _ in current })
+            case .entry(let entry, let archived):
                 // The night was read, so the diary is readable — whatever the
                 // rest of it holds.
-                var fields = Self.dreamDiaryEntryJSON(entry, archived: Self.dreamDiaryIsArchived(entry, dataRoot: dataRoot))
+                var fields = Self.dreamDiaryEntryJSON(entry, archived: archived)
                 fields["storage"] = .string("readable")
                 return .object(fields)
             }
@@ -108,11 +95,7 @@ extension SwiftToolDispatcher {
             ])
         }
         let entries = listing.entries
-        // Some nights were listed but unreadable: the answer is real but PARTIAL.
-        // ALWAYS SAY WHETHER THE DIARY COULD BE READ. Agent, 2026-09-14: a
-        // healthy diary returned no readability line at all, so "no entries"
-        // and "could not be read" were the same answer on the wire. `storage`
-        // is on every envelope now; `note` only when it is not plain readable.
+        // Every envelope reports storage readability; a note distinguishes unreadable or partial results from empty ones.
         let unreadable: [String: JSONValue] = listing.unreadableEntries > 0
             ? [
                 "unreadable_entries": .int(Int64(listing.unreadableEntries)),
@@ -123,7 +106,7 @@ extension SwiftToolDispatcher {
                     "\(listing.unreadableEntries) night(s) are in the diary but could not be "
                         + "read this time — they are missing from what follows"),
             ]
-            : Self.dreamDiaryStorageFields(dataRoot: dataRoot)
+            : Self.dreamDiaryStorageFields(listing.storage)
 
         // TEXT search across the diary. Same verbatim-entry contract as the
         // by-date read, just several of them, newest first and capped.
@@ -142,7 +125,7 @@ extension SwiftToolDispatcher {
                 "query": .string(needle),
                 "entries": .array(shown.map { entry in
                     .object(Self.dreamDiaryEntryJSON(
-                        entry, archived: Self.dreamDiaryIsArchived(entry, dataRoot: dataRoot)))
+                        entry, archived: !listing.activeFilenames.contains(entry.filename ?? "\(entry.date).md")))
                 }),
                 "returned": .int(Int64(shown.count)),
                 "matched": .int(Int64(matched.count)),
@@ -155,7 +138,7 @@ extension SwiftToolDispatcher {
         let weeksAsked = max(1, min(
             Self.dreamDiaryMaximumWeeks,
             Self.jsonInt(input["weeks"]) ?? Self.dreamDiaryDefaultWeeks))
-        let allWeeks = Self.dreamDiaryWeeks(entries, dataRoot: dataRoot)
+        let allWeeks = Self.dreamDiaryWeeks(entries, activeFilenames: listing.activeFilenames)
         let shown = Array(allWeeks.prefix(weeksAsked))
         let listed = shown.reduce(0) { $0 + $1.count }
         return .object(unreadable.merging([
@@ -203,16 +186,9 @@ extension SwiftToolDispatcher {
         return out
     }
 
-    /// WHETHER THE DIARY IS THERE AT ALL. A directory that does not exist is
-    /// `missing` — a brand-new install, or a data root without dreams — and is
-    /// not the same answer as a diary that is present and empty. Only the
-    /// listing can tell `partial` and `unreadable`; those are set at the call
-    /// sites that hold one.
-    static func dreamDiaryStorageFields(dataRoot: URL) -> [String: JSONValue] {
-        let diary = dataRoot.appendingPathComponent("dream_diary", isDirectory: true)
-        var isDirectory: ObjCBool = false
-        let exists = FileManager.default.fileExists(atPath: diary.path, isDirectory: &isDirectory)
-        guard exists, isDirectory.boolValue else {
+    /// Render the availability established by the diary reader.
+    static func dreamDiaryStorageFields(_ storage: String) -> [String: JSONValue] {
+        if storage == "missing" {
             return [
                 "storage": .string("missing"),
                 "note": .string(
@@ -220,10 +196,7 @@ extension SwiftToolDispatcher {
                         + "which is not the same as a diary that could not be read"),
             ]
         }
-        // EXISTING IS NOT READABLE. A directory whose permissions deny a listing
-        // still answers `fileExists`, so the old check labelled it "readable"
-        // and every envelope said the diary was fine. Actually open it.
-        guard (try? FileManager.default.contentsOfDirectory(atPath: diary.path)) != nil else {
+        if storage == "unreadable" {
             return [
                 "storage": .string("unreadable"),
                 "note": .string(
@@ -234,29 +207,17 @@ extension SwiftToolDispatcher {
         return ["storage": .string("readable")]
     }
 
-    /// Archived or not, decided the way the diary decides it: an entry still in
-    /// `dream_diary/` is live, one weekly REM moved into `archive/<year>/` is
-    /// archived. Asked because the reader merges both into one list and the
-    /// merge is exactly what makes "is this still current" unreadable.
-    static func dreamDiaryIsArchived(_ entry: DreamEntry, dataRoot: URL) -> Bool {
-        let name = entry.filename ?? "\(entry.date).md"
-        let live = dataRoot
-            .appendingPathComponent("dream_diary", isDirectory: true)
-            .appendingPathComponent(name)
-        return !FileManager.default.fileExists(atPath: live.path)
-    }
-
     /// One night in the index: the night's dream as Today and the Dreams page
     /// name it (the latest, by `DreamNight`), and every dream of the night when
     /// a later run added one — a re-dream lives inside the night it is about,
     /// so there is no separate day for it.
-    static func dreamDiaryIndexRow(_ entry: DreamEntry, dataRoot: URL) -> JSONValue {
+    static func dreamDiaryIndexRow(_ entry: DreamEntry, activeFilenames: Set<String>) -> JSONValue {
         let night = entry.night
         var row: [String: JSONValue] = [
             "date": .string(entry.date),
             "first_line": .string(String((night.latest.map { $0.title ?? $0.firstLine } ?? "")
                 .prefix(dreamDiaryExcerptCharacters))),
-            "archived": .bool(dreamDiaryIsArchived(entry, dataRoot: dataRoot)),
+            "archived": .bool(!activeFilenames.contains(entry.filename ?? "\(entry.date).md")),
         ]
         if night.dreams.count > 1 {
             row["dreams"] = .array(night.dreams.map { dream in
@@ -271,12 +232,12 @@ extension SwiftToolDispatcher {
     /// The index, grouped by the Dreams page's own rule (`DreamDiaryWeeks`).
     static func dreamDiaryWeeks(
         _ entries: [DreamEntry],
-        dataRoot: URL,
+        activeFilenames: Set<String>,
         now: Date = Date(),
         calendar: Calendar = .current
     ) -> [DreamDiaryWeekGroup] {
         DreamDiaryWeeks.weeks(entries, now: now, calendar: calendar).map { week in
-            DreamDiaryWeekGroup(title: week.title, rows: week.entries.map { dreamDiaryIndexRow($0, dataRoot: dataRoot) })
+            DreamDiaryWeekGroup(title: week.title, rows: week.entries.map { dreamDiaryIndexRow($0, activeFilenames: activeFilenames) })
         }
     }
 }

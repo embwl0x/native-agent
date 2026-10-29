@@ -32,11 +32,9 @@ extension ConnectorOAuthRegistry {
         let providerID = normalizedConnectorID(provider)
         guard !providerID.isEmpty else { return nil }
         let path = connectorRegistryPath(root: root)
-        let persistence = SwiftNativePersistenceCore()
-        let current = try await persistence.withFileLock(path) {
+        let current = try await SwiftNativePersistenceCore.withFileLock(path) {
             try readRegistry(at: path)
         }
-        return try checkedConnectorRows(from: current)
-            .first { connectorRow($0, matches: providerID) }
+        return current.first { connectorRow($0, matches: providerID) }
     }
 }

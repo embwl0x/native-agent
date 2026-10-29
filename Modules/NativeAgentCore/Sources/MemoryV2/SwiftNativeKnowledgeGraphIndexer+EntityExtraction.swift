@@ -14,9 +14,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         func add(_ rawName: String, forcedType: String? = nil) {
             guard let name = cleanEntityName(canonicalFileEntityName(rawName)) else { return }
             let type = forcedType ?? inferType(name)
-            // One node per name. The same name under two types ("Agent" as a
-            // person AND a concept) is how the graph grew duplicate hubs; the
-            // first lane to claim a name wins, and people are added first.
+            // One node per name: people are added first, and the first type to claim a name wins.
             let key = name.lowercased()
             guard !seen.contains(key) else { return }
             seen.insert(key)
@@ -26,9 +24,8 @@ extension SwiftNativeKnowledgeGraphIndexer {
         for person in knownPeople where !person.isEmpty && knownTermMentioned(person, in: content) {
             add(person, forcedType: "person")
         }
-        let contentRange = NSRange(content.startIndex..<content.endIndex, in: content)
         for term in knownTerms {
-            if term.regex.firstMatch(in: content, range: contentRange) != nil {
+            if content.range(of: term.pattern, options: [.regularExpression, .caseInsensitive]) != nil {
                 add(term.name, forcedType: term.type)
             }
         }
@@ -43,14 +40,8 @@ extension SwiftNativeKnowledgeGraphIndexer {
         for match in regexMatches(#"\b[A-Za-z0-9_./-]+\.(?:app|md|json|swift|sqlite|mlpackage|mlmodelc)\b"#, in: content) {
             add(match)
         }
-        // User, 2026-09-05: "the graph is probably messed up with the way she
-        // was writing memories." It was: two capitalisation lanes here turned
-        // "Existing", "Fails SOFT" and "VERIFICATION DISCIPLINE" into concept
-        // nodes. People, places and organisations now come from the
-        // on-device name tagger; a capital letter is not an entity.
-        // The people this store is about are known by name, whatever the
-        // tagger makes of a short row: the primary user (and any name the
-        // caller passes) is a person when mentioned whole.
+        // Tag people, places and organisations on-device; capitalization alone does not establish an entity.
+        // Whole mentions of caller-supplied known names identify people regardless of the tagger.
         for (name, type) in taggedNames(in: content, knownPeople: knownPeople) {
             add(name, forcedType: type)
         }
@@ -58,13 +49,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         return Array(ordered.prefix(24))
     }
 
-    /// Named entities the system's tagger is sure of — personal, place and
-    /// organisation names, joined across words ("Ada Lovelace", "New York") —
-    /// minus the shapes it gets wrong on short memory rows. Every rule in
-    /// `taggedNameIsCredible` is a failure observed in the live store on
-    /// 2026-09-05 ("Judge", "Nudge", "KG upgrades", "Greet User", "AI", "the
-    /// Sky", "Pacific time", "Agentic Systems Architect"). User: "Memory is
-    /// important. Get this right."
+    /// Tagged personal, place and organisation names pass credibility filters for short memory rows.
     private nonisolated static func taggedNames(
         in content: String,
         knownPeople: [String]
@@ -143,14 +128,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
            name.rangeOfCharacter(from: .lowercaseLetters) == nil {
             return false
         }
-        // 2026-09-06: the same acronym glued to its neighbour. On "Codex SSHes
-        // into the VM through an SSH Bridge" the tagger returns "Codex SSHes"
-        // and "SSH Bridge" as organisations: a verb-inflected acronym, and an
-        // acronym plus the next capital. `isAcronymInflectedToken` only ever
-        // guarded the title-case lane, which was removed in v5, so nothing
-        // caught these once people/places/organisations came from the tagger.
-        // An acronym is not an organisation on its own (rule above); it does
-        // not become one by acquiring a neighbour.
+        // Acronyms and verb-inflected acronyms do not become organisation names by acquiring a neighbour.
         if tokens.count > 1, tokens.contains(where: isAcronymFragmentToken) {
             return false
         }
@@ -182,7 +160,6 @@ extension SwiftNativeKnowledgeGraphIndexer {
             // sister,", "Sarah's birthday", "Sarah and Mike". The imperative
             // mistakes ("Judge glass…", "Nudge it…", "Greet User") put a noun,
             // pronoun, determiner or adjective right after the word instead.
-            // (Codex review 2026-09-05: the blanket rule rejected new people.)
             if type == "person" {
                 let rest = content[range.upperBound...]
                 let trimmed = rest.drop(while: { $0 == " " })
@@ -279,10 +256,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         return canonicalPersonaDocuments[upper] ?? raw
     }
 
-    /// A token the tagger should not have joined to a neighbour: a short
-    /// all-caps acronym ("SSH", "VM" — the same shape and bound the
-    /// single-token acronym rule rejects) or one inflected as a verb
-    /// ("SSHes"). 2026-09-06.
+    /// A short all-caps acronym ("SSH", "VM") or verb-inflected acronym ("SSHes") cannot join a neighbour's name.
     private nonisolated static func isAcronymFragmentToken(_ token: String) -> Bool {
         let letters = token.filter(\.isLetter)
         guard letters.count >= 2 else { return false }
@@ -318,7 +292,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         return "concept"
     }
 
-    private static let knownTerms: [(name: String, type: String, regex: NSRegularExpression)] = [
+    private static let knownTerms: [(name: String, type: String, pattern: String)] = [
         ("NativeAgent", "project"),
         ("Claude", "tool"),
         ("GPT", "tool"),
@@ -349,10 +323,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         ("GROWTH.md", "tool"),
         ("AGENTS.md", "tool"),
     ].map { name, type in
-        (name, type, try! NSRegularExpression(
-            pattern: "\\b" + NSRegularExpression.escapedPattern(for: name) + "\\b",
-            options: [.caseInsensitive]
-        ))
+        (name, type, "\\b" + NSRegularExpression.escapedPattern(for: name) + "\\b")
     }
 
     private static let canonicalPersonaDocuments: [String: String] = [
@@ -369,20 +340,10 @@ extension SwiftNativeKnowledgeGraphIndexer {
         "ok", "okay", "on", "or", "so", "that", "the", "then", "there",
         "this", "to", "we", "what", "when", "why", "yeah", "yes", "you",
         "your", "user", "the user",
-        // 2026-07-02 audit: the daemon-era extractor let bare pronouns
-        // become concept entities ("You" ×8, "We" ×4, "He" ×1 purged from
-        // the live graph). The list above already blocked we/you; close
-        // the rest of the pronoun class so no capture path can mint one.
+        // Bare pronouns cannot become concept entities through any capture path.
         "he", "she", "her", "him", "his", "hers", "they", "them", "their",
         "theirs", "us", "our", "ours", "me", "my", "mine", "these", "those",
-        // 2026-07-21 audit: the capitalized-phrase regex mints any
-        // sentence-initial capitalized word as an entity, so calendar words
-        // and sentence-initial imperative/filler words became junk concept
-        // entities ("Today", "Remember", "Update", "Monday", "January").
-        // Same whole-phrase lowercase match as the pronoun class above — a
-        // word here can never be minted as a standalone entity, but a real
-        // multi-word name containing it ("May Lee") still can.
-        // Days + months (full and common abbreviated forms).
+        // Whole-phrase stopwords exclude standalone calendar and filler words while allowing names such as "May Lee".
         "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
         "sunday", "january", "february", "march", "april", "may", "june",
         "july", "august", "september", "october", "november", "december",
@@ -393,10 +354,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         "last", "first", "finally", "also", "just", "still", "again",
         "remember", "reminder", "update", "updated", "note", "noted",
         "todo", "fyi", "btw",
-        // Fresh-install evidence (2026-07-25): repetition alone must not
-        // rehabilitate common sentence-leading verbs, emphasis adjectives,
-        // or spelled-out counts as named entities. Multiword names remain
-        // unaffected because stopwords are matched against the whole phrase.
+        // Repetition cannot make common verbs, emphasis adjectives or spelled-out counts standalone named entities.
         "do", "done", "expected", "hard", "nightly", "rewrote",
         "one", "two", "three", "four", "five", "six",
         "seven", "eight", "nine", "ten", "eleven", "twelve",

@@ -9,10 +9,8 @@ DMG=""
 RECEIPT=""
 SOURCE_REVISION=""
 VERSION=""
-# internal-build-seat-hygiene item 1: the human-visible CFBundleShortVersionString
-# of the bundle inside this DMG. Non-publish lanes suffix it with
-# -dev.<short8sha>[.dirty]; publish lanes keep it bare. Defaults to $VERSION so
-# an older caller keeps producing an identical attestation.
+# Human-visible CFBundleShortVersionString, including the internal-build suffix.
+# Defaults to $VERSION.
 SHORT_VERSION=""
 OUTPUT=""
 DMG_SIGNATURE_REQUIRED=""
@@ -68,17 +66,13 @@ jq -e \
   '.schema_version == 1
    and .source_revision == $revision
    and .source_dirty == false
-   and ((.canonical_gate == "script/test.sh" and .ios_required == true and .ios_result == "passed")
-        or (.canonical_gate == "script/release.sh --artifact-only" and .ios_required == false and .ios_result == "not_run"))
+   and (.canonical_gate == "script/release.sh --artifact-only" and .ios_required == false and .ios_result == "not_run")
    and (.completed_at | type == "string" and length > 0)' \
   "$RECEIPT" >/dev/null \
-  || fail "test receipt does not prove the exact clean source and required iOS gate"
+  || fail "release receipt does not prove the exact clean source and artifact gate"
 
 DMG_SHA256="$(shasum -a 256 "$DMG" | awk '{print $1}')"
 RECEIPT_SHA256="$(shasum -a 256 "$RECEIPT" | awk '{print $1}')"
-RECEIPT_GATE="$(jq -r '.canonical_gate' "$RECEIPT")"
-RECEIPT_IOS_REQUIRED="$(jq -r '.ios_required' "$RECEIPT")"
-RECEIPT_IOS_RESULT="$(jq -r '.ios_result' "$RECEIPT")"
 DMG_BYTES="$(wc -c < "$DMG" | tr -d '[:space:]')"
 CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 mkdir -p "$(dirname "$OUTPUT")"
@@ -86,16 +80,13 @@ TMP="$OUTPUT.tmp.$$"
 trap 'rm -f "$TMP"' EXIT
 
 jq -n \
+  --slurpfile receipt "$RECEIPT" \
   --arg version "$VERSION" \
   --arg short_version "$SHORT_VERSION" \
   --argjson internal_build "$INTERNAL_BUILD" \
   --arg source_revision "$SOURCE_REVISION" \
   --arg created_at "$CREATED_AT" \
   --arg receipt_sha256 "$RECEIPT_SHA256" \
-  --arg receipt_gate "$RECEIPT_GATE" \
-  --argjson receipt_ios_required "$RECEIPT_IOS_REQUIRED" \
-  --arg receipt_ios_result "$RECEIPT_IOS_RESULT" \
-  --arg receipt_completed_at "$(jq -r '.completed_at' "$RECEIPT")" \
   --arg dmg_name "$(basename "$DMG")" \
   --arg dmg_sha256 "$DMG_SHA256" \
   --argjson dmg_bytes "$DMG_BYTES" \
@@ -111,11 +102,11 @@ jq -n \
     created_at: $created_at,
     test_receipt: {
       sha256: $receipt_sha256,
-      canonical_gate: $receipt_gate,
+      canonical_gate: $receipt[0].canonical_gate,
       source_dirty: false,
-      ios_required: $receipt_ios_required,
-      ios_result: $receipt_ios_result,
-      completed_at: $receipt_completed_at
+      ios_required: $receipt[0].ios_required,
+      ios_result: $receipt[0].ios_result,
+      completed_at: $receipt[0].completed_at
     },
     dmg: {
       name: $dmg_name,

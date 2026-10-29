@@ -5,14 +5,14 @@ import TrustCenter
 
 /// Assembles current-task provenance; TrustCenter alone evaluates authority.
 public enum ChatFullMacYoloAdmission {
-    public static func admitted(tool: String, surface: String, dataRoot: URL, source: String) async -> Bool {
+    public static func admitted(surface: String, dataRoot: URL, source: String,
+                                snapshot: TrustPolicyAuthorizationSnapshot? = nil) async -> Bool {
         var origin = SecurityOriginContext.currentTurn(
             verifiedSessionId: ChatToolSessionContext.verifiedSessionId, surface: surface
         )
         origin.source = source
         let authority = await SwiftNativeSecurityCenter(dataRoot: dataRoot).fullMacYoloAuthority(
-            tool: tool,
-            origin: origin
+            origin: origin, snapshot: snapshot
         )
         return authority.admitted
     }

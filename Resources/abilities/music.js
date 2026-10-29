@@ -1,5 +1,5 @@
 /* NativeAgent ability
-{"id": "music", "kind": "tool", "version": 1, "reach": {"capabilities": ["app_write:com.apple.Music"]}, "face": {"page": "music"}, "record": {"description": "Control Music playback, resolve an exact library track, and verify playback through the read-only music-library part.", "actions": ["authored.music-library"], "inputSchema": {"type": "object", "properties": {"operation": {"type": "string", "enum": ["control"]}, "input": {"type": "object"}}, "required": ["operation", "input"], "additionalProperties": false}}}
+{"id": "music", "kind": "tool", "version": 1, "reach": {"capabilities": ["app_write:com.apple.Music"]}, "face": {"page": "music"}, "record": {"description": "Play, pause, stop or skip Music; bound play with seconds through the native player call, resolve an exact library track, and read playback through music-library.", "actions": ["authored.music-library"], "inputSchema": {"type": "object", "properties": {"operation": {"type": "string", "enum": ["control"]}, "input": {"type": "object"}}, "required": ["operation", "input"], "additionalProperties": false}}}
 */
 const text = value => ["string", "number", "boolean"].includes(typeof value) ? String(value) : "";
 const named = value => text(value).trim();
@@ -52,25 +52,42 @@ function pickTrack(name, artist) {
 function control(input) {
     const playlist = named(input.playlist), track = named(input.track === undefined ? (input.song === undefined ? input.query : input.song) : input.track), artist = named(input.artist);
     const action = named(input.action).toLowerCase() || (playlist || track ? "play" : "");
-    if (!action) return {status:"completed", action_performed:"none", now_playing:nowPlaying(), actions:"action play/pause/toggle/next/previous, or playlist or track (with artist) to play one by name"};
-    let command;
+    const seconds = input.seconds;
+    if (seconds !== undefined && (!Number.isInteger(seconds) || seconds < 1 || seconds > 30 || !["play", "resume", "start"].includes(action)))
+        return Object.assign(failed("invalid_seconds"), {fix:"seconds takes a whole number from 1 through 30 with play only."});
+    if (!action) return {status:"completed", action_performed:"none", now_playing:nowPlaying(), actions:"action play/pause/stop/toggle/next/previous, or playlist or track (with artist) to play one by name; play takes seconds (1–30) and stops itself"};
+    let command, selectedID;
     if (["play", "resume", "start"].includes(action)) {
-        if (playlist) command = playlistCommand(playlist);
+        if (playlist) command = playlistCommand(playlist, seconds !== undefined);
         else if (track) {
             const pick = pickTrack(track, artist);
             if (pick.refusal) return pick.refusal;
-            command = 'play (first track of library playlist 1 whose persistent ID is "' + escape(pick.id) + '")';
-        } else command = "play";
-    } else if (["pause", "stop"].includes(action)) command = "pause";
+            selectedID = pick.id;
+            command = 'play (first track of library playlist 1 whose persistent ID is "' + escape(pick.id) + '")' + (seconds !== undefined ? " with once" : "");
+        } else command = seconds !== undefined ? "play current track with once" : "play";
+    } else if (action === "pause") command = "pause";
+    else if (action === "stop") command = "stop";
     else if (["toggle", "playpause", "play_pause"].includes(action)) command = "playpause";
     else if (["next", "next_track", "skip", "forward"].includes(action)) command = "next track";
     else if (["previous", "prev", "previous_track", "back", "restart"].includes(action)) command = "previous track";
-    else return Object.assign(failed("unknown_action"), {fix:"Say play, pause, toggle, next or previous, or give playlist or track to play one by name."});
+    else return Object.assign(failed("unknown_action"), {fix:"Say play, pause, stop, toggle, next or previous, or give playlist or track to play one by name."});
     let receipt;
-    try { receipt = host.apps.call({bundle_id:"com.apple.Music", script:controlScript(command), launch:true, read_only:false}); }
+    if (seconds !== undefined) {
+        // Resolve the expected song before any playback effect, including the
+        // playlist's first song irrespective of Music's shuffle setting.
+        if (!selectedID) {
+            const selected = script(playlist ? playlistCommand(playlist, true) : 'return "selected|||" & (persistent ID of current track)', true);
+            if (!selected.startsWith("selected|||")) return Object.assign(failed("playlist_selection_failed"), {detail:selected});
+            selectedID = selected.slice(11);
+        }
+        command = 'play (first track of library playlist 1 whose persistent ID is "' + escape(selectedID) + '") with once';
+    }
+    const call = {bundle_id:"com.apple.Music", script:controlScript(command, seconds !== undefined), launch:true, read_only:false};
+    if (seconds !== undefined) Object.assign(call, {seconds, track_id:selectedID});
+    try { receipt = host.apps.call(call); }
     catch (error) {
         const result = error.receipt && error.receipt.result;
-        if (result && result.code === -1728 && (playlist || track)) return {status:"failed", integration:"music", reason:"not_found",
+        if (result && result.code === -1728 && error.receipt.effects === "none" && (playlist || track)) return {status:"failed", integration:"music", reason:"not_found",
             fix:'Nothing in the library matches "' + (playlist || track) + '". music_list_playlists or music_search_library shows the exact names. Search the Apple Music catalog in Music if available, or play it in an existing Chrome tab using browser actions.', evidence:error.receipt};
         return errorResult(error);
     }
@@ -83,17 +100,22 @@ function control(input) {
     const now = nowPlaying();
     // The act's receipt stays true even when its separate readback fails.
     const result = {status:"completed", action_performed:action, effects:receipt.effects, control_receipt:receipt, now_playing:now};
+    if (seconds !== undefined) {
+        result.seconds = seconds;
+        result.bounded_outcome = receipt.bounded_outcome;
+        if (receipt.cancelled) Object.assign(result, {status:"cancelled", reason:"cancelled"});
+    }
     if (playlist) result.playlist = playlist;
     if (track) result.track = track;
     if (now.status !== "completed") return result;
-    const notStarted = ["play", "resume", "start"].includes(action) && !(now.isPlaying && now.track);
+    const notStarted = ["play", "resume", "start"].includes(action) && (seconds !== undefined ? !raw.startsWith("ok|||") : !(now.isPlaying && now.track));
     if (notStarted) Object.assign(result, {status:"failed", reason:"playback_not_started", fix:"Music has not started a track. Open Music and check that the selection is playable."});
     return result;
 }
 
-function controlScript(command) { return `
+function controlScript(command, bounded) { return `
     ${command}
-    return "ok"
+    ${bounded ? 'repeat 30 times\n        if player state is playing then exit repeat\n        delay 0.1\n    end repeat\n    if player state is not playing then return "not_started"\n    set player position to 0\n    return "ok|||" & (persistent ID of current track)' : 'return "ok"'}
 
 `; }
 
@@ -112,7 +134,7 @@ with timeout of 10 seconds
 end timeout
 `; }
 
-function playlistCommand(playlist) { return `
+function playlistCommand(playlist, bounded) { return `
 set matchingPlaylists to (every playlist whose name is "${escape(playlist)}")
 if (count of matchingPlaylists) is 0 then
     set suggestions to ""
@@ -124,7 +146,7 @@ if (count of matchingPlaylists) is 0 then
     return "missing_playlist|||" & suggestions
 end if
 if (count of matchingPlaylists) > 1 then return "ambiguous_playlist|||"
-play item 1 of matchingPlaylists
+${bounded ? 'return "selected|||" & (persistent ID of track 1 of (item 1 of matchingPlaylists))' : 'play item 1 of matchingPlaylists'}
 `; }
 function nowPlaying() {
     const result = part.call("music-library", {operation:"now_playing", input:{}});

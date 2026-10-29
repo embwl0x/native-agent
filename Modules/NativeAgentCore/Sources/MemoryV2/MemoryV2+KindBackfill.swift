@@ -1,25 +1,13 @@
-// U3 wave-2 item 5b (2026-06-10): approval-gated LLM kind backfill for the
-// legacy kind-less rows (32 at audit time).
-//
-// Decay/supersession shipped in wave 1 but are inert because no live row
-// carries metadata.kind. This stages ONE inbox approval card proposing an
-// LLM-classified kind per legacy row; apply-on-approve writes metadata.kind
-// through the store's own write path. NOTHING mutates silently — kinds/rates
-// are Agent/user-owned semantics (u3-memory-quality hard constraint).
+// Kind backfill stages one approval card; only approval writes the proposed kinds through the store.
+// Kinds and decay rates belong to the agent and user.
 //
 // Backfill owns its stamp-file idempotence and pending-approval recovery
 // scan; card id == approval id so InboxView's approve/reject routes through
 // resolveApproval(id); `canceled` clears the stamp (re-stages next pass),
 // `denied` keeps it (a refused backfill is never re-proposed).
 //
-// Module boundary (UPDATED 2026-06-10, wave-2 integration decision): the
-// old "MemoryV2 never imports ApprovalInbox" rule is RETIRED — ApprovalInbox
-// is a leaf module (PersistenceCore only, no cycle) and the consolidation
-// gate now uses SwiftNativeApprovalInbox directly. This file predates that
-// call and keeps the closure-injection shape (approval RECORD create +
-// pending-scan injected by the app layer): it works, it's tested, and
-// rewriting it buys nothing. New MemoryV2 code may import ApprovalInbox
-// directly. The visible inbox CARD is written through LiveNotificationInbox;
+// Approval creation and pending scans are injected by the app layer.
+// The visible inbox CARD is written through LiveNotificationInbox;
 // the resolveApproval dispatch branch for `action` lives in the app
 // layer (NativeClient).
 
@@ -28,21 +16,20 @@ import GRDB
 import NativeAgentCore
 import NotificationInbox
 import PersistenceCore
+import NativeAgentShared
 
 // Blueprint: | `MemoryV2+KindBackfill.swift` | `MemoryKindBackfill`: approval-staged legacy row classifications and checked apply through canonical storage |
 
 /// Staging stamps: local backup/export and memory PrivacyMap, no phone sync.
 public enum MemoryKindBackfill {
 
-    /// Approval action id. Distinct from wave-1's "memory.repair" so the
-    /// existing repair executor can never half-fire on this payload.
+    /// A distinct action id keeps kind backfill separate from memory repair.
     public static let action = "memory.kind_backfill"
 
-    /// Payload discriminator (mirrors the wave-1 payload "kind" convention).
+    /// Payload discriminator.
     public static let payloadKindValue = "memory.kind_backfill.rows"
 
-    /// Stamp kind under <dataRoot>/memory/repairs/ (same idempotence dir the
-    /// wave-1 stagers use).
+    /// Stamp kind under <dataRoot>/memory/repairs/.
     public static let stampKind = "memory.kind_backfill"
 
     // MARK: - Row proposal
@@ -84,7 +71,7 @@ public enum MemoryKindBackfill {
     /// dropped from the card by `classify` below, never coerced to a
     /// default label; fix-round finding 1). Fail-safe, never fail-wrong.
     public static func foundationModelsClassifier(content: String, taxonomy: [String]) async throws -> String {
-        try await AppleFoundationModelsAdapter.classify(content: content, into: taxonomy)
+        try await OnDeviceClassification.classify(content: content, into: taxonomy)
     }
 
     /// Classify rows into the canonical taxonomy. Per-row failures or
@@ -111,8 +98,7 @@ public enum MemoryKindBackfill {
 
     // MARK: - Staging
 
-    /// Idempotent staging entry point (call on launch, after the wave-1
-    /// repair stagers). Returns the approval id when a card exists after
+    /// Idempotent staging entry point. Returns the approval id when a card exists after
     /// this call (fresh or reused), nil when there was nothing to stage or
     /// staging failed (no stamp is written on failure — retried next pass).
     ///
@@ -166,11 +152,9 @@ public enum MemoryKindBackfill {
         guard !rows.isEmpty else { return nil }
 
         let title = "Memory: classify \(rows.count) legacy memories into kinds"
-        let reason = "These memories carry no kind, so the kind-scoped decay and "
-            + "supersession semantics you approved can't see them. Approve to stamp each row "
-            + "with the LLM-proposed kind listed (metadata only — content, embeddings and "
-            + "ranking inputs other than kind are untouched, written through the normal memory "
-            + "write path); deny to leave every row exactly as it is."
+        let reason = "Approve to classify these memories with the proposed kinds through the normal memory write path. "
+            + "Only kind metadata changes; content and embeddings stay intact. Replacement still requires explicit, "
+            + "fingerprinted intent. Deny to leave every row as it is."
         let body: JSONValue = .object([
             "title": .string(title),
             "action": .string(action),
@@ -180,8 +164,7 @@ public enum MemoryKindBackfill {
         ])
         do {
             let approvalId = try await createApproval(body)
-            // Card failure fails the stage (no stamp) — a stamped backfill
-            // with no visible card would be invisible forever (wave-1 rule).
+            // Card failure leaves no stamp so an invisible backfill cannot block restaging.
             try await ensureInboxCard(dataRoot: dataRoot, approvalId: approvalId, rows: rows)
             writeStamp(approvalId: approvalId, dataRoot: dataRoot)
             return approvalId
@@ -322,7 +305,7 @@ public enum MemoryKindBackfill {
         try await LiveNotificationInbox.live(dataRoot: dataRoot).appendUnique(card, id: approvalId)
     }
 
-    // MARK: - Stamps (idempotence + cancel-restage; wave-1 shape)
+    // MARK: - Stamps (idempotence + cancel-restage)
 
     public static func stampPath(dataRoot: URL) -> URL {
         dataRoot
@@ -347,9 +330,7 @@ public enum MemoryKindBackfill {
             "staged_at": .string(MemoryStorage.nowISO8601()),
         ])
         do {
-            try FileManager.default.createDirectory(
-                at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try stamp.serializedData(pretty: true).write(to: path, options: .atomic)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(stamp.serializedData(pretty: true), to: path)
         } catch {
             nativeLog("[kindBackfill] stamp write failed: \(String(describing: error))")
         }

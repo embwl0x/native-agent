@@ -18,33 +18,17 @@ struct WorkshopView: View {
     @State private var notifiedTaskUnavailable = false
     @State private var didResolveNotifiedTask = false
     private let notifiedTaskID: String?
-    /// `false` when pushed as a NavigationLink destination from another
-    /// NavigationStack (the More hub). Nesting NavigationStacks makes the
-    /// destination render and immediately pop back — the same trap
-    /// SkillsToolsView and MemoryView already avoid this way.
-    private let embedInNavigationStack: Bool
-
-    init(embedInNavigationStack: Bool = true, notifiedTaskID: String? = nil) {
-        self.embedInNavigationStack = embedInNavigationStack
+    init(notifiedTaskID: String? = nil) {
         self.notifiedTaskID = notifiedTaskID
     }
 
     var body: some View {
-        if embedInNavigationStack {
-            NavigationStack { workshopContent }
-                .alert("Error", isPresented: .constant(store.error != nil), actions: {
-                    Button("OK") { store.error = nil }
-                }, message: {
-                    Text(store.error ?? "")
-                })
-        } else {
-            workshopContent
-                .alert("Error", isPresented: .constant(store.error != nil), actions: {
-                    Button("OK") { store.error = nil }
-                }, message: {
-                    Text(store.error ?? "")
-                })
-        }
+        workshopContent
+            .alert("Error", isPresented: .constant(store.error != nil), actions: {
+                Button("OK") { store.error = nil }
+            }, message: {
+                Text(store.error ?? "")
+            })
     }
 
     private var presentation: WorkshopContentPresentation {
@@ -195,11 +179,11 @@ struct WorkshopView: View {
             }
             HStack(spacing: 10) {
                 Button {
-                    Task { _ = await store.approveWorkshopTask(task) }
+                    Task { _ = await store.decideWorkshopStep(task, approve: true) }
                 } label: { Text("Approve").frame(minWidth: 72) }
                     .alivePrimaryButton()
                 Button(role: .destructive) {
-                    Task { _ = await store.rejectWorkshopTask(task) }
+                    Task { _ = await store.decideWorkshopStep(task, approve: false) }
                 } label: { Text("Reject").frame(minWidth: 72) }
                     .aliveSecondaryButton()
             }
@@ -310,7 +294,7 @@ final class WorkshopStore: ObservableObject {
         }
     }
 
-    func approveWorkshopTask(_ task: WorkshopTaskRecord) async -> Bool {
+    func decideWorkshopStep(_ task: WorkshopTaskRecord, approve: Bool) async -> Bool {
         // Screenshot fixtures (-deskSample) never send anything to the Mac.
         if MobileDeskSample.mode != nil { return false }
         guard let stepId = task.currentStepId?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -321,27 +305,7 @@ final class WorkshopStore: ObservableObject {
             return false
         }
         do {
-            try await iCloudSyncEngine.shared.approveStep(executionId: task.id, stepId: stepId)
-            await refresh()
-            return true
-        } catch {
-            self.error = error.localizedDescription
-            return false
-        }
-    }
-
-    func rejectWorkshopTask(_ task: WorkshopTaskRecord) async -> Bool {
-        // Screenshot fixtures (-deskSample) never send anything to the Mac.
-        if MobileDeskSample.mode != nil { return false }
-        guard let stepId = task.currentStepId?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !stepId.isEmpty,
-              stepId.lowercased() != "pending"
-        else {
-            self.error = "This task snapshot does not include the pending step id yet. Refresh and try again."
-            return false
-        }
-        do {
-            try await iCloudSyncEngine.shared.rejectStep(executionId: task.id, stepId: stepId)
+            try await iCloudSyncEngine.shared.decideWorkshopStep(executionId: task.id, stepId: stepId, approve: approve)
             await refresh()
             return true
         } catch {
@@ -456,6 +420,14 @@ struct WorkshopTaskDetailSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var isWorking = false
 
+    private func decideStep(approve: Bool) {
+        Task {
+            isWorking = true
+            defer { isWorking = false }
+            if await store.decideWorkshopStep(task, approve: approve) { dismiss() }
+        }
+    }
+
     var body: some View {
         NavigationStack {
             AlivePage(title: task.title, line: task.requiresApproval == true ? "Needs your yes" : DeskStatusWords.word(for: task.status), style: .pushed) {
@@ -463,21 +435,13 @@ struct WorkshopTaskDetailSheet: View {
                 if task.requiresApproval == true {
                     HStack(spacing: 10) {
                         Button {
-                            Task {
-                                isWorking = true
-                                if await store.approveWorkshopTask(task) { dismiss() }
-                                isWorking = false
-                            }
+                            decideStep(approve: true)
                         } label: {
                             Text("Approve Step").frame(maxWidth: .infinity)
                         }
                         .alivePrimaryButton()
                         Button(role: .destructive) {
-                            Task {
-                                isWorking = true
-                                if await store.rejectWorkshopTask(task) { dismiss() }
-                                isWorking = false
-                            }
+                            decideStep(approve: false)
                         } label: {
                             Text("Reject Step").frame(maxWidth: .infinity)
                         }
@@ -544,8 +508,7 @@ struct NewWorkshopTaskSheet: View {
     @State private var title = ""
     @State private var objective = ""
     @State private var isSubmitting = false
-    // 2026-09-06: one sheet submission owns one action across uncertain sends.
-    // A new sheet is an explicitly new task, even with identical wording.
+    // Each sheet owns one action across uncertain sends; a new sheet is a new task.
     @State private var submission: InboxAction?
 
     var body: some View {
@@ -567,7 +530,7 @@ struct NewWorkshopTaskSheet: View {
                     Task {
                         guard !isSubmitting else { return }
                         isSubmitting = true
-                        // 2026-09-06: only the first send from this sheet is a new request.
+                        // Only the first send from this sheet is a new request.
                         let intentionalNewRequest = submission == nil
                         if submission == nil {
                             submission = .make(action: "submitWorkshopTask", payload: [
@@ -613,16 +576,6 @@ struct NewWorkshopTaskSheet: View {
 
 struct StatusBadge: View {
     let status: String
-
-    var color: Color {
-        switch status.lowercased() {
-        case "active", "running", "succeeded": return .green
-        case "done", "completed": return .blue
-        case "blocked", "failed", "error", "timeout": return .red
-        case "queued", "paused": return .orange
-        default: return .secondary
-        }
-    }
 
     var body: some View {
         Text(DeskStatusWords.word(for: status))

@@ -1,9 +1,10 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 
 // Blueprint: | `CognitiveModels.swift` | `CognitiveNode`, snapshots and `CognitiveFrozenRead`: source/subject identity, bounded emotional tags, association edges and persistence health values |
 
-public enum CognitiveSourceClass: String, Sendable, Equatable, CaseIterable {
+public enum CognitiveSourceClass: String, Codable, Sendable, Equatable, CaseIterable {
     case observed
     case userStated
     case inferred
@@ -26,7 +27,7 @@ public enum CognitiveNodeKind: String, Sendable, Equatable, CaseIterable {
     case feltResolution
 }
 
-public struct CognitiveSubjectReference: Sendable, Hashable, Equatable {
+public struct CognitiveSubjectReference: Codable, Sendable, Hashable, Equatable {
     public var type: String
     public var id: String
     public var label: String?
@@ -57,16 +58,13 @@ public struct CognitiveNode: Sendable, Equatable, Identifiable {
     public var summary: String
     public var metadata: [String: JSONValue]
 
-    // MARK: - Emotional tag (Wave A)
-    // A persistent per-node FEELING, stamped from the substrate's live affect at
-    // encode and asymmetrically blended toward the current moment on re-activation.
-    // Backed by private storage so every write clamps into its welfare-bounded range
-    // (a tag can never leave its range no matter how it's mutated). Defaults are the
-    // neutral 0 point so pre-tag nodes restored from an older schema are fully
-    // backward-compatible.
+    // Emotional tags default to neutral, clamp every write and blend asymmetrically on reactivation.
     private var _emotionalValence: Double
     private var _emotionalArousal: Double
     private var _emotionalWarmth: Double
+    /// The fold seq of the last lived moment that stamped or reconsolidated
+    /// this node's feeling (`lived_seq`, migration v9). nil: none.
+    public var livedSeq: UInt64? = nil
 
     /// How positive/negative the moment felt. −1 (aversive) … +1 (positive), 0 neutral.
     public var emotionalValence: Double {
@@ -82,6 +80,18 @@ public struct CognitiveNode: Sendable, Equatable, Identifiable {
     public var emotionalWarmth: Double {
         get { _emotionalWarmth }
         set { _emotionalWarmth = (newValue).clamped01() }
+    }
+
+    enum FeltDirection: String {
+        case warm, stung, charged
+    }
+
+    /// Negative valence takes precedence; neutral tags stay silent.
+    var feltDirection: FeltDirection? {
+        if emotionalValence <= -0.15 { return .stung }
+        if emotionalValence >= 0.15 || emotionalWarmth >= 0.35 { return .warm }
+        if emotionalArousal >= 0.6 { return .charged }
+        return nil
     }
 
     public init(
@@ -119,36 +129,9 @@ public struct CognitiveNode: Sendable, Equatable, Identifiable {
     }
 
     public var turnKind: CognitiveTurnKind {
-        // 2026-09-13 (performance pass 3): the explicit check comes FIRST.
-        // `CognitiveEvent.init` stamps the resolved kind into
-        // `metadata["turnKind"]`, so virtually every node answers from that one
-        // dictionary lookup — and this getter is read in hot substrate loops
-        // (`substrateFatigueProxy`, `soundEchoSelection`, `makeAttentionSignals`,
-        // `stashDelivery`), 337 of one sampled turn's 690 substrate-thread
-        // samples. Inferring first built a signal array over every metadata
-        // value, sorted the keys, and then threw the answer away.
-        // H3 (2026-08-02): an explicit classification is honored in BOTH
-        // directions. This used to discard an explicit `.live` whenever the
-        // inference disagreed, which made the escape hatch one-way: a turn the
-        // originator KNEW was live got re-inferred from its own words and
-        // demoted, while an explicit `.debug` was always respected. Since
-        // `CognitiveEvent.init` stamps the resolved kind into
-        // `metadata["turnKind"]`, that demotion re-fired on every node read,
-        // silently overriding the event's own resolved provenance.
         if let explicit = CognitiveTurnKind.from(metadataValue: metadata[CognitiveTurnKind.metadataKey]) {
             return explicit
         }
-
-        let inferred = CognitiveTurnKind.inferred(fromSignals: [
-            kind.rawValue,
-            subjectReference.type,
-            subjectReference.id,
-            subjectReference.label ?? "",
-            summary,
-        ] + metadata.keys.sorted().flatMap { key -> [String] in
-            [key] + CognitiveMetadataSignals.stringSignals(from: metadata[key] ?? .null)
-        })
-        if inferred != .live { return inferred }
         switch kind {
         case .toolObservation, .providerHealth, .workshopExecution, .appLifecycle, .feltResolution:
             return .system
@@ -207,7 +190,7 @@ public struct CognitiveFeltProxyReads: Sendable, Equatable {
     public static let absent = CognitiveFeltProxyReads()
 }
 
-/// Immutable presentation-only inputs captured with a frozen cognition epoch.
+/// Presentation-only state frozen by value with a cognition epoch.
 /// This is not durable cognition: it only prevents previews or failed provider
 /// calls from consuming cadence or continuity state.
 public struct CognitiveCapsulePresentationState: Sendable, Equatable {
@@ -215,16 +198,12 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
     public var fingerprintCount: Int
     public var fingerprintLastSurfacedAt: Date?
     /// The opening of a gap whose Since line lost the one slot: still owed
-    /// on User's next turn (Phase 5A), whatever his turns since.
+    /// on User's next turn, whatever his turns since.
     public var owedSinceGap: Date?
     public var lastSessionBridgeAt: Date?
-    /// Consecutive accepted turns the "- Settling:" line was presented. Capped
-    /// so a long warm phase over old negative nodes cannot turn the line into a
-    /// standing instruction (W4/P4).
-    public var settlingRun: Int
     /// The worn-token SET the rut nudge last spoke for, and when. The nudge is
     /// change-driven, so it needs to remember what it already said rather than
-    /// re-deriving "a rut exists" every turn (2026-09-01).
+    /// re-deriving "a rut exists" every turn.
     public var soundRutSignature: String?
     public var soundRutLastSurfacedAt: Date?
     /// Accepted live capsules since the rut nudge last spoke. Counted rather
@@ -233,17 +212,11 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
     /// The one early repeat (she fed the rut again after it was named) has
     /// been spent for the current signature; a new signature re-arms it.
     public var soundRutEarlyRepeatSpent: Bool
-    /// PRESENTATION RECEIPTS for the two 2026-09-02 felt-line organs. Both are
-    /// counters, never text: how many accepted capsules carried an OBJECT on the
-    /// felt line, and how many carried the one allowed contradicting second
-    /// word, plus when that last happened. They gate nothing — they exist so
-    /// "did the ambivalence exception ever actually fire, and how often" is a
-    /// measurement rather than a story, which is the failure mode every other
-    /// line on this capsule has already had once.
-    public var feltObjectCount: Int
+    /// Accepted capsules carrying the allowed contradicting second word, and
+    /// when it last appeared. These measure presentation without gating it.
     public var ambivalenceCount: Int
     public var lastAmbivalenceAt: Date?
-    /// REMINDED-OF (2026-09-02). When the unbidden-recall line last spoke, and
+    /// When the unbidden-recall line last spoke, and
     /// how many accepted turns ago — the two halves of "at most once every
     /// `remindedOfMinTurns` turns". `nil` last-surfaced means it has never
     /// spoken, which is eligible.
@@ -257,11 +230,11 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
     /// second unbidden recall, it is a loop. Bounded by
     /// `remindedOfLedgerCapacity`; ids only, never text.
     public var remindedOfSurfaced: [String: Date]
-    /// Phase 5 B1: dream residue phrase id → when it surfaced. The newest
+    /// Dream residue phrase id → when it surfaced. The newest
     /// stamp is the line's cooldown; a phrase never surfaces twice in a
     /// diary's life. Ids only, never text.
     public var dreamThemeSurfaced: [String: Date]
-    /// Cares lane 2: care id → when she last meant to bring it up. It rests
+    /// Care id → when she last meant to bring it up. It rests
     /// 12 h unless it moved again since. Ids only, never text.
     public var careReleased: [String: Date]
     /// Care id → when its plain "On your mind" line showed and how many
@@ -285,12 +258,10 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
         fingerprintLastSurfacedAt: Date? = nil,
         owedSinceGap: Date? = nil,
         lastSessionBridgeAt: Date? = nil,
-        settlingRun: Int = 0,
         soundRutSignature: String? = nil,
         soundRutLastSurfacedAt: Date? = nil,
         soundRutTurnsSinceSurfaced: Int = 0,
         soundRutEarlyRepeatSpent: Bool = false,
-        feltObjectCount: Int = 0,
         ambivalenceCount: Int = 0,
         lastAmbivalenceAt: Date? = nil,
         remindedOfLastSurfacedAt: Date? = nil,
@@ -305,12 +276,10 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
         self.fingerprintLastSurfacedAt = fingerprintLastSurfacedAt
         self.owedSinceGap = owedSinceGap
         self.lastSessionBridgeAt = lastSessionBridgeAt
-        self.settlingRun = max(0, settlingRun)
         self.soundRutSignature = soundRutSignature
         self.soundRutLastSurfacedAt = soundRutLastSurfacedAt
         self.soundRutTurnsSinceSurfaced = max(0, soundRutTurnsSinceSurfaced)
         self.soundRutEarlyRepeatSpent = soundRutEarlyRepeatSpent
-        self.feltObjectCount = max(0, feltObjectCount)
         self.ambivalenceCount = max(0, ambivalenceCount)
         self.lastAmbivalenceAt = lastAmbivalenceAt
         self.remindedOfLastSurfacedAt = remindedOfLastSurfacedAt
@@ -324,7 +293,7 @@ public struct CognitiveCapsulePresentationState: Sendable, Equatable {
 
 public struct CognitiveFrozenRead: Sendable, Equatable {
     public let fixedAt: Date
-    public let stateRevision: UInt64
+    public let mindEpoch: UInt64
     public let configuration: CognitiveConfiguration
     public let personalityDynamics: PersonalityDynamicsConfiguration
     public let snapshot: CognitiveSubstrateSnapshot
@@ -334,13 +303,12 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
     public let feltProxies: CognitiveFeltProxyReads
     public let soundLandingScores: [UUID: Double]
     public let capsulePresentationState: CognitiveCapsulePresentationState
-    public let pendingCompletionOpen: Bool
     public let associationSuppressions: [CognitiveAssociationSuppression]
     public let trustedPeerIds: Set<String>
+    public let cares: [CognitiveCare]
 
     public init(
         fixedAt: Date,
-        stateRevision: UInt64,
         configuration: CognitiveConfiguration,
         personalityDynamics: PersonalityDynamicsConfiguration = .default,
         snapshot: CognitiveSubstrateSnapshot,
@@ -350,12 +318,13 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
         feltProxies: CognitiveFeltProxyReads = .absent,
         soundLandingScores: [UUID: Double] = [:],
         capsulePresentationState: CognitiveCapsulePresentationState = CognitiveCapsulePresentationState(),
-        pendingCompletionOpen: Bool = false,
         associationSuppressions: [CognitiveAssociationSuppression] = [],
-        trustedPeerIds: Set<String> = []
+        trustedPeerIds: Set<String> = [],
+        mindEpoch: UInt64 = 0,
+        cares: [CognitiveCare] = []
     ) {
         self.fixedAt = fixedAt
-        self.stateRevision = stateRevision
+        self.mindEpoch = mindEpoch
         self.configuration = configuration
         self.personalityDynamics = personalityDynamics
         self.snapshot = snapshot
@@ -365,9 +334,9 @@ public struct CognitiveFrozenRead: Sendable, Equatable {
         self.feltProxies = feltProxies
         self.soundLandingScores = soundLandingScores
         self.capsulePresentationState = capsulePresentationState
-        self.pendingCompletionOpen = pendingCompletionOpen
         self.associationSuppressions = associationSuppressions
         self.trustedPeerIds = trustedPeerIds
+        self.cares = cares
     }
 }
 

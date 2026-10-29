@@ -1,14 +1,15 @@
 import Foundation
+import NativeAgentShared
 // Blueprint: | `MacSyncActionRouter+Providers.swift` | `MacSyncActionRouter`: `configureEncryptedProvider`, `startProviderSignIn` |
 
 extension MacSyncActionRouter {
-    /// dispatch has already checked the HMAC and the approved phone signature.
-    /// Keep plaintext scoped to this call; the original envelope stays sealed.
+    /// Phone input travels sealed; after HMAC and approved-phone verification,
+    /// Mac owners apply, store and verify plaintext and issue content-free receipts.
     func configureEncryptedProvider(_ action: InboxAction) async -> [String: String] {
         do {
             guard action.payload.count == 1,
                   let sealed = action.payload[SecretActionEnvelope.field],
-                  let encodedSecret = try PairingSecretManager.existingSecretBase64(),
+                  let encodedSecret = try PairingSecret.existingSecretBase64(),
                   let secret = Data(base64Encoded: encodedSecret) else {
                 return providerFailure("Could not decrypt the credential. Check pairing and try again.")
             }

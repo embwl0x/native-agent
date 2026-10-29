@@ -1,5 +1,4 @@
-// Move-only extraction (tightness Wave C) from CognitionObservatoryView.swift
-
+import NativeAgentShared
 import SwiftUI
 import CognitiveSubstrate
 
@@ -7,17 +6,9 @@ import CognitiveSubstrate
 
 extension CognitionObservatoryView {
 
-    // REM lineage rendering lives in CognitionProposalsView
-    // (Activity surface, B2.4). Identity Proposals were retired after the
-    // liveness audit proved the experimental producer never shipped.
+    // REM lineage renders in CognitionProposalsView on the Activity surface.
 
-    /// THE READOUT, THEN THE RECEIPTS (2026-09-13).
-    ///
-    /// The raw ten-event list below answers "what happened", in event order,
-    /// with truncated summaries and lineage ids — which is the material a
-    /// reader has to reconstruct a week FROM, not an answer to "what changed".
-    /// The week's rows go on top: one line per lesson or view, its outcome in
-    /// words, and the passage that formed it. Bounded, no charts.
+    /// Weekly lessons, outcomes and forming passages precede the raw event receipts.
     @ViewBuilder
     func growthWeekReadout(_ week: CognitiveGrowthWeek) -> some View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {

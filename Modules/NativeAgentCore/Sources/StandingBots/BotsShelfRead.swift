@@ -1,6 +1,6 @@
 import Foundation
 import NativeAgentCore
-// Blueprint: | `BotsShelfRead.swift` | Shelf and Desk consume `BotRunnerScheduler.Projection`; one running/queued/model-choice/pause/run-status classification for Mac, quiet reads and iPhone; approval and run-feed read models |
+// Blueprint: | `BotsShelfRead.swift` | Shelf and Desk consume `BotRunnerScheduler.BotSchedule`; one running/queued/model-choice/pause/run-status classification for Mac, quiet reads and iPhone; approval and run-feed read models |
 
 /// A bot occurrence that never ran, for the Desk's schedule fold. Read-only.
 public struct DeskMissedBot: Identifiable, Equatable, Sendable {
@@ -9,7 +9,7 @@ public struct DeskMissedBot: Identifiable, Equatable, Sendable {
     public let line: String
     public let dueAt: Date
 
-    public static func load(root: URL, timing: BotRunnerScheduler.Projection) -> [DeskMissedBot] {
+    public static func load(root: URL, timing: BotRunnerScheduler.BotSchedule) -> [DeskMissedBot] {
         let missed = timing.missed
         guard !missed.isEmpty,
               let bots = try? BotDefinitionStore(dataRoot: root).list() else { return [] }
@@ -28,7 +28,7 @@ public struct DeskTimedBot: Identifiable, Equatable, Sendable {
     public let line: String
     public let nextRun: Date?
 
-    public static func load(root: URL, timing: BotRunnerScheduler.Projection) -> [DeskTimedBot] {
+    public static func load(root: URL, timing: BotRunnerScheduler.BotSchedule) -> [DeskTimedBot] {
         guard let bots = try? BotDefinitionStore(dataRoot: root).list() else { return [] }
         return bots.filter { !$0.paused && $0.cadence != .manual }.map { bot in
             DeskTimedBot(id: bot.id, name: bot.name, line: BotsShelfRecord.cadence(bot.cadence) + ".", nextRun: timing.dates[bot.id])
@@ -68,7 +68,7 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
         if queued { return .queued }
         if needsModelChoice { return .needsModelChoice }
         if definition.paused { return .paused }
-        guard let latest = entries.max(by: { $0.runAt < $1.runAt }) else { return .new }
+        guard let latest = latestEntry else { return .new }
         switch latest.runtimeStatus {
         case .waitingForApproval: return .waitingForApproval
         case .waitingOnPerson: return .waitingOnPerson
@@ -87,6 +87,8 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
         return "Missed \(Self.metadataDate(missed.dueAt)) · \(missed.words)"
     }
     public var sortedEntries: [ShelfEntry] { entries.sorted { $0.runAt > $1.runAt } }
+    /// Equal timestamps retain the first entry in recorded order.
+    public var latestEntry: ShelfEntry? { entries.max { $0.runAt < $1.runAt } }
     public var id: UUID { definition.id }
     public var needsModelChoice: Bool { definition.needsModelChoice }
     public static func shortDate(_ date: Date) -> String { metadataDate(date) }
@@ -138,7 +140,7 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
     /// "Last Sep 10 at 1:47 AM · Next Sep 17 at 1:47 AM", or the part that exists.
     public var timingLine: String {
         var parts: [String] = []
-        if let last = sortedEntries.first { parts.append("Last \(Self.metadataDate(last.runAt))") }
+        if let last = latestEntry { parts.append("Last \(Self.metadataDate(last.runAt))") }
         if let nextRun {
             parts.append("Next \(Self.metadataDate(nextRun))")
         }
@@ -147,7 +149,7 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
     /// "Sep 10 at 1:47 AM · Blocked. I don't have a headless fetch tool": when it last
     /// spoke and the first line of what it said, so a card is never just a timestamp.
     public var lastOutcomeLine: String {
-        guard let last = sortedEntries.first else { return "No runs yet" }
+        guard let last = latestEntry else { return "No runs yet" }
         let firstLine = last.actualReply.split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .first { !$0.isEmpty }?.replacingOccurrences(of: "**", with: "")
@@ -155,8 +157,7 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
         switch last.runtimeStatus {
         case .completed: said = firstLine.map { "Reply saved: " + $0 } ?? (last.runHealth == .nothingNew ? "Checked, nothing new" : "Ended, nothing saved")
         case .waitingForApproval: said = "Waiting for approval"
-        // The run raised a card and is waiting to be answered. Not a fault,
-        // and never "Interrupted" (Agent, 2026-09-13).
+        // Awaiting a person's answer is a waiting status, not an interruption.
         case .waitingOnPerson: said = last.statusDetail.map { "Waiting on you — \($0)" } ?? "Waiting on you"
         case .stopped:
             said = last.statusDetail.map { "Stopped, " + $0 } ?? firstLine.map { "Stopped, partial reply kept: " + $0 } ?? "Stopped"
@@ -180,7 +181,7 @@ public struct BotsShelfRecord: Identifiable, Equatable, Sendable {
         case .failed: "Could not check"
         }
     }
-    public static func read(root: URL, timing: BotRunnerScheduler.Projection, followingModel: String? = nil) throws -> [BotsShelfRecord] {
+    public static func read(root: URL, timing: BotRunnerScheduler.BotSchedule, followingModel: String? = nil) throws -> [BotsShelfRecord] {
         let shelf = ShelfStore(dataRoot: root)
         let events = (try? BotEventStore(dataRoot: root).lastEvents()) ?? [:]
         // One checked bulk read for the whole shelf, instead of paginating

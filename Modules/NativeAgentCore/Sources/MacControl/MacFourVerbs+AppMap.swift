@@ -1,17 +1,21 @@
 import Foundation
 import NativeAgentCore
 
-// Blueprint: | `MacFourVerbs+AppMap.swift` | `MacFourVerbs` app-map integration: learn only verified named-control acts; remembered routes must match fresh live element evidence |
+// Blueprint: | `MacFourVerbs+AppMap.swift` | `MacFourVerbs` app-map integration: remember verified named controls; control-scoped pointer hypotheses retain contrary and uncertain outcomes, match fresh live evidence and never block background Accessibility |
 
-// Her-screen Phase 5 — per-app maps, the four-verb side (store: MacAppMaps.swift).
-//
-// Record: only after the closed loop VERIFIED an act on a named control
-// (effect observed, the acted element answered the name). Use: only when the
-// fresh read had no match, only on an element the live look handed back at the
-// remembered path, and only when that live element's kind and label still
-// match the entry AND answer the request. Anything else ignores the entry and
-// weakens or evicts it. A stale map can cost a miss, never a wrong click.
+// Per-app maps live in `MacAppMaps.swift`.
+// Record only verified named-control acts; reuse only when the live element at the remembered path matches kind, label and request.
+// A mismatch weakens or evicts the entry; stale memory must never redirect a click.
 extension MacFourVerbs {
+    static func appMapFailure(_ error: Error, after reply: MacFourVerbsReply? = nil) -> MacFourVerbsReply {
+        var detail = reply?.detail ?? ["effects": .string("none")]
+        detail["app_map_error"] = .string(error.localizedDescription)
+        detail["app_map_saved"] = .bool(false)
+        return MacFourVerbsReply(ok: reply?.ok ?? false,
+            text: (reply.map { $0.text + "\n" } ?? "") + "App-map learning failed: " + error.localizedDescription,
+            detail: detail)
+    }
+
     /// Controls, never content: a row or a field's label can be someone's
     /// file name, subject line or typed text.
     static let mappableKinds: Set<String> = [
@@ -29,7 +33,7 @@ extension MacFourVerbs {
     }
 
     /// A verified act on a named control: remember where it lives.
-    func rememberVerified(_ target: String, _ candidate: ActTarget, in sighting: Sighting) async {
+    func rememberVerified(_ target: String, _ candidate: ActTarget, in sighting: Sighting) async throws {
         guard let bundle = sighting.bundleIdentifier, let window = sighting.windowKind,
               let asked = Self.mapName(target), let path = candidate.sourceAXPath, !path.isEmpty,
               let label = candidate.label, !label.isEmpty,
@@ -42,31 +46,50 @@ extension MacFourVerbs {
         // App chrome only. A label already vetted when it was first stored is
         // not re-checked; a new one must be a stable system label or appear in
         // the app's own menu bar. Anything else could be content: not stored.
-        if !(await store.has(bundle: bundle, window: window, asked: asked, label: label)) {
+        if !(try await store.has(bundle: bundle, window: window, asked: asked, label: label)) {
             if !MacAppMaps.isStableSystemLabel(label) {
                 guard await inMenuBar(label, app: sighting.appName) else { return }
             }
         }
-        await store.record(bundle: bundle, window: window, asked: asked, label: label,
+        try await store.record(bundle: bundle, window: window, asked: asked, label: label,
                            kind: candidate.kind, path: path)
     }
 
-    /// Whether a press of this kind of control in this app takes the pointer:
-    /// the route that last showed a consequence there. Accessibility is the
-    /// default and needs no entry.
-    func pressesByPointer(_ pressed: ActTarget, in sighting: Sighting) async -> Bool {
-        guard let bundle = sighting.bundleIdentifier else { return false }
-        return await MacAppMapStore.shared.learned(bundle: bundle, "press " + pressed.kind) == "pointer"
+    /// Identity is the live control in its window kind, including path and
+    /// label. A success on another same-kind control says nothing about it.
+    private static func pressControl(_ pressed: ActTarget, in sighting: Sighting) -> String? {
+        guard let window = sighting.windowKind, let path = pressed.sourceAXPath, !path.isEmpty,
+              let label = pressed.label, !label.isEmpty, mappableKinds.contains(pressed.kind),
+              !pressed.isSupplemental, !pressed.regionOnly, !pressed.physicalOnly else { return nil }
+        return CausalTransitionEvidence.opaqueIdentity(
+            [window, pressed.kind, normalize(label), path.map(String.init).joined(separator: ".")].joined(separator: "\u{0}"))
     }
 
-    /// A press's outcome folded into the app's learned routes, on positive
-    /// evidence only: a pointer press with a consequence sets the pointer, a
-    /// verified accessibility press clears it, an inconclusive one (an
-    /// already-selected tab) changes nothing.
-    func learnRoute(pointer: Bool, pressed: ActTarget, reply: MacFourVerbsReply, in sighting: Sighting) async {
-        guard let bundle = sighting.bundleIdentifier, !pressed.isSupplemental, reply.ok,
-              Self.string(reply.detail["verification"]) == MotorVerificationState.satisfied.rawValue else { return }
-        await MacAppMapStore.shared.learn(bundle: bundle, "press " + pressed.kind, pointer ? "pointer" : nil)
+    /// A hypothesis for this control, never an exclusive capability claim.
+    func pressesByPointer(_ pressed: ActTarget, in sighting: Sighting) async throws -> Bool {
+        guard let bundle = sighting.bundleIdentifier,
+              let control = Self.pressControl(pressed, in: sighting) else { return false }
+        return try await MacAppMapStore.shared.pressRoute(bundle: bundle, control: control)?.suggestsPointer == true
+    }
+
+    func learnRoute(pointer: Bool, pressed: ActTarget, reply: MacFourVerbsReply, in sighting: Sighting) async throws {
+        guard let bundle = sighting.bundleIdentifier, let window = sighting.windowKind,
+              let label = pressed.label, let control = Self.pressControl(pressed, in: sighting) else { return }
+        let store = MacAppMapStore.shared
+        // Apply the same chrome-only privacy boundary as remembered controls.
+        let knownChrome: Bool
+        if MacAppMaps.isStableSystemLabel(label) { knownChrome = true }
+        else {
+            knownChrome = try await store.entries(bundle: bundle, window: window).contains {
+                $0.path == pressed.sourceAXPath && $0.label == label && $0.kind == pressed.kind
+            }
+        }
+        guard knownChrome else { return }
+        let verification = Self.string(reply.detail["verification"])
+        let outcome = reply.ok && verification == MotorVerificationState.satisfied.rawValue
+            && Self.string(reply.detail["verification_scope"]) != MacActClosedLoop.ActClassification.readoutOnlyScope
+            ? "satisfied" : verification == MotorVerificationState.failed.rawValue ? "failed" : "unverified"
+        try await store.recordPress(bundle: bundle, control: control, pointer: pointer, outcome: outcome)
     }
 
     /// Whether the app's own menu bar has an item with exactly this label
@@ -87,7 +110,7 @@ extension MacFourVerbs {
     /// The fresh read has no match for `target`. A remembered control is used
     /// only when the live element at its path still is that control. Two or
     /// more remembered controls answering is a question, never a pick.
-    func mapResolve(_ target: String, in sighting: Sighting) async -> Resolution? {
+    func mapResolve(_ target: String, in sighting: Sighting) async throws -> Resolution? {
         guard let bundle = sighting.bundleIdentifier, let window = sighting.windowKind,
               let asked = Self.mapName(target) else { return nil }
         let bare = Self.normalize(Self.stripRoleWords(target))
@@ -95,7 +118,7 @@ extension MacFourVerbs {
         // Save BUTTON does not answer it.
         let namedKind = Self.trailingRoleQualifier(in: target)?.kind ?? Self.roleHint(in: target)
         let store = MacAppMapStore.shared
-        let entries = await store.entries(bundle: bundle, window: window)
+        let entries = try await store.entries(bundle: bundle, window: window)
             .filter { ($0.asked == asked || Self.normalize($0.label) == bare)
                 && (namedKind == nil || $0.kind == namedKind) }
         let live = sighting.targets
@@ -104,7 +127,7 @@ extension MacFourVerbs {
             guard let element = live.first(where: { $0.sourceAXPath == entry.path && !$0.isSupplemental }) else {
                 // Not in this read at all: maybe gone, maybe past the read's
                 // caps. Weaken, don't guess.
-                await store.penalize(bundle: bundle, window: window, path: entry.path, evict: false)
+                try await store.penalize(bundle: bundle, window: window, path: entry.path, evict: false)
                 continue
             }
             if element.kind == entry.kind, !element.regionOnly,
@@ -114,7 +137,7 @@ extension MacFourVerbs {
                 continue
             }
             // Something else lives at that path now.
-            await store.penalize(bundle: bundle, window: window, path: entry.path, evict: true)
+            try await store.penalize(bundle: bundle, window: window, path: entry.path, evict: true)
         }
         if verified.count > 1 { return .ambiguous(verified) }
         return verified.first.map { .hit($0) }

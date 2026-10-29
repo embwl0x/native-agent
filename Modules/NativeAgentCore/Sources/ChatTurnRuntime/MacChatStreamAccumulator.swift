@@ -1,5 +1,6 @@
 import Foundation
-// Blueprint: | `MacChatStreamAccumulator.swift` | `ChatStreamAccumulator` actor; `consume`; deltas arm one publication deadline, rearmed only for owed text; settlement/termination cancel and join publication |
+import ToolRegistry
+// Blueprint: | `MacChatStreamAccumulator.swift` | `ChatStreamAccumulator` actor consumes core `TurnStreamEvent` directly and sanitizes activity; deltas arm one publication deadline, rearmed only for owed text; settlement/termination cancel and join publication |
 
 /// Stream-local accumulator for one chat turn's deltas.
 ///
@@ -22,11 +23,14 @@ public actor ChatStreamAccumulator {
     /// waiting for the next token. Join the publisher before completion/error
     /// so an already-enqueued snapshot cannot overwrite the final reply.
     public func consume(
-        _ stream: AsyncThrowingStream<MacChatStreamUpdate, Error>,
+        _ stream: AsyncThrowingStream<TurnStreamEvent, Error>,
         interval: TimeInterval,
+        activityIdentity: MacChatTurnIdentity,
+        onTurnActivity: @escaping @Sendable (MacChatTurnActivity) async -> Void,
         publish: @escaping @MainActor @Sendable (String, Int, Bool?) throws -> Void
     ) async throws -> String {
         defer { ticker = nil; nextPublicationAt = nil }
+        let shown = ShownToolNames()
         do {
             for try await update in stream {
                 try Task.checkCancellation()
@@ -42,7 +46,19 @@ public actor ChatStreamAccumulator {
                     try await publish(accumulated, accumulatedUTF16, settled)
                     continue
                 }
-                guard case .text(let delta) = update else { continue }
+                let delta: String
+                switch update {
+                case .delta(let text): delta = text
+                case .toolUse, .toolResult, .notice:
+                    if let activity = MacChatTurnActivityBoundary.activity(
+                        from: update, identity: activityIdentity, shown: shown, at: Date()
+                    ) { await onTurnActivity(activity) }
+                    continue
+                case .error(let message):
+                    throw NSError(domain: "NativeAgentStream", code: -1,
+                        userInfo: [NSLocalizedDescriptionKey: message])
+                case .final, .replyTextSettled: continue
+                }
                 accumulated += delta
                 accumulatedUTF16 += delta.utf16.count
                 guard ticker == nil, accumulatedUTF16 > takenUTF16 else { continue }
@@ -98,9 +114,4 @@ public actor ChatStreamAccumulator {
         takenUTF16 = accumulatedUTF16
         return accumulated
     }
-}
-
-public enum MacChatStreamUpdate: Sendable {
-    case text(String)
-    case replyTextSettled(Bool)
 }

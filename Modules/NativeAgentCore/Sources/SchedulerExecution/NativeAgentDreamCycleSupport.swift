@@ -53,31 +53,3 @@ enum NativeAgentDreamCycleSchedule {
 
     private static func timeZone() -> TimeZone { .current }
 }
-
-enum NativeAgentDreamNotificationInboxPolicy {
-    static let source = "dream_cycle"
-
-    static func archiveOlderDreamRows(
-        _ rows: [JSONValue],
-        keeping keepItemId: String
-    ) -> (rows: [JSONValue], archivedCount: Int) {
-        var archivedCount = 0
-        let rewritten = rows.map { row -> JSONValue in
-            guard case .object(var obj) = row,
-                  SchedulerJobRuntime.string(obj["source"]) == source,
-                  SchedulerJobRuntime.string(obj["id"]) != keepItemId else {
-                return row
-            }
-            let status = (SchedulerJobRuntime.string(obj["status"]) ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
-            guard status != "archived", status != "dismissed" else {
-                return row
-            }
-            obj["status"] = .string("archived")
-            archivedCount += 1
-            return .object(obj)
-        }
-        return (rewritten, archivedCount)
-    }
-}

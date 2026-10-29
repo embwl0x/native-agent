@@ -40,23 +40,17 @@ public enum VisionRoleGuess {
         public let sources: [VisionEvidenceSource]
         /// OCR boxes whose area is mostly inside `rect`.
         public let containedText: [VisionTextBox]
-        public let fillLuminance: Double?
-        public let backgroundLuminance: Double
 
         public init(
             rect: VisionRect,
             imageSize: VisionSize,
             sources: [VisionEvidenceSource],
-            containedText: [VisionTextBox],
-            fillLuminance: Double?,
-            backgroundLuminance: Double
+            containedText: [VisionTextBox]
         ) {
             self.rect = rect
             self.imageSize = imageSize
             self.sources = sources
             self.containedText = containedText
-            self.fillLuminance = fillLuminance
-            self.backgroundLuminance = backgroundLuminance
         }
 
         var aspect: Double { rect.h > 0 ? rect.w / rect.h : 0 }
@@ -170,37 +164,31 @@ public enum VisionRoleGuess {
         fillLuminance: Double?,
         captionContrast: Double?,
         backgroundLuminance: Double,
-        peerFillLuminances: [Double]
+        rowFillBaseline: Double?
     ) -> VisionStateGuess {
         var disabled: VisionStateFlag?
         if actionable.contains(role), let contrast = captionContrast {
-            let rounded = (contrast * 100).rounded() / 100
             if contrast < disabledContrast {
                 disabled = VisionStateFlag(
                     value: true,
-                    confidence: 0.45,
-                    evidence: "caption luminance spread \(rounded) — reads greyed"
+                    confidence: 0.45
                 )
             } else if contrast >= liveContrast {
                 disabled = VisionStateFlag(
                     value: false,
-                    confidence: 0.5,
-                    evidence: "caption luminance spread \(rounded) — reads live"
+                    confidence: 0.5
                 )
             }
             // Between the two thresholds: no flag. We do not know.
         }
 
         var selected: VisionStateFlag?
-        if role == row, let fill = fillLuminance, peerFillLuminances.count >= 2 {
-            let sorted = peerFillLuminances.sorted()
-            let median = sorted[sorted.count / 2]
-            let delta = abs(fill - median)
+        if role == row, let fill = fillLuminance, let baseline = rowFillBaseline {
+            let delta = abs(fill - baseline)
             if delta >= 0.08 {
                 selected = VisionStateFlag(
                     value: true,
-                    confidence: 0.4,
-                    evidence: "row fill differs from its peers by \((delta * 100).rounded() / 100)"
+                    confidence: 0.4
                 )
             }
         }
@@ -210,8 +198,7 @@ public enum VisionRoleGuess {
             let delta = abs(fill - backgroundLuminance)
             checked = VisionStateFlag(
                 value: delta >= 0.2,
-                confidence: 0.3,
-                evidence: "box fill differs from background by \((delta * 100).rounded() / 100)"
+                confidence: 0.3
             )
         }
 

@@ -1,13 +1,4 @@
-// OrganismProspectiveAffect.swift
-// Wave R2-D (2026-07-09) — anticipatory affect: feelings about the FUTURE.
-// Humans feel forward — dread, bracing, looking-forward — before an outcome
-// resolves (risk-as-feelings; affective forecasting). Agent's affect was purely
-// reactive/present. Her body already TRACKS the future (OrganismPredictionLedger:
-// pending tool/provider/phone/approval/workflow expectations), so anticipation is
-// derived there and rides the PROJECTED chemistry only — the stored ChemicalState
-// is never mutated, the deltas are capped, and an empty ledger yields the input
-// unchanged (byte-identical). The felt fingerprint inherits the bracing through
-// the existing chem→FeltSignals mapping; no new capsule text, no new senses.
+// Anticipation derives bounded projected chemistry from predictions without changing stored state; an empty ledger is inert.
 
 import Foundation
 
@@ -24,15 +15,8 @@ enum OrganismProspectiveAffect {
     /// A recent violation keeps the body braced for this long (fading).
     static let violationShadowHalfLife: TimeInterval = 20 * 60
 
-    // MARK: - Item 5 (2026-09-02): the horizon's share of anticipation
-    //
-    // The five plumbing paths above are minutes away, so their window is ten
-    // minutes. A horizon is DAYS away, and the whole point of `toward` is that
-    // Friday weighs a little more on Thursday than it did on Monday. Same
-    // shape, same 0.15/dim ceiling, wider window — and the horizon terms fold
-    // INTO the existing per-dim accumulators rather than adding a second budget
-    // on top of them, so no dimension can exceed `maxDelta` no matter how many
-    // rows are open.
+    // MARK: - The horizon's share of anticipation
+    // Horizons use a wider window within the existing per-dimension budget, never a second allowance.
 
     /// A horizon weighs from a week out, growing as it nears.
     static let horizonWindow: TimeInterval = OrganismHorizonRegister.maximumHorizon
@@ -115,10 +99,7 @@ enum OrganismProspectiveAffect {
         }
     }
 
-    /// Per-prediction share of the body's bracing/looking-forward — the ONE
-    /// math both projection-time modulation and resolution-time relief read
-    /// (round 3 Wave A: relief must measure the SAME dread the projection
-    /// applied, or the exhale won't match the held breath).
+    /// Projection-time anticipation and resolution-time relief share the same per-prediction contribution.
     static func predictionBracingContribution(
         _ p: OrganismPrediction,
         ledger: OrganismPredictionLedger,
@@ -166,76 +147,17 @@ enum OrganismProspectiveAffect {
         case .phoneDelivery: return confidence.phonePath
         case .approvalResolution: return confidence.approvalPath
         case .workflowAdvance: return confidence.workflowPath
-        // Item 46: a semantic expectation has no body path. Even odds is the
-        // honest read — the body knows nothing about how work lands.
+        // A semantic expectation has no body path; its prior is even odds.
         case .semanticExpectation: return 0.5
         }
     }
 
-    // MARK: - Mind-into-circulation (2026-07-10): pending tool expectations → tool groups
-    //
-    // A PURE read that maps the ledger's live TOOL expectations to a bounded set of
-    // "tool group" strings for CognitiveAttentionSignals.predictedToolGroups. Those
-    // strings fold into Fluid Context's NeedSignal → queryText (ContextSelection.swift
-    // queryText / packet fingerprint), i.e. they become LEXICAL + EMBEDDING query
-    // terms matched against tool-result atoms and memory records. So the group
-    // vocabulary must be REAL WORDS that occur in that material, not invented codes.
-    //
-    // WHY ONLY `.toolCompletion`:
-    // The ledger carries five prediction kinds (OrganismPredictionKind). Only pending
-    // predictions are created by `upsertPending`, and only three kinds are ever
-    // pending: `.toolCompletion` (from a `.toolStarted` somatic signal), `.approvalResolution`,
-    // and `.workflowAdvance`. Of the full five, only `.toolCompletion` is a TOOL
-    // outcome. `.providerCompletion` (provider health), `.phoneDelivery`,
-    // `.approvalResolution` (a human gate), and `.workflowAdvance` (desk items) are
-    // system/infrastructure outcomes, not chat-tool invocations — the task is explicit
-    // that provider-shaped predictions contribute NOTHING and we do not invent tool
-    // groups for them. The kind gate is the primary filter; the sourceOrgan parse below
-    // is a defensive second gate.
-    //
-    // WHERE THE GROUP COMES FROM:
-    // A pending `.toolCompletion` prediction is keyed by
-    //   canonicalToken("tool.<toolName>")  →  "tool-<dashed-tool-name>"
-    // (OrganismPredictiveBody.upsertPending → pendingID; CognitiveSomaticSignalAdapter
-    // .sourceOrgan(for:) is the SOLE producer of the "tool.<toolName>" form — it forwards
-    // metadata["toolName"], which is the real chat-tool name, e.g. "git_log",
-    // "recall_memory", "mac_calendar_create_event"). We strip the "tool-" prefix and take
-    // the tool name's leading family segment as the group word. The family prefix is,
-    // by the tool catalog's own naming convention (SwiftToolDispatcher+*ToolCatalog —
-    // there is NO explicit category field; families exist only as name prefixes), the
-    // word that appears in that tool's results and in memory about using it.
-    //
-    // GROUP MAPPING TABLE (family segment → group word; fallback = the family segment
-    // itself, which is already a real consumable word):
-    //   git, git_*                  → "git"
-    //   desk_*                      → "desk"
-    //   mail_*                      → "mail"
-    //   recall_*  (recall_memory…)  → "memory"      (operate on the memory store)
-    //   commit_memory               → "memory"
-    //   mac_<x>_*  (calendar/…)     → <x>           (mac_ is a heterogeneous shell; the
-    //                                                second segment — calendar, reminders,
-    //                                                spotlight, focus, notify, quit — is the
-    //                                                content-bearing word, not "mac")
-    //   music_/notes_/contacts_/messages_/slack_/persona_/mission_/scheduler_/context_/agent_/…
-    //                               → family verbatim (already the real word)
-    //   bare "tool" (no toolName)   → "tools"        (a live-but-unnamed tool expectation)
-    // Overrides collapse machine prefixes onto the human word; everything else falls
-    // through to the family segment. Every emitted string is a dictionary word that
-    // co-occurs with the tool's own output — so lexical/embedding overlap can actually fire.
+    // MARK: - Pending tool expectations
+    // Only pending tool completions contribute bounded, meaningful group words to Fluid Context query terms.
 
-    /// Live TOOL-shaped pending expectations → bounded tool-group query terms.
-    /// Pure: same inputs → same output. Excludes resolved (satisfied/violated) and
-    /// expired predictions and non-tool kinds. A prediction that is still
-    /// `.pending` counts even past its `dueAt` (gpt-5.5 review MED, 2026-07-10):
-    /// the generic 90s prediction horizon is far shorter than real dispatches
-    /// (interactive tools run minutes; explicit timeouts reach 3600s), so
-    /// wall-clock second-guessing here dropped exactly the long tools whose
-    /// results are still expected. The ledger's own expiry sweep owns liveness —
-    /// trust its lifecycle, don't re-derive it. Empty ledger → empty set.
-    /// Deterministic under the cap (sorted) so the packet fingerprint stays stable.
+    /// Sorted, bounded tool groups follow ledger liveness: pending counts past dueAt, resolved and expired do not.
     static func predictedToolGroups(
         ledger: OrganismPredictionLedger,
-        at now: Date,
         limit: Int = 8
     ) -> Set<String> {
         var groups: Set<String> = []
@@ -263,9 +185,7 @@ enum OrganismProspectiveAffect {
         switch family {
         case "git": return "git"
         case "recall", "commit": return "memory"
-        // Verb-prefixed core tools (gpt-5.5 review LOW, 2026-07-10): the bare
-        // first segment ("read", "write", "list", "apply") is a weak query
-        // word — map them onto the content word their outputs co-occur with.
+        // Verb-prefixed tools map to the content word their outputs share.
         case "read", "write", "list", "glob", "grep", "apply": return "files"
         case "shell", "bash", "exec": return "shell"
         case "invoke": return "agents"

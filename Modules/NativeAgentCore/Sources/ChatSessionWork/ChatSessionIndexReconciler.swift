@@ -1,8 +1,10 @@
 import Darwin
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Transcripts
+import TurnTrace
 // Blueprint: | `ChatSessionIndexReconciler.swift` | `ChatSessionIndexReconciler` actor; `reconcile` selects repairs and commits through ChatSessionIndexFile |
 
 /// Bounded launch repair for the one unavoidable two-file chat commit window:
@@ -24,14 +26,11 @@ public struct ChatSessionIndexReconciliationReport: Sendable, Equatable {
 
 public actor ChatSessionIndexReconciler {
     private let dataRoot: URL
-    private let persistence: SwiftNativePersistenceCore
 
     public init(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore()
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) {
         self.dataRoot = dataRoot
-        self.persistence = persistence
     }
 
     /// Legacy human-readable reconciliation time. Exact version identity is
@@ -57,13 +56,17 @@ public actor ChatSessionIndexReconciler {
 
     private struct StaleRead: Sendable {
         let bytes: Int64
-        let rows: [JSONValue]
-        let readReport: JSONLReadReport
+        let rows: [[String: JSONValue]]?
         let version: JSONValue?
+
+        /// Distinguish an absent conversational row from one with no readable preview.
+        let preview: (text: String, stamp: TranscriptRowStamp)?
+        let firstSpokenStamp: String?
+        let lastSpokenStamp: String?
     }
 
     /// A transcript row's own stamp (`TranscriptRowStamp`), for the preview taken from it.
-    private static func stamp(_ row: [String: JSONValue]?) -> TranscriptRowStamp {
+    private nonisolated static func stamp(_ row: [String: JSONValue]?) -> TranscriptRowStamp {
         let metadata: [String: JSONValue] = if case .object(let value)? = row?["metadata"] { value } else { [:] }
         return TranscriptRowStamp.of(id: string(row?["id"]) ?? "", role: string(row?["role"])?.lowercased() ?? "",
                                      metadata: metadata, rowSource: string(row?["source"]))
@@ -71,20 +74,7 @@ public actor ChatSessionIndexReconciler {
 
     private struct StaleRepair: Sendable {
         let candidate: StaleCandidate
-        let version: JSONValue?
-        let messageCount: Int64
-        let preview: String
-        /// The previewed row's own stamp, kept beside its preview text.
-        let previewStamp: TranscriptRowStamp
-        /// 2026-09-06: whether the transcript held a conversational row AT ALL.
-        /// An empty `preview` used to mean both "no user/assistant row" and
-        /// "the last one has no readable string content" (a structured or
-        /// empty body), and the repair cleared the row's preview for both — so
-        /// a live conversation whose last turn carried non-string content lost
-        /// its sidebar line on the phone and the Mac.
-        let hasConversationalRow: Bool
-        let lastSpokenStamp: String?
-        let firstSpokenStamp: String?
+        let read: StaleRead
     }
 
     private struct SelectionPass: Sendable {
@@ -99,20 +89,19 @@ public actor ChatSessionIndexReconciler {
         maximumStaleRepairs: Int = 50
     ) async throws -> ChatSessionIndexReconciliationReport {
         let sessionsPath = dataRoot.appendingPathComponent("chat/sessions.json")
-        let archivePath = dataRoot.appendingPathComponent("chat/archive/sessions.jsonl")
         let messagesDirectory = dataRoot.appendingPathComponent("chat/messages", isDirectory: true)
         guard FileManager.default.fileExists(atPath: messagesDirectory.path) else { return .init() }
 
         // Select missing and stale rows under the index lock using metadata only.
         // Transcript locks and parsing belong outside this shared critical section.
-        let selection = try await persistence.withFileLock(sessionsPath) { () -> SelectionPass in
+        let selection = try await SwiftNativePersistenceCore.withFileLock(sessionsPath) { () -> SelectionPass in
             var report = ChatSessionIndexReconciliationReport()
             let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
             let knownIDs = Set(rows.compactMap { row -> String? in
                 guard case .string(let raw)? = row["id"],
                       NativeAgentChatSessionID.normalizedPathComponent(raw) == raw else { return nil }
                 return raw
-            }).union(try Self.archivedSessionIDs(at: archivePath))
+            }).union(try Self.archivedSessionIDs(dataRoot: self.dataRoot))
 
             let directoryEntries = try FileManager.default.contentsOfDirectory(
                 at: messagesDirectory,
@@ -155,28 +144,7 @@ public actor ChatSessionIndexReconciler {
             let boundedCandidates = candidates.prefix(fileLimit)
             report.skippedForBounds += max(0, candidates.count - boundedCandidates.count)
 
-            // 2026-09-06: STALE-ROW SELECTION. The scan above deliberately
-            // never opens a transcript that already has a canonical index row —
-            // re-reading all ~2000 of them at launch is exactly the cost this
-            // reconciler removed. But the two-file commit window it repairs
-            // has a second outcome, and this one leaves the row in place: the
-            // transcript append is durable, the crash lands before
-            // `syncSessionIndex` rewrites `sessions.json`, and the row
-            // survives describing a transcript it no longer matches — short
-            // `messageCount`, previous turn's `lastMessagePreview`, `updatedAt`
-            // one message behind. Nothing repairs it later:
-            // `ChatTranscriptLineCountCache` is in-memory and cold at launch,
-            // and the row is only rewritten when the session is next appended
-            // to, which for a finished conversation is never. Autocompaction
-            // has the same shape — it rewrites the transcript and never touches
-            // the index.
-            //
-            // A metadata-only exact version gate avoids both timestamp rounding
-            // and perpetual stale exemptions after compaction. Legacy rows
-            // receive their first exact acknowledgement in bounded batches.
-            //
-            // Bounded per launch, so a pile of stale rows cannot starve a
-            // session that is missing from the sidebar entirely.
+            // Bound stale-row reads by exact transcript version so orphan recovery cannot starve.
             var staleCandidates: [StaleCandidate] = []
             var staleRepairBudget = max(0, maximumStaleRepairs)
             if staleRepairBudget > 0 {
@@ -257,31 +225,13 @@ public actor ChatSessionIndexReconciler {
                 continue
             }
             let remainingBytes = maximumBytes - consumedBytes
-            let read = try await Self.withAvailableTranscriptLock(transcript) {
-                let attributes = try FileManager.default.attributesOfItem(atPath: transcript.path)
-                let bytes = (attributes[.size] as? NSNumber)?.int64Value ?? 0
-                guard bytes >= 0, bytes <= remainingBytes else { return nil as StaleRead? }
-                let scan = try await persistence.readJSONLReporting(transcript)
-                return StaleRead(bytes: bytes, rows: scan.rows, readReport: scan.report,
-                                 version: ChatSessionIndexFile.transcriptVersion(at: transcript))
-            }
-            guard let acquiredRead = read, let read = acquiredRead else {
+            guard let read = try await Self.readTranscript(transcript, sessionID: sessionID,
+                                                          maximumBytes: remainingBytes) else {
                 report.skippedForBounds += 1
                 continue
             }
             consumedBytes += read.bytes
-            let scan = (rows: read.rows, report: read.readReport)
-            let objectRows: [[String: JSONValue]] = scan.rows.compactMap {
-                guard case .object(let object) = $0 else { return nil }
-                return object
-            }
-            if scan.report.malformedLineCount > 0
-                || scan.report.trailingPartialLine
-                || !Self.rowsAreTrustworthy(
-                    objectRows,
-                    parsedRowCount: scan.rows.count,
-                    sessionID: sessionID
-                ) {
+            guard let objectRows = read.rows else {
                 report.corruptTranscripts += 1
                 continue
             }
@@ -298,50 +248,30 @@ public actor ChatSessionIndexReconciler {
             let firstUserContent = objectRows.first(where: {
                 Self.string($0["role"])?.lowercased() == "user"
             }).flatMap { Self.content($0) }
-            let lastContent = objectRows.last.flatMap { Self.content($0) } ?? ""
-            // 2026-09-06: a session's `source` says what the conversation
-            // IS, and the live writer stamps it ONCE at creation and never
-            // restamps it (see the §1.3 note in
-            // ChatOrchestrationClient+MessagePersistence). Recovering it
-            // from the LAST row rebuilt exactly the last-writer-wins value
-            // that note removed — a Mac chat one iPhone reply touched came
-            // back as an iOS session. Take the creation row's source.
-            //
-            // 2026-09-06: the creation row is the first row a SURFACE
-            // authored. Compaction PREPENDS a system row of its own
-            // (ChatSessionAutocompactor writes source
-            // "native_autocompaction"; TelegramSessionStore writes
-            // "telegram_native_compaction"), so on any compacted session the
-            // first physical row is the compactor, and taking it stamped the
-            // compactor as the session's origin surface.
-            let source = objectRows.first(where: { row in
+            // Session origin belongs to the first surface-authored row, excluding compaction system rows.
+            let creation = objectRows.first(where: { row in
                 guard Self.string(row["source"]) != nil else { return false }
                 return Self.string(row["role"])?.lowercased() != "system"
-            }).flatMap { Self.string($0["source"]) } ?? "app"
+            })
+            let source = creation.flatMap { Self.string($0["source"]) } ?? "app"
+            let kind = SessionConversation.kind(threadKind: creation.flatMap { Self.string($0["threadKind"]) }, source: source,
+                                                sourceKey: creation.flatMap { Self.string($0["sourceKey"]) })
             var recoveredRow: [String: JSONValue] = [
                 "id": .string(sessionID),
                 "title": .string(Self.bounded(firstUserContent ?? "Recovered Chat", to: 80)),
                 "source": .string(source),
+                "threadKind": .string(kind.rawValue),
                 "createdAt": .string(createdAt),
                 "updatedAt": .string(updatedAt),
                 "archived": .bool(false),
                 "messageCount": .int(Int64(objectRows.count)),
                 "summary": .string(""),
             ]
-            let preview = Self.bounded(lastContent, to: 160)
-            let spoken = objectRows.filter { ["user", "assistant"].contains(Self.string($0["role"])?.lowercased() ?? "") }
-            recoveredRow["firstMessageAt"] = spoken.first?["createdAt"] ?? spoken.first?["timestamp"]
-            recoveredRow["lastMessageAt"] = spoken.last?["createdAt"] ?? spoken.last?["timestamp"]
-            if !preview.isEmpty {
-                recoveredRow["lastMessagePreview"] = .string(preview)
-                recoveredRow[TranscriptRowStamp.previewKey] = Self.stamp(objectRows.last).json
-            }
-            // 2026-09-06: stamp the transcript state this row was built
-            // from, so the stale-row pass below does not re-open a file
-            // this pass just finished reading, on this launch or any later
-            // one. The mtime is the pre-read one: if the file moved under
-            // the read, the stamp is behind and the next launch re-reads —
-            // the safe direction.
+            recoveredRow["firstMessageAt"] = read.firstSpokenStamp.map(JSONValue.string)
+            recoveredRow["lastMessageAt"] = read.lastSpokenStamp.map(JSONValue.string)
+            recoveredRow["lastMessagePreview"] = .string(read.preview?.text ?? "")
+            recoveredRow[TranscriptRowStamp.previewKey] = (read.preview?.stamp ?? Self.stamp(nil)).json
+            // Stamp the pre-read mtime so a concurrent change remains eligible for repair.
             if let modified = values.contentModificationDate {
                 recoveredRow[Self.transcriptStampKey] = .string(Self.iso8601(modified))
             }
@@ -365,43 +295,16 @@ public actor ChatSessionIndexReconciler {
                 continue
             }
             let remainingBytes = maximumBytes - consumedBytes
-            // 2026-09-06: the size is measured UNDER the transcript lock, and
-            // it is that size the budget is charged. Measured before the lock
-            // it described a file the read no longer sees — an append between
-            // the two undercharged the budget by exactly the bytes the read
-            // then paid for.
-            let read = try await Self.withAvailableTranscriptLock(candidate.url) { () -> StaleRead? in
-                let attributes = try? FileManager.default.attributesOfItem(
-                    atPath: candidate.url.path
-                )
-                let bytes = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
-                guard bytes >= 0, bytes <= remainingBytes else { return nil }
-                let scan = try await persistence.readJSONLReporting(candidate.url)
-                return StaleRead(bytes: bytes, rows: scan.rows, readReport: scan.report,
-                                 version: ChatSessionIndexFile.transcriptVersion(at: candidate.url))
-            }
-            guard let acquiredRead = read, let read = acquiredRead else {
+            // Measure and charge transcript bytes under the same lock as the read.
+            guard let read = try await Self.readTranscript(candidate.url, sessionID: candidate.sessionID,
+                                                          maximumBytes: remainingBytes) else {
                 report.skippedForBounds += 1
                 continue
             }
             consumedBytes += read.bytes
 
-            let objectRows: [[String: JSONValue]] = read.rows.compactMap {
-                guard case .object(let object) = $0 else { return nil }
-                return object
-            }
-            // 2026-09-06: the SAME row validation the recovery pass applies.
-            // Accepting any parseable non-empty object let a malformed row
-            // count toward `messageCount` and stamped the index row as verified
-            // against a transcript this reconciler does not actually trust.
-            guard read.readReport.malformedLineCount == 0,
-                  !read.readReport.trailingPartialLine,
-                  !objectRows.isEmpty,
-                  Self.rowsAreTrustworthy(
-                      objectRows,
-                      parsedRowCount: read.rows.count,
-                      sessionID: candidate.sessionID
-                  ) else {
+            // Stale repairs require the same trusted transcript rows as orphan recovery.
+            guard let objectRows = read.rows, !objectRows.isEmpty else {
                 // Damaged transcripts stay visible and unstamped: this pass
                 // repairs an index row from a transcript it trusts, and never
                 // the other way round.
@@ -409,32 +312,7 @@ public actor ChatSessionIndexReconciler {
                 continue
             }
 
-            // Preview and `updatedAt` come from the last CONVERSATIONAL row,
-            // not the last physical one: `syncSessionIndex` is only ever called
-            // for a "user" or "assistant" row, so a trailing tool receipt is
-            // not what it would have written, and its serialized result is not
-            // a sidebar preview.
-            let lastSpoken = objectRows.last { candidate in
-                let role = Self.string(candidate["role"])?.lowercased()
-                return role == "user" || role == "assistant"
-            }
-            repairs.append(
-                StaleRepair(
-                    candidate: candidate,
-                    version: read.version,
-                    messageCount: Int64(objectRows.count),
-                    preview: Self.bounded(
-                        lastSpoken.flatMap { Self.content($0) } ?? "",
-                        to: 160
-                    ),
-                    previewStamp: Self.stamp(lastSpoken),
-                    hasConversationalRow: lastSpoken != nil,
-                    lastSpokenStamp: Self.string(lastSpoken?["createdAt"])
-                        ?? Self.string(lastSpoken?["timestamp"]),
-                    firstSpokenStamp: objectRows.first { ["user", "assistant"].contains(Self.string($0["role"])?.lowercased() ?? "") }
-                        .flatMap { Self.string($0["createdAt"]) ?? Self.string($0["timestamp"]) }
-                )
-            )
+            repairs.append(StaleRepair(candidate: candidate, read: read))
         }
 
         guard !repairs.isEmpty || !recovered.isEmpty else { return report }
@@ -442,11 +320,11 @@ public actor ChatSessionIndexReconciler {
         let pendingRecovered = recovered
 
         // PASS 3 — the index lock again, briefly, for the writes only.
-        let writes = try await persistence.withFileLock(sessionsPath) { () -> (recovered: Int, repaired: Int) in
+        let writes = try await SwiftNativePersistenceCore.withFileLock(sessionsPath) { () -> (recovered: Int, repaired: Int) in
             var rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: sessionsPath)
             // An archive may have committed while transcript reads were outside
             // the index lock. Its durable claim wins over orphan recovery.
-            let archivedIDs = try Self.archivedSessionIDs(at: archivePath)
+            let archivedIDs = try Self.archivedSessionIDs(dataRoot: self.dataRoot)
             var positions: [String: Int] = [:]
             for (offset, row) in rows.enumerated() {
                 guard case .string(let id)? = row["id"], positions[id] == nil else { continue }
@@ -457,57 +335,27 @@ public actor ChatSessionIndexReconciler {
             for repair in pendingRepairs {
                 guard let position = positions[repair.candidate.sessionID] else { continue }
                 var row = rows[position]
-                // 2026-09-06: the index lock was released for the read, so a
-                // live append may have rewritten this row since it was
-                // selected. Only a row still exactly as it was selected is
-                // repaired from a transcript read against that same state;
-                // anything else is already fresher than this pass, and the
-                // stat gate will pick it up again next launch if it is not.
+                let read = repair.read
+                // Apply repair only while the selected index state remains unchanged.
                 guard row["updatedAt"] == repair.candidate.updatedAt,
                       row[Self.transcriptStampKey] == repair.candidate.stamp,
                       row[ChatSessionIndexFile.acknowledgedTranscriptKey] == repair.candidate.version else { continue }
                 var disagreed = false
                 if row["firstMessageAt"] == nil || row["firstMessageAt"] == .null {
-                    row["firstMessageAt"] = repair.firstSpokenStamp.map(JSONValue.string)
+                    row["firstMessageAt"] = read.firstSpokenStamp.map(JSONValue.string)
                 }
-                row["lastMessageAt"] = repair.lastSpokenStamp.map(JSONValue.string)
-                let count = JSONValue.int(repair.messageCount)
+                row["lastMessageAt"] = read.lastSpokenStamp.map(JSONValue.string)
+                let count = JSONValue.int(Int64(read.rows?.count ?? 0))
                 if row["messageCount"] != count {
                     row["messageCount"] = count
                     disagreed = true
                 }
-                if !repair.hasConversationalRow {
-                    // 2026-09-06: the transcript this row was repaired from
-                    // carries no conversational row at all, so the preview on
-                    // the row quotes a message the transcript no longer holds.
-                    // Leaving it made the sidebar (and the phone's session
-                    // list) show a line from a conversation that was cleared
-                    // back to tool receipts. Clear it instead.
-                    if row["lastMessagePreview"] != nil,
-                       row["lastMessagePreview"] != .string("") {
-                        row["lastMessagePreview"] = .string("")
-                        disagreed = true
-                    }
-                    if row[TranscriptRowStamp.previewKey] == nil {
-                        // Nothing to quote has an empty stamp; written once so
-                        // the row leaves repair.
-                        row[TranscriptRowStamp.previewKey] = repair.previewStamp.json
-                        disagreed = true
-                    }
-                } else if repair.preview.isEmpty {
-                    // There IS a last user/assistant row, it just has no
-                    // readable string content to quote: the preview is what
-                    // that row quotes, nothing, under that row's stamp. Older
-                    // words kept here would wear a stamp that is not theirs.
-                    if row[TranscriptRowStamp.previewKey] == nil {
-                        row["lastMessagePreview"] = .string("")
-                        row[TranscriptRowStamp.previewKey] = repair.previewStamp.json
-                        disagreed = true
-                    }
-                } else if row["lastMessagePreview"] != .string(repair.preview)
-                            || row[TranscriptRowStamp.previewKey] != repair.previewStamp.json {
-                    row["lastMessagePreview"] = .string(repair.preview)
-                    row[TranscriptRowStamp.previewKey] = repair.previewStamp.json
+                // A transcript with no conversational row has no preview to quote.
+                let preview = JSONValue.string(read.preview?.text ?? "")
+                let previewStamp = (read.preview?.stamp ?? Self.stamp(nil)).json
+                if row["lastMessagePreview"] != preview || row[TranscriptRowStamp.previewKey] != previewStamp {
+                    row["lastMessagePreview"] = preview
+                    row[TranscriptRowStamp.previewKey] = previewStamp
                     disagreed = true
                 }
                 // `updatedAt` orders the sidebar, so it only ever moves
@@ -515,7 +363,7 @@ public actor ChatSessionIndexReconciler {
                 // an older tail, so a transcript's last row can be older than
                 // the row that describes it; that is not a reason to send the
                 // conversation down the list.
-                if let lastStamp = repair.lastSpokenStamp,
+                if let lastStamp = read.lastSpokenStamp,
                    let lastDate = Self.date(lastStamp),
                    let rowDate = Self.date(Self.string(row["updatedAt"])),
                    lastDate > rowDate {
@@ -523,16 +371,11 @@ public actor ChatSessionIndexReconciler {
                     disagreed = true
                 }
                 if disagreed {
-                    // 2026-09-06: the phone orders published transcripts by
-                    // this counter. A repair that changes what the row says
-                    // about its transcript without moving the counter left the
-                    // phone holding its pre-repair copy for good — nothing
-                    // published afterwards looked newer than the snapshot it
-                    // already had.
+                    // Changed transcript metadata advances the phone's publication counter.
                     ChatSessionIndexFile.bumpTranscriptGeneration(in: &row)
                 }
                 row[Self.transcriptStampKey] = .string(Self.iso8601(repair.candidate.modified))
-                row[ChatSessionIndexFile.acknowledgedTranscriptKey] = repair.version
+                row[ChatSessionIndexFile.acknowledgedTranscriptKey] = read.version
                 rows[position] = row
                 wroteRow = true
                 if disagreed { repaired += 1 }
@@ -559,53 +402,47 @@ public actor ChatSessionIndexReconciler {
     /// Manual archives retain transcript bytes. Those files are intentionally
     /// absent from the hot index, not lost rows to recover at the next launch.
     /// Called under the shared session-index lock used by archive writers.
-    private nonisolated static func archivedSessionIDs(at path: URL) throws -> Set<String> {
-        guard FileManager.default.fileExists(atPath: path.path) else { return [] }
-        let data = try Data(contentsOf: path)
-        var ids = Set<String>()
-        for line in data.split(separator: 10) {
-            guard let value = try? JSONValue.parse(Data(line)),
-                  case .object(let row) = value,
-                  case .string(let id)? = row["id"] else {
-                throw NSError(domain: "ChatSessionIndexReconciler", code: -422, userInfo: [
-                    NSLocalizedDescriptionKey: "chat archive tail is unreadable; refusing session recovery"
-                ])
-            }
-            ids.insert(id)
-        }
-        return ids
+    private nonisolated static func archivedSessionIDs(dataRoot: URL) throws -> Set<String> {
+        Set(try ChatSessionRetention.archiveIndexRows(dataRoot: dataRoot).compactMap { row in
+            guard case .string(let id)? = row["id"] else { return nil }
+            return id
+        })
     }
 
-    /// Launch repair never queues behind an active transcript writer. Use the
-    /// same sidecar and inode check as persistence; contention is deferred to
-    /// a later launch, without occupying a cooperative-pool thread.
+    /// Launch repair skips busy transcripts without queuing behind a writer.
+    /// Size, validation and preview all describe the same locked read.
+    private nonisolated static func readTranscript(
+        _ transcript: URL, sessionID: String, maximumBytes: Int64
+    ) async throws -> StaleRead? {
+        try await withAvailableTranscriptLock(transcript) { () -> StaleRead? in
+            let attributes = try FileManager.default.attributesOfItem(atPath: transcript.path)
+            let bytes = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+            guard bytes >= 0, bytes <= maximumBytes else { return nil }
+            let scan = try await SwiftNativePersistenceCore.readJSONLReporting(transcript)
+            let rows = scan.rows.compactMap { row -> [String: JSONValue]? in
+                guard case .object(let object) = row else { return nil }
+                return object
+            }
+            let valid = scan.report.malformedLineCount == 0 && !scan.report.trailingPartialLine
+                && rowsAreTrustworthy(rows, parsedRowCount: scan.rows.count, sessionID: sessionID)
+            let spoken = rows.filter { ["user", "assistant"].contains(string($0["role"])?.lowercased() ?? "") }
+            return StaleRead(bytes: bytes, rows: valid ? rows : nil,
+                             version: ChatSessionIndexFile.transcriptVersion(at: transcript),
+                             preview: spoken.last.map { (bounded(content($0) ?? "", to: 160), stamp($0)) },
+                             firstSpokenStamp: string(spoken.first?["createdAt"]) ?? string(spoken.first?["timestamp"]),
+                             lastSpokenStamp: string(spoken.last?["createdAt"]) ?? string(spoken.last?["timestamp"]))
+        } ?? nil
+    }
+
     private nonisolated static func withAvailableTranscriptLock<T: Sendable>(
         _ transcript: URL,
         _ body: @Sendable () async throws -> T
     ) async throws -> T? {
         try Task.checkCancellation()
-        let lockPath = transcript.path + ".lock"
-        let fd = Darwin.open(lockPath, O_CREAT | O_WRONLY, 0o600)
-        guard fd >= 0 else {
-            throw NSError(domain: "FileLock", code: Int(errno))
-        }
-        defer { Darwin.close(fd) }
-        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
-            let error = errno
-            if error == EWOULDBLOCK || error == EINTR { return nil }
-            throw NSError(domain: "FileLock", code: Int(error))
-        }
-        defer { _ = flock(fd, LOCK_UN) }
-        var held = stat()
-        var current = stat()
-        guard fstat(fd, &held) == 0, stat(lockPath, &current) == 0,
-              held.st_dev == current.st_dev, held.st_ino == current.st_ino else {
+        do {
+            return try await SwiftNativePersistenceCore.withFileLock(transcript, waitingAtMost: 0, body)
+        } catch let error as NSError where error.domain == "FileLock" && error.code == Int(ETIMEDOUT) {
             return nil
-        }
-        return try await FileLockScope.$heldLockPaths.withValue(
-            FileLockScope.heldLockPaths.union([lockPath])
-        ) {
-            try await body()
         }
     }
 

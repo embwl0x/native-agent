@@ -1,21 +1,8 @@
 import SwiftUI
 import Research
 import AppKit
-import CoreGraphics
-import ScreenCaptureKit
-import ScreenVision
-import Speech
-import AVFoundation
-import UniformTypeIdentifiers
 import NativeAgentShared
-import MemoryV2
 import PersistenceCore
-#if canImport(CoreSpotlight)
-import CoreSpotlight
-#endif
-#if canImport(CloudKit)
-import CloudKit
-#endif
 
 // Blueprint: | `ResearchView.swift` | `ResearchView`: search/configuration actions and eligibility/status presentation over root-scoped Research owners |
 
@@ -26,6 +13,8 @@ struct ResearchView: View {
     @State private var state: ResearchViewState = .idle
     @State private var showingSearchConfiguration = false
     @State private var savingSearchConfiguration = false
+    @State private var detectingSearchService = false
+    @State private var searchConfigurationEdit = UUID()
     @State private var searchServiceStatus: ResearchSearchServiceStatus = .idle
     private var urlDraft: String {
         get { appModel.editDraft("research.searxngURL", seed: appModel.searxngBaseURL) }
@@ -54,16 +43,12 @@ struct ResearchView: View {
         )
     }
 
-    private var isDetectingSearchService: Bool {
-        if case .detecting = searchServiceStatus { return true }
-        return false
-    }
-
     private var searchServiceURL: Binding<String> {
         Binding(
             get: { urlDraft },
             set: { value in
                 urlDraft = value
+                searchConfigurationEdit = UUID()
                 searchServiceStatus = .idle
             }
         )
@@ -79,12 +64,12 @@ struct ResearchView: View {
                     Button("Find", systemImage: "magnifyingglass") {
                         findSearchService()
                     }
-                    .disabled(savingSearchConfiguration || isDetectingSearchService)
+                    .disabled(savingSearchConfiguration || detectingSearchService)
                     .accessibilityIdentifier("research.search-service.find")
                     Button("Save", systemImage: "checkmark.circle") {
                         saveSearchConfiguration()
                     }
-                    .disabled(!searchConfigurationPresentation.canSave)
+                    .disabled(!searchConfigurationPresentation.canSave || detectingSearchService)
                     .accessibilityIdentifier("research.search-service.save")
                 }
                 if let error = searchConfigurationPresentation.validationError {
@@ -129,8 +114,7 @@ struct ResearchView: View {
             case .idle:
                 NativeEmptyState(
                     title: "Research results",
-                    detail: "No search has run in this view.",
-                    systemImage: "doc.text.magnifyingglass"
+                    detail: "No search has run in this view."
                 )
             case .loading:
                 ProgressView("Searching")
@@ -138,14 +122,12 @@ struct ResearchView: View {
             case .failed(let message):
                 NativeEmptyState(
                     title: "Search failed",
-                    detail: message,
-                    systemImage: "exclamationmark.triangle"
+                    detail: message
                 )
             case .loaded(let results) where results.isEmpty:
                 NativeEmptyState(
                     title: "No results",
-                    detail: "No matches found for \"\(submittedQuery)\".",
-                    systemImage: "magnifyingglass"
+                    detail: "No matches found for \"\(submittedQuery)\"."
                 )
             case .loaded(let results):
                 List(results) { result in
@@ -193,8 +175,9 @@ struct ResearchView: View {
     }
 
     private func saveSearchConfiguration() {
-        guard !savingSearchConfiguration else { return }
+        guard !savingSearchConfiguration, !detectingSearchService else { return }
         let submittedDraft = urlDraft
+        let submittedEdit = searchConfigurationEdit
         let url: String
         do {
             url = try SwiftNativeResearchClient.normalizedSearXNGBaseURL(submittedDraft)
@@ -202,28 +185,38 @@ struct ResearchView: View {
             searchServiceStatus = .saveFailed(error.localizedDescription)
             return
         }
+        // Hold the submitted field while configuration publication updates its seed.
+        urlDraft = submittedDraft
         savingSearchConfiguration = true
         Task {
             do {
                 _ = try await SwiftNativeResearchClient(dataRoot: appModel.engine.dataRoot)
                     .saveSearXNGBaseURL(url)
                 try await appModel.engine.configuration.readSearXNG(dataRoot: appModel.engine.dataRoot)
-                if urlDraft == submittedDraft {
+                if searchConfigurationEdit == submittedEdit, urlDraft == submittedDraft {
                     appModel.clearEditDraft("research.searxngURL")
+                    searchServiceStatus = .saved
                 }
-                searchServiceStatus = .saved
             } catch {
-                searchServiceStatus = .saveFailed(UserFacingError.cause(error, action: "save the search service"))
+                if searchConfigurationEdit == submittedEdit {
+                    searchServiceStatus = .saveFailed(UserFacingError.cause(error, action: "save the search service"))
+                }
             }
             savingSearchConfiguration = false
         }
     }
 
     private func findSearchService() {
-        guard !isDetectingSearchService, !savingSearchConfiguration else { return }
+        guard !detectingSearchService, !savingSearchConfiguration else { return }
+        let submittedDraft = urlDraft
+        let submittedEdit = searchConfigurationEdit
+        urlDraft = submittedDraft
+        detectingSearchService = true
         searchServiceStatus = .detecting
         Task {
+            defer { detectingSearchService = false }
             let outcome = await appModel.autodetectSearXNG()
+            guard searchConfigurationEdit == submittedEdit, urlDraft == submittedDraft else { return }
             if case .found = outcome { appModel.clearEditDraft("research.searxngURL") }
             searchServiceStatus = .autodetect(outcome)
         }

@@ -23,30 +23,12 @@ import TrustCenter
 import TrustPersistence
 // Blueprint: | `QuietSelfAdminRender.swift` | Quiet page assembly and app read/action host; Tools ability rows use Parts.list, including turn and senses; mounted presentation supplies the visible mode and Agent room for self-window reads, independently of Advanced sidebar `current` and its screenshot restriction; Today waiting uses `WorkOverviewRead`, helpers use the engine bot shelf, chat cards use the transcript owner's checked projection; page indexing/rendering receives live layout; context receipts read the engine data root |
 
-/// Only screenshots mount an offscreen copy of a page. Text reads load owner
-/// state directly. The screenshot's unordered host never touches the visible
-/// window; this flag suppresses lifecycle writes while allowing read-only
-/// `quietReadTask` loads to finish before capture.
-private struct QuietOffscreenReadKey: EnvironmentKey {
-    static let defaultValue = false
-}
-
-/// The tab a screenshot asked for. A tabbed page's offscreen copy draws it, or
-/// its first (default) tab when nil — never the tab User last left open.
-private struct QuietRailTabKey: EnvironmentKey {
-    static let defaultValue: String? = nil
-}
-
 extension EnvironmentValues {
-    var quietOffscreenRead: Bool {
-        get { self[QuietOffscreenReadKey.self] }
-        set { self[QuietOffscreenReadKey.self] = newValue }
-    }
+    /// Screenshots suppress lifecycle writes while allowing read-only loads.
+    @Entry var quietOffscreenRead: Bool = false
 
-    var quietRailTab: String? {
-        get { self[QuietRailTabKey.self] }
-        set { self[QuietRailTabKey.self] = newValue }
-    }
+    /// The requested screenshot tab, or the page's default when nil.
+    @Entry var quietRailTab: String? = nil
 }
 
 private struct LiveTaskModifier<ID: Equatable>: ViewModifier {
@@ -205,16 +187,8 @@ enum QuietSelfAdminRender {
         // `liveOnAppear`), so a read cannot change what the page reports.
         .environment(\.quietOffscreenRead, true)
         .frame(width: size.width, height: size.height)
-        // The room, drawn HERE and nowhere else in a quiet read.
-        //
-        // On the glass the ground is the window's job (`ShellFrame` draws
-        // `ShellSheet`; `ShellRoomBackdrop` is deliberately `Color.clear` so a
-        // page never draws a second plate). The offscreen host has no
-        // ShellFrame, so the page had NO ground: every material resolved
-        // against nothing and the Providers title came back all but invisible
-        // on the capture while reading fine on screen. An opaque room ground
-        // behind the copy is the same colour the sheet resolves to, and it is
-        // behind the page, so nothing the page draws moves.
+        // ShellFrame owns the onscreen ground through ShellSheet; the
+        // offscreen host supplies the same room color behind the page.
         .background(NativeAgentShell.room.ignoresSafeArea())
     }
 
@@ -328,11 +302,14 @@ enum QuietSelfAdminRender {
     static func pageImagePNG(
         for page: QuietPage, tab: String? = nil, appModel: AppModel, size: CGSize = defaultSize
     ) async -> (data: Data, width: Int, height: Int)? {
-        await withPreparedHost(for: page, tab: tab, appModel: appModel, size: size) { hosting in
+        guard size.width.isFinite, size.height.isFinite,
+              let width = Int(exactly: size.width.rounded(.down)), width > 0,
+              let height = Int(exactly: size.height.rounded(.down)), height > 0 else { return nil }
+        return await withPreparedHost(for: page, tab: tab, appModel: appModel, size: size) { hosting in
             // 1x: a retina page doubles the bytes for detail a model does not read.
             guard let bitmap = NSBitmapImageRep(
                 bitmapDataPlanes: nil,
-                pixelsWide: Int(size.width), pixelsHigh: Int(size.height),
+                pixelsWide: width, pixelsHigh: height,
                 bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
                 colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
             ) else { return nil }
@@ -372,63 +349,58 @@ extension QuietSelfAdminRender {
             } else { projection.insert(section("Page caption unavailable",[caption.error?.message ?? caption.status.rawValue]),at:0) }
         default: break
         }
-        return await RuntimeReadProjection.quietPageContext(
+        return await RuntimeReadouts.quietPageContext(
             projection, pageID: page.id,
             model: appModel.chatModel, providerID: appModel.chatProvider,
-            dataRoot: dataRoot(appModel), providers: appModel.engine.providers)
+            dataRoot: appModel.engine.dataRoot, providers: appModel.engine.providers)
     }
 
     /// The page, in the words of the records it draws from.
     static func pageProjection(for page: QuietPage, appModel: AppModel) async -> [JSONValue] {
-        if let content = RuntimeReadProjection.quietVirtualPage(
+        if let content = RuntimeReadouts.quietVirtualPage(
             page.value) { return content }
-        if let service = RuntimeReadProjection.quietServicePages[page.id] {
-            return await RuntimeReadProjection.quietService(
+        if let service = RuntimeReadouts.quietServicePages[page.id] {
+            return await RuntimeReadouts.quietService(
                 page.value, service,
                 connectors: appModel.engine.connectors,
                 macIntegration: appModel.engine.macIntegration, statusText: connectorStatusText)
         }
         switch page.item {
         case .chat: return await chatProjection(appModel: appModel)
-        case .bots: return await RuntimeReadProjection.quietBots(engine: appModel.engine)
+        case .bots: return await RuntimeReadouts.quietBots(engine: appModel.engine)
         case .activity: return await todayProjection(appModel: appModel)
         case .providers: return await providersProjection(appModel: appModel)
-        case .trust: return RuntimeReadProjection.quietTrust(trust: appModel.engine.trust, dataRoot: dataRoot(appModel),
-            presetTitle: { TrustPolicyPreset.matching(policy: $0, accessMode: $1)?.title ?? "custom" }) { policy, mode in
+        case .trust: return RuntimeReadouts.quietTrust(trust: appModel.engine.trust, dataRoot: appModel.engine.dataRoot,
+            presetTitle: { MobileTrustAction.Preset.matching(policy: $0, accessMode: $1)?.title ?? "custom" }) { policy, mode in
             TrustGuardrailSummary.rows(policy: policy, accessMode: mode).map { "\($0.title): \($0.value). \($0.detail)" }
         }
-        case .memories: return RuntimeReadProjection.quietMemories(appModel.engine.memory,
+        case .memories: return RuntimeReadouts.quietMemories(appModel.engine.memory,
             keptLine: MemoriesPageContent.keptLine(appModel.engine.memory.memories.count), graphEntityCount: appModel.engine.memory.graphTotalEntities)
-        case .desk: return await RuntimeReadProjection.quietDesk(desk: appModel.engine.desk)
-        case .inboxPolicy: return RuntimeReadProjection.quietNotifications(appModel.engine.inbox)
+        case .desk: return await RuntimeReadouts.quietDesk(desk: appModel.engine.desk)
+        case .inboxPolicy: return RuntimeReadouts.quietNotifications(appModel.engine.inbox)
         case .diagnostics: return await diagnosticsProjection(appModel: appModel)
         case .tools: return toolsProjection(appModel: appModel)
-        case .capabilities: return RuntimeReadProjection.quietCapabilities(trust: appModel.engine.trust, approvals: appModel.engine.approvals,
+        case .capabilities: return RuntimeReadouts.quietCapabilities(trust: appModel.engine.trust, approvals: appModel.engine.approvals,
             workflowCount: appModel.engine.desk.workflows.count, actionCount: appModel.engine.tools.nativeActions.count)
-        case .connectors where page.tab == "iphone": return await RuntimeReadProjection.quietPairing(appModel.engine.sync, dataRoot: dataRoot(appModel))
-        case .connectors where page.tab == "agents": return await RuntimeReadProjection.quietAgents(appModel.engine.contacts)
-        case .connectors: return await RuntimeReadProjection.quietConnectors(
+        case .connectors where page.tab == "iphone": return await RuntimeReadouts.quietPairing(appModel.engine.sync, dataRoot: appModel.engine.dataRoot)
+        case .connectors where page.tab == "agents": return await RuntimeReadouts.quietAgents(appModel.engine.contacts)
+        case .connectors: return await RuntimeReadouts.quietConnectors(
             appModel.engine.connectors, workspaceCount: appModel.engine.connectors.workspaces.count,
             statusText: connectorStatusText)
-        case .telegram: return RuntimeReadProjection.quietTelegram(appModel.engine.telegram)
-        case .macIntegration: return await RuntimeReadProjection.quietMacIntegration(
+        case .telegram: return RuntimeReadouts.quietTelegram(appModel.engine.telegram)
+        case .macIntegration: return await RuntimeReadouts.quietMacIntegration(
             connectors: appModel.engine.connectors, macIntegration: appModel.engine.macIntegration,
             workspaceCount: appModel.engine.connectors.workspaces.count, statusText: connectorStatusText)
-        case .personality: return await RuntimeReadProjection.quietPersonality(name: appModel.engine.persona.profile?.name,
-            currentPersona: appModel.chatPersona, documents: appModel.engine.persona.documents, dataRootOverride: appModel.dataRootOverride)
-        case .settings: return RuntimeReadProjection.quietSettings(agentName: appModel.agentDisplayName, providerID: appModel.chatProvider,
+        case .personality: return await RuntimeReadouts.quietPersonality(appModel.engine.persona, currentPersona: appModel.chatPersona)
+        case .settings: return RuntimeReadouts.quietSettings(agentName: appModel.agentDisplayName, providerID: appModel.chatProvider,
             model: appModel.chatModel, fileAccess: appModel.chatFileAccess, status: appModel.statusForAgent)
         default: return []
         }
     }
 
-    private static func dataRoot(_ appModel: AppModel) -> URL {
-        appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-    }
+    private static let section = RuntimeReadouts.quietPageSection
 
-    private static let section = RuntimeReadProjection.quietPageSection
-
-    private static let countLine = RuntimeReadProjection.quietCountLine
+    private static let countLine = RuntimeReadouts.quietCountLine
 
     // MARK: Chat
 
@@ -437,18 +409,15 @@ extension QuietSelfAdminRender {
     private static func chatProjection(appModel: AppModel) async -> [JSONValue] {
         let sessionID = appModel.activeChatSessionId
         guard !sessionID.isEmpty else {
-            return [section("Chat", ["No conversation is open.", MoodTintProjection.line()])]
+            return [section("Chat", ["No conversation is open.", MoodTintReadout.line()])]
         }
         let messages = appModel.engine.transcripts.messages(for: sessionID)
-        let groups = MessageGrouper.groups(
-            for: messages,
-            sessionId: sessionID,
-            structureVersion: appModel.engine.transcripts.structureVersion
-        )
+        await appModel.engine.transcripts.prepareGroups(for: sessionID)
+        let groups = appModel.engine.transcripts.groups(for: sessionID)
         var sections: [JSONValue] = [section("Chat", [
             "Conversation: \(sessionID)",
             countLine(messages.count, "message", "messages") + " loaded.",
-            MoodTintProjection.line(),
+            MoodTintReadout.line(),
         ])]
 
         // Read the same mounted draft and pane that composer verbs change.
@@ -463,7 +432,7 @@ extension QuietSelfAdminRender {
         }
         let shell = QuietSelfAdmin.shared.composerCards
         let paneRows: [String] = shell.map { live in
-            live.activePane.isOpen
+            live.activePane != nil
                 ? [live.paneReadLine] + live.rows.map {
                     $0.isSelected ? "\($0.label) — selected" : $0.label
                 }
@@ -482,24 +451,7 @@ extension QuietSelfAdminRender {
         // The folds, in transcript order, by the row the fold stands on.
         var foldLines: [String] = []
         for group in groups where group.isToolGroup {
-            // Same three-way rule the glass uses: a raised card is a question,
-            // not a failure, pending or answered (2026-09-14).
-            let statuses = group.messages.map {
-                ChatShellToolSummary.status(
-                    kind: $0.metadata?.kind,
-                    ok: $0.metadata?.ok,
-                    resultSummary: $0.metadata?.resultSummary,
-                    resultStatus: $0.metadata?.resultStatus,
-                    interactionState: $0.metadata?.interactionState
-                )
-            }
-            foldLines.append(
-                await appModel.engine.transcripts.presentation.prepare("headline:"+(group.messages.first?.id ?? "empty"), input: ChatShellToolSummary.headlineInput(
-                    count: group.messages.count,
-                    failed: statuses.filter { $0 == .failed }.count,
-                    needsYou: statuses.filter { $0 == .needsYou }.count
-                ))
-            )
+            foldLines.append(await appModel.engine.transcripts.prepareToolFold(group.messages))
         }
         if !foldLines.isEmpty {
             sections.append(section("Tool folds", foldLines))
@@ -507,9 +459,9 @@ extension QuietSelfAdminRender {
 
         do {
             let read = try await appModel.engine.transcripts.loadTranscript(sessionId: sessionID)
-            sections += RuntimeReadProjection.quietChatCards(read)
+            sections += RuntimeReadouts.quietChatCards(read)
         } catch {
-            sections.append(RuntimeReadProjection.quietPageIssue("Cards", reason: "chat_cards_unavailable",
+            sections.append(RuntimeReadouts.quietPageIssue("Cards", reason: "chat_cards_unavailable",
                 detail: error.localizedDescription, instruction: "Resolve the reported conversation read problem without deleting its history, then reload Chat.",
                 next: ["page": .string("chat")], error: error))
         }
@@ -548,7 +500,7 @@ extension QuietSelfAdminRender {
             rows.isEmpty ? [] : [section(heading, rows.map { [$0.time, $0.title, $0.line].filter { !$0.isEmpty }.joined(separator: " · ") })]
         }
         let blocks: [String: [JSONValue]] = [
-            "waiting": (appModel.ownerWaitingCount ?? 0) > 0 ? [section("Waiting on you", waiting)] : [],
+            "waiting": (appModel.engine.desk.ownerWaitingCount ?? 0) > 0 ? [section("Waiting on you", waiting)] : [],
             "earlier": TodayView.earlierNotesLine(earlier).map { [section("Earlier", [$0] + earlier.map { $0.title + ($0.count > 1 ? " ×\($0.count)" : "") })] } ?? [],
             "did": rows("What I did today", today.didRows),
             "ahead": rows("Ahead", snapshot.ahead),
@@ -560,21 +512,19 @@ extension QuietSelfAdminRender {
 
     // MARK: Providers
 
-    /// The three groups, each with the model its whole group runs on, and the
-    /// accounts that are connected. User, 2026-09-13: every surface in a group
-    /// runs on the group's model, so the projection reads the group's rows.
+    /// Each group's rows supply its shared model and connected accounts.
     private static func providersProjection(appModel: AppModel) async -> [JSONValue] {
         let outcome = await appModel.engine.providers.refreshSettings(refreshCatalog: false, cause: UserFacingError.cause)
         guard case .loaded(let snapshot) = outcome else {
             if case .failed(let reason) = outcome {
-                return [RuntimeReadProjection.quietPageIssue("Providers", reason: "providers_read_failed",
+                return [RuntimeReadouts.quietPageIssue("Providers", reason: "providers_read_failed",
                     detail: reason, instruction: "Resolve the reported account or routing problem in Providers.", tap: "Providers")]
             }
-            return [RuntimeReadProjection.quietPageIssue("Providers", reason: "providers_not_loaded",
+            return [RuntimeReadouts.quietPageIssue("Providers", reason: "providers_not_loaded",
                 detail: "Providers have not loaded.", instruction: "Read Providers to load accounts and routing.",
                 next: ["page": .string("providers")], status: "not_loaded")]
         }
-        return RuntimeReadProjection.quietProviders(routing: snapshot.routing, providers: snapshot.providers)
+        return RuntimeReadouts.quietProviders(routing: snapshot.routing, providers: snapshot.providers)
     }
 
 
@@ -587,7 +537,7 @@ extension QuietSelfAdminRender {
         head.append(countLine(appModel.engine.runs.rows.count, "run recorded", "runs recorded"))
         var sections = [section("Diagnostics", head)]
         if appModel.engine.doctor.health == nil {
-            sections.append(RuntimeReadProjection.quietPageIssue("Runtime health", reason: "runtime_health_not_loaded",
+            sections.append(RuntimeReadouts.quietPageIssue("Runtime health", reason: "runtime_health_not_loaded",
                 detail: "No runtime health snapshot has loaded.", instruction: "Read Diagnostics to load runtime health.",
                 next: ["page": .string("diagnostics")], status: "not_loaded"))
         }
@@ -600,7 +550,7 @@ extension QuietSelfAdminRender {
                         ?? "read with ability.read; only Markdown guidance restores without a version")
                 }))
             }
-        } catch { sections.append(RuntimeReadProjection.quietPageIssue("Tool targets", reason: "tool_targets_unavailable",
+        } catch { sections.append(RuntimeReadouts.quietPageIssue("Tool targets", reason: "tool_targets_unavailable",
             detail: error.localizedDescription, instruction: "Resolve the reported ability-store read problem before restoring an ability; inspect Tools for its current state.",
             next: ["page": .string("tools")], error: error)) }
         if !appModel.engine.runs.rows.isEmpty {
@@ -624,36 +574,36 @@ extension QuietSelfAdminRender {
             authored: tools.authored,
             loadFailed: tools.catalogLoadError != nil, loadError: tools.catalogLoadError)
         var sections: [JSONValue] = []
-        switch ToolsCatalogSurfacePresentation.state(for: state) {
-        case .loading(let detail), .empty(let detail):
-            sections.append(section("Tools", [detail.detail]))
-        case .unavailable(let detail):
-            sections.append(RuntimeReadProjection.quietPageIssue("Tools", reason: "tool_catalog_unavailable",
-                detail: tools.catalogLoadError ?? detail.detail,
+        switch state {
+        case .loading:
+            sections.append(section("Tools", ["Loading the tools…"]))
+        case .empty:
+            sections.append(section("Tools", ["The tool list loaded, but there were no tools in it."]))
+        case .unavailable:
+            sections.append(RuntimeReadouts.quietPageIssue("Tools", reason: "tool_catalog_unavailable",
+                detail: tools.catalogLoadError ?? "No tool catalog loaded. Use Refresh to load it.",
                 instruction: "Resolve the reported catalog read problem, then read Tools to reload it.",
                 next: ["page": .string("tools")]))
-        case .catalog:
-            if let catalog = tools.catalog {
-                if case .stale(_, _, let detail) = state {
-                    sections.append(RuntimeReadProjection.quietPageIssue("Tools", reason: "tool_catalog_stale",
-                        detail: detail ?? "The catalog could not refresh; these are the last loaded tools.",
-                        instruction: "Resolve the reported catalog read problem, then read Tools to reload it.",
-                        next: ["page": .string("tools")], status: "stale"))
-                }
-                sections += ChatToolCatalogPresentation.buckets(for: catalog, authored: tools.authored).map { bucket in
-                    section(bucket.title, bucket.tools.map {
-                        "\($0.name): \(catalog.status(for: $0).title) · \($0.description)"
-                    })
-                }
-                sections.append(section("Mac access", [catalog.builderModeDetail]
-                    + catalog.builderAvailable + catalog.macAppAvailable))
+        case let .available(catalog, buckets), let .stale(catalog, buckets, _):
+            if case .stale(_, _, let detail) = state {
+                sections.append(RuntimeReadouts.quietPageIssue("Tools", reason: "tool_catalog_stale",
+                    detail: detail ?? "The catalog could not refresh; these are the last loaded tools.",
+                    instruction: "Resolve the reported catalog read problem, then read Tools to reload it.",
+                    next: ["page": .string("tools")], status: "stale"))
             }
+            sections += buckets.buckets.map { bucket in
+                section(bucket.title, bucket.tools.map {
+                    "\($0.name): \(catalog.status(for: $0).title) · \($0.description)"
+                })
+            }
+            sections.append(section("Mac access", [catalog.builderModeDetail]
+                + catalog.builderAvailable + catalog.macAppAvailable))
         }
         do {
             if case .object(let list) = try Parts(root: tools.dataRoot).list() {
                 sections.append(.object(list.merging(["heading": .string("Abilities")]) { _, new in new }))
             }
-        } catch { sections.append(RuntimeReadProjection.quietPageIssue("Abilities", reason: "ability_list_unavailable",
+        } catch { sections.append(RuntimeReadouts.quietPageIssue("Abilities", reason: "ability_list_unavailable",
             detail: error.localizedDescription, instruction: "Ask the person to repair the reported ability-store defect, then read Tools again.",
             next: ["page": .string("tools")])) }
         return sections
@@ -750,12 +700,12 @@ enum QuietPages {
     /// The page index as the window shows it: a page whose rail row or place
     /// the layout hides (ui/layout.json) leaves it, and still reads by name.
     var pages: [QuietToolPage] {
-        guard let appModel = NativeAgentAppCoordinator.shared.appModel else { return [] }
-        return RuntimeReadProjection.quietPages(
+        guard let appModel = ApplicationLifetime.shared.appModel else { return [] }
+        return RuntimeReadouts.quietPages(
             layout: appModel.engine.layout.layout, profile: SimpleViewMode.current)
     }
-    var currentPage: QuietToolPage? { NativeAgentAppCoordinator.shared.currentPage.map(\.value) }
-    var visiblePageInput: [String: JSONValue]? { NativeAgentAppCoordinator.shared.visiblePageInput }
+    var currentPage: QuietToolPage? { ApplicationLifetime.shared.currentPage.map(\.value) }
+    var visiblePageInput: [String: JSONValue]? { ApplicationLifetime.shared.visiblePageInput }
     func page(named raw: String) -> QuietToolPage? { QuietToolPage.page(named: raw) }
     /// `app {page: "context", item: session_id}`: the composer's context
     /// receipt for a conversation, read from the turn traces by the same code
@@ -763,9 +713,9 @@ enum QuietPages {
     /// Defaults to the conversation on screen.
     @MainActor
     func contextReceiptRead(input: [String: JSONValue]) async -> JSONValue {
-        guard let appModel = NativeAgentAppCoordinator.shared.appModel else { return AppToolExecutor.unattachedFailure() }
+        guard let appModel = ApplicationLifetime.shared.appModel else { return AppToolExecutor.unattachedFailure() }
         return await AppToolExecutor.contextReceiptRead(input: input, activeSessionID: appModel.activeChatSessionId) { sessionID in
-            let state = await ContextReceiptProjection.read(sessionId: sessionID, selectedModel: appModel.chatModel, dataRoot: appModel.engine.dataRoot)
+            let state = await ContextReceipts.read(sessionId: sessionID, selectedModel: appModel.chatModel, dataRoot: appModel.engine.dataRoot)
             return ComposerContextReceiptPresentation.lines(state)
         }
     }
@@ -776,7 +726,7 @@ enum QuietPages {
     /// conversation on screen, as the pane does.
     @MainActor
     func agentViewRead(input: [String: JSONValue]) async -> JSONValue {
-        guard let appModel = NativeAgentAppCoordinator.shared.appModel else { return AppToolExecutor.unattachedFailure() }
+        guard let appModel = ApplicationLifetime.shared.appModel else { return AppToolExecutor.unattachedFailure() }
         return await AppToolExecutor.agentViewRead(input: input, rooms: HerScreenPreview.tabs(appModel.engine.layout.layout, profile: SimpleViewMode.agent),
                                                    activeSessionID: appModel.activeChatSessionId) { room, scope in
             await appModel.engine.turns.readAgentScreen(room: room, scope: scope)
@@ -789,7 +739,7 @@ enum QuietPages {
     func pageScreenshot(input: [String: JSONValue]) async -> JSONValue {
         let requested = Self.text(input["page"])
         let resolved = AppDoorNames.resolve(requested)
-        let target = resolved == "current" ? NativeAgentAppCoordinator.shared.currentPage
+        let target = resolved == "current" ? ApplicationLifetime.shared.currentPage
             : QuietPages.page(named: resolved) ?? QuietPages.drawOnly.first(where: { $0.id == resolved })
         guard let page = target else {
             return AppToolExecutor.failure(resolved == "current" ? "app_window_unavailable" : "unknown_page",
@@ -816,15 +766,21 @@ enum QuietPages {
             }
             tab = home.tab
         }
-        guard let appModel = NativeAgentAppCoordinator.shared.appModel else { return AppToolExecutor.unattachedFailure() }
+        guard let appModel = ApplicationLifetime.shared.appModel else { return AppToolExecutor.unattachedFailure() }
         var size = QuietSelfAdminRender.defaultSize
-        switch input["height"] {
-        case .int(let value)?: size.height = CGFloat(value)
-        case .double(let value)?: size.height = CGFloat(value)
-        case .string(let value)?: size.height = Double(value).map { CGFloat($0) } ?? size.height
-        default: break
+        if let requestedHeight = input["height"] {
+            let height: Double?
+            switch requestedHeight {
+            case .int(let value): height = Double(value)
+            case .double(let value): height = value
+            case .string(let value): height = Double(value)
+            default: height = nil
+            }
+            guard let height, height.isFinite else {
+                return AppToolExecutor.failure("invalid_height", "Screenshot height must be a finite number.")
+            }
+            size.height = min(max(CGFloat(height), 400), 2400)
         }
-        size.height = min(max(size.height, 400), 2400)
         guard let rendered = await QuietSelfAdminRender.pageImagePNG(for: page, tab: tab, appModel: appModel, size: size) else {
             return AppToolExecutor.failure("render_failed", "Offscreen bitmap allocation or PNG encoding failed.",
                 extra: ["page": .string(page.id), "tab": .string(tabKey),
@@ -834,7 +790,7 @@ enum QuietPages {
         }
         return AppToolExecutor.pageScreenshotResult(
             page: page.value, tabKey: tabKey,
-            dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot(), rendered: rendered)
+            dataRoot: appModel.engine.dataRoot, rendered: rendered)
     }
 
     private static func text(_ value: JSONValue?) -> String {

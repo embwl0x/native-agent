@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Procedures
@@ -17,9 +18,7 @@ extension SwiftNativeApprovalInbox {
     public static let procedureReviewApprovalAction = "living_fabric.procedure_review"
     private static let procedureReviewApprovalSchema = "living-fabric-procedure-review.v1"
 
-    /// Mints the only production-capable reviewer decision. The compiler later
-    /// recomputes `candidateEvidenceDigest`, so even an approved stale proposal
-    /// cannot compile a changed candidate.
+    /// Mints the sole production reviewer decision; compilation rechecks its candidate evidence digest.
     public func approvedProcedureReviewerDecision(
         approvalID: String,
         proposal: ProcedureReviewProposal

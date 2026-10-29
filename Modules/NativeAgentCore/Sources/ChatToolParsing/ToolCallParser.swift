@@ -12,7 +12,7 @@ package struct ParsedToolCall: Equatable {
     package let id: String
     package let name: String
     package let input: [String: JSONValue]
-    /// 2026-09-22: <invoke> parameters that were JSON-typed, as written, so a
+    /// <invoke> parameters that were JSON-typed, as written, so a
     /// string-schema param given text "42" can be restored to the string.
     package var invokeRawText: [String: String] = [:]
     /// Text lane: undeclared fields or raw invoke content without parameters.
@@ -59,22 +59,25 @@ package enum ToolCallParser {
     /// blocks `{"type":"tool_use","id":...,"name":"...","input":{...}}`.
     /// `parseInvoke`: only the text tool lane runs Claude's `<invoke>` form.
     package static func parse(_ raw: String, parseInvoke: Bool = false, recordShims: Bool = true) -> [ParsedToolCall] {
-        let openAI = parseOpenAI(raw)
-        let calls = openAI ?? parseAnthropic(raw, parseInvoke: true, recordShims: false)
+        let parsed = try? JSONValue.parse(Data(raw.trimmingCharacters(in: .whitespacesAndNewlines).utf8))
+        let openAI = parseOpenAI(parsed)
+        let positioned = openAI == nil ? parseAnthropic(raw, parsed: parsed) : []
+        let calls = openAI ?? positioned.map { $0.1 }
         guard formattedToolCallViolation(in: raw, toolNames: [], parseInvoke: parseInvoke,
-                                         openAI: openAI, calls: calls) == nil else {
-            if !calls.isEmpty, calls.allSatisfy({ isIgnorableToolName($0.name) }) {
-                _ = executableCalls(calls, recordShims: recordShims)
+                                         openAI: openAI, calls: calls) == nil else { return [] }
+        if let openAI { return executableCalls(openAI) }
+        // A native content block can quote invokes inside its arguments.
+        let accepted = positioned.filter { parseInvoke || !$0.2 }
+        if !parseInvoke, !positioned.isEmpty, accepted.isEmpty { return executableCalls(parseContentBlocks(parsed)) }
+        // Only accepted calls emit receipts.
+        return accepted.compactMap { positioned in
+            let call = positioned.1
+            guard !isIgnorableToolName(call.name) else { return nil }
+            if recordShims, positioned.2, call.undeclaredKeys.isEmpty {
+                TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("L12"), "site": .string("ToolCallParser.swift:parseAnthropic")]))
             }
-            return []
+            return call
         }
-        // Validation recognizes inline invokes even when this lane cannot execute them.
-        // Only the accepted parse reports repairs; detector probes above stay silent.
-        if openAI == nil {
-            if !recordShims, parseInvoke { return executableCalls(calls, recordShims: false) }
-            return executableCalls(parseAnthropic(raw, parseInvoke: parseInvoke, recordShims: recordShims), recordShims: recordShims)
-        }
-        return executableCalls(calls, recordShims: recordShims)
     }
 
     /// Restore the outer closing tag swallowed by the text-lane API stop.
@@ -89,49 +92,6 @@ package enum ToolCallParser {
         return cut
     }
 
-    /// Wave 2 #7: work promised for a LATER turn, which MY QUEUE keeps (the
-    /// in-turn shapes above still bounce first). Conservative
-    /// on purpose: a sentence counts only with BOTH a first-person commitment
-    /// (I'll / I will / I'm going to; not negated, not "I'll be") AND an
-    /// explicit cross-turn marker. A question, an offer or a conditional
-    /// ("if", "would", "could", "might", "want me to", "should I", "unless")
-    /// never counts, nor text in quotes, code fences or block quotes. Each hit
-    /// is the sentence as she wrote it and the condition its marker names:
-    /// after_card, when_user_messages, own_turn or next_turn. Three at most.
-    package static func crossTurnDeferrals(_ raw: String) -> [(sentence: String, when: String)] {
-        var prose = raw.replacingOccurrences(of: #"```[\s\S]*?```"#, with: "\n", options: .regularExpression)
-        prose = prose.split(separator: "\n", omittingEmptySubsequences: false)
-            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix(">") }.joined(separator: "\n")
-        var found: [(sentence: String, when: String)] = []
-        for piece in prose.split(whereSeparator: { ".!?;\n".contains($0) }) where found.count < 3 {
-            let sentence = piece.trimmingCharacters(in: .whitespaces)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "-*•_ "))
-            guard (12...280).contains(sentence.count),
-                  prose[piece.endIndex...].first != "?" else { continue }
-            let text = sentence.lowercased()
-                .replacingOccurrences(of: "\u{2019}", with: "'").replacingOccurrences(of: "\u{02BC}", with: "'")
-                .replacingOccurrences(of: #""[^"]*"|“[^”]*”"#, with: " ", options: .regularExpression)
-            func has(_ pattern: String) -> Bool { text.range(of: pattern, options: .regularExpression) != nil }
-            guard has(#"\b(i'll|i\s+will|i'm\s+going\s+to|i\s+am\s+going\s+to)\s+(?!(not|never|be)\b)[a-z]"#),
-                  !has(#"\b(if|would|could|might|unless|whether|want\s+me|should\s+i)\b"#) else { continue }
-            let when: String
-            if has(#"\b(once|after|when)\s+(you|user|he)\s+(approve|approves|ok|oks|okay|okays|sign\s+off|signs\s+off)\b"#)
-                || has(#"\b(once|after|when)\s+(the\s+|that\s+|this\s+)?(card|approval)\b"#)
-                || has(#"\bonce\s+((it|that|this)('s|\s+is)\s+)?approved\b"#) {
-                when = "after_card"
-            } else if has(#"\b(once|after|when)\s+(you|user|he)\s+(reply|replies|respond|responds|write|writes|message|messages|text|texts|get\s+back|gets\s+back|come\s+back|comes\s+back|wake|wakes)\b"#)
-                || has(#"\b(once|after|when)\s+(you're|you\s+are|user's|user\s+is|he's|he\s+is)\s+back\b"#) {
-                when = "when_user_messages"
-            } else if has(#"\b(on|in|during)\s+my\s+own\s+(turn|time)\b"#) || has(#"\bwhen\s+i\s+(next\s+)?wake\b"#) {
-                when = "own_turn"
-            } else if has(#"\b(next|following)\s+turn\b"#) || has(#"\bin\s+my\s+next\s+(reply|message)\b"#) {
-                when = "next_turn"
-            } else { continue }
-            found.append((sentence, when))
-        }
-        return found
-    }
-
     private static let toolUseMarkerRegexes = [
         #"<tool_use\s+id="[^"]*"\s+name="[^"]+"\s*>[\s\S]*?</tool_use>"#,
         #"<tool_use\s+name="[^"]+"\s*>[\s\S]*?</tool_use>"#,
@@ -143,19 +103,22 @@ package enum ToolCallParser {
     package static func stripToolUseMarkers(_ raw: String) -> String {
         var s = raw
         for rx in toolUseMarkerRegexes {
-            s = rx.stringByReplacingMatches(
-                in: s, options: [],
-                range: NSRange(s.startIndex..., in: s), withTemplate: ""
-            )
+            let quoted = codeRanges(in: s)
+            let result = NSMutableString(string: s)
+            for match in rx.matches(in: s, range: NSRange(s.startIndex..., in: s)).reversed()
+                where !quoted.contains(where: { NSLocationInRange(match.range.location, $0) }) {
+                result.replaceCharacters(in: match.range, with: "")
+            }
+            s = result as String
         }
         return s
     }
 
-    package static func executableCalls(_ calls: [ParsedToolCall], recordShims: Bool = true) -> [ParsedToolCall] {
-        calls.filter { !isIgnorableToolName($0.name, recordShim: recordShims) }
+    package static func executableCalls(_ calls: [ParsedToolCall]) -> [ParsedToolCall] {
+        calls.filter { !isIgnorableToolName($0.name) }
     }
 
-    package static func isIgnorableToolName(_ name: String, recordShim: Bool = false) -> Bool {
+    package static func isIgnorableToolName(_ name: String) -> Bool {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return trimmed.isEmpty
     }
@@ -168,16 +131,27 @@ package enum ToolCallParser {
         #"(?s)(`+)(?!`)(.*?)(?<!`)\1(?!`)"#,
     ].map { try! NSRegularExpression(pattern: $0) }
 
+    private static func codeRanges(in raw: String) -> [NSRange] {
+        codeRegionRegexes.flatMap { $0.matches(in: raw, range: NSRange(raw.startIndex..., in: raw)).map(\.range) }
+    }
+
+    /// Keep offsets while hiding quoted examples from protocol detection.
+    private static func unquotedProtocolText(_ raw: String) -> String {
+        let text = NSMutableString(string: raw)
+        for range in codeRanges(in: raw) {
+            text.replaceCharacters(in: range, with: String(repeating: " ", count: range.length))
+        }
+        return text as String
+    }
+
     private static let orphanRegex = try! NSRegularExpression(pattern: #"(?im)^[ \t]*(?:</?(?:tool_use|invoke|parameter)\b|_?(?:tool_use|ool_use)\b[ \t>])"#)
     private static let invokeStartRegex = try! NSRegularExpression(pattern: #"(?im)^[ \t]*(?:<function_calls>\s*)?<invoke\b"#)
-    private static let quotedMarkerRegex = try! NSRegularExpression(pattern: #"(?i)<(?:tool_use|invoke)\b"#)
     private static let nestedMarkerRegex = try! NSRegularExpression(pattern: #"<(?:tool_use|invoke)\b"#)
     private static let formattedMarkerRegex = try! NSRegularExpression(pattern: #"(?is)(?:\*\*|__)\s*<(tool_use|invoke)\b[\s\S]*?</\1>\s*(?:\*\*|__)"#)
     private static let headerRegex = try! NSRegularExpression(pattern: #"(?im)^[ \t]*(?:\d+[ \t]*)?(?:\*\*|__)?[ \t]*Tool[ \t]+Call[ \t]*(?::[ \t]*[A-Za-z0-9_.:-]*)?[ \t]*(?:\*\*|__)?[ \t]*$"#)
     private static let fencedJSONRegex = try! NSRegularExpression(pattern: #"(?is)(?:```|~~~)[ \t]*(?:json)?[ \t]*\r?\n[ \t]*\{[\s\S]*?(?:```|~~~)"#)
-    private static let markerRegex = try! NSRegularExpression(pattern: #"<tool_use\s+(?:id="[^"]*"\s+)?name="([^"]+)"\s*>([\s\S]*?)</tool_use>"#)
-    private static let idMarkerRegex = try! NSRegularExpression(pattern: #"<tool_use\s+id="([^"]*)"\s+name="([^"]+)"\s*>([\s\S]*?)</tool_use>"#)
-    private static let legacyMarkerRegex = try! NSRegularExpression(pattern: #"<tool_use\s+name="([^"]+)"\s*>([\s\S]*?)</tool_use>"#)
+    private static let markerRegex = try! NSRegularExpression(pattern: #"<tool_use\s+(?:id="([^"]*)"\s+)?name="([^"]+)"\s*>([\s\S]*?)</tool_use>"#)
+    private static let positionedMarkerRegex = try! NSRegularExpression(pattern: "(?=" + markerRegex.pattern + ")")
     private static let invokeRegex = try! NSRegularExpression(pattern: #"<invoke\s+name="([^"]+)"\s*>([\s\S]*?)</invoke>"#)
     private static let parameterRegex = try! NSRegularExpression(pattern: #"<parameter\s+name="([^"]+)"\s*>([\s\S]*?)</parameter>"#)
     // Overlapping matches let a complete inner call survive an unfinished outer call.
@@ -185,7 +159,7 @@ package enum ToolCallParser {
 
     /// Control debris is not prose, even when the provider ends inside it.
     /// Keep fenced and inline code and complete calls intact, including their arguments.
-    package static func stripProtocolDebris(_ raw: String, recordShims: Bool = true) -> String {
+    package static func stripProtocolDebris(_ raw: String) -> String {
         let stripped = raw.replacingOccurrences(
             of: #"(?is)(```.*?```|~~~.*?~~~|(?<!`)(`+)(?!`).*?(?<!`)\2(?!`)|<tool_use\b[^<>]*>.*?</tool_use>|<invoke\b[^<>]*>.*?</invoke>)|(?:"# + protocolDebrisPattern + ")",
             with: "$1", options: .regularExpression)
@@ -193,49 +167,35 @@ package enum ToolCallParser {
         return stripped
     }
 
-    /// Broken or formatted calls never execute or settle as ordinary prose.
+    /// Broken or formatted executable calls get a format nudge; quoted code is prose.
     /// The shared loop gives one format nudge before settling incomplete.
     package static func formattedToolCallViolation(
         in raw: String, toolNames: Set<String> = [], parseInvoke: Bool = false
     ) -> ToolCallProtocolViolation? {
-        let openAI = parseOpenAI(raw)
+        let parsed = try? JSONValue.parse(Data(raw.trimmingCharacters(in: .whitespacesAndNewlines).utf8))
+        let openAI = parseOpenAI(parsed)
         return formattedToolCallViolation(in: raw, toolNames: toolNames, parseInvoke: parseInvoke,
-                                          openAI: openAI, calls: openAI ?? parseAnthropic(raw, parseInvoke: true, recordShims: false))
+                                          openAI: openAI, calls: openAI ?? parseAnthropic(raw, parsed: parsed).map { $0.1 })
     }
 
     private static func formattedToolCallViolation(
         in raw: String, toolNames: Set<String>, parseInvoke: Bool,
         openAI: [ParsedToolCall]?, calls: [ParsedToolCall]
     ) -> ToolCallProtocolViolation? {
+        let unquoted = unquotedProtocolText(raw)
         // Remove complete calls before looking for orphan tags or placeholders.
         // Their arguments may legitimately contain these strings.
-        // Fenced code is quoted text, never a call.
-        let unfenced = raw.replacingOccurrences(
-            of: #"(?s)```.*?```|~~~.*?~~~"#, with: "", options: .regularExpression)
-        let remainder = stripToolUseMarkers(unfenced)
+        let remainder = stripToolUseMarkers(unquoted)
         if regexMatches(orphanRegex, in: remainder)
-            || (!unfenced.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                && stripProtocolDebris(unfenced, recordShims: false).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            || (!parseInvoke && regexMatches(invokeStartRegex, in: raw))
+            || (!unquoted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && stripProtocolDebris(unquoted).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            || (!parseInvoke && regexMatches(invokeStartRegex, in: unquoted))
             || (openAI != nil && calls.isEmpty)
-            || (!calls.isEmpty && executableCalls(calls, recordShims: false).isEmpty) {
+            || (!calls.isEmpty && executableCalls(calls).isEmpty) {
             return ToolCallProtocolViolation(kind: .malformedToolUseMarker)
         }
 
-        // A syntactically valid marker inside a code fence or inline Markdown
-        // is still protocol-invalid. Check this before parseAnthropic, whose
-        // intentionally unanchored marker regex otherwise finds the inner tag.
-        // Inspect the whole code region: <function_calls> and example prose
-        // may precede the invoke that the executable parser would find.
-        let ns = raw as NSString
-        for rx in codeRegionRegexes {
-            for match in rx.matches(in: raw, range: NSRange(location: 0, length: ns.length)) {
-                if regexMatches(quotedMarkerRegex, in: ns.substring(with: match.range(at: 2))) {
-                    return ToolCallProtocolViolation(kind: .formattedToolUseMarker)
-                }
-            }
-        }
-        if regexMatches(formattedMarkerRegex, in: raw) {
+        if regexMatches(formattedMarkerRegex, in: unquoted) {
             return ToolCallProtocolViolation(kind: .formattedToolUseMarker)
         }
 
@@ -246,18 +206,19 @@ package enum ToolCallParser {
         //   ```
         // Requiring both an exact header line and a following fenced JSON
         // object avoids bouncing ordinary prose that merely discusses calls.
-        if regexMatches(headerRegex, in: raw), regexMatches(fencedJSONRegex, in: raw) {
+        if regexMatches(headerRegex, in: unquoted), regexMatches(fencedJSONRegex, in: raw) {
             return ToolCallProtocolViolation(kind: .markdownToolCallBlock)
         }
 
-        // 2026-09-22: a marker whose body is not a JSON object used to run
-        // with {} and fail as "missing X", so the model never learned why.
-        // Only for a real tool name: anything else is prose quoting the syntax.
-        for m in markerRegex.matches(in: raw, range: NSRange(location: 0, length: ns.length)) {
-            guard toolNames.contains(ns.substring(with: m.range(at: 1))) else { continue }
-            let body = ns.substring(with: m.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+        // Known tool markers require a JSON object body; quoted syntax is prose.
+        let ns = raw as NSString
+        let quoted = codeRanges(in: raw)
+        for m in markerRegex.matches(in: raw, range: NSRange(location: 0, length: ns.length))
+            where !quoted.contains(where: { NSLocationInRange(m.range.location, $0) }) {
+            guard toolNames.contains(ns.substring(with: m.range(at: 2))) else { continue }
+            let body = ns.substring(with: m.range(at: 3)).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !body.isEmpty else { continue }
-            if markerObject(body, recordShims: false) != nil { continue }
+            if markerObject(body) != nil { continue }
             return ToolCallProtocolViolation(kind: .malformedToolUseMarker)
         }
         return nil
@@ -268,16 +229,14 @@ package enum ToolCallParser {
         guard let start = earliestPotentialProtocolMarker(in: raw)?.lowerBound else { return nil }
         let ns = raw as NSString
         // Keep the full reply's quotation context, including fences before the marker.
-        let codeRanges = codeRegionRegexes.flatMap { rx in
-            rx.matches(in: raw, range: NSRange(location: 0, length: ns.length)).map(\.range)
-        }
+        let quoted = codeRanges(in: raw)
         var replacements: [String] = []
         for region in repairRegionRegex.matches(in: raw, range: NSRange(start..., in: raw)) {
-            guard !codeRanges.contains(where: { NSLocationInRange(region.range.location, $0) }) else { continue }
+            guard !quoted.contains(where: { NSLocationInRange(region.range.location, $0) }) else { continue }
             let name = ns.substring(with: region.range(withName: "name"))
             guard toolNames.contains(name), !isIgnorableToolName(name) else { continue }
             let body = ns.substring(with: region.range(withName: "body")).trimmingCharacters(in: .whitespacesAndNewlines)
-            if let input = markerObject(body, recordShims: false),
+            if let input = markerObject(body),
                let json = try? JSONValue.object(input).serialize(pretty: false) {
                 let id = region.range(withName: "id").location == NSNotFound
                     ? "" : " id=\"\(ns.substring(with: region.range(withName: "id")))\""
@@ -318,10 +277,9 @@ package enum ToolCallParser {
         }
         if let tool = raw.range(of: "<tool", options: [.caseInsensitive]) {
             let prefix = raw[..<tool.lowerBound]
-            // Keep a surrounding Markdown wrapper too. Otherwise an opening
-            // fence could stream just before the inner marker is recognized.
+            // Keep a surrounding Markdown wrapper until the round can distinguish an example.
             for wrapper in ["```", "~~~", "**", "__", "`"] {
-                if let start = prefix.range(of: wrapper, options: [.backwards]) {
+                if let start = prefix.range(of: wrapper, options: .backwards) {
                     candidates.append(start)
                 }
             }
@@ -330,11 +288,13 @@ package enum ToolCallParser {
     }
 
     /// Visible prose preceding the earliest possible protocol marker, unchanged if absent.
-    package static func visiblePrefix(in raw: String, recordShims: Bool = true) -> String {
-        if let marker = earliestPotentialProtocolMarker(in: raw) {
-            return stripProtocolDebris(String(raw[..<marker.lowerBound]), recordShims: recordShims)
+    package static func visiblePrefix(in raw: String) -> String {
+        let unquoted = unquotedProtocolText(raw)
+        if let candidate = earliestPotentialProtocolMarker(in: unquoted),
+           let marker = Range(NSRange(candidate, in: unquoted), in: raw) {
+            return stripProtocolDebris(String(raw[..<marker.lowerBound]))
         }
-        return stripProtocolDebris(raw, recordShims: recordShims)
+        return stripProtocolDebris(raw)
     }
 
     private static func regexMatches(_ regex: NSRegularExpression, in raw: String) -> Bool {
@@ -346,13 +306,8 @@ package enum ToolCallParser {
     //   "tool_calls": [{"id":..., "function":{"name":..., "arguments":"<json-string>"}}]
     // or
     //   "function_call": {"name":..., "arguments":"<json-string>"}
-    static func parseOpenAI(_ raw: String) -> [ParsedToolCall]? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let data = trimmed.data(using: .utf8) else { return nil }
-        guard let parsed = try? JSONValue.parse(data),
-              case .object(let obj) = parsed else {
-            return nil
-        }
+    private static func parseOpenAI(_ parsed: JSONValue?) -> [ParsedToolCall]? {
+        guard case .object(let obj)? = parsed else { return nil }
         if case .array(let arr) = obj["tool_calls"] ?? .null {
             var calls: [ParsedToolCall] = []
             for item in arr {
@@ -396,94 +351,65 @@ package enum ToolCallParser {
         return call
     }
 
-    // <tool_use> marker (both OAuth-direct adapters emit) + bare JSON content
-    // blocks (the Anthropic content-array shape). Marker is now id-bearing:
-    //   <tool_use id="toolu_..." name="X">{json}</tool_use>
-    // The legacy form `<tool_use name="X">{json}</tool_use>` is still parsed
-    // — id falls back to empty so the tool loop can detect and skip the
-    // round-trip ID echo.
     /// Read the marker body as the declared JSON object.
-    static func markerObject(_ body: String, recordShims: Bool = true) -> [String: JSONValue]? {
+    static func markerObject(_ body: String) -> [String: JSONValue]? {
         guard case .object(let object)? = try? JSONValue.parse(Data(body.utf8)) else { return nil }
         return object
     }
 
-    static func parseAnthropic(_ raw: String, parseInvoke: Bool = false, recordShims: Bool = true) -> [ParsedToolCall] {
+    private static func parseAnthropic(_ raw: String, parsed: JSONValue?) -> [(Int, ParsedToolCall, Bool)] {
         var positionedCalls: [(Int, ParsedToolCall, Bool)] = []
         let ns = raw as NSString
-        // The two marker patterns do not overlap; collect both before sorting.
-        for m in idMarkerRegex.matches(in: raw, options: [], range: NSRange(location: 0, length: ns.length)) {
-            let id = ns.substring(with: m.range(at: 1))
+        let quoted = codeRanges(in: raw)
+        // Each spelling consumes its own span, including rejected swallowed markers.
+        var consumed: [Bool: Int] = [:]
+        for m in positionedMarkerRegex.matches(in: raw, range: NSRange(location: 0, length: ns.length)) {
+            let hasID = m.range(at: 1).location != NSNotFound
+            guard m.range.location >= consumed[hasID, default: 0] else { continue }
+            consumed[hasID] = NSMaxRange(m.range(at: 3)) + "</tool_use>".utf16.count
+            guard !quoted.contains(where: { NSLocationInRange(m.range.location, $0) }) else { continue }
+            let id = hasID ? ns.substring(with: m.range(at: 1)) : ""
             let name = ns.substring(with: m.range(at: 2))
             let body = ns.substring(with: m.range(at: 3))
-            let input = markerObject(body, recordShims: recordShims) ?? [:]
-            positionedCalls.append((m.range.location, ParsedToolCall(id: id, name: name, input: input), false))
+            // An unclosed ID-less marker cannot swallow a later call.
+            if !hasID, body.contains("<tool_use") { continue }
+            positionedCalls.append((m.range.location, argumentsCall(id: id, name: name, .string(body)), false))
         }
-        // Legacy plain-name form. Kept as a back-compat seam.
-        for m in legacyMarkerRegex.matches(in: raw, options: [], range: NSRange(location: 0, length: ns.length)) {
+        for m in invokeRegex.matches(in: raw, range: NSRange(location: 0, length: ns.length))
+            where !quoted.contains(where: { NSLocationInRange(m.range.location, $0) }) {
             let name = ns.substring(with: m.range(at: 1))
             let body = ns.substring(with: m.range(at: 2))
-            // An unclosed legacy marker swallowing a later id-form block.
-            if body.contains("<tool_use") { continue }
-            let input = markerObject(body, recordShims: recordShims) ?? [:]
-            positionedCalls.append((m.range.location, ParsedToolCall(id: "", name: name, input: input), false))
-        }
-        // Claude's own trained form, which Opus 5.5 writes despite the
-        // protocol above: <invoke name="X"><parameter name="k">v</parameter></invoke>.
-        if parseInvoke {
-            for m in invokeRegex.matches(in: raw, range: NSRange(location: 0, length: ns.length)) {
-                let name = ns.substring(with: m.range(at: 1))
-                let body = ns.substring(with: m.range(at: 2))
-                let bns = body as NSString
-                var input: [String: JSONValue] = [:]
-                var rawText: [String: String] = [:]
-                for p in parameterRegex.matches(in: body, range: NSRange(location: 0, length: bns.length)) {
-                    let key = bns.substring(with: p.range(at: 1))
-                    let value = bns.substring(with: p.range(at: 2))
-                    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if let d = trimmed.data(using: .utf8), let parsed = try? JSONValue.parse(d),
-                       trimmed.first.map({ "{[0123456789-tfn".contains($0) }) == true {
-                        input[key] = parsed
-                        rawText[key] = value
-                    } else { input[key] = .string(value) }
-                }
-                var call = ParsedToolCall(id: "", name: name, input: input, invokeRawText: rawText)
-                if input.isEmpty, !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    call.undeclaredKeys = ["raw <invoke> body without <parameter> elements"]
-                }
-                positionedCalls.append((m.range.location, call, true))
+            let bns = body as NSString
+            var input: [String: JSONValue] = [:]
+            var rawText: [String: String] = [:]
+            for p in parameterRegex.matches(in: body, range: NSRange(location: 0, length: bns.length)) {
+                let key = bns.substring(with: p.range(at: 1))
+                let value = bns.substring(with: p.range(at: 2))
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let d = trimmed.data(using: .utf8), let parsed = try? JSONValue.parse(d),
+                   trimmed.first.map({ "{[0123456789-tfn".contains($0) }) == true {
+                    input[key] = parsed
+                    rawText[key] = value
+                } else { input[key] = .string(value) }
             }
-        }
-        if !positionedCalls.isEmpty {
-            return positionedCalls.sorted { $0.0 < $1.0 }.map { positioned in
-                let call = positioned.1
-                guard positioned.2 else { return call }
-                if recordShims, call.undeclaredKeys.isEmpty {
-                    TurnTraceBus.fireFromContext(kind: "shim.fired", payload: .object(["id": .string("L12"), "site": .string("ToolCallParser.swift:parseAnthropic")]))
-                }
-                return call
+            var call = ParsedToolCall(id: "", name: name, input: input, invokeRawText: rawText)
+            if input.isEmpty, !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                call.undeclaredKeys = ["raw <invoke> body without <parameter> elements"]
             }
+            positionedCalls.append((m.range.location, call, true))
         }
-        // Bare JSON content-block / array shape.
-        var calls: [ParsedToolCall] = []
-        if let d = raw.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
-           let parsed = try? JSONValue.parse(d) {
-            if case .array(let arr) = parsed {
-                for item in arr {
-                    if case .object(let o) = item,
-                       case .string("tool_use") = o["type"] ?? .null,
-                       case .string(let name) = o["name"] ?? .null {
-                        let id: String = { if case .string(let s) = o["id"] ?? .null { return s } else { return "" } }()
-                        calls.append(argumentsCall(id: id, name: name, o["input"] ?? .null))
-                    }
-                }
-            } else if case .object(let o) = parsed,
-                      case .string("tool_use") = o["type"] ?? .null,
-                      case .string(let name) = o["name"] ?? .null {
-                let id: String = { if case .string(let s) = o["id"] ?? .null { return s } else { return "" } }()
-                calls.append(argumentsCall(id: id, name: name, o["input"] ?? .null))
-            }
+        if !positionedCalls.isEmpty { return positionedCalls.sorted { $0.0 < $1.0 } }
+        return parseContentBlocks(parsed).enumerated().map { ($0.offset, $0.element, false) }
+    }
+
+    private static func parseContentBlocks(_ parsed: JSONValue?) -> [ParsedToolCall] {
+        guard let parsed else { return [] }
+        let blocks = if case .array(let blocks) = parsed { blocks } else { [parsed] }
+        return blocks.compactMap { block in
+            guard case .object(let fields) = block, fields["type"] == .string("tool_use"),
+                  case .string(let name)? = fields["name"] else { return nil }
+            let id = if case .string(let id)? = fields["id"] { id } else { "" }
+            return argumentsCall(id: id, name: name, fields["input"] ?? .null)
         }
-        return calls
     }
 }

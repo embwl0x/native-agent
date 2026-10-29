@@ -1,6 +1,5 @@
-// Move-only extraction (tightness Wave C) from NativeCognitionRuntime.swift
-
 import Foundation
+import NativeAgentShared
 import BackgroundLoops
 import CognitiveSubstrate
 import Context
@@ -29,10 +28,7 @@ private enum CognitiveReflectionPersonaError: Error, Sendable, CustomStringConve
 }
 
 extension NativeCognitionRuntime {
-    /// A4.6 (clause 4): reflection is tissue downstream of the canonical
-    /// dream/REM commit, exactly like replay — not a 6h poll pretending to
-    /// notice it. Called from the somatic handler AFTER the replay await, so
-    /// reflection sees post-replay substrate state. Each caller retains its
+    /// Reflection follows the committed dream/REM replay. Each caller retains its
     /// committed material while awaiting the existing single-flight owner.
     /// Budget/enabled/reservation gating stays inside `runReflectionIfDue`;
     /// this path adds no new unattended-LLM authority. Gated to the live app
@@ -71,10 +67,10 @@ extension NativeCognitionRuntime {
         material: [String: CognitiveReflectionCause]? = nil,
         demand: CognitiveReflectionDemand = .requested,
         sameSourceCooldown: TimeInterval? = nil
-    ) async -> CognitiveBackgroundRunOutcome {
+    ) async -> LoopTickOutcome {
         await bootstrap()
-        if let bootstrapFailure { return .failed(bootstrapFailure) }
-        if let providerRoutingFailure { return .failed(providerRoutingFailure) }
+        if let bootstrapFailure { return .failed(error: bootstrapFailure) }
+        if let providerRoutingFailure { return .failed(error: providerRoutingFailure) }
         let request: CognitiveReflectionRequest
         // Take the lease BEFORE planning: planning sets the in-flight
         // reservation, and a lease refusal after it would strand that
@@ -82,7 +78,7 @@ extension NativeCognitionRuntime {
         let lease = host.backgroundWorkLease(dataRoot: dataRoot)
         let window = host.backgroundWorkWindow(Date())
         guard await lease.tryAcquire(holder: "reflection", window: window) else {
-            return .skipped("background work lease held")
+            return .skipped(reason: "background work lease held")
         }
         switch await substrate.planReflectionChecked(
             reason: reason,
@@ -95,22 +91,25 @@ extension NativeCognitionRuntime {
         case .refused(let admission):
             // Honest skip: which fence stopped it, and the load reading behind it.
             _ = await lease.releaseUnused(holder: "reflection", window: window)
-            return .skipped(admission.reason == CognitiveSubstrate.reflectionRefusalDisabled
+            return .skipped(reason: admission.reason == CognitiveSubstrate.reflectionRefusalDisabled
                 ? LoopTickOutcome.offPrefix + "reflection disabled" : admission.detail)
         }
         let reflectionOutcome = await executeReflection(request: request, llm: llm)
-        if case .skipped(let why) = reflectionOutcome, why != "reflection cancelled" {
+        if case .skipped(let why, _) = reflectionOutcome, why != "reflection cancelled" {
             // Routing refused before any provider work; return the unused slot.
             // A cancellation came after the provider call began: the slot is spent.
             _ = await lease.releaseUnused(holder: "reflection", window: window)
         }
         publishRuntimeChange(reason: "reflection:finished")
-        if case .completed = reflectionOutcome { await proposePursuitFromReflectionIfEligible(reason: reason) }
+        if case .completed = reflectionOutcome, !Task.isCancelled, !isFlushedForTermination {
+            await proposePursuitFromReflectionIfEligible(reason: reason)
+        }
         return reflectionOutcome
     }
 
     private func proposePursuitFromReflectionIfEligible(reason: String) async {
-        guard await host.unattendedWorkAllowed(dataRoot: dataRoot) else { return }
+        guard !Task.isCancelled, !isFlushedForTermination,
+              await host.unattendedWorkAllowed(dataRoot: dataRoot) else { return }
         let cares = await substrate.caresPressing(for: CognitiveCare.ownerKey, at: Date()).map(\.care)
         let store = SwiftNativeDeskStore(dataRoot: dataRoot)
         guard let state = try? await store.liveState() else { return }
@@ -132,6 +131,7 @@ extension NativeCognitionRuntime {
         guard let proposal = AutonomousPursuitProposer.propose(
             cares: cares, openAgentPursuitCount: open.count, citedCareIds: cited) else { return }
         do {
+            guard !Task.isCancelled, !isFlushedForTermination else { return }
             let item = try await store.openPursuit(
                 project: proposal.project, title: proposal.title, pursuit: proposal.pursuit, summary: proposal.summary,
                 notify: NotifyPolicy(level: .direct, on: ["explicit"],
@@ -151,7 +151,7 @@ extension NativeCognitionRuntime {
     }
 
     @discardableResult
-    public func runManualReflection(reason: String = "observatory manual reflection") async -> CognitiveBackgroundRunOutcome {
+    public func runManualReflection(reason: String = "manual reflection") async -> LoopTickOutcome {
         await bootstrap()
         let configuration = await substrate.configurationSnapshot()
         guard configuration.enabled && configuration.reflectiveCallsEnabled else {
@@ -165,7 +165,7 @@ extension NativeCognitionRuntime {
                 ])
             )
             publishRuntimeChange(reason: "reflection:gate_denied")
-            return .skipped(gateReason)
+            return .skipped(reason: gateReason)
         }
         if let providerRoutingFailure {
             await substrate.recordReceipt(
@@ -177,7 +177,7 @@ extension NativeCognitionRuntime {
                 ])
             )
             publishRuntimeChange(reason: "reflection:provider_unavailable")
-            return .skipped("provider routing unavailable: \(providerRoutingFailure)")
+            return .skipped(reason: "provider routing unavailable: \(providerRoutingFailure)")
         }
         let request: CognitiveReflectionRequest
         switch await substrate.planReflectionChecked(reason: reason, demand: .requested) {
@@ -193,7 +193,7 @@ extension NativeCognitionRuntime {
                 ])
             )
             publishRuntimeChange(reason: "reflection:skipped")
-            return .skipped(admission.detail)
+            return .skipped(reason: admission.detail)
         }
         let outcome = await executeReflection(
             request: request,
@@ -207,30 +207,27 @@ extension NativeCognitionRuntime {
     private func executeReflection(
         request: CognitiveReflectionRequest,
         llm: any LLMClient
-    ) async -> CognitiveBackgroundRunOutcome {
+    ) async -> LoopTickOutcome {
         let result: CognitiveReflectionJudgment
-        // User, 2026-09-13: every model-consuming lane resolves through its
-        // Providers group. Reflection used to call on `CognitiveConfiguration`'s
-        // stored model — a hardcoded Anthropic id — which is a route chosen in
-        // code, not at the picker. The Memory and mind group's answer is the
-        // only answer now, read through the CHECKED seam: corrupt provider
-        // authority is unavailable, not an excuse to invent a model.
-        let routedModel: String
+        // Bind one checked route for execution and receipt attribution.
+        var plannedRequest = request
+        let route: TurnRouteAdmission
         do {
             let snapshot = try await SwiftNativeProviderRouting(dataRoot: dataRoot)
                 .checkedRoutingSnapshot()
-            let resolved = ProviderRoutingSurfaceLookup
-                .value(snapshot.preferences, request.surface)?.model
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            guard !resolved.isEmpty else {
+            guard ProviderRoutingSurfaceLookup.value(snapshot.preferences, request.surface)?
+                .model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false else {
                 await substrate.releaseReflectionReservation(request: request)
                 await substrate.recordReceipt(
                     kind: "reflection.model_unresolved",
                     payload: .object(["surface": .string(request.surface)])
                 )
-                return .skipped("No model is set up for Memory and mind yet.")
+                return .skipped(reason: "No model is set up for Memory and mind yet.")
             }
-            routedModel = resolved
+            route = try snapshot.routeAdmission(for: request.surface, choice: nil, inheritChat: false)
+            plannedRequest.model = route.modelId
+            plannedRequest.provider = route.providerId ?? ""
+            plannedRequest.reasoningEffort = route.reasoningEffort
         } catch {
             await substrate.releaseReflectionReservation(request: request)
             await substrate.recordReceipt(
@@ -240,19 +237,21 @@ extension NativeCognitionRuntime {
                     "error": .string(String(describing: error)),
                 ])
             )
-            return .skipped("The saved provider choice could not be read.")
+            return .skipped(reason: "The saved provider choice could not be read.")
         }
+        let request = plannedRequest
         do {
             let system = try await cognitiveReflectionSystemPrompt(surface: request.surface)
             let raw = try await PrivateWorkContextAssembly.$current.withValue(.suppliedPersona) {
-                try await llm.complete(
-                    prompt: request.prompt,
-                    system: system,
-                    model: routedModel,
-                    surface: request.surface, purpose: "reflection"
-                )
+                try await route.withModelContext {
+                    try await llm.complete(
+                        prompt: request.prompt,
+                        system: system,
+                        model: nil,
+                        surface: request.surface, purpose: "reflection", tools: nil
+                    )
+                }
             }
-            try Task.checkCancellation()
             result = try JSONDecoder().decode(CognitiveReflectionJudgment.self, from: Data(raw.utf8))
             try result.validate(material: request.material)
         } catch let error as CognitiveReflectionPersonaError {
@@ -269,7 +268,7 @@ extension NativeCognitionRuntime {
                 rejection: "reflection persona failure was not accepted by the substrate",
                 persistenceFailure: "reflection persona failure receipt persistence failed"
             ) { return failure }
-            return .failed("reflection persona load failed: \(error.localizedDescription)")
+            return .failed(error: "reflection persona load failed: \(error.localizedDescription)")
         } catch is CancellationError {
             if let failure = await settleReflectionResult(
                 request: request,
@@ -278,7 +277,7 @@ extension NativeCognitionRuntime {
                 rejection: "reflection cancellation was not accepted by the substrate",
                 persistenceFailure: "reflection cancellation receipt persistence failed"
             ) { return failure }
-            return .skipped("reflection cancelled")
+            return .skipped(reason: "reflection cancelled")
         } catch {
             if let failure = await settleReflectionResult(
                 request: request,
@@ -286,7 +285,7 @@ extension NativeCognitionRuntime {
                 rejection: "reflection failure was not accepted by the substrate",
                 persistenceFailure: "reflection failure receipt persistence failed"
             ) { return failure }
-            return .failed("reflection failed: \(error.localizedDescription)")
+            return .failed(error: "reflection failed: \(error.localizedDescription)")
         }
 
         if let failure = await settleReflectionResult(
@@ -297,7 +296,7 @@ extension NativeCognitionRuntime {
             persistenceFailure: "reflection integrated but receipt persistence failed"
         ) { return failure }
         let persistenceEnabled = await substrate.configurationSnapshot().persistenceEnabled
-        return .completed(persistenceEnabled
+        return .completed(result: persistenceEnabled
             ? "reflection result and receipt are durable"
             : "reflection result integrated in memory-only mode")
     }
@@ -309,7 +308,18 @@ extension NativeCognitionRuntime {
         cancelled: Bool = false,
         rejection: String,
         persistenceFailure: String
-    ) async -> CognitiveBackgroundRunOutcome? {
+    ) async -> LoopTickOutcome? {
+        await settle { [self] in
+            await self.persistReflectionSettlement(request: request, resultSummary: resultSummary,
+                judgment: judgment, cancelled: cancelled, rejection: rejection, persistenceFailure: persistenceFailure)
+        }
+    }
+
+    private func persistReflectionSettlement(
+        request: CognitiveReflectionRequest, resultSummary: String,
+        judgment: CognitiveReflectionJudgment?, cancelled: Bool,
+        rejection: String, persistenceFailure: String
+    ) async -> LoopTickOutcome? {
         // Internal reflection mutations use the same coalesced settlement as sensory input.
         defer { scheduleDirtyMicrocycle(reason: "reflection_result") }
         guard let receipt = await substrate.recordReflectionResult(
@@ -318,12 +328,12 @@ extension NativeCognitionRuntime {
             provider: request.provider,
             cancelled: cancelled,
             judgment: judgment
-        ) else { return .failed(rejection) }
+        ) else { return .failed(error: rejection) }
         do {
             try await substrate.persistReflectionResultChecked(receipt)
         } catch {
             // A persistence failure never integrates the result a second time.
-            return .failed("\(persistenceFailure): \(error.localizedDescription)")
+            return .failed(error: "\(persistenceFailure): \(error.localizedDescription)")
         }
         return nil
     }
@@ -355,10 +365,7 @@ extension NativeCognitionRuntime {
                 "docCount": .int(Int64(packet.activeDocs.count)),
             ])
         )
-        let boundary = """
-        # Private reflection
-        Reflect as yourself on the supplied runtime evidence. Be concise. Do not claim hidden state, dispatch actions, change identity, memory or schemas, or treat inferred or dreamed content as observed. Use only the care stance and open-question changes stated in the task.
-        """
+        let boundary = try completionPolicy("reflection", section: "system")
         return [compiled, boundary].joined(separator: "\n\n")
     }
 
@@ -366,37 +373,6 @@ extension NativeCognitionRuntime {
         usesLiveAppBody
             ? SwiftNativePersonaEngine(dataRoot: dataRoot)
             : SwiftNativePersonaEngine.isolated(dataRoot: dataRoot)
-    }
-
-    public func setReflectionSelection(model: String, provider: String) async throws {
-        guard usesLiveAppBody else {
-            throw NSError(
-                domain: "NativeCognitionRuntime",
-                code: 409,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "Alternate-root cognition runtimes cannot mutate the live app's reflection setting."]
-            )
-        }
-        let trimmed = model.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            throw NSError(
-                domain: "NativeCognitionRuntime",
-                code: 400,
-                userInfo: [NSLocalizedDescriptionKey: "Choose a model for Memory and mind."]
-            )
-        }
-        let resolvedModel = trimmed
-        let resolvedProvider = provider.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !resolvedProvider.isEmpty else {
-            throw NSError(
-                domain: "NativeCognitionRuntime",
-                code: 400,
-                userInfo: [NSLocalizedDescriptionKey: "Reflection provider is missing."]
-            )
-        }
-        try await writeReflectionSurface(model: resolvedModel, provider: resolvedProvider)
-        await refreshConfiguration()
-        publishRuntimeChange(reason: "configuration:reflection_model")
     }
 
     public func reflectionRouteStatus() async -> NativeReflectionRouteStatus {
@@ -472,34 +448,4 @@ extension NativeCognitionRuntime {
         }
     }
 
-    /// Deliberately does nothing since 2026-09-13. It used to seed a
-    /// `cognition_reflection` row at startup from the cognitive configuration —
-    /// an override nobody asked for, written before a person had chosen
-    /// anything, which then split Memory and mind. Reflection resolves through
-    /// the group; there is nothing to seed.
-    func ensureReflectionSurfaceSeed() async {  // internal for actor extensions (move-only Wave C)
-    }
-
-    /// 2026-09-13 review: this used to write `cognition_reflection` alone, which
-    /// is precisely the per-surface override the group rule exists to prevent —
-    /// one lane of Memory and mind pointed somewhere its group-mates are not.
-    /// The separate reflection control now writes the GROUP's override: every
-    /// member of Memory and mind, the same thing the Providers page writes.
-    private func writeReflectionSurface(
-        model: String,
-        provider: String,
-        overwriteExisting: Bool = true
-    ) async throws {
-        let routing = SwiftNativeProviderRouting(dataRoot: dataRoot)
-        for surface in ProviderSurfaceGroups.mind.surfaces {
-            try await routing.saveSurfaceConfiguration(
-                surface: surface,
-                model: model,
-                reasoningEffort: "high",
-                serviceTier: nil,
-                providerId: provider,
-                overwriteExisting: overwriteExisting
-            )
-        }
-    }
 }

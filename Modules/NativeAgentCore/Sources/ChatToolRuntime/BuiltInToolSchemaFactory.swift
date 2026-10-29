@@ -3,7 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 import StandingBots
-// Blueprint: | `BuiltInToolSchemaFactory.swift` | `BuiltInToolSchemaFactory` struct; `requestedSchema`; common constructors come from `PersistenceCore.ToolSchema` |
+// Blueprint: | `BuiltInToolSchemaFactory.swift` | `BuiltInToolSchemaFactory` struct; `schemas` composes domain declarations in catalog order; lazy `requestedSchema`; common constructors come from `PersistenceCore.ToolSchema` |
 
 /// Per-request schema construction; descriptions and parameters stay lazy.
 package struct BuiltInToolSchemaFactory {
@@ -36,28 +36,6 @@ package struct BuiltInToolSchemaFactory {
         )
     }
 
-
-
-    // Recall has mutually exclusive search/page fields. Responses may
-    // require every property on the wire, so unused fields must admit
-    // null rather than forcing invented strings or integer placeholders.
-    func nullableRecallField(_ schema: JSONValue) -> JSONValue {
-        guard case .object(var properties) = schema,
-              case .string(let type)? = properties["type"] else { return schema }
-        properties["type"] = .array([.string(type), .string("null")])
-        return .object(properties)
-    }
-
-    /// An enum field that may also be null: `type` admits null AND `null`
-    /// is a member of `enum`, because a JSON Schema `enum` is exhaustive —
-    /// widening `type` alone would still reject null.
-    func nullableEnumStringSchema(_ values: [String], _ desc: String) -> JSONValue {
-        ToolSchema.obj([
-            ("type", .array([.string("string"), .string("null")])),
-            ("enum", .array(values.map(JSONValue.string) + [.null])),
-            ("description", .string(desc)),
-        ])
-    }
 
 
     func numSchema(
@@ -166,12 +144,12 @@ package struct BuiltInToolSchemaFactory {
     func recallParameters() -> Data {
         ToolSchema.params(
             properties: [
-                ("query", nullableRecallField(ToolSchema.strSchema("Search text; null in ID page mode."))),
-                ("k", nullableRecallField(ToolSchema.intSchema("Search result count, default 5; null in ID page mode."))),
-                ("memory_id", nullableRecallField(ToolSchema.strSchema("Exact id from a recall hit; null in search mode. Set query/k to null when paging."))),
-                ("offset", nullableRecallField(ToolSchema.intSchema("ID mode only: character offset, default 0; follow next_offset. Null in search mode."))),
-                ("max_characters", nullableRecallField(ToolSchema.intSchema("ID mode only: positive page size, capped at 2000. Null in search mode."))),
-                ("expected_content_sha256", nullableRecallField(ToolSchema.strSchema("ID mode: content_sha256 from the previous page, supplied by read_more. Null for a first page or search. A mismatch returns record_changed without text."))),
+                ("query", ToolSchema.nullable(ToolSchema.strSchema("Search text; null in ID page mode."))),
+                ("k", ToolSchema.nullable(ToolSchema.intSchema("Search result count, default 5; null in ID page mode."))),
+                ("memory_id", ToolSchema.nullable(ToolSchema.strSchema("Exact id from a recall hit; null in search mode. Set query/k to null when paging."))),
+                ("offset", ToolSchema.nullable(ToolSchema.intSchema("Copy next_offset to continue the same query/k (ranked candidate offset), or the same memory_id (character offset). Default 0."))),
+                ("max_characters", ToolSchema.nullable(ToolSchema.intSchema("ID mode only: positive page size, capped at 2000. Null in search mode."))),
+                ("expected_content_sha256", ToolSchema.nullable(ToolSchema.strSchema("ID mode: content_sha256 from the previous page, supplied by read_more. Null for a first page or search. A mismatch returns record_changed without text."))),
             ],
             required: []
         )
@@ -184,7 +162,21 @@ package struct BuiltInToolSchemaFactory {
         includeFullMacAccessibilityInjectionTools: Bool,
         includeActivityQueryTool: Bool
     ) -> [LLMToolSchema] {
-        var schemas = coreSchemas()
+        var schemas = webSchemas()
+        schemas.append(contentsOf: fileSchemas())
+        schemas.append(contentsOf: memoryReadSchemas())
+        schemas.append(contentsOf: workspaceSchemas())
+        schemas.append(contentsOf: historySchemas())
+        schemas.append(contentsOf: personaSchemas())
+        schemas.append(contentsOf: turnSchemas())
+        schemas.append(contentsOf: personalAppSchemas())
+        schemas.append(contentsOf: schedulerSchemas())
+        schemas.append(contentsOf: memoryWriteSchemas())
+        schemas.append(contentsOf: collaborationSchemas())
+        schemas.append(contentsOf: innerStateSchemas())
+        schemas.append(contentsOf: deskSchemas())
+        schemas.append(contentsOf: studioSchemas())
+        schemas.append(contentsOf: memoryReviewSchemas())
         schemas.append(contentsOf: standingBotSchemas())
         schemas.append(contentsOf: agentCommunicationSchemas())
         appendOptionalSchemas(

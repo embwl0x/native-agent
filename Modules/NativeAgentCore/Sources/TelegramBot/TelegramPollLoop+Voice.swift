@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `TelegramPollLoop+Voice.swift` | `TelegramPollLoop`: `recordVoiceTranscription`, `voiceTranscriptionNotice`, `voiceAttachment` |
@@ -36,47 +37,36 @@ extension TelegramPollLoop {
         try? await appendJSONLCapped(
             .object(row),
             to: telegramDir.appendingPathComponent("receipts.jsonl"),
-            using: SwiftNativePersistenceCore(),
             maxLines: JSONLLineCaps.telegramReceipts,
             logLabel: "TelegramPollLoop.receipts"
         )
     }
 
     static func voiceTranscriptionNotice(for error: Error) -> String {
-        let cause = _tgRedactToken(error.localizedDescription)
-        if error is CancellationError {
+        let cause = TurnSecretRedactor.redactText(error.localizedDescription)
+        switch error {
+        case is CancellationError:
             return "voice_cancelled: Voice transcription was cancelled. No transcript was confirmed; no further action is needed for this attempt."
-        }
-        if case TelegramMediaDownloadError.oversized(let bytes, let cap) = error {
+        case TelegramMediaDownloadError.oversized(let bytes, let cap):
             return "voice_oversized: Voice note is \(bytes) bytes; limit \(cap). Send a shorter note in this conversation."
-        }
-        if case TelegramVoiceTranscriptionError.speechPermissionDenied(let state) = error, state == "not determined" {
-            return "voice_permission_required: \(cause). In Telegram setup, choose Set up Telegram voice and approve Speech Recognition."
-        }
-        let description = [
-            (error as? LocalizedError)?.errorDescription,
-            String(describing: error)
-        ]
-        .compactMap { $0 }
-        .joined(separator: " ")
-        .lowercased()
-        if description.contains("siri and dictation") || description.contains("dictation") {
-            return "voice_dictation_blocked: \(cause). Enable Dictation in System Settings → Keyboard → Dictation."
-        }
-        if description.contains("speech recognition permission denied") {
+        case TelegramVoiceTranscriptionError.speechPermissionDenied(let state):
+            if state == "not determined" {
+                return "voice_permission_required: \(cause). In Telegram setup, choose Set up Telegram voice and approve Speech Recognition."
+            }
             return "voice_permission_denied: \(cause). Allow NativeAgent in System Settings → Privacy & Security → Speech Recognition; a restricted grant needs the Mac administrator."
-        }
-        if description.contains("apple speech unavailable") {
+        case TelegramVoiceTranscriptionError.speechUnavailable:
             return "voice_speech_unavailable: \(cause). Check the recognition language and service availability in macOS Dictation settings."
-        }
-        if description.contains("ogg/opus") || description.contains("ffmpeg") || description.contains("audio conversion failed") {
+        case TelegramVoiceTranscriptionError.conversionFailed:
             return "voice_conversion_failed: \(cause). Send M4A, MP3 or WAV audio in this conversation."
-        }
-        if description.contains("timed out") {
-            return "voice_timeout: \(cause). No transcript was confirmed; type the message in this conversation."
-        }
-        if description.contains("oversized") {
-            return "voice_oversized: \(cause). Send a shorter note within the voice byte limit shown in Telegram setup."
+        case TelegramVoiceTranscriptionError.speechRecognitionFailed(let detail):
+            let description = detail.lowercased()
+            if description.contains("dictation") {
+                return "voice_dictation_blocked: \(cause). Enable Dictation in System Settings → Keyboard → Dictation."
+            }
+            if description.contains("timed out") {
+                return "voice_timeout: \(cause). No transcript was confirmed; type the message in this conversation."
+            }
+        default: break
         }
         return "voice_transcription_failed: \(cause). Type the message in this conversation."
     }
@@ -104,7 +94,7 @@ extension TelegramPollLoop {
                 kind: kind,
                 fileId: fileId,
                 mimeType: mime,
-                sizeBytes: _tgJSONInt(obj["file_size"]),
+                sizeBytes: (obj["file_size"]?.integerValue.flatMap(Int.init(exactly:)) ?? obj["file_size"]?.stringValue.flatMap(Int.init)),
                 bytes: nil,
                 captureFilename: nil
             )

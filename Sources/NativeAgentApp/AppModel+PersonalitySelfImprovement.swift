@@ -1,41 +1,11 @@
-import EngineRuntime
 import Foundation
-import Observation
-import Darwin
-import AppKit
-@preconcurrency import EventKit
 import SwiftUI
 import NativeAgentShared
-import PersistenceCore
-import NativeAgentCore
-import ToolRegistry
-import MemoryV2
-import ProviderRouting
-import BackgroundLoops
-import ApprovalInbox
-import ToolExecution
+import EngineRuntime
 import PersonaEngine
-import TrustCenter
-import DreamREMCycle
 import DoctorChecks
-import Research
-import MultimodalTTS
-import TriggerScheduler
-import WorkshopExecution
-import NotificationInbox
-import SystemOps
-import ScreenVision
-import TelegramBot
-import Dispatcher
-import MacControl
-import Onboarding
-import MacIntegration
-import WorkflowOrchestration
-import Connectors
-import Browser
+import DreamREMCycle
 import Cognition
-import Context
-import ContextFlow
 // Blueprint: | `AppModel+PersonalitySelfImprovement.swift` | Mac personality editor outcomes delegate profile/document publication and writes to `engine.persona`; support diagnostics and proposal actions |
 
 /// The identity field is one of the few profile fields with immediate live UI
@@ -93,7 +63,6 @@ extension AppModel {
     enum SupportDiagnosticsLoadOutcome: Equatable {
         case unavailable(String)
         case loaded(SupportDiagnostics, reusedDoctorReport: Bool)
-        case failed(String)
     }
 
     @MainActor
@@ -107,24 +76,16 @@ extension AppModel {
         }
         supportDiagnosticsLoading = true
         defer { supportDiagnosticsLoading = false }
-        do {
-            // B2.6d: if a full Doctor run finished within the TTL, reuse its
-            // result (identical offline rollup) rather than re-running the
-            // whole pass. Falls back to a fresh run when stale or never run.
-            let reuse = EngineDoctorRuntime<AppDoctorPort>.reusableSupportReport(
-                report: engine.doctor.report, completedAt: engine.doctor.reportCompletedAt
-            )
-            let diagnostics = try await SupportDiagnostics.read(reusingChecks: reuse?.checks)
-            supportDiagnostics = diagnostics
-            statusText = reuse != nil
-                ? "Support diagnostics refreshed (reused recent Doctor result)"
-                : "Support diagnostics refreshed"
-            return .loaded(diagnostics, reusedDoctorReport: reuse != nil)
-        } catch {
-            let detail = UserFacingError.cause(error, action: "gather support diagnostics")
-            setFailureStatus("Couldn't gather support diagnostics. " + detail, cause: error)
-            return .failed(detail)
-        }
+        // Reuse a completed Doctor report while it is still fresh.
+        let reuse = EngineDoctorRuntime<AppDoctorPort>.reusableSupportReport(
+            report: engine.doctor.report, completedAt: engine.doctor.reportCompletedAt
+        )
+        let diagnostics = await SupportDiagnostics.read(reusingChecks: reuse?.checks)
+        supportDiagnostics = diagnostics
+        statusText = reuse != nil
+            ? "Support diagnostics refreshed (reused recent Doctor result)"
+            : "Support diagnostics refreshed"
+        return .loaded(diagnostics, reusedDoctorReport: reuse != nil)
     }
 
     @MainActor
@@ -188,21 +149,6 @@ extension AppModel {
         })
         await loadMemoryProposals(animateDecision: true)
         await engine.approvals.refresh()
-    }
-
-    // PATCH-2026-05-29: dreams-tab — Dreams tab data + control methods.
-
-    /// Fetch the dream diary (newest first) plus the composite dream-enabled flag.
-    /// Returns nil on failure and records the error in `dreamError`.
-    @MainActor
-    func fetchDreamDiary(limit: Int = 30) async -> DreamDiary? {
-        dreamError = nil
-        do {
-            return try await engine.cognitionView.dreamDiary(limit: limit)
-        } catch {
-            dreamError = UserFacingError.message(error, action: "load the dream diary")
-            return nil
-        }
     }
 
     /// Fetch a single diary entry by date (YYYY-MM-DD). Returns nil on 404/error.
@@ -309,12 +255,12 @@ extension AppModel {
         dreamError = nil
         do {
             let result = try await NativeAgentEngine.runDream(dataRoot: engine.dataRoot, trigger: .manual)
-            if let detail = DreamRunResult.completionFailure(result) {
+            if let detail = DreamReport.completionFailure(result) {
                 dreamError = "Dream cycle failed: \(detail)"
                 statusText = "Dream cycle failed"
                 return false
             }
-            statusText = DreamRunResult.statusText(result)
+            statusText = DreamReport.statusText(result)
             return true
         } catch {
             dreamError = UserFacingError.message(error, action: "run the dream cycle")

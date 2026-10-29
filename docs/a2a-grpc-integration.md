@@ -9,6 +9,9 @@ NativeAgent serves and consumes these A2A 1.0 operations over gRPC:
 - GetExtendedAgentCard
 
 JSON-RPC and HTTP+JSON remain available, with 0.3 JSON-RPC compatibility.
+HTTP+JSON subscriptions use `GET /a2a/tasks/{id}:subscribe`. Work stopped by
+a data restore projects as terminal `canceled`, with its restore reason in
+the status message, on every A2A binding.
 Agent reaches peers through `app` agent actions; see
 [Agent conversations](agent-communication.md).
 
@@ -29,9 +32,19 @@ The outbound adapter is
 It sends configured bearer credentials as metadata, sets a timeout, uses TLS
 for HTTPS, and permits plaintext only under the existing loopback URL policy.
 It has no retry policy: losing a reply must not replay an accepted send.
-`AgentA2AWire` selects the first supported advertised interface.
-`AgentPeerPolicy.peerAuthorizeInterface` requires the card's origin, with one
-exception: a gRPC interface may use a sibling port on the same host and scheme.
+Produced files retain the shared 10,000,000-byte file limit; encoded output
+parts share a 16,000,000-byte budget. HTTP and gRPC accept complete messages
+up to 32 MiB, including encoded files and task metadata. Streams bound each
+frame and the assembled task rather than counting all prior frames again:
+consumed SSE frames are released, and a final artifact replaces its draft.
+HTTP completion returns the receipt already accumulated from complete frames;
+an incomplete tail or EOF does not establish task completion.
+`AgentPeerHTTP.send` owns one bounded live-update channel and forwarding task;
+HTTP and gRPC yield into it, and settlement or cancellation closes both resources.
+`AgentPeerDiscovery.authenticatedInterface` selects the first supported interface
+through `AgentA2AWire` and authorizes it through `AgentPeerPolicy.peerAuthorizeInterface`,
+including after an extended-card fetch. The card's origin is required, with one
+exception: gRPC may use a sibling port on the same host and scheme.
 A card cannot redirect credentials to another host or downgrade TLS.
 
 ## Schema and packages
@@ -40,6 +53,10 @@ A card cannot redirect credentials to another host or downgrade TLS.
 inputs to `script/regenerate_a2a_grpc.sh`. Generated Swift is checked in under
 `Modules/NativeAgentCore/Sources/AgentLinkTransport/Generated/`; normal app
 builds do not run the generators.
+Regeneration disables the unused generated client and trims the unused
+simple-service API. Protobuf messages, method descriptors, `ServiceProtocol`
+and its streaming adapters remain; the outbound adapter calls `GRPCClient`
+directly.
 
 Both package manifests pin:
 

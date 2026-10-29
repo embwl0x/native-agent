@@ -1,8 +1,10 @@
 import Foundation
+import NativeAgentShared
 import Darwin
 import SQLite3
 import PersistenceCore
-// Blueprint: | `MacMessagesHistory.swift` | protected Messages-directory access probe, bounded SQLite reads and folded matching |
+import NativeAgentCore
+// Blueprint: | `MacMessagesHistory.swift` | protected Messages-directory access probe, bounded SQLite reads, latest-unread thread filtering, date-bounded ordering and folded matching |
 
 /// A small, read-only window into Messages' own conversations and history.
 /// No transcript cache, database copy, background scan or archived-object instantiation.
@@ -185,7 +187,7 @@ enum MacMessagesHistory {
             if let sender = string(statement, 4) { row["sender"] = .string(sender) }
             if date > 0 {
                 let seconds = Double(date) / (date > 100_000_000_000 ? 1_000_000_000 : 1)
-                row["date"] = .string(ISO8601DateFormatter().string(from: Date(timeIntervalSinceReferenceDate: seconds)))
+                row["date"] = .string(NativeTimestampFormat.plainZulu(Date(timeIntervalSinceReferenceDate: seconds)))
             }
             messages.append(.object(row))
             step = sqlite3_step(statement)
@@ -210,7 +212,7 @@ enum MacMessagesHistory {
             result["count"] = .int(Int64(messages.count))
             result["history_ordering"] = .string("Newest message date first across all conversations; message ID breaks date ties.")
             if let since, let total {
-                result["since"] = .string(ISO8601DateFormatter().string(from: since))
+                result["since"] = .string(NativeTimestampFormat.plainZulu(since))
                 result[fromMe ? "sent_count" : "received_count"] = .int(total)
                 result["count_note"] = .string("Exact local message record count from since (inclusive), independent of the page limit. Includes attachments, reactions and special records; not a count of conversations or recipients.")
             }
@@ -226,7 +228,7 @@ enum MacMessagesHistory {
     /// group name, and last message's date and text. With `words`, a
     /// conversation whose messages contain them carries the newest such
     /// message as `snippet`. Names come from Contacts in the caller.
-    static func threads(words: String?, threadID: String? = nil, unreadOnly: Bool = false, oldestUnread: Bool = false) -> [String: JSONValue] {
+    static func threads(words: String?, threadID: String? = nil, unreadOnly: Bool = false, oldestUnread: Bool = false, since: Date? = nil) -> [String: JSONValue] {
         guard !Task.isCancelled else { return unavailable("history_cancelled", "The conversation read was cancelled.") }
         guard let budget = Budget() else {
             return unavailable("database_unavailable", "Messages' local database could not be opened. NativeAgent may need macOS Full Disk Access. No permission was changed.")
@@ -239,7 +241,7 @@ enum MacMessagesHistory {
         func when(_ date: Int64) -> String? {
             guard date > 0 else { return nil }
             let seconds = Double(date) / (date > 100_000_000_000 ? 1_000_000_000 : 1)
-            return ISO8601DateFormatter().string(from: Date(timeIntervalSinceReferenceDate: seconds))
+            return NativeTimestampFormat.plainZulu(Date(timeIntervalSinceReferenceDate: seconds))
         }
         let archived = "CASE WHEN m.text IS NULL AND length(m.attributedBody) <= 65536 THEN m.attributedBody END"
         let unread = unreadAvailable(database)
@@ -247,13 +249,25 @@ enum MacMessagesHistory {
             return unavailable("unread_state_unavailable", "This Messages database does not expose is_read, so unread filtering and ordering are unavailable.")
         }
         let unreadCount = unread ? "(SELECT count(*) FROM chat_message_join u JOIN message um ON um.ROWID = u.message_id WHERE u.chat_id = c.ROWID AND um.is_from_me = 0 AND um.is_read = 0)" : "NULL"
-        let unreadJoin = unreadOnly || oldestUnread ? """
+        func window(_ column: String) -> String {
+            since == nil ? "1" : "\(column) >= CASE WHEN \(column) > 100000000000 THEN ?2 ELSE ?3 END"
+        }
+        func bindWindow(_ statement: OpaquePointer) {
+            guard let since else { return }
+            let seconds = since.timeIntervalSinceReferenceDate
+            sqlite3_bind_int64(statement, 2, Int64((seconds * 1_000_000_000).rounded(.up)))
+            sqlite3_bind_int64(statement, 3, Int64(seconds.rounded(.up)))
+        }
+        let unreadJoin = oldestUnread ? """
             JOIN message u ON u.ROWID = (SELECT um.ROWID FROM chat_message_join uj
                 JOIN message um ON um.ROWID = uj.message_id
-                WHERE uj.chat_id = c.ROWID AND um.is_from_me = 0 AND um.is_read = 0
+                WHERE uj.chat_id = c.ROWID AND um.is_from_me = 0 AND um.is_read = 0 AND \(window("um.date"))
                 ORDER BY um.date ASC, um.ROWID ASC LIMIT 1)
             """ : ""
         let unreadColumns = oldestUnread ? "u.date, u.ROWID, substr(u.text, 1, 400), \(archived.replacingOccurrences(of: "m.", with: "u."))" : "NULL, NULL, NULL, NULL"
+        var filters = [window("j.last")]
+        if threadID != nil { filters.append("c.guid = ?1") }
+        if unreadOnly { filters.append("m.is_from_me = 0 AND m.is_read = 0") }
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(database, """
             SELECT c.guid, c.display_name, j.last, m.is_from_me, substr(m.text, 1, 400), \(archived),
@@ -265,7 +279,7 @@ enum MacMessagesHistory {
                   GROUP BY chat_id) j ON j.chat_id = c.ROWID
             LEFT JOIN message m ON m.ROWID = (SELECT message_id FROM chat_message_join WHERE chat_id = c.ROWID ORDER BY message_date DESC, message_id DESC LIMIT 1)
             \(unreadJoin)
-            \(threadID == nil ? "" : "WHERE c.guid = ?1")
+            WHERE \(filters.joined(separator: " AND "))
             ORDER BY \(oldestUnread ? "u.date ASC, u.ROWID ASC, c.guid ASC" : "j.last DESC")
             """, -1, &statement, nil) == SQLITE_OK, let statement else {
             return unavailable("unsupported_history_schema", "This Messages database version cannot list its conversations.")
@@ -274,6 +288,7 @@ enum MacMessagesHistory {
         if let threadID {
             bind(threadID, to: statement, at: 1)
         }
+        bindWindow(statement)
         var threads: [[String: JSONValue]] = []
         var step = sqlite3_step(statement)
         while step == SQLITE_ROW {
@@ -315,13 +330,15 @@ enum MacMessagesHistory {
             guard sqlite3_prepare_v2(database, """
                 SELECT c.guid, substr(m.text, 1, 400), \(archived)
                 FROM chat_message_join j JOIN message m ON m.ROWID = j.message_id JOIN chat c ON c.ROWID = j.chat_id
-                WHERE (m.text IS NOT NULL AND folded_contains(m.text, ?1)) OR (m.text IS NULL AND m.attributedBody IS NOT NULL)
+                WHERE ((m.text IS NOT NULL AND folded_contains(m.text, ?1)) OR (m.text IS NULL AND m.attributedBody IS NOT NULL))
+                  AND \(window("m.date"))
                 ORDER BY j.message_date DESC
                 """, -1, &search, nil) == SQLITE_OK, let search else {
                 return unavailable("unsupported_history_schema", "This Messages database version cannot search its messages.")
             }
             defer { sqlite3_finalize(search) }
             bind(folded, to: search, at: 1)
+            bindWindow(search)
             var found: [String: String] = [:]
             step = sqlite3_step(search)
             while step == SQLITE_ROW {

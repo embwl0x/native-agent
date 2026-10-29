@@ -5,17 +5,8 @@ import MacControl
 
 public enum MacChatTurnPresentationEvent: Sendable {
     case status(String)
-    case dropDraft(sessionId: String)
-    case moveDraft(from: String, to: String)
-    case selectMigratedSession(String)
-    case workingCommentary(sessionId: String, bubbleId: String, characters: Int)
-    case clearPreview(String)
-    case movePreview(from: String, to: String)
-    case moveReplying(from: String, to: String)
-    case replySettledChanged(sessionId: String, settled: Bool)
     case intakeClosed
     case activity(MacChatTurnActivity)
-    case streamFrame(sessionId: String, bubbleId: String, text: String)
 }
 
 /// The app supplies selection and presentation only. Core calls this port at
@@ -27,13 +18,14 @@ public protocol MacChatTurnPresentationPort: AnyObject, Sendable {
     var knownChatSessionIDs: Set<String> { get }
     func chatHasConversationRows(sessionId: String) -> Bool
     func captureMacWorkContinuation(_ text: String, taskReference: String) async -> MacWorkContinuation?
+    func animateMacChatMutation(_ mutation: () -> Void)
     func presentMacChatTurn(_ event: MacChatTurnPresentationEvent)
     func recordMacControlHandoff(text: String, reply: String, sessionId: String) async throws
     func cancelICloudChatTurnForControlHandoff(sessionId: String)
     func refreshChatMessagesAfterTurn(sessionId: String, messagesAlreadyRefreshed: Bool) async
     func runMacChatTurnBody(
         _ text: String, attachments: [NativeAgentShared.MultimodalAttachment],
-        sessionId: String, generation: Int, ctx: MacChatTurnBodyContext,
+        sessionId: String, generation: Int,
         hideUserBubble: Bool, activityIdentity: MacChatTurnIdentity
     ) async
 }

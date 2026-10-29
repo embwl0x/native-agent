@@ -3,14 +3,11 @@ import NativeAgentCore
 import PersistenceCore
 import MacControl
 import TrustCenter
-// Blueprint: | `ChatToolJSONRedaction.swift` | `ChatToolJSONRedaction` enum; `injectionRedactedArgJSON`, `injectionRedactedResultJSON` |
+// Blueprint: | `ChatToolJSONRedaction.swift` | `ChatToolJSONRedaction`: typed argument redaction; `redactedResultJSON` parses once, strips screen pixels then injected values and encodes once; malformed screen-only text passes through, malformed injection-shaped text is suppressed |
 
 package enum ChatToolJSONRedaction {
-    /// W2/W3-FIX-R2 — redact an injection tool's ARGUMENT json before it is
-    /// persisted or previewed. Works on the serialized string because that is
-    /// what this layer is handed. A body that will not parse is dropped
-    /// entirely for a secret-bearing tool: an unparseable payload we cannot
-    /// redact is not a payload worth keeping.
+    /// Redact secret-bearing arguments before persistence or preview; malformed
+    /// injection arguments cannot be inspected and are suppressed.
     package nonisolated static func injectionRedactedArgJSON(tool: String, json: String) -> String {
         // The app door: only an action whose args carry a key or token, or a
         // script naming one, is rewritten, so every other call keeps its
@@ -32,36 +29,22 @@ package enum ChatToolJSONRedaction {
         return out
     }
 
-    /// Same, for an injection tool's RESULT (an `ax_act` re-reads and returns
-    /// the value it just wrote).
-    package nonisolated static func injectionRedactedResultJSON(tool: String, json: String) -> String {
-        guard MacInjectionToolNames.isInjectionTool(tool)
-            || MacInjectionArgRedaction.carriesSecretArgs(tool: tool) else { return json }
-        guard let parsed = try? JSONValue.parse(Data(json.utf8)),
-              let out = try? MacInjectionResultRedaction
-                .redacted(tool: tool, result: parsed)
-                .serialize(pretty: false) else {
-            // A non-JSON summary from an injection tool cannot be inspected for
-            // the written value, so it is not kept verbatim.
-            return json.contains("\"") || json.contains("{")
-                ? "[redacted: \(tool) result]"
-                : json
+    /// Strip screen pixels, then injected values, through one parse and encode.
+    /// Malformed screen-only text passes through; injection-shaped text cannot.
+    package nonisolated static func redactedResultJSON(tool: String, json: String) -> String {
+        let injection = MacInjectionToolNames.isInjectionTool(tool)
+            || MacInjectionArgRedaction.carriesSecretArgs(tool: tool)
+        let screen = MacScreenViewResultRedaction.carriesImage(tool: tool)
+        guard injection || screen else { return json }
+        guard let parsed = try? JSONValue.parse(Data(json.utf8)) else {
+            return injection && (json.contains("\"") || json.contains("{"))
+                ? "[redacted: \(tool) result]" : json
         }
-        return out
-    }
-
-    /// W3.5-FIX 3 — strip `mac_view`'s base64 picture out of a serialized
-    /// RESULT before it is persisted or previewed. Unlike the injection
-    /// redactors this cannot fall back to "[redacted]" on a parse failure: a
-    /// summary that will not parse also cannot contain a JSON `image` key we
-    /// put there, and blanking every unparseable read result would destroy the
-    /// transcript. A parse failure therefore leaves the (image-free) text.
-    package nonisolated static func screenViewRedactedResultJSON(tool: String, json: String) -> String {
-        guard MacScreenViewResultRedaction.carriesImage(tool: tool) else { return json }
-        guard let parsed = try? JSONValue.parse(Data(json.utf8)) else { return json }
-        let stripped = MacScreenViewResultRedaction.redacted(tool: tool, result: parsed)
-        guard let out = try? stripped.serialize(pretty: false) else {
-            return "[redacted: \(tool) result]"
+        let redacted = MacInjectionResultRedaction.redacted(tool: tool,
+            result: MacScreenViewResultRedaction.redacted(tool: tool, result: parsed))
+        guard let out = try? redacted.serialize(pretty: false) else {
+            return screen || json.contains("\"") || json.contains("{")
+                ? "[redacted: \(tool) result]" : json
         }
         return out
     }

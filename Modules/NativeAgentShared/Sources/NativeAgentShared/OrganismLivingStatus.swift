@@ -25,7 +25,6 @@ public struct OrganismLivingStatusFile: Codable, Hashable, Sendable {
     public var lastSignalAt: Date?
     public var body: OrganismLivingBodyFile
     public var counters: OrganismLivingCountersFile
-    public var reflexCandidates: [OrganismLivingReflexCandidateFile]?
     public var standingViewProposals: [OrganismLivingStandingViewProposalFile]?
     /// Optional for wire compatibility with snapshots written before explicit
     /// availability reporting. New writers always set it.
@@ -40,7 +39,7 @@ public struct OrganismLivingStatusFile: Codable, Hashable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case generatedAt, enabled, posture, bodyLine, behaviorLine, needsUser, needsAttention
-        case signalCount, lastSignalAt, body, counters, reflexCandidates, standingViewProposals
+        case signalCount, lastSignalAt, body, counters, standingViewProposals
         case availability, unavailableReason
     }
 
@@ -70,7 +69,6 @@ public struct OrganismLivingStatusFile: Codable, Hashable, Sendable {
         lastSignalAt = try c.decodeIfPresent(Date.self, forKey: .lastSignalAt)
         body = try c.decode(OrganismLivingBodyFile.self, forKey: .body)
         counters = try c.decode(OrganismLivingCountersFile.self, forKey: .counters)
-        reflexCandidates = try c.decodeIfPresent([OrganismLivingReflexCandidateFile].self, forKey: .reflexCandidates)
         standingViewProposals = try c.decodeIfPresent([OrganismLivingStandingViewProposalFile].self, forKey: .standingViewProposals)
         availability = try c.decodeIfPresent(OrganismLivingStatusAvailability.self, forKey: .availability)
         unavailableReason = try c.decodeIfPresent(String.self, forKey: .unavailableReason)
@@ -88,7 +86,6 @@ public struct OrganismLivingStatusFile: Codable, Hashable, Sendable {
         lastSignalAt: Date?,
         body: OrganismLivingBodyFile,
         counters: OrganismLivingCountersFile,
-        reflexCandidates: [OrganismLivingReflexCandidateFile]?,
         standingViewProposals: [OrganismLivingStandingViewProposalFile]?,
         availability: OrganismLivingStatusAvailability? = nil,
         unavailableReason: String? = nil
@@ -104,7 +101,6 @@ public struct OrganismLivingStatusFile: Codable, Hashable, Sendable {
         self.lastSignalAt = lastSignalAt
         self.body = body
         self.counters = counters
-        self.reflexCandidates = reflexCandidates
         self.standingViewProposals = standingViewProposals
         self.availability = availability
         self.unavailableReason = unavailableReason
@@ -175,34 +171,6 @@ public struct OrganismLivingCountersFile: Codable, Hashable, Sendable {
         self.reflexesNeedReview = reflexesNeedReview
         self.approvedReflexBiases = approvedReflexBiases
         self.standingViewProposals = standingViewProposals
-    }
-}
-
-public struct OrganismLivingReflexCandidateFile: Codable, Hashable, Sendable, Identifiable {
-    public var id: String
-    public var pattern: String
-    public var trustClass: String
-    public var confidence: Double
-    public var reviewRequired: Bool
-    public var autoActivationAllowed: Bool
-    public var approvedAt: Date?
-
-    public init(
-        id: String,
-        pattern: String,
-        trustClass: String,
-        confidence: Double,
-        reviewRequired: Bool,
-        autoActivationAllowed: Bool,
-        approvedAt: Date?
-    ) {
-        self.id = id
-        self.pattern = pattern
-        self.trustClass = trustClass
-        self.confidence = confidence
-        self.reviewRequired = reviewRequired
-        self.autoActivationAllowed = autoActivationAllowed
-        self.approvedAt = approvedAt
     }
 }
 

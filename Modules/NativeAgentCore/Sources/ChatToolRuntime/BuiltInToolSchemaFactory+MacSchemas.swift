@@ -63,7 +63,7 @@ extension BuiltInToolSchemaFactory {
                 requestedSchema(
                     name: "git_status",
                     toolClass: .read,
-                    description: "Read branch, ahead/behind counts, and staged, unstaged, and untracked changes. Available only when Full Mac file access is active.",
+                    description: "Read parsed branch, ahead/behind counts, and staged, unstaged, and untracked changes once, without raw status duplication. Omitted cwd uses the app's verified source checkout, or workspace when none exists; returns cwd. Requires Full Mac file access.",
                     parametersJSON: ToolSchema.params(
                         properties: [("cwd", ToolSchema.strSchema("Repository directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical NativeAgent workspace."))],
                         required: []
@@ -72,7 +72,7 @@ extension BuiltInToolSchemaFactory {
                 requestedSchema(
                     name: "git_diff",
                     toolClass: .read, capabilities: ["tool_call"],
-                    description: "Read staged or unstaged changes, or committed patches since a date, optionally limited to a path. Available only when Full Mac file access is active.",
+                    description: "Read staged or unstaged changes, or committed patches since a date, optionally limited to a path. Omitted cwd uses the app's verified source checkout, or workspace when none exists; returns cwd. Requires Full Mac file access.",
                     parametersJSON: ToolSchema.params(
                         properties: [
                             ("cwd", ToolSchema.strSchema("Repository directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical NativeAgent workspace.")),
@@ -86,7 +86,7 @@ extension BuiltInToolSchemaFactory {
                 requestedSchema(
                     name: "git_log",
                     toolClass: .read, capabilities: ["tool_call"],
-                    description: "Read commits and changed files across them, optionally since a date. With since, the file union covers the entire period even when commit details reach their limit. Returns per-commit files and has_more coverage. Available only when Full Mac file access is active.",
+                    description: "Read commits and changed files across them, optionally since a date. Omitted cwd uses the app's verified source checkout, or workspace when none exists; returns cwd. With since, the file union covers the entire period even when commit details reach their limit. Returns per-commit files and has_more coverage. Requires Full Mac file access.",
                     parametersJSON: ToolSchema.params(
                         properties: [
                             ("cwd", ToolSchema.strSchema("Repository directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical NativeAgent workspace.")),
@@ -100,7 +100,7 @@ extension BuiltInToolSchemaFactory {
                 requestedSchema(
                     name: "repo_dirty_summary",
                     toolClass: .read, capabilities: ["tool_call"],
-                    description: "Read a combined summary of the branch, changed files, and recent commits. Available only when Full Mac file access is active.",
+                    description: "Read a combined summary of the branch, changed files, and recent commits. Omitted cwd uses the app's verified source checkout, or workspace when none exists; returns cwd. Requires Full Mac file access.",
                     parametersJSON: ToolSchema.params(
                         properties: [
                             ("cwd", ToolSchema.strSchema("Repository directory. Defaults to a verified NativeAgent source checkout when present, otherwise the canonical NativeAgent workspace.")),
@@ -109,16 +109,16 @@ extension BuiltInToolSchemaFactory {
                         required: []
                     )
                 ),
-                // CLI tools require Full Mac file access and default to confirmation.
+                // CLI tools require Full Mac file access; the owner certifies literal reads.
                 // The admitted bridge uses the same autonomy gate as local chat.
                 requestedSchema(
                     name: "shell",
                     toolClass: .write, reach: .his, capabilities: ["process_spawn", "shell", "tool_call"],
-                    description: "Run a shell command via /bin/sh -c. Captures stdout/stderr/exit_code. Requires admitted Full Mac file access; ordinary commands run without a routine approval card. Default cwd is a verified NativeAgent source checkout when present, otherwise the canonical <dataRoot>/workspace used by public installs. Default timeout: 120s, max 600s.",
+                    description: "Run a shell command via /bin/sh -c. Captures stdout/stderr/exit_code. Requires admitted Full Mac file access. Default cwd is your canonical workspace, the same root as files mutations; relative cwd starts there. Reach the owner's source checkout only with explicit cwd. Literal commands certified by the shell owner (pwd, df, uname, whoami, uptime, simple git log/status/diff/show) run as confined reads; everything else stays write. A pre-launch refusal returns execution:not_run and effect:none. Default timeout: 120s, max 600s.",
                     parametersJSON: ToolSchema.params(
                         properties: [
                             ("cmd", ToolSchema.strSchema("Required. The shell command line. Passed as -c argument to /bin/sh.")),
-                            ("cwd", ToolSchema.strSchema("Optional existing working directory. Relative paths resolve in the canonical NativeAgent workspace/source checkout. Active Full Mac may select an ordinary absolute external project; sensitive authority and protected system paths remain denied.")),
+                            ("cwd", ToolSchema.strSchema("Existing directory; defaults to your workspace and resolves relative paths there. Use explicit cwd for the source checkout. Active Full Mac may select an ordinary absolute external project; sensitive authority and protected system paths remain denied.")),
                             ("timeout_seconds", ToolSchema.intSchema("Optional. Default 120, max 600. Subprocess group gets SIGTERM then SIGKILL after 2s.")),
                         ],
                         required: ["cmd"]
@@ -127,11 +127,11 @@ extension BuiltInToolSchemaFactory {
                 requestedSchema(
                     name: "bash",
                     toolClass: .write, reach: .his, capabilities: ["process_spawn", "shell", "tool_call"],
-                    description: "Run a shell command via /bin/bash -c (not sh). Same shape as shell. Use this when the command needs bash features: arrays, [[ ]] tests, process substitution, $'...",
+                    description: "Run a command via /bin/bash -c. Default cwd is your canonical workspace; relative cwd starts there. Use explicit cwd for the owner's source checkout. Same read certification and confinement as shell.run; everything else stays write. Pre-launch refusals return execution:not_run, effect:none. Use bash for arrays, [[ ]] tests and process substitution. Requires Full Mac file access.",
                     parametersJSON: ToolSchema.params(
                         properties: [
                             ("cmd", ToolSchema.strSchema("Required. The bash command line. Passed as -c argument to /bin/bash.")),
-                            ("cwd", ToolSchema.strSchema("Optional existing working directory. Relative paths resolve in the canonical NativeAgent workspace/source checkout. Active Full Mac may select an ordinary absolute external project; sensitive authority and protected system paths remain denied.")),
+                            ("cwd", ToolSchema.strSchema("Existing directory; defaults to your workspace and resolves relative paths there. Use explicit cwd for the source checkout. Active Full Mac may select an ordinary absolute external project; sensitive authority and protected system paths remain denied.")),
                             ("timeout_seconds", ToolSchema.intSchema("Optional. Default 120, max 600.")),
                         ],
                         required: ["cmd"]
@@ -158,7 +158,7 @@ extension BuiltInToolSchemaFactory {
                         properties: [
                             ("patch", ToolSchema.strSchema("Required. The unified diff text. Will be written to a tmpfile before git apply.")),
                             ("cwd", ToolSchema.strSchema("Optional existing working directory. Relative paths resolve in the canonical NativeAgent workspace/source checkout. Active Full Mac may select an ordinary absolute external project; sensitive authority and protected system paths remain denied.")),
-                            ("three_way", nullableRecallField(ToolSchema.boolSchema("Optional. Default true; passes --3way only inside a Git repository. Outside a repository, uses plain apply. Set false for strict apply that fails fast on context mismatch."))),
+                            ("three_way", ToolSchema.nullable(ToolSchema.boolSchema("Optional. Default true; passes --3way only inside a Git repository. Outside a repository, uses plain apply. Set false for strict apply that fails fast on context mismatch."))),
                         ],
                         required: ["patch"]
                     )
@@ -175,7 +175,7 @@ extension BuiltInToolSchemaFactory {
                             ("target", ToolSchema.strSchema("Optional target name to build. Mutually exclusive with product.")),
                             ("jobs", ToolSchema.intSchema("Optional SwiftPM --jobs value, clamped 1...64.")),
                             ("timeout_seconds", ToolSchema.intSchema("Optional. Default 600, max 3600.")),
-                            ("disable_swiftpm_sandbox", nullableRecallField(ToolSchema.boolSchema("Optional. Defaults true so SwiftPM does not invoke its own sandbox-exec inside our outer wrapper (profiles cannot nest). Leave it true; setting it false makes the build fail at manifest compile."))),
+                            ("disable_swiftpm_sandbox", ToolSchema.nullable(ToolSchema.boolSchema("Optional. Defaults true so SwiftPM does not invoke its own sandbox-exec inside our outer wrapper (profiles cannot nest). Leave it true; setting it false makes the build fail at manifest compile."))),
                         ],
                         required: []
                     )
@@ -191,7 +191,7 @@ extension BuiltInToolSchemaFactory {
                             ("filter", ToolSchema.strSchema("Optional SwiftPM --filter regex/specifier.")),
                             ("jobs", ToolSchema.intSchema("Optional SwiftPM --jobs value, clamped 1...64.")),
                             ("timeout_seconds", ToolSchema.intSchema("Optional. Default 900, max 3600.")),
-                            ("disable_swiftpm_sandbox", nullableRecallField(ToolSchema.boolSchema("Optional. Defaults true so SwiftPM does not invoke its own sandbox-exec inside our outer wrapper (profiles cannot nest). Leave it true; setting it false makes the build fail at manifest compile."))),
+                            ("disable_swiftpm_sandbox", ToolSchema.nullable(ToolSchema.boolSchema("Optional. Defaults true so SwiftPM does not invoke its own sandbox-exec inside our outer wrapper (profiles cannot nest). Leave it true; setting it false makes the build fail at manifest compile."))),
                         ],
                         required: []
                     )
@@ -229,11 +229,11 @@ extension BuiltInToolSchemaFactory {
                     )
                 ),
                 // Restart requires Full Mac file access and defaults to confirmation.
-                // The detached relauncher preserves the reply grace and ten-minute cooldown.
+                // The detached relauncher waits for turn settlement and keeps the ten-minute cooldown.
                 requestedSchema(
                     name: "restart_app",
                     toolClass: .write, capabilities: ["process_spawn", "system_control", "tool_call"],
-                    description: "Restart the already-installed NativeAgent.app bundle: writes an audit receipt, spawns a detached relauncher, then terminates the app after a \(Int(AppRestartCoordinator.terminateGraceSeconds))s grace so this turn finishes persisting. This does not build, stage, sign, or install new Swift code; after Swift source edits use app.install instead. The relauncher observes process exit and reopens the app bundle; it aborts if quitting takes more than \(AppRestartCoordinator.relaunchExitDeadlineSeconds)s. Refuses if a tool-initiated restart fired within the last 10 minutes (cooldown). Requires admitted Full Mac file access; restarting needs no routine approval card.",
+                    description: "Restart the already-installed NativeAgent.app bundle: writes an audit receipt, spawns a detached relauncher, then requests termination when the originating turn settles. If that turn stalls for \(Int(AppRelaunch.stalledTurnSeconds))s, the app exits with an explicit unfinished outcome. This does not build, stage, sign, or install new Swift code; after Swift source edits use app.install instead. The relauncher observes process exit and reopens the app bundle; it aborts if quitting takes more than \(AppRelaunch.relaunchExitDeadlineSeconds)s. Refuses if a tool-initiated restart fired within the last 10 minutes (cooldown). Requires admitted Full Mac file access; restarting needs no routine approval card.",
                     parametersJSON: ToolSchema.params(
                         properties: [
                             ("reason", ToolSchema.strSchema("Required. Why the restart is needed (lands in the audit envelope at data/restart_audit/<uuid>.json).")),
@@ -268,7 +268,7 @@ extension BuiltInToolSchemaFactory {
                 requestedSchema(
                     name: "system_info",
                     toolClass: .read, reach: .his, capabilities: ["tool_call"],
-                    description: "Read this Mac's system, disk, memory, top five CPU/memory processes, battery, network, local/public IP, connected macOS VPN services, Wi-Fi SSID and whether the person is here directly; unavailable fields are labeled. With person:true, only read whether the person is here: {here, idle_seconds} from their own input (yours never counts), away after 300 seconds idle, here null while unknown. Public IP uses a 3-second HTTPS lookup. Only when requested, speed_test:true measures upload/download and responsiveness with networkQuality, limited to 20 seconds and using internet bandwidth. With app, only read that installed app's bundle version by exact name or full .app path from the Mac's app index. With check_updates:true, only list available macOS software updates, read-only with a 30-second deadline; this does not check NativeAgent or App Store apps. Use app, check_updates or speed_test separately.No app opening, screen or guide read is needed. Available only when Full Mac system access is active.",
+                    description: "Read this Mac's system, named disk capacity (disk: Data at /System/Volumes/Data; system_disk: sealed System at /), memory, top five CPU/memory processes, battery, network, local/public IP, connected macOS VPN services, Wi-Fi SSID and whether the person is here directly; unavailable fields are labeled. With person:true, only read whether the person is here: {here, idle_seconds} from their own input (yours never counts), away after 300 seconds idle, here null while unknown. Public IP uses a 3-second HTTPS lookup. Only when requested, speed_test:true measures upload/download and responsiveness with networkQuality, limited to 20 seconds and using internet bandwidth. With app, only read that installed app's bundle version by exact name or full .app path from the Mac's app index. With check_updates:true, only list available macOS software updates, read-only with a 30-second deadline; this does not check NativeAgent or App Store apps. Use app, check_updates or speed_test separately.No app opening, screen or guide read is needed. Available only when Full Mac system access is active.",
                     parametersJSON: ToolSchema.params(properties: [
                         ("check_updates", ToolSchema.boolSchema("List macOS software updates instead of system information; never installs anything.")),
                         ("app", ToolSchema.strSchema("Exact installed app name or full .app path; read CFBundleShortVersionString and build directly without launching it.")),
@@ -310,10 +310,10 @@ extension BuiltInToolSchemaFactory {
                 requestedSchema(
                     name: "read",
                     toolClass: .read, reach: .his,
-                    description: "Read document text from a file (explicit path or the window’s file) or a scrolling window. File: extracts PDF/plain text, limited to 32 MiB, 400 PDF pages and 400,000 characters. Window: merges overlapping reads, bounded to 40 frames, 400,000 characters and 20 seconds; checks scroll restoration after movement. Read reached_end, truncated, truncation_reason, gaps and scroll_restored where returned; a stopped read may be incomplete. Presses/types/opens nothing. Page retained output with app result.page and result_handle; paging cannot recover unread source text. Secret lines become \"[redacted: <reason>]\". On failure, use the cause and supplied remedy; for a scanned PDF with no text layer, use screen. Requires Full Mac Accessibility; explicit path also requires Full Mac file access.",
+                    description: "Read document text from an explicit file path or the live window. File: extracts PDF/plain text, limited to 32 MiB, 400 PDF pages and 400,000 characters. Window: merges overlapping reads, bounded to 40 frames, 400,000 characters and 20 seconds; checks scroll restoration after movement. Read reached_end, truncated, truncation_reason, gaps and scroll_restored where returned; a stopped read may be incomplete. Presses/types/opens nothing. Page retained output with app result.page and result_handle; paging cannot recover unread source text. Secret lines become \"[redacted: <reason>]\". On failure, use the cause and supplied remedy; for a scanned PDF with no text layer, use screen. Requires Full Mac Accessibility; explicit path also requires Full Mac file access.",
                     parametersJSON: ToolSchema.params(
                         properties: [
-                            ("path", ToolSchema.strSchema("Optional: read this file instead of the screen — an absolute path to a PDF or a plain-text file. Omit it to read whatever document is in front of you (or, when the front window names no file, the window's own text).")),
+                            ("path", ToolSchema.strSchema("Optional: read this file instead of the screen — an absolute path to a PDF or a plain-text file. Omit it to read the live window’s text, including unsaved edits.")),
                             ("app", ToolSchema.strSchema("Read this running app’s window without activating, raising or launching it, e.g. Preview. Missing/ambiguous app: use the failure’s cause and remedy. Ignored with path, which reads the file.")),
                         ],
                         required: []

@@ -1,8 +1,9 @@
 import Foundation
 import NativeAgentCore
+import NativeAgentShared
 import PersistenceCore
 import Dispatcher
-// Blueprint: | `BotTurnRunner.swift` | `BotTurnRunner` owns helper-only model/tool rounds over the helper transcript; injected wire codecs, gated dispatch and row writer reuse their existing owners; Stop saves partial output through settle |
+// Blueprint: | `BotTurnRunner.swift` | `BotTurnRunner` owns helper-only model/tool rounds over the shared prefix layout supplied by its adapter; injected wire codecs, gated dispatch and row writer reuse their existing owners; Stop saves partial output through settle |
 
 /// Helpers think on their own history and instructions, never the resident's turn engine.
 package enum BotTurnRunner {
@@ -16,19 +17,19 @@ package enum BotTurnRunner {
     }
 
     package static func run(
-        bot: BotDefinition, input: LLMMessage, history: [LLMMessage], system: String,
+        bot: BotDefinition, messages initialMessages: [LLMMessage], system: String,
         model: String, llm: any LLMClient, schemas: [LLMToolSchema]?,
         visible: @Sendable (String) -> String,
         release: @Sendable (inout String) -> String,
         progress: @Sendable (String) async -> Void,
         decode: @Sendable (String, [LLMStreamToolCall]) throws -> [Call],
-        feedback: @Sendable (String, [Call], [String], [LLMContentBlock]) throws -> [LLMMessage],
+        feedback: @Sendable (String, [Call], [JSONValue], [LLMContentBlock]) throws -> [LLMMessage],
         dispatch: @Sendable (Call, LocalToolImage.Round) async throws -> (JSONValue, [LLMContentBlock]),
         waiting: @Sendable (JSONValue) -> BotTurnReply?,
-        artifacts: @Sendable () -> [BotArtifact],
-        save: @escaping @Sendable (BotTurnReply) async throws -> Void
+        attachments: @Sendable () -> [MultimodalAttachment],
+        save: @escaping @Sendable (BotTurnReply, [MultimodalAttachment]) async throws -> Void
     ) async throws -> BotTurnReply {
-        var messages = history + [input]
+        var messages = initialMessages
         var output = ""
         var text = ""
         var outcome = BotTurnReply(reply: "", model: model)
@@ -39,6 +40,7 @@ package enum BotTurnRunner {
                 text = ""
                 var pending = ""
                 var calls: [LLMStreamToolCall] = []
+                var boundary: LLMToolBoundaryReason?
                 for try await event in llm.streamMessages(messages: messages, system: system,
                     model: model, surface: "bot", tools: schemas) {
                     try Task.checkCancellation()
@@ -48,7 +50,7 @@ package enum BotTurnRunner {
                         let safe = release(&pending)
                         if !safe.isEmpty { await progress(safe) }
                     case .toolCall(let call): calls.append(call)
-                    case .toolBoundary: break
+                    case .toolBoundary(let reason): boundary = boundary ?? reason
                     case .keepAlive, .replyTextSettled: break
                     }
                 }
@@ -59,15 +61,20 @@ package enum BotTurnRunner {
                 output += prose
                 let roundText = text
                 text = ""
+                if let boundary {
+                    outcome.status = .failed
+                    outcome.detail = "The reply is incomplete (\(boundary.rawValue)); no calls from this round were dispatched."
+                    break
+                }
                 let decoded = try decode(roundText, calls)
                 if decoded.isEmpty { break }
-                var results: [String] = []
+                var results: [JSONValue] = []
                 var images: [LLMContentBlock] = []
                 let imageRound = LocalToolImage.Round()
                 for call in decoded {
                     try Task.checkCancellation()
                     let (result, pixels) = try await dispatch(call, imageRound)
-                    results.append(try result.serialize(pretty: false))
+                    results.append(result)
                     images += pixels
                     if let held = waiting(result) { outcome = held; break }
                 }
@@ -81,10 +88,15 @@ package enum BotTurnRunner {
         }
         outcome.reply = BotRunner.conditionReply(output, sessionID: bot.sessionID)
         outcome.model = model
-        outcome.artifacts = artifacts()
+        let attachments = attachments()
+        outcome.artifacts = attachments.map {
+            var artifact = BotArtifact(name: $0.name ?? "Artifact", path: $0.path ?? "")
+            artifact.type = $0.type; artifact.mime = $0.mime; artifact.byteSize = $0.byteSize
+            return artifact
+        }
         let saved = outcome
         let persisted = await settle { () -> Result<Void, Error> in
-            do { try await save(saved); return .success(()) }
+            do { try await save(saved, attachments); return .success(()) }
             catch { return .failure(error) }
         }
         try persisted.get()

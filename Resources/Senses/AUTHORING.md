@@ -1,5 +1,13 @@
 # Write a sense
 
+Make a sense for a Mac app, a live Chrome site, or a foreign file format
+(including binary) whose read captures material. Plain text uses files.read;
+a web page is read with read_page (app web.read). Visible browser text and
+folder listings are not sense.make material; folder watches are not its
+corners. Read with mac.look, chrome.snapshot or files.read first. Without
+place, sense.make uses the most recent read in this conversation; an explicit
+place selects that captured read. show:"material" reveals it without rereading.
+
 Return one self-contained ES2020 JavaScript file. No imports, host IO or
 network. Start with frame.js; copy only the shared helpers your reader needs.
 The builtin entries are complete worked examples. The examples/ files are
@@ -66,13 +74,12 @@ on one. Preserve source redaction. Keep extraction and expansion bounded.
 Site material is `{kind:"page", snapshot}` from Agent's existing Chrome
 tab. `snapshot.summary.text` is the independent text view. Preserve it;
 derive things and verbs from `snapshot.nodes`, never from guessed controls.
-`builtin/site.js` is the worked live site example. Its addresses encode the
-page URL and Chrome's structural `elementPath`; preserve that convention in
-grown site senses. Paths include the live frame, DOM ancestry and shadow
-boundaries and remain stable while that structure stays the same. Resolve
-focus and folded cursors against the current snapshot of that same URL.
-`more` anchors the next element path and text offset, never a snapshot ID or
-row number. If the path disappears or the URL changes, fail explicitly.
+`builtin/site.js` is the worked live site example. Its readable addresses use
+`site:<host><path>#<addressFragment>` from Chrome's captured nodes; preserve that
+convention in grown site senses. `elementPath` and `elementIdentity` stay private
+resolution proofs. Resolve focus and folded cursors against the current snapshot
+of that same URL. `more` anchors a returned address and text offset, never a
+snapshot ID or row number. If the place disappears or the URL changes, fail explicitly.
 
 Only source actions authorize site verbs: `click` maps to `chrome.click`,
 `fill` to `chrome.fill` with `{value}`, and `select` to `chrome.select` with

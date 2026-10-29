@@ -1,11 +1,10 @@
+import NativeAgentShared
 import SwiftUI
 import AppKit
 
 // Blueprint: | `NativeAgentFeel.swift` | `NAInteractiveModifier` and `NAButtonStyle`: shared hover/press feedback vocabulary for interactive Mac surfaces |
 
-// Liquid Feel Pass W1 (2026-08-16, docs/build_plans/liquid-feel-pass.md).
-// The ONE shared interaction vocabulary: every clickable surface answers the
-// cursor the same way. No layout or IA changes ride in this file.
+// Clickable surfaces share one hover and press vocabulary.
 
 // MARK: - Hover-responsive rows/cards
 
@@ -29,8 +28,7 @@ private struct NAInteractiveModifier: ViewModifier {
                 value: hovering
             )
             .onHover { hovering = $0 }
-            // Lazy containers recycle rows by identity — a row scrolled away
-            // while hovered must not reappear pre-lit (gpt-5.5 MED).
+            // Recycled rows must not retain hover state.
             .onDisappear { hovering = false }
     }
 }
@@ -50,7 +48,7 @@ extension View {
 struct NAButtonStyle: ButtonStyle {
     @State private var hovering = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    // Disabled buttons must not answer the cursor (gpt-5.5 LOW).
+    // Disabled buttons must not answer the cursor.
     @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {

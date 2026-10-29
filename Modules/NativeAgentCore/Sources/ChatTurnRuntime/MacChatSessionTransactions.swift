@@ -3,7 +3,7 @@ import Observation
 import Transcripts
 import NativeAgentShared
 import NativeAgentCore
-// Blueprint: | `MacChatSessionTransactions.swift` | selection intent/transactions, load-completion waiter and running-session navigation; `LatestRead` owns session-index publication, and committed create/rename changes use `write`; selection and durable rename intents retain their independent action identities |
+// Blueprint: | `MacChatSessionTransactions.swift` | explicit selection intent/transactions, live direct automatic selection, load-completion waiter and running-session navigation; `LatestRead` owns session-index publication, and committed create/open/rename changes use `write`; selection and durable rename intents retain their independent action identities |
 
 /// Canonical transcript operations, implemented by the existing Core facade.
 @MainActor
@@ -21,10 +21,9 @@ public protocol MacChatSessionStore: AnyObject {
 /// window identity remains one synchronous MainActor presentation operation.
 @MainActor
 public protocol MacChatSessionSelectionPort: AnyObject {
-    associatedtype ChatSessionLoadSnapshot
     var chatSelectionGeneration: Int { get set }
     var activeChatSessionId: String { get }
-    func commitChatSessionSelection(_ requestedId: String, snapshot: ChatSessionLoadSnapshot?, persistSelection: Bool)
+    func commitChatSessionSelection(_ requestedId: String)
 }
 
 /// Serializes durable session-index mutations without holding an actor across
@@ -81,86 +80,69 @@ public final class MacChatSessionTransactions {
         await withCheckedContinuation { loadWaiters.append($0) }
     }
 
-    public func existingMainSession(in sessions: [NativeAgentShared.ChatSession]) -> NativeAgentShared.ChatSession? {
-        sessions.first(where: { isMainAppSourceKey($0.sourceKey) && $0.archived != true })
+    public func existingMainSession(in sessions: [NativeAgentShared.ChatSession], anchorSessionId: String? = nil,
+                                    currentSelection: String? = nil) -> NativeAgentShared.ChatSession? {
+        let direct = sessions.filter { $0.archived != true && SessionConversation.kind($0).isHisConversation }
+        return direct.first(where: { $0.id == anchorSessionId })
+            ?? direct.first(where: { $0.id == currentSelection })
+            ?? direct.first(where: { isMainAppSourceKey($0.sourceKey) })
+            ?? direct.first
     }
 
     public func create(store: any MacChatSessionStore, title: String = "New Chat") async throws -> NativeAgentShared.ChatSession {
         let session = try await store.create(title: title, sourceKey: "app")
-        indexRead.write {
-            if !store.sessions.contains(where: { $0.id == session.id }) {
-                store.sessions.insert(session, at: 0)
-            }
-        }
+        publishOpenedSession(session, store: store)
         return session
     }
 
+    public func publishOpenedSession(_ session: NativeAgentShared.ChatSession, store: any MacChatSessionStore) {
+        indexRead.write {
+            if let index = store.sessions.firstIndex(where: { $0.id == session.id }) {
+                store.sessions[index] = session
+            } else {
+                store.sessions.insert(session, at: 0)
+            }
+        }
+    }
+
     public func reconcileStartupSession(
-        store: any MacChatSessionStore
+        store: any MacChatSessionStore, anchorSessionId: String? = nil, currentSelection: String? = nil
     ) async throws -> (session: NativeAgentShared.ChatSession, created: Bool) {
-        if let session = existingMainSession(in: store.sessions) { return (session, false) }
+        if let session = existingMainSession(in: store.sessions, anchorSessionId: anchorSessionId,
+                                             currentSelection: currentSelection) { return (session, false) }
         let session = try await create(store: store)
         return (session, true)
     }
 
-    public func restoreLiveRows<Message: MacChatRetryMessage>(
-        messages: () -> [Message], streaming: Bool, userTurnId: String?, bubbleId: String?,
-        makeUser: (String) -> Message, makeAssistant: (String) -> Message, append: (Message) -> Void
-    ) {
-        guard streaming else { return }
-        if let userTurnId, !messages().contains(where: { $0.id == userTurnId }) {
-            append(makeUser(userTurnId))
-        }
-        if let bubbleId, !messages().contains(where: { $0.id == bubbleId }) {
-            append(makeAssistant(bubbleId))
-        }
-    }
-
     public func select<Port: MacChatSessionSelectionPort>(
         _ requestedId: String,
-        persistSelection: Bool,
+        userInitiated: Bool = true,
         port: Port,
         store: any MacChatSessionStore,
-        runtime: MacChatTurnRuntime,
         presentStatus: (String) -> Void,
-        load: (String) async throws -> Port.ChatSessionLoadSnapshot
+        load: (String) async throws -> Void
     ) async {
         guard !requestedId.isEmpty else { return }
         // The human has picked a session. From here on this launch the main
         // window stops defaulting to the conversation anchor — never yank
         // someone off a session they chose.
-        MacChatSelectionIntent.noteUserChoice()
+        if userInitiated { MacChatSelectionIntent.noteUserChoice() }
         port.chatSelectionGeneration += 1
         let generation = port.chatSelectionGeneration
         let hasCachedTranscript = store.hasCachedTranscript(for: requestedId)
-        let lifecycleAtLoadStart = runtime.lifecycle(for: requestedId)
 
         if hasCachedTranscript {
-            port.commitChatSessionSelection(
-                requestedId,
-                snapshot: nil,
-                persistSelection: persistSelection
-            )
+            port.commitChatSessionSelection(requestedId)
         }
 
         do {
-            let snapshot = try await load(requestedId)
+            try await load(requestedId)
             guard port.chatSelectionGeneration == generation,
                   store.sessions.contains(where: { $0.id == requestedId }) else { return }
             if hasCachedTranscript {
                 guard port.activeChatSessionId == requestedId else { return }
             }
-            // A turn can start AND settle during this load, leaving no active
-            // stream for commitChatSessionSelection's guard to see. Its retained
-            // lifecycle is the existing evidence that the local rows/receipt
-            // advanced. Still honor selection, but do not roll those rows back.
-            let currentLifecycle = runtime.lifecycle(for: requestedId)
-            let turnAdvanced = currentLifecycle != nil && currentLifecycle != lifecycleAtLoadStart
-            port.commitChatSessionSelection(
-                requestedId,
-                snapshot: turnAdvanced ? nil : snapshot,
-                persistSelection: persistSelection
-            )
+            port.commitChatSessionSelection(requestedId)
         } catch {
             if port.chatSelectionGeneration == generation {
                 presentStatus("Chat session load failed: \(error.localizedDescription)")

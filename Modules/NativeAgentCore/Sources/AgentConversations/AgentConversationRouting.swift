@@ -116,13 +116,14 @@ public enum AgentConversationRouting {
                 args["bot_id"] = .string(botID.uuidString)
                 return Route(tool: "shelf_entry", input: args, agent: canonical)
             }
-            args["bot_id"] = .string(botID.uuidString)
             if let limit = input["limit"] {
+                args["id"] = .string(botID.uuidString)
                 args["limit"] = try integer(limit, field: "limit", range: 1...100)
                 return Route(tool: "shelf_read", input: args, agent: canonical)
             }
             // Opening a bot conversation should show its latest actual reply,
             // not an unread index that disappears after being acknowledged.
+            args["bot_id"] = .string(botID.uuidString)
             return Route(tool: "shelf_entry", input: args, agent: canonical)
         }
         guard conversation == nil else { throw invalid("Coding-agent reads currently require message_id without conversation_id; conversation filtering is not supported by delegation_status.") }
@@ -178,10 +179,6 @@ public enum AgentConversationRouting {
             }
         } else { return nil }
         return .object(["tool": .string("agent_read"), "input": .object(input)])
-    }
-
-    public static func supportedOptions(agent: String, dataRoot: URL = PersistenceCore.defaultDataRoot()) -> Set<String>? {
-        AgentConversationDelivery.door(for: agent, dataRoot: dataRoot)?.options
     }
 
     package static func validate(options: [String: JSONValue], allowed: Set<String>, continuing: Bool) throws {

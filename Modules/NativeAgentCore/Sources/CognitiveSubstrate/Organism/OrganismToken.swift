@@ -8,9 +8,8 @@ enum OrganismToken {
         var output = ""
         var previousWasDash = false
         for scalar in lower.unicodeScalars {
-            let value = scalar.value
-            let isLetter = value >= 97 && value <= 122
-            let isDigit = value >= 48 && value <= 57
+            let isLetter = CharacterSet.letters.contains(scalar)
+            let isDigit = CharacterSet.decimalDigits.contains(scalar)
             if isLetter || isDigit {
                 output.unicodeScalars.append(scalar)
                 previousWasDash = false

@@ -13,11 +13,11 @@ import NativeAgentShared
 
 extension AppDelegate {
     static func registerBackgroundTaskHandlers() {
-        for loopId in BackgroundLoopsManager.retiredSystemBackgroundActivities {
+        for loopId in BackgroundLoopLifetimes.retiredSystemBackgroundActivities {
             NSBackgroundActivityScheduler(
                 identifier: NativeAgentICloudBridgeConstants.backgroundTaskIdentifier(loopId)).invalidate()
         }
-        for entry in BackgroundLoopsManager.systemBackgroundActivities {
+        for entry in BackgroundLoopLifetimes.systemBackgroundActivities {
             let activity = NSBackgroundActivityScheduler(
                 identifier: NativeAgentICloudBridgeConstants.backgroundTaskIdentifier(entry.loopId))
             activity.interval = entry.interval
@@ -26,7 +26,7 @@ extension AppDelegate {
             activity.qualityOfService = .utility
             activity.schedule { completion in
                 Task.detached(priority: .utility) {
-                    let outcome = await BackgroundLoopsManager.shared.runTickIfDue(loopId: entry.loopId)
+                    let outcome = await BackgroundLoopLifetimes.shared.runTickIfDue(loopId: entry.loopId)
                     if case .failed = outcome { completion(.deferred) }
                     else { completion(.finished) }
                 }
@@ -38,11 +38,11 @@ extension AppDelegate {
 /// Mounted Inspector and bridge effects for the engine's Doctor owner.
 struct AppDoctorPort: EngineDoctorPlatformPort {
     let dataRoot: URL
-    var backgroundLoopsManager: BackgroundLoopsManager = .shared
+    var backgroundLoopsManager: BackgroundLoopLifetimes = .shared
 
     var runtime: EngineDoctorRuntime<AppDoctorPort> { EngineDoctorRuntime(dataRoot: dataRoot, port: self) }
     var doctorEngine: NativeAgentEngine { .live }
-    var doctorManager: BackgroundLoops.BackgroundLoopsManager { backgroundLoopsManager }
+    var doctorManager: BackgroundLoops.BackgroundLoopLifetimes { backgroundLoopsManager }
 
     func doctorRestartLoop(id: String) async -> LoopRestartOutcome {
         await NativeAgentEngine.restartBackgroundLoop(id: id, manager: backgroundLoopsManager)

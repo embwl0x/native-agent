@@ -1,14 +1,11 @@
 import Foundation
 import CryptoKit
 import NativeAgentCore
-import os
 import PersistenceCore
 import TurnTrace
-// v2Prefix delivery ladder: supportsMidConversationSystem / …ClearAt.
-import ProviderRouting
-// Blueprint: | `SessionHistoryReader.swift` | `SessionHistoryReader` actor; `messages`, `messagesWithStats`; initialization leaves retired middle-index files untouched |
+// Blueprint: | `SessionHistoryReader.swift` | `SessionHistoryReader` actor; `promptMessagesWithStats` retains the cursor boundary regardless of raw bytes/rows; `messages`, `messagesWithStats`; initialization leaves retired middle-index files untouched |
 
-// MARK: - ChatMessage / ChatSession
+// MARK: - ChatMessage
 
 public struct ChatMessage: Sendable, Codable {
     public let role: String           // 'user' | 'assistant' | 'system'
@@ -38,20 +35,6 @@ extension ChatMessage {
     }
 }
 
-public struct ChatSession: Sendable, Codable {
-    public let id: String
-    public let createdAt: String
-    public let title: String?
-    public let extras: JSONValue?
-
-    public init(id: String, createdAt: String, title: String?, extras: JSONValue?) {
-        self.id = id
-        self.createdAt = createdAt
-        self.title = title
-        self.extras = extras
-    }
-}
-
 public struct SessionHistoryReadStats: Sendable, Equatable {
     public let mode: String
     public let sourceBytes: Int64
@@ -64,7 +47,7 @@ public struct SessionHistoryReadStats: Sendable, Equatable {
     /// Valid JSON rows that are not usable chat message objects.
     public let invalidShapeRowCount: Int
     public let returnedCount: Int
-    /// L4-04: rows skipped because they belong to the CURRENT run. This is
+    /// Rows skipped because they belong to the current run. This is
     /// the number that separates "fresh session, nothing to load" from
     /// "history existed and decoded to nothing" in the turn trace.
     public let excludedByRunId: Int
@@ -98,10 +81,12 @@ public struct SessionHistoryReadStats: Sendable, Equatable {
 public struct SessionHistoryReadResult: Sendable {
     public let messages: [ChatMessage]
     public let stats: SessionHistoryReadStats
+    public let contextStatistics: (totalChars: Int, messageCount: Int)
 
-    public init(messages: [ChatMessage], stats: SessionHistoryReadStats) {
+    public init(messages: [ChatMessage], stats: SessionHistoryReadStats, contextStatistics: (totalChars: Int, messageCount: Int) = (0, 0)) {
         self.messages = messages
         self.stats = stats
+        self.contextStatistics = contextStatistics
     }
 }
 
@@ -114,24 +99,13 @@ private struct SessionHistoryLineReadResult: Sendable {
 
 // MARK: - SessionHistoryReader
 
-/// Reads daemon-format chat session history from disk. The daemon stores
-/// chat sessions as a single JSON list at `data/chat/sessions.json` and
+/// Reads chat session history from disk. Sessions live in
+/// a single JSON list at `data/chat/sessions.json` and
 /// per-session messages at `data/chat/messages/<id>.jsonl`.
 public actor SessionHistoryReader {
-    private static let log = Logger(subsystem: "com.nativeagent.core", category: "session-history")
-    /// Prompt assembly is a latency-sensitive projection over the canonical
-    /// JSONL audit log. Never let a few giant tool receipts turn that projection
-    /// back into an unbounded transcript scan.
+    /// Opening anchors and relevance sampling have their own bounded reads;
+    /// the replayed head belongs exclusively to HistoryWindowCursorStore.
     private static let promptHeadMaximumBytes = 64 * 1024
-    /// The prompt tail must reach the window cursor's boundary or the head
-    /// slides by BYTES while the cursor reports stable: at 192 KB the live
-    /// session's last 96 rows (242 KB, tool results included) already
-    /// overflowed it, the boundary row fell out of the tail, "boundary not
-    /// found → drop nothing" made the head the tail's first row, and every
-    /// appended row moved it — a full history rebuild on four of seven turns
-    /// (2026-09-02, caught by the prefix digest chain). Compaction bounds the
-    /// transcript, so 2 MB is a ceiling, not a working size.
-    private static let promptTailMaximumBytes = 2 * 1024 * 1024
     private static let relevanceFullReadMaximumBytes = 128 * 1024
     private static let relevanceSampleMaximumBytes = 96 * 1024
     private static let relevanceSampleWindowCount = 8
@@ -180,16 +154,7 @@ public actor SessionHistoryReader {
         let excludedRunId = excludingRunId?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let shouldExcludeRun = excludedRunId?.isEmpty == false
-        let path = transcriptURL ?? dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("messages", isDirectory: true)
-            .appendingPathComponent("\(safeId).jsonl")
-        let parent = path.resolvingSymlinksInPath().deletingLastPathComponent()
-        let compacted = path.lastPathComponent.hasPrefix("messages.compact.") && path.pathExtension == "jsonl"
-            && parent == dataRoot.appendingPathComponent("chat/sessions/\(safeId)").resolvingSymlinksInPath()
-        guard compacted || ["chat/messages", "chat/archive/messages", "chat/archive/originals"].contains(where: {
-            parent == dataRoot.appendingPathComponent($0).resolvingSymlinksInPath()
-        }) else { throw CocoaError(.fileReadNoPermission) }
+        let path = try transcriptPath(for: safeId, transcriptURL: transcriptURL)
         if !strictEvidence, !FileManager.default.fileExists(atPath: path.path) {
             return SessionHistoryReadResult(
                 messages: [],
@@ -207,6 +172,7 @@ public actor SessionHistoryReader {
         let bytesRead: Int64
         let truncatedRead: Bool
         let mode: String
+        var validEncoding = true
         if let limit, limit > 0, !strictEvidence {
             // A bounded tail: only the bytes the selection needs, from the end.
             // A file that will not open, seek or read whole is read_failed,
@@ -251,6 +217,7 @@ public actor SessionHistoryReader {
                 text = decoded
             } else {
                 text = String(decoding: data, as: UTF8.self)
+                validEncoding = String(data: data, encoding: .utf8) != nil
             }
             lines = text
                 .split(separator: "\n", omittingEmptySubsequences: true)
@@ -284,7 +251,8 @@ public actor SessionHistoryReader {
                 excludedByRunId: decodeResult.excludedByRunId,
                 returnedCount: msgs.count,
                 truncated: truncated
-            )
+            ),
+            contextStatistics: validEncoding ? decodeResult.contextStatistics : (0, 0)
         )
     }
 
@@ -367,69 +335,86 @@ public actor SessionHistoryReader {
         do { return try Data(contentsOf: path) } catch CocoaError.fileReadNoSuchFile { return nil }
     }
 
-    /// The first few messages plus a bounded tail. This lets the prompt
-    /// renderer keep true opening anchors for continuity without decoding an
-    /// entire large JSONL transcript on every turn.
+    /// Opening anchors, every recollection, and the cursor's contiguous window.
+    /// The tail is a minimum read width, never another owner of the head. With
+    /// no surviving boundary, admit the transcript so the cursor can establish
+    /// one under its rendered-row and character budgets.
     public nonisolated func promptMessagesWithStats(
         transcript: Data?,
         anchorLimit: Int = 3,
         tailLimit: Int,
-        excludingRunId: String? = nil
-    ) -> SessionHistoryReadResult {
+        windowCursor: HistoryWindowCursor,
+        excludingRunId: String? = nil,
+        relevanceWhen: (SessionHistoryReadResult) -> Bool = { _ in false }
+    ) -> (prompt: SessionHistoryReadResult, relevance: SessionHistoryReadResult?) {
         guard let transcript else {
-            return SessionHistoryReadResult(
+            return (SessionHistoryReadResult(
                 messages: [],
                 stats: SessionHistoryReadStats(mode: "missing")
-            )
+            ), nil)
         }
         let excludedRunId = excludingRunId?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let shouldExcludeRun = excludedRunId?.isEmpty == false
         if tailLimit <= 0 {
-            return SessionHistoryReadResult(
+            return (SessionHistoryReadResult(
                 messages: [],
                 stats: SessionHistoryReadStats(mode: "tail_zero")
-            )
+            ), nil)
+        }
+        var rows: [String: DecodedRow] = [:]
+        func decode(_ line: String) -> DecodedRow {
+            if let row = rows[line] { return row }
+            let row = Self.decodeRow(line)
+            rows[line] = row
+            return row
         }
         let head = Self.headLinesResult(
             from: transcript,
             maximumLineCount: max(0, anchorLimit),
             maximumBytes: Self.promptHeadMaximumBytes
         )
-        let tail = Self.tailLinesResult(
-            from: transcript,
-            minimumLineCount: max(64, tailLimit),
-            maximumBytes: Self.promptTailMaximumBytes
-        )
-        let decodeResult = Self.decodeMessages(
-            from: head.lines + tail.lines,
-            excludingRunId: shouldExcludeRun ? excludedRunId : nil,
-            excludingAwaitingConsumption: true
-        )
-        let decoded = decodeResult.messages
-        var seen: Set<String> = []
-        var out: [ChatMessage] = []
-        for msg in decoded {
-            let key = msg.historyIdentity()
-            guard !seen.contains(key) else { continue }
-            seen.insert(key)
-            out.append(msg)
+        let lines = String(decoding: transcript, as: UTF8.self)
+            .split(separator: "\n", omittingEmptySubsequences: true)
+        var windowStart = 0
+        if let boundary = windowCursor.dropBoundaryIdentity {
+            for index in lines.indices.reversed() {
+                let decoded = Self.decodeMessages(from: [String(lines[index])],
+                    excludingRunId: nil, excludingAwaitingConsumption: true, decode: decode)
+                guard let row = decoded.messages.first else { continue }
+                let identity = boundary.hasPrefix("id\u{1F}") ? row.historyIdentity()
+                    : SessionHistoryPromptRenderer.renderable(row)?.historyIdentity
+                if identity == boundary {
+                    windowStart = index
+                    break
+                }
+            }
         }
-        return SessionHistoryReadResult(
-            messages: out,
-            stats: SessionHistoryReadStats(
-                mode: "head_tail",
-                sourceBytes: max(head.sourceBytes, tail.sourceBytes),
-                bytesRead: head.bytesRead + tail.bytesRead,
-                linesRead: head.lines.count + tail.lines.count,
-                decodedCount: decoded.count,
-                malformedRowCount: decodeResult.malformedRowCount,
-                invalidShapeRowCount: decodeResult.invalidShapeRowCount,
-                excludedByRunId: decodeResult.excludedByRunId,
-                returnedCount: out.count,
-                truncated: head.truncated || tail.truncated || decoded.count != out.count
-            )
-        )
+        // Raw payload size cannot displace the cursor's actual boundary.
+        let tailStart = min(windowStart, max(0, lines.count - max(64, tailLimit)))
+        var selected: [String] = []
+        for (index, line) in lines.enumerated() {
+            let text = String(line)
+            if index >= tailStart || (index < head.lines.count && head.lines[index] == text) {
+                selected.append(text)
+                continue
+            }
+            // Only older recollection candidates need decoding.
+            if text.contains("compaction_summary"), case .object(let fields)? = decode(text).value,
+               case .object(let metadata)? = fields["metadata"], metadata["kind"] == .string("compaction_summary") {
+                selected.append(text)
+            } else if index < head.lines.count {
+                selected.append(head.lines[index])
+            }
+        }
+        let prompt = Self.selectionResult(
+            SessionHistoryLineReadResult(lines: selected, sourceBytes: Int64(transcript.count),
+                bytesRead: Int64(transcript.count), truncated: selected.count < lines.count),
+            mode: "cursor_recollections_tail", excludingRunId: shouldExcludeRun ? excludedRunId : nil, decode: decode)
+        let relevance = relevanceWhen(prompt) ? relevanceMessagesWithStats(
+            size: transcript.count, excludingRunId: excludingRunId, decode: decode
+        ) { transcript.subdata(in: (transcript.startIndex + $0)..<(transcript.startIndex + $0 + $1)) } : nil
+        return (prompt, relevance)
     }
 
     /// Return bounded candidates for semantic "earlier session" ranking.
@@ -440,42 +425,46 @@ public actor SessionHistoryReader {
     /// From the file, reading only the windows it samples.
     public func relevanceMessagesWithStats(
         forSessionId id: String,
-        excludingRunId: String? = nil
+        excludingRunId: String? = nil,
+        transcriptURL: URL? = nil
     ) throws -> SessionHistoryReadResult {
         guard let safeId = NativeAgentChatSessionID.normalizedPathComponent(id) else {
             return SessionHistoryReadResult(messages: [], stats: SessionHistoryReadStats(mode: "invalid_session_id"))
         }
-        let path = dataRoot.appendingPathComponent("chat/messages/\(safeId).jsonl")
+        let path = try transcriptPath(for: safeId, transcriptURL: transcriptURL)
         guard FileManager.default.fileExists(atPath: path.path) else {
             return SessionHistoryReadResult(messages: [], stats: SessionHistoryReadStats(mode: "missing"))
         }
         guard let handle = try? FileHandle(forReadingFrom: path), let size = try? handle.seekToEnd() else {
             return SessionHistoryReadResult(messages: [], stats: SessionHistoryReadStats(mode: "read_failed"))
         }
-        return relevanceMessagesWithStats(size: Int(size), excludingRunId: excludingRunId) { offset, count in
-            (try? handle.seek(toOffset: UInt64(offset))).flatMap { _ in try? handle.read(upToCount: count) }
+        var unread = false
+        let result = relevanceMessagesWithStats(size: Int(size), excludingRunId: excludingRunId) { offset, count in
+            let chunk = (try? handle.seek(toOffset: UInt64(offset))).flatMap { _ in try? handle.read(upToCount: count) }
+            if chunk?.count != count { unread = true }
+            return chunk
         }
+        return unread ? SessionHistoryReadResult(messages: [], stats: SessionHistoryReadStats(mode: "read_failed")) : result
     }
 
-    /// From the bytes this turn already holds.
-    public nonisolated func relevanceMessagesWithStats(
-        transcript: Data?,
-        excludingRunId: String? = nil
-    ) -> SessionHistoryReadResult {
-        guard let transcript else {
-            return SessionHistoryReadResult(
-                messages: [],
-                stats: SessionHistoryReadStats(mode: "missing")
-            )
-        }
-        return relevanceMessagesWithStats(size: transcript.count, excludingRunId: excludingRunId) {
-            transcript.subdata(in: (transcript.startIndex + $0)..<(transcript.startIndex + $0 + $1))
-        }
+    private func transcriptPath(for safeId: String, transcriptURL: URL?) throws -> URL {
+        let path = transcriptURL ?? dataRoot
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("messages", isDirectory: true)
+            .appendingPathComponent("\(safeId).jsonl")
+        let parent = path.resolvingSymlinksInPath().deletingLastPathComponent()
+        let compacted = path.lastPathComponent.hasPrefix("messages.compact.") && path.pathExtension == "jsonl"
+            && parent == dataRoot.appendingPathComponent("chat/sessions/\(safeId)").resolvingSymlinksInPath()
+        guard compacted || ["chat/messages", "chat/archive/messages", "chat/archive/originals"].contains(where: {
+            parent == dataRoot.appendingPathComponent($0).resolvingSymlinksInPath()
+        }) else { throw CocoaError(.fileReadNoPermission) }
+        return path
     }
 
     private nonisolated func relevanceMessagesWithStats(
         size: Int,
         excludingRunId: String?,
+        decode: (String) -> DecodedRow = SessionHistoryReader.decodeRow,
         bytes: (_ offset: Int, _ count: Int) -> Data?
     ) -> SessionHistoryReadResult {
         let excludedRunId = excludingRunId?
@@ -498,10 +487,18 @@ public actor SessionHistoryReader {
             )
             mode = "relevance_sampled"
         }
-        let decodeResult = Self.decodeMessages(
+        return Self.selectionResult(lineRead, mode: mode,
+            excludingRunId: shouldExcludeRun ? excludedRunId : nil, decode: decode)
+    }
+
+    private nonisolated static func selectionResult(
+        _ lineRead: SessionHistoryLineReadResult, mode: String,
+        excludingRunId: String?, decode: (String) -> DecodedRow
+    ) -> SessionHistoryReadResult {
+        let decodeResult = decodeMessages(
             from: lineRead.lines,
-            excludingRunId: shouldExcludeRun ? excludedRunId : nil,
-            excludingAwaitingConsumption: true
+            excludingRunId: excludingRunId,
+            excludingAwaitingConsumption: true, decode: decode
         )
         let decoded = decodeResult.messages
         var seen: Set<String> = []
@@ -572,16 +569,6 @@ public actor SessionHistoryReader {
             bytesRead: Int64(size - offset),
             truncated: offset > 0
         )
-    }
-
-    private nonisolated static func tailLinesResult(
-        from data: Data,
-        minimumLineCount: Int,
-        maximumBytes: Int? = nil
-    ) -> SessionHistoryLineReadResult {
-        tailLinesResult(size: data.count, minimumLineCount: minimumLineCount, maximumBytes: maximumBytes) {
-            data.subdata(in: (data.startIndex + $0)..<(data.startIndex + $0 + $1))
-        }
     }
 
     private nonisolated static func headLinesResult(
@@ -675,33 +662,57 @@ public actor SessionHistoryReader {
             truncated: bytesRead < Int64(size)
         )
     }
+    package typealias DecodedRow = (value: JSONValue?, role: String?, content: String?, timestamp: String?, contextStatistics: (totalChars: Int, messageCount: Int))
+
+    /// Parse one row's canonical fields and raw-object context counts; preserve invalid JSON shapes.
+    package nonisolated static func decodeRow(_ line: String) -> DecodedRow {
+        let lineData = Data(line.trimmingCharacters(in: .whitespacesAndNewlines).utf8)
+        var statistics = (totalChars: 0, messageCount: 0)
+        let parsed: JSONValue? = autoreleasepool {
+            let raw = try? JSONSerialization.jsonObject(with: lineData, options: [.fragmentsAllowed])
+            if let object = raw as? [String: Any] {
+                statistics.messageCount = 1
+                if let content = object["content"] as? String {
+                    statistics.totalChars = content.count
+                } else if let content = object["content"],
+                          let bytes = try? JSONSerialization.data(withJSONObject: content) {
+                    statistics.totalChars = bytes.count
+                }
+            }
+            // Non-finite legacy tokens remain readable but never count as raw JSON objects.
+            return raw.map { JSONValue(fromFoundation: $0) } ?? (try? JSONValue.parse(lineData))
+        }
+        guard case .object(let row)? = parsed else { return (parsed, nil, nil, nil, statistics) }
+        func string(_ key: String) -> String? { if case .string(let text)? = row[key] { return text }; return nil }
+        return (parsed, string("role"), string("content") ?? string("text"), string("createdAt") ?? string("timestamp"), statistics)
+    }
+
     private nonisolated static func decodeMessages(
         from lines: [String],
         excludingRunId: String?,
-        excludingAwaitingConsumption: Bool = false
+        excludingAwaitingConsumption: Bool = false,
+        decode: (String) -> DecodedRow = SessionHistoryReader.decodeRow
     ) -> (
         messages: [ChatMessage],
         excludedByRunId: Int,
         malformedRowCount: Int,
-        invalidShapeRowCount: Int
+        invalidShapeRowCount: Int,
+        contextStatistics: (totalChars: Int, messageCount: Int)
     ) {
         var msgs: [ChatMessage] = []
         var excludedCount = 0
         var malformedCount = 0
         var invalidShapeCount = 0
+        var contextStatistics = (totalChars: 0, messageCount: 0)
         msgs.reserveCapacity(lines.count)
         for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty { continue }
-            guard let lineData = trimmed.data(using: .utf8),
-                  let parsed = try? JSONValue.parse(lineData) else {
-                malformedCount += 1
-                continue
-            }
-            guard case .object(let obj) = parsed else {
-                invalidShapeCount += 1
-                continue
-            }
+            let decoded = decode(line)
+            contextStatistics.totalChars += decoded.contextStatistics.totalChars
+            contextStatistics.messageCount += decoded.contextStatistics.messageCount
+            guard let parsed = decoded.value else { malformedCount += 1; continue }
+            guard case .object(let obj) = parsed else { invalidShapeCount += 1; continue }
             if excludingAwaitingConsumption, case .object(let metadata)? = obj["metadata"],
                metadata["awaitingConsumption"] == .bool(true) { continue }
             if let excludingRunId,
@@ -709,31 +720,18 @@ public actor SessionHistoryReader {
                 excludedCount += 1
                 continue
             }
-            var role: String? = nil
-            var content: String? = nil
-            var timestamp: String = ""
-            if case .string(let s)? = obj["role"] { role = s }
-            if case .string(let s)? = obj["content"] { content = s }
-            // 2026-09-06: legacy transcript rows spell the body `text`, the
-            // same fallback `search_chat_history` already reads. Without it
-            // this decoder counted those rows as invalid shape and dropped
-            // them, so a legacy row could be FOUND by search and then be
-            // unreadable by `read_chat_message`, which reads through here.
-            else if case .string(let s)? = obj["text"] { content = s }
-            if case .string(let s)? = obj["createdAt"] { timestamp = s }
-            else if case .string(let s)? = obj["timestamp"] { timestamp = s }
-            guard let role, let content else {
+            guard let role = decoded.role, let content = decoded.content else {
                 invalidShapeCount += 1
                 continue
             }
             msgs.append(ChatMessage(
                 role: role,
                 content: content,
-                timestamp: timestamp,
+                timestamp: decoded.timestamp ?? "",
                 extras: parsed
             ))
         }
-        return (msgs, excludedCount, malformedCount, invalidShapeCount)
+        return (msgs, excludedCount, malformedCount, invalidShapeCount, contextStatistics)
     }
 
     private nonisolated static func message(_ value: JSONValue, hasRunId runId: String) -> Bool {
@@ -747,36 +745,4 @@ public actor SessionHistoryReader {
         return false
     }
 
-    /// Load session metadata from `data/chat/sessions.json`.
-    public func session(id: String) async throws -> ChatSession? {
-        let path = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions.json")
-        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
-        // A sessions.json that exists but cannot be read or parsed is NOT
-        // "no such session" — the nil below reads that way to every caller,
-        // so say so once in the log rather than silently.
-        guard let data = try? Data(contentsOf: path) else {
-            Self.log.error("sessions.json unreadable at \(path.path, privacy: .public)")
-            return nil
-        }
-        guard let parsed = try? JSONValue.parse(data) else {
-            Self.log.error("sessions.json is not valid JSON at \(path.path, privacy: .public)")
-            return nil
-        }
-        guard case .array(let arr) = parsed else {
-            Self.log.error("sessions.json is not a JSON array at \(path.path, privacy: .public)")
-            return nil
-        }
-        for entry in arr {
-            guard case .object(let obj) = entry else { continue }
-            guard case .string(let entryId)? = obj["id"], entryId == id else { continue }
-            var createdAt = ""
-            var title: String? = nil
-            if case .string(let s)? = obj["createdAt"] { createdAt = s }
-            if case .string(let s)? = obj["title"] { title = s }
-            return ChatSession(id: entryId, createdAt: createdAt, title: title, extras: entry)
-        }
-        return nil
-    }
 }

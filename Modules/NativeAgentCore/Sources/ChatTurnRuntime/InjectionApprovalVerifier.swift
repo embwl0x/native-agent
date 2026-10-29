@@ -5,27 +5,6 @@ import ApprovalInbox
 import MacControl
 // Blueprint: | `InjectionApprovalVerifier.swift` | `ApprovalInboxInjectionApprovalVerifier` struct; `verifyInjectionApproval` |
 
-// MARK: - W2/W3-FIX-R2 1 — replay evidence must be CHECKED, never asserted
-
-/// Why this type exists.
-///
-/// The first cut let ONE thing exempt an injection tool from the approval
-/// floor: an `ApprovedChatToolReplay` whose fields matched the call. But that
-/// struct is a public value type with a public init, and its `matches` only
-/// asked whether the caller-supplied fields equalled the caller-supplied call
-/// plus a NONEMPTY approval id. So any in-process caller could write
-/// `ApprovedChatToolReplay(approvalID: "x", tool: "legacy keystroke tool", ...)`,
-/// hand it to `makeGatedToolDispatchClient`, and take the one exemption — then
-/// the same unverified string was minted into a `MacInjectionCapability`. The
-/// capability's non-forgeability bought nothing, because its ROOT was a string
-/// nobody checked.
-///
-/// The fix is to make the approval record itself the authority. Before the
-/// floor exemption and before the mint, the dispatcher asks a verifier whether
-/// a record with that id really exists, is really resolved-approved, is for
-/// THIS tool and THIS surface, is bound to THIS body, and has not already been
-/// spent. A nonempty string is never sufficient; a matching struct is never
-/// sufficient; only a record on disk that a human resolved is.
 public enum InjectionApprovalVerification: String, Sendable, Equatable {
     case verified
     case recordNotFound = "approval_record_not_found"
@@ -42,73 +21,19 @@ public enum InjectionApprovalVerification: String, Sendable, Equatable {
     case spendUnavailable = "approval_spend_unrecordable"
 }
 
-/// Process-global single-use ledger for injection APPROVAL RECORDS.
-///
-/// `MacInjectionCapabilityLedger` makes one minted capability usable once. This
-/// makes one approval RECORD mintable once, which is the stronger property: a
-/// caller that re-presents the same resolved record cannot mint a second
-/// capability from it, even from a different dispatcher instance.
-public actor MacInjectionApprovalConsumptionLedger {
-    public static let shared = MacInjectionApprovalConsumptionLedger()
-
-    private var consumed: Set<String> = []
-    private var consumedAt: [String: Date] = [:]
-
-    /// Returns false if this approval id was already spent.
-    public func consume(approvalID: String, now: Date = Date()) -> Bool {
-        prune(now: now)
-        guard !consumed.contains(approvalID) else { return false }
-        consumed.insert(approvalID)
-        consumedAt[approvalID] = now
-        return true
-    }
-
-    /// Test seam — hermetic tests must not inherit each other's approvals.
-    public func reset() {
-        consumed.removeAll()
-        consumedAt.removeAll()
-    }
-
-    private func prune(now: Date) {
-        guard consumedAt.count > 512 else { return }
-        for (id, stamp) in consumedAt where now.timeIntervalSince(stamp) > 86_400 {
-            consumed.remove(id)
-            consumedAt.removeValue(forKey: id)
-        }
-    }
-}
-
-/// The real verifier: the canonical `ApprovalInbox` on disk is the authority.
-///
-/// Single use is now THREE layers, checked in this order:
-///   1. the record's persisted `executedAction` — a completed injection,
-///   2. the durable spend marker — an injection that STARTED (survives a
-///      crash between the effect landing and the outcome being written),
-///   3. the process-global ledger — a second mint inside one process.
-/// (2) is the addition; it is the first line of the spend, not a replacement
-/// for (1) or (3).
+/// Requires a resolved-approved canonical inbox record matching the tool,
+/// body digest and any recorded surface, with no completed execution evidence.
+/// The inbox's durable spend enforces single use across tasks, processes and restarts.
+/// Spend precedes `.verified` and remains permanent even when execution fails.
 public struct ApprovalInboxInjectionApprovalVerifier: Sendable {
-    /// Typed as the SPENDING inbox, not the plain one: the durable spend is
-    /// part of what makes verification single-use, so an inbox that cannot
-    /// record a spend cannot be wired here at all. Fail-closed by type,
-    /// with no runtime cast to get wrong.
-    private let inbox: any InjectionApprovalSpendingInbox
-    private let ledger: MacInjectionApprovalConsumptionLedger
+    private let inbox: SwiftNativeApprovalInbox
 
-    public init(
-        dataRoot: URL,
-        ledger: MacInjectionApprovalConsumptionLedger = .shared
-    ) {
+    public init(dataRoot: URL) {
         self.inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        self.ledger = ledger
     }
 
-    public init(
-        inbox: any InjectionApprovalSpendingInbox,
-        ledger: MacInjectionApprovalConsumptionLedger = .shared
-    ) {
+    public init(inbox: SwiftNativeApprovalInbox) {
         self.inbox = inbox
-        self.ledger = ledger
     }
 
     public func verifyInjectionApproval(
@@ -125,8 +50,7 @@ public struct ApprovalInboxInjectionApprovalVerifier: Sendable {
               record.decision?.lowercased() == "approved" else {
             return .notApproved
         }
-        // An executed record is a SPENT record. The persistent half of single
-        // use: the process ledger below is lost on restart, this is not.
+        // An executed record is already spent, independently of the spend marker.
         if let executed = record.executedAction, executed != .null {
             return .alreadyConsumed
         }
@@ -152,18 +76,6 @@ public struct ApprovalInboxInjectionApprovalVerifier: Sendable {
         }
         guard approvedDigest == callDigest else { return .bodyMismatch }
 
-        // THE SPEND, and it happens BEFORE `.verified` is returned.
-        //
-        // The checks above are all read-only evidence about the record. This is
-        // the first WRITE, and it is deliberately first-in-the-transaction: the
-        // executor writes `executedAction` only after dispatch returns, so a
-        // crash after the click landed but before the annotation left a
-        // resolved-approved record with `executedAction == nil` — reusable on
-        // the next launch, with the process ledger below gone and (for click /
-        // scroll / ax_act) no secret-vault dependency to block the replay.
-        // Durably burning the approval here means the crash window contains no
-        // reusable state. The spend is never rolled back if the injection then
-        // fails; see `InjectionApprovalSpendingInbox`.
         switch await inbox.consumeInjectionApproval(
             id: id,
             digest: callDigest,
@@ -178,7 +90,6 @@ public struct ApprovalInboxInjectionApprovalVerifier: Sendable {
             return .spendUnavailable
         }
 
-        guard await ledger.consume(approvalID: id) else { return .alreadyConsumed }
         return .verified
     }
 

@@ -1,10 +1,12 @@
 import AuthoredCapabilities
 import ChatTurnContracts
+import ChatTurnRuntime
 import ChatToolRuntime
 import ChatToolParsing
 import Desk
 import Dispatcher
 import Foundation
+import NativeAgentShared
 import Privacy
 import NativeAgentCore
 import PersistenceCore
@@ -12,7 +14,9 @@ import Senses
 import ToolExecution
 import ToolRegistry
 import TrustCenter
-// Blueprint: | `AppToolExecutor+PartRun.swift` | `AppToolExecutor`: a part's own run (`doorPart`: Desk holds, the gated `authored.<id>`, `afterPartRun`: MY QUEUE upgrade line, runner-owned effect reconciliation and action-owned version recovery, with fresh-run calls only for no effects, a strict stop kept to resume), `doorPartPreview` retains nested value-call version pins, `doorPartResume`, `partAlias` (the older skill.*/tool.* doors and older spellings of a part's action, until the release after the one that ships one-part), `doorWouldCard`; stopped checkpoints delegate to Desk’s `PartRunStore` |
+import Transcripts
+import TurnTrace
+// Blueprint: | `AppToolExecutor+PartRun.swift` | `AppToolExecutor`: a part's own run (`doorPart`: Desk holds, the gated `authored.<id>` with its in-flight turn's arrival check (a message or that turn's Stop), `afterPartRun`: MY QUEUE upgrade line, runner-owned effect reconciliation and action-owned version recovery, with fresh-run calls only for no effects, a strict stop kept to resume), `doorPartPreview` retains nested value-call version pins, `doorPartResume` (optional bare/action ability id checked before claiming its checkpoint; receipts name the bare id), `partAlias` (the older skill.*/tool.* doors and older spellings of a part's action, until the release after the one that ships one-part), `doorWouldCard`; stopped checkpoints delegate to Desk’s `PartRunStore` |
 
 /// A part's run through its own action (`authored.<id>`): every call keeps
 /// the turn's gates. Its preview runs its code with every write previewed;
@@ -24,10 +28,14 @@ extension AppToolExecutor {
     /// through it and its receipt names the new call. The one place they
     /// resolve, for a turn's call and a part's code alike (`AppScriptRunner.Host`).
     /// Delete in the release after the one that ships one-part.
-    static func partAlias(_ id: String, _ args: [String: JSONValue], root: URL) -> (id: String, args: [String: JSONValue])? {
+    static func partAlias(_ id: String, _ args: [String: JSONValue], root: URL, aliases: [String: String]? = nil) -> (id: String, args: [String: JSONValue])? {
         let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        func partID(_ named: String) -> String? {
+            if let aliases { return aliases[named.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()] }
+            return (try? Parts(root: root).row(named)).flatMap { $0?["id"] }?.scalarText
+        }
         if let named = ToolNameAliases.authoredTool(id),
-           let part = (try? Parts(root: root).row(named)).flatMap({ $0?["id"] }).flatMap(inputString), part.lowercased() != named.lowercased() {
+           let part = partID(named), part.lowercased() != named.lowercased() {
             return ("authored." + part, args)
         }
         let doors = ["skill.save": "ability.save", "tool.propose": "ability.save", "skill.read": "ability.read", "skill.list": "ability.list",
@@ -42,7 +50,7 @@ extension AppToolExecutor {
         case "skill.read": for field in ["source", "content"] { out.removeValue(forKey: field) }
         case "tool.reject": out["pending"] = .bool(true)
         case "skill.run":
-            let part = (try? Parts(root: root).row(doorText(out["id"]))).flatMap { $0?["id"] }.flatMap(inputString) ?? doorText(out["id"])
+            let part = partID(doorText(out["id"])) ?? doorText(out["id"])
             return ("authored." + part, partFields(args["input"] ?? args["args"]))
         default: break
         }
@@ -78,7 +86,7 @@ extension AppToolExecutor {
             return Self.doorRefusal("secret_in_input", "\(path) carries a key or token, and an ability's input never does. Nothing ran.",
                 remedy: "use_actions", "Pass a key as a single app action, not to an ability.")
         }
-        let session = Self.inputString(input["__session_id"]) ?? ChatToolSessionContext.verifiedSessionId
+        let session = input["__session_id"]?.scalarText ?? ChatToolSessionContext.verifiedSessionId
         if let session {
             let store = SwiftNativeDeskStore(dataRoot: root)
             for ref in Self.deskRefs(.object(given)) {
@@ -87,7 +95,15 @@ extension AppToolExecutor {
                     remedy: "none", "Leave it to that one, or pick it up there.", extra: ["held_by": .string(by)])
             }
         }
-        let result = try await runFolded(action, input: call, surface: surface)
+        // A part that is not done goes on by itself only inside this conversation's
+        // turn in flight, one the person can Stop, until a message or that Stop arrives.
+        let turn = session.flatMap { session in ChatCancelFlag.inFlightTurns(dataRoot: root).first {
+            $0.sessionId == session && $0.turnId == TurnTraceContext.turnId } }
+        let arrived = turn.map { turn in { @Sendable () -> Parts.Arrival? in
+            ChatCancelFlag.isRaised(turn.stop) ? .stop : ChatTurnSteering.hasPending(turn.sessionId) ? .message : nil } }
+        let result = try await Parts.$arrived.withValue(arrived) {
+            try await runFolded(action, input: call, surface: surface)
+        }
         return await Self.afterPartRun(result, id: action.tool, input: given, session: input["__session_id"], surface: surface, root: root)
     }
 
@@ -114,11 +130,14 @@ extension AppToolExecutor {
     /// What a run says about its part, once it is back: the upgrade it owes
     /// as a quiet MY QUEUE line, the remedy for a stop, and a run kept to
     /// resume when it stopped to ask or handed a step back.
-    static func afterPartRun(_ result: JSONValue, id: String, input: [String: JSONValue], session: JSONValue?, surface: String, root: URL) async -> JSONValue {
+    static func afterPartRun(_ result: JSONValue, id: String, input given: [String: JSONValue], session: JSONValue?, surface: String, root: URL) async -> JSONValue {
         guard case .object(var out) = result else { return result }
+        out["id"] = .string(id)
+        // A part that carried itself names the input its last run ran on.
+        let input = if case .object(let last)? = out["ran_on"] { last } else { given }
         let calls: [JSONValue]? = if case .array(let calls)? = out.removeValue(forKey: "journal") { calls } else { nil }
         let row = (try? Parts(root: root).row(id)) ?? nil
-        let name = row.flatMap { Parts.fields(.object($0))["name"] }.flatMap(inputString) ?? id
+        let name = row.flatMap { Parts.fields(.object($0))["name"] }?.scalarText ?? id
         let voices = row.map(Parts.voices) ?? []
         out["name"] = .string(name)
         if case .string(let upgrade)? = out.removeValue(forKey: "upgrade") {
@@ -137,7 +156,7 @@ extension AppToolExecutor {
                 : unresumable), "next_call": .object(["tool": .string("app"), "input": .object(["action": .string("authored." + id), "args": .object(input)])])])
         }
         guard out["status"] == .string("stopped"), partHandBacks.contains(reason), let calls,
-              !outside, let digest = inputString(out["version"]) else { return .object(out) }
+              !outside, let digest = out["version"]?.scalarText else { return .object(out) }
         let runID = "run-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8).lowercased()
         let back = partFields(out["hand_back"])
         let question = [back["question"], partFields(out["stopped"])["detail"]].lazy.map(doorText).first { !$0.isEmpty } ?? reason
@@ -147,7 +166,7 @@ extension AppToolExecutor {
             "run_id": .string(runID), "skill": .string(id), "name": .string(name), "digest": .string(digest),
             "input": .object(input), "journal": .array(calls), "question": .string(question), "reason": .string(reason),
             "version": .string(digest), "hostRevision": .string(OwnedProgramStore.hostRevision),
-            "at": .string(ISO8601DateFormatter().string(from: Date())),
+            "at": .string(NativeTimestampFormat.plainZulu(Date())),
             "steer": PeerDataTaint.carriedRecord(peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: surface),
                                                  peerID: ChatToolSessionContext.envelope?.verifiedUserId),
         ]
@@ -164,7 +183,7 @@ extension AppToolExecutor {
         // The Desk items it touched stay its own until it is resumed or dropped:
         // another conversation that works one is told "held by run <id>".
         var held: [String] = []
-        if let owner = inputString(session) ?? ChatToolSessionContext.verifiedSessionId {
+        if let owner = session?.scalarText ?? ChatToolSessionContext.verifiedSessionId {
             held = (try? await SwiftNativeDeskStore(dataRoot: root).hold(deskRefs(calls), run: runID, session: owner)) ?? []
         }
         out["resume"] = .object(["run_id": .string(runID), "question": .string(question), "held": .array(held.map(JSONValue.string))])
@@ -183,18 +202,32 @@ extension AppToolExecutor {
         return .object(out)
     }
 
-    /// `ability.resume`: claimed once, sealed, the same version, still on and
-    /// its input still fitting; the turn takes on the steer it ran under, and
-    /// a woken run its wake (input.wake, past the params check, as it ran).
-    /// Then the code runs again: what it read is read again live, and it goes
-    /// on only if all of it reads the same (`OwnedProgramRunner.Replay`).
-    /// A preview claims, closes and runs nothing: it says what resuming would do.
+    /// `ability.resume` claims once, rechecks sealed admission, active version and input, and inherits steer and wake.
+    /// Live replay rereads prior reads and continues only while they match.
+    /// Preview only inspects: it claims no run, transfers no holds and closes no queued step.
     @MainActor
     func doorPartResume(_ args: [String: JSONValue], preview: Bool = false, session: JSONValue?, surface: String, root: URL) async -> JSONValue {
         let runID = Self.doorText(args["run_id"])
         if runID.range(of: "^run-[0-9a-f]{8}$", options: .regularExpression) == nil {
             return Self.doorRefusal("invalid_run_id", "run_id must be run- followed by eight lowercase hex digits. Nothing ran.",
                 remedy: "select_run", "Read the saved run ids and pass the exact run_id.", next: ["page": .string("tools")])
+        }
+        // An optional ability reference binds the requested run without claiming
+        // it on a typo or a different ability. run_id remains the exact checkpoint.
+        if let named = args["id"]?.scalarText {
+            do {
+                let parts = Parts(root: root)
+                guard let row = try parts.row(named), let id = row["id"]?.scalarText else {
+                    let refusal = try parts.unknown(named)
+                    return .object(refusal.fields.merging(["status": .string("refused")]) { $1 })
+                }
+                if let waiting = await PartRunStore.read(runID, root: root),
+                   Self.doorText(waiting["skill"]) != id {
+                    return Self.doorRefusal("wrong_ability", "\(runID) is not a stopped run of \(id). Nothing was claimed or run.",
+                        remedy: "select_run", "Read the saved run ids and choose this ability's run_id.",
+                        next: ["page": .string("tools")], extra: ["id": .string(id), "run_id": .string(runID)])
+                }
+            } catch { return ChatToolOutcome.failure(error: error, tool: "ability.resume") }
         }
         guard let run = await (preview ? PartRunStore.read(runID, root: root) : PartRunStore.take(runID, root: root)) else {
             return Self.doorRefusal("not_found",
@@ -208,7 +241,7 @@ extension AppToolExecutor {
             let input = Self.partFields(run["input"])
             if preview { return .object(["status": .string("stopped"), "reason": .string(DataRootLife.stoppedReason),
                 "execution": .string("not_run"), "effects": .string("none"), "resume_mode": .string("fresh"),
-                "run_id": .string(runID), "ability": .string(id), "input": .object(input)]) }
+                "run_id": .string(runID), "id": .string(id), "ability": .string(id), "input": .object(input)]) }
             do {
                 let result = try await Parts(root: root).run(id: id, input: .object(input))
                 return await Self.afterPartRun(result, id: id, input: input, session: session, surface: surface, root: root)
@@ -216,7 +249,7 @@ extension AppToolExecutor {
         }
         // Claimed in this life: its holds pass to the resuming conversation.
         let store = SwiftNativeDeskStore(dataRoot: root)
-        let owner = preview ? nil : Self.inputString(session) ?? ChatToolSessionContext.verifiedSessionId
+        let owner = preview ? nil : session?.scalarText ?? ChatToolSessionContext.verifiedSessionId
         var passed: [String: DeskHold] = [:]
         if let owner { passed = (try? await store.passHolds(run: runID, to: owner)) ?? [:] }
         // Its queued step closes once the run is taken up or closed; a resume turned away
@@ -229,7 +262,8 @@ extension AppToolExecutor {
         }
         func closed(_ reason: String, _ why: String) -> JSONValue {
             Self.doorRefusal(reason, why + (preview ? " Resuming run \(runID) would close it; nothing was claimed or run."
-                : " Run \(runID) is closed; nothing ran."), remedy: "none", "Read the ability and affected state before choosing what remains; do not repeat completed effects.")
+                : " Run \(runID) is closed; nothing ran."), remedy: "none", "Read the ability and affected state before choosing what remains; do not repeat completed effects.",
+                extra: ["id": .string(id)])
         }
         let row = (try? Parts(root: root).row(id)) ?? nil
         guard let row, row["status"] == .string("active"), row["codeFingerprint"] == run["digest"],
@@ -246,7 +280,7 @@ extension AppToolExecutor {
             if at.isEmpty, case .array(let call)? = last["call"], call.count == 4 { at = ["call": call[0], "id": call[1], "line": call[3]] }
             return .object([
                 "status": .string("preview"), "effects": .string("none"), "execution": .string("not_run"),
-                "run_id": .string(runID), "name": .string(name),
+                "run_id": .string(runID), "id": .string(id), "name": .string(name),
                 "ability": .string(id), "question": run["question"] ?? .null, "reason": run["reason"] ?? .null,
                 "input": .object(input), "wake": run["wake"] ?? .null, "stopped_at": .object(at),
                 "detail": .string("Resuming would run \(name) from the top on this input: each call it made before it stopped "
@@ -325,7 +359,7 @@ extension AppToolExecutor {
                   case .array(let given)? = try? JSONValue.parse(Data(raw.utf8)),
                   case .success(let input) = AppScriptRunner.doorInput(id: id, given: given) else { return [] }
             let args = partFields(input["args"])
-            return [args["handle"], args["id"]].compactMap { inputString($0) }
+            return [args["handle"], args["id"]].compactMap { $0?.scalarText }
         }
     }
 }

@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import TrustCenter
@@ -33,34 +34,6 @@ public struct ContextLookupResult: Sendable, Equatable {
             "query": .string(query),
             "features": .array(features),
             "createdAt": .string(createdAt),
-        ])
-    }
-}
-
-// MARK: - Feature-surface record → JSON (Python dict key order)
-
-extension FeatureSurfaceRecord {
-    /// Per-record dict in the SAME insertion order as the Python literal
-    ///: id, sourceId, name, kind, status,
-    /// description, triggers, permissions, riskClass, autoload, useCount,
-    /// lastUsedAt, updatedAt, endpoints. `lastUsedAt` is always nil in the
-    /// static literal → emitted as JSON null (matching Python `None`).
-    public func contextLookupJSON() -> JSONValue {
-        .object([
-            "id": .string(id),
-            "sourceId": .string(sourceId),
-            "name": .string(name),
-            "kind": .string(kind),
-            "status": .string(status),
-            "description": .string(description),
-            "triggers": .array(triggers.map { .string($0) }),
-            "permissions": .array(permissions.map { .string($0) }),
-            "riskClass": .string(riskClass),
-            "autoload": .bool(autoload),
-            "useCount": .int(Int64(useCount)),
-            "lastUsedAt": lastUsedAt.map { JSONValue.string($0) } ?? .null,
-            "updatedAt": .string(updatedAt),
-            "endpoints": .array(endpoints.map { .string($0) }),
         ])
     }
 }
@@ -122,9 +95,6 @@ public actor SwiftNativeContextClient {
     /// SAME truthiness rules `or` uses: returns the `str()`-coercion of the first
     /// key whose value is PYTHON-TRUTHY. A falsy value (None / "" / 0 / 0.0 /
     /// False / [] / {}) is skipped, exactly as Python's `x or next` skips it.
-    /// (gpt-5.5 review finding #2: a string-only variant would diverge for a
-    /// truthy non-string `message`/`reason` — e.g. `message=1` → Python hint-
-    /// eligible, string-only Swift not.)
     static func firstNonEmptyString(_ body: [String: JSONValue], keys: [String]) -> String? {
         for k in keys {
             if let s = pythonStr(body[k]) { return s }
@@ -132,36 +102,15 @@ public actor SwiftNativeContextClient {
         return nil
     }
 
-    /// Returns `str(value)` IFF `value` is Python-truthy, else nil (so a chain of
-    /// `pythonStr(...) ?? pythonStr(...) ?? fallback` reproduces `a or b or c`).
-    /// Falsy JSON values map to nil: null, "" , 0, 0.0, false, [], {}.
-    /// Truthy values are coerced to their Python `str()` text for the shapes that
-    /// actually occur in these payloads (string verbatim; bool → "True"/"False";
-    /// int → decimal; double → Python float repr for the common integral/simple
-    /// cases). These coercions exist for parity-defense; in production every one
-    /// of these fields is a string.
+    /// Skip falsey values; retain capitalized true and container sentinels.
+    /// Other scalars keep JSONValue's verbatim strings and numeric spelling.
     static func pythonStr(_ value: JSONValue?) -> String? {
-        guard let value else { return nil }
+        guard let value, value.isTruthy else { return nil }
         switch value {
-        case .null:
-            return nil
-        case .string(let s):
-            return s.isEmpty ? nil : s
-        case .bool(let b):
-            return b ? "True" : "False"   // Python str(True) == "True"
-        case .int(let i):
-            return i == 0 ? nil : String(i)
-        case .double(let d):
-            if d == 0 { return nil }
-            // Python str() of an integral float drops the fraction only via repr
-            // rules; for the parity-defense scope (these are never floats in
-            // practice) emit Swift's default which matches Python for simple
-            // values closely enough — the field is non-load-bearing here.
-            return String(d)
-        case .array(let a):
-            return a.isEmpty ? nil : "<array>"   // truthy non-empty list; never occurs
-        case .object(let o):
-            return o.isEmpty ? nil : "<object>"  // truthy non-empty dict; never occurs
+        case .bool: return "True"
+        case .array: return "<array>"
+        case .object: return "<object>"
+        default: return value.scalarText
         }
     }
 }

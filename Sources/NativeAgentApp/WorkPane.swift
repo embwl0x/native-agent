@@ -12,11 +12,7 @@ import Senses
 
 // Blueprint: | `WorkPane.swift` | `WorkPaneState` and `WorkPane`: one read-only work column's Steps/Screen/Make selection, explicit visibility and turn-driven auto-open |
 
-// User, 2026-10-04 (plan page, Agent reviewed): the Work pane. A column beside
-// the chat, like Claude's panes, that only READS what the turn is doing —
-// opening or closing it never touches the work itself. "Let User feel me here,
-// not watch a dashboard perform being busy." Main window only; Simple view and
-// the detached chat windows have none.
+// The main window's Work pane reads the turn; opening or closing it never changes the work.
 
 /// What the pane shows. `make` carries the ref the Make studio opens.
 enum WorkPaneTab: Hashable {
@@ -201,7 +197,7 @@ struct WorkPane: View {
                     switch state.tab {
                     case .steps: WorkPaneSteps(sessionId: sessionId)
                     case .screen: WorkPaneScreen(sessionId: sessionId)
-                    case .make(let ref): WorkPaneMake(ref: ref)
+                    case .make(let ref): WorkPaneMakeView(ref: ref)
                     case .sense:
                         if let view = senses.interactiveView {
                             WorkPaneSenseView(presentation: view)
@@ -383,15 +379,6 @@ struct WorkPaneScreen: View {
                 .padding(.horizontal, NativeAgentShellLayout.roomGutter)
         }
     }
-}
-
-// MARK: - Make
-
-/// The Make studio (WorkPaneMakeView.swift): what she made, in versions.
-struct WorkPaneMake: View {
-    let ref: String?
-
-    var body: some View { WorkPaneMakeView(ref: ref) }
 }
 
 // MARK: - Header button

@@ -47,50 +47,23 @@ public struct MemoryDisclosureClassification: Sendable, Codable, Equatable {
 /// tool; this policy only decides whether a record may leave MemoryV2 for the
 /// requested persona/surface.
 public enum MemoryRecordDisclosurePolicy {
-    /// Carries BOTH spellings of the Workshop surface (P2-3). Nothing that
-    /// reaches `permits(surface:)` can still say `missions` — `canonicalSurface`
-    /// folds it first — but these sets were also written verbatim into memory
-    /// rows by the retired Workshop execution lane, and a row that lists both
-    /// stays readable by a 0.3.x build whose `canonicalSurface` folds the other
-    /// direction (`workshop` -> `missions`). Never drop `missions`.
-    /// `bot` is a standing bot's run (Astra audit 2, finding 3, 2026-09-11): one
-    /// of Agent's own agents on her brief under her Trust, not a remote seat. Its
-    /// absence here made every explicit bot surface list intersect to empty and
-    /// every default local-private row undisclosable to a bot.
+    /// Keep both `workshop` and `missions` for persisted rows and older readers.
+    /// A standing bot runs under the agent's own Trust and can read local-private memories.
     public static let allSurfaces: Set<String> = ([
         "chat", "telegram", "ios", "slack", "bridge", "bot",
     ] as Set<String>).union(WorkshopSurfaceVocabulary.bothSpellings)
-    /// Telegram is User's authenticated personal surface — same trust tier as
-    /// the Mac app and iOS (2026-07-20: its absence here silently filtered
-    /// EVERY semantic recall on Telegram; only prompt-injectable no-human
-    /// surfaces like slack stay outside local_private).
-    /// `bot` joins the local-private tier for the same reason `telegram` did: a
-    /// bot run is local, autonomous, and authorized by Agent's own Trust — it is
-    /// her reading her own memories, not a prompt-injectable remote surface.
+    /// Authenticated personal surfaces and local bot runs share the local-private tier.
     public static let localPrivateSurfaces: Set<String> = ([
         "chat", "telegram", "ios", "bridge", "bot",
     ] as Set<String>).union(WorkshopSurfaceVocabulary.bothSpellings)
 
-    /// The canonical wire identifier for the Workshop/Executions surface is
-    /// `workshop` (P2-3, 2026-08-05). It was `missions` through 0.3.7, so rows
-    /// already on disk list `missions` in `permittedSurfaces` forever — the
-    /// fold below is what keeps them readable, and it must never be removed.
-    /// The agent bridges dispatch tools with surface "claude-bridge" /
-    /// "codex-bridge"; their policy identity is `bridge` (2026-07-20: the
-    /// unmapped spellings fail-closed every bridge recall).
+    /// Canonicalize persisted `missions` to `workshop` and agent bridge surfaces to `bridge`.
     public static func canonicalSurface(_ value: String) -> String {
         let normalized = normalize(value)
         switch normalized {
         case "claude-bridge", "claude_bridge",
              "codex-bridge", "codex_bridge",
-             // 2026-09-15, User's ruling on the peer bridge: "anybody that
-             // connects gets the WHOLE Agent". `agent-bridge` was outside BOTH
-             // sets above, so every classified row failed `permits` and an
-             // inbound peer turn recalled NOTHING — she met a peer with no
-             // memory. The fence is for EFFECTS (see PeerTurnEffectPolicy),
-             // never for what she can remember: a peer turn is an ordinary
-             // session of hers, so its policy identity is `bridge` like the
-             // other two.
+             // PeerTurnEffectPolicy fences effects; peer sessions retain ordinary bridge recall.
              "agent-bridge", "agent_bridge": return "bridge"
         default: return WorkshopSurfaceVocabulary.canonicalSurface(normalized)
         }
@@ -111,7 +84,7 @@ public enum MemoryRecordDisclosurePolicy {
         }
 
         let normalizedTags = (tags ?? []).map(normalize)
-        let rawPrivacy = string(metadata, key: "privacy")
+        let rawPrivacy = metadata?.objectValue?["privacy"]?.stringValue
             ?? normalizedTags.first(where: { $0.hasPrefix("privacy:") })
                 .map { String($0.dropFirst("privacy:".count)) }
         let privacy: MemoryDisclosurePrivacy
@@ -141,8 +114,15 @@ public enum MemoryRecordDisclosurePolicy {
         )
     }
 
-    public static func classify(_ record: MemoryRecord) -> MemoryDisclosureClassification? {
-        classify(
+    /// A record whose `valid_to` has passed was true once and is not now: it
+    /// stays in the store and leaves what is disclosed, like a superseded one.
+    public static func isTemporallyEligible(validTo: String?, at now: Date) -> Bool {
+        validTo.flatMap(MemoryRecallScoring.parseTimestamp).map { $0 > now } ?? true
+    }
+
+    public static func classify(_ record: MemoryRecord, at now: Date = Date()) -> MemoryDisclosureClassification? {
+        guard isTemporallyEligible(validTo: record.validTo, at: now) else { return nil }
+        return classify(
             personaID: record.personaId,
             status: record.status,
             lifecycle: record.lifecycle,
@@ -153,12 +133,6 @@ public enum MemoryRecordDisclosurePolicy {
 
     private static func normalize(_ value: String) -> String {
         value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    }
-
-    private static func string(_ value: JSONValue?, key: String) -> String? {
-        guard case .object(let object)? = value,
-              case .string(let result)? = object[key] else { return nil }
-        return result
     }
 
     private static func strings(_ value: JSONValue?, key: String) -> [String] {

@@ -1,5 +1,5 @@
 import Foundation
-// Blueprint: | `SurfaceLayout.swift` | `SurfaceLayout` struct: the layout document's shape, vocabulary and seed; `addMissing`, `shown`, `arranged` for the Mac and the phone; `QuietToolPage` owns the shared page definitions including inbox/unindexed reads; `AppDoorNames` shares page/item aliases and derives accepted part face pages from those definitions |
+// Blueprint: | `SurfaceLayout.swift` | `SurfaceLayout` struct: the layout document's shape, vocabulary and seed; `addMissing`, `shown`, `arranged` for the Mac and the phone; `QuietToolPage` owns the shared page definitions including inbox/unindexed reads; `AppDoorNames` shares page/item aliases, the door's page resolution (`step`, `place`: alias, `page/item` split, home rooms) and derives accepted part face pages from those definitions |
 
 public struct QuietToolPage: Sendable, Equatable {
     public let id: String
@@ -123,6 +123,39 @@ public enum AppDoorNames {
     public static func resolve(_ raw: String) -> String {
         let key = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return aliases[key] ?? key
+    }
+
+    /// One step of where the door takes a call's page before anything reads
+    /// or acts (`AppToolExecutor.runAppDoor`): an alias resolves and a
+    /// `page/item` path splits (`label` is the resolved page); with no action
+    /// and no item, a home room named as a page becomes home's item and `app`
+    /// is home (an empty `page` means none). Nil when the place is final.
+    public static func step(page: String, item: String, action: Bool) -> (page: String, item: String?, label: String)? {
+        let requested = page.trimmingCharacters(in: .whitespacesAndNewlines)
+        let canonical = resolve(requested)
+        let parts = canonical.split(separator: "/", maxSplits: 1).map(String.init)
+        if !requested.isEmpty, let first = parts.first, requested != canonical || parts.count == 2 {
+            return (first, parts.count == 2 ? parts[1] : nil, canonical)
+        }
+        let named = item.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !action, named.isEmpty, homeItems.contains(canonical) || canonical == "app" else { return nil }
+        return canonical == "app" ? ("", nil, "home") : ("home", canonical, "home." + canonical)
+    }
+
+    /// The place the door's steps end at, for a call that names no action:
+    /// a page and item that are home's (or no page and an item) open or do
+    /// what home's item says; anything else reads.
+    public static func place(page: String, item: String) -> (page: String, item: String) {
+        var page = page.trimmingCharacters(in: .whitespacesAndNewlines)
+        var item = item.trimmingCharacters(in: .whitespacesAndNewlines)
+        // An alias resolves to a canonical page and a path splits once, so the
+        // steps end within a few; the bound only guards a cycle in the table.
+        for _ in 0..<8 {
+            guard let next = step(page: page, item: item, action: false) else { break }
+            page = next.page
+            if let named = next.item { item = named }
+        }
+        return (AppDoorNames.resolve(page), item)
     }
 
     public static let items: [String: [String: String]] = [

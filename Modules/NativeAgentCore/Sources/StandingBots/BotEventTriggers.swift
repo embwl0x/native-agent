@@ -2,19 +2,15 @@ import Foundation
 
 // Blueprint: | `BotEventTriggers.swift` | `BotEventRouter` and `BotEventStore`: Slack event matching/admission and durable wake records from already received events |
 
-/// Event waking (0.4.12). A bot already wakes on a schedule or on Run once;
-/// a trigger lets an outside event wake it. Only a source the app already
-/// receives is offered: the Slack socket-mode runner. StandingBots owns
-/// matching, admission and the record of what woke a bot; the listener lives
-/// where the data already arrives. GitHub events were one until 10-21 (see
-/// `BotDefinition.githubTriggerOff`).
+/// Slack events wake bots through StandingBots matching, admission and wake
+/// records; the listener stays with the socket-mode runner that receives them.
 public enum BotEventSource: String, Codable, Sendable, CaseIterable {
     case slack
 
     public var label: String { "Slack" }
 }
 
-/// Persisted on the definition. `filter` is the Slack channel; `keyword` is
+/// Persisted on the definition. `filter` is the Slack channel ID; `keyword` is
 /// optional and must appear in the event text.
 public struct BotEventTrigger: Codable, Equatable, Sendable {
     public var source: BotEventSource
@@ -44,21 +40,10 @@ public struct BotEventTrigger: Codable, Equatable, Sendable {
         return text.allSatisfy { $0.isNumber || ($0.isLetter && $0.isUppercase) }
     }
 
-    static func normalized(_ value: String) -> String {
-        var text = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        while text.hasPrefix("#") || text.hasPrefix("@") { text.removeFirst() }
-        return text
-    }
-
-    /// True when this trigger wants the event. An empty filter takes every
-    /// event from the source.
+    /// Match the admitted Slack channel ID before applying the optional keyword.
     func wants(_ event: BotIncomingEvent) -> Bool {
-        guard source == event.source else { return false }
-        let filterKey = BotEventTrigger.normalized(filter)
-        if !filterKey.isEmpty {
-            let target = BotEventTrigger.normalized(event.target)
-            guard target == filterKey || target.hasSuffix("/" + filterKey) else { return false }
-        }
+        guard filter.trimmingCharacters(in: .whitespacesAndNewlines).caseInsensitiveCompare(
+            event.target.trimmingCharacters(in: .whitespacesAndNewlines)) == .orderedSame else { return false }
         if let keyword {
             let haystack = (event.summary + "\n" + event.detail).lowercased()
             guard haystack.contains(keyword.lowercased()) else { return false }
@@ -118,8 +103,7 @@ public struct BotEventStore: Sendable {
     public init(dataRoot: URL) { disk = StandingBotsDisk(dataRoot: dataRoot) }
     private var path: URL { disk.root.appendingPathComponent("last-events.json") }
 
-    /// The saved records; one a GitHub event wrote (before 10-21) drops on
-    /// read, as its bot no longer waits on one.
+    /// Discard records for retired GitHub triggers on read.
     private func records() throws -> [String: BotEventRecord] {
         struct Saved: Decodable {
             let record: BotEventRecord?

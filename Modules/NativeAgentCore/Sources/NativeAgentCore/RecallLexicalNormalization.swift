@@ -1,4 +1,27 @@
-// Blueprint: | `RecallLexicalNormalization.swift` | `RecallLexicalNormalization`: shared retrieval-only inflections and question-word vocabulary; canonical text and authority remain verbatim |
+// Blueprint: | `RecallLexicalNormalization.swift` | `characterEditDistance`: pure Character comparison; `RecallLexicalNormalization`: shared retrieval-only inflections and question-word vocabulary; canonical text and authority remain verbatim |
+
+/// Stable FNV-1a-64 over exact UTF-8; callers own seeds, normalization and formatting.
+public func fnv1a64(_ text: String, seed: UInt64 = 0xcbf2_9ce4_8422_2325) -> UInt64 {
+    var hash = seed
+    for byte in text.utf8 {
+        hash ^= UInt64(byte)
+        hash = hash &* 0x0000_0100_0000_01b3
+    }
+    return hash
+}
+
+/// Character insertion, deletion and substitution distance; callers own normalization.
+public func characterEditDistance(_ a: [Character], _ b: [Character]) -> Int {
+    var row = Array(0...b.count)
+    for (i, character) in a.enumerated() {
+        var next = [i + 1]
+        for (j, other) in b.enumerated() {
+            next.append(min(next[j] + 1, row[j + 1] + 1, row[j] + (character == other ? 0 : 1)))
+        }
+        row = next
+    }
+    return row[b.count]
+}
 
 /// Lightweight English inflection normalization for retrieval only. Never use
 /// this for canonical text, identifiers, authorization, or exact-match tools.
@@ -19,12 +42,6 @@ public enum RecallLexicalNormalization {
 
     /// Words that carry the SHAPE of a question, never its subject. Both the
     /// context router and MemoryV2's BM25 lane score against this one list.
-    ///
-    /// 2026-09-06: the router filtered these before ranking; recall's BM25 lane
-    /// did not, so "What does User call me?" spent three of its five query terms
-    /// on `what`/`does`/`me`. BM25 normalizes by the best candidate's raw
-    /// score, so whichever row happened to accumulate the most filler mass took
-    /// the whole lexical boost away from the row that actually answered.
     public static let stopWords: Set<String> = [
         "a", "an", "and", "are", "as", "at", "be", "been", "by", "for",
         "from", "has", "have", "he", "her", "hers", "him", "his", "i", "in",

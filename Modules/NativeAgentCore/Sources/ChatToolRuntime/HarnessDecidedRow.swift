@@ -1,4 +1,6 @@
 import Foundation
+import NativeAgentShared
+import NativeAgentCore
 import ChatTurnContracts
 import NotificationInbox
 import PersistenceCore
@@ -7,11 +9,8 @@ import AgentConversations
 
 // Blueprint: | `HarnessDecidedRow.swift` | `HarnessDecidedRow`: rolling per-requester/tool decision visibility without push; info writes stay off the tool gate's path |
 
-/// User 10-01: Agent is the boss. Where the harness used to card the person for
-/// a peer's, a helper's or a driven agent's step and now lets her decide, it
-/// leaves one rolling info row per requester and tool (no push) so he can see
-/// what she decided. The detail is the session the decision happened in.
-/// Written off the gate's path: the call it records never waits on the inbox.
+/// One rolling info row per requester/tool shows her decision without a push.
+/// The detail names the session; the write stays off the tool gate's path.
 public enum HarnessDecidedRow {
     public static func post(requester: String, tool: String, sessionID: String?, dataRoot: URL, ran: Bool = false) {
         Task { _ = await record(requester: requester, tool: tool, sessionID: sessionID, dataRoot: dataRoot, ran: ran) }
@@ -41,7 +40,7 @@ public enum HarnessDecidedRow {
         let id = key + "." + UUID().uuidString.prefix(8).lowercased()
         let row: JSONValue = .object([
             "id": .string(id),
-            "created_at": .string(ISO8601DateFormatter().string(from: Date())),
+            "created_at": .string(NativeTimestampFormat.plainZulu(Date())),
             "source": .string("harness_decided"),
             "severity": .string("info"),
             "title": .string(String(title.prefix(200))),

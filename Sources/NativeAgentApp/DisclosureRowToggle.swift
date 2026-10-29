@@ -2,11 +2,7 @@ import SwiftUI
 
 // Blueprint: | `DisclosureRowToggle.swift` | `DisclosureRowToggle`: whole-label disclosure hit target sharing the DisclosureGroup's existing binding |
 
-// User (2026-08-11): "I have to click on the tiny > to get it to open... I
-// should be able to click on the whole thing." macOS DisclosureGroup only
-// toggles on the chevron; this makes the ENTIRE label row a hit target.
-// Apply to a DisclosureGroup's label view, passing the same binding the
-// group uses.
+// The whole disclosure label toggles the same binding as its DisclosureGroup.
 struct DisclosureRowToggle: ViewModifier {
     @Binding var isExpanded: Bool
 

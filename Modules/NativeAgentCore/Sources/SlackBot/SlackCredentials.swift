@@ -26,7 +26,7 @@ public enum SlackCredentials {
     private static let service = "com.nativeagent.connector.slack.v1"
     public static let referenceField = "credential_keychain_ref"
     public static let generationField = "credential_generation"
-    /// Where a token sat in the files before 10-07, by kind.
+    /// File-backed token aliases, by kind.
     public static let fileKeys: [Token: [String]] = [
         .bot: ["access_token", "oauth_token", "token", "bot_token"],
         .app: ["socket_mode_app_token", "app_token", "slack_app_token"],
@@ -49,7 +49,7 @@ public enum SlackCredentials {
     /// Only an explicit bot-token replacement may omit a missing prior app grant.
     public static func read(_ token: Token, dataRoot: URL, allowMissingGrant: Bool = false) throws -> String? {
         try CredentialFileLock.withLock(ConnectorOAuthRegistry.connectorRegistryPath(root: dataRoot)) {
-            try CredentialFileLock.withLock(files(dataRoot: dataRoot)[0]) {
+            try CredentialFileLock.withLock(TransportAllowlist.slackMetadataPath(dataRoot: dataRoot)) {
                 guard !FileManager.default.fileExists(atPath: saveIntent(dataRoot: dataRoot).path) else { throw Failure.unavailable }
                 try migrateFileTokens(dataRoot: dataRoot)
                 if let reference = try committedReference(dataRoot: dataRoot) {
@@ -62,9 +62,9 @@ public enum SlackCredentials {
 
     /// One metadata/token snapshot, using the same lock order as save and revoke.
     public static func withSnapshot<T>(dataRoot: URL, _ body: () throws -> T) throws -> T {
-        let paths = files(dataRoot: dataRoot)
+        let authPath = TransportAllowlist.slackMetadataPath(dataRoot: dataRoot)
         return try CredentialFileLock.withLock(ConnectorOAuthRegistry.connectorRegistryPath(root: dataRoot)) {
-            try CredentialFileLock.withLock(paths[0]) {
+            try CredentialFileLock.withLock(authPath) {
                 // A save a crash left half-done is finished first (same locks, reentrant).
                 try recoverPendingSave(dataRoot: dataRoot)
                 try migrateFileTokens(dataRoot: dataRoot)
@@ -104,7 +104,7 @@ public enum SlackCredentials {
     /// Disconnecting Slack removes both tokens and every grant for this root,
     /// including references retained by older backups or interrupted saves.
     public static func delete(dataRoot: URL) throws {
-        try CredentialFileLock.withLock(files(dataRoot: dataRoot)[0]) {
+        try CredentialFileLock.withLock(TransportAllowlist.slackMetadataPath(dataRoot: dataRoot)) {
             guard !FileManager.default.fileExists(atPath: saveIntent(dataRoot: dataRoot).path) else { throw Failure.unavailable }
             for token in Token.allCases { try write(nil, token, dataRoot: dataRoot) }
             var request = query(.bot, dataRoot: dataRoot)
@@ -123,11 +123,6 @@ public enum SlackCredentials {
                 }
             }
         }
-    }
-
-    /// The canonical metadata file, shared with ingress and effect-time policy.
-    public static func files(dataRoot: URL) -> [URL] {
-        TransportAllowlist.slackMetadataPaths(dataRoot: dataRoot)
     }
 
     /// Caller holds registry then canonical auth's lock. File fields are migration input,
@@ -160,7 +155,7 @@ public enum SlackCredentials {
         if !tokenKeys.isEmpty {
             for key in tokenKeys { object[key] = nil }
             object["credential_store"] = .string("keychain")
-            let path = files(dataRoot: dataRoot)[0]
+            let path = TransportAllowlist.slackMetadataPath(dataRoot: dataRoot)
             let bytes = try JSONValue.object(object).serializedData(pretty: true)
             try SwiftNativePersistenceCore.writeDataAtomicDurable(bytes, to: path)
             guard try Data(contentsOf: path) == bytes else { throw Failure.unavailable }
@@ -185,7 +180,7 @@ public enum SlackCredentials {
 
     /// Registry permission and canonical absence permit a checked, one-time import.
     public static func metadata(dataRoot: URL) throws -> [String: JSONValue] {
-        let path = files(dataRoot: dataRoot)[0]
+        let path = TransportAllowlist.slackMetadataPath(dataRoot: dataRoot)
         return try CredentialFileLock.withLock(ConnectorOAuthRegistry.connectorRegistryPath(root: dataRoot)) {
             try CredentialFileLock.withLock(path) {
                 let mayImport = try permitsFileMigration(dataRoot: dataRoot)
@@ -256,7 +251,7 @@ public enum SlackCredentials {
             default: throw PersistenceCoreError.ioFailure("Saved connector credential field \(field) has an invalid type")
             }
         }
-        _ = try TransportAllowlist.slack(objects: [object])
+        _ = try TransportAllowlist.slack(fields: object)
         return object
     }
 
@@ -266,22 +261,20 @@ public enum SlackCredentials {
         _ enabled: Bool, dataRoot: URL,
         publishRegistry: @Sendable () async throws -> Void
     ) async throws {
-        let path = files(dataRoot: dataRoot)[0]
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
+        let path = TransportAllowlist.slackMetadataPath(dataRoot: dataRoot)
+        try await SwiftNativePersistenceCore.withFileLock(path) {
             var config = try metadata(dataRoot: dataRoot)
             try await publishRegistry()
             config["socket_mode_enabled"] = .bool(enabled)
-            try await persistence.writeJSON(.object(config), to: path)
+            try await SwiftNativePersistenceCore.writeJSON(.object(config), to: path)
         }
     }
 
     public static func revoke(
-        dataRoot: URL, persistence: SwiftNativePersistenceCore,
-        publishRegistry: @Sendable () async throws -> Void
+        dataRoot: URL, publishRegistry: @Sendable () async throws -> Void
     ) async throws {
-        let path = files(dataRoot: dataRoot)[0]
-        try await persistence.withFileLock(path) {
+        let path = TransportAllowlist.slackMetadataPath(dataRoot: dataRoot)
+        try await SwiftNativePersistenceCore.withFileLock(path) {
             _ = try metadata(dataRoot: dataRoot)
             try await publishRegistry()
             // Keep the reference locked until its Keychain grant is removed.
@@ -300,7 +293,7 @@ public enum SlackCredentials {
     }
 
     private static func committedReference(dataRoot: URL) throws -> String? {
-        let path = files(dataRoot: dataRoot)[0]
+        let path = TransportAllowlist.slackMetadataPath(dataRoot: dataRoot)
         guard FileManager.default.fileExists(atPath: path.path) else { return nil }
         guard case .object(let object) = try JSONValue.parse(Data(contentsOf: path)) else { throw Failure.unavailable }
         guard let value = object[referenceField] else { return nil }
@@ -347,26 +340,26 @@ public enum SlackCredentials {
 
     public static func recoverPendingSave(dataRoot: URL) throws {
         let registryPath = ConnectorOAuthRegistry.connectorRegistryPath(root: dataRoot)
-        let paths = files(dataRoot: dataRoot)
+        let authPath = TransportAllowlist.slackMetadataPath(dataRoot: dataRoot)
         let path = saveIntent(dataRoot: dataRoot)
         try CredentialFileLock.withLock(registryPath) {
             guard FileManager.default.fileExists(atPath: path.path) else { return }
-            try CredentialFileLock.withLock(paths[0]) {
+            try CredentialFileLock.withLock(authPath) {
                 guard case .object(let intent) = try JSONValue.parse(Data(contentsOf: path)),
                       intent["version"] == .int(1),
                       case .object(let connector)? = intent["connector"],
                       case .string(let reference)? = connector[referenceField], UUID(uuidString: reference) != nil,
-                      let registry = intent["registry"],
+                      let savedRegistry = intent["registry"],
                       fileKeys.values.joined().allSatisfy({ connector[$0] == nil }) else {
                     throw Failure.unavailable
                 }
-                _ = try ConnectorOAuthRegistry.checkedConnectorRows(from: registry)
+                let registry = JSONValue.array(try ConnectorOAuthRegistry.checkedConnectorRows(from: savedRegistry).map(JSONValue.object))
                 _ = try grant(reference, dataRoot: dataRoot)
                 // Canonical auth publishes metadata and grant together; the
                 // registry is last. A crash keeps the exact intent for retry.
                 let bytes = try JSONValue.object(connector).serializedData(pretty: true)
-                try SwiftNativePersistenceCore.writeDataAtomicDurable(bytes, to: paths[0])
-                guard try Data(contentsOf: paths[0]) == bytes else { throw Failure.unavailable }
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(bytes, to: authPath)
+                guard try Data(contentsOf: authPath) == bytes else { throw Failure.unavailable }
                 try ConnectorOAuthRegistry.writeRegistry(registry, at: registryPath)
                 guard try Data(contentsOf: registryPath) == registry.serializedData(pretty: true) else { throw Failure.unavailable }
                 try FileManager.default.removeItem(at: path)

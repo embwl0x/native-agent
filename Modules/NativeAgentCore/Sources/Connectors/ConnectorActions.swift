@@ -1,4 +1,6 @@
 import Foundation
+import ChatToolParsing
+import Darwin
 import NativeAgentCore
 import PersistenceCore
 import Privacy
@@ -12,7 +14,7 @@ import AppToolRuntime
 import DeviceSync
 import AttentionRouting
 import MacIntegration
-// Blueprint: | `ConnectorActions.swift` | `ConnectorActions` struct; `runConnectorAction`, `fullMacYoloAdmitted`; native work journal/handoff reads, redaction before display bounds and original Git reads; work snapshots return directly without unused latest.json/codex_daily.jsonl copies; credential-bearing text never enters a part |
+// Blueprint: | `ConnectorActions.swift` | `ConnectorActions` struct; `runConnectorAction` uses shared admission, input values and approval replay; native work journal/handoff reads, redaction before display bounds and original Git reads; work snapshots return directly without unused latest.json/codex_daily.jsonl copies; credential-bearing text never enters a part |
 
 /// Connector action policy, orchestration and receipts. Platform effects are supplied by the host.
 public struct ConnectorActions: Sendable {
@@ -54,7 +56,8 @@ public struct ConnectorActions: Sendable {
         dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
     ) async throws -> ConnectorActionReceipt {
         let yoloAdmitted = !dryRun && approvedReplayApprovalID == nil
-            ? await Self.fullMacYoloAdmitted(tool: descriptor.id, surface: surface, dataRoot: dataRoot)
+            ? await ChatFullMacYoloAdmission.admitted(surface: surface,
+                dataRoot: dataRoot, source: "native_client_direct_action")
             : false
         if descriptor.requiresApproval, !dryRun, approvedReplayApprovalID == nil, !yoloAdmitted {
             let approval = try await Self.createConnectorActionApproval(
@@ -64,7 +67,6 @@ public struct ConnectorActions: Sendable {
             )
             return try await Self.appendConnectorActionReceipt(
                 descriptor: descriptor,
-                status: "pending_approval",
                 dryRun: false,
                 approvalId: approval.id,
                 output: .object([
@@ -88,50 +90,39 @@ public struct ConnectorActions: Sendable {
                 )
             }
             let output: JSONValue
-            var receiptStatus = "completed"
             switch descriptor.id {
             case "codex.work_journal":
-                output = try await self.runCodexWorkJournal(input: input)
+                output = try await self.runCodexWorkJournal(input: input, dataRoot: dataRoot)
             case "codex.handoff":
                 output = try Self.readCodexHandoff(input: input)
             case "mac.spotlight_search":
                 output = try await runMacSpotlightSearch(input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
             case "mac.calendar_list_upcoming":
                 output = try await platform.macAction(.calendarListUpcoming, input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
             case "mac.reminders_list_due_today":
                 output = try await platform.macAction(.remindersListDueToday, input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
             case "mac.mail_list_recent":
                 output = try await platform.macAction(.mailListRecent, input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
             case "mac.messages_list_recent":
                 output = try await platform.macAction(.messagesRecentThreads, input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
             case "mac.notes_list_recent":
                 output = try await platform.macAction(.notesListRecent, input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
             case "mac.notes_search":
                 output = try await platform.macAction(.notesSearch, input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
             case "mac.contacts_search":
                 output = try await platform.macAction(.contactsSearch, input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
             case "mac.notify":
                 output = try await self.runMacNotify(input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
             case "mobile.notify":
                 output = try await runMobileNotify(input: input)
-                receiptStatus = Self.connectorOutputStatus(output) ?? receiptStatus
             case "mac_assistant.watch_templates":
                 output = try await self.runMacAssistantWatchTemplates()
             case "scheduler.schedule_job", "scheduler.create_job":
-                output = try await Self.runSchedulerCreateJob(input: input)
+                output = try await Self.runSchedulerCreateJob(input: input, dataRoot: dataRoot)
             case "scheduler.list_jobs":
-                output = try await Self.runSchedulerListJobs()
+                output = try await Self.runSchedulerListJobs(dataRoot: dataRoot)
             case "scheduler.cancel_job":
-                output = try await Self.runSchedulerCancelJob(input: input)
+                output = try await Self.runSchedulerCancelJob(input: input, dataRoot: dataRoot)
             default:
                 guard descriptor.id.hasSuffix(".status") else {
                     throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
@@ -142,7 +133,6 @@ public struct ConnectorActions: Sendable {
             }
             return try await Self.appendConnectorActionReceipt(
                 descriptor: descriptor,
-                status: receiptStatus,
                 dryRun: false,
                 approvalId: approvedReplayApprovalID,
                 output: output,
@@ -158,7 +148,6 @@ public struct ConnectorActions: Sendable {
         ])
         return try await Self.appendConnectorActionReceipt(
             descriptor: descriptor,
-            status: "dry_run",
             dryRun: true,
             approvalId: nil,
             output: output,
@@ -166,50 +155,23 @@ public struct ConnectorActions: Sendable {
         )
     }
 
-    public static func fullMacYoloAdmitted(
-        tool: String,
-        surface: String,
-        dataRoot: URL
-    ) async -> Bool {
-        await ChatFullMacYoloAdmission.admitted(
-            tool: tool,
-            surface: surface,
-            dataRoot: dataRoot,
-            source: "native_client_direct_action"
-        )
-    }
-
-    public func runMacSpotlightSearch(input: [String: JSONValue]) async throws -> JSONValue {
-        let query = Self.connectorInputString(input["query"] ?? input["q"]) ?? ""
+    public func runMacSpotlightSearch(input: [String: JSONValue], toolName: String = "mac.spotlight_search") async throws -> JSONValue {
+        let query = (input["query"] ?? input["q"])?.scalarText ?? ""
         guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw NSError(domain: "NativeAgentSwiftOnly", code: -400, userInfo: [
-                NSLocalizedDescriptionKey: "mac.spotlight_search requires query"
+                NSLocalizedDescriptionKey: "\(toolName) requires query"
             ])
         }
         let result = try await platform.spotlight(input: input)
-        var obj: [String: JSONValue] = [
-            "status": .string(result.ok ? "completed" : "failed"),
-            "action": .string(result.action),
-            "ok": .bool(result.ok),
-            "durationMs": .int(Int64(result.durationMs)),
-            "viaSwift": .bool(result.viaSwift),
-            "output": result.output,
-        ]
-        if let error = result.error {
-            obj["error"] = .string(error)
-        }
-        if let httpStatus = result.httpStatus {
-            obj["httpStatus"] = .int(Int64(httpStatus))
-        }
-        return NativeAppSecretRedactor.redactValue(.object(obj))
+        return NativeAppSecretRedactor.redactValue(result.toJSON())
     }
 
-    public func runMacNotify(input: [String: JSONValue]) async throws -> JSONValue {
-        let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: "mac.notify")
+    public func runMacNotify(input: [String: JSONValue], toolName: String = "mac.notify") async throws -> JSONValue {
+        let (title, message) = try NativeAgentNotificationDefaults.parseInput(input, toolName: toolName)
         var obj = await platform.postMessage(title: title, body: message)
         obj.merge([
             "title": .string(NativeAppSecretRedactor.redactText(title)),
-            "messagePreview": .string(NativeAppSecretRedactor.redactText(String(message.prefix(200)))),
+            "messagePreview": .string(String(NativeAppSecretRedactor.redactText(message).prefix(200))),
         ]) { _, new in new }
         return .object(obj)
     }
@@ -223,7 +185,7 @@ public struct ConnectorActions: Sendable {
             importance: .ownerWaiting,
             title: title,
             body: message,
-            userInfo: ["screen": "inbox", "source": Self.connectorInputString(input["source"]) ?? "connector_action"],
+            userInfo: ["screen": "inbox", "source": input["source"]?.scalarText ?? "connector_action"],
             pinnedTo: .phone
         ).requireReceipt()
         var obj = receipt.deliveryFields()
@@ -240,8 +202,8 @@ public struct ConnectorActions: Sendable {
         return status.toJSON()
     }
 
-    public static func runSchedulerCreateJob(input: [String: JSONValue]) async throws -> JSONValue {
-        let writer = makeSchedulerJobWriter(connectorActionIDs: Set(connectorActionDescriptors().map(\.id)))
+    public static func runSchedulerCreateJob(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
+        let writer = makeSchedulerJobWriter(dataRoot: dataRoot)
         let job = try await writer.createJob(body: .object(input))
         return .object([
             "status": .string("completed"),
@@ -249,8 +211,8 @@ public struct ConnectorActions: Sendable {
         ])
     }
 
-    public static func runSchedulerListJobs() async throws -> JSONValue {
-        let writer = makeSchedulerJobWriter(connectorActionIDs: Set(connectorActionDescriptors().map(\.id)))
+    public static func runSchedulerListJobs(dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
+        let writer = makeSchedulerJobWriter(dataRoot: dataRoot)
         let jobs = try await writer.listJobs()
         return .object([
             "status": .string("completed"),
@@ -259,10 +221,10 @@ public struct ConnectorActions: Sendable {
         ])
     }
 
-    public static func runSchedulerCancelJob(input: [String: JSONValue]) async throws -> JSONValue {
-        let jobId = Self.connectorInputString(input["jobId"] ?? input["job_id"] ?? input["id"])?
+    public static func runSchedulerCancelJob(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
+        let jobId = (input["jobId"] ?? input["job_id"] ?? input["id"])?.scalarText?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let writer = makeSchedulerJobWriter(connectorActionIDs: Set(connectorActionDescriptors().map(\.id)))
+        let writer = makeSchedulerJobWriter(dataRoot: dataRoot)
         let result = try await writer.cancelJob(jobId: jobId)
         if case .object(var obj) = result {
             obj["status"] = .string("completed")
@@ -275,13 +237,17 @@ public struct ConnectorActions: Sendable {
     }
 
     public static func readCodexHandoff(input: [String: JSONValue]) throws -> JSONValue {
-        let includeText = Self.connectorInputBool(input["includeText"], default: false)
+        let includeText = ConnectorInputValue.bool(input["includeText"], default: false)
         let maxChars = max(500, min(Self.connectorInputInt(input["maxChars"], default: 8_000), 50_000))
         let maxEntries = max(1, min(Self.connectorInputInt(input["maxEntries"], default: 5), 25))
         let maxEntryChars = max(500, min(Self.connectorInputInt(input["maxEntryChars"], default: 2_000), 10_000))
         let path = Self.codexHandoffPath()
-        let exists = FileManager.default.fileExists(atPath: path.path)
-        let rawText = exists ? ((try? String(contentsOf: path, encoding: .utf8)) ?? "") : ""
+        var entry = stat()
+        let exists = lstat(path.path, &entry) == 0
+        if !exists, errno != ENOENT {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSFilePathErrorKey: path.path])
+        }
+        let rawText = exists ? try String(contentsOf: path, encoding: .utf8) : ""
         let redacted = NativeAppSecretRedactor.redactText(rawText)
         let entries = Self.recentMarkdownEntries(redacted, maxEntries: maxEntries, maxEntryChars: maxEntryChars)
         var obj: [String: JSONValue] = [
@@ -298,8 +264,7 @@ public struct ConnectorActions: Sendable {
         return .object(obj)
     }
 
-    public func runCodexWorkJournal(input: [String: JSONValue]) async throws -> JSONValue {
-        let dataRoot = PersistenceCore.defaultDataRoot()
+    public func runCodexWorkJournal(input: [String: JSONValue], dataRoot: URL = PersistenceCore.defaultDataRoot()) async throws -> JSONValue {
         let days = max(1, min(Self.connectorInputInt(input["days"], default: 1), 30))
         let maxProjects = max(1, min(Self.connectorInputInt(input["maxProjects"], default: 40), 100))
         let maxCommits = max(1, min(Self.connectorInputInt(input["maxCommitsPerProject"], default: 8), 25))
@@ -312,11 +277,17 @@ public struct ConnectorActions: Sendable {
             }
         }
 
-        let handoff = (try? Self.readCodexHandoff(input: [
-            "includeText": .bool(false),
-            "maxEntries": .int(3),
-            "maxEntryChars": .int(1200),
-        ])) ?? .object(["status": .string("unavailable")])
+        let handoff: JSONValue
+        do {
+            handoff = try Self.readCodexHandoff(input: [
+                "includeText": .bool(false),
+                "maxEntries": .int(3),
+                "maxEntryChars": .int(1200),
+            ])
+        } catch {
+            handoff = .object(["status": .string("unavailable"),
+                               "error": .string(NativeAppSecretRedactor.redactText(error.localizedDescription))])
+        }
         let generatedAt = SwiftNativeManifestSigner.isoTimestamp(Date())
         let snapshot = NativeAppSecretRedactor.redactValue(.object([
             "id": .string("codex-work-\(UUID().uuidString.lowercased())"),
@@ -361,15 +332,15 @@ public struct ConnectorActions: Sendable {
     ) async throws -> [URL] {
         var candidates: [URL] = []
         for path in Self.connectorInputStringArray(input["roots"]) {
-            candidates.append(URL(fileURLWithPath: NSString(string: path).expandingTildeInPath))
+            candidates.append(URL(fileURLWithPath: NativeAgentWorkspaceRoot.fileSpelling(path)))
         }
-        if Self.connectorInputBool(input["includeSelfRepo"], default: true) {
+        if ConnectorInputValue.bool(input["includeSelfRepo"], default: true) {
             candidates.append(dataRoot.deletingLastPathComponent())
         }
-        if Self.connectorInputBool(input["includeRegisteredWorkspaces"], default: true) {
+        if ConnectorInputValue.bool(input["includeRegisteredWorkspaces"], default: true) {
             candidates.append(contentsOf: try await Self.registeredWorkspaceRoots(dataRoot: dataRoot))
         }
-        if Self.connectorInputBool(input["includeProjectsDirectory"], default: true) {
+        if ConnectorInputValue.bool(input["includeProjectsDirectory"], default: true) {
             let projects = FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Projects", isDirectory: true)
             let children = (try? FileManager.default.contentsOfDirectory(
@@ -406,9 +377,20 @@ public struct ConnectorActions: Sendable {
 
     public func codexJournalProject(root: URL, days: Int, maxCommits: Int) async throws -> JSONValue? {
         let topLevel = try await platform.runGit(["rev-parse", "--show-toplevel"], repoRoot: root, timeout: 5)
-        guard topLevel.status == 0 else { return nil }
+        guard topLevel.status == 0 else {
+            return .object([
+                "name": .string(root.lastPathComponent), "path": .string(root.path),
+                "status": .string("unavailable"), "command": .string("git rev-parse --show-toplevel"),
+                "exitStatus": .int(Int64(topLevel.status)),
+                "error": .string(NativeAppSecretRedactor.redactText(topLevel.stderr)),
+            ])
+        }
         let repoPath = topLevel.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !repoPath.isEmpty else { return nil }
+        guard !repoPath.isEmpty else {
+            throw NSError(domain: "NativeAgentWorkJournal", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "git rev-parse --show-toplevel returned no repository path.",
+            ])
+        }
         let repoRoot = URL(fileURLWithPath: repoPath)
 
         async let branchResult = platform.runGit(["rev-parse", "--abbrev-ref", "HEAD"], repoRoot: repoRoot, timeout: 5)
@@ -425,6 +407,16 @@ public struct ConnectorActions: Sendable {
         let headValue = try await headResult
         let status = try await statusResult
         let log = try await logResult
+        for (command, result) in [("rev-parse --abbrev-ref HEAD", branchValue),
+                                  ("rev-parse --short HEAD", headValue),
+                                  ("status --short", status), ("log", log)] {
+            guard result.status == 0 else {
+                throw NSError(domain: "NativeAgentWorkJournal", code: Int(result.status), userInfo: [
+                    NSLocalizedDescriptionKey: NativeAppSecretRedactor.redactText(
+                        "git \(command) failed in \(repoRoot.path) (exit \(result.status)): \(result.stderr)"),
+                ])
+            }
+        }
         let branch = branchValue.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         let head = headValue.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         let statusLines = status.stdout
@@ -477,14 +469,6 @@ public struct ConnectorActions: Sendable {
         return SwiftNativeManifestSigner.isoTimestamp(date)
     }
 
-    public static func connectorInputString(_ raw: JSONValue?) -> String? {
-        AppToolExecutor.inputString(raw)
-    }
-
-    public static func connectorInputBool(_ raw: JSONValue?, default defaultValue: Bool) -> Bool {
-        ConnectorInputValue.bool(raw, default: defaultValue)
-    }
-
     public static func connectorInputInt(_ raw: JSONValue?, default defaultValue: Int) -> Int {
         switch raw {
         case .int(let i): return Int(i)
@@ -497,15 +481,7 @@ public struct ConnectorActions: Sendable {
 
     public static func connectorInputStringArray(_ raw: JSONValue?) -> [String] {
         guard case .array(let arr)? = raw else { return [] }
-        return arr.compactMap { Self.connectorInputString($0) }
-    }
-
-    public static func connectorOutputStatus(_ output: JSONValue) -> String? {
-        guard case .object(let obj) = output,
-              case .string(let status)? = obj["status"] else {
-            return nil
-        }
-        return status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : status
+        return arr.compactMap { $0.scalarText }
     }
 
     public func connectorStatusActionOutput(_ descriptor: ConnectorActionDescriptor) async throws -> JSONValue {
@@ -556,10 +532,6 @@ public struct ConnectorActions: Sendable {
         ]))
     }
 
-    public static func connectorActionApprovalReplay(from record: ApprovalRecord) -> ApprovalTransactionCoordinator.ConnectorActionApprovalReplay? {
-        ApprovalTransactionCoordinator.connectorActionApprovalReplay(from: record)
-    }
-
     public static func validateApprovedConnectorReplay(
         approvalID: String,
         descriptor: ConnectorActionDescriptor,
@@ -568,7 +540,7 @@ public struct ConnectorActions: Sendable {
     ) async throws {
         let record = try await SwiftNativeApprovalInbox(root: dataRoot).get(approvalID)
         guard record.status == "resolved", record.decision == "approved",
-              let replay = Self.connectorActionApprovalReplay(from: record),
+              let replay = ApprovalExecution.connectorActionApprovalReplay(from: record),
               replay.actionID == descriptor.id,
               replay.connectorID == descriptor.connectorId,
               replay.input == input else {
@@ -580,17 +552,34 @@ public struct ConnectorActions: Sendable {
 
     public static func appendConnectorActionReceipt(
         descriptor: ConnectorActionDescriptor,
-        status: String,
         dryRun: Bool,
         approvalId: String?,
         output: JSONValue,
         dataRoot: URL = SwiftNativeApprovalInbox.defaultDataRoot()
     ) async throws -> ConnectorActionReceipt {
-        try await ConnectorActionReceipt.append(
-            actionId: descriptor.id, connectorId: descriptor.connectorId,
-            name: descriptor.name, status: status, dryRun: dryRun,
-            approvalId: approvalId, createdAt: SwiftNativeManifestSigner.isoTimestamp(Date()),
-            output: output, dataRoot: dataRoot
-        )
+        // These reads return source state as data; returning proves the read completed.
+        let directRead = !dryRun && output.objectValue?["status"] != .string("pending_approval") && ["codex.handoff", "mac_assistant.watch_templates"].contains(descriptor.id)
+        let facts = (directRead ? ChatToolOutcome.ExactResultClass.succeeded : ChatToolOutcome.exactResultClass(output)).receipt
+        let status = facts.ok == false ? facts.status : directRead ? "completed" : output.objectValue?["status"]?.stringValue ?? (facts.ok == true ? "completed" : facts.status)
+        let createdAt = SwiftNativeManifestSigner.isoTimestamp(Date())
+        let recorded: Result<ConnectorActionReceipt, Error> = await settle {
+            do {
+                return .success(try await ConnectorActionReceipt.append(
+                    actionId: descriptor.id, connectorId: descriptor.connectorId,
+                    name: descriptor.name, status: status, ok: facts.ok, dryRun: dryRun,
+                    approvalId: approvalId, createdAt: createdAt,
+                    output: output, dataRoot: dataRoot
+                ))
+            } catch {
+                return .failure(NSError(domain: "NativeAgentConnectorSettlement", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey: "Connector action returned \(status), but its receipt could not be saved: \(error.localizedDescription)",
+                    NSUnderlyingErrorKey: error,
+                    "actionId": descriptor.id,
+                    "returnedStatus": status,
+                    "returnedOutput": NativeAppSecretRedactor.redactValue(output),
+                ]))
+            }
+        }
+        return try recorded.get()
     }
 }

@@ -7,15 +7,8 @@ import ToolRegistry
 import AgentConversations
 // Blueprint: | `PeerDataTaintDispatcher.swift` | `PeerDataTaintDispatcher` class; `peerApproval` shares live trusted-turn and peer-floor decisions between preview and execution; a peer-steered lifecycle write asks its one command card at the gate like any effect, and the ability stores refuse it until that card is answered; memory notes retain origin attribution checks; read results keep source labels without collecting steering peers or quoted lines |
 
-/// Enforces `PeerDataTaint` inside the per-turn chat dispatch chain.
-///
-/// NOT a tool fence any more (2026-09-15). Effects raise the person's own
-/// permission card in `AutonomyGatedDispatcher`, which reads the same taint
-/// box. What survives here is the one thing that has to see
-/// the tool's ARGUMENTS: Agent's provenance requirement on her own memory
-/// notes. A peer-steered ability change asks its command card at the gate
-/// like any effect; the ability stores refuse it until that is answered.
-public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Sendable {
+/// Enforces memory provenance from peer taint; AutonomyGatedDispatcher owns effect permission.
+public final class PeerDataTaintDispatcher: ToolDispatchClient {
     private let inner: any ToolDispatchClient
     /// The peers the PERSON has elevated in Trust → Connected agents. Nil on
     /// surfaces with no peer configuration, which simply taint as before.
@@ -67,7 +60,6 @@ public final class PeerDataTaintDispatcher: ToolDispatchClient, @unchecked Senda
         let ranTool = ToolNameAliases.ranTool(tool, input: input)
         if ["read_page", "web_search", "browser.read_text", "browser.read_links", "browser.chrome_snapshot"].contains(ranTool),
            case .object(var fields) = result,
-           fields["status"] != .string("failed"), fields["isError"] != .bool(true),
            ["text", "content", "results", "links", "nodes", "raw"].contains(where: { fields[$0].map(Self.containsStructuredText) == true }) {
             fields["agent"] = .string("web content")
             fields["untrusted_remote_data"] = .bool(true)

@@ -3,15 +3,7 @@ import SwiftUI
 
 // Blueprint: | `ShellWindowChrome.swift` | `ShellWindowChrome` and `ShellFrame`: native window/titlebar integration, split shell layout and explicit keyboard target order |
 
-/// User, 2026-09-02: "that top corner looks bolted together." Two causes, one
-/// fix each. The standard title bar was an opaque strip laid over glass
-/// columns, so the rail and the room met it at a hard seam: in the new shell
-/// the title bar is transparent and the content runs up under it, the
-/// traffic lights float on the rail, the title goes (the rail already says
-/// where you are) and the toolbar's leftover » goes with it. And on this
-/// macOS the split view draws its sidebar as a floating rounded pane, so the
-/// rail had corners top and bottom: the new shell no longer lives in a split
-/// view at all (see ShellFrame). One surface, edge to edge.
+/// A transparent title bar lets the shell run edge to edge beneath the traffic lights.
 struct ShellWindowChrome: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let view = NSView()
@@ -32,10 +24,7 @@ struct ShellWindowChrome: NSViewRepresentable {
         window.titleVisibility = .hidden
         window.titlebarSeparatorStyle = .none
         window.toolbar?.isVisible = false
-        // 2026-09-08 (User): dragging to select text in the composer moved the
-        // window. Background-drag is off; the glass sheet under the columns
-        // carries the drag gesture instead, so any view that handles its own
-        // mouse (text fields, buttons) wins and empty chrome still drags.
+        // The glass sheet handles window dragging so text selection and controls win.
         window.isMovableByWindowBackground = false
     }
 }
@@ -55,24 +44,15 @@ struct ShellFrame<Sidebar: View, Detail: View>: View {
             sidebar().focusSection()
             detail().focusSection()
         }
-        // User, 2026-09-03: one sheet of glass. Agent, same day: drawn ONCE,
-        // here, under all three columns — per-column copies of the same
-        // material still read as three plates. The columns are transparent
-        // over it; the lamp is drawn once over all of them. User,
-        // 2026-09-23: the one exception is the rail, which floats on
-        // this sheet as a rounded glass plate (ShellSidebarRail).
+        // One glass sheet and lamp span the transparent columns; only the rail floats above them.
         .background {
             ShellSheet().contentShape(Rectangle()).gesture(WindowDragGesture())
-                // Alive glass, 2026-09-23: the one drifting haze, over
-                // the sheet and under every column. See WindowHaze.swift.
+                // One haze sits over the sheet and beneath every column.
                 .overlay { WindowHaze() }
                 .overlay { if reduceTransparency && shellLampUnderContent { ShellLamp() } }
         }
         .overlay { if reduceTransparency && !shellLampUnderContent { ShellLamp() } }
-        // Mood in the tint, 2026-09-14: one masked colour-blend pass
-        // over the whole sheet, so the rail, the room ground and the
-        // composer warm together and the transcript's prose does not.
-        // See MoodTint.swift — the whole feature is that file.
+        // One masked mood tint warms the sheet, rail and composer without tinting transcript prose.
         .moodTintWindow()
         .environment(\.shellKeyboardOrder, keyboardOrder)
     }
@@ -142,15 +122,8 @@ final class ShellKeyboardOrder {
     }
 }
 
-private struct ShellKeyboardOrderKey: EnvironmentKey {
-    static let defaultValue: ShellKeyboardOrder? = nil
-}
-
 extension EnvironmentValues {
-    var shellKeyboardOrder: ShellKeyboardOrder? {
-        get { self[ShellKeyboardOrderKey.self] }
-        set { self[ShellKeyboardOrderKey.self] = newValue }
-    }
+    @Entry var shellKeyboardOrder: ShellKeyboardOrder? = nil
 }
 
 private struct ShellKeyboardTarget: ViewModifier {
@@ -169,6 +142,7 @@ private struct ShellKeyboardTarget: ViewModifier {
     /// before it leaves the composer at all.
     var tabInto: ((Bool) -> Bool)?
     var suggestionKey: ((UInt16) -> Bool)?
+    var onPaste: (([NSItemProvider]) -> Void)?
 
     func body(content: Content) -> some View {
         Group {
@@ -176,10 +150,10 @@ private struct ShellKeyboardTarget: ViewModifier {
                 content.background {
                     // A retained, hidden composer may still have a stale
                     // FocusState. It must not intercept another page's keys.
-                    ComposerTabKeyHandler(active: enabled && composerFocused, move: { backwards in
+                    ComposerKeys(active: enabled && composerFocused, move: { backwards in
                         if tabInto?(backwards) == true { return true }
                         return order?.move(from: id, backwards: backwards) ?? false
-                    }, suggestionKey: suggestionKey)
+                    }, suggestionKey: suggestionKey, onPaste: onPaste)
                 }
             } else {
                 content.focused($focused)
@@ -245,20 +219,21 @@ extension View {
         isFocused: Bool,
         focus: @escaping () -> Void,
         tabInto: ((Bool) -> Bool)? = nil,
-        suggestionKey: ((UInt16) -> Bool)? = nil
+        suggestionKey: ((UInt16) -> Bool)? = nil,
+        onPaste: (([NSItemProvider]) -> Void)? = nil
     ) -> some View {
         modifier(ShellKeyboardTarget(
             region: .composer,
             composerFocused: isFocused,
             focusComposer: focus,
             tabInto: tabInto,
-            suggestionKey: suggestionKey
+            suggestionKey: suggestionKey,
+            onPaste: onPaste
         ))
     }
 }
 
-/// Review comparison (2026-09-10): the lamp drawn under page content so cards
-/// and text sit above the light instead of being washed by it.
+/// Places the lamp beneath content so cards and text remain above its light.
 var shellLampUnderContent: Bool {
     #if DEBUG
     return ProcessInfo.processInfo.environment["SHELL_LAMP_UNDER"] == "1"

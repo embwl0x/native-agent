@@ -1,3 +1,4 @@
+import NativeAgentShared
 import SwiftUI
 
 // Blueprint: | `ChatCodeBlockView.swift` | `ChatCodeBlockView`: selectable fenced code, language label and idempotent copy; no renderer state or clock |

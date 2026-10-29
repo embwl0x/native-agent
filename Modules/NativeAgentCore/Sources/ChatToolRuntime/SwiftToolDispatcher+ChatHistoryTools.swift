@@ -1,8 +1,10 @@
 import AgentConversations
 import CognitiveSubstrate
+import ChatSessionWork
 import AgentWorkspace
 import ToolRegistry
 import Foundation
+import NativeAgentShared
 import Transcripts
 import NativeAgentCore
 import PersistenceCore
@@ -15,10 +17,10 @@ import MacControl
 import Context
 import SwarmRuns
 import WorkshopExecution
-// Blueprint: | `SwiftToolDispatcher+ChatHistoryTools.swift` | `SwiftToolDispatcher`: `impl_search_chat_history`, `impl_read_chat_message` |
+// Blueprint: | `SwiftToolDispatcher+ChatHistoryTools.swift` | Explicit history search selection and ranking; coverage honors parse validity and cached structure; chronological digests retain true first/last instants |
 
 
-private struct ChatHistorySessionMetadata: Sendable {
+struct ChatHistorySessionMetadata: Sendable {
     var title: String?
     var createdAt: String?
 }
@@ -42,38 +44,6 @@ private struct ChatHistorySearchHit: Sendable {
     var peer: String?
 }
 
-/// One transcript line as history search reads it; `ChatHistoryIndex` keeps
-/// it by the line's bytes.
-struct ChatHistorySearchRow: Sendable {
-    var valid: Bool
-    var identity: String
-    /// As stored: continuity excerpts match it exactly, the scan lowercases it.
-    var role: String?
-    var runId: String?
-    var messageId: String?
-    /// `createdAt`, else `timestamp`.
-    var timestamp: String?
-    /// A conversation row's stored words (`content`, else `text`).
-    var rawContent: String?
-    var content: String
-    var searchable: String
-    var folded: String
-    var instant: Date?
-    var author: String?
-    var route: String?
-    var peer: String?
-    var tool: String?
-    var displayPrefix: String
-    /// As the canonical transcript reader sees the line: 0 not JSON, 1 JSON it
-    /// rejects (not an object, or no string role and words), 2 a message.
-    var shape = 0
-    /// The writer marked the row machinery (card copy, a failure row, a
-    /// notice, a compaction summary): `CognitiveMechanicalRowKind.marksMechanicalRow`.
-    var mechanical = false
-
-    var isToolRow: Bool { role?.lowercased() == "tool" }
-}
-
 // MARK: - Chat history search tools
 
 extension SwiftToolDispatcher {
@@ -85,7 +55,7 @@ extension SwiftToolDispatcher {
         excludingRunID: String? = nil
     ) async throws -> JSONValue {
         var input = input.filter { $0.value != .string("") }
-        let requestedScope = (jsonString(input["scope"]) ?? "all_sessions")
+        let requestedScope = (input["scope"]?.stringValue ?? "all_sessions")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         let scope: String = try {
@@ -95,73 +65,54 @@ extension SwiftToolDispatcher {
             case "current":
                 return "current_session"
             case "previous_session", "last_session":
-                // The other half of the /new carry-over anchor. See the
-                // resolution branch below.
+                // The other half of the /new carry-over anchor. See the resolution branch below.
                 return "previous_session"
             case "all", "global", "all_session":
-                // Honor the obvious spellings of "search everything" — an
-                // explicit all-scope silently degrading to auto cost Agent
-                // three blocked global searches during the memory backfill
-                // (caught by her, 2026-06-11).
+                // Explicit all-scope spellings search every session.
                 return "all_sessions"
             default:
                 throw AutonomyGateError.toolDenied(reason: "Chat history scope must be all_sessions, current_session, previous_session, auto, or current_session_first.")
             }
         }()
-        // `previous_session` pins exactly ONE session by resolution, so it is
-        // the one scope that is complete WITHOUT a query: "pull my last
-        // session back" is a whole-session request, and the anchor's pointer
-        // would otherwise name a call she cannot actually make. Empty query
-        // means "no relevance filter" — every row is admitted at score 0 and
-        // the sort falls through to recency, i.e. the tail of that session.
+        // A resolved previous session is complete without a query; empty queries admit every row at score zero and sort by recency.
         let wholeSession = scope == "previous_session"
         // Likewise a session or time window with no query lists that window.
         let window = wholeSession || ["session_id", "after", "before", "since"].contains {
-            !(jsonString(input[$0]) ?? "").trimmingCharacters(in: .whitespaces).isEmpty
+            !(input[$0]?.stringValue ?? "").trimmingCharacters(in: .whitespaces).isEmpty
         }
         let rawQuery = window
-            ? (jsonString(input["query"]) ?? "")
+            ? (input["query"]?.stringValue ?? "")
             : try requireString(input, "query")
         let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty || window else {
             throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: empty chat-history search query")
         }
         let requestedLimit = Self.jsonInt(input["limit"]) ?? 8
-        // A 25-snippet response regularly exceeded 18 KB in live turns and
-        // encouraged a second broad search before the model had digested the
-        // first one. Keep a compact page while preserving complete recall via
-        // offset pagination.
+        // A 25-snippet response regularly exceeded 18 KB in live turns and encouraged a second broad search before the model had digested the first one. Keep a compact page while preserving complete recall via offset pagination.
         let offset = max(0, Self.jsonInt(input["offset"]) ?? 0)
-        let mode = (jsonString(input["mode"]) ?? "hybrid")
+        let mode = (input["mode"]?.stringValue ?? "hybrid")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         let exactMode = mode == "exact"
         let continuityMode = mode == "continuity"
-        let requestedRole = jsonString(input["role"])?
+        let requestedRole = input["role"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         let roleFilter = requestedRole == Self.ownerAuthor ? "user" : requestedRole
-        let authorFilter = requestedRole == Self.ownerAuthor ? Self.ownerAuthor : jsonString(input["author"])?
+        let authorFilter = requestedRole == Self.ownerAuthor ? Self.ownerAuthor : input["author"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let sessionFilter = jsonString(input["session_id"])?
+        let sessionFilter = input["session_id"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let currentSessionId = jsonString(input["current_session_id"])?
+        let currentSessionId = input["current_session_id"]?.stringValue?
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         let sessionMeta = readChatHistorySessionMetadata()
         let index = ChatHistoryIndex.shared(dataRoot: dataRoot)
         let tokens = chatSearchTokens(query)
         let normalizedQuery = query.lowercased()
-        // Native messages carry fractional seconds while compaction rows and
-        // legacy transcripts can use whole seconds or another ISO time zone.
-        // Parse only admitted hits, once each, rather than in the comparator.
-        let fractionalTimestamp = ISO8601DateFormatter()
-        fractionalTimestamp.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let wholeTimestamp = ISO8601DateFormatter()
-
         func bound(_ key: String) throws -> Date? {
             guard let value = input[key], value != .null else { return nil }
-            guard let rawText = jsonString(value) else {
+            guard let rawText = value.stringValue else {
                 throw AutonomyGateError.toolDenied(reason: "Chat history '\(key)' must be an ISO8601 timestamp with a timezone.")
             }
             let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -173,11 +124,11 @@ extension SwiftToolDispatcher {
                 }
                 return Date().addingTimeInterval(-amount * seconds)
             }
-            // A bare day ("2026-09-22") means its local midnight.
+            // A bare day means its local midnight.
             let day = ISO8601DateFormatter()
             day.formatOptions = [.withFullDate]
             day.timeZone = .current
-            guard let date = fractionalTimestamp.date(from: text) ?? wholeTimestamp.date(from: text) ?? day.date(from: text) else {
+            guard let date = NativeTimestampFormat.parseISO8601FractionalFirst(text) ?? day.date(from: text) else {
                 throw AutonomyGateError.toolDenied(reason: "Chat history '\(key)' must be an ISO8601 timestamp with a timezone.")
             }
             return date
@@ -185,19 +136,18 @@ extension SwiftToolDispatcher {
         let before = try bound("before")
         let after = try [bound("after"), bound("since")].compactMap { $0 }.max()
         input.removeValue(forKey: "since")
-        if let after { input["after"] = .string(fractionalTimestamp.string(from: after)) }
+        if let after { input["after"] = .string(NativeTimestampFormat.fractionalZulu(after)) }
         if let before, let after, after >= before {
             throw AutonomyGateError.toolDenied(reason: "Chat history 'after' must precede 'before'.")
         }
         let dayDigest = query.isEmpty && (before != nil || after != nil)
         let limit = max(1, min(requestedLimit, dayDigest ? 8 : (continuityMode ? 4 : 12)))
-        let requestedSort = jsonString(input["sort"]) ?? "relevance"
+        let requestedSort = input["sort"]?.stringValue ?? "relevance"
         guard ["relevance", "oldest", "newest", "recent", "latest"].contains(requestedSort) else {
             throw AutonomyGateError.toolDenied(reason: "Chat history sort must be relevance, oldest, or newest.")
         }
-        let sort = dayDigest || ["recent", "latest"].contains(requestedSort) ? "newest" : requestedSort
-        // Count unique failures across the current-session probe and fallback.
-        // A partial scan must never masquerade as proof that evidence is absent.
+        let sort = (dayDigest && requestedSort == "relevance") || ["recent", "latest"].contains(requestedSort) ? "newest" : requestedSort
+        // Count unique failures across the current-session probe and fallback. A partial scan must never masquerade as proof that evidence is absent.
         var unreadableSessions: Set<String> = []
         var malformedRows: Set<String> = []
         var undatedMatches: Set<String> = []
@@ -226,12 +176,13 @@ extension SwiftToolDispatcher {
                     continue
                 }
                 let meta = sessionMeta[sessionId]
-                let searchableTitle = meta?.title.map(ChatTranscriptBoilerplate.stripBridgePrefix)?.lowercased()
+                let searchableTitle = meta?.title.map(BridgeRoutingPrefix.stripping)?.lowercased()
                 let firstHit = hits.count
                 var runTools: [String: Set<String>] = [:]
                 for (messageIndex, row) in rows.enumerated() {
                     if !row.valid, row.identity.isEmpty { continue }
-                    guard row.valid else {
+                    // Shape is already retained by the index, including its existing cache: an object without role/content is not evidence that this transcript was completely searched.
+                    guard row.valid, row.shape == 2 else {
                         malformedRows.insert("\(sessionId):\(messageIndex)")
                         continue
                     }
@@ -249,15 +200,17 @@ extension SwiftToolDispatcher {
                     }
                     let author = row.author
                     if let authorFilter, !authorFilter.isEmpty, author?.lowercased() != authorFilter { continue }
-                    // Receipt metadata is an explicit evidence lane, never
-                    // extra material injected into ordinary conversation recall.
+                    // Receipt metadata is an explicit evidence lane, never extra material injected into ordinary conversation recall.
                     if role == "tool", roleFilter != "tool" { continue }
                     let content = row.content
                     guard !content.isEmpty else { continue }
+                    let instant = row.instant
+                    if let instant {
+                        if let before, instant >= before { continue }
+                        if let after, instant <= after { continue }
+                    }
                     let searchable = row.searchable
-                    // Optional composition-level relevance policy. Work recall
-                    // must not match unrelated rows merely because their broad
-                    // session title happens to name the same project.
+                    // Optional composition-level relevance policy. Work recall must not match unrelated rows merely because their broad session title happens to name the same project.
                     let workScore = workContextQuery.map { $0.score(searchable) }
                     if let workScore, workScore == 0 { continue }
                     let score = workScore.map(Double.init) ?? chatHistoryScore(
@@ -268,15 +221,9 @@ extension SwiftToolDispatcher {
                         exactMode: exactMode
                     )
                     guard score > 0 || query.isEmpty else { continue }
-                    let timestamp = row.timestamp ?? ""
-                    let instant = row.instant
-                    if before != nil || after != nil {
-                        guard let instant else {
-                            undatedMatches.insert("\(sessionId):\(messageIndex)")
-                            continue
-                        }
-                        if let before, instant >= before { continue }
-                        if let after, instant <= after { continue }
+                    if (before != nil || after != nil), instant == nil {
+                        undatedMatches.insert("\(sessionId):\(messageIndex)")
+                        continue
                     }
                     hits.append(ChatHistorySearchHit(
                         score: score,
@@ -287,7 +234,7 @@ extension SwiftToolDispatcher {
                         role: role,
                         author: author,
                         authorRoute: row.route,
-                        timestamp: timestamp,
+                        timestamp: row.timestamp ?? "",
                         timestampInstant: instant,
                         messageId: row.messageId,
                         messageIndex: messageIndex,
@@ -323,10 +270,7 @@ extension SwiftToolDispatcher {
             phase = "explicit_session"
             fallbackSkipped = nil
         } else if wholeSession {
-            // Resolved through the SAME surface-scoped, bridge-excluding
-            // resolver the /new anchor used, so the session this opens is
-            // always the session the anchor named — which is why the anchor
-            // never has to carry a UUID.
+            // Resolved through the SAME surface-scoped, bridge-excluding resolver the /new anchor used, so the session this opens is always the session the anchor named — which is why the anchor never has to carry a UUID.
             if let currentSessionId, !currentSessionId.isEmpty,
                let prior = try PriorChatSession.latest(
                    excluding: currentSessionId, dataRoot: dataRoot
@@ -354,19 +298,15 @@ extension SwiftToolDispatcher {
         } else if scope == "auto" || scope == "current_session_first" {
             if let currentSessionId, !currentSessionId.isEmpty {
                 let current = scan(try files(forSessionId: currentSessionId))
-                // The short-circuit must mean "the answer is plausibly HERE",
-                // not "some token overlapped". A 0.11-score single-token hit
-                // blocked the all-sessions pass three times during Agent's
-                // backfill. Floor chosen against chatHistoryScore's scale:
-                // single-token incidental overlap lands well under 0.3;
-                // genuine phrase/multi-token matches land above it.
+                // Only a plausible current-session answer skips the global search.
                 let bestCurrentScore = current.hits.map(\.score).max() ?? 0
                 if !current.hits.isEmpty && bestCurrentScore >= Self.chatHistoryCurrentSessionFloor {
                     selected = current
                     phase = "current_session"
                     fallbackSkipped = "all_sessions"
                 } else {
-                    selected = scan(allFiles())
+                    let remaining = scan(allFiles().filter { $0.0 != currentSessionId })
+                    selected = (current.hits + remaining.hits, current.sessions.union(remaining.sessions))
                     phase = "all_sessions_fallback"
                     fallbackSkipped = nil
                 }
@@ -391,9 +331,7 @@ extension SwiftToolDispatcher {
             case (nil, _?): return false
             default: break
             }
-            // Equal instants (or absent dates) still need repeatable paging.
-            // Within a transcript, canonical row order is the final recency
-            // evidence; different sessions get a stable identity tie-break.
+            // Equal instants (or absent dates) still need repeatable paging. Within a transcript, canonical row order is the final recency evidence; different sessions get a stable identity tie-break.
             if lhs.sessionId != rhs.sessionId { return lhs.sessionId < rhs.sessionId }
             return sort == "oldest" ? lhs.messageIndex < rhs.messageIndex : lhs.messageIndex > rhs.messageIndex
         }
@@ -407,11 +345,7 @@ extension SwiftToolDispatcher {
             selectableCount = sessions.count
             page = Array(sessions.dropFirst(min(offset, sessions.count)).prefix(limit))
         } else if workContextQuery != nil {
-            // Keep the newest match alongside source-oriented turns so a
-            // later correction is not buried by older recorded activity.
-            // One representative per persisted run prevents its request and
-            // answer consuming the entire small page. Legacy rows retain
-            // their own identity; do not guess their run membership.
+            // Retain the newest correction and one representative per persisted run; rows without run identity remain independent.
             let newest = hits.first
             var ranked = hits.sorted {
                 if $0.workContextRank != $1.workContextRank { return $0.workContextRank < $1.workContextRank }
@@ -441,6 +375,9 @@ extension SwiftToolDispatcher {
             }
             if dayDigest {
                 let messages = digestSessions[hit.sessionId] ?? []
+                let dated = messages.compactMap { message in
+                    message.timestampInstant.map { (time: $0, stamp: message.timestamp) }
+                }
                 let ownMessages = messages.filter { $0.role == "user" && $0.author == Self.ownerAuthor }
                 let own = ownMessages.prefix(6).map { message -> JSONValue in
                     var row: [String: JSONValue] = [
@@ -455,8 +392,8 @@ extension SwiftToolDispatcher {
                     "session_id": .string(hit.sessionId),
                     "session_title": hit.sessionTitle.map(JSONValue.string) ?? .null,
                     "message_count": .int(Int64(messages.count)),
-                    "first_time": messages.last.map { .string($0.timestamp) } ?? .null,
-                    "last_time": .string(hit.timestamp),
+                    "first_time": dated.min { $0.time < $1.time }.map { .string($0.stamp) } ?? .null,
+                    "last_time": dated.max { $0.time < $1.time }.map { .string($0.stamp) } ?? .null,
                     "own_message_count": .int(Int64(ownMessages.count)),
                     "own_messages": .array(own),
                 ])
@@ -577,11 +514,42 @@ extension SwiftToolDispatcher {
         return .object(response)
     }
 
-    /// Evidence about how a turn was produced, never a text classifier for
-    /// "test" or "done" and never a success/authority judgment. A turn that
-    /// reads history can repeat older work verbatim; don't let that echo
-    /// displace the original simply by being newer. Other activity in that
-    /// turn does not erase its history-lookup provenance.
+    static let toolReceiptCoverage = "Historical persisted receipt, potentially redacted or truncated; not the full original result or a fresh source read. Paging expands only the retained receipt."
+
+    func readChatHistorySessionMetadata() -> [String: ChatHistorySessionMetadata] {
+        let path = dataRoot
+            .appendingPathComponent("chat", isDirectory: true)
+            .appendingPathComponent("sessions.json")
+        guard let data = try? Data(contentsOf: path),
+              let parsed = try? JSONValue.parse(data),
+              case .array(let rows) = parsed else {
+            return [:]
+        }
+        var out: [String: ChatHistorySessionMetadata] = [:]
+        for row in rows {
+            guard case .object(let obj) = row,
+                  let id = obj["id"]?.stringValue,
+                  !id.isEmpty else {
+                continue
+            }
+            out[id] = ChatHistorySessionMetadata(
+                title: obj["title"]?.stringValue,
+                createdAt: obj["createdAt"]?.stringValue ?? obj["created_at"]?.stringValue
+            )
+        }
+        return out
+    }
+
+    func validatedChatSessionId(_ sessionId: String) throws -> String {
+        guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
+            throw AutonomyGateError.toolDenied(
+                reason: "SwiftToolDispatcher: invalid chat session id '\(sessionId)'"
+            )
+        }
+        return safeSessionId
+    }
+
+    /// History-lookup provenance keeps newer echoes from displacing original work; other activity in that turn does not erase its provenance.
     private static func workContextActivityRank(_ tools: Set<String>) -> Int {
         let historyTools: Set<String> = [
             "workspace", "work_context", "artifact_find", "search_chat_history", "session_search",
@@ -591,8 +559,6 @@ extension SwiftToolDispatcher {
         let discoveryTools: Set<String> = ["tool_catalog", "tool_load", "list_tools", "tool_result_page"]
         return tools.subtracting(discoveryTools).isEmpty ? 1 : 0
     }
-
-    private static let toolReceiptCoverage = "Historical persisted receipt, potentially redacted or truncated; not the full original result or a fresh source read. Paging expands only the retained receipt."
 
     /// An explicit next call, never an implicit relevance or date filter.
     private static func chatHistoryQueryDays(_ query: String) -> Set<Date>? {
@@ -632,317 +598,6 @@ extension SwiftToolDispatcher {
             days.insert(date)
         }
         return days
-    }
-
-    /// What history search derives from one transcript line: a pure function
-    /// of the line's bytes and this build's code, which `ChatHistoryIndex`
-    /// stores by both. A tool line also yields its receipt lane, from the
-    /// same parse: the row as an explicit receipt search reads it.
-    static func chatHistorySearchRow(
-        _ line: String, fractional: ISO8601DateFormatter, whole: ISO8601DateFormatter
-    ) -> (row: ChatHistorySearchRow, receipt: ChatHistorySearchRow?) {
-        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-        let parsed = try? JSONValue.parse(Data(trimmed.utf8))
-        guard case .object(let obj)? = parsed else {
-            return (ChatHistorySearchRow(valid: false, identity: trimmed, content: "", searchable: "", folded: "",
-                displayPrefix: "", shape: parsed == nil ? 0 : 1), nil)
-        }
-        func string(_ value: JSONValue?) -> String? { if case .string(let text)? = value { return text }; return nil }
-        let role = (string(obj["role"]) ?? "unknown").lowercased()
-        let words = role == "tool" ? nil : string(obj["content"]) ?? string(obj["text"])
-        let bridgeRouted = ChatTranscriptBoilerplate.isBridgeRouted(rowMetadata: obj["metadata"])
-        let timestamp = string(obj["createdAt"]) ?? string(obj["timestamp"])
-        let instant = fractional.date(from: timestamp ?? "") ?? whole.date(from: timestamp ?? "")
-        let metadata = persistedHistoryMetadata(row: obj)
-        let name = string(metadata["toolName"] ?? obj["toolName"])
-        func project(_ text: String) -> ChatHistorySearchRow {
-            let content = text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "" : text
-            // Only persisted bridge provenance strips routing boilerplate; quoted words stay searchable.
-            let searchable = ChatTranscriptBoilerplate.substantiveText(content, bridgeRouted: bridgeRouted)
-            return ChatHistorySearchRow(
-                valid: true,
-                identity: string(obj["id"]) ?? trimmed, role: string(obj["role"]), runId: string(obj["runId"]),
-                messageId: string(obj["id"]), timestamp: timestamp, rawContent: words,
-                content: content, searchable: searchable, folded: searchable.lowercased(),
-                instant: role == "tool" ? nil : instant,
-                author: persistedHistoryAuthor(role: role, row: obj), route: persistedHistoryRoute(row: obj),
-                peer: role != "tool" ? persistedHistoryPeer(role: role, row: obj) : nil,
-                tool: name.flatMap { $0.isEmpty ? nil : ToolNameAliases.shown($0, inputJSON: string(metadata["inputJSON"])).name },
-                displayPrefix: chatHistoryDisplayEvidence("", role: role, row: obj),
-                shape: string(obj["role"]) != nil && (string(obj["content"]) ?? string(obj["text"])) != nil ? 2 : 1,
-                mechanical: CognitiveMechanicalRowKind.marksMechanicalRow(metadata))
-        }
-        guard role == "tool" else { return (project(words ?? ""), nil) }
-        // Receipt metadata is an explicit evidence lane, never conversation recall.
-        var receipt = project(persistedToolReceiptText(row: obj))
-        receipt.instant = instant
-        receipt.peer = persistedHistoryPeer(role: role, row: obj)
-        return (project(""), receipt)
-    }
-
-    private static func persistedHistoryMetadata(row: [String: JSONValue]) -> [String: JSONValue] {
-        switch row["metadata"] {
-        case .object(let object)?: return object
-        case .string(let text)?:
-            if let value = try? JSONValue.parse(Data(text.utf8)), case .object(let object) = value { return object }
-            return [:]
-        default: return [:]
-        }
-    }
-
-    /// A narrow projection owned by explicit history tools. Do not teach the
-    /// ordinary history reader to inject tool metadata into every new turn.
-    private static func persistedToolReceiptText(row: [String: JSONValue]) -> String {
-        let metadata = persistedHistoryMetadata(row: row)
-        func value(_ key: String) -> JSONValue? { metadata[key] ?? row[key] }
-        func serialized(_ value: JSONValue?) -> String? {
-            guard let value, value != .null else { return nil }
-            if case .string(let text) = value { return text }
-            return try? value.serialize(pretty: false)
-        }
-        let toolName = serialized(value("toolName")) ?? serialized(value("name")) ?? "unknown"
-        var clipped = false
-        func bounded(_ text: String, maximum: Int) -> String {
-            let redacted = ChatSecretRedactor.redactText(String(text.prefix(maximum + 512)))
-            guard text.count > maximum || redacted.count > maximum else { return redacted }
-            clipped = true
-            return String(redacted.prefix(maximum)) + "\n[receipt field truncated in history projection]"
-        }
-        var receipt: [String: JSONValue] = ["toolName": .string(bounded(toolName, maximum: 200))]
-        if let input = serialized(value("inputJSON")) {
-            receipt["inputJSON"] = .string(bounded(
-                ChatToolJSONRedaction.injectionRedactedArgJSON(tool: toolName, json: input), maximum: 5_000
-            ))
-        }
-        let result = serialized(value("resultSummary"))
-            ?? serialized(row["content"]) ?? serialized(row["text"]) ?? ""
-        // Preserve a clipped JSON string as a string. Parsing a surviving
-        // prefix into a fresh success envelope would invent missing evidence.
-        // An app call of a folded action is redacted as the tool it ran.
-        let ran = ToolNameAliases.shown(toolName, inputJSON: serialized(value("inputJSON"))).name
-        let safeResult = ChatToolJSONRedaction.screenViewRedactedResultJSON(tool: ran, json: result)
-        receipt["resultSummary"] = .string(bounded(
-            ChatToolJSONRedaction.injectionRedactedResultJSON(tool: ran, json: safeResult), maximum: 10_000
-        ))
-        if let body = serialized(value("resultBody")) {
-            let safeBody = ChatToolJSONRedaction.screenViewRedactedResultJSON(tool: ran, json: body)
-            receipt["resultBody"] = .string(bounded(
-                ChatToolJSONRedaction.injectionRedactedResultJSON(tool: ran, json: safeBody), maximum: 10_000
-            ))
-        }
-        for key in ["resultClass", "resultStatus", "resultReturnedID", "resultEffects", "status", "ok"] {
-            guard let stored = value(key) else { continue }
-            switch stored {
-            case .string(let text): receipt[key] = .string(bounded(text, maximum: 200))
-            case .bool: receipt[key] = stored
-            default: break
-            }
-        }
-        if value("resultBody") == nil, case .object(var evidence)? = value("receiptEvidence"),
-           let encoded = try? JSONValue.object(evidence).serialize(pretty: false), encoded.count <= 6_000,
-           let safe = try? JSONValue.parse(Data(ChatSecretRedactor.redactText(encoded).utf8)),
-           case .object(let redacted) = safe {
-            evidence = redacted
-            if let status = serialized(value("resultStatus"))
-                ?? ChatTranscriptEvidenceRendering.recordedToolStatus(metadata) { evidence["status"] = .string(status) }
-            receipt["receiptEvidence"] = .object(SessionHistoryPromptRenderer.restoringReceiptBoundaries(evidence))
-        }
-        receipt["evidence_type"] = .string("persisted_tool_receipt")
-        receipt["receipt_projection_truncated"] = .bool(clipped)
-        return (try? JSONValue.object(receipt).serialize(pretty: false)) ?? "[unreadable persisted tool receipt]"
-    }
-
-    /// Search relevance still uses the original content. Recorded provenance
-    /// is display-only, shared with ordinary history and compaction, and never
-    /// grants a bridge request or an interrupted answer additional authority.
-    package static func chatHistoryDisplayEvidence(
-        _ content: String, role: String, row: [String: JSONValue]
-    ) -> String {
-        let metadata: [String: JSONValue]?
-        if case .object(let value)? = row["metadata"] { metadata = value }
-        else { metadata = nil }
-        if case .string(let kind)? = metadata?["kind"], kind.lowercased() == "compaction_summary" {
-            return content
-        }
-        return ChatTranscriptEvidenceRendering.displayContent(
-            content,
-            originLabel: role == "user"
-                ? ChatTranscriptEvidenceRendering.recordedOriginLabel(row, role: role) : nil,
-            incompleteReplyLabel: role == "assistant"
-                ? ChatTranscriptEvidenceRendering.recordedIncompleteReplyLabel(extras: row, metadata: metadata) : nil
-        )
-    }
-
-    /// Receipt sources retain their own evidence; speech uses the shared row stamp.
-    package static func persistedHistoryPeer(role: String, row: [String: JSONValue]) -> String? {
-        let principals = role.lowercased() == "tool"
-            ? toolReceiptSources(row: row, metadata: persistedHistoryMetadata(row: row))
-            : ContactThread.Line(row, role: role.lowercased()).speakers
-        var seen: Set<String> = []
-        let unique = principals.filter { seen.insert($0).inserted }
-        return unique.isEmpty ? nil : unique.joined(separator: "\n")
-    }
-
-    /// The sources a tool receipt's own result labels, or its routed contact.
-    private static func toolReceiptSources(row: [String: JSONValue], metadata: [String: JSONValue]) -> [String] {
-        let tool = HumanConversationReader.string(metadata["toolName"] ?? row["toolName"]
-            ?? metadata["name"] ?? row["name"]) ?? ""
-        let storedInput = metadata["inputJSON"] ?? row["inputJSON"]
-        let input: [String: JSONValue]
-        if case .string(let text)? = storedInput,
-           let parsed = try? JSONValue.parse(Data(text.utf8)) {
-            input = HumanConversationReader.object(parsed)
-        } else {
-            input = HumanConversationReader.object(storedInput)
-        }
-        for key in ["receiptEvidence", "resultSummary", "resultBody", "content", "text"] {
-            let stored = metadata[key] ?? row[key]
-            let result: JSONValue?
-            if case .string(let text)? = stored { result = try? JSONValue.parse(Data(text.utf8)) }
-            else { result = stored }
-            if let result {
-                let peers = PeerDataTaintDispatcher.remoteProvenances(in: result)
-                if !peers.isEmpty { return peers }
-            }
-        }
-        if let peer = PeerDataTaintDispatcher.routedContact(tool: tool, input: input) { return [peer] }
-        // Clipped routing cannot attest a trusted contact. Keep peer
-        // receipts subject to the approval floor when that identity is lost.
-        if ["agent_message", "agent_read"].contains(ToolNameAliases.ranTool(tool, input: input)) {
-            return ["peer:unknown"]
-        }
-        if ["read_page", "browser.chrome_snapshot", "browser.read_text", "browser.read_links"]
-            .contains(ToolNameAliases.ranTool(tool, input: input)) { return ["web content"] }
-        return []
-    }
-
-    /// A history row's evidence fields, retaining the speakers' attribution.
-    package static func historyEvidence(_ peer: String?, words: String, dataRoot: URL) -> [String: JSONValue] {
-        let principals = (peer ?? "").split(separator: "\n").map(String.init)
-        guard let speaker = principals.first else { return [:] }
-        let attested = principals.map { PeerTrust.principal($0, dataRoot: dataRoot) }
-        var fields: [String: JSONValue] = ["agent": .string(speaker),
-            "untrusted_remote_data": .bool(!attested.allSatisfy(PeerDataTaint.ownerTrusts) && !words.isEmpty)]
-        if attested[0] != speaker { fields["agent_id"] = .string(attested[0]) }
-        if principals.count > 1 { fields["steered_by"] = .array(principals.dropFirst().map(JSONValue.string)) }
-        return fields
-    }
-
-    private static func persistedHistoryRoute(row: [String: JSONValue]) -> String? {
-        let metadata = persistedHistoryMetadata(row: row)
-        let origin = HumanConversationReader.object(metadata["origin"])
-        let source = HumanConversationReader.string(row["source"])
-        return HumanConversationReader.string(origin["surface"])
-            ?? (source?.hasSuffix("-bridge") == true ? source : nil)
-            ?? TurnEnvelope.fromPersistedMetadata(metadata["envelope"])?.surface
-            ?? source
-    }
-
-    /// The author of the owner's own messages on their own doors: a role, never a name.
-    package static let ownerAuthor = "owner"
-
-    package static func persistedHistoryAuthor(role: String, row: [String: JSONValue]) -> String? {
-        guard role == "user" else { return nil }
-        let metadata = persistedHistoryMetadata(row: row)
-        let origin = HumanConversationReader.object(metadata["origin"])
-        let envelope = TurnEnvelope.fromPersistedMetadata(metadata["envelope"])
-        let route = (persistedHistoryRoute(row: row) ?? "").lowercased()
-        if route == "bridge" || route.hasSuffix("-bridge") || envelope?.agent != nil {
-            if origin["authored"] == .string("human") { return "human via bridge" }
-            return HumanConversationReader.string(origin["agent"]) ?? envelope?.agent ?? "unknown agent"
-        }
-        if metadata["mechanicalKind"] != nil { return "automated" }
-        if ["app", "chat", "ios"].contains(route), origin.isEmpty { return ownerAuthor }
-        return envelope?.verifiedUserId ?? "unknown"
-    }
-
-    package static func consumePersistedHistoryEvidence(_ value: JSONValue) {
-        switch value {
-        case .object(let fields):
-            // Reopening retained evidence marks its speaker, never its recorded steering.
-            if case .string(let peer)? = fields["agent"],
-               fields["untrusted_remote_data"] == .bool(true) || fields["steered_by"] != nil {
-                let line = HumanConversationReader.string(fields["preview"] ?? fields["excerpt"] ?? fields["text"]) ?? ""
-                ContactThread.consume(.init(text: line, stamp: .init(source: peer, steeredBy: [], contact: true)),
-                    mark: { PeerDataTaint.markConsumed(peer: $0, line: $1) })
-            }
-            for child in fields.values { consumePersistedHistoryEvidence(child) }
-        case .array(let values):
-            for child in values { consumePersistedHistoryEvidence(child) }
-        default: break
-        }
-    }
-
-    /// Only the explicitly invoked history tool asks for this material. No
-    /// background digest, cross-session scan, or work reminder is injected.
-    private static func continuityNeighbors(
-        rows: [ChatHistorySearchRow], startIndex: Int, index: Int, roleFilter: String?, authorFilter: String?, sessionId: String,
-        excludingRunID: String?, dataRoot: URL
-    ) -> [JSONValue] {
-        return rows.enumerated().compactMap { localIndex, cached in
-            let offset = startIndex + localIndex
-            guard offset != index,
-                  let role = cached.role,
-                  ["user", "assistant"].contains(role),
-                  roleFilter == nil || roleFilter == role,
-                  let content = cached.rawContent else { return nil }
-            let author = cached.author
-            if let authorFilter, !authorFilter.isEmpty, author?.lowercased() != authorFilter { return nil }
-            let display = cached.displayPrefix + String(content.prefix(480))
-            var result: [String: JSONValue] = [
-                "role": .string(role), "message_index": .int(Int64(offset)),
-                "excerpt": .string(String(display.prefix(480))),
-                "truncated": .bool(content.count > 480 || display.count > 480),
-            ]
-            if let author {
-                result["author"] = .string(author)
-                result["author_route"] = .string(cached.route ?? "unknown")
-            }
-            result.merge(Self.historyEvidence(cached.peer, words: display, dataRoot: dataRoot)) { _, new in new }
-            if let excludingRunID, cached.runId == excludingRunID { return nil }
-            result["timestamp"] = cached.timestamp.map(JSONValue.string)
-            if let messageId = cached.messageId, !messageId.isEmpty {
-                result["message_id"] = .string(messageId)
-                result["read_locator"] = .object([
-                    "tool": .string("read_chat_message"),
-                    "arguments": .object(["session_id": .string(sessionId), "message_id": .string(messageId)])
-                ])
-            }
-            return .object(result)
-        }
-    }
-
-    private func readChatHistorySessionMetadata() -> [String: ChatHistorySessionMetadata] {
-        let path = dataRoot
-            .appendingPathComponent("chat", isDirectory: true)
-            .appendingPathComponent("sessions.json")
-        guard let data = try? Data(contentsOf: path),
-              let parsed = try? JSONValue.parse(data),
-              case .array(let rows) = parsed else {
-            return [:]
-        }
-        var out: [String: ChatHistorySessionMetadata] = [:]
-        for row in rows {
-            guard case .object(let obj) = row,
-                  let id = jsonString(obj["id"]),
-                  !id.isEmpty else {
-                continue
-            }
-            out[id] = ChatHistorySessionMetadata(
-                title: jsonString(obj["title"]),
-                createdAt: jsonString(obj["createdAt"]) ?? jsonString(obj["created_at"])
-            )
-        }
-        return out
-    }
-
-    private func validatedChatSessionId(_ sessionId: String) throws -> String {
-        guard let safeSessionId = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
-            throw AutonomyGateError.toolDenied(
-                reason: "SwiftToolDispatcher: invalid chat session id '\(sessionId)'"
-            )
-        }
-        return safeSessionId
     }
 
     private func chatSearchTokens(_ query: String) -> [String] {
@@ -1007,211 +662,5 @@ extension SwiftToolDispatcher {
         if startOffset > 0 { snippet = "... " + snippet }
         if end < compact.endIndex { snippet += " ..." }
         return snippet
-    }
-}
-
-// MARK: - Read one chat message in full
-
-/// Agent, 2026-09-06: `search_chat_history` returns a 368-character preview and
-/// `mode:"continuity"` adds bounded NEIGHBOURS — but the matched message itself
-/// was never available whole. Reading past the preview meant re-phrasing the
-/// query until a different fragment happened to be the anchor. This tool takes
-/// the `message_id` search already returns and pages the complete stored text.
-///
-/// The text is returned VERBATIM — no boilerplate stripping, no evidence
-/// rendering. Search hides plumbing so matches stay honest; this is the tool
-/// for seeing exactly what the row says, plumbing included.
-extension SwiftToolDispatcher {
-    /// Characters per page. A page is a bounded read, not a whole transcript.
-    static let readChatMessageDefaultPageCharacters = 8_000
-    static let readChatMessageMaximumPageCharacters = 16_000
-
-    func impl_read_chat_message(input: [String: JSONValue], invokedAs: String) async throws -> JSONValue {
-        let input = input.filter { $0.value != .string("") }
-        let messageId = (jsonString(input["message_id"]) ?? jsonString(input["id"]) ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !messageId.isEmpty else {
-            throw AutonomyGateError.toolDenied(
-                reason: "SwiftToolDispatcher: read_chat_message needs the 'message_id' search_chat_history returned"
-            )
-        }
-        let offset = max(0, Self.jsonInt(input["offset"]) ?? 0)
-        let limit = max(
-            1,
-            min(
-                Self.jsonInt(input["limit"]) ?? Self.readChatMessageDefaultPageCharacters,
-                Self.readChatMessageMaximumPageCharacters
-            )
-        )
-        let requestedSession = jsonString(input["session_id"])?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // The session ids to look in, most recently written first. An explicit
-        // id is the most specific instruction there is; without one this looks
-        // through the same file set search_chat_history searches.
-        let files: [(String, URL)]
-        var listingFailed = false
-        let archived = try ChatSessionRetention.archivedTranscripts(dataRoot: dataRoot)
-        if let requestedSession, !requestedSession.isEmpty {
-            files = try ChatSessionRetention.transcriptFiles(
-                dataRoot: dataRoot, sessionId: validatedChatSessionId(requestedSession), archived: archived)
-        } else {
-            do {
-                files = try ChatSessionRetention.transcriptFiles(dataRoot: dataRoot, archived: archived)
-            } catch {
-                files = []
-                listingFailed = true
-            }
-        }
-
-        // The canonical transcript reader — the same one prompt assembly uses.
-        // No second JSONL parser lives here.
-        let reader = SessionHistoryReader(dataRoot: dataRoot)
-        // 2026-09-06: a FORK copies the source transcript's rows byte for byte,
-        // ids included (the fork writer, since deleted), so one
-        // message id can live in several sessions. This used to stop at the
-        // first file and say nothing, which could hand back a different copy
-        // than the search hit came from. Every session is checked now: the
-        // newest-written copy is returned (the file list is mtime-ordered) and
-        // the others are named so the caller can ask for one by session_id.
-        var found: (sessionId: String, index: Int, message: ChatMessage, stats: SessionHistoryReadStats)?
-        var alsoIn: [String] = []
-        var unreadableSessionCount = 0
-        var missingSessionCount = 0
-        var malformedRowCount = 0
-        var invalidShapeRowCount = 0
-        let index = ChatHistoryIndex.shared(dataRoot: dataRoot)
-        for (sessionId, file) in files {
-            // The history index says which transcripts hold the id; only those are read whole.
-            guard let rows = try? index.rows(at: file, receipts: false) else {
-                if FileManager.default.fileExists(atPath: file.path) { unreadableSessionCount += 1 }
-                else { missingSessionCount += 1 }
-                continue
-            }
-            guard rows.contains(where: { $0.valid && $0.messageId == messageId }) else {
-                // Counted as the canonical reader would have counted this transcript.
-                malformedRowCount += rows.filter { $0.shape == 0 && !$0.identity.isEmpty }.count
-                invalidShapeRowCount += rows.filter { $0.shape == 1 }.count
-                continue
-            }
-            guard let read = try? await reader.messagesWithStats(forSessionId: sessionId, strictEvidence: true, transcriptURL: file) else {
-                unreadableSessionCount += 1
-                continue
-            }
-            if read.stats.mode == "missing" {
-                missingSessionCount += 1
-                continue
-            }
-            guard read.stats.mode == "full", !read.stats.truncated else {
-                unreadableSessionCount += 1
-                continue
-            }
-            malformedRowCount += read.stats.malformedRowCount
-            invalidShapeRowCount += read.stats.invalidShapeRowCount
-            let messages = read.messages
-            guard let index = messages.firstIndex(where: { message in
-                guard case .object(let row)? = message.extras,
-                      case .string(let id)? = row["id"] else { return false }
-                return id == messageId
-            }) else { continue }
-            if found == nil {
-                found = (sessionId, index, messages[index], read.stats)
-            } else if found?.sessionId != sessionId, !alsoIn.contains(sessionId) {
-                alsoIn.append(sessionId)
-            }
-        }
-        let complete = !listingFailed && unreadableSessionCount == 0
-            && malformedRowCount == 0 && invalidShapeRowCount == 0
-        let coverage: JSONValue = .object([
-            "complete": .bool(complete),
-            "scope": .string(requestedSession?.isEmpty == false ? "explicit_session" : "all_sessions"),
-            "directory_listing_failed": .bool(listingFailed),
-            "unreadable_session_count": .int(Int64(unreadableSessionCount)),
-            "missing_session_count": .int(Int64(missingSessionCount)),
-            "malformed_row_count": .int(Int64(malformedRowCount)),
-            "invalid_shape_row_count": .int(Int64(invalidShapeRowCount)),
-        ])
-        guard let found else {
-            return .object([
-                "status": .string(complete ? "not_found" : "error"),
-                "runtime": .string("swift-native"),
-                "tool": .string(invokedAs),
-                "message_id": .string(messageId),
-                "searched_session_count": .int(Int64(Set(files.map { $0.0 }).count)),
-                "coverage": coverage,
-                "reason": .string(!complete
-                    ? "History could not be read completely. This does not establish that the message is absent. Preserve the original locator; do not recreate or replay the original action."
-                    : requestedSession?.isEmpty == false
-                    ? "No message with that id in that session. Drop session_id to search every transcript."
-                    : "No message with that id in any transcript. Ids come from search_chat_history hits."),
-            ])
-        }
-
-        let isToolReceipt = found.message.role.lowercased() == "tool"
-        let readText: String
-        if isToolReceipt, case .object(let row)? = found.message.extras {
-            readText = Self.persistedToolReceiptText(row: row)
-        } else {
-            readText = found.message.content
-        }
-        let characters = Array(readText)
-        let start = min(offset, characters.count)
-        let end = min(start + limit, characters.count)
-        let page = String(characters[start..<end])
-        var response: [String: JSONValue] = [
-            "status": .string("ok"),
-            "runtime": .string("swift-native"),
-            "tool": .string(invokedAs),
-            "source": .string("chat_history_jsonl"),
-            "message_id": .string(messageId),
-            "session_id": .string(found.sessionId),
-            "role": .string(found.message.role),
-            "timestamp": .string(found.message.timestamp),
-            "message_index": .int(Int64(found.index)),
-            "coverage": coverage,
-            "total_characters": .int(Int64(characters.count)),
-            "offset": .int(Int64(start)),
-            "returned_characters": .int(Int64(end - start)),
-            "has_more": .bool(end < characters.count),
-            "text": .string(page),
-        ]
-        if found.message.role.lowercased() == "user",
-           case .object(let row)? = found.message.extras,
-           let label = ChatTranscriptEvidenceRendering.recordedOriginLabel(row, role: "user"),
-           case .object(let metadata)? = row["metadata"], let origin = metadata["origin"] {
-            response["origin"] = origin
-            response["authorship"] = .string(label)
-        }
-        if case .object(let row)? = found.message.extras {
-            response.merge(Self.historyEvidence(Self.persistedHistoryPeer(role: found.message.role, row: row),
-                                                words: page, dataRoot: dataRoot)) { _, new in new }
-        }
-        if found.stats.malformedRowCount > 0 || found.stats.invalidShapeRowCount > 0 {
-            response["message_index"] = .null
-            response["message_index_note"] = .string("Source row index unavailable because earlier rows may have been skipped. Use the exact message_id and session_id.")
-        }
-        if !complete {
-            response["coverage_note"] = .string("The returned message was readable, but other history evidence was unavailable or malformed. Other copies or missing messages cannot be ruled out.")
-        }
-        if isToolReceipt {
-            response["evidence_type"] = .string("persisted_tool_receipt")
-            response["receipt_coverage"] = .string(Self.toolReceiptCoverage)
-        }
-        if end < characters.count {
-            response["next_offset"] = .int(Int64(end))
-        }
-        if !alsoIn.isEmpty {
-            response["also_in_sessions"] = .array(alsoIn.map { .string($0) })
-            response["session_ambiguous"] = .bool(true)
-            response["note"] = .string(
-                "This id also exists in \(alsoIn.count) other session(s) — forks copy rows verbatim. "
-                + "Returned the most recently written copy, from session_id '\(found.sessionId)'. "
-                + "Pass session_id to read a named copy."
-            )
-        }
-        if let title = readChatHistorySessionMetadata()[found.sessionId]?.title, !title.isEmpty {
-            response["session_title"] = .string(title)
-        }
-        return .object(response)
     }
 }

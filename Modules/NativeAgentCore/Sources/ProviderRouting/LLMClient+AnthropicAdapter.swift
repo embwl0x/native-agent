@@ -2,10 +2,10 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `LLMClient+AnthropicAdapter.swift` | `AnthropicAdapter`: Messages completion/stream transport, credential discovery, prompt blocks and thinking/tool wire controls |
+// Blueprint: | `LLMClient+AnthropicAdapter.swift` | `AnthropicTransport`: shared buffered Messages response operation, credential discovery, prompt blocks and thinking/tool wire controls |
 
 /// Anthropic Messages API adapter. URLSession is injectable for tests.
-public final class AnthropicAdapter: LLMAdapter {
+public final class AnthropicTransport: LLMTransport {
     public static let toolWire = ProviderToolWire.native
     public let providerId: String
     // INTERNAL (not private): the native-tools lane lives in
@@ -27,52 +27,40 @@ public final class AnthropicAdapter: LLMAdapter {
     /// resolution; tests and secondary runtimes must inject their own root.
     private let dataRootOverride: URL?
     let maxTokensOverride: Int?
-    /// F1-H1: cadence of the native-tools `streamMessages` keepalive heartbeat
-    /// (seconds). The override is a single blocking call that yields nothing
-    /// until it returns, so a `.keepAlive` is emitted this often to keep
-    /// ProviderStreamGuard's idle clock alive during long silent thinking.
-    /// 30s in production (well under the 90s idle default); injectable so tests
-    /// can drive it under a short idle window without waiting 30 wall seconds.
-    let nativeToolKeepAliveInterval: TimeInterval
     /// Does THIS instance talk to Anthropic's own first-party Messages API
     /// (api.anthropic.com, `x-api-key`)? True for the default init, false for
     /// `kimiCode()`.
     ///
-    /// It gates the two native-tool behaviors that are documented by Anthropic
-    /// but were never wire-probed against Kimi's coding endpoint:
-    ///   1. REAL SSE tool streaming (content_block_start → input_json_delta →
-    ///      content_block_stop). kimi-code deliberately rides the blocking
-    ///      call + keepalive shape it launched on (see streamMessages).
-    ///   2. `strict: true` on closed tool schemas, so the PROVIDER validates
-    ///      structured arguments instead of the repair machinery downstream.
+    /// It gates first-party strict tool schemas, signed thinking replay and
+    /// Anthropic conversation cache markers. All message stream routes use real SSE.
     /// Set at construction — never re-derived from `providerId` at a call
     /// site, so there is exactly one place to audit.
     let firstPartyAnthropicToolContract: Bool
-    /// U1 step 1 — per-call llm.call telemetry writer (override is test-only).
+    /// Per-call llm.call telemetry writer (override is test-only).
     let telemetry: LLMCallTraceRecorder
-    /// Native-tools lane only: the thinking blocks that came back with each
-    /// tool-calling response, keyed by that response's tool_use ids, so the
-    /// next round can replay them (claude-fable-5-1 has thinking always on and
-    /// 400s on a tool_result round whose assistant turn dropped them). In
-    /// memory, bounded, never persisted — see AnthropicThinkingLedger.
-    let thinkingLedger = AnthropicThinkingLedger()
+    /// Bounded in-memory thinking replay, keyed by the response's tool-use IDs.
+    let thinkingLedger = ToolCallReplayLedger<[AnthropicThinkingBlock]>()
 
     private var credentialRoot: URL {
         dataRootOverride ?? PersistenceCore.defaultDataRoot()
     }
 
-    /// The one credential lookup every request path in this adapter uses, in
-    /// one place so the native-tools lane cannot drift from it (the saved
-    /// provider config file under the injected data root; override is tests).
-    func resolvedCredentialKey() throws -> String {
-        guard let key = apiKeyOverride
-                ?? LLMCredentialResolver.resolveAPIKey(
+    /// Every Messages path uses the same credential, headers and sorted body encoding.
+    func request(body: [String: Any]) throws -> URLRequest {
+        guard let key = try apiKeyOverride
+                ?? LLMCredentialResolver.checkedAPIKey(
                     providerConfigFile: credentialConfigFile,
                     dataRoot: credentialRoot),
               !key.isEmpty else {
             throw LLMError.notConfigured(provider: providerId)
         }
-        return key
+        var req = URLRequest(url: endpoint)
+        req.httpMethod = "POST"
+        req.setValue(key, forHTTPHeaderField: "x-api-key")
+        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        req.setValue("application/json", forHTTPHeaderField: "content-type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
+        return req
     }
 
     public init(
@@ -84,7 +72,6 @@ public final class AnthropicAdapter: LLMAdapter {
         telemetryDataRootOverride: URL? = nil,
         providerId: String = "anthropic",
         credentialConfigFile: String = "anthropic.json",
-        nativeToolKeepAliveInterval: TimeInterval = 30,
         firstPartyAnthropicToolContract: Bool = true
     ) {
         self.session = session
@@ -94,7 +81,6 @@ public final class AnthropicAdapter: LLMAdapter {
         self.dataRootOverride = dataRootOverride
         self.providerId = providerId
         self.credentialConfigFile = credentialConfigFile
-        self.nativeToolKeepAliveInterval = max(0.001, nativeToolKeepAliveInterval)
         self.firstPartyAnthropicToolContract = firstPartyAnthropicToolContract
         // Keep credential discovery and telemetry inside the same injected
         // body by default. A caller may still override telemetry explicitly,
@@ -106,7 +92,7 @@ public final class AnthropicAdapter: LLMAdapter {
     }
 
     func requestMaxTokens(model: String) -> Int {
-        if let limit = (LLMCallContext.turnTokenBudget?.available ?? LLMCallContext.botOutputTokenLimit) { return limit }
+        if let limit = LLMCallContext.turnTokenBudget?.available { return limit }
         return FirstPartyExecutionControls.anthropicMaxOutputTokens(
             model: model,
             requestedEffort: LLMCallContext.reasoningEffort,
@@ -123,18 +109,12 @@ public final class AnthropicAdapter: LLMAdapter {
     public static func kimiCode(
         session: URLSession = .shared,
         apiKeyOverride: String? = nil,
-        // Keep Kimi's explicit 32768 override independent of Claude's
-        // model/effort-aware default: K3-class thinking is always
-        // on and counts against max_tokens — live-probed 2026-07-19: a
-        // substantive task at max effort consumed 8192 entirely in thinking
-        // (stop_reason=max_tokens, zero text blocks). max_tokens is a cap,
-        // not a spend; the headroom is free until used.
+        // Kimi's separate token cap includes its always-on thinking.
         maxTokens: Int = 32_768,
         dataRootOverride: URL? = nil,
-        telemetryDataRootOverride: URL? = nil,
-        nativeToolKeepAliveInterval: TimeInterval = 30
-    ) -> AnthropicAdapter {
-        AnthropicAdapter(
+        telemetryDataRootOverride: URL? = nil
+    ) -> AnthropicTransport {
+        AnthropicTransport(
             session: session,
             endpoint: URL(string: "https://api.kimi.com/coding/v1/messages")!,
             apiKeyOverride: apiKeyOverride,
@@ -143,46 +123,15 @@ public final class AnthropicAdapter: LLMAdapter {
             telemetryDataRootOverride: telemetryDataRootOverride,
             providerId: "kimi-code",
             credentialConfigFile: "kimi-code.json",
-            nativeToolKeepAliveInterval: nativeToolKeepAliveInterval,
-            // Kimi's coding endpoint was probed for shapes A/B/C only (request
-            // tools[], tool_use response, tool_result replay, parallel calls).
-            // Its SSE tool framing and its handling of `strict` are unprobed,
-            // so this lane keeps the exact wire it launched on.
+            // Kimi shares SSE framing, without first-party strict schemas,
+            // signed thinking replay or Anthropic cache markers.
             firstPartyAnthropicToolContract: false
         )
     }
 
-    /// U1 step 3 + 2b/3b — system as a BLOCK ARRAY with an ephemeral
-    /// cache_control breakpoint. The Messages API accepts `system` as a
-    /// plain string OR an array of text blocks; only the block-array form
-    /// can carry cache_control. This adapter has no claudeCodeIdentity block
-    /// (that's OAuth-mode-only) and never ships tools (the LLMAdapter
-    /// default forwards drop them).
-    ///
-    /// With a stable/dynamic split bound via LLMCallContext.systemSegments
-    /// (U1 2b/3b) that reassembles byte-for-byte into `system`
-    /// (INVARIANT: system == stable + "\n\n" + dynamic), the breakpoint
-    /// moves to the END of the stable block (persona+pins) and the dynamic
-    /// block (recall+history) follows uncached — the per-turn churn stops
-    /// invalidating the stable prefix. Without segments (or on any
-    /// mismatch), the single combined sys-block breakpoint is byte-identical
-    /// to the pre-2b/3b request shape.
-    ///
-    /// BYTE FAITHFULNESS (gpt-5.5 review blocker, 2026-06-10): the API does
-    /// not guarantee any particular join between adjacent text blocks, so
-    /// the emitted block texts must concatenate byte-for-byte to `system`.
-    /// The "\n\n" separator rides as a SUFFIX on the stable block's text
-    /// (cache-safe: the suffix is exactly as stable as the block itself).
-    ///
-    /// `cacheEligible` (2026-07-21 audit; mirrors the OAuth adapter's
-    /// toolCapable gate): the COMBINED-block fallback carries an ephemeral
-    /// breakpoint ONLY for cache-eligible callers — a chat turn, which binds
-    /// `LLMCallContext.sessionId` around every adapter call and re-sends the
-    /// same persona mass turn after turn. One-shot callers (background loops,
-    /// dream/REM) bind no session context; stamping the breakpoint there pays
-    /// Anthropic's 1.25x cache-WRITE premium with ~zero read probability, so
-    /// they emit the plain block. The segmented split is unaffected (segments
-    /// are only ever bound on chat turns, alongside sessionId).
+    /// System block texts concatenate byte-for-byte to `system`, with separators on preceding blocks.
+    /// Valid segments put the cache breakpoint at the stable end; otherwise the system stays combined.
+    /// Combined blocks carry a cache breakpoint only for callers with a session context.
     static func makeSystemBlocks(
         _ system: String?,
         segments: SystemPromptSegments? = LLMCallContext.systemSegments,
@@ -193,37 +142,12 @@ public final class AnthropicAdapter: LLMAdapter {
            !seg.stable.isEmpty, !seg.dynamic.isEmpty,
            seg.reassembles(into: sys)
         {
-            // `stableSuffix` is session-stable text assembled AFTER `stable`
-            // (e.g. the "Also loaded this session" tool catalog). It rides
-            // INSIDE the cached prefix as its own block, and the breakpoint
-            // moves to the LAST stable block so `stable` stays a strict
-            // prefix of the cached mass. Emitting only [stable][dynamic]
-            // here would silently DROP it from the model's view — the
-            // reassembles() guard passes either way, because it checks the
-            // SEGMENTS against `sys`, not the blocks this branch emits.
-            // Separators ride as suffixes, so the block texts still
-            // concatenate to `sys` byte-for-byte; with an empty suffix the
-            // emitted blocks are byte-identical to the old two-block shape.
-            let hasSuffix = !seg.stableSuffix.isEmpty
-            var blocks: [[String: Any]] = [[
-                "type": "text",
-                "text": seg.stable + "\n\n",
-            ]]
-            if hasSuffix {
-                blocks.append([
-                    "type": "text",
-                    "text": seg.stableSuffix + "\n\n",
-                    "cache_control": ["type": "ephemeral"],
-                ])
-            } else {
-                blocks[0]["cache_control"] = ["type": "ephemeral"]
+            let layout = seg.textBlockLayout
+            return layout.texts.enumerated().map { index, text in
+                var block: [String: Any] = ["type": "text", "text": text]
+                if index == layout.lastStableIndex { block["cache_control"] = ["type": "ephemeral"] }
+                return block
             }
-            // Dynamic tail: NO cache_control — churns per turn.
-            blocks.append([
-                "type": "text",
-                "text": seg.dynamic,
-            ])
-            return blocks
         }
         if cacheEligible {
             return [[
@@ -240,20 +164,8 @@ public final class AnthropicAdapter: LLMAdapter {
         ]]
     }
 
-    public func complete(prompt: String, system: String?, model: String) async throws -> String {
-        guard let key = apiKeyOverride
-                ?? LLMCredentialResolver.resolveAPIKey(
-                    providerConfigFile: credentialConfigFile,
-                    dataRoot: credentialRoot),
-              !key.isEmpty else {
-            throw LLMError.notConfigured(provider: providerId)
-        }
-
-        var req = URLRequest(url: endpoint)
-        req.httpMethod = "POST"
-        req.setValue(key, forHTTPHeaderField: "x-api-key")
-        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        req.setValue("application/json", forHTTPHeaderField: "content-type")
+    /// The prompt lane sends no native tools; those ride the messages lane.
+    public func complete(prompt: String, system: String?, model: String, tools: [LLMToolSchema]?) async throws -> String {
         var body: [String: Any] = [
             "model": model,
             "max_tokens": requestMaxTokens(model: model),
@@ -264,13 +176,13 @@ public final class AnthropicAdapter: LLMAdapter {
         }
         FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: model)
         applyThinkingControls(to: &body)
-        req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
-
-        return try await performCompletion(request: req, model: model)
+        return try await performCompletion(request: request(body: body), model: model).text
     }
 
-    /// Shared HTTP validation, text-block parsing and usage for both request shapes.
-    private func performCompletion(request req: URLRequest, model: String) async throws -> String {
+    /// Buffered Messages validation and receipts; only native-tool requests interpret tool/thinking blocks.
+    func performCompletion(
+        request req: URLRequest, model: String, nativeTools: Bool = false
+    ) async throws -> AnthropicNativeToolResult {
         let requestStartNs = DispatchTime.now().uptimeNanoseconds
         let data: Data
         let response: URLResponse
@@ -280,14 +192,12 @@ public final class AnthropicAdapter: LLMAdapter {
             response = head
             data = try await bytes.reduce(into: Data()) { $0.append($1) }
         } catch {
-            // Cancellation MUST propagate as CancellationError so structured-
-            // concurrency callers can distinguish cancel from a real network
-            // failure. URLSession surfaces cancel as NSURLErrorDomain + NSURLErrorCancelled (R-M2).
+            // URLSession cancellation propagates as CancellationError, distinct from network failure.
             throw mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "anthropic")"))
         }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
 
-        // User, 2026-09-06 WHY: preserve the HTTP status even with an empty body.
+        // Preserve the HTTP status even with an empty body.
         try throwIfChatCompletionsError(status: status, data: data, response: response)
 
         guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -311,10 +221,17 @@ public final class AnthropicAdapter: LLMAdapter {
             )
             throw LLMError.outputLengthLimit(partial: text)
         }
-        guard !text.isEmpty else {
+        let toolCalls = try (nativeTools ? Self.nativeToolCalls(content) : [])
+        if nativeTools {
+            let thinking = Self.nativeThinkingBlocks(content)
+            if !toolCalls.isEmpty, !thinking.isEmpty {
+                await thinkingLedger.record(thinking, callIDs: toolCalls.map(\.id))
+            }
+        }
+        guard !text.isEmpty || !toolCalls.isEmpty else {
             throw emptyTextResponseError(obj, content: content)
         }
-        // U1 step 1: token/cache usage telemetry (non-fatal, numbers only).
+        // Token/cache usage telemetry is non-fatal and contains numbers only.
         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
         await telemetry.record(
             requestBody: req.httpBody,
@@ -325,30 +242,16 @@ public final class AnthropicAdapter: LLMAdapter {
             ttftMs: nil,
             durationMs: durationMs
         )
-        return text
-    }
-
-    /// The single-prompt lane sends no `tools` array; native tools ride only
-    /// the messages lane (`completeMessages` / `streamMessages`).
-    public func complete(
-        prompt: String,
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?
-    ) async throws -> String {
-        try await complete(prompt: prompt, system: system, model: model)
+        return AnthropicNativeToolResult(
+            text: text, toolCalls: toolCalls, stopReason: obj["stop_reason"] as? String
+        )
     }
 
     // MARK: - Structured messages (native vision)
 
-    /// Native-vision `completeMessages` override. The api-key Anthropic path is
-    /// a fallthrough in the user's OAuth setup, but we wire real vision here too so
-    /// no provider/credential combo silently loses images.
-    ///
-    /// BYTE-IDENTITY: when the conversation carries NO image block, we DELEGATE
-    /// to `complete(prompt:)` via a role-prefixed flatten — that keeps the
-    /// text-only request body byte-identical to the pre-vision path. We only
-    /// build a structured Messages-API body when an `.image` block is present.
+    /// The `anthropic` and `kimi-code` routes select this Messages transport directly.
+    /// Non-nil tools retain native blocks; with nil tools, text-only calls keep
+    /// role-prefixed compatibility flattening and image calls use content blocks.
     public func completeMessages(
         messages: [LLMMessage],
         system: String?,
@@ -378,7 +281,7 @@ public final class AnthropicAdapter: LLMAdapter {
         }
         guard hasImage else {
             // Preserve this adapter's SYSTEM prefix. No images → no tripwire note.
-            let flattened = llmCompatibilityPrompt(messages: messages) { role in
+            let flattened = try llmCompatibilityPrompt(messages: messages) { role in
                 switch role {
                 case .user: "USER:"
                 case .assistant: "ASSISTANT:"
@@ -386,15 +289,7 @@ public final class AnthropicAdapter: LLMAdapter {
                 }
             }
             let combined = flattened.text
-            return try await complete(prompt: combined, system: system, model: model)
-        }
-
-        guard let key = apiKeyOverride
-                ?? LLMCredentialResolver.resolveAPIKey(
-                    providerConfigFile: credentialConfigFile,
-                    dataRoot: credentialRoot),
-              !key.isEmpty else {
-            throw LLMError.notConfigured(provider: providerId)
+            return try await complete(prompt: combined, system: system, model: model, tools: tools)
         }
 
         // Encode each message as an Anthropic message with a content-block
@@ -405,17 +300,8 @@ public final class AnthropicAdapter: LLMAdapter {
             var blocks: [[String: Any]] = []
             for block in m.content {
                 switch block {
-                case .text(let t):
-                    blocks.append(["type": "text", "text": t])
-                case .image(let mediaType, let base64, _, _):
-                    blocks.append([
-                        "type": "image",
-                        "source": [
-                            "type": "base64",
-                            "media_type": mediaType,
-                            "data": base64,
-                        ],
-                    ])
+                case .text, .image:
+                    blocks.append(Self.anthropicBlock(block))
                 case .toolUse(_, let name, let inputJSON):
                     let argsStr = String(data: inputJSON, encoding: .utf8) ?? "{}"
                     blocks.append(["type": "text", "text": "[tool_use \(name) \(argsStr)]"])
@@ -423,40 +309,18 @@ public final class AnthropicAdapter: LLMAdapter {
                     blocks.append(["type": "text", "text": "[tool_result] \(content)"])
                 }
             }
-            // Mid-conversation tool changes never ride THIS lane (it ships no
-            // `tools` array, so there is nothing a `tool_reference` could name
-            // and any block here would be a 400). Drop a message that carries
-            // nothing else rather than emitting an empty `content` array,
-            // which the Messages API rejects. Unreachable in production — the
-            // structured native lane is the only producer — and byte-identical
-            // for every message that has content.
+            // The Messages API rejects an empty content array.
             guard !blocks.isEmpty else { continue }
             // Three-way role: a `.system` message is emitted as a
             // MID-CONVERSATION system message here too, so the api-key lane
-            // never silently relabels it as assistant text. `clear_at` rides
-            // with it; the api-key transport sends no beta header, so a model
+            // never silently relabels it as assistant text. A model
             // that cannot honour it will reject the request loudly rather
-            // than silently dropping the turn-scoped semantics.
-            var entry: [String: Any] = [
-                "role": AnthropicOAuthDirectAdapter.wireRole(m.role),
+            // than silently changing its role.
+            let entry: [String: Any] = [
+                "role": AnthropicOAuthTransport.wireRole(m.role),
                 "content": blocks,
             ]
-            if m.turnScopedClearAtNextUserMessage {
-                entry["clear_at"] = "next_user_message"
-            }
             anthropicMessages.append(entry)
-        }
-
-        var req = URLRequest(url: endpoint)
-        req.httpMethod = "POST"
-        req.setValue(key, forHTTPHeaderField: "x-api-key")
-        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        req.setValue("application/json", forHTTPHeaderField: "content-type")
-        // clear_at in the body REQUIRES its beta header. Same rule as the
-        // OAuth lane: present iff a message carries the flag, absent
-        // otherwise, so every pre-existing request stays byte-identical.
-        if let beta = AnthropicOAuthDirectAdapter.clearAtBeta(for: messages) {
-            req.setValue(beta, forHTTPHeaderField: "anthropic-beta")
         }
 
         var body: [String: Any] = [
@@ -469,28 +333,13 @@ public final class AnthropicAdapter: LLMAdapter {
         }
         FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: model)
         applyThinkingControls(to: &body)
-        req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
-
-        // User, 2026-09-06: carry the status — see the sibling above.
-        return try await performCompletion(request: req, model: model)
+        return try await performCompletion(request: request(body: body), model: model).text
     }
 
-    // MARK: - Streaming (SSE)
+    // MARK: - Thinking controls
 
-    /// Anthropic Messages API in streaming mode. Parses SSE frames of shape:
-    ///   event: content_block_delta
-    ///   data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
-    /// Yields the inner `delta.text` only — ignores message_start/stop, ping,
-    /// thinking deltas, and tool_use chunks (those route through ToolLoop).
-    /// Kimi Code reasoning control on the Anthropic wire: Kimi's canonical
-    /// knob is a TOP-LEVEL `reasoning_effort` ("low"/"high"/"max"), NOT the
-    /// Anthropic `thinking` budget (their docs: "Do not use the K2.x thinking
-    /// parameter"; K3 thinking is ALWAYS on and cannot be disabled).
-    /// Live-probed 2026-07-19 against api.kimi.com/coding with a real key:
-    /// all three levels 200 on k3 AND kimi-for-coding; unknown values are
-    /// tolerated (no 400). Scoped to kimi-code — Claude api-key behavior is
-    /// unchanged. "none"/unset omits the field → provider default (max per
-    /// their docs). Legacy "medium" picks map to "high".
+    /// Kimi uses top-level `reasoning_effort`; its thinking is always on.
+    /// Unset/none omits the field, medium maps to high, and low/high/max pass through.
     func applyThinkingControls(to body: inout [String: Any]) {
         guard providerId == "kimi-code" else { return }
         let effort = (LLMCallContext.reasoningEffort ?? "none")
@@ -505,14 +354,7 @@ public final class AnthropicAdapter: LLMAdapter {
             // "none"/unset is a deliberate "no pin", NOT a misconfiguration.
             break
         default:
-            // F1-L1: an UNRECOGNIZED reasoning_effort string is a misconfigured
-            // surface pin. Omitting the key would silently fall to the provider
-            // default ("max" — the 32k-thinking, most-expensive setting), hiding
-            // the bad config behind the priciest behavior. Clamp to "high": a
-            // catalog-supported value (low/high/max all live-probed 200 on
-            // 2026-07-19), the safe middle — real reasoning without the runaway
-            // max budget — and NOT the silent default. Log one diagnostic line
-            // so the misconfigured surface is discoverable.
+            // Unknown effort uses "high" with a diagnostic instead of the provider's "max" default.
             FileHandle.standardError.write(Data((
                 "[applyThinkingControls] kimi-code: unrecognized reasoning_effort "
                 + "'\(effort)' — clamping to 'high'\n").utf8))
@@ -533,11 +375,7 @@ public final class AnthropicAdapter: LLMAdapter {
         }.joined()
     }
 
-    /// Names an HTTP-200 response that carried zero answer text — the error a
-    /// caller sees must say WHAT came back, not "invalid response status 200"
-    /// (that anonymous form sent the K3 debugging in the wrong direction three
-    /// times, 2026-07-19/20). The stop reason distinguishes a length limit or
-    /// refusal from an empty provider response.
+    /// Empty HTTP-200 replies name the stop reason to distinguish limits, refusals and missing text.
     func emptyTextResponseError(_ obj: [String: Any], content: [[String: Any]]) -> LLMError {
         let stopReason = (obj["stop_reason"] as? String) ?? "absent"
         if stopReason == "max_tokens" {
@@ -546,9 +384,7 @@ public final class AnthropicAdapter: LLMAdapter {
                 + "before any answer text (stop_reason=max_tokens); raise "
                 + "max_tokens or lower the reasoning effort")
         }
-        // Anthropic documents stop_reason=refusal as a NORMAL empty-content
-        // 200 (model declined). Deterministic — replaying the same request
-        // refuses again, so never classify it transient (gpt-5.5, 2026-07-20).
+        // A refusal is deterministic and never transient.
         if stopReason == "refusal" {
             return LLMError.providerError(message:
                 "\(providerId): model declined to answer (stop_reason=refusal)")
@@ -581,222 +417,4 @@ public final class AnthropicAdapter: LLMAdapter {
         return LLMError.failure(.malformedResponse)
     }
 
-    public func stream(
-        prompt: String,
-        system: String?,
-        model: String
-    ) -> AsyncThrowingStream<String, Error> {
-        let session = self.session
-        let endpoint = self.endpoint
-        let apiKeyOverride = self.apiKeyOverride
-        let maxTokens = requestMaxTokens(model: model)
-        let credentialRoot = self.credentialRoot
-        let telemetry = self.telemetry
-        let providerId = self.providerId
-        let credentialConfigFile = self.credentialConfigFile
-        return AsyncThrowingStream { continuation in
-            let task = Task {
-                guard let key = apiKeyOverride
-                        ?? LLMCredentialResolver.resolveAPIKey(
-                            providerConfigFile: credentialConfigFile,
-                            dataRoot: credentialRoot),
-                      !key.isEmpty else {
-                    continuation.finish(throwing: LLMError.notConfigured(provider: providerId))
-                    return
-                }
-
-                var req = URLRequest(url: endpoint)
-                req.httpMethod = "POST"
-                req.setValue(key, forHTTPHeaderField: "x-api-key")
-                req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-                req.setValue("application/json", forHTTPHeaderField: "content-type")
-                req.setValue("text/event-stream", forHTTPHeaderField: "accept")
-
-                var body: [String: Any] = [
-                    "model": model,
-                    "max_tokens": maxTokens,
-                    "stream": true,
-                    "messages": [["role": "user", "content": prompt]],
-                ]
-                if let systemBlocks = Self.makeSystemBlocks(system) {
-                    body["system"] = systemBlocks
-                }
-                FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: model)
-                applyThinkingControls(to: &body)
-                do {
-                    req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
-                } catch {
-                    continuation.finish(throwing: LLMError.underlying(message: "encode: \(error)"))
-                    return
-                }
-
-                let requestStartNs = DispatchTime.now().uptimeNanoseconds
-                let bytes: URLSession.AsyncBytes
-                let response: URLResponse
-                do {
-                    (bytes, response) = try await ProviderWire.open(session, req)
-                } catch {
-                    continuation.finish(throwing: mapTransportError(error, fallback: .underlying(message: "connection refused: \(endpoint.host ?? "anthropic")")))
-                    return
-                }
-                defer { bytes.task.cancel() }
-                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                if status == 429 {
-                    // A3.4: honor Retry-After (header is available pre-drain).
-                    continuation.finish(throwing: LLMError.rateLimited(
-                        message: "rate limited",
-                        retryAfterSeconds: parseRetryAfterSeconds(from: response)))
-                    return
-                }
-                if !(200..<300).contains(status) {
-                    // Same body preservation as the non-streaming paths: drain
-                    // a bounded chunk so a 403 quota / auth message reaches the user.
-                    let errData: Data
-                    do {
-                        errData = try await ProviderErrorBodyDrain.read(
-                            bytes, maxBytes: 4096, timeout: 2.0
-                        )
-                    } catch {
-                        continuation.finish(throwing: error)
-                        return
-                    }
-                    continuation.finish(throwing: LLMError.failure(.http(
-                        status: status, detail: ProviderFailure.wireDetail(errData),
-                        retryAfter: parseRetryAfterSeconds(from: response))))
-                    return
-                }
-
-                do {
-                    // R15: SSEEventStream owns framing (event:/data: association,
-                    // CRLF, multi-line data, EOF flush); this loop owns Anthropic
-                    // protocol semantics. `event: error` mid-stream (overloaded /
-                    // rate-limit / server hiccup) throws; EOF without
-                    // `message_stop` is a truncation.
-                    // Usage spans message_start and message_delta; TTFT includes
-                    // thinking output. The row is recorded on message_stop.
-                    var usage = LLMUsage()
-                    var ttftMs: Int?
-                    var yieldedAnyText = false
-                    var lastStopReason: String?
-                    var runaway = RunawayOutputDetector(endsAtToolBoundary:
-                        system?.contains(AnthropicOAuthDirectAdapter.textToolProtocolHeader) == true)
-                    for try await sse in SSEEventStream(bytes) {
-                        try Task.checkCancellation()
-                        let payload = sse.data
-                        if payload.isEmpty || payload == "[DONE]" { continue }
-                        guard let data = payload.data(using: .utf8),
-                              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                        else { continue }
-
-                        // Dispatch by event type. Anthropic SSE always pairs event:
-                        // with data:, so the event name is authoritative; the payload's
-                        // own `type` field is a useful fallback for resilience.
-                        let eventName = sse.event ?? ""
-                        let effectiveEvent = eventName.isEmpty
-                            ? AnthropicAdapter.streamEventType(obj, eventName: nil) : eventName
-
-                        try AnthropicAdapter.consumeStreamEvent(obj, event: effectiveEvent, usage: &usage, stopReason: &lastStopReason)
-                        switch effectiveEvent {
-                        case "message_stop":
-                            continuation.yield(runaway.finish())
-                            // Documented terminal event. Finish clean and return —
-                            // don't trust any bytes after this.
-                            let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                            await telemetry.record(
-                                requestBody: req.httpBody,
-                                provider: providerId,
-                                model: model,
-                                streaming: true,
-                                usage: usage.isEmpty ? nil : usage,
-                                ttftMs: ttftMs,
-                                durationMs: durationMs,
-                                stopReason: lastStopReason
-                            )
-                            if lastStopReason == "max_tokens" {
-                                RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit")
-                                continuation.finish()
-                                return
-                            }
-                            if !yieldedAnyText {
-                                throw FirstPartyExecutionControls.anthropicEmptyStreamError(
-                                    providerID: providerId,
-                                    stopReason: lastStopReason,
-                                    expectedOutput: "answer text"
-                                )
-                            }
-                            continuation.finish()
-                            return
-                        case "content_block_start":
-                            guard let block = obj["content_block"] as? [String: Any],
-                                  block["type"] as? String == "redacted_thinking" else { continue }
-                            if ttftMs == nil {
-                                ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                            }
-                            continuation.yield("")
-                        case "content_block_delta":
-                            guard let delta = obj["delta"] as? [String: Any] else { continue }
-                            switch delta["type"] as? String {
-                            case "text_delta":
-                                guard let text = delta["text"] as? String, !text.isEmpty
-                                else { continue }
-                                if ttftMs == nil {
-                                    ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                                }
-                                yieldedAnyText = true
-                                let stop = runaway.feed(text)
-                                let kept = runaway.takeCommittedText()
-                                continuation.yield(kept)
-                                if stop {
-                                    // Ended by us, not by message_stop: record the call anyway, so
-                                    // the turn's cost stays visible (usage has message_start's input
-                                    // and cache counts; output tokens are unknown after cancel).
-                                    await telemetry.record(
-                                        requestBody: req.httpBody,
-                                        provider: providerId,
-                                        model: model,
-                                        streaming: true,
-                                        usage: usage.isEmpty ? nil : usage,
-                                        ttftMs: ttftMs,
-                                        durationMs: Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000),
-                                        status: "ok",
-                                        stopReason: "client_tool_boundary"
-                                    )
-                                    // Ended at a complete tool block, like a
-                                    // stop sequence: the calls before it run.
-                                    continuation.finish()
-                                    return
-                                }
-                            case "thinking_delta", "input_json_delta":
-                                if ttftMs == nil {
-                                    ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                                }
-                                // Provider output without reply text.
-                                continuation.yield("")
-                            default:
-                                continue
-                            }
-                        default:
-                            // ping, content_block_start/stop — safe to ignore.
-                            continue
-                        }
-                    }
-                    // Loop exited via EOF without hitting `case "message_stop"`.
-                    // That's a truncated stream — surface it so partial replies
-                    // don't look like clean ends.
-                    throw LLMError.streamTruncated(
-                        message: "Anthropic stream ended without message_stop"
-                    )
-                } catch let err as LLMError {
-                    // Preserve typed errors so callers can pattern-match (providerError
-                    // / streamTruncated / notConfigured all need to survive intact).
-                    continuation.finish(throwing: err)
-                } catch is CancellationError {
-                    continuation.finish(throwing: CancellationError())
-                } catch {
-                    continuation.finish(throwing: mapTransportError(error, fallback: .underlying(message: "stream: \(error)")))
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
-    }
 }

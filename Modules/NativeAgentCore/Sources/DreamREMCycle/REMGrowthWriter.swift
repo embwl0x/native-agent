@@ -1,7 +1,7 @@
 import Foundation
 import PersistenceCore
 
-// Blueprint: | `REMGrowthWriter.swift` | `REMGrowthWriter.appendApprovedLesson`: exact approved paragraph append to a ready canonical persona root, preserving authored headings |
+// Blueprint: | `REMGrowthWriter.swift` | Exact standalone-paragraph ranges shared by approved append, pin survival and eviction; append preserves authored headings |
 
 // Approved lessons append as standalone paragraphs to canonical GROWTH.md.
 // The writer preserves the approved text and existing hand-authored headings;
@@ -15,12 +15,7 @@ public enum REMGrowthWriter {
         }
     }
 
-    /// Thrown when `personaRoot` doesn't look like a real persona root
-    /// (no SOUL.md and no GROWTH.md). The resolver's last-resort fallback is
-    /// `<dataRoot>/memory`; minting a GROWTH.md there would bypass the
-    /// PersonaEngine pre-onboarding guard AND land the lesson in the stale
-    /// fallback copy nobody reads (gpt-5.5 review MED, 2026-07-03 — the
-    /// same wrong-directory class as the persona-distill incident).
+    /// An unready persona root has neither SOUL.md nor GROWTH.md; writing there would bypass onboarding.
     public struct PersonaRootUnready: Error, CustomStringConvertible {
         public let path: String
         public var description: String {
@@ -29,15 +24,26 @@ public enum REMGrowthWriter {
         }
     }
 
-    /// True when `text` exists in `body` as a standalone entry paragraph —
-    /// bounded by line breaks (or document edges), never a substring of a
-    /// longer paragraph (gpt-5.5 review MED: containment alone would
-    /// false-positive skip a shorter lesson embedded in an existing entry).
+    /// Matches text only at line or document boundaries, never inside a longer paragraph.
     public static func containsEntryParagraph(_ body: String, _ text: String) -> Bool {
-        if body == text { return true }
-        if body.hasPrefix(text + "\n") { return true }
-        if body.hasSuffix("\n" + text) { return true }
-        return body.contains("\n" + text + "\n")
+        !entryParagraphRanges(body, text).isEmpty
+    }
+
+    static func entryParagraphRanges(_ body: String, _ text: String) -> [Range<String.Index>] {
+        if text.isEmpty {
+            return (Array(body.indices) + [body.endIndex]).filter {
+                ($0 == body.startIndex || body[body.index(before: $0)] == "\n") && ($0 == body.endIndex || body[$0] == "\n")
+            }.map { $0..<$0 }
+        }
+        var ranges: [Range<String.Index>] = []
+        var searchFrom = body.startIndex
+        while let range = body.range(of: text, range: searchFrom..<body.endIndex) {
+            if (range.lowerBound == body.startIndex || body[body.index(before: range.lowerBound)] == "\n"),
+               (range.upperBound == body.endIndex || body[range.upperBound] == "\n") { ranges.append(range) }
+            // Overlapping matches can contain another standalone paragraph.
+            searchFrom = body.index(after: range.lowerBound)
+        }
+        return ranges
     }
 
     /// Append an approved REM lesson to `<personaRoot>/GROWTH.md` under the
@@ -66,12 +72,8 @@ public enum REMGrowthWriter {
            !fm.fileExists(atPath: personaRoot.appendingPathComponent("SOUL.md").path) {
             throw PersonaRootUnready(path: personaRoot.path)
         }
-        let persistence = SwiftNativePersistenceCore()
-        return try await persistence.withFileLock(growth) {
-            // Read failure aborts; only a genuinely absent file starts a new
-            // document (2026-09-06): `try?` turned an unreadable-but-present
-            // GROWTH.md into "", and the atomic write below then replaced her
-            // whole growth document with a header and one lesson.
+        return try await SwiftNativePersistenceCore.withFileLock(growth) {
+            // Only a missing file starts a new document; other read failures abort the append.
             let body: String
             do {
                 body = try String(contentsOf: growth, encoding: .utf8)
@@ -79,16 +81,11 @@ public enum REMGrowthWriter {
                 body = ""
             }
             if containsEntryParagraph(body, text) { return false }
-            // Body only — no derived `## heading` (User, 2026-07-03): any
-            // heading machine-derived from the lesson just repeats its first
-            // clause, and GROWTH rides into every chat turn, so duplicate
-            // bytes are a per-turn prompt tax. Her hand-authored entries
-            // keep their labels; REM entries are one clean paragraph.
             let entry = "\n\(text)\n"
             let rebuilt = body.isEmpty
                 ? "# GROWTH.md\n" + entry
                 : (body.hasSuffix("\n") ? body + entry : body + "\n" + entry)
-            try rebuilt.data(using: .utf8)!.write(to: growth, options: .atomic)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(rebuilt.utf8), to: growth)
             return true
         }
     }

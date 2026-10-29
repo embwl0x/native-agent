@@ -78,8 +78,6 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
                 "inbox.json",
             ]
         case .advanced:
-            // command_palette.json retired 2026-08-28 (E8): the Mac stopped
-            // writing it, so the group must stop declaring it.
             [
                 "turn_summaries.json",
                 "knowledge_graph.json",
@@ -95,11 +93,7 @@ public enum NAMobileSnapshotGroup: String, CaseIterable, Codable, Sendable {
     /// believes about the state itself, and the authoritative rows of the group
     /// must always be among the files that stay.
     ///
-    /// 2026-09-13: `.desk` carries the compact board AND the uncompressed
-    /// reading copies, each bounded on its own, so legitimately large notes
-    /// could push the pair past `maximumStatusBytes` and the board — every Desk
-    /// row the phone has — would fail to publish over material it does not even
-    /// need. The copies are the part that can wait.
+    /// Desk reading copies may be shed so the compact board still fits its status envelope.
     public var trimmableFilenames: [String] {
         switch self {
         case .desk: ["desk_details.json"]

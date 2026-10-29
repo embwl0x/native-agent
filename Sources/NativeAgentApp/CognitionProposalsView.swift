@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Cognition
 import SwiftUI
 import Observation
@@ -14,8 +15,8 @@ struct CognitionProposalsView: View {
                 Text("Replay schemas are read-only lineage from the canonical Dream/REM approval path.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                NativePanel(title: "REM Replay Lineage", systemImage: "point.3.connected.trianglepath.dotted", tint: .green) {
-                    schemaProposalsBody(cognition.proposalsDetail?.schemaProposals ?? [])
+                NativePanel(title: "REM Replay Lineage") {
+                    schemaProposalsBody(cognition.detail?.schemaProposals ?? [])
                 }
             }
             .padding(NativeAgentSpacing.xl)
@@ -23,10 +24,10 @@ struct CognitionProposalsView: View {
         .navigationTitle("REM Replay Lineage")
         .task {
             let changes = await cognition.changes()
-            await cognition.refreshProposals()
+            await cognition.refreshDetail()
             for await _ in changes {
                 guard !Task.isCancelled else { return }
-                await cognition.refreshProposals()
+                await cognition.refreshDetail()
             }
         }
     }

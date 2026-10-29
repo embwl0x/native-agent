@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Privacy
@@ -10,14 +11,12 @@ import WorkshopExecution
 /// Each source says unavailable, ready (possibly empty), or unconfigured.
 public struct MorningBriefSources: Sendable {
     let root: URL
-    let persistence: any PersistenceCoreProtocol
     let now: Date
-    let worklogPath: URL
+    let worklogPath: URL?
 
-    public init(root: URL, persistence: any PersistenceCoreProtocol, now: Date, worklogPath: URL?) {
-        self.root = root; self.persistence = persistence; self.now = now
-        self.worklogPath = worklogPath ?? FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".claude/state/claude-worklog.jsonl")
+    public init(root: URL, now: Date, worklogPath: URL?) {
+        self.root = root; self.now = now
+        self.worklogPath = worklogPath
     }
 
     public func packet() async -> JSONValue {
@@ -27,7 +26,9 @@ public struct MorningBriefSources: Sendable {
         formatter.dateFormat = "EEEE, MMMM d"
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = .autoupdatingCurrent
-        let yesterday = calendar.date(byAdding: .day, value: -1, to: calendar.startOfDay(for: now))!
+        guard let yesterday = calendar.date(byAdding: .day, value: -1, to: calendar.startOfDay(for: now)) else {
+            return .object(["state": .string("unavailable"), "error": .string("brief_calendar_unavailable: cannot determine the previous local day")])
+        }
         return .object([
             "operation": .string("brief"), "dayLabel": .string(formatter.string(from: now)),
             "now": .string(NativeTimestampFormat.fractionalUTCOffset(now)),
@@ -40,18 +41,17 @@ public struct MorningBriefSources: Sendable {
 
     private func desk() async -> JSONValue {
         do {
-            guard let native = persistence as? SwiftNativePersistenceCore else { throw CocoaError(.featureUnsupported) }
-            let state = try await SwiftNativeDeskStore(dataRoot: root, persistence: native).liveState()
+            let state = try await SwiftNativeDeskStore(dataRoot: root).liveState()
             return .object(["state": .string("ready"),
                 "statuses": .array(state.items.map { .string($0.status.rawValue) }),
                 // Desk owns the projection's readiness and dependency truth.
-                "body": .string(NativeAppSecretRedactor.redactText(DeskProjection.render(state, now: now)))])
+                "body": .string(NativeAppSecretRedactor.redactText(DeskPage.render(state, now: now)))])
         } catch { return unavailable(error) }
     }
 
     private func workshop() async -> JSONValue {
         do {
-            let rows = try await SwiftNativeWorkshopRunner(root: root, persistence: persistence)
+            let rows = try await SwiftNativeWorkshopRunner(root: root)
                 .listWorkshopExecutions()
             return checked(rows, fields: ["status", "completedAt", "completed_at", "updatedAt", "updated_at"]) { row in
                 guard case .string(let status)? = row["status"] else { return false }
@@ -86,22 +86,17 @@ public struct MorningBriefSources: Sendable {
     /// Only parsed, redacted summary fields leave this native reader; neither
     /// the private worklog's raw bytes nor unrelated fields enter her part.
     private func worklog() -> JSONValue {
+        guard let worklogPath else { return .object(["state": .string("unconfigured")]) }
         do {
-            let handle = try FileHandle(forReadingFrom: worklogPath)
-            defer { try? handle.close() }
-            let end = try handle.seekToEnd()
-            let start = end > 128 * 1024 ? end - 128 * 1024 : 0
-            try handle.seek(toOffset: start)
-            let data = try handle.readToEnd() ?? Data()
-            guard var text = String(data: data, encoding: .utf8) else { throw CocoaError(.fileReadInapplicableStringEncoding) }
-            if start > 0 {
-                guard let newline = text.firstIndex(of: "\n") else { throw CocoaError(.fileReadCorruptFile) }
-                text = String(text[text.index(after: newline)...])
-            }
+            guard let read = try SwiftNativePersistenceCore.tailPhysicalLines(worklogPath, limit: .max, maxBytes: 128 * 1024)
+            else { throw CocoaError(.fileReadNoSuchFile) }
+            if read.leadingFragment, read.lines.count == 1, read.lines[0].count == read.bytesRead { throw CocoaError(.fileReadCorruptFile) }
             var rows: [JSONValue] = []
             var damaged = false
-            for line in text.split(separator: "\n") where !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                guard case .object(let row)? = try? JSONValue.parse(Data(line.utf8)),
+            for line in read.lines.dropFirst(read.leadingFragment ? 1 : 0) {
+                guard let text = String(data: line, encoding: .utf8) else { throw CocoaError(.fileReadInapplicableStringEncoding) }
+                if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
+                guard case .object(let row)? = try? JSONValue.parse(line),
                       case .string(let ts)? = row["ts"], NativeTimestampFormat.parseISO8601FractionalFirst(ts) != nil,
                       case .string(let summary)? = row["summary"] else { damaged = true; continue }
                 rows.append(.object(["ts": .string(ts), "summary": .string(NativeAppSecretRedactor.redactText(summary))]))

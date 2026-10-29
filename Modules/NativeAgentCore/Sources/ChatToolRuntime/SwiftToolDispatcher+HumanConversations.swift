@@ -21,12 +21,10 @@ public struct HumanConversationSnapshot: Sendable {
 }
 
 public enum HumanConversationReader {
-    public static func string(_ value: JSONValue?) -> String? { HumanConversationIndex.string(value) }
-    public static func object(_ value: JSONValue?) -> [String: JSONValue] { HumanConversationIndex.object(value) }
     public static func rows(dataRoot: URL) throws -> [[String: JSONValue]] { try HumanConversationIndex.rows(dataRoot: dataRoot) }
-    public static func read(sessionID: String, dataRoot: URL, replyBefore: Date? = nil) async throws -> HumanConversationSnapshot {
+    public static func read(sessionID: String, dataRoot: URL, replyBefore: Date? = nil, surface: String? = nil) async throws -> HumanConversationSnapshot {
         guard NativeAgentChatSessionID.normalizedPathComponent(sessionID) != nil,
-              let row = try rows(dataRoot: dataRoot).first(where: { string($0["id"]) == sessionID }) else {
+              let row = try rows(dataRoot: dataRoot).first(where: { $0["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) == sessionID }) else {
             throw AutonomyGateError.toolDenied(reason: "This conversation is unavailable. Open the conversation list again.")
         }
         let transcript = dataRoot.appendingPathComponent("chat/messages/\(sessionID).jsonl")
@@ -40,28 +38,31 @@ public enum HumanConversationReader {
             && result.stats.malformedRowCount == 0 && result.stats.invalidShapeRowCount == 0
         let recent = result.messages.suffix(128)
         let visible = recent.filter { ["user", "assistant"].contains($0.role) }
-        let lastID = result.messages.last.flatMap { string(object($0.extras)["id"]) }
+        let lastID = result.messages.last.flatMap { ($0.extras?.objectValue ?? [:])["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) }
+        // With `surface`, the thread's latest message from that surface (one thread, many doors).
         let human = result.messages.last { message in
             message.role == "user" && (replyBefore.map {
                 (DeskClock.parseISO(message.timestamp) ?? .distantFuture) <= $0
+            } ?? true) && (surface.map { wanted in
+                TurnEnvelope.fromPersistedMetadata(((message.extras?.objectValue ?? [:])["metadata"]?.objectValue ?? [:])["envelope"])?.surface == wanted
             } ?? true)
         }
         var route: TurnEnvelope?
         if let human, complete, replyBefore == nil || result.messages.filter({ $0.role == "user" }).allSatisfy({
             DeskClock.parseISO($0.timestamp) != nil
         }) {
-            let metadata = object(object(human.extras)["metadata"])
+            let metadata = ((human.extras?.objectValue ?? [:])["metadata"]?.objectValue ?? [:])
             let candidate = TurnEnvelope.fromPersistedMetadata(metadata["envelope"])
             // Never infer User from a bridge/worker turn or decode a destination from a session id.
-            if metadata["mechanicalKind"] == nil, object(metadata["origin"]).isEmpty,
+            if metadata["mechanicalKind"] == nil, (metadata["origin"]?.objectValue ?? [:]).isEmpty,
                let candidate, candidate.agent == nil,
                ["app", "chat", "mac", "telegram", "slack", "ios", "iphone", "mobile", "icloud"].contains(candidate.surface) {
                 route = candidate
             }
         }
         let generation = ChatSessionIndexFile.transcriptGeneration(in: row).map(String.init) ?? "legacy"
-        return .init(sessionID: sessionID, title: string(row["title"]) ?? "Conversation",
-                     source: string(row["source"]) ?? "app", revision: generation + ":" + (lastID ?? "unavailable"), sourceRevision: generation,
+        return .init(sessionID: sessionID, title: row["title"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? "Conversation",
+                     source: row["source"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? "app", revision: generation + ":" + (lastID ?? "unavailable"), sourceRevision: generation,
                      lastMessageID: lastID, route: route, messages: visible, complete: complete)
     }
     /// One conversation's latest messages (8, up to 16) and whether
@@ -76,7 +77,7 @@ public enum HumanConversationReader {
         let canReply = !current && snapshot.lastMessageID != nil && routeAvailable(snapshot.route)
         var untrusted = false
         let rows = snapshot.messages.suffix(limit).map {
-            ContactThread.Line(object($0.extras), role: $0.role, text: $0.content, timestamp: $0.timestamp)
+            ContactThread.Line(($0.extras?.objectValue ?? [:]), role: $0.role, text: $0.content, timestamp: $0.timestamp)
         }
         let messages = ContactThread.project(rows, mark: { PeerDataTaint.markConsumed(peer: $0, line: $1) }).map { line -> JSONValue in
             var value: [String: JSONValue] = ["role": .string(line.role), "text": .string(String(line.text.prefix(6000))),
@@ -86,7 +87,7 @@ public enum HumanConversationReader {
             if let speaker = line.speakers.first {
                 let principal = PeerTrust.principal(speaker, dataRoot: dataRoot)
                 let trusted = PeerTrust.ownerTrusts(principal, dataRoot: dataRoot)
-                let bridged = line.role == "user" && (string(object(line.metadata["origin"])["surface"])?.hasSuffix("-bridge") == true
+                let bridged = line.role == "user" && ((line.metadata["origin"]?.objectValue ?? [:])["surface"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 })?.hasSuffix("-bridge") == true
                     || TurnEnvelope.fromPersistedMetadata(line.metadata["envelope"])?.surface.hasSuffix("-bridge") == true)
                 if bridged { value["agent_id"] = .string(principal) }
                 value["untrusted_remote_data"] = .bool(!trusted)

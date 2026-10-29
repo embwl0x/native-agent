@@ -3,23 +3,12 @@ import NativeAgentCore
 import Network
 import PersistenceCore
 import Security
-// Blueprint: | `BrowserIPCServer.swift` | browser IPC routing and shared NativeLoopbackListener transport conformance; browser_ipc.json alone publishes endpoint/token discovery and Doctor readiness events, with backup/export/phone exclusions and privacy coverage; no duplicate token file writer; connection retirement cancels its routed task; deadlines report unknown effect outcome |
-
-/// The app binds its shared loopback listener and HTTP head parser.
-public protocol BrowserIPCTransport: Sendable {
-    var isActive: Bool { get }
-    var headerByteCap: Int { get }
-    func start(onReady: @escaping @Sendable (UInt16) -> Void,
-               onConnection: @escaping @Sendable (NWConnection) -> Void,
-               onTerminated: @escaping @Sendable () -> Void) -> Bool
-    func stop()
-    func parseRequestHead(_ data: Data) -> (method: String, path: String, headers: [String: String])?
-    func parseContentLength(_ headers: [String: String], maxBytes: Int) -> Int?
-}
+import NativeAgentShared
+// Blueprint: | `BrowserIPCServer.swift` | browser IPC routing with NativeLoopbackListener and BridgeCore HTTP parsing/writing; invalid response objects close the connection; browser_ipc.json alone publishes endpoint/token discovery and Doctor readiness events, with backup/export/phone exclusions and privacy coverage; no duplicate token file writer; connection retirement cancels its routed task; deadlines report unknown effect outcome |
 
 @MainActor
-public final class BrowserIPCServer {
-    public init(dataRoot: URL, transport: any BrowserIPCTransport, effects: any BrowserIPCWindowEffects) {
+public final class BrowserIPCServer: BridgeHTTPServer {
+    public init(dataRoot: URL, transport: NativeLoopbackListener, effects: any BrowserIPCWindowEffects) {
         self.dataRoot = dataRoot
         self.transport = transport
         self.effects = effects
@@ -31,7 +20,7 @@ public final class BrowserIPCServer {
     public private(set) var ipcToken: String = ""
     public private(set) var ipcPort: UInt16 = 0
     private let dataRoot: URL
-    private nonisolated let transport: any BrowserIPCTransport
+    private nonisolated let transport: NativeLoopbackListener
     private let effects: any BrowserIPCWindowEffects
 
     /// Drop a connection that hasn't completed its request/response within this window
@@ -66,28 +55,13 @@ public final class BrowserIPCServer {
 
     // MARK: - IPC server
 
-    private static func endpointIsLoopback(_ endpoint: NWEndpoint) -> Bool {
-        guard case let .hostPort(host, _) = endpoint else { return true }
-        let value = "\(host)".lowercased()
-            .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-        return value == "localhost"
-            || value == "127.0.0.1"
-            || value == "::1"
-            || value.hasPrefix("::1%")
-    }
-
     public func start() {
         guard !transport.isActive, ipcToken.isEmpty else { return }
 
-        var bytes = [UInt8](repeating: 0, count: 24)
-        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else {
+        guard let token = BridgeCore.generateToken() else {
             nativeLog("NativeAgent browser IPC failed to generate a secure token")
             return
         }
-        let token = Data(bytes).base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
         ipcToken = token
         ipcPort = 0
         removeDiscoveryFile()
@@ -132,16 +106,8 @@ public final class BrowserIPCServer {
     }
 
     public func stop() {
+        handleIPCListenerTerminated(token: ipcToken)
         transport.stop()
-        ipcToken = ""
-        ipcPort = 0
-        for connection in connections.values { connection.cancel() }
-        connections.removeAll()
-        for timeout in connectionTimeouts.values { timeout.cancel() }
-        connectionTimeouts.removeAll()
-        for operation in connectionOperations.values { operation.cancel() }
-        connectionOperations.removeAll()
-        removeDiscoveryFile()
     }
 
     private func acceptIPC(_ conn: NWConnection, token: String) {
@@ -149,7 +115,7 @@ public final class BrowserIPCServer {
             conn.cancel()
             return
         }
-        guard Self.endpointIsLoopback(conn.endpoint) else {
+        guard BridgeCore.endpointIsLoopback(conn.endpoint) else {
             conn.cancel()
             return
         }
@@ -169,7 +135,7 @@ public final class BrowserIPCServer {
             conn?.cancel()
             _ = self
         }
-        Self.readIPCRequest(conn, buffered: Data(), server: self)
+        BridgeCore.readRequest(conn, buffered: Data(), maxBodyBytes: 2 * 1024 * 1024, server: self)
     }
 
     /// Retiring the connection also retires its deadline and exact routed task.
@@ -179,63 +145,13 @@ public final class BrowserIPCServer {
         connectionOperations.removeValue(forKey: key)?.cancel()
     }
 
-    // MARK: - HTTP parsing (nonisolated)
-
-    nonisolated private static func readIPCRequest(_ conn: NWConnection, buffered: Data, server: BrowserIPCServer) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: 131072) { [weak server] data, _, isComplete, error in
-            guard let server else { return }
-            if error != nil { conn.cancel(); return }
-            var buf = buffered
-            if let d = data { buf.append(d) }
-
-            guard let headerEnd = buf.range(of: Data("\r\n\r\n".utf8)) else {
-                if isComplete || buf.count > server.transport.headerByteCap { conn.cancel() }
-                else { Self.readIPCRequest(conn, buffered: buf, server: server) }
-                return
-            }
-            guard headerEnd.lowerBound <= server.transport.headerByteCap else { conn.cancel(); return }
-
-            let headerData = buf.subdata(in: 0..<headerEnd.lowerBound)
-            guard let (method, path, headers) = server.transport.parseRequestHead(headerData) else { conn.cancel(); return }
-
-            guard let contentLength = server.transport.parseContentLength(headers, maxBytes: 2 * 1024 * 1024) else {
-                Self.writeRawJSON(conn, status: 413, obj: ["error": "invalid_content_length"])
-                return
-            }
-            let bodyStart = headerEnd.upperBound
-            let bodyAlready = buf.subdata(in: bodyStart..<buf.count)
-
-            if bodyAlready.count >= contentLength {
-                let body = Data(bodyAlready.prefix(contentLength))
-                Task { @MainActor in
-                    server.routeIPC(conn: conn, method: method, path: path, headers: headers, body: body)
-                }
-            } else {
-                guard !isComplete else { conn.cancel(); return }
-                Self.readIPCBody(conn, have: bodyAlready, need: contentLength, method: method, path: path, headers: headers, server: server)
-            }
-        }
-    }
-
-    nonisolated private static func readIPCBody(_ conn: NWConnection, have: Data, need: Int, method: String, path: String, headers: [String: String], server: BrowserIPCServer) {
-        conn.receive(minimumIncompleteLength: 1, maximumLength: max(1, need - have.count)) { [weak server] data, _, isComplete, error in
-            guard let server else { return }
-            guard error == nil else { conn.cancel(); return }
-            var acc = have
-            if let d = data { acc.append(d) }
-            if acc.count >= need {
-                let body = Data(acc.prefix(need))
-                Task { @MainActor in
-                    server.routeIPC(conn: conn, method: method, path: path, headers: headers, body: body)
-                }
-            } else {
-                guard !isComplete else { conn.cancel(); return }
-                Self.readIPCBody(conn, have: acc, need: need, method: method, path: path, headers: headers, server: server)
-            }
-        }
-    }
-
     // MARK: - Routing
+
+    public nonisolated func route(conn: NWConnection, method: String, path: String, headers: [String: String], body: Data) {
+        Task { @MainActor in
+            self.routeIPC(conn: conn, method: method, path: path, headers: headers, body: body)
+        }
+    }
 
     private func routeIPC(conn: NWConnection, method: String, path: String, headers: [String: String], body: Data) {
         let timeoutKey = ObjectIdentifier(conn)
@@ -258,7 +174,7 @@ public final class BrowserIPCServer {
                 do { try await Task.sleep(for: Self.ipcIdleTimeout) } catch { return }
                 conn?.cancel()
             }
-            Self.writeRawJSON(conn, status: 500, obj: [
+            BridgeCore.writeJSON(conn, status: 500, obj: [
                 "error": "outcome_unknown",
                 "detail": "Browser operation exceeded its deadline; its outcome is unknown."
             ])
@@ -271,39 +187,8 @@ public final class BrowserIPCServer {
             )
             guard !Task.isCancelled, self.connections[timeoutKey] === conn else { return }
             self.connectionOperations.removeValue(forKey: timeoutKey)
-            self.writeIPCJSON(conn, status: response.status, obj: response.object)
+            guard JSONSerialization.isValidJSONObject(response.object) else { conn.cancel(); return }
+            BridgeCore.writeJSON(conn, status: response.status, obj: response.object)
         }
-    }
-
-    // MARK: - HTTP response helpers
-
-    private func writeIPCJSON(_ conn: NWConnection, status: Int, obj: [String: Any]) {
-        Self.writeRawJSON(conn, status: status, obj: obj)
-    }
-
-    nonisolated private static func writeRawJSON(_ conn: NWConnection, status: Int, obj: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: obj) else { conn.cancel(); return }
-        let statusText: String
-        switch status {
-        case 200: statusText = "OK"
-        case 400: statusText = "Bad Request"
-        case 401: statusText = "Unauthorized"
-        case 413: statusText = "Payload Too Large"
-        default:  statusText = "Internal Server Error"
-        }
-        let header = "HTTP/1.1 \(status) \(statusText)\r\nContent-Type: application/json\r\nContent-Length: \(data.count)\r\nConnection: close\r\n\r\n"
-        var resp = Data(header.utf8)
-        resp.append(data)
-        conn.send(content: resp, completion: .contentProcessed { _ in conn.cancel() })
-    }
-}
-
-extension NativeLoopbackListener: BrowserIPCTransport {
-    public var headerByteCap: Int { BridgeCore.headerByteCap }
-    public func parseRequestHead(_ data: Data) -> (method: String, path: String, headers: [String: String])? {
-        BridgeCore.parseRequestHead(data)
-    }
-    public func parseContentLength(_ headers: [String: String], maxBytes: Int) -> Int? {
-        BridgeCore.parseContentLength(headers, maxBytes: maxBytes)
     }
 }

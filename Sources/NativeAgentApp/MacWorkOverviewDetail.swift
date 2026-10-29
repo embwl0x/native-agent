@@ -45,7 +45,7 @@ struct MacWorkOverviewDetail: View {
                     InboxItemDetailSheet(item: item, onAction: { action in
                         await actionFlight.perform {
                             try await InboxCardActions.perform(item.id, action: action,
-                                dataRootOverride: appModel.dataRootOverride, effects: AppInboxCardActionEffects(inbox: appModel.engine.inbox))
+                                dataRootOverride: appModel.engine.dataRoot, effects: AppInboxCardActionEffects(inbox: appModel.engine.inbox))
                         }
                     }, onOpenGroup: { group = $0 }, closesOnGroupSelection: false, onClose: onDone)
                 } else {
@@ -106,9 +106,9 @@ struct MacWorkOverviewDetail: View {
         Task {
             defer { deciding = false }
             do {
-                _ = try await ApprovalTransactionCoordinator.resolveWorkshopStep(
+                _ = try await ApprovalExecution.resolveWorkshopStep(
                     executionId: execution.id, stepId: execution.currentStepId,
-                    decision: approve ? "approve" : "reject", dataRootOverride: appModel.dataRootOverride)
+                    decision: approve ? "approve" : "reject")
                 onDone()
             } catch { self.error = UserFacingError.message(error, action: "\(approve ? "approve" : "reject") that step") }
         }

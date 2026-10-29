@@ -3,9 +3,9 @@ import Synchronization
 
 // Blueprint: | `OrganPulse.swift` | `OrganPulse`: shared proof-of-pass values and installed recording hook; BackgroundLoops owns durable pulse records |
 
-/// One organ's proof of life: when its pass last ran, what it came to, and how
-/// often it promises to run. A pass that fails leaves no pulse, so its last one
-/// ages until Doctor calls it overdue.
+/// One organ's observation: when its pass ran, its outcome, note and cadence.
+/// Failed passes can record skipped diagnostics; a fresh timestamp alone does
+/// not prove successful work. Doctor reads the outcome, note and cadence together.
 ///
 /// BackgroundLoops owns the record (the `pulses` key of the loop-state file).
 /// Every organ reaches it through this one hook — TurnTrace sits below

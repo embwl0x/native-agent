@@ -1,5 +1,6 @@
 import AgentWorkspace
 import Foundation
+import NativeAgentShared
 import Darwin
 import CryptoKit
 import NativeAgentCore
@@ -12,7 +13,7 @@ import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
-// Blueprint: | `SwiftToolDispatcher+ClaudeBridgeTools.swift` | `SwiftToolDispatcher`: `runClaudeMessage`, `claudeReceiptStatus`, `markWakeStartedNothing` |
+// Blueprint: | `SwiftToolDispatcher+ClaudeBridgeTools.swift` | `SwiftToolDispatcher`: `runClaudeMessage`, `markWakeStartedNothing` finishes shared wake receipts |
 
 extension SwiftToolDispatcher {
     // A carried inbox door is read by its live session; it never starts a headless run.
@@ -32,10 +33,7 @@ extension SwiftToolDispatcher {
         case .success(let fields): (text, priority) = fields
         case .failure(let refusal): return refusal.value
         }
-        // 2026-09-07: a message to Claude must not die on a stale Desk number.
-        // The agent burned eight rounds re-sending with desk_item "123" after
-        // each denial and never delivered its review. A binding that is not
-        // live is dropped, the message goes, and the result says so.
+        // A stale Desk binding is dropped and reported without denying delivery.
         let (deskHandle, droppedDeskItem) = try await delegationDeskHandleDroppingStale(input)
         let pairReviewer: Bool
         switch Self.pairReviewerRequested(in: input) {
@@ -56,7 +54,7 @@ extension SwiftToolDispatcher {
             return envelope
         }
 
-        let originSessionId = Self.extractSessionId(from: input)
+        let originSessionId = ChatToolSessionInjection.explicitSessionId(in: input)
         let origin = Self.agentBridgeReplyOrigin(surface: surface, route: ChatToolSessionContext.replyRoute)
         let dir = inboxURL.deletingLastPathComponent()
 
@@ -82,31 +80,15 @@ extension SwiftToolDispatcher {
         case .success(let selection): conversation = selection
         case .failure(let error): return error.envelope
         }
-        let topic = conversation.topic
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        var entry: [String: JSONValue] = [
-            "id": .string(messageId),
-            "messageId": .string(messageId),
-            "createdAt": .string(timestamp),
-            "from": .string("assistant"),
-            "priority": .string(priority),
-            "text": .string(text),
-            "read": .bool(false),
-        ]
-        if let topic { entry["topic"] = .string(topic) }
-        if let conversationId = conversation.conversationId {
-            entry["conversationId"] = .string(conversationId)
-        }
+        let timestamp = NativeTimestampFormat.plainZulu(Date())
+        var entry = conversation.inboxFields(messageId: messageId, queuedAt: timestamp,
+            priority: priority, text: text, sessionId: originSessionId, origin: origin,
+            workingDirectory: workingDirectory, deskHandle: deskHandle)
         if Self.builderConversationReferenceSupplied(in: input) { entry["requireExistingConversation"] = .bool(true) }
-        if let workingDirectory { entry["workingDirectory"] = .string(workingDirectory) }
-        if let deskHandle { entry["deskHandle"] = .string(deskHandle) }
         if pairReviewer { entry["pairReviewer"] = .bool(true) }
         if fyi { entry["expectsReply"] = .bool(false) }
-        if !originSessionId.isEmpty { entry["sessionId"] = .string(originSessionId) }
-        entry["origin"] = origin
         let inboxEntry = entry
 
-        let persistence = SwiftNativePersistenceCore()
         let quarantineNote = Self.BuilderInboxQuarantineNote()
         let appendResult: (status: String, retryWake: Bool, queuedAt: String)
         do {
@@ -114,14 +96,15 @@ extension SwiftToolDispatcher {
                 messageId, entry: inboxEntry, to: inboxURL, queuedAt: timestamp,
                 comparePairReviewer: true, maxLines: JSONLLineCaps.claudeBridgeInbox,
                 logLabel: "SwiftToolDispatcher.claudeMessage",
-                persistence: persistence, quarantine: quarantineNote, durable: true
+                quarantine: quarantineNote, durable: true
             )
         } catch {
-            return .object([
-                "status": .string("failed"),
-                "reason": .string("inbox_write_failed"),
-                "detail": .string(ChatToolOutcome.errorMessage(error)),
-            ])
+            var failure = Self.builderFailureFields(error, tool: "claude_message",
+                reason: "inbox_write_failed", effects: .unknown, owner: inboxURL.path,
+                instruction: "Reconcile this message_id against the preserved inbox and execution evidence before another send; this wake did not launch.")
+            failure["messageId"] = .string(messageId)
+            Self.stampBuilderInboxQuarantine(quarantineNote, on: &failure)
+            return .object(failure)
         }
         guard appendResult.status != "conflict" else {
             return .object([
@@ -132,62 +115,37 @@ extension SwiftToolDispatcher {
                 "messageId": .string(messageId),
             ])
         }
-        var response: [String: JSONValue] = [
-            "status": .string("queued"),
+        var response = conversation.queuedReceipt(entry: entry, filePath: inboxURL.path,
+            queuedAt: appendResult.queuedAt, deduplicated: appendResult.status == "duplicate",
+            replyWith: "agent.message")
+        response.merge([
+            "delivery": .string("queued"),
             "sent": .bool(true),
             "completed": .bool(false),
             "read": .bool(false),
-            "messageId": .string(messageId),
-            "deduplicated": .bool(appendResult.status == "duplicate"),
-            "filePath": .string(inboxURL.path),
-            "priority": .string(priority),
-            "queuedAt": .string(appendResult.queuedAt),
             "detail": .string("Queued for \(who.name); acceptance is owed until its live session reads this message. Open that session and read this exact message with agent.read; do not resend it."),
             "remedy": door.remedy(),
-        ]
+        ]) { _, new in new }
         Self.stampBuilderInboxQuarantine(quarantineNote, on: &response)
-        if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
-        if let deskHandle { response["deskHandle"] = .string(deskHandle) }
         if let droppedDeskItem {
             response["deskItemIgnored"] = .string(droppedDeskItem)
             response["detail"] = .string((Self.stringField("detail", in: .object(response)) ?? "") + " desk_item '\(droppedDeskItem)' is not a live Desk item; the message was queued without a Desk binding. Omit desk_item unless you have a live handle from app desk.read.")
         }
         if pairReviewer { response["reviewerPairRequested"] = .bool(true) }
-        if let conversationId = conversation.conversationId {
-            response["conversationId"] = .string(conversationId)
-            response["replyWith"] = .string("agent.message")
-        }
         return .object(response)
     }
 
-    /// Maps the wake helper's own status onto the four states this receipt can
-    /// honestly claim. "queued" is the floor, never a lie: the durable inbox
-    /// row is already written by the time we get here, so an unheard-from or
-    /// deduplicated wake is still a real enqueue.
-    static func claudeReceiptStatus(_ wakeup: JSONValue?) -> String {
-        switch stringField("status", in: wakeup ?? .null) {
-        case "sent", "started":
-            // Admitted by the helper: a runner exists. Not proof of completion,
-            // which is what `delegation_status` and the outcome loop are for.
-            return "accepted"
-        case "completed", "replayed":
-            return "completed"
-        case "failed", "blocked":
-            // The row is on disk but nothing was admitted to act on it, so the
-            // receipt must not read healthier than the send actually was.
-            return "failed"
-        default:
-            return "queued"
-        }
-    }
-
-    /// A wake that started nothing (the replay guard, wakes switched off, no
-    /// helper) leaves the row on disk with no one to act on it: "queued" would
-    /// promise an answer that never comes (walk 2, 09-25: OMP "waiting" forever).
-    /// The replay guard's skip is the exception: that work already ran, so it
-    /// reads completed (deduplicated), with delivery reported separately.
+    /// Finish failed and skipped wakes without promising work that never started.
+    /// Already-completed work retains its prior delivery evidence and reply.
     static func markWakeStartedNothing(_ response: inout [String: JSONValue], agent: String, dataRoot: URL) {
         let wakeup = response["wakeup"] ?? .null
+        if let status = stringField("status", in: wakeup), ["failed", "blocked"].contains(status) {
+            response["status"] = .string("failed")
+            if let why = stringField("fix", in: wakeup) ?? stringField("message", in: wakeup) ?? stringField("detail", in: wakeup) {
+                response["detail"] = .string(why)
+            }
+            return
+        }
         guard stringField("status", in: wakeup) == "skipped", let reason = stringField("reason", in: wakeup) else { return }
         if reason == "already_completed" {
             // Say which run, its recorded delivery, and any retained answer.

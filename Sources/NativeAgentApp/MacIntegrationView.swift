@@ -1,4 +1,3 @@
-import Connectors
 import TrustCenter
 
 // Blueprint: | `MacIntegrationView.swift` | `MacIntegrationView`: checked integration read/write controls, actual permission probes and truthful System Settings handoff outcomes |
@@ -7,67 +6,18 @@ import SwiftUI
 import EngineRuntime
 import MacIntegration
 import MacControl
-import AVFoundation
 import DeviceSync
 
 /// Presentation-level truth for the System Permissions card. These helpers
 /// deliberately accept only the statuses the real probes can verify; cached,
 /// stale, or invented values must keep the acquisition CTA visible.
 enum MacIntegrationSystemPermissionPresentation {
-    static let speechRecognitionKey = "speech_recognition"
-    static let microphoneKey = "microphone"
-    static let calendarKey = "calendar"
-    static let remindersKey = "reminders"
-    static let contactsKey = "contacts"
-    static let appleEventsMailKey = "apple_events_mail"
-    static let appleEventsMessagesKey = "apple_events_messages"
-    static let appleEventsNotesKey = "apple_events_notes"
-    static let appleEventsMusicKey = "apple_events_music"
-
-    static let statusKeys = [
-        speechRecognitionKey, microphoneKey,
-        calendarKey, remindersKey, contactsKey,
-        appleEventsMailKey, appleEventsMessagesKey,
-        appleEventsNotesKey, appleEventsMusicKey,
-    ]
-
     static func allGranted(_ statuses: [String: String]) -> Bool {
-        statusKeys.allSatisfy { statuses[$0] == "granted" || statuses[$0] == "authorized" }
+        let keys = MacIntegrationFrameworkPermission.allCases.map(\.rawValue)
+            + AppleScriptExecution.automationTargetApps.map { AppleScriptExecution.automationStatusKey(app: $0) }
+        return keys.allSatisfy { statuses[$0] == "granted" || statuses[$0] == "authorized" }
     }
 
-}
-
-/// The only System Settings launch boundary for the Mac Integration panel.
-/// A valid deep-link URL is not proof the handoff succeeded: `NSWorkspace.open`
-/// can return false when the target pane is unavailable, so retain that result
-/// and surface it through the panel's request-failure alert.
-enum MacIntegrationSettingsDeepLink {
-    enum Outcome: Equatable {
-        case opened(SystemPermissionCapability)
-        case unavailable(SystemPermissionCapability)
-        case failed(SystemPermissionCapability)
-
-        var failureMessage: String? {
-            switch self {
-            case .opened:
-                return nil
-            case .unavailable(let capability):
-                return "NativeAgent could not find a System Settings privacy pane for \(capability.displayName)."
-            case .failed(let capability):
-                return "NativeAgent could not open System Settings → Privacy & Security → \(capability.displayName). Open System Settings manually, enable NativeAgent, then return here and refresh."
-            }
-        }
-    }
-
-    static func open(
-        _ capability: SystemPermissionCapability,
-        using opener: (URL) -> Bool = { NSWorkspace.shared.open($0) }
-    ) -> Outcome {
-        guard let url = SystemPermissionPreflight.settingsURL(for: capability) else {
-            return .unavailable(capability)
-        }
-        return opener(url) ? .opened(capability) : .failed(capability)
-    }
 }
 
 /// The persisted integration policy is an authority store, so an existing
@@ -133,39 +83,7 @@ private struct MacIntegrationPermissionLoadErrorPanel: View {
     }
 }
 
-/// Pure state/copy boundary for the two visually similar permission alerts.
-/// The save alert and a TCC-request failure are different user actions and
-/// remain separately gated even when both errors exist at once.
-enum MacIntegrationPermissionFailurePresentation {
-    static let saveAlertTitle = "Permission save failed"
-    static let requestAlertTitle = "Permission request failed"
-
-    static func saveAlertIsPresented(
-        persistenceError: String?,
-        requestError: String?
-    ) -> Bool {
-        persistenceError != nil
-    }
-
-    static func requestAlertIsPresented(
-        persistenceError: String?,
-        requestError: String?
-    ) -> Bool {
-        requestError != nil
-    }
-
-    static func registrationFailureMessage(for permission: MacIntegrationFrameworkPermission) -> String {
-        if permission == .calendar {
-            return "macOS rejected NativeAgent's Calendar permission request. Tell the person about this permission failure and preserve the reported error."
-        }
-        return "macOS did not register the \(permission.label) permission request. Keep NativeAgent in the foreground and try Grant once more."
-    }
-}
-
 struct MacIntegrationView: View {
-    /// Trust's one Mac tab: Chrome control and Mac control lead, the per-app
-    /// grants follow. Off where this view stands alone.
-    var showsMacControl = false
     @Environment(AppModel.self) private var appModel
     @Environment(\.scenePhase) private var scenePhase
     private var projection: MacIntegrationFacade { appModel.engine.macIntegration }
@@ -175,9 +93,7 @@ struct MacIntegrationView: View {
     private var tccStatuses: [String: String] { projection.systemStatuses }
     @State private var persistenceError: String?
 
-    // PATCH-2026-06-07: TCC permission wizard. Lets the user do the system-prompt
-    // dance once up front instead of one-at-a-time when Agent first tries each
-    // tool. Keys: "calendar" | "reminders" | "contacts" | "apple_events".
+    // Request system permissions up front for calendar, reminders, contacts and Apple events.
     @State private var isRequestingAll: Bool = false
     @State private var requestingFramework: MacIntegrationFrameworkPermission? = nil
     @State private var permissionRequestError: String?
@@ -185,27 +101,13 @@ struct MacIntegrationView: View {
     /// (so we can show a spinner + disable the other Grant buttons).
     @State private var requestingApp: String? = nil
 
-    /// Maps the shared `SystemPermissionStatus` onto the snake_case status
-    /// strings this view's badges and Grant/Open-Settings branches already use.
-    nonisolated private static func badgeKey(_ status: SystemPermissionStatus) -> String {
-        switch status {
-        case .granted: return "granted"
-        case .denied: return "denied"
-        case .restricted: return "restricted"
-        case .notDetermined: return "not_determined"
-        case .unknown: return "unknown"
-        }
-    }
-
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
-                if showsMacControl {
-                    AdvancedSection(title: "Chrome control") {
-                        ChromeControlPermissionsView()
-                    }
-                    MacControlPermissionsView()
+                AdvancedSection(title: "Chrome control") {
+                    ChromeControlPermissionsView()
                 }
+                MacControlPermissionsView()
                 Text("Choose which Mac apps and features I can read from or use. Contacts, Mail, Messages and Notes start with read on and write off; turn on write to let me send or change anything there. Changes apply right away.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
@@ -215,28 +117,16 @@ struct MacIntegrationView: View {
                     Text("Grant only the access you want to use. You can return here later; ordinary text chat needs none of these permissions.")
                         .font(ShellType.caption)
                         .foregroundStyle(NativeAgentShell.secondary)
-                    // 2026-06-07 the user caught "only 4 system permission rows but
-                    // way more tabs underneath." The collapsed "AppleEvents"
-                    // row hid 4 distinct per-app TCC grants (Mail / Messages
-                    // / Notes / Music) — couldn't tell which app was missing.
-                    // Each integration that needs a real macOS TCC grant now
-                    // gets its own row with its own badge.
-                    // 2026-08-18: Speech Recognition first — it is the one the
-                    // headless Telegram voice path silently depends on, and the
-                    // one a user has no other way to discover is missing.
-                    tccStatusRow(label: "Speech recognition", icon: "waveform", statusKey: MacIntegrationSystemPermissionPresentation.speechRecognitionKey, frameworkPermission: .speechRecognition)
-                    tccStatusRow(label: "Microphone", icon: "mic", statusKey: MacIntegrationSystemPermissionPresentation.microphoneKey, frameworkPermission: .microphone)
-                    tccStatusRow(label: "Calendar", icon: "calendar", statusKey: MacIntegrationSystemPermissionPresentation.calendarKey, frameworkPermission: .calendar)
-                    tccStatusRow(label: "Reminders", icon: "checklist", statusKey: MacIntegrationSystemPermissionPresentation.remindersKey, frameworkPermission: .reminders)
-                    tccStatusRow(label: "Contacts", icon: "person.crop.circle", statusKey: MacIntegrationSystemPermissionPresentation.contactsKey, frameworkPermission: .contacts)
-                    tccStatusRow(label: "Mail",     icon: "envelope",  statusKey: MacIntegrationSystemPermissionPresentation.appleEventsMailKey,     appleEventApp: "Mail")
-                    tccStatusRow(label: "Messages", icon: "message",   statusKey: MacIntegrationSystemPermissionPresentation.appleEventsMessagesKey, appleEventApp: "Messages")
-                    tccStatusRow(label: "Notes",    icon: "note.text", statusKey: MacIntegrationSystemPermissionPresentation.appleEventsNotesKey,    appleEventApp: "Notes")
-                    tccStatusRow(label: "Music",    icon: "music.note",statusKey: MacIntegrationSystemPermissionPresentation.appleEventsMusicKey,    appleEventApp: "Music")
+                    // Each TCC grant has its own row; Speech Recognition comes first for headless Telegram voice.
+                    tccStatusRow(label: "Speech recognition", icon: "waveform", frameworkPermission: .speechRecognition)
+                    tccStatusRow(label: "Microphone", icon: "mic", frameworkPermission: .microphone)
+                    tccStatusRow(label: "Calendar", icon: "calendar", frameworkPermission: .calendar)
+                    tccStatusRow(label: "Reminders", icon: "checklist", frameworkPermission: .reminders)
+                    tccStatusRow(label: "Contacts", icon: "person.crop.circle", frameworkPermission: .contacts)
+                    ForEach(Array(zip(AppleScriptExecution.automationTargetApps, ["envelope", "message", "note.text", "music.note"])), id: \.0) { app, icon in
+                        tccStatusRow(label: app, icon: icon)
+                    }
 
-                    // Taste pass 2026-07-24: with every row above already
-                    // granted, a prominent "Grant All" CTA is a dead button and
-                    // the page's focal point — collapse it to a status line.
                     if allSystemPermissionsGranted {
                         Text("Every system permission is granted.")
                             .font(ShellType.label)
@@ -291,12 +181,7 @@ struct MacIntegrationView: View {
                     }
                 }
 
-                // 2026-07-23 B2.5a cross-link: this tab owns per-app system
-                // (TCC) grants + per-surface read/write. The Mac Control
-                // CAPABILITY policy (shell, AppleScript, Accessibility, file
-                // ops, iOS remote) and the assistant watch live in the Trust
-                // tab — pointed to here so each control has one discoverable
-                // home instead of the old two-tab split.
+                // This tab owns TCC grants and integration access; Mac control capabilities live in Trust.
                 AdvancedSection(title: "Mac control capabilities") {
                     Text("Shell commands, AppleScript, clicking and typing, file operations, iPhone remote control and background watches live on the Trust page under Mac control.")
                         .font(ShellType.label)
@@ -333,28 +218,18 @@ struct MacIntegrationView: View {
                 .help("Check permissions again after changing them in System Settings.")
                 .accessibilityLabel("Refresh Mac permissions")
         }
-        .alert(MacIntegrationPermissionFailurePresentation.saveAlertTitle,
+        .alert("Permission save failed",
                isPresented: Binding(
-                get: {
-                    MacIntegrationPermissionFailurePresentation.saveAlertIsPresented(
-                        persistenceError: persistenceError,
-                        requestError: permissionRequestError
-                    )
-                },
+                get: { persistenceError != nil },
                 set: { if !$0 { persistenceError = nil } }
                )) {
             Button("OK", role: .cancel) { persistenceError = nil }
         } message: {
             Text(persistenceError ?? "")
         }
-        .alert(MacIntegrationPermissionFailurePresentation.requestAlertTitle,
+        .alert("Permission request failed",
                isPresented: Binding(
-                get: {
-                    MacIntegrationPermissionFailurePresentation.requestAlertIsPresented(
-                        persistenceError: persistenceError,
-                        requestError: permissionRequestError
-                    )
-                },
+                get: { permissionRequestError != nil },
                 set: { if !$0 { permissionRequestError = nil } }
                )) {
             Button("OK", role: .cancel) { permissionRequestError = nil }
@@ -462,10 +337,9 @@ struct MacIntegrationView: View {
     private func tccStatusRow(
         label: String,
         icon: String,
-        statusKey: String,
-        frameworkPermission: MacIntegrationFrameworkPermission? = nil,
-        appleEventApp: String? = nil
+        frameworkPermission: MacIntegrationFrameworkPermission? = nil
     ) -> some View {
+        let statusKey = frameworkPermission?.rawValue ?? AppleScriptExecution.automationStatusKey(app: label)
         let status = tccStatuses[statusKey] ?? "unknown"
         return HStack(spacing: 12) {
             Image(systemName: icon)
@@ -505,20 +379,14 @@ struct MacIntegrationView: View {
                     .controlSize(.small)
                 }
             }
-            // Per-app Automation control. The passive probe never prompts
-            // (askUserIfNeeded:false) and the chat/bridge AppleScript path
-            // can't surface the first-run prompt from its background queue —
-            // so this button is the ONLY in-app way to fire a single app's
-            // Automation consent. Surgical by design: grants exactly THIS
-            // app, never the Mail/Music "Grant All" bazooka. For a state
-            // that's already a hard denial, the prompt can't re-fire, so we
-            // deep-link to the Automation pane instead.
-            if let app = appleEventApp {
+            // Ask for this app's Automation consent through the shared owner;
+            // a resolved denial needs the Automation pane instead.
+            if frameworkPermission == nil {
                 if status == "not_determined" || status == "unknown" || status == "app_not_running" {
                     Button {
-                        Task { await requestAppleEventGrant(app) }
+                        Task { await requestAppleEventGrant(label) }
                     } label: {
-                        if requestingApp == app {
+                        if requestingApp == label {
                             ProgressView().controlSize(.small)
                         } else {
                             Text("Grant")
@@ -553,191 +421,40 @@ struct MacIntegrationView: View {
     private func requestFrameworkGrant(_ permission: MacIntegrationFrameworkPermission) async {
         requestingFramework = permission
         defer { requestingFramework = nil }
-
-        let status: String
-        switch permission {
-        case .calendar:
-            status = await LocalPIMConnectorActions.requestCalendarAccess()
-        case .reminders:
-            status = await LocalPIMConnectorActions.requestReminderAccess()
-        case .contacts:
-            status = await MacContactsExecutor.requestAccess()
-        case .speechRecognition:
-            // This is the acquisition path the headless Telegram voice pipeline
-            // never had. The call is a no-op unless the grant is still
-            // notDetermined — macOS refuses to re-prompt a resolved grant, so a
-            // denied state falls through to System Settings below instead of
-            // leaving the user tapping a button that does nothing.
-            status = Self.badgeKey(
-                await SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined())
-        case .microphone:
-            status = await AVCaptureDevice.requestAccess(for: .audio)
-                ? "granted"
-                : Self.badgeKey(SystemPermissionPreflight.status(.microphone))
-        }
-        await projection.refresh()
-
-        if status == "denied" || status == "restricted" {
-            // A resolved denial cannot be re-prompted. Say so AND open the pane,
-            // rather than reporting a silent no-op.
-            permissionRequestError = "\(permission.label) is already \(status) for NativeAgent, "
-                + "and macOS will not ask again once a permission has been answered. "
-                + "Opening System Settings → Privacy & Security → \(permission.label) — "
-                + "switch NativeAgent on there, then hit Refresh."
-            openSystemSettings(permission.capability)
-        } else if status == "not_determined" || status == "unknown" {
-            permissionRequestError = MacIntegrationPermissionFailurePresentation.registrationFailureMessage(for: permission)
-        }
+        await requestPermissions(["privacy:" + permission.capability.rawValue])
     }
 
     /// Preserve a failed Settings handoff in the same visible alert used for a
     /// failed permission request. Opening a pane is a user-facing recovery
     /// action; returning false must never look like a successful click.
-    @discardableResult
-    private func openSystemSettings(
-        _ capability: SystemPermissionCapability,
-        opener: (URL) -> Bool = { NSWorkspace.shared.open($0) }
-    ) -> MacIntegrationSettingsDeepLink.Outcome {
-        let outcome = MacIntegrationSettingsDeepLink.open(capability, using: opener)
-        if let message = outcome.failureMessage {
+    private func openSystemSettings(_ capability: SystemPermissionCapability) {
+        if let message = SystemPermissionPreflight.openSettings(capability) {
             permissionRequestError = message
         }
-        return outcome
     }
 
     private func grantAllPermissions() async {
         isRequestingAll = true
         defer { isRequestingAll = false }
 
-        // Speech Recognition — first, and BEFORE the microphone prompt, because
-        // it is the grant with no other acquisition path in the whole app.
-        let speech = Self.badgeKey(
-            await SystemPermissionPreflight.requestSpeechRecognitionIfNotDetermined())
-
-        // Microphone
-        let micGranted = await AVCaptureDevice.requestAccess(for: .audio)
-        let mic = micGranted ? "granted" : Self.badgeKey(SystemPermissionPreflight.status(.microphone))
-
-        // Calendar
-        let cal = await LocalPIMConnectorActions.requestCalendarAccess()
-
-        // Reminders
-        let rem = await LocalPIMConnectorActions.requestReminderAccess()
-
-        // Contacts
-        let con = await MacContactsExecutor.requestAccess()
-
-        let unresolvedFrameworks = [
-            ("Speech Recognition", speech),
-            ("Microphone", mic),
-            ("Calendar", cal),
-            ("Reminders", rem),
-            ("Contacts", con),
-        ].compactMap { label, status in
-            (status == "not_determined" || status == "unknown") ? label : nil
+        let automation = AppleScriptExecution.automationTargetApps.compactMap {
+            AppleScriptExecution.automationTargetBundleIDs[$0].map { "applescript:" + $0 }
         }
-        if !unresolvedFrameworks.isEmpty {
-            permissionRequestError = "macOS did not register: \(unresolvedFrameworks.joined(separator: ", ")). Keep NativeAgent in the foreground and use the individual Grant button. If Calendar remains unresolved, tell the person about the permission failure."
-        }
-
-        // AppleEvents — request each target app independently so macOS creates
-        // the real Automation rows for NativeAgent. The passive probe cannot
-        // repair a nuked TCC table because it deliberately does not prompt.
-        var aeStatuses: [String: String] = [:]
-        for app in SystemAppleScriptAdapter.automationTargetApps {
-            await ensureAppleEventsTargetLaunched(app)
-            let s = await Self.requestAppleEventApp(app)
-            aeStatuses[app] = s
-        }
-        let anyAEDenied = aeStatuses.values.contains("denied")
-
-        await projection.refresh()
-
-        // 2026-06-07 the user caught "I hit grant all permissions now it does
-        // nothing." Root cause: macOS only fires the TCC prompt when
-        // status is .notDetermined. If a permission was previously
-        // denied (user clicked "Don't Allow" once), the request* APIs
-        // return silently — no UI feedback, nothing happens. Same for
-        // already-granted: no prompt, just returns the existing status.
-        //
-        // For permissions stuck in denied/restricted state, open
-        // System Settings directly to the right pane so the user can
-        // toggle the switch manually. Each Apple framework has its own
-        // pane URL — these are stable Apple-documented anchors. For
-        // AppleEvents we open the Automation pane once if ANY of the
-        // 4 target apps is denied (the pane lists all four under
-        // NativeAgent so the user can fix them in one place).
-        // 2026-06-07 macOS 13+ ships System Settings (not System Preferences)
-        // and the URL scheme changed. Old `com.apple.preference.security`
-        // works on macOS 12 and earlier; new
-        // `com.apple.settings.PrivacySecurity.extension` works on 13+. We
-        // try the new one first; NSWorkspace.open falls back gracefully if
-        // the bundle isn't installed (returns false but doesn't throw).
-        var needsManualGrant: [SystemPermissionCapability] = []
-        if speech == "denied" || speech == "restricted" {
-            needsManualGrant.append(.speechRecognition)
-        }
-        if mic == "denied" || mic == "restricted" {
-            needsManualGrant.append(.microphone)
-        }
-        if cal == "denied" || cal == "restricted" {
-            needsManualGrant.append(.calendars)
-        }
-        if rem == "denied" || rem == "restricted" {
-            needsManualGrant.append(.reminders)
-        }
-        if con == "denied" || con == "restricted" {
-            needsManualGrant.append(.contacts)
-        }
-        if anyAEDenied {
-            needsManualGrant.append(.automation)
-        }
-        // Open one pane per stuck permission, spaced 400ms apart so the
-        // user can see each window open instead of a single one stealing
-        // focus. NSWorkspace.open is the standard way to open
-        // x-apple.systempreferences: URLs.
-        var settingsFailures: [String] = []
-        for (i, capability) in needsManualGrant.enumerated() {
-            try? await Task.sleep(nanoseconds: UInt64(i * 400_000_000))
-            if let message = openSystemSettings(capability).failureMessage {
-                settingsFailures.append(message)
-            }
-        }
-        if !settingsFailures.isEmpty {
-            permissionRequestError = settingsFailures.joined(separator: " ")
-        }
+        await requestPermissions(MacIntegrationFrameworkPermission.allCases.map(\.rawValue) + automation)
     }
 
-    /// Fires the REAL Automation consent prompt for ONE target app, then
-    /// records the resulting state. This is the surgical counterpart to
-    /// `grantAllPermissions()` — the user asked for exactly Messages + Notes, not
-    /// the four-app bazooka. The target app must be running for the consent
-    /// check to prompt (otherwise it returns procNotFound/-600 silently), so
-    /// we launch it without stealing focus first.
+    /// The shared permission owner asks for just this app's Automation grant.
     private func requestAppleEventGrant(_ app: String) async {
         requestingApp = app
         defer { requestingApp = nil }
-        await ensureAppleEventsTargetLaunched(app)
-        _ = await Self.requestAppleEventApp(app)
+        guard let bundleID = AppleScriptExecution.automationTargetBundleIDs[app] else { return }
+        await requestPermissions(["applescript:" + bundleID])
+    }
+
+    private func requestPermissions(_ ids: [String]) async {
+        let problems = await SystemPermissionPreflight.requestMacOSAccess(ids)
+        permissionRequestError = problems.isEmpty ? nil : problems.joined(separator: " ")
         await projection.refresh()
-    }
-
-    private func ensureAppleEventsTargetLaunched(_ app: String) async {
-        if let bundleID = SystemAppleScriptAdapter.automationTargetBundleIDs[app],
-           let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID) {
-            let cfg = NSWorkspace.OpenConfiguration()
-            cfg.activates = false
-            _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: cfg)
-        }
-    }
-
-    /// Same as `probeAppleEventApp` but passes `askUserIfNeeded: true` so the
-    /// system PRESENTS the consent prompt when the grant is not yet
-    /// determined. Must run off the main thread — the call blocks while the
-    /// user answers. A previously-denied grant won't re-prompt (TCC respects
-    /// the recorded "no"); use the row's Open Settings deep-link for that.
-    private static func requestAppleEventApp(_ app: String) async -> String {
-        await SystemAppleScriptAdapter.automationStatus(app: app, ask: true)
     }
 
     private static func statusBadgeColor(_ status: String) -> Color {
@@ -782,9 +499,5 @@ struct MacIntegrationView: View {
     }
 }
 
-// MARK: - Page kit (2026-09-03 Advanced refinement)
-//
-// The page was a grouped `Form`: every row sat on its own inset slab, and on
-// the shell's one sheet that read as a stack of plates rather than a page.
-// A section is now the Advanced list's shape — an eyebrow, then one card.
+// MARK: - Page kit
 

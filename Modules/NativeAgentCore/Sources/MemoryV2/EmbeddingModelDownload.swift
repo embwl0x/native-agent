@@ -5,6 +5,7 @@ import PersistenceCore
 import Synchronization
 #if os(macOS)
 import Darwin
+import NativeAgentShared
 // Blueprint: | `EmbeddingModelDownload.swift` | `EmbeddingModelDownload` actor; `ranges`, `assemble`; operation-scoped status observation and retained, cancellation-aware extraction through actual subprocess exit; shared status text and progress projection |
 #endif
 
@@ -139,7 +140,7 @@ public actor EmbeddingModelDownload {
         guard size > 0, parts > 0 else { return [] }
         let chunk = (size - 1) / Int64(parts) + 1
         return stride(from: Int64(0), to: size, by: Int(chunk)).map {
-            ByteRange(start: $0, end: min(size - 1, $0 + chunk - 1))
+            ByteRange(start: $0, end: $0 + min(chunk - 1, size - 1 - $0))
         }
     }
 

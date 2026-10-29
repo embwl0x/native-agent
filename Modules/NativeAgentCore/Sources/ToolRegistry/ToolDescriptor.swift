@@ -4,7 +4,7 @@ import PersistenceCore
 import os
 // Blueprint: | `ToolDescriptor.swift` | `ToolDescriptor`, `ToolExecutor`, `AppActionBinding`: composed action calls, effect declarations (class, reach, capabilities; each form supplies the common case) and executable ownership registration |
 
-// MARK: - Tool descriptors (S9, 2026-09-26)
+// MARK: - Tool descriptors
 
 /// Stable, runtime-owned categories for the Tools catalog. The catalog is the
 /// authority for the mounted tool set; this registry is the authority for the
@@ -119,19 +119,17 @@ public struct AppActionBinding: Sendable {
         read || (!readWhen.isEmpty && readWhen.allSatisfy { (args[$0.key] ?? .null) == $0.value })
     }
 
-    /// The two resolvers an executor installs, held by reference. A closure
-    /// stored inside the lock's generic state is wrapped in a reabstraction
-    /// thunk pair on every mutation of that state: after hours of chain
-    /// builds the part resolver sat under hundreds of nested thunks, and the
-    /// first unregistered action name overran a cooperative thread's 512 KB
-    /// stack (Agent's 18:58Z crash, 10-17; the same on the test copy after
-    /// ninety seconds). A class's stored closure keeps one shape.
+    /// Hold executor closures by reference so generic lock-state mutations cannot
+    /// accumulate reabstraction thunks around them.
     private final class Resolvers: Sendable {
         let authorableToolName: @Sendable (String) -> Bool
         let part: @Sendable (String) -> AppActionBinding?
-        init(authorableToolName: @escaping @Sendable (String) -> Bool, part: @escaping @Sendable (String) -> AppActionBinding?) {
+        let catalog: @Sendable () -> [String: AppActionBinding]
+        init(authorableToolName: @escaping @Sendable (String) -> Bool, part: @escaping @Sendable (String) -> AppActionBinding?,
+             catalog: @escaping @Sendable () -> [String: AppActionBinding]) {
             self.authorableToolName = authorableToolName
             self.part = part
+            self.catalog = catalog
         }
     }
 
@@ -139,12 +137,20 @@ public struct AppActionBinding: Sendable {
     // receipt. No static initializer here reaches back into the app schemas.
     private static let registry = OSAllocatedUnfairLock(initialState: (
         actions: [String: AppActionBinding](), tools: [String: ToolDescriptor](),
-        resolvers: Resolvers(authorableToolName: { _ in false }, part: { _ in nil })))
+        resolvers: Resolvers(authorableToolName: { _ in false }, part: { _ in nil }, catalog: { [:] })))
 
-    public static func register(_ actions: [String: AppActionBinding], tools: [ToolDescriptor], authorableToolName: @escaping @Sendable (String) -> Bool, partPolicy: @escaping @Sendable (String) -> AppActionBinding?) {
+    public static func register(_ actions: [String: AppActionBinding], tools: [ToolDescriptor], authorableToolName: @escaping @Sendable (String) -> Bool, partPolicy: @escaping @Sendable (String) -> AppActionBinding?,
+                                policyCatalog: @escaping @Sendable () -> [String: AppActionBinding] = { [:] }) {
         registerTools(tools)
-        let resolvers = Resolvers(authorableToolName: authorableToolName, part: partPolicy)
+        let resolvers = Resolvers(authorableToolName: authorableToolName, part: partPolicy, catalog: policyCatalog)
         registry.withLock { $0 = (actions, $0.tools, resolvers) }
+    }
+
+    @TaskLocal private static var catalog: [String: AppActionBinding]?
+
+    /// One synchronous, bounded projection operation, including misses.
+    package static func withCatalog<T>(_ body: () throws -> T) rethrows -> T {
+        try $catalog.withValue(registry.withLock { $0.resolvers }.catalog(), operation: body)
     }
 
     /// The core dispatcher's own tool names, registered where the dispatcher is
@@ -162,7 +168,7 @@ public struct AppActionBinding: Sendable {
     }
 
     public static func builtInToolName(_ tool: String) -> Bool {
-        registry.withLock { $0.tools[tool] != nil }
+        registry.withLock { $0.tools[ToolNameAliases.canonical(tool)] != nil }
     }
 
     /// How many tool names are reserved; the table only grows, so a reader
@@ -171,16 +177,16 @@ public struct AppActionBinding: Sendable {
 
     /// The class a registered tool's declaration gives it.
     public static func declaredClass(_ tool: String) -> ToolClass? {
-        registry.withLock { $0.tools[tool]?.schema.toolClass }
+        registry.withLock { $0.tools[ToolNameAliases.canonical(tool)]?.schema.toolClass }
     }
 
     public static func declaredSchema(_ tool: String) -> LLMToolSchema? {
-        registry.withLock { $0.tools[tool]?.schema }
+        registry.withLock { $0.tools[ToolNameAliases.canonical(tool)]?.schema }
     }
 
     /// The catalog bucket a registered tool is filed under.
     public static func declaredBucket(_ tool: String) -> ChatToolCatalogBucket? {
-        registry.withLock { $0.tools[tool]?.bucket }
+        registry.withLock { $0.tools[ToolNameAliases.canonical(tool)]?.bucket }
     }
 
     public static func authorableToolName(_ tool: String) -> Bool {
@@ -209,7 +215,9 @@ public struct AppActionBinding: Sendable {
         let key = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !key.isEmpty else { return nil }
         let (saved, resolvers) = registry.withLock { ($0.actions[key], $0.resolvers) }
-        return saved ?? resolvers.part(key)
+        if let saved { return saved }
+        if let catalog { return catalog[key] }
+        return resolvers.part(key)
     }
 
     static func actionID(tool: String, input: [String: JSONValue]) -> String? {

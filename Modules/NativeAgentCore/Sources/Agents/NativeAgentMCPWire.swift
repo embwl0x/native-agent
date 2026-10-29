@@ -1,4 +1,5 @@
 import Foundation
+import ChatToolParsing
 import CoreFoundation
 // Blueprint: | `NativeAgentMCPWire.swift` | MCP negotiation, parsing, caller-supplied request identity and reply projection |
 
@@ -6,7 +7,8 @@ import CoreFoundation
 /// stay with the canonical bridge and chat owners.
 enum NativeAgentMCPWire {
     enum Action {
-        case message(body: Data, project: @Sendable (Int, [String: Any]) -> [String: Any])
+        case message(body: [String: Any], replayBody: Data, wait: (seconds: Int, progressToken: ID?),
+                     project: @Sendable (Int, [String: Any]) -> [String: Any])
         case reply(requestID: String, sessionID: String, offset: Int, waitSeconds: Int,
                    project: @Sendable ([String: Any]) -> [String: Any])
         case immediate(status: Int, body: [String: Any])
@@ -36,9 +38,8 @@ enum NativeAgentMCPWire {
     typealias Held = (messages: [[String: String]], remaining: Int)
 
     /// `held` rides beside the normal result of either tool (`held_messages`).
-    static func parse(_ body: Data, defaultSession: String? = nil, held: Held = ([], 0)) -> Action {
-        guard body.count <= 100_000,
-              let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+    static func parse(_ json: [String: Any]?, byteCount: Int, defaultSession: String? = nil, held: Held = ([], 0)) -> Action {
+        guard byteCount <= 100_000, let json else {
             return failure(.null, code: -32700, message: "Expected one bounded JSON-RPC request.")
         }
         let id: ID
@@ -90,9 +91,7 @@ enum NativeAgentMCPWire {
                       text.utf8.count <= 64000 else {
                     return failure(id, code: -32602, message: "Provide nonempty text up to 64000 UTF-8 bytes and optional session/request IDs.")
                 }
-                // The id stays the transport's task and replay locator, so a retry
-                // carries the same bytes; every id runs in the contact's one
-                // conversation with her (`storedConversation`, User 10-20).
+                // The id is the transport's replay locator; every id runs in the contact's one conversation.
                 let session: String
                 if let supplied = args["session_id"] {
                     guard let value = supplied as? String, validSession(value) else {
@@ -100,19 +99,19 @@ enum NativeAgentMCPWire {
                     }
                     session = value
                 } else { session = defaultSession ?? "mcp-" + UUID().uuidString.lowercased() }
-                // request_id is REQUIRED, and minting one here is exactly what
-                // made it useless: it is the at-most-once claim key
-                // (AgentPeerReplayClaimStore), so a server-minted id meant the
-                // same JSON-RPC bytes, re-sent, claimed a fresh key and ran
-                // the turn again. Only the caller can say "this is the same
-                // message I already sent".
+                // Only the caller can identify a retry with the same request_id.
                 guard let supplied = args["request_id"], let request = supplied as? String,
                       exactUUID(request) else {
                     return failure(id, code: -32602, message: "request_id is required and must be a canonical UUID. It is this message's replay key: retry the same message under the same request_id, and use a new one only for new content.")
                 }
-                if let raw = args["wait_seconds"], wholeNumber(raw, in: 0...maximumWaitSeconds) == nil {
+                guard let seconds = wholeNumber(args["wait_seconds"] ?? defaultWaitSeconds, in: 0...maximumWaitSeconds) else {
                     return failure(id, code: -32602, message: "wait_seconds must be an integer from 0 through \(maximumWaitSeconds).")
                 }
+                let rawToken = (params["_meta"] as? [String: Any])?["progressToken"]
+                var token: ID?
+                if let text = rawToken as? String, text.utf8.count <= 256 { token = .string(text) }
+                else if let number = rawToken as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                        number.stringValue == String(number.int64Value) { token = .number(number.int64Value) }
                 // wait_seconds stays OUT of the message body: that body is the
                 // replay digest, and waiting longer is not different content.
                 let message: [String: Any] = ["text": text, "sessionId": session, "request_id": request]
@@ -120,7 +119,7 @@ enum NativeAgentMCPWire {
                     return failure(id, code: -32603, message: "Could not encode message.")
                 }
                 let agent = PeerFacingIdentity.agentName
-                return .message(body: data, project: { status, receipt in
+                return .message(body: message, replayBody: data, wait: (seconds, token), project: { status, receipt in
                     let accepted = status == 200 && receipt["ack"] as? String == "enqueued"
                         && receipt["sessionId"] as? String == session
                         && receipt["requestId"] as? String == request
@@ -133,25 +132,25 @@ enum NativeAgentMCPWire {
                     ]
                     if status >= 400 && status < 500 { result["status"] = "rejected" }
                     if !accepted, let detail = receipt["detail"] { result["detail"] = detail }
-                    // The call waited (waitRequest): carry what the task holds now.
+                    // A waited call carries what the task holds now.
                     var failed = !accepted
                     if accepted, let state = receipt["original_status"] as? String {
-                        for key in ["reply", "has_more", "next_offset", "original_status", "run_id", "provider_failure", "work", "delegated_completions"] {
+                        for key in ["reply", "attachments", "completionDelivery", "deliveryId", "has_more", "next_offset", "original_status", "run_id", "provider_failure", "work", "delegated_completions", "retrieval_result_class", "execution_result_class", "execution_terminal"] {
                             result[key] = receipt[key]
                         }
                         let more = receipt["has_more"] as? Bool == true
                         if more, let next = receipt["next_offset"] {
                             result["read_with"] = ["tool": "agent_reply", "arguments": ["session_id": session, "request_id": request, "offset": next]]
                         }
-                        switch state {
-                        case "completed":
+                        let execution = ChatToolOutcome.ExactResultClass(rawValue: receipt["execution_result_class"] as? String ?? "")
+                        if execution == .succeeded {
                             result["status"] = "answered"
                             result["detail"] = more ? "\(agent) answered. Follow read_with for the rest of the reply." : "\(agent) answered."
-                        case "failed", "canceled", "stopped":
+                        } else if execution?.isFailure == true {
                             result["status"] = state
                             result["detail"] = receipt["detail"] ?? "The turn did not finish. Do not resend automatically."
                             failed = true
-                        default:
+                        } else {
                             result["detail"] = "Queued and still in progress (\(state)); reply holds what is written so far. Read the rest with agent_reply. Do not resend."
                         }
                     }
@@ -179,33 +178,18 @@ enum NativeAgentMCPWire {
                     waitSeconds = value
                 }
                 return .reply(requestID: request, sessionID: session, offset: offset, waitSeconds: waitSeconds, project: { receipt in
-                    let allowed: Set<String> = ["status", "reply", "request_id", "session_id", "run_id", "offset", "next_offset", "has_more", "evidence", "coverage", "original_status", "original_outcome", "detail", "provider_failure", "work", "delegated_completions", "wait_ignored"]
+                    let allowed: Set<String> = ["status", "reply", "attachments", "completionDelivery", "deliveryId", "request_id", "session_id", "run_id", "offset", "next_offset", "has_more", "evidence", "coverage", "original_status", "original_outcome", "detail", "provider_failure", "work", "delegated_completions", "wait_ignored", "retrieval_result_class", "execution_result_class", "execution_terminal"]
                     return toolResult(id, fields: receipt.filter { allowed.contains($0.key) },
                                       // "pending" is a reply still being written, not an error.
-                                      failed: !["ok", "pending"].contains(receipt["status"] as? String ?? "")
-                                        || ["failed", "canceled", "chat_failed", "no_reply"].contains(receipt["original_status"] as? String ?? ""),
+                                      failed: ["retrieval_result_class", "execution_result_class"].contains {
+                                          ChatToolOutcome.ExactResultClass(rawValue: receipt[$0] as? String ?? "")?.isFailure == true
+                                      },
                                       held: held)
                 })
             }
             return failure(id, code: -32602, message: "Unknown tool. Use tools/list.")
         default: return failure(id, code: -32601, message: "Method not supported.")
         }
-    }
-
-    /// What an already-parsed `agent_message` call asked of the wait: seconds
-    /// to hold the call for the reply (0 = the old immediate acknowledgement)
-    /// and the client's progress token, which turns the answer into an SSE
-    /// stream of `notifications/progress` carrying the partial reply.
-    static func waitRequest(_ body: Data) -> (seconds: Int, progressToken: ID?) {
-        let params = (try? JSONSerialization.jsonObject(with: body) as? [String: Any])?["params"] as? [String: Any]
-        let args = params?["arguments"] as? [String: Any]
-        let seconds = args?["wait_seconds"].flatMap { wholeNumber($0, in: 0...maximumWaitSeconds) } ?? defaultWaitSeconds
-        let raw = (params?["_meta"] as? [String: Any])?["progressToken"]
-        var token: ID?
-        if let text = raw as? String, text.utf8.count <= 256 { token = .string(text) }
-        else if let number = raw as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
-                number.stringValue == String(number.int64Value) { token = .number(number.int64Value) }
-        return (seconds, token)
     }
 
     static func progress(_ token: ID, step: Int, message: String) -> [String: Any] {
@@ -237,29 +221,29 @@ enum NativeAgentMCPWire {
     }
 
     /// What the held messages may add to one result, measured as they appear
-    /// in its text content (escaped twice): well under the 1 MiB a relay reads.
+    /// in it: once in its structured content, once in its text (escaped twice);
+    /// well under the 1 MiB a relay reads.
     static let heldBudget = 256 * 1024
 
     static func heldFits(_ messages: [[String: String]]) -> Bool {
         guard let inner = try? JSONSerialization.data(withJSONObject: messages),
               let outer = try? JSONSerialization.data(withJSONObject: [String(decoding: inner, as: UTF8.self)]) else { return false }
-        return outer.count <= heldBudget
+        return inner.count + outer.count <= heldBudget
     }
 
     private static func toolResult(_ id: ID, fields: [String: Any], failed: Bool, held: Held = ([], 0)) -> [String: Any] {
-        var text = fields, structured = fields
-        // The messages travel once, in the text every host shows its model;
-        // the structured copy says they are there and how many still wait.
+        var fields = fields
+        // The text is the structured content serialized: a host may show its
+        // model either one, so the messages ride in both. A structured copy
+        // that only counted them reached Claude Desktop as a blank message.
         if !held.messages.isEmpty || held.remaining > 0 {
-            text["held_messages"] = held.messages
-            text["held_remaining"] = held.remaining
-            structured["held_messages_in_text"] = held.messages.count
-            structured["held_remaining"] = held.remaining
+            fields["held_messages"] = held.messages
+            fields["held_remaining"] = held.remaining
         }
-        let data = (try? JSONSerialization.data(withJSONObject: text, options: [.sortedKeys])) ?? Data("{}".utf8)
+        let data = (try? JSONSerialization.data(withJSONObject: fields, options: [.sortedKeys])) ?? Data("{}".utf8)
         return ["jsonrpc": "2.0", "id": id.value, "result": [
             "content": [["type": "text", "text": String(decoding: data, as: UTF8.self)]],
-            "structuredContent": structured, "isError": failed
+            "structuredContent": fields, "isError": failed
         ]]
     }
 

@@ -155,12 +155,6 @@ package enum AgentWorkspaceArrivals {
         let bytes = (try? encoder.encode(value)) ?? Data()
         return SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
     }
-    static func object(_ value: JSONValue?) -> [String: JSONValue] {
-        if case .object(let row)? = value { return row }; return [:]
-    }
-    static func text(_ value: JSONValue?) -> String? {
-        if case .string(let text)? = value { return text }; return nil
-    }
 
     static func preview(_ text: String?, source: String, alreadyTruncated: Bool = false) -> Preview? {
         guard let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
@@ -177,7 +171,7 @@ package enum AgentWorkspaceArrivals {
             let source = key == "completion_text_head" && receipt["record_kind"] == .string("delivery_receipt")
                 ? "Delivery record" : ["detail", "execution_error", "error"].contains(key)
                     ? "Recorded issue" : key.hasSuffix("_head") ? "Retained answer excerpt" : "Saved answer"
-            if let value = preview(text(receipt[key]), source: source,
+            if let value = preview(receipt[key]?.stringValue, source: source,
                 alreadyTruncated: key.hasSuffix("_head") || receipt["reply_truncated"] == .bool(true)
                     || (key == "agent_reply_text" && receipt["agent_reply_truncated"] != .bool(false))) { return value }
         }
@@ -186,9 +180,8 @@ package enum AgentWorkspaceArrivals {
 
     static func conversations(dataRoot: URL, scope: String) throws -> [Candidate] {
         try AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: true).filter { $0.scopeSessionID == scope }.map { row in
-            var receipt = object(row.receipt)
-            if case .array(let jobs)? = receipt["jobs"], jobs.count == 1 { receipt = object(jobs.first) }
-            let status = text(receipt["run_status"] ?? receipt["status"] ?? receipt["state"]) ?? row.phase
+            let receipt = row.sendEvidence
+            let status = (receipt["run_status"] ?? receipt["status"] ?? receipt["state"])?.stringValue ?? row.phase
             var kind: Kind?
             if receipt["needs_input"] == .bool(true) || receipt["needs_authentication"] == .bool(true)
                 || ["waiting_approval", "waiting_for_approval", "waiting_on_you", "waiting_on_person", "input-required", "auth-required"].contains(status) { kind = .decision }
@@ -209,7 +202,7 @@ package enum AgentWorkspaceArrivals {
                 revision: row.operationID + ":" + row.phase + ":" + fingerprint,
                 title: row.name + " — " + row.label, kind: kind, location: location,
                 eventID: row.agent.hasPrefix("bot:") ? helperEvent(
-                    bot: String(row.agent.dropFirst(4)), entry: text(receipt["entry_id"] ?? receipt["message_id"])) : nil,
+                    bot: String(row.agent.dropFirst(4)), entry: (receipt["entry_id"] ?? receipt["message_id"])?.stringValue) : nil,
                 preview: receiptPreview(receipt, kind: kind), from: row.name, status: status,
                 peer: row.agent.hasPrefix("peer:") ? row.agent : nil,
                 // A contact's cached reply, as its writer stamped it; a helper's shelf is no contact's.
@@ -228,37 +221,21 @@ package enum AgentWorkspaceArrivals {
 /// ancestors are watched until the canonical path exists; no timer is added.
 final class AgentWorkspaceArrivalMonitor: @unchecked Sendable {
     private let lock = NSLock()
-    private let paths: [String: URL]
     private var watcher: FileChangeWatcher?
-    private var armed: [String: URL] = [:]
     private var dirty: Set<String> = ["agents", "human", "bots", "work"]
     init(dataRoot: URL) {
-        paths = ["agents": "agents/conversations.json", "human": "chat/sessions.json",
+        let paths = ["agents": "agents/conversations.json", "human": "chat/sessions.json",
                  "bots": "bots/shelf-index.json", "work": "orchestration/task_ledger.jsonl"]
             .mapValues { dataRoot.appendingPathComponent($0) }
-        rearm()
-    }
-    private func rearm() {
-        let current = paths.mapValues { path -> URL in
-            var existing = path
-            while !FileManager.default.fileExists(atPath: existing.path), existing.path != "/" {
-                existing.deleteLastPathComponent()
-            }
-            return existing
+        watcher = FileChangeWatcher(paths: Array(paths.values)) { [weak self] path in
+            self?.invalidate(Set(paths.filter { $0.value.standardizedFileURL == path.standardizedFileURL }.keys))
         }
-        guard current != armed else { return }
-        armed = current
-        watcher = FileChangeWatcher(paths: Array(Set(current.values))) { [weak self] path in
-            self?.invalidate(Set(current.filter { $0.value.standardizedFileURL == path.standardizedFileURL }.keys))
-        }
-        invalidate()
     }
     func invalidate(_ sources: Set<String> = ["agents", "human", "bots", "work"]) {
         lock.lock(); dirty.formUnion(sources); lock.unlock()
     }
     /// Called only on the navigation actor; callbacks touch only the dirty bit.
     func takeChanged() -> Set<String> {
-        rearm()
         lock.lock(); defer { lock.unlock() }
         let changed = dirty; dirty = []; return changed
     }
@@ -281,26 +258,26 @@ extension AgentWorkspaceNavigation {
             do { state.accept(try AgentWorkspaceArrivals.conversations(dataRoot: dataRoot, scope: scope), owner: "agents") }
             catch { state.unavailable.insert("agents") }
         }
-        let places = (sessions[key]?.places ?? []) + (sessions[key]?.watched ?? [])
+        let places = (sessions[key]?.arrangement.places ?? []) + (sessions[key]?.watched ?? [])
         let humanIDs = Set(places.compactMap { place -> String? in
             guard case .record("chat_conversations", let args, _) = place else { return nil }
-            return AgentWorkspaceArrivals.text(args["conversation_session_id"])
+            return args["conversation_session_id"]?.stringValue
         }).subtracting([scope])
         if !humanIDs.isEmpty, changed.contains("human") {
             do {
                 let rows = try HumanConversationIndex.rows(dataRoot: dataRoot)
                 let candidates = rows.compactMap { row -> AgentWorkspaceArrivals.Candidate? in
-                    guard let id = AgentWorkspaceArrivals.text(row["id"]), humanIDs.contains(id) else { return nil }
+                    guard let id = row["id"]?.stringValue, humanIDs.contains(id) else { return nil }
                     let generation: String
                     if case .int(let value)? = row["lastConversationGeneration"] { generation = String(value) }
                     else { generation = "legacy" }
-                    let title = AgentWorkspaceArrivals.text(row["title"]) ?? "Conversation"
+                    let title = row["title"]?.stringValue ?? "Conversation"
                     // The preview travels with the stamp the index kept beside it; one with none is not shown.
                     let stamp = HumanConversationIndex.previewStamp(row)
                     return .init(source: "human:" + id, revision: generation, title: title,
                         kind: generation == "legacy" ? nil : .activity,
                         location: .record(tool: "chat_conversations", input: ["conversation_session_id": .string(id)], title: title),
-                        preview: stamp == nil ? nil : AgentWorkspaceArrivals.preview(AgentWorkspaceArrivals.text(row["lastMessagePreview"]),
+                        preview: stamp == nil ? nil : AgentWorkspaceArrivals.preview(row["lastMessagePreview"]?.stringValue,
                             source: "Conversation index preview", alreadyTruncated: true),
                         status: "conversation_changed", stamp: stamp)
                 }
@@ -309,7 +286,7 @@ extension AgentWorkspaceNavigation {
         }
         let taskIDs = Set(places.compactMap { place -> String? in
             guard case .record("task_ledger_list", let args, _) = place else { return nil }
-            return AgentWorkspaceArrivals.text(args["task_id"])
+            return args["task_id"]?.stringValue
         })
         if !taskIDs.isEmpty, changed.contains("work") {
             do {
@@ -321,7 +298,7 @@ extension AgentWorkspaceNavigation {
                 state.pending.removeAll { previousIDs.contains($0.id) && !retained.contains($0.id) }
                 let candidates = rows.filter { taskIDs.contains($0.taskId) }.map { row in
                     AgentWorkspaceArrivals.Candidate(source: "work:" + row.taskId,
-                        revision: AgentWorkspaceArrivals.hash(.object(AgentWorkspaceArrivals.object(row.toJSON())
+                        revision: AgentWorkspaceArrivals.hash(.object((row.toJSON().objectValue ?? [:])
                             .filter { !["createdTs", "updatedTs"].contains($0.key) })), title: row.title ?? "Shared work",
                         kind: row.status == .done ? .finished : row.status == .blocked ? .decision : row.status == .cancelled ? .failure : nil,
                         location: .record(tool: "task_ledger_list", input: ["task_id": .string(row.taskId)], title: row.title ?? "Shared work"),
@@ -333,7 +310,7 @@ extension AgentWorkspaceNavigation {
         }
         let bots = Set(places.compactMap { place -> UUID? in
             guard case .record("agent_read", let args, _) = place,
-                  let agent = AgentWorkspaceArrivals.text(args["agent"]), agent.hasPrefix("bot:") else { return nil }
+                  let agent = args["agent"]?.stringValue, agent.hasPrefix("bot:") else { return nil }
             return UUID(uuidString: String(agent.dropFirst(4)))
         })
         if !bots.isEmpty, changed.contains("bots") {
@@ -361,7 +338,7 @@ extension AgentWorkspaceNavigation {
         sessions[key]?.arrivals = state
     }
 
-    func arrivalProjection(key: String) -> AgentWorkspaceProjection {
+    func arrivalProjection(key: String) -> WorkspacePage {
         let state = sessions[key]?.arrivals
         let items = (state?.pending ?? []).sorted { $0.kind.priority < $1.kind.priority }.map { notice in
             AgentWorkspaceItem(title: notice.title, content: notice.presented(), actions: [
@@ -381,14 +358,14 @@ extension AgentWorkspaceNavigation {
         }
         if session.arrivalReturn == nil {
             // The Arrivals tray itself isn't the interrupted work.
-            let path = session.path.filter {
+            let path = session.arrangement.path.filter {
                 if case .arrivals = $0 { return false }
                 if case .page(.arrivals, _) = $0 { return false }
                 return true
             }
             session.arrivalReturn = .init(path: path.isEmpty ? [.home] : path, document: session.document,
-                anchor: session.workAnchor, topic: session.workTopic, bookmark: session.browserBookmark,
-                workspaceID: session.selectedWorkspaceID)
+                anchor: session.arrangement.workAnchor, topic: session.arrangement.workTopic, bookmark: session.browserBookmark,
+                workspaceID: session.arrangement.selectedWorkspaceID)
         }
         sessions[key] = session
         return notice.location
@@ -398,15 +375,15 @@ extension AgentWorkspaceNavigation {
         guard let saved = sessions[key]?.arrivalReturn else { return current(key: key) }
         // A draft may have been edited, submitted, or discarded while the
         // arrival was open. Restore its current resident copy, never stale inputs.
-        let drafts = sessions[key]?.drafts ?? []
+        let drafts = sessions[key]?.arrangement.drafts ?? []
         let path = saved.path.compactMap { location -> AgentWorkspaceLocation? in
             guard case .form(let form) = location else { return location }
             return drafts.first { $0.draftID == form.draftID }.map(AgentWorkspaceLocation.form)
         }
-        sessions[key]?.path = path.isEmpty ? [.home] : path
+        sessions[key]?.arrangement.path = path.isEmpty ? [.home] : path
         sessions[key]?.document = saved.document
-        sessions[key]?.workAnchor = saved.anchor; sessions[key]?.workTopic = saved.topic
-        sessions[key]?.browserBookmark = saved.bookmark; sessions[key]?.selectedWorkspaceID = saved.workspaceID
+        sessions[key]?.arrangement.workAnchor = saved.anchor; sessions[key]?.arrangement.workTopic = saved.topic
+        sessions[key]?.browserBookmark = saved.bookmark; sessions[key]?.arrangement.selectedWorkspaceID = saved.workspaceID
         sessions[key]?.arrivalReturn = nil
         return path.last ?? .home
     }
@@ -434,7 +411,7 @@ extension AgentWorkspaceNavigation {
     }
     func takeArrivalNotice(key: String, announce: Bool = true) -> JSONValue? {
         guard var session = sessions[key], var state = session.arrivals, !state.refreshing else { return nil }
-        // One announcement per event (09-26): contacts' conversations and
+        // One announcement per event: contacts' conversations and
         // helpers already speak in the glance line every turn, so only what
         // it doesn't cover rides a tool result. Arrivals still lists them all.
         let pending = state.pending.filter { !$0.announced && !$0.source.hasPrefix("agents:") && !$0.source.hasPrefix("bots:") }

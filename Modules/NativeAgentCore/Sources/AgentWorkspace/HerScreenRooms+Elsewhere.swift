@@ -7,13 +7,7 @@ import Transcripts
 import NativeAgentShared
 // Blueprint: | `HerScreenRooms+Elsewhere.swift` | HerScreen door lines own completed other-room exchanges for the person's Mac/phone timeline and bounded words in home-turn context; peer turns never carry the person's words |
 
-/// One timeline across doors (Wave 2 #10, 2026-10-02): what User said on each
-/// of his doors (Mac chat, Telegram, iPhone, Slack) and what agents said over
-/// the bridges, read from the transcripts those doors already write. A door
-/// is per message (its envelope's surface): one chat can hold several.
-/// Her own wakes (ResidentWake's session) are a door of hers too: one mind,
-/// so what a wake concluded reaches her other chats (User, 10-02).
-/// Read-only: nothing here writes a session or changes how one is stored.
+/// Transcript message surfaces join person, bridge and wake exchanges into one read-only timeline.
 extension HerScreen {
     /// One thing said to her on a door, and her last answer after it there.
     /// A wake's is when her answer landed: that is when it concluded.
@@ -45,24 +39,21 @@ extension HerScreen {
 
     /// Newest first: the 12 most recently written transcripts of the last week
     /// (no earlier than `since` when given); helpers' own sessions stay out.
-    static func doorFiles(dataRoot: URL, now: Date, since: Date? = nil) -> [URL] {
+    static func doorLines(dataRoot: URL, now: Date, since: Date? = nil) -> [DoorLine] {
         let dir = dataRoot.appendingPathComponent("chat/messages", isDirectory: true).path
-        return ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [])
-            .filter { $0.hasSuffix(".jsonl") && !$0.hasPrefix("bot-") }
+        let sessions = try? SessionConversation(dataRoot: dataRoot)
+        let files = ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [])
+            .filter { $0.hasSuffix(".jsonl") && sessions?.isHelper(String($0.dropLast(6))) != true }
             .compactMap { name -> (path: String, at: Int)? in
                 var info = stat()
                 guard lstat(dir + "/" + name, &info) == 0,
-                      Double(info.st_mtimespec.tv_sec) + 1 >= max(since ?? .distantPast, now.addingTimeInterval(-7 * 86_400)).timeIntervalSince1970 else { return nil }
+                      Double(info.st_mtimespec.tv_sec) + 1 >= now.addingTimeInterval(-7 * 86_400).timeIntervalSince1970 else { return nil }
                 return (dir + "/" + name, info.st_mtimespec.tv_sec)
             }
-            .sorted { ($0.at, $0.path) > ($1.at, $1.path) }.prefix(12).map { URL(fileURLWithPath: $0.path) }
-    }
-
-    static func doorLines(dataRoot: URL, now: Date, since: Date? = nil) -> [DoorLine] {
-        let files = doorFiles(dataRoot: dataRoot, now: now, since: since)
-        let dir = dataRoot.appendingPathComponent("chat/messages", isDirectory: true).path
-        DoorIndex.shared.keep(only: Set(doorFiles(dataRoot: dataRoot, now: now).map(\.path)), in: dir + "/")
-        return files.flatMap { transcript($0).lines }.sorted { $0.at > $1.at }
+            .sorted { ($0.at, $0.path) > ($1.at, $1.path) }.prefix(12)
+        DoorIndex.shared.keep(only: Set(files.map(\.path)), in: dir + "/")
+        return files.filter { Double($0.at) + 1 >= (since ?? .distantPast).timeIntervalSince1970 }
+            .flatMap { transcript(URL(fileURLWithPath: $0.path)).lines }.sorted { $0.at > $1.at }
     }
 
     /// Each transcript's door lines and when she last answered
@@ -110,7 +101,8 @@ extension HerScreen {
                     var rows = data[data.startIndex..<end].split(separator: UInt8(ascii: "\n"))
                     if partial, !rows.isEmpty { rows.removeFirst() }
                     entry.offset += UInt64(end - data.startIndex + 1)
-                    read(rows, session: url.deletingPathExtension().lastPathComponent, into: &entry)
+                    read(rows, session: url.deletingPathExtension().lastPathComponent,
+                         dataRoot: url.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent(), into: &entry)
                     if entry.lines.count > 30 { entry.lines.removeFirst(entry.lines.count - 30) }
                 }
             }
@@ -122,8 +114,8 @@ extension HerScreen {
     /// Rows onto a transcript's index: the things said to her with a known
     /// door and her answer to each. Wake notices
     /// and other mechanical rows are not anyone speaking.
-    private static func read(_ rows: [Data.SubSequence], session: String, into entry: inout DoorIndex.Entry) {
-        let wake = session == ResidentWake.session
+    private static func read(_ rows: [Data.SubSequence], session: String, dataRoot: URL, into entry: inout DoorIndex.Entry) {
+        let wake = SessionConversation.kind(session, dataRoot: dataRoot)?.isOwnWork == true
         for raw in rows {
             guard let speech = ContactThread.Line(jsonl: Data(raw)) else { continue }
             let metadata = speech.metadata
@@ -153,8 +145,8 @@ extension HerScreen {
                     entry.open = true
                     continue
                 }
-                let surface = HumanConversationIndex.string(HumanConversationIndex.object(metadata["origin"])["surface"])
-                    ?? HumanConversationIndex.string(HumanConversationIndex.object(metadata["envelope"])["surface"])
+                let surface = (metadata["origin"]?.objectValue ?? [:])["surface"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 })
+                    ?? (metadata["envelope"]?.objectValue ?? [:])["surface"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 })
                 guard let door = speech.contact ? "bridge" : surface.flatMap({ HerScreen.door($0) }) else { continue }
                 var text: String
                 if door == "bridge" {
@@ -177,14 +169,14 @@ extension HerScreen {
     }
 
     /// A reading copy only: never appended to the person's session or fed as chat.
-    package static func otherRoomExchanges(dataRoot: URL, since: Date, now: Date = Date()) -> [OtherRoomExchange] {
-        let named = peerNames(dataRoot), identity = names(dataRoot)
+    package static func otherRoomExchanges(dataRoot: URL, identity: AgentContactIdentity, since: Date, now: Date = Date()) -> [OtherRoomExchange] {
+        let named = identity.peerNames, profile = names(dataRoot)
         return doorLines(dataRoot: dataRoot, now: now, since: since).compactMap { line in
             guard line.door == "bridge", !line.byPerson, let reply = line.reply,
                   line.active >= since, line.active <= now else { return nil }
             return OtherRoomExchange(id: line.session + ":" + line.id, sessionID: line.session,
-                contactID: line.agent ?? "another agent", contact: clip(who(line, person: identity.person, peers: named), 80),
-                agent: identity.agent, at: line.active, message: String(line.text.prefix(600)), reply: String(reply.prefix(600)))
+                contactID: line.agent ?? "another agent", contact: clip(who(line, person: profile.person, peers: named), 80),
+                agent: profile.agent, at: line.active, message: String(line.text.prefix(600)), reply: String(reply.prefix(600)))
         }.sorted { ($0.at, $0.id) < ($1.at, $1.id) }
     }
 
@@ -194,17 +186,6 @@ extension HerScreen {
     static func who(_ line: DoorLine, person: String, peers: [String: String]) -> String {
         if line.door == wakeDoor { return "me" }
         return ContactThread.project([.init(text: line.text, stamp: line.stamp)], person: person, names: peers, unlistedPeer: "an agent").first!.speaker
-    }
-
-    /// "peer:<id>" → the contact name User gave it.
-    static func peerNames(_ dataRoot: URL) -> [String: String] {
-        guard let data = try? Data(contentsOf: dataRoot.appendingPathComponent("agents/peers.json")),
-              let peers = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [:] }
-        var names: [String: String] = [:]
-        for peer in peers {
-            if let id = peer["id"] as? String, let name = nonEmpty(peer["name"] as? String) { names["peer:" + id] = name }
-        }
-        return names
     }
 
     private static func quoted(_ text: String, _ limit: Int) -> String {
@@ -247,10 +228,15 @@ extension HerScreen {
         let person = names(dataRoot).person
         let lines = Array(doorLines(dataRoot: dataRoot, now: now).filter { $0.session != scope }.prefix(12))
         var pages: [String: String] = [:], speech: [String: [ContactThread.Line]] = [:]
-        let named = peerNames(dataRoot)
+        let named = AgentWorkspacePorts.current.conversations.identity(dataRoot: dataRoot).peerNames
+        let chats = Result { try withNames(dataRoot) { book in
+            lines.map { line in Result {
+                "chat.\(try book.number("chat", id: line.session) { Set(((try? FileManager.default.contentsOfDirectory(atPath: dataRoot.appendingPathComponent("chat/messages").path)) ?? []).map { ($0 as NSString).deletingPathExtension }) })"
+            } }
+        } }
         let rows = lines.enumerated().map { index, line -> String in
             let name = "elsewhere.\(index + 1)", who = HerScreen.who(line, person: person, peers: named)
-            let exchange = exchangePages(name, line, who: who, dataRoot: dataRoot, now: now)
+            let exchange = exchangePages(name, line, who: who, chat: { try chats.get()[index].get() }, now: now)
             for (item, page) in exchange { pages[scope + "\u{0}" + item] = page }
             let shown = ContactThread.Line(text: line.text, stamp: line.stamp)
             ContactThread.consume(shown, mark: { peer, _ in
@@ -266,31 +252,30 @@ extension HerScreen {
                       verbs: rows.isEmpty ? [] : [("elsewhere.N", "read that exchange and my reply; continue if needed")])
     }
 
-    private static func exchangePages(_ name: String, _ line: DoorLine, who: String, dataRoot: URL, now: Date) -> [String: String] {
-        let dir = dataRoot.appendingPathComponent("chat/messages").path
-        let chat = withNames(dataRoot) { book in
-            "chat.\(book.number("chat", id: line.session) { Set(((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []).map { ($0 as NSString).deletingPathExtension }) })"
-        }
-        // Keep exact redacted words and formatting. List rows remain previews;
-        // opening an exchange has bounded, lossless continuation pages.
-        let text = "SAID\n" + line.text + "\n\nME\n" + (line.reply ?? "no reply from me there yet")
-        let pageCharacters = 8_000
-        var chunks: [String] = [], cursor = text.startIndex
-        while cursor < text.endIndex {
-            let end = text.index(cursor, offsetBy: pageCharacters, limitedBy: text.endIndex) ?? text.endIndex
-            chunks.append(String(text[cursor..<end]))
-            cursor = end
-        }
-        func item(_ index: Int) -> String { index == 0 ? name : name + ".more.\(index + 1)" }
-        return Dictionary(uniqueKeysWithValues: chunks.enumerated().map { index, chunk in
-            let read = chunks.count == 1 ? "Complete exchange · \(text.count) characters"
-                : "Exchange part \(index + 1) of \(chunks.count) · \(chunk.count) of \(text.count) characters"
-            var verbs: [(String, String)] = []
-            if index + 1 < chunks.count { verbs.append((item(index + 1), "continue this exact exchange")) }
-            verbs.append((chat, "open the conversation"))
-            return (item(index), screen([item(index), line.door, who, when(line.at, now: now)],
-                [[read], [chunk]], verbs: verbs, back: "Back: elsewhere · home."))
-        })
+    private static func exchangePages(_ name: String, _ line: DoorLine, who: String, chat: () throws -> String, now: Date) -> [String: String] {
+        do {
+            let chat = try chat()
+            // Keep exact redacted words and formatting. List rows remain previews;
+            // opening an exchange has bounded, lossless continuation pages.
+            let text = "SAID\n" + line.text + "\n\nME\n" + (line.reply ?? "no reply from me there yet")
+            let pageCharacters = 8_000
+            var chunks: [String] = [], cursor = text.startIndex
+            while cursor < text.endIndex {
+                let end = text.index(cursor, offsetBy: pageCharacters, limitedBy: text.endIndex) ?? text.endIndex
+                chunks.append(String(text[cursor..<end]))
+                cursor = end
+            }
+            func item(_ index: Int) -> String { index == 0 ? name : name + ".more.\(index + 1)" }
+            return Dictionary(uniqueKeysWithValues: chunks.enumerated().map { index, chunk in
+                let read = chunks.count == 1 ? "Complete exchange · \(text.count) characters"
+                    : "Exchange part \(index + 1) of \(chunks.count) · \(chunk.count) of \(text.count) characters"
+                var verbs: [(String, String)] = []
+                if index + 1 < chunks.count { verbs.append((item(index + 1), "continue this exact exchange")) }
+                verbs.append((chat, "open the conversation"))
+                return (item(index), screen([item(index), line.door, who, when(line.at, now: now)],
+                    [[read], [chunk]], verbs: verbs, back: "Back: elsewhere · home."))
+            })
+        } catch { return [name: nameFailure(error)] }
     }
 
     // MARK: The per-turn line
@@ -305,16 +290,11 @@ extension HerScreen {
     /// and no bridge line rides at all. Her wake is her own thought, so it
     /// rides there too. Read from the transcripts' index (`transcript`), the
     /// same line every iteration of a turn.
-    package static func elsewhere(dataRoot: URL, scope: String, surface: String, peer: Bool, turn: Date?) async -> String? {
+    package static func elsewhere(dataRoot: URL, identity: AgentContactIdentity, scope: String, surface: String, peer: Bool, turn: Date?) async -> String? {
         guard let here = door(surface), MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: dataRoot) else { return nil }
-        let key = "elsewhere\u{0}" + scope + "\u{0}" + (turn.map { String($0.timeIntervalSince1970) } ?? "-")
+        let key = "elsewhere\u{0}" + dataRoot.standardizedFileURL.path + "\u{0}" + scope + "\u{0}" + (turn.map { String($0.timeIntervalSince1970) } ?? "-")
         if turn != nil, let kept = HerMemo.shared.glance(key) { return kept }
-        let text = elsewhereLine(dataRoot: dataRoot, scope: scope, here: here, peer: peer, now: turn ?? Date())
-        if turn != nil { HerMemo.shared.keepGlance(key, text) }
-        return text
-    }
-
-    private static func elsewhereLine(dataRoot: URL, scope: String, here: String, peer: Bool, now: Date) -> String? {
+        let now = turn ?? Date()
         let mine: Date? = NativeAgentChatSessionID.normalizedPathComponent(scope) == nil ? nil
             : transcript(dataRoot.appendingPathComponent("chat/messages/\(scope).jsonl")).mine
         let since = mine ?? now.addingTimeInterval(-3600)
@@ -332,7 +312,7 @@ extension HerScreen {
                     : "") + ". app {item:\"elsewhere\"}")
         }
         if !peer {
-            for exchange in otherRoomExchanges(dataRoot: dataRoot, since: since, now: now).reversed()
+            for exchange in otherRoomExchanges(dataRoot: dataRoot, identity: identity, since: since, now: now).reversed()
                 .filter({ $0.sessionID != scope && $0.at > since }).prefix(5) {
                 // Context assembly runs outside the app door: mark read where it is bound.
                 AgentWorkspacePorts.binding?.tools.markConsumed(peer: exchange.contactID)
@@ -341,7 +321,9 @@ extension HerScreen {
                     + "\"\nYou replied: \"" + clip(exchange.reply, 600).replacingOccurrences(of: "\"", with: "'") + "\"")
             }
         }
-        return lines.isEmpty ? nil : lines.joined(separator: "\n")
+        let text = lines.isEmpty ? nil : lines.joined(separator: "\n")
+        if turn != nil { HerMemo.shared.keepGlance(key, text) }
+        return text
     }
 
     private static func userLine(_ fresh: [DoorLine], dataRoot: URL, peer: Bool, now: Date) -> String? {

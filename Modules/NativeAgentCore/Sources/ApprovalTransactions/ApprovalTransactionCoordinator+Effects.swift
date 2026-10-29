@@ -9,16 +9,16 @@ import ChatTurnContracts
 import MemoryV2
 import TrustCenter
 import WorkshopExecution
-// Blueprint: | `ApprovalTransactionCoordinator+Effects.swift` | `ApprovalTransactionEffects` port; `ApprovalTransactionCoordinator.decideBlockedWorkshopStep`; workshop-step decision/approval transaction |
+// Blueprint: | `ApprovalTransactionCoordinator+Effects.swift` | `ApprovalTransactionEffects` port; `ApprovalExecution.decideBlockedWorkshopStep`; workshop-step decision/approval transaction |
 
 /// Effect adapters supplied by the host; transaction ordering and replay fences
-/// remain in ApprovalTransactionCoordinator.
+/// remain in ApprovalExecution.
 public protocol ApprovalTransactionEffects: Sendable {
     func disableSkill(name: String) async throws
     /// `reviewedDigest` nil restores only Markdown guidance; a digest
     /// admits exactly that script as User's, as the Skills page's Install does.
     func enableSkill(name: String, reviewedDigest: String?) async throws
-    func runConnectorAction(descriptor: ConnectorActionDescriptor, dryRun: Bool, input: [String: JSONValue], approvedReplayApprovalID: String, dataRoot: URL) async throws -> ApprovalConnectorActionResult
+    func runConnectorAction(descriptor: ConnectorActionDescriptor, dryRun: Bool, input: [String: JSONValue], approvedReplayApprovalID: String, dataRoot: URL) async throws -> ConnectorActionReceipt
     func toolDispatchClient(enforceAppAutonomy: Bool) -> any ToolDispatchClient
     func continueChatToolApproval(dataRoot: URL, sessionID: String, envelope: TurnEnvelope, prompt: String, fileAccess: String) async throws
     func chatTurnCompleted(sessionID: String?) async
@@ -29,17 +29,7 @@ public protocol ApprovalTransactionEffects: Sendable {
     func workshopStepNotFound(_ description: String) -> any Error
 }
 
-public struct ApprovalConnectorActionResult: Sendable {
-    public let id: String
-    public let status: String
-
-    public init(id: String, status: String) {
-        self.id = id
-        self.status = status
-    }
-}
-
-public extension ApprovalTransactionCoordinator {
+public extension ApprovalExecution {
     /// Deny or Approve on the Desk's waiting step (MacWorkOverviewDetail), for
     /// the agent: the same `rejectStep` / `approveStep`, decided in her name.
     /// Only the step the task is blocked on; approving is User's below Full
@@ -60,7 +50,7 @@ public extension ApprovalTransactionCoordinator {
                 "detail": .string("This task is \(execution.status), not waiting on a step approval, so there is nothing to \(approve ? "approve" : "deny").")])
         }
         let provenance = ApprovalResolutionProvenance.local(
-            decidedBy: PersonaCompiler.agentDisplayName(dataRoot: PersistenceCore.defaultDataRoot()))
+            decidedBy: PersonaCompiler.agentDisplayName(dataRoot: dataRoot))
         if approve {
             // A step that cannot be undone on his side waits for his tap even
             // under Full Mac (User, 10-17); her approve never stands in for his.
@@ -107,7 +97,7 @@ public extension ApprovalTransactionCoordinator {
 
     /// The pending card staged for exactly this step.
     func stagedWorkshopStep(executionId: String, stepId: String) async throws -> ApprovalRecord {
-        let inbox = SwiftNativeApprovalInbox(root: dataRootOverride ?? SwiftNativeApprovalInbox.defaultDataRoot())
+        let inbox = SwiftNativeApprovalInbox(root: dataRoot)
         try await inbox.mergeLegacyApprovalRows()
         let pending = try await inbox.list(filter: ApprovalFilter(status: "pending"))
         guard let staged = pending.first(where: { record in

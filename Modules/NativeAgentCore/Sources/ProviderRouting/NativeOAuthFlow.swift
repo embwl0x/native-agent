@@ -38,7 +38,7 @@ public enum NativeOAuthFlow {
                 "auth_mode": "setup_token",
                 "saved_at": now,
             ]
-            try NativeOAuthSupport.writeJSONObject(payload, to: path)
+            try OAuthGrantOperations.writeJSONObject(payload, to: path)
             return nil
         } catch {
             return "Failed to save setup-token: \(error.localizedDescription)"
@@ -57,7 +57,7 @@ public enum NativeOAuthFlow {
         switch normalizedOAuthProviderId(providerId) {
         case "openai_oauth_direct": path = openAIAppOwnedAuthPath(dataRoot: dataRoot)
         case "anthropic_oauth_direct": path = anthropicTokenPath(dataRoot: dataRoot)
-        case "xai_oauth_direct": path = XAIOAuthDirectAdapter.tokenPath(dataRoot: dataRoot)
+        case "xai_oauth_direct": path = XAIOAuthTransport.tokenPath(dataRoot: dataRoot)
         default: throw ProviderRoutingError.providerNotFound
         }
         do {
@@ -84,17 +84,13 @@ public enum NativeOAuthFlow {
         providerId: String,
         dataRoot: URL? = nil
     ) async -> OAuthFlowResult {
-        // User, 2026-09-06: the xAI and ChatGPT flows dropped the selected root
-        // here and persisted under the default one.
+        // Every sign-in flow persists under the selected root.
         let root = dataRoot ?? PersistenceCore.defaultDataRoot()
         if normalizedOAuthProviderId(providerId) == "xai_oauth_direct" {
             return await startXAIOAuthFlow(platform: platform, dataRoot: root)
         }
 
-        // ChatGPT/OpenAI (2026-07-05, User): codex-free direct sign-in. OpenAI's
-        // ChatGPT client only allows a LOOPBACK redirect, not a custom scheme,
-        // so it can't use the ASWebAuthenticationSession path below — it runs a
-        // native local-listener flow (:1455) instead. See NativeOAuthFlow+Loopback.
+        // ChatGPT sign-in uses the native loopback listener because its client requires a loopback redirect.
         if providerId == "openai_oauth_direct" {
             return await startOpenAILoopbackFlow(platform: platform, dataRoot: root)
         }
@@ -110,19 +106,20 @@ public enum NativeOAuthFlow {
         let attempt = signInAttempts.begin(providerId: providerId, dataRoot: root)
         defer { signInAttempts.finish(attempt) }
         let pkce = PKCE.generate()
-        // pi-ai / Claude Code convention: Anthropic uses the verifier as state.
-        // OpenAI uses random hex (mirrors pi-ai's randomBytes(16).toString).
-        let state: String = (config.stateEqualsVerifier ? pkce.verifier
-                                                        : NativeOAuthSupport.randomHex(16))
+        // Anthropic binds state to the PKCE verifier.
+        let state = pkce.verifier
 
         let redirectURI = config.redirectURI
 
         // Build authorization URL.
-        let authURL = config.buildAuthURL(
+        let authURL: URL
+        do { authURL = try config.buildAuthURL(
             redirectURI: redirectURI,
             state: state,
             challenge: pkce.challenge
-        )
+        ) } catch {
+            return OAuthFlowResult(ok: false, error: "Invalid authorization URL: \(error.localizedDescription)")
+        }
 
         // Run the in-process auth session. Throws on user-cancel / scheme
         // mismatch / OS failure; returns the callback URL on success.
@@ -161,7 +158,7 @@ public enum NativeOAuthFlow {
             )
         } catch {
             return OAuthFlowResult(ok: false,
-                error: "Token exchange failed: \(NativeOAuthSupport.redact(error.localizedDescription))")
+                error: "Token exchange failed: \(OAuthGrantOperations.redact(error.localizedDescription))")
         }
 
         guard let accessToken = tokens["access_token"] as? String,
@@ -193,9 +190,7 @@ public enum NativeOAuthFlow {
     }
 }
 
-/// 2026-09-06: sign-out and newer sign-ins retire suspended native OAuth
-/// attempts. The check and synchronous token write share the sign-out lock,
-/// so a late browser/token response cannot silently reconnect an account.
+/// Sign-out and newer sign-ins retire pending attempts; checks and token writes share the sign-out lock.
 final class OAuthSignInAttempts: @unchecked Sendable {
     struct Attempt {
         let key: String

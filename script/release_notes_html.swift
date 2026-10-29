@@ -1,6 +1,5 @@
 #!/usr/bin/env swift
-// release_notes_html.swift — markdown release notes -> styled HTML fragment
-// for the Sparkle update dialog (update-dialog-polish, 2026-08-20).
+// Markdown release notes -> styled HTML fragment for the Sparkle update dialog.
 //
 // Reads markdown on stdin, writes a self-contained <div> fragment on stdout:
 // headings, bullet lists (with two-space continuation lines), paragraphs,
@@ -28,27 +27,23 @@ func escape(_ s: String) -> String {
 // Inline transforms run on ESCAPED text: **bold** and `code`. Pairs only —
 // an unmatched marker stays literal. Code spans are lifted out FIRST via
 // placeholders so the bold pass can never match into a code span (or vice
-// versa) and emit crossed tags like <strong>a <code>b</strong> c</code>
-// (gpt-5.5 review MEDIUM). The placeholder bytes are control characters that
-// escape() strips from input, so input text can never collide with them.
+// versa) and emit crossed tags like <strong>a <code>b</strong> c</code>.
+// The placeholder bytes are control characters that escape() strips from input.
+let codeRE = try! NSRegularExpression(pattern: "`([^`]+)`")
+let boldRE = try! NSRegularExpression(pattern: "\\*\\*([^*]+)\\*\\*")
+
 func inline(_ s: String) -> String {
     var out = s
     var codeSpans: [String] = []
-    let codeRE = try! NSRegularExpression(pattern: "`([^`]+)`")
     while let m = codeRE.firstMatch(in: out, range: NSRange(out.startIndex..., in: out)),
           let whole = Range(m.range, in: out), let body = Range(m.range(at: 1), in: out) {
         codeSpans.append(String(out[body]))
         out.replaceSubrange(whole, with: "\u{01}\(codeSpans.count - 1)\u{02}")
     }
-    let boldRE = try! NSRegularExpression(pattern: "\\*\\*([^*]+)\\*\\*")
     out = boldRE.stringByReplacingMatches(
         in: out, range: NSRange(out.startIndex..., in: out),
         withTemplate: "<strong>$1</strong>")
-    // Restore in REVERSE creation order: a later span's body can contain an
-    // earlier span's placeholder (e.g. "``x``" lifts twice, span 1 wrapping
-    // placeholder 0), and forward order left that inner placeholder as raw
-    // control bytes in the output — which then broke the CDATA/xmllint gate
-    // downstream (sweep 2026-08-21).
+    // Restore in reverse creation order because a span can contain an earlier placeholder.
     for (i, body) in codeSpans.enumerated().reversed() {
         out = out.replacingOccurrences(of: "\u{01}\(i)\u{02}", with: "<code>\(body)</code>")
     }
@@ -112,9 +107,7 @@ func flushList() {
     if olOpen { html.append("</ol>"); olOpen = false }
 }
 
-// "1. item" / "12. item" → the body after the marker, else nil. Ordered lists
-// previously fell through to the paragraph path and shipped raw "1." markers
-// past the appcast payload guard (gpt-5.5 sweep review, 2026-08-21).
+// "1. item" / "12. item" → the body after the marker, else nil.
 func orderedItemBody(_ line: String) -> String? {
     var digits = 0
     for ch in line {
@@ -141,9 +134,7 @@ func flushFence() {
 for rawLine in input.components(separatedBy: "\n") {
     let line = escape(rawLine)
     let trimmed = line.trimmingCharacters(in: .whitespaces)
-    // Fenced code blocks: verbatim (already-escaped) content, no inline
-    // markdown passes. Previously a fence fell through to the paragraph path
-    // and the backtick runs collided with the code-span placeholders.
+    // Fenced code blocks keep escaped content verbatim, without inline transforms.
     if trimmed.hasPrefix("```") {
         if fenceOpen { flushFence(); fenceOpen = false } else {
             flushList(); flushParagraph(); fenceOpen = true

@@ -44,7 +44,7 @@ extension NativeAgentEngine {
         case "save_helper":
             guard let text = payload["edit"], text.utf8.count <= 64 * 1024 else { throw HelperRemoteError.invalid }
             let edit = try JSONDecoder().decode(MobileHelperEdit.self, from: Data(text.utf8))
-            var bot: BotDefinition
+            let bot: BotDefinition
             if let id = edit.id {
                 bot = try store.get(id)
                 guard bot.deleted != true, edit.revision == bot.updatedAt.timeIntervalSinceReferenceDate else {
@@ -55,41 +55,37 @@ extension NativeAgentEngine {
                                     budget: BotBudget(tokens: BotRunLimits.maximumTokens, seconds: BotRunLimits.maximumSeconds))
             }
             let modelPinned = edit.modelPinned ?? ((!edit.provider.isEmpty && !edit.model.isEmpty) || bot.modelPinned == true)
+            var selectedModel: ProviderModelInfo?
             if modelPinned {
-                let providers = try await self.providers.list()
+                let providers = try await self.providers.list().providers
                 guard let provider = providers.first(where: { $0.provider_id == edit.provider && $0.auth_status.eligible }),
                       let model = provider.models.first(where: { $0.id == edit.model }),
                       (model.supported_reasoning_efforts ?? ["low", "medium", "high", "xhigh"]).contains(edit.think),
                       !edit.fast || model.supports_fast == true else { throw HelperRemoteError.model }
+                selectedModel = model
             }
-            let tokens = edit.tokens.isEmpty ? BotRunLimits.maximumTokens : Int(edit.tokens) ?? 0
-            let seconds = edit.seconds.isEmpty ? BotRunLimits.maximumSeconds : Double(edit.seconds) ?? 0
-            let daily: Int? = edit.daily.isEmpty ? nil : Int(edit.daily) ?? 0
-            guard tokens > 0, seconds.isFinite, seconds > 0, daily.map({ $0 > 0 }) ?? true,
-                  !edit.tell || !edit.condition.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                throw HelperRemoteError.invalid
-            }
-            bot.name = edit.name; bot.brief = edit.brief; bot.outputFormat = nil
-            bot.provider = edit.provider; bot.model = edit.model; bot.reasoningEffort = edit.think; bot.fast = edit.fast
-            bot.modelPinned = modelPinned
-            if !modelPinned { bot.followProviders() }
-            bot.budget = BotBudget(tokens: tokens, seconds: seconds); bot.dailyTokenCeiling = daily
-            bot.notificationCondition = edit.tell ? edit.condition : nil
-            bot.eventTrigger = nil
+            let when: String
             switch edit.timing {
-            case "manual": bot.cadence = .manual
-            case "interval":
-                guard let hours = Double(edit.hours), hours.isFinite, hours > 0 else { throw HelperRemoteError.invalid }
-                bot.cadence = .interval(seconds: hours * 3600)
-            case "cron": bot.cadence = .cron(expression: edit.cron)
-            case "event":
-                guard let source = BotEventSource(rawValue: edit.eventSource),
-                      !edit.eventFilter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw HelperRemoteError.invalid }
-                bot.cadence = .manual
-                bot.eventTrigger = BotEventTrigger(source: source, filter: edit.eventFilter, keyword: edit.eventKeyword)
+            case "manual": when = "Manual only"
+            case "interval": when = "Every N hours"
+            case "cron": when = "Custom"
+            case "event": when = "On an event"
             default: throw HelperRemoteError.invalid
             }
-            let recovered = try edit.id == nil ? store.create(bot) : store.update(bot)
+            guard let source = BotEventSource(rawValue: edit.timing == "event" ? edit.eventSource : "slack") else { throw HelperRemoteError.invalid }
+            var candidate: BotDefinition
+            do {
+                candidate = try BotDefinitionStore.editorDefinition(bot, name: edit.name, brief: edit.brief,
+                    provider: edit.provider, model: edit.model, think: edit.think, modelPinned: modelPinned,
+                    providerReady: selectedModel != nil, supportedEfforts: selectedModel?.supported_reasoning_efforts ?? ["low", "medium", "high", "xhigh"],
+                    supportsFast: selectedModel?.supports_fast == true, fast: edit.fast,
+                    tokens: edit.tokens, seconds: edit.seconds, daily: edit.daily, when: when, hours: edit.hours,
+                    cron: edit.cron, weekday: 0, clockText: "", timingUnchanged: false,
+                    eventSource: source, eventFilter: edit.eventFilter, eventKeyword: edit.eventKeyword, tell: edit.tell, condition: edit.condition)
+            } catch { throw HelperRemoteError.invalid }
+            // The phone payload does not edit personality.
+            candidate.personality = bot.personality
+            let recovered = try edit.id == nil ? store.create(candidate) : store.update(candidate)
             return try await helperReceipt(recovered)
         case "get_helper", "pause_helper", "run_helper":
             guard let id else { throw HelperRemoteError.invalid }

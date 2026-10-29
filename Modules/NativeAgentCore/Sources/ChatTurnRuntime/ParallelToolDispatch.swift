@@ -5,50 +5,20 @@ import ToolRegistry
 import TrustCenter
 // Blueprint: | `ParallelToolDispatch.swift` | `ParallelToolDispatch` enum; `isSerialFallbackForced`, `isParallelSafe` reads the declared class and the catalog bucket (reads of their own data and files run side by side; their devices, the app door and the unplaced run one at a time); keyword scheduling inference removed |
 
-// MARK: - Parallel dispatch of independent tool calls (U1 step 6, 2026-06-10)
+// MARK: - Parallel dispatch of independent tool calls
 //
-// The OpenAI adapter requests parallel_tool_calls:true and Anthropic batches
-// tool_use blocks freely — the model routinely emits 2+ calls per iteration,
-// which this loop used to execute strictly one-by-one. When an iteration
-// carries multiple SIDE-EFFECT-SAFE calls, they now run concurrently in a
-// task group (cap: maxConcurrentPerIteration) and the results are
-// reassembled in ORIGINAL INDEX ORDER, so the provider-visible wire shape —
-// one assistant message with N tool_use blocks, then ONE user message with N
-// tool_result blocks paired by id in the same order — is byte-identical to
-// the serial path. (Pairing convention verified in both OAuth adapters:
-// tool_result.tool_use_id / function_call_output.call_id echo; blocks are
-// encoded in message order, so slot order == tool_use order is the contract.)
-//
-// A tool's declared read class is its parallel-safety contract. The Mac
-// Integration declaration still vetoes write-mode calls. Effect-time gates
-// continue to judge every call.
-//
-// MIXED BATCHES: consecutive parallel-safe calls coalesce into one
-// concurrent group; every unsafe call is its own serial group. Groups
-// execute strictly in original order (a write at index k never overlaps
-// reads at indices <k or >k), so any execution is observationally
-// equivalent to the serial order for side-effect-bearing tools.
-//
-// ROLLBACK LEVER: set env NATIVE_AGENT_SERIAL_TOOL_DISPATCH=1 (or
-// true/yes/on) to force the old strictly-serial path. Default is parallel
-// ON.
-//
-// FAILURE ISOLATION: each concurrent child catches its own error — a
-// throwing tool becomes that slot's `{"error": ...}` result exactly as the
-// serial path produces, and never cancels siblings. Turn cancellation
-// cancels all children via structured concurrency (task-group teardown);
-// the parallel set is read-only by construction, so there are no orphan
-// writes to clean up.
-//
-// STEP-5 INTERACTION: results are still appended as ONE user message per
-// iteration, so IntraTurnToolResultClearing ages a parallel batch exactly
-// like a serial one (the sweep counts tool-result MESSAGES, not blocks).
+// Safe calls run under maxConcurrentPerIteration; results preserve original slot order and tool-use id pairing.
+// Declared read class and catalog bucket determine safety; Mac Integration and effect-time gates still apply.
+// Consecutive safe calls form concurrent groups; unsafe calls run alone, with groups executed in original order.
+// NATIVE_AGENT_SERIAL_TOOL_DISPATCH=1/true/yes/on forces serial dispatch; otherwise parallel dispatch is enabled.
+// Each child reports its own errors without cancelling siblings; turn cancellation cancels all children.
+// One user message holds each iteration's results; clearing counts messages rather than result blocks.
 public enum ParallelToolDispatch {
     /// Concurrency cap per iteration. Anything beyond this queues behind the
     /// window (completion-ordered refill).
     static let maxConcurrentPerIteration = 4
 
-    /// Rollback lever (documented above). Checked once per process.
+    /// Serial-dispatch override, checked once per process.
     static let serialFallbackEnvVar = "NATIVE_AGENT_SERIAL_TOOL_DISPATCH"
 
     /// Pure, injectable parser for the env flag (unit-testable without
@@ -72,19 +42,12 @@ public enum ParallelToolDispatch {
     public static func isParallelSafe(internalToolName name: String, input: [String: JSONValue] = [:]) -> Bool {
         guard PermissionLaw.toolClass(name, input: input) == .read else { return false }
         let canonical = ToolNameAliases.canonical(name)
-        // `git diff` of the working tree rewrites .git/index (git applies GIT_OPTIONAL_LOCKS=0 to
-        // every other read; verified on git 2.50.1, 2026-09-01), so it runs alone.
+        // Working-tree git diff may rewrite .git/index, so it runs alone.
         if canonical == "git_diff" { return false }
         return [.core, .fileOps].contains(AppActionBinding.declaredBucket(canonical) ?? .unclassified)
     }
 
-    /// Fleet-dispatch exception (User, 2026-08-27): `invoke_codex` declares a write because two spawns sharing a checkout stash
-    /// each other's edits. But when EVERY invoke_codex call in the iteration
-    /// carries an explicit cwd in a distinct, non-overlapping checkout (per-lane
-    /// worktrees), the spawns may run concurrently —
-    /// that is exactly Agent's lane-burn shape. Any missing, blank, or
-    /// duplicate cwd disables the override for the whole iteration (fail
-    /// closed, back to serial).
+    /// invoke_codex calls may run concurrently only when every cwd names a distinct, non-overlapping checkout.
     ///
     /// Returns one entry per call: `true` to force parallel-safe, `nil` to
     /// keep the declared-class verdict.
@@ -94,11 +57,7 @@ public enum ParallelToolDispatch {
         let none: [Bool?] = Array(repeating: nil, count: names.count)
         let codexIdx = names.indices.filter { names[$0] == "invoke_codex" }
         guard codexIdx.count >= 2 else { return none }
-        // Distinctness must be FILESYSTEM identity, not string identity:
-        // symlinked or case-aliased paths on APFS can name the same checkout
-        // (gpt-5.5 review BLOCKING, 2026-08-27). Each cwd must exist and
-        // resolve to a unique checkout (device, inode), with no overlapping
-        // writable roots; subdirectories of one checkout are not isolated.
+        // Require existing, non-overlapping checkout roots with unique (device, inode) identities, resolving path aliases.
         var identities: Set<FleetCwdIdentity> = []
         var roots: [String] = []
         for i in codexIdx {
@@ -106,7 +65,8 @@ public enum ParallelToolDispatch {
                   !c.trimmingCharacters(in: .whitespaces).isEmpty,
                   let root = Self.fleetCheckoutRoot(path: c),
                   !roots.contains(where: {
-                      root == $0 || root.hasPrefix($0 + "/") || $0.hasPrefix(root + "/")
+                      NativeAgentWorkspaceRoot.relativePath(root, under: $0) != nil
+                          || NativeAgentWorkspaceRoot.relativePath($0, under: root) != nil
                   }),
                   let identity = Self.fleetCwdIdentity(path: root),
                   identities.insert(identity).inserted else {

@@ -1,8 +1,9 @@
 import Foundation
+import NativeAgentShared
 import PersistenceCore
 import Experiences
 import NativeAgentCore
-// Blueprint: | `ShelfStore.swift` | `ShelfStore` struct; `append`, `settleApproval` |
+// Blueprint: | `ShelfStore.swift` | `ShelfStore` struct; `append`, `settleApproval`; query-bound cursor and plain offset paging with whole-word headlines |
 
 public struct ShelfStore: Sendable {
     public static let maximumPageSize = 100
@@ -129,10 +130,14 @@ public struct ShelfStore: Sendable {
     /// case-insensitive search of headline/findings/change/uncertainties. Cursors are query-bound.
     /// `readerId` selects unread entries for that reader only (e.g. "agent" vs "ui:user").
     /// Reads never acknowledge entries. Start with nil cursor to revisit unread holes or refresh.
+    /// `offset` skips matching rows; never combine it with a cursor.
     public func shelfRead(bot: UUID? = nil, since: Date? = nil, topic: String? = nil,
                           limit: Int = 20, cursor: String? = nil, readerId: String? = nil,
-                          newestFirst: Bool = false) throws -> ShelfReadPage {
+                          newestFirst: Bool = false, offset: Int = 0) throws -> ShelfReadPage {
         guard (1...Self.maximumPageSize).contains(limit) else { throw StandingBotsError.invalidValue("limit must be 1...100") }
+        guard offset >= 0, cursor == nil || offset == 0 else {
+            throw StandingBotsError.invalidValue("offset must be nonnegative; use offset or cursor, not both")
+        }
         if let since, !since.timeIntervalSince1970.isFinite { throw StandingBotsError.invalidValue("since") }
         if let readerId { try validateReader(readerId) }
         let query = Query(bot: bot, since: since, topic: topic?.trimmingCharacters(in: .whitespacesAndNewlines), readerId: readerId,
@@ -149,20 +154,23 @@ public struct ShelfStore: Sendable {
             // Read one lookahead row; only returned rows can move the continuation boundary.
             let all = try books()
             let ordered = newestFirst ? Array(all.reversed()) : all
-            let selected = ordered.lazy.filter { book in
+            let matching = ordered.filter { book in
                 let entry = book.entry
-                return (newestFirst ? book.sequence < after : book.sequence > after) && !seen.contains(entry.id)
+                return !seen.contains(entry.id)
                     && (bot == nil || entry.botId == bot)
                     && (since == nil || entry.runAt > since!)
                     && matches(entry, topic: query.topic)
-            }.prefix(limit + 1)
-            let candidates = Array(selected)
+            }
+            let start = cursor == nil ? offset : matching.prefix(while: {
+                newestFirst ? $0.sequence >= after : $0.sequence <= after
+            }).count
+            let candidates = Array(matching.dropFirst(start).prefix(limit + 1))
             let page = Array(candidates.prefix(limit))
             let rows = page.map { book in
                 let entry = book.entry
                 return ShelfIndexRow(id: entry.id, botId: entry.botId, briefVersion: entry.briefVersion,
                                      runAt: entry.runAt, coverageStart: entry.coverageStart, coverageEnd: entry.coverageEnd,
-                                     headline: String(entry.headline.prefix(240)), headlineTruncated: entry.headline.count > 240,
+                                     headline: BotHeadline.clipped(entry.headline), headlineTruncated: entry.headline.count > 240,
                                      runHealth: entry.runHealth)
             }
             let hasMore = candidates.count > limit
@@ -171,21 +179,15 @@ public struct ShelfStore: Sendable {
             // history ends at the oldest row; refresh from nil for new arrivals.
             let continuation = newestFirst && !hasMore ? nil : (next ?? cursor)
             return ShelfReadPage(rows: rows, nextCursor: continuation,
-                                 truncated: hasMore || rows.contains(where: \.headlineTruncated))
+                                 truncated: hasMore || rows.contains(where: \.headlineTruncated),
+                                 nextOffset: hasMore && start <= Int.max - page.count ? start + page.count : nil)
         }
     }
 
     /// Every settled entry, grouped by bot, in ONE checked pass under the
     /// store lock — same `books()` validation as `shelfRead` and `entry`, and
     /// the same ascending append order within each bot.
-    ///
-    /// User, 2026-09-13 (speed): the Bots shelf used to reach the same result
-    /// by paginating each bot's whole history and then calling `entry` for
-    /// every row. Each of those calls decoded and sorted EVERY book of EVERY
-    /// bot, so a shelf of N entries across B bots cost roughly N×(N+B) decodes
-    /// to show a page that is one decode's worth of information.
-    /// Acknowledgement state is deliberately not consulted: this is the shelf
-    /// as the page draws it, and reads never acknowledge.
+    /// Reads ignore acknowledgement state and never acknowledge entries.
     public func entriesByBot() throws -> [UUID: [ShelfEntry]] {
         try disk.locked {
             var grouped: [UUID: [ShelfEntry]] = [:]

@@ -1,18 +1,5 @@
 // REMLessonOrigin.swift
-// Phase 5 C1 (2026-10-03): a lesson keeps the moment that taught it.
-//
-// Agent: "compression saves conclusions and loses the experience behind them."
-// A REM lesson lands in GROWTH as a slogan. Its proposal row already keeps the
-// dream passages and their sources; REM now also writes `whatChanged` (what
-// surprised her, what changed). When the lesson is approved, this keeps one
-// small memory of kind `lesson_origin`: the moment behind it (his verbatim
-// words, from the moment recorded in the same conversation on the same day)
-// plus what changed. It rides the personal recall lane, so a turn the lesson
-// is relevant to can bring back the moment instead of the slogan, which
-// GROWTH already carries.
-//
-// On-device only: no model call. One record per approved lesson; storing the
-// same origin again re-asserts the existing row.
+// Approved lessons retain one idempotent, on-device lesson_origin memory with source moments and whatChanged.
 
 import ChatTurnContracts
 import DreamREMCycle
@@ -53,7 +40,8 @@ public enum REMLessonOrigin {
     public static func originMoments(
         for row: REMProposalRow,
         moments: [MemoryRecord],
-        peerSessionTrusted: (String) -> Bool
+        peerSessionTrusted: (String) -> Bool,
+        dataRoot: URL = defaultDataRoot()
     ) -> [MemoryRecord] {
         let days = sourceDays(row)
         guard !days.isEmpty else { return [] }
@@ -61,10 +49,10 @@ public enum REMLessonOrigin {
             .joined(separator: " "))
         let ranked: [(MemoryRecord, Int)] = moments.compactMap { record in
             guard (record.status ?? "active") == "active", MemoryMoments.isMoment(record.extras),
-                  let session = MemoryMoments.metadataString(record.extras, "session_id"),
+                  let session = record.extras?.objectValue?["session_id"]?.stringValue,
                   let at = MemoryMoments.parseTimestamp(record.observedAt ?? record.createdAt),
                   days.contains("\(session)|\(MemoryMoments.dayKey(at))"),
-                  ownExchange(record, session: session, peerSessionTrusted: peerSessionTrusted) else { return nil }
+                  ownExchange(record, session: session, peerSessionTrusted: peerSessionTrusted, dataRoot: dataRoot) else { return nil }
             let shared = words(record.text).intersection(about).count
             return shared > 0 ? (record, shared) : nil
         }
@@ -74,9 +62,9 @@ public enum REMLessonOrigin {
 
     /// User and Agent's own exchange, or a peer User made his own in Trust
     /// (`PeerTrust`). Any other peer's moment is not the origin of her lesson.
-    static func ownExchange(_ record: MemoryRecord, session: String, peerSessionTrusted: (String) -> Bool) -> Bool {
-        let author = MemoryMoments.metadataString(record.extras, "author") ?? "user"
-        let peer = author != "user" || session.hasPrefix("agent-") || session.hasPrefix("bot-")
+    static func ownExchange(_ record: MemoryRecord, session: String, peerSessionTrusted: (String) -> Bool, dataRoot: URL) -> Bool {
+        let author = record.extras?.objectValue?["author"]?.stringValue ?? "user"
+        let peer = author != "user" || SessionConversation.kind(session, dataRoot: dataRoot, includingArchived: true)?.isPeerConversation == true
         return !peer || peerSessionTrusted(session)
     }
 
@@ -94,7 +82,7 @@ public enum REMLessonOrigin {
               !changed.isEmpty else { return nil }
         let lived = moment.flatMap { MemoryMoments.parseTimestamp($0.observedAt ?? $0.createdAt) }.map { MemoryMoments.dayKey($0) }
             ?? row.livedDates?.last ?? String(row.createdAt.prefix(10))
-        guard let said = moment.flatMap({ MemoryMoments.metadataString($0.extras, "quote") })?
+        guard let said = moment.flatMap({ $0.extras?.objectValue?["quote"]?.stringValue })?
             .trimmingCharacters(in: .whitespacesAndNewlines), !said.isEmpty else {
             return "What changed: \(changed) (lived \(lived))"
         }
@@ -116,7 +104,7 @@ public enum REMLessonOrigin {
         if let kept = try await memory.authorityRecord(id: id) { return kept }
         let moments = try await memory.listMemory(kind: MemoryMoments.kind)
         var peerOwners: [(id: String, prefix: String)]?
-        let behind = originMoments(for: row, moments: moments) { session in
+        let behind = originMoments(for: row, moments: moments, peerSessionTrusted: { session in
             // Read contacts once when a peer candidate needs them; trust is
             // still checked for each candidate against the live authority.
             if peerOwners == nil {
@@ -129,7 +117,7 @@ public enum REMLessonOrigin {
             }
             guard let owner = peerOwners?.first(where: { session.hasPrefix($0.prefix) }) else { return false }
             return ownerTrusts(owner.id)
-        }
+        }, dataRoot: dataRoot)
         guard let text = originText(for: row, moment: behind.first) else { return nil }
         var metadata: [String: JSONValue] = [
             "kind": .string(kind),

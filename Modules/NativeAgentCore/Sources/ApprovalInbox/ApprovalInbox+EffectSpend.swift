@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
@@ -22,12 +23,7 @@ extension SwiftNativeApprovalInbox {
     /// Kept separate from injection_spends.json: injection verification owns
     /// its narrower capability fence, while this store owns ordinary approved
     /// chat-tool and connector execution starts.
-    nonisolated var effectSpendPath: URL {
-        root
-            .appendingPathComponent("workflows", isDirectory: true)
-            .appendingPathComponent("approvals", isDirectory: true)
-            .appendingPathComponent("effect_spends.json")
-    }
+    nonisolated var effectSpendPath: URL { Self.effectSpendPath(root: root) }
 
     public func consumeApprovedEffect(
         id: String,
@@ -42,20 +38,21 @@ extension SwiftNativeApprovalInbox {
         guard !id.isEmpty, !digest.isEmpty, !action.isEmpty, !surface.isEmpty else {
             return .unavailable
         }
-        let path = effectSpendPath
-        let now = Date()
-        let persistence = self.persistence
+        return await consumeApprovedEffect(id: id, marker: [
+            "digest": .string(digest), "action": .string(action),
+            "surface": .string(surface), "spentAt": .string(NativeTimestampFormat.fractionalZulu(Date())),
+            "dispatched": .bool(false),
+        ], at: effectSpendPath, schema: Self.effectSpendSchema, actionField: "action")
+    }
+
+    func consumeApprovedEffect(
+        id: String, marker: [String: JSONValue], at path: URL, schema: String, actionField: String
+    ) async -> ApprovalEffectSpendOutcome {
         do {
-            return try await persistence.withFileLock(path) {
-                var spends = try Self.loadEffectSpends(at: path)
+            return try await SwiftNativePersistenceCore.withFileLock(path) {
+                var spends = try Self.loadSpends(at: path, schema: schema, actionField: actionField)
                 if spends[id] != nil { return .alreadySpent }
-                spends[id] = .object([
-                    "digest": .string(digest),
-                    "action": .string(action),
-                    "surface": .string(surface),
-                    "spentAt": .string(Self.effectSpendTimestamp(now)),
-                    "dispatched": .bool(false),
-                ])
+                spends[id] = .object(marker)
                 if spends.count > Self.effectSpendCap {
                     let retainedIDs = Set(try Self.loadApprovalRowsChecked(
                         at: path.deletingLastPathComponent().appendingPathComponent("requests.json")
@@ -67,9 +64,9 @@ extension SwiftNativeApprovalInbox {
                         spends.removeValue(forKey: entry.key)
                     }
                 }
-                try await persistence.writeJSON(
+                try await SwiftNativePersistenceCore.writeJSON(
                     .object([
-                        "schema": .string(Self.effectSpendSchema),
+                        "schema": .string(schema),
                         "spends": .object(spends),
                     ]),
                     to: path
@@ -83,72 +80,67 @@ extension SwiftNativeApprovalInbox {
         }
     }
 
-    /// 2026-09-18: the executor's spend and the dispatch's consumption share
-    /// one durable marker; a restart cannot reuse a still-fresh exemption.
-    func consumeApprovedReplayDispatch(id: String) async throws -> ApprovedReplayVerification {
+    /// Verify the loaded spend and consume dispatch under the same lock.
+    func consumeApprovedReplayDispatch(
+        id: String, matching matches: @Sendable ([String: JSONValue]) -> Bool
+    ) async throws -> ApprovedReplayVerification {
         let path = effectSpendPath
-        return try await persistence.withFileLock(path) { [persistence] in
-            var spends = try Self.loadEffectSpends(at: path)
+        return try await SwiftNativePersistenceCore.withFileLock(path) {
+            var spends = try Self.loadSpends(at: path, schema: Self.effectSpendSchema, actionField: "action")
             guard case .object(var marker)? = spends[id] else { return .notSpentByExecutor }
+            guard matches(marker) else { return .notSpentByExecutor }
             guard case .bool(let dispatched)? = marker["dispatched"] else {
                 throw ApprovalInboxError.malformedResponse("approval effect spend marker has no valid dispatched state")
             }
             if dispatched { return .alreadyConsumed }
             marker["dispatched"] = .bool(true)
             spends[id] = .object(marker)
-            try await persistence.writeJSON(.object([
+            try await SwiftNativePersistenceCore.writeJSON(.object([
                 "schema": .string(Self.effectSpendSchema), "spends": .object(spends),
             ]), to: path)
             return .verified
         }
     }
 
-    /// Read-only probe for the durable spend marker. Public since 2026-09-06:
-    /// the dispatcher verifies a post-approval replay against it (an honest
-    /// replay is one the executor spent moments before dispatching). Never
-    /// mutates.
-    public func approvedEffectSpend(id: String) async throws -> JSONValue? {
-        let spends = try Self.loadEffectSpends(at: effectSpendPath)
-        return spends[id.trimmingCharacters(in: .whitespacesAndNewlines)]
-    }
-
-    nonisolated static func loadEffectSpends(at path: URL) throws -> [String: JSONValue] {
+    nonisolated static func loadSpends(
+        at path: URL, schema: String, actionField: String
+    ) throws -> [String: JSONValue] {
         guard FileManager.default.fileExists(atPath: path.path) else { return [:] }
         let data: Data
         do {
             data = try Data(contentsOf: path)
         } catch {
             throw ApprovalInboxError.unavailable(
-                underlying: "approval effect spend store unreadable: \(error.localizedDescription)"
+                underlying: "\(schema) spend store unreadable: \(error.localizedDescription)"
             )
         }
         guard !data.isEmpty else {
-            throw ApprovalInboxError.malformedResponse("approval effect spend store exists but is empty")
+            throw ApprovalInboxError.malformedResponse("\(schema) spend store exists but is empty")
         }
         let raw: JSONValue
         do {
             raw = try JSONValue.parse(data)
         } catch {
             throw ApprovalInboxError.malformedResponse(
-                "approval effect spend store contains malformed JSON: \(error.localizedDescription)"
+                "\(schema) spend store contains malformed JSON: \(error.localizedDescription)"
             )
         }
         guard case .object(let root) = raw,
-              root["schema"] == .string(effectSpendSchema),
+              root["schema"] == .string(schema),
               case .object(let spends)? = root["spends"] else {
             throw ApprovalInboxError.malformedResponse(
-                "approval effect spend store has an unsupported shape or schema"
+                "\(schema) spend store has an unsupported shape or schema"
             )
         }
         for (id, value) in spends {
             guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   case .object(let marker) = value,
                   case .string(let digest)? = marker["digest"], !digest.isEmpty,
-                  case .string(let action)? = marker["action"], !action.isEmpty,
+                  case .string(let action)? = marker[actionField], !action.isEmpty,
                   case .string(let surface)? = marker["surface"], !surface.isEmpty,
                   case .string(let spentAt)? = marker["spentAt"], !spentAt.isEmpty else {
                 throw ApprovalInboxError.malformedResponse(
-                    "approval effect spend store contains a malformed marker"
+                    "\(schema) spend store contains a malformed marker"
                 )
             }
         }
@@ -159,9 +151,5 @@ extension SwiftNativeApprovalInbox {
         guard case .object(let object) = value,
               case .string(let value)? = object["spentAt"] else { return "" }
         return value
-    }
-
-    private nonisolated static func effectSpendTimestamp(_ date: Date) -> String {
-        NativeTimestampFormat.fractionalZulu(date)
     }
 }

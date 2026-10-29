@@ -7,6 +7,7 @@ import Foundation
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+import Transcripts
 
 // Blueprint: | `QuietChatSessionCommands.swift` | `QuietChatSessionCommands`: effect-free session fences, session operations and queued-turn receipts through canonical turn owners |
 
@@ -38,7 +39,7 @@ public protocol QuietChatSessionCommandPort: MacChatTurnPresentationPort {
     func clearQuietChatMessages(sessionId: String) async -> (succeeded: Bool, agentMessage: String)
     func archiveQuietChat(sessionId: String) async -> (succeeded: Bool, agentMessage: String)
     func compactQuietChat(sessionId: String, model: String?, providerID: String?, force: Bool) async throws -> ChatSessionCompactionOutcome
-    func exportQuietChat(session: NativeAgentShared.ChatSession?, sessionId: String, messages: [Transcript.Message]) async throws -> URL
+    func exportQuietChat(session: NativeAgentShared.ChatSession?, sessionId: String, messages: [Transcript.Message]) async throws -> ChatExportResult
     func publishChatSnapshot()
     func quietChatIsDetached(_ sessionId: String) -> Bool
     func openQuietChatWindow(sessionId: String)
@@ -103,7 +104,7 @@ public enum QuietChatSessionCommands {
             let result = await appModel.clearQuietChatMessages(sessionId: session.id)
             guard result.succeeded else { return failure("clear_failed", result.agentMessage, session, effects: "unknown") }
             HarnessDecidedRow.post(requester: "Full Mac", tool: "chat.clear \(session.id)",
-                                   sessionID: AppToolExecutor.inputString(input["__session_id"]),
+                                   sessionID: input["__session_id"]?.scalarText,
                                    dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
             return ok(session, changed: true, "Every message in \(session.title) is gone for good.")
         case "archive":
@@ -152,9 +153,16 @@ public enum QuietChatSessionCommands {
         case "export":
             do {
                 let messages = try await appModel.chatCommandTranscripts.loadMessages(sessionId: session.id, cached: true)
-                let file = try await appModel.exportQuietChat(session: session.row, sessionId: session.id, messages: messages)
-                var body = ok(session, changed: true, "Exported \(session.title) as Markdown.")
-                if case .object(var fields) = body { fields["path"] = .string(file.path); body = .object(fields) }
+                let result = try await appModel.exportQuietChat(session: session.row, sessionId: session.id, messages: messages)
+                let message = result.unavailableImages.isEmpty
+                    ? "Exported \(session.title) as Markdown."
+                    : "Exported \(session.title) as Markdown; some images were unavailable: \(result.unavailableImages.joined(separator: "; "))."
+                var body = ok(session, changed: true, message)
+                if case .object(var fields) = body {
+                    fields["path"] = .string(result.url.path)
+                    fields["unavailable_images"] = .array(result.unavailableImages.map { .string($0) })
+                    body = .object(fields)
+                }
                 return body
             } catch {
                 return AppToolExecutor.ownedFailure(error, code: "chat_export_failed", owner: "conversation \(session.id)",
@@ -229,7 +237,7 @@ public enum QuietChatSessionCommands {
     /// Archived rows are read only when requested; listing changes nothing.
     @MainActor
     private static func list<Host: QuietChatSessionCommandPort>(_ input: [String: JSONValue], appModel: Host) async -> JSONValue {
-        let archived = AppToolExecutor.inputString(input["archived"])?.lowercased() == "true"
+        let archived = input["archived"]?.scalarText?.lowercased() == "true"
         let pinned = Set(appModel.quietPinnedChatSessionIDs)
         let pinnedOnly: Bool? = if case .bool(let value)? = input["pinned"] { value } else { nil }
         var rows = appModel.chatCommandTranscripts.sessions
@@ -238,11 +246,11 @@ public enum QuietChatSessionCommands {
                 return AppToolExecutor.failure("list_failed", "The conversation list didn't read (\(error.localizedDescription)). Try again.")
             }
         }
-        let query = AppToolExecutor.inputString(input["query"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let query = input["query"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         rows = rows.filter { ($0.archived == true) == archived && (pinnedOnly == nil || pinned.contains($0.id) == pinnedOnly)
             && (query.isEmpty || BridgeRoutingPrefix.stripping($0.title).localizedCaseInsensitiveContains(query)) }
             .sorted { ($0.updatedAt ?? $0.createdAt) > ($1.updatedAt ?? $1.createdAt) }
-        let offset = min(rows.count, max(0, AppToolExecutor.inputString(input["offset"]).flatMap { Int($0) } ?? 0))
+        let offset = min(rows.count, max(0, input["offset"]?.scalarText.flatMap { Int($0) } ?? 0))
         let page = rows.dropFirst(offset).prefix(20)
         let next = offset + page.count
         return .object([

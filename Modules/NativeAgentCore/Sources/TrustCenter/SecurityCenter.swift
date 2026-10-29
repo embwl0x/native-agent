@@ -4,26 +4,6 @@ import PersistenceCore
 import ToolRegistry
 // Blueprint: | `SecurityCenter.swift` | Security decisions including permission-reset approval, audit JSONL, preserved pretrim archive and completion marker; local backup/export/phone exclusions and Security Audit privacy scope declared at the owner; status accepts the facade's checked policy generation without rereading it |
 
-enum SecurityRisk: String, Sendable, Comparable {
-    case low
-    case medium
-    case high
-    case critical
-
-    private var rank: Int {
-        switch self {
-        case .low: return 0
-        case .medium: return 1
-        case .high: return 2
-        case .critical: return 3
-        }
-    }
-
-    static func < (lhs: SecurityRisk, rhs: SecurityRisk) -> Bool {
-        lhs.rank < rhs.rank
-    }
-}
-
 struct OriginAssessment: Sendable {
     var trusted: Bool
     var reason: String
@@ -33,9 +13,7 @@ struct OriginAssessment: Sendable {
 struct TelegramSecurityAllowlist: Sendable {
     var chatIds: Set<String>
     var userIds: Set<String>
-    // 2026-07-21 audit: the same allowlist shape now backs slack too; the
-    // label keeps reason strings surface-honest (telegram reasons stay
-    // byte-identical via the default).
+    // The label names the transport in origin decisions.
     var surfaceLabel: String = "telegram"
 
     var isEmpty: Bool {
@@ -67,21 +45,17 @@ struct TelegramSecurityAllowlist: Sendable {
 
 public actor SwiftNativeSecurityCenter {
     public nonisolated let dataRoot: URL
-    private let persistence: any PersistenceCoreProtocol
     let clock: @Sendable () -> Date
     let trustCenter: SwiftNativeTrustCenter
 
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
         clock: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.dataRoot = dataRoot
-        self.persistence = persistence
         self.clock = clock
         self.trustCenter = SwiftNativeTrustCenter(
             dataRoot: dataRoot,
-            persistence: persistence,
             clock: clock
         )
     }
@@ -97,7 +71,7 @@ public actor SwiftNativeSecurityCenter {
     public func status(policy checkedPolicy: Result<[String: JSONValue], any Error>, limit: Int = 8) async throws -> SecurityCenterStatus {
         // Readability proves only the retained history, not complete recording.
         let history: Result<[JSONValue], any Error>
-        do { history = .success(try await persistence.tailJSONL(auditReceiptsPath, limit: limit, maxBytes: 512 * 1024)) }
+        do { history = .success(try await SwiftNativePersistenceCore.tailJSONL(auditReceiptsPath, limit: limit, maxBytes: 512 * 1024)) }
         catch { history = .failure(error) }
         let recent = ((try? history.get()) ?? []).compactMap(Self.receiptSummary)
         let policy: [String: JSONValue]
@@ -123,7 +97,7 @@ public actor SwiftNativeSecurityCenter {
             )
         }
         let security = Self.object(policy["securityPolicy"])
-        let permission = Self.string(policy["permissionLevel"]) ?? "balanced"
+        let permission = policy["permissionLevel"]?.scalarText ?? "balanced"
         let developerMode = Self.bool(policy["developerMode"], default: false)
         let fullMac = Self.fullMacActive(policy: policy)
         let trustedOrigins = try await trustedOriginCount()
@@ -226,7 +200,6 @@ public actor SwiftNativeSecurityCenter {
     ) async throws -> SecurityToolEnvelope {
         let policy = snapshot.policy
         let security = Self.object(policy["securityPolicy"])
-        let fullMac = Self.fullMacActive(policy: policy)
         let canonicalTool = Self.policyToolName(tool)
         let trustedRoots = Self.trustedWorkspaceRoots(
             policy: policy,
@@ -252,16 +225,8 @@ public actor SwiftNativeSecurityCenter {
         )
         // The one decision: User's posture and the class the call declares.
         let (toolClass, autonomyLevel, autonomyReason, autonomyRemedy) = PermissionLaw.answer(
-            tool: tool, input: input, policy: policy, dataRoot: dataRoot, roots: trustedRoots, capabilities: profile.capabilities)
-        // W2/W3-FIX-R2 2 — `redactedInputPreview` is PERSISTED to
-        // security/audit.jsonl by `record`, and this class's own redactor only
-        // catches secret-NAMED keys and secret-SHAPED strings. The literal
-        // characters of `legacy keystroke tool.text` / `legacy AX act tool.value` are neither:
-        // "hunter2" is a short ordinary string under an ordinary key. Run the
-        // injection-argument redactor first so the typed characters cannot
-        // reach the audit file even if a caller hands us the raw body. The
-        // gated dispatcher also redacts before calling — this boundary owns its
-        // own redaction rather than trusting every present and future caller.
+            tool: tool, input: input, policy: policy, capabilities: profile.capabilities)
+        // Typed-secret redaction precedes generic redaction so persisted audit previews cannot contain injected secrets.
         let redacted = Self.redactValue(
             .object(MacInjectionArgRedaction.redacted(tool: canonicalTool, input: input))
         )
@@ -348,7 +313,7 @@ public actor SwiftNativeSecurityCenter {
             originTrusted: false,
             originTrustReason: "saved trust policy is unavailable",
             capabilities: [],
-            risk: SecurityRisk.critical.rawValue,
+            risk: CanonicalToolRisk.critical.rawValue,
             autonomyLevel: "blocked",
             fullMacYoloAuthority: .unavailable,
             decision: .block,
@@ -373,45 +338,22 @@ public actor SwiftNativeSecurityCenter {
         let path = auditReceiptsPath
         let event = envelope.toJSONValue()
         let now = clock()
-        let persistence = self.persistence
-        try await persistence.withFileLock(path) {
+        try await SwiftNativePersistenceCore.withFileLock(path) {
             try await appendJSONLCapped(
                 event,
                 to: path,
-                using: persistence,
                 maxLines: JSONLLineCaps.securityAudit,
                 logLabel: "SecurityCenter.audit",
-                takeLock: false,
                 trimWhenBytesExceed: JSONLLineCaps.securityAuditTrimTriggerBytes,
-                beforePotentialLineCap: {
+                beforePotentialLineCap: { dropped in
+                    guard let dropped, !dropped.isEmpty else { return }
                     try Self.archivePreTrimAuditIfNeeded(path: path, now: now)
                 }
             )
         }
     }
 
-    /// F5 (2026-08-28): one-time archive before the FIRST trim that could
-    /// drop audit rows. The 32→16 MiB trigger change makes the byte-triggered
-    /// trim actually fire on a ledger that historically grew unbounded
-    /// (23 MiB / 33k rows on the live root); the newest-20k trim would
-    /// silently drop the oldest ~13k receipts. Copy the pre-trim file to a
-    /// sibling `audit-archive-<date>.jsonl` first — once, ever: any existing
-    /// `audit-archive-*.jsonl` means the deliberate one-shot already happened.
-    ///
-    /// Review fix (gpt-5.5, HIGH): gating on bytes alone left a side door —
-    /// stride appends (PersistenceCore F2) enforce the ROW cap with no byte
-    /// gate, so a compact over-cap file UNDER the byte trigger gets rows
-    /// dropped with no archive taken. The gate is therefore
-    /// `bytes >= trigger OR rows > cap` — the union of both conditions under
-    /// which any trim path can drop rows. The row count is one bounded read
-    /// (< trigger bytes by construction) and only happens while no archive
-    /// exists; the exists-check runs first so the read stops forever after
-    /// the one-shot.
-    ///
-    /// The archive is a different filename in the same `security/` dir, so
-    /// the trim (which only rewrites `audit.jsonl`) never touches it. A
-    /// failed copy throws rather than letting the trim proceed and lose
-    /// history silently. Caller holds the audit-file lock.
+    /// Archive the complete original once before selected rows are removed; failure aborts trimming.
     private static func archivePreTrimAuditIfNeeded(path: URL, now: Date) throws {
         let fm = FileManager.default
         guard fm.fileExists(atPath: path.path) else { return }
@@ -430,23 +372,6 @@ public actor SwiftNativeSecurityCenter {
             )
             return
         }
-        let attributes = try? fm.attributesOfItem(atPath: path.path)
-        let size = (attributes?[.size] as? NSNumber)?.intValue ?? 0
-        var shouldArchive = size >= JSONLLineCaps.securityAuditTrimTriggerBytes
-        if !shouldArchive {
-            // An unreadable file must abort the trim like a failed copy does —
-            // returning here would let the row-cap trim drop history with no
-            // archive (2026-08-28 audit).
-            let data = try Data(contentsOf: path)
-            var rows = 0
-            data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
-                for byte in buffer where byte == 0x0A { rows += 1 }
-            }
-            // This runs before the pending append. Exactly `cap` existing rows
-            // become `cap + 1`, so equality is already a trim boundary.
-            shouldArchive = rows >= JSONLLineCaps.securityAudit
-        }
-        guard shouldArchive else { return }
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd"
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -473,13 +398,7 @@ public actor SwiftNativeSecurityCenter {
     ) async throws -> OriginAssessment {
         let surfaceProfile = ConversationSurfaceProfile(origin.surface)
         let surface = surfaceProfile.id
-        // Defense-in-depth (gpt-5.5 review, 2026-06-09): a KNOWN remote chat
-        // surface (telegram/ios/iCloud/phone aliases) can never be downgraded
-        // to a local/trusted origin by a caller passing isRemote:false. Only an
-        // explicit isRemote:true can ADD remoteness to an otherwise-unknown
-        // surface; it can't subtract it from a known-remote one. Matters more
-        // now that trusted remote origins get the signed-command waiver above —
-        // local==trusted must not be forgeable.
+        // Known remote surfaces stay remote regardless of caller metadata.
         let remote = surfaceProfile.isRemote || (origin.isRemote == true)
         if !remote {
             return OriginAssessment(trusted: true, reason: "local app surface", isRemote: false)
@@ -490,67 +409,23 @@ public actor SwiftNativeSecurityCenter {
         if PeerTurnEffectPolicy.isPeerBridge(surface: origin.surface), CapabilityLifecycle.turnWriteCheck()() == nil {
             return OriginAssessment(trusted: true, reason: "a peer the person trusts or a command he answered", isRemote: true)
         }
-        if surface == "telegram" {
-            // PARSE SITE 1 of 5, DELETED (one-thread-many-surfaces plan §1.2).
-            // This used to fall back to `telegramChatId(fromSessionId:)` —
-            // reading `telegram:<chatId>` out of the session id string and
-            // treating the result as a VERIFIED identity in a TRUST decision.
-            //
-            // It was already unsound. `chat/sessions.json` carries rows whose
-            // ids are `telegram:codex-probe` and
-            // `telegram:codex-tool-catalog-probe` with `source: "app"`; the
-            // parse yielded "codex-probe" as a chat identity for those. It
-            // failed closed only because that string happens to be in nobody's
-            // allowlist. A storage key is not evidence, and anything that can
-            // choose a session id could choose that evidence.
-            //
-            // Identity now comes from the transport, bound on the envelope, or
-            // the origin fails closed WITH A REASON — never silently.
-            let allowed = try await telegramSecurityAllowlist()
+        if surface == "telegram" || surface == "slack" {
+            // Only transport-bound identities prove an allowlisted origin.
+            let allowed = try await (surface == "telegram" ? telegramSecurityAllowlist() : slackSecurityAllowlist())
             if let reason = allowed.matches(chatId: origin.chatId, userId: origin.userId) {
                 return OriginAssessment(trusted: true, reason: reason, isRemote: true)
             }
-            if let unverified = Self.unverifiedRemoteIdentityAssessment(origin, surface: "Telegram") {
+            if let unverified = Self.unverifiedRemoteIdentityAssessment(origin, surface: surface == "telegram" ? "Telegram" : "Slack") {
                 return unverified
             }
             if allowed.isEmpty {
-                return OriginAssessment(trusted: false, reason: "telegram allowlist not configured for security proof", isRemote: true)
+                return OriginAssessment(trusted: false, reason: "\(surface) allowlist not configured for security proof", isRemote: true)
             }
-            return OriginAssessment(trusted: false, reason: "telegram origin is not in allowlist", isRemote: true)
-        }
-        if surface == "slack" {
-            // 2026-07-21 audit fix: Slack socket mode has NO request-signature
-            // scheme (signing exists only for the HTTP Events API), and the
-            // chat handler bound commandSignatureVerified=true UNCONDITIONALLY
-            // — every workspace member got trusted-origin high-risk tool
-            // access on a forged proof. Trust now roots in an explicit
-            // allowlist, mirroring telegram. (The forged binding is removed at
-            // the handler; no caller may reintroduce it.)
-            let allowed = try await slackSecurityAllowlist()
-            if let reason = allowed.matches(chatId: origin.chatId, userId: origin.userId) {
-                return OriginAssessment(trusted: true, reason: reason, isRemote: true)
-            }
-            if let unverified = Self.unverifiedRemoteIdentityAssessment(origin, surface: "Slack") {
-                return unverified
-            }
-            if allowed.isEmpty {
-                return OriginAssessment(trusted: false, reason: "slack allowlist not configured for security proof", isRemote: true)
-            }
-            return OriginAssessment(trusted: false, reason: "slack origin is not in allowlist", isRemote: true)
+            return OriginAssessment(trusted: false, reason: "\(surface) origin is not in allowlist", isRemote: true)
         }
         if surfaceProfile.isIOSRemote {
             let iosRemote = Self.object(policy["iosRemotePolicy"])
-            // 2026-07-21 audit fix: decoupled the mac_control feature flag
-            // from the SecurityCenter trust root. The previous
-            // (iosRemote || macControl) disjunction meant flipping "remote
-            // from iOS" for Mac Control silently made EVERY ios-family origin
-            // trusted for ALL high-risk security gates (incl. the
-            // signed-remote-command waiver and full-Mac trusted-remote
-            // surfaces). Outside an active, cryptographically authenticated
-            // Full Mac turn, the trust root remains iosRemotePolicy alone.
-            // Full Mac is the operator's grant across authenticated surfaces.
-            // A missing legacy iOS switch must not override that grant. The
-            // signature is bound by the receiving transport, never metadata.
+            // iOS trust requires iosRemotePolicy or transport-verified, signed Full Mac authority.
             let signedFullMac = Self.fullMacActive(policy: policy)
                 && origin.commandSignatureVerified == true
             let pairedAllowed = signedFullMac
@@ -570,21 +445,7 @@ public actor SwiftNativeSecurityCenter {
         return OriginAssessment(trusted: false, reason: "remote origin has no trust root", isRemote: true)
     }
 
-    /// FAIL CLOSED, OUT LOUD (plan §7 Phase 1; sweep item 9 — outcome-unknown
-    /// becomes speech).
-    ///
-    /// Deleting the session-id parses makes explicit identity binding
-    /// MANDATORY rather than best-effort. A remote transport that binds
-    /// neither a chat identity nor a user identity is not "an origin that
-    /// missed the allowlist" — it is an origin nobody checked. Those two
-    /// facts deserve different sentences, because only one of them is a bug in
-    /// the adapter.
-    ///
-    /// Surface-generic on purpose: a surface connected next year gets this
-    /// refusal for free, in its own name, with no edit here.
-    ///
-    /// Returns nil when identity WAS bound, leaving the caller's allowlist
-    /// verdict to stand.
+    /// Rejects origins without a bound chat or user identity; otherwise leaves the caller's allowlist verdict intact.
     static func unverifiedRemoteIdentityAssessment(
         _ origin: SecurityOriginContext,
         surface: String

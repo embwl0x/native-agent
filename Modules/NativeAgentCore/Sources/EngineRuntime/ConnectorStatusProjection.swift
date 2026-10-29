@@ -11,22 +11,14 @@ import Cognition
 import Observation
 import AppKit
 import EventKit
-// Blueprint: | `ConnectorStatusProjection.swift` | `ConnectorStatusProjection` observable engine owner: `LatestRead` publishes checked accounts, secret metadata and credential-free Slack policy; committed account updates publish through `write`, mutation verification uses its own refresh result; source invalidations; `connectorRowWithRuntimeOverlay`, `readConnectorRecords` (finishes pending Slack saves before seeding an absent registry with undecided choices; publication failures propagate), `updateConnector`, `restartSlackLane` (a Slack toggle or a phone Disconnect rebuilds the Socket Mode lane from what is saved); connector pages share decayed action/HTTP receipt evidence, including the Slack door's Web API calls |
-
-/// Platform permission evidence and the current display voice are supplied lazily.
-public protocol ConnectorStatusPlatform: Sendable {
-    func calendarEventKitReadState() -> String
-    var agentSubject: String { get }
-    /// A distributed public build seeds no self-hosted connectors.
-    var isPublicReleaseBundle: Bool { get }
-}
+// Blueprint: | `ConnectorStatusProjection.swift` | `ConnectorReadiness` observable engine owner: `LatestRead` publishes checked accounts, secret metadata and credential-free Slack policy; committed account updates publish through `write`, mutation verification uses its own refresh result; source invalidations; `connectorRowWithRuntimeOverlay`, `readConnectorRecords` (finishes pending Slack saves before seeding an absent registry with undecided choices; publication failures propagate), `updateConnector`, `restartSlackLane` (a Slack toggle or a phone Disconnect rebuilds the Socket Mode lane from what is saved); connector pages share decayed action/HTTP receipt evidence, including the Slack door's Web API calls |
 
 /// The engine's checked account, secret-metadata and Slack-policy revision.
 @Observable
-public final class ConnectorStatusProjection: Sendable {
+public final class ConnectorReadiness: Sendable {
     public typealias SecretMetadata = (name: String, hosts: [String], programs: [Keyring.Program], at: Date, account: String?)
     public let root: URL
-    let platform: any ConnectorStatusPlatform
+    let platform: AppConnectorStatusPlatform
     @MainActor public private(set) var accounts: Result<[ConnectorRecord], Error> = .success([])
     @MainActor public private(set) var secrets: Result<[SecretMetadata], Error>?
     @MainActor public private(set) var slackPolicy: Result<SlackIngressPolicy, Error>?
@@ -39,7 +31,7 @@ public final class ConnectorStatusProjection: Sendable {
     @ObservationIgnored @MainActor lazy var workspacesRead = LatestRead()
     @ObservationIgnored @MainActor lazy var actionsRead = LatestRead()
 
-    public init(root: URL, platform: any ConnectorStatusPlatform) {
+    public init(root: URL, platform: AppConnectorStatusPlatform) {
         self.root = root
         self.platform = platform
     }
@@ -68,9 +60,8 @@ public final class ConnectorStatusProjection: Sendable {
     }
 
     @MainActor public func observe() async {
-        let credentials = SlackCredentials.files(dataRoot: root)
         await EventDeadlinePhysiology.refreshOnChanges(paths: [Self.connectorRegistryPath(root: root),
-            ConnectorActionReceipt.receiptsPath(root: root)] + credentials +
+            ConnectorActionReceipt.receiptsPath(root: root), TransportAllowlist.slackMetadataPath(dataRoot: root)] +
             ["telegram/config.json", "research/config.json", "slack/config.json", "slack/state.json",
              "slack", "connectors/slack/save_intent.json"].map { root.appendingPathComponent($0) },
             stores: [.keyring],
@@ -97,7 +88,7 @@ public final class ConnectorStatusProjection: Sendable {
     public static func connectorRowWithRuntimeOverlay(
         _ row: [String: JSONValue],
         root: URL,
-        platform: any ConnectorStatusPlatform,
+        platform: AppConnectorStatusPlatform,
         proof: [String: (at: Date, succeeded: Bool, authorizationFailed: Bool)]? = nil
     ) -> [String: JSONValue] {
         guard let id = connectorString(row["id"]).map(normalizedConnectorID), !id.isEmpty else {
@@ -122,14 +113,21 @@ public final class ConnectorStatusProjection: Sendable {
 
         // Configuration alone leaves health unknown; EventKit carries its read result.
         if id == "telegram" {
-            if let cfg = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: root), !cfg.botToken.isEmpty {
-                out["enabled"] = .bool(cfg.enabled)
-                out["authState"] = .string("configured")
-                out["healthStatus"] = .string(cfg.enabled ? "unknown" : "disabled")
-            } else {
+            do {
+                if let cfg = try TelegramBot.TelegramConfig.loadSavedConfiguration(dataRoot: root, includeDisconnected: false), !cfg.botToken.isEmpty {
+                    out["enabled"] = .bool(cfg.enabled)
+                    out["authState"] = .string("configured")
+                    out["healthStatus"] = .string(cfg.enabled ? "unknown" : "disabled")
+                } else {
+                    out["enabled"] = .bool(false)
+                    out["authState"] = .string("not_connected")
+                    out["healthStatus"] = .string("needs_auth")
+                }
+            } catch {
                 out["enabled"] = .bool(false)
-                out["authState"] = .string("not_connected")
-                out["healthStatus"] = .string("needs_auth")
+                out["authState"] = .string("failed")
+                out["healthStatus"] = .string("failed")
+                out["runtimeDetail"] = .string("Its saved settings do not read (\(error.localizedDescription)). Disconnect it, then set it up again.")
             }
             return out
         }
@@ -149,7 +147,7 @@ public final class ConnectorStatusProjection: Sendable {
                 out["enabled"] = .bool(false)
                 out["authState"] = .string("failed")
                 out["healthStatus"] = .string("failed")
-                out["runtimeDetail"] = .string(error.localizedDescription)
+                out["runtimeDetail"] = .string("Its saved settings do not read (\(error.localizedDescription)). Disconnect it, then set it up again.")
             }
             return out
         }
@@ -201,6 +199,7 @@ public final class ConnectorStatusProjection: Sendable {
             let existingHealth = connectorString(out["healthStatus"])?.lowercased()
             let token: Bool
             do {
+                _ = try SlackCredentials.metadata(dataRoot: root)
                 token = try SlackCredentials.read(.bot, dataRoot: root) != nil
                 if token { out["enabled"] = .bool(try !SlackSocketModeConfig.socketModeSwitchedOff(dataRoot: root)) }
             } catch {
@@ -240,7 +239,7 @@ public final class ConnectorStatusProjection: Sendable {
     public static func applySlackRuntimeStateFeed(
         to row: inout [String: JSONValue],
         root: URL,
-        platform: any ConnectorStatusPlatform
+        platform: AppConnectorStatusPlatform
     ) {
         switch SlackRuntimeStateFeed.read(dataRoot: root) {
         case .absent:
@@ -326,66 +325,29 @@ public final class ConnectorStatusProjection: Sendable {
         ConnectorOAuthRegistry.connectorRegistryPath(root: root)
     }
 
-    public static func readConnectorRecords(root: URL, platform: any ConnectorStatusPlatform) async throws -> [ConnectorRecord] {
+    public static func readConnectorRecords(root: URL, platform: AppConnectorStatusPlatform) async throws -> [ConnectorRecord] {
         // Fresh install shows the blank-slate catalog instead of "0 connectors".
         try await seedDefaultConnectorsIfEmpty(root: root, platform: platform)
         let path = connectorRegistryPath(root: root)
-        let persistence = SwiftNativePersistenceCore()
-        return try await persistence.withFileLock(path) {
+        return try await SwiftNativePersistenceCore.withFileLock(path) {
             try checkedConnectorRecords(root: root, platform: platform)
         }
     }
 
     /// The checked reader behind the engine's published account revision.
-    public static func checkedConnectorRecords(root: URL, platform: any ConnectorStatusPlatform) throws -> [ConnectorRecord] {
+    public static func checkedConnectorRecords(root: URL, platform: AppConnectorStatusPlatform) throws -> [ConnectorRecord] {
         let current = try ConnectorOAuthRegistry.readRegistry(at: connectorRegistryPath(root: root))
         // List and mutation projections use the same receipt-backed overlay.
-        let checkedRows = try ConnectorOAuthRegistry.checkedConnectorRows(from: current)
-        // The phone's readiness and action eligibility must not conceal a
-        // malformed credential behind a second, apparently healthy source.
-        // A malformed credential fails its own row (disabled, failed, with why),
-        // never the whole list, and never reads as an absent one.
-        var unreadable: [String: String] = [:]
-        for row in checkedRows {
-            let id = normalizedConnectorID(connectorString(row["id"]) ?? "")
-            do {
-                if id == "telegram" {
-                    try TelegramBot.TelegramConfig.validateSavedConfiguration(dataRoot: root)
-                }
-                if id == "searxng" {
-                    let path = root.appendingPathComponent("research/config.json")
-                    let config: JSONValue
-                    do { config = try JSONValue.parse(Data(contentsOf: path)) }
-                    catch CocoaError.fileReadNoSuchFile { config = .object([:]) }
-                    guard case .object(let fields) = config,
-                          fields["searxng_base_url"] == nil || connectorString(fields["searxng_base_url"]) != nil else {
-                        throw PersistenceCoreError.ioFailure("Saved SearXNG settings must contain a string URL")
-                    }
-                }
-                if id == "slack" {
-                    _ = try SlackCredentials.metadata(dataRoot: root)
-                }
-            } catch {
-                unreadable[id] = error.localizedDescription
-            }
-        }
         let proof = ConnectorProofLedger.latestByConnector(root: root)
-        let rows = checkedRows.map { row -> [String: JSONValue] in
-            var out = connectorRowWithRuntimeOverlay(row, root: root, platform: platform, proof: proof)
-            if let why = unreadable[normalizedConnectorID(connectorString(row["id"]) ?? "")] {
-                out["enabled"] = .bool(false)
-                out["authState"] = .string("failed")
-                out["healthStatus"] = .string("failed")
-                out["runtimeDetail"] = .string("Its saved settings do not read (\(why)). Disconnect it, then set it up again.")
-            }
-            return out
+        let rows = current.map {
+            connectorRowWithRuntimeOverlay($0, root: root, platform: platform, proof: proof)
         }
         let data = try JSONValue.array(rows.map { .object($0) }).serializedData(pretty: false)
         return try JSONDecoder().decode([ConnectorRecord].self, from: data)
     }
 
     public static func updateConnector(
-        id: String, enabled: Bool, root: URL, platform: any ConnectorStatusPlatform
+        id: String, enabled: Bool, root: URL, platform: AppConnectorStatusPlatform
     ) async throws -> ConnectorRecord {
         let row = try await ConnectorRegistryActions.updateConnector(
             id: id, enabled: enabled, root: root,
@@ -401,7 +363,7 @@ public final class ConnectorStatusProjection: Sendable {
     /// The Socket Mode lane holds the tokens it was built with: every change to
     /// Slack's switch or credentials rebuilds it from what is saved now.
     static func restartSlackLane(root: URL) async {
-        await BackgroundLoopsManager.shared.restartLoop(id: "slack_socket_mode") {
+        await BackgroundLoopLifetimes.shared.restartLoop(id: "slack_socket_mode") {
             await NativeAgentEngine.makeSlackSocketModeLane(dataRoot: root)
         }
     }
@@ -460,10 +422,9 @@ public final class ConnectorStatusProjection: Sendable {
 
     /// Only an absent registry bootstraps. Even an empty saved catalog belongs
     /// to the operator; damaged content is reported by the checked reader.
-    private static func seedDefaultConnectorsIfEmpty(root: URL, platform: any ConnectorStatusPlatform) async throws {
+    private static func seedDefaultConnectorsIfEmpty(root: URL, platform: AppConnectorStatusPlatform) async throws {
         let path = connectorRegistryPath(root: root)
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
+        try await SwiftNativePersistenceCore.withFileLock(path) {
             try SlackCredentials.recoverPendingSave(dataRoot: root)
             do {
                 _ = try FileManager.default.attributesOfItem(atPath: path.path)

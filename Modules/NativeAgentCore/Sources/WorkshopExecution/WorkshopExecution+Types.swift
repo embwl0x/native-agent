@@ -1,11 +1,12 @@
 import Foundation
+import NativeAgentShared
 import os
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
 
-// Blueprint: | `WorkshopExecution+Types.swift` | Workshop execution value contracts: specs/steps, verification/records, enqueue outcomes, argument validation and planner interface |
+// Blueprint: | `WorkshopExecution+Types.swift` | Workshop execution value contracts: specs/steps with optional-read intent, verification/records, enqueue outcomes, argument validation and planner interface |
 
 // MARK: - Errors
 
@@ -14,28 +15,10 @@ public enum WorkshopExecutionError: Error, LocalizedError, Equatable {
     case persistenceFailure(String)
     case plannerFailure(String)
     case underlying(String)
-    // WAVE 41 W01 (REOPEN §6.220-rd2 #1): parity errors for the two daemon
-    // submission gates the native writer must mirror.
-    //
-    // `.forbidden` — parity for the daemon route's 403 when missionPolicy is
-    // off: the retired daemon returns
-    //   {"error": "forbidden", "detail": "missionPolicy.enabled not set in trust policy"}
-    // The associated value is that exact `detail` string so the seam can
-    // reconstruct the same envelope.
-    //
-    // `.workshopExecutionsBusy` — parity for MissionsBusyError,
-    // mapped by the daemon to HTTP 503 + MissionsBusyError.to_dict():
-    //   {"ok": false, "error": "missions_busy", "retryable": true, "detail": ...}
-    // The associated value is the same `detail` message string.
+    // Admission errors retain their detail string and stable wire error code.
     case forbidden(String)
     case workshopExecutionsBusy(String)
-    // STALE APPROVAL (2026-06-10, gpt-5.5 executor-port blocker #3): a
-    // resume was requested for an execution that is no longer
-    // blocked_on_approval (cancelled/failed/completed in the meantime).
-    // The step was NOT executed. Distinct from `.invalidRequest` so the
-    // approval-resolution caller can annotate the approval record honestly
-    // ("execution no longer blocked — not executed") instead of reporting a
-    // generic failure + claim-clear.
+    // A stale approval did not execute: the execution is no longer blocked, so resolution must record that outcome distinctly.
     case staleApproval(String)
     /// No slot was available; keep the resolved approval for a later drain.
     case approvalDeferred
@@ -53,9 +36,7 @@ public enum WorkshopExecutionError: Error, LocalizedError, Equatable {
         }
     }
 
-    /// Parity error code for `.forbidden` / `.workshopExecutionsBusy` — the `error`
-    /// field the daemon route puts in the JSON envelope. nil for the other
-    /// cases (those map to 400/500/etc., not a single stable code).
+    /// Stable JSON-envelope error code for admission refusals; nil for other errors.
     public var parityErrorCode: String? {
         switch self {
         case .forbidden: return "forbidden"
@@ -67,16 +48,13 @@ public enum WorkshopExecutionError: Error, LocalizedError, Equatable {
 
 // MARK: - Value types
 
-/// Caller-facing execution spec. Matches MissionRunner.submit() arg surface
-/// at the retired daemon: (title, objective, trigger_source,
-/// trust_required).
+/// Caller-facing execution spec.
 public struct WorkshopExecutionSpec: Codable, Sendable, Equatable {
     public var title: String
     public var objective: String
     public var triggerSource: String     // "manual" (the person), "agent" (workshop_submit) or "trigger:<name>"
     public var trustRequired: String     // "none"|"draft_auto"|"send_approval"|"destructive_strong"
-    /// Stable Desk identity for the Workshop-owned path. Nil is retained for
-    /// daemon-era callers while consumers migrate shadow-first.
+    /// Stable Desk identity when the caller associates the execution with Desk work.
     public var deskHandle: String?
     /// Optional reference to the existing connector workspace registry. This
     /// is association metadata only; it grants no path or tool authority.
@@ -102,8 +80,7 @@ public struct WorkshopExecutionSpec: Codable, Sendable, Equatable {
     }
 }
 
-/// Single plan step. Mirrors daemon @dataclass Step:
-///   id, description, tool_or_action, args, autonomy.
+/// One planned call. Optional reads may supply no evidence; effects remain required.
 public struct WorkshopExecutionStep: Codable, Sendable, Equatable {
     public var id: String
     public var description: String
@@ -111,6 +88,8 @@ public struct WorkshopExecutionStep: Codable, Sendable, Equatable {
     public var args: JSONValue           // .object(...) keeps Python's flat dict shape
     public var autonomy: String          // "auto" | "needs_approval"
     public var argumentSchema: JSONValue? = nil
+    /// Nil on older plans means required. Read/effect class comes from the call's declaration.
+    public var optional: Bool? = nil
 
     public init(
         id: String,
@@ -118,7 +97,8 @@ public struct WorkshopExecutionStep: Codable, Sendable, Equatable {
         toolOrAction: String,
         args: JSONValue = .object([:]),
         autonomy: String = "auto",
-        argumentSchema: JSONValue? = nil
+        argumentSchema: JSONValue? = nil,
+        optional: Bool? = nil
     ) {
         self.id = id
         self.description = description
@@ -126,6 +106,7 @@ public struct WorkshopExecutionStep: Codable, Sendable, Equatable {
         self.args = args
         self.autonomy = autonomy
         self.argumentSchema = argumentSchema
+        self.optional = optional
     }
 
     /// Emit the asdict(step) shape (snake_case keys, raw JSON values).
@@ -138,6 +119,7 @@ public struct WorkshopExecutionStep: Codable, Sendable, Equatable {
             "autonomy": .string(autonomy),
         ]
         if let argumentSchema { object["argument_schema"] = argumentSchema }
+        if let optional { object["optional"] = .bool(optional) }
         return .object(object)
     }
 }
@@ -185,21 +167,9 @@ public struct WorkshopVerificationRecord: Codable, Sendable, Equatable {
               case .string(let rawStatus)? = object["status"],
               let status = WorkshopVerificationStatus(rawValue: rawStatus)
         else { return nil }
-        let checkedAt: String = {
-            if case .string(let value)? = object["checked_at"] { return value }
-            return ""
-        }()
-        let methods: [String] = {
-            guard case .array(let values)? = object["methods"] else { return [] }
-            return values.compactMap {
-                guard case .string(let value) = $0 else { return nil }
-                return value
-            }
-        }()
-        let detail: String = {
-            if case .string(let value)? = object["detail"] { return value }
-            return ""
-        }()
+        let checkedAt = object["checked_at"]?.stringValue ?? ""
+        let methods = object["methods"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        let detail = object["detail"]?.stringValue ?? ""
         return Self(status: status, checkedAt: checkedAt, methods: methods, detail: detail)
     }
 }
@@ -207,6 +177,10 @@ public struct WorkshopVerificationRecord: Codable, Sendable, Equatable {
 /// Persisted execution record. Field order + names match the Python @dataclass
 /// Execution so asdict() output is shape-identical.
 public struct WorkshopExecutionRecord: Codable, Sendable, Equatable {
+    public static func isSuccessful(_ status: String) -> Bool { ["completed", "done", "succeeded"].contains(status.lowercased()) }
+    public static func isTerminal(_ status: String) -> Bool { isSuccessful(status) || ["failed", "cancelled", "canceled", "stopped", "unverified"].contains(status.lowercased()) }
+    public var isTerminal: Bool { Self.isTerminal(status) }
+    public var isSuccessful: Bool { Self.isSuccessful(status) }
     /// Every planned step must have explicit integer-zero provider accounting.
     var hasExactZeroProviderStepAccounting: Bool {
         guard stepsCompleted.count == plan.count else { return false }
@@ -299,9 +273,7 @@ public struct WorkshopExecutionRecord: Codable, Sendable, Equatable {
     }
 }
 
-/// Envelope returned by submit(). Matches daemon's `MissionRunner.submit()`
-/// return shape (a Execution record), but pulled to the fields the trigger
-/// scheduler fire_now path needs ({status, mission_id}).
+/// Submission status, execution identity and full record; executionId remains encoded as missionId.
 public struct WorkshopExecutionEnqueueResult: Codable, Sendable, Equatable {
     public var status: String            // "queued" — terminal status of submit (NOT "fired")
     public var executionId: String
@@ -337,30 +309,17 @@ public enum WorkshopArgumentValidation {
     }
 }
 
-/// Planner provider seam; production uses `SwiftNativeWorkshopPlannerLLM`.
+/// Typed planner seam; provider planning owns its prompt and decoding.
 public protocol WorkshopPlannerLLM: Sendable {
-    /// Exact direct provider calls issued by one `runCodex` invocation. A
-    /// custom/test adapter that cannot prove this leaves it nil; callers must
-    /// not infer provider usage merely because the method was invoked.
-    var directProviderCallCountPerInvocation: Int? { get }
-    /// Available connector action descriptors; an empty list is supported.
-    func availableConnectorActions() async -> [JSONValue]
-
-    /// Run the planner on the routed surface and return (model, raw output).
-    /// Planning errors propagate to the caller.
-    func runCodex(prompt: String, surface: String, timeoutSeconds: Int) async throws -> (model: String, output: String)
+    func plan(spec: WorkshopExecutionSpec, dataRoot: URL, now: Date) async throws
+        -> (steps: [WorkshopExecutionStep], providerCallCount: Int?, binding: WorkshopCompiledFileCopyBinding?)
 }
 
-public extension WorkshopPlannerLLM {
-    var directProviderCallCountPerInvocation: Int? { nil }
-}
-
-/// Deny-LLM implementation: no connector actions; planning throws.
+/// Planning without a configured planner refuses work.
 public struct StubWorkshopPlannerLLM: WorkshopPlannerLLM {
     public init() {}
-    public var directProviderCallCountPerInvocation: Int? { 0 }
-    public func availableConnectorActions() async -> [JSONValue] { [] }
-    public func runCodex(prompt: String, surface: String, timeoutSeconds: Int) async throws -> (model: String, output: String) {
-        throw WorkshopExecutionError.plannerFailure("stub planner does not run codex")
+    public func plan(spec: WorkshopExecutionSpec, dataRoot: URL, now: Date) async throws
+        -> (steps: [WorkshopExecutionStep], providerCallCount: Int?, binding: WorkshopCompiledFileCopyBinding?) {
+        throw WorkshopExecutionError.plannerFailure("stub planner cannot produce a plan")
     }
 }

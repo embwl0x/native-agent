@@ -29,7 +29,7 @@ extension AppQuietToolHost {
         if verb == "misses" { return await AppToolExecutor.quietMindMisses(dataRoot: appModel.engine.dataRoot) }
         return await AppToolExecutor.runQuietMind(
             verb: verb, input: input, runtime: NativeAgentEngine.liveCognition,
-            dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot(), remPolicy: trustPolicy,
+            dataRoot: appModel.engine.dataRoot, remPolicy: trustPolicy,
             dreamEnabled: { await dreamEnabled() },
             runDream: {
                 let succeeded = await appModel.runDreamPassForDreams()
@@ -48,15 +48,14 @@ extension AppQuietToolHost {
     // MARK: - ability_manage
 
     func managePart(verb: String, input: [String: JSONValue], steer: [String]) async -> QuietMindOutcome {
-        let outcome = await CapabilityLifecycleCommands(dataRootOverride: appModel.dataRootOverride)
+        let outcome = await CapabilityLifecycleCommands(dataRootOverride: appModel.engine.dataRoot)
             .managePart(verb: verb, input: input, steer: steer)
-        if outcome.refreshSkills { await appModel.loadSkillManifests() }
         // The Tools page's own refresh, its catalog too, so a dropped tool leaves
         // both lists; before the verb's status, which the refresh must not overwrite.
         if outcome.refreshTools { _ = await appModel.refreshForSidebarItem(.tools) }
         if let status = outcome.toolStatus {
             appModel.recordToolOperationStatus(status.message, outcome: status.succeeded ? .succeeded : .failed)
-            appModel.statusCause = status.cause
+            appModel.statusCause = nil
         }
         return (outcome.ok, outcome.detail, outcome.fields)
     }

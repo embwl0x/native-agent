@@ -37,61 +37,33 @@ public enum CheckedFixedSizeSecretFile {
             throw Unavailable(path: url.path, detail: "expected byte count must be positive")
         }
 
-        let fileManager = FileManager.default
-        let parent = url.deletingLastPathComponent()
-        do {
-            try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
-        } catch {
-            throw Unavailable(
-                path: url.path,
-                detail: "cannot create secret directory: \(error.localizedDescription)"
-            )
-        }
+        return try CredentialFileLock.withLock(url) {
+            let parent = url.deletingLastPathComponent()
+            switch targetKind(at: url) {
+            case .missing:
+                let generated: Data
+                do {
+                    generated = try generate()
+                } catch {
+                    throw Unavailable(
+                        path: url.path,
+                        detail: "secret generation failed: \(error.localizedDescription)"
+                    )
+                }
+                guard generated.count == byteCount else {
+                    throw Unavailable(
+                        path: url.path,
+                        detail: "generator returned \(generated.count) bytes; expected \(byteCount)"
+                    )
+                }
+                return try createAndVerify(generated, at: url, parent: parent)
 
-        let lockPath = url.path + ".lock"
-        let lockFD = Darwin.open(lockPath, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        guard lockFD >= 0 else {
-            throw unavailable(url, operation: "open lock", code: errno)
-        }
-        defer { Darwin.close(lockFD) }
-        guard flock(lockFD, LOCK_EX) == 0 else {
-            throw unavailable(url, operation: "lock", code: errno)
-        }
-        defer { _ = flock(lockFD, LOCK_UN) }
+            case .existing:
+                return try readAndVerify(at: url, byteCount: byteCount)
 
-        var lockStat = stat()
-        guard fstat(lockFD, &lockStat) == 0,
-              (lockStat.st_mode & S_IFMT) == S_IFREG else {
-            throw Unavailable(path: url.path, detail: "lock state is not a regular file")
-        }
-        guard fchmod(lockFD, 0o600) == 0 else {
-            throw unavailable(url, operation: "secure lock permissions", code: errno)
-        }
-
-        switch targetKind(at: url) {
-        case .missing:
-            let generated: Data
-            do {
-                generated = try generate()
-            } catch {
-                throw Unavailable(
-                    path: url.path,
-                    detail: "secret generation failed: \(error.localizedDescription)"
-                )
+            case .unavailable(let detail):
+                throw Unavailable(path: url.path, detail: detail)
             }
-            guard generated.count == byteCount else {
-                throw Unavailable(
-                    path: url.path,
-                    detail: "generator returned \(generated.count) bytes; expected \(byteCount)"
-                )
-            }
-            return try createAndVerify(generated, at: url, parent: parent)
-
-        case .existing:
-            return try readAndVerify(at: url, byteCount: byteCount)
-
-        case .unavailable(let detail):
-            throw Unavailable(path: url.path, detail: detail)
         }
     }
 
@@ -130,140 +102,119 @@ public enum CheckedFixedSizeSecretFile {
             throw Unavailable(path: url.path, detail: "expected byte count must be positive")
         }
 
-        let fileManager = FileManager.default
-        let parent = url.deletingLastPathComponent()
-        do {
-            try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
-        } catch {
-            throw Unavailable(
-                path: url.path,
-                detail: "cannot create secret directory: \(error.localizedDescription)"
+        return try CredentialFileLock.withLock(url) {
+            let fileManager = FileManager.default
+            let parent = url.deletingLastPathComponent()
+            // Validate before generating so a damaged authority file is preserved
+            // byte-for-byte instead of being silently repaired by "Regenerate".
+            _ = try readAndVerify(at: url, byteCount: byteCount)
+            var originalInfo = stat()
+            guard lstat(url.path, &originalInfo) == 0,
+                  (originalInfo.st_mode & S_IFMT) == S_IFREG else {
+                throw Unavailable(path: url.path, detail: "existing state changed during rotation")
+            }
+
+            let generated: Data
+            do {
+                generated = try generate()
+            } catch {
+                throw Unavailable(
+                    path: url.path,
+                    detail: "secret generation failed: \(error.localizedDescription)"
+                )
+            }
+            guard generated.count == byteCount else {
+                throw Unavailable(
+                    path: url.path,
+                    detail: "generator returned \(generated.count) bytes; expected \(byteCount)"
+                )
+            }
+
+            let temporaryURL = parent.appendingPathComponent(".\(url.lastPathComponent).rotate.\(UUID().uuidString)")
+            let temporaryFD = Darwin.open(
+                temporaryURL.path,
+                O_CREAT | O_EXCL | O_RDWR | O_NOFOLLOW | O_CLOEXEC,
+                0o600
             )
-        }
+            guard temporaryFD >= 0 else {
+                throw unavailable(url, operation: "create replacement state", code: errno)
+            }
 
-        let lockPath = url.path + ".lock"
-        let lockFD = Darwin.open(lockPath, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0o600)
-        guard lockFD >= 0 else {
-            throw unavailable(url, operation: "open lock", code: errno)
-        }
-        defer { Darwin.close(lockFD) }
-        guard flock(lockFD, LOCK_EX) == 0 else {
-            throw unavailable(url, operation: "lock", code: errno)
-        }
-        defer { _ = flock(lockFD, LOCK_UN) }
-        guard fchmod(lockFD, 0o600) == 0 else {
-            throw unavailable(url, operation: "secure lock permissions", code: errno)
-        }
+            var swapped = false
+            var complete = false
+            defer {
+                Darwin.close(temporaryFD)
+                var mayRemoveTemporary = !swapped
+                if swapped, !complete {
+                    mayRemoveTemporary = renameatx_np(
+                        AT_FDCWD, temporaryURL.path,
+                        AT_FDCWD, url.path,
+                        UInt32(RENAME_SWAP)
+                    ) == 0
+                }
+                if mayRemoveTemporary,
+                   (!complete || fileManager.fileExists(atPath: temporaryURL.path)) {
+                    _ = unlink(temporaryURL.path)
+                }
+            }
 
-        // Validate before generating so a damaged authority file is preserved
-        // byte-for-byte instead of being silently repaired by "Regenerate".
-        _ = try readAndVerify(at: url, byteCount: byteCount)
-        var originalInfo = stat()
-        guard lstat(url.path, &originalInfo) == 0,
-              (originalInfo.st_mode & S_IFMT) == S_IFREG else {
-            throw Unavailable(path: url.path, detail: "existing state changed during rotation")
-        }
+            do {
+                guard fchmod(temporaryFD, 0o600) == 0 else {
+                    throw unavailable(url, operation: "secure replacement state", code: errno)
+                }
+                try writeAll(generated, fd: temporaryFD, url: temporaryURL)
+                guard fsync(temporaryFD) == 0,
+                      lseek(temporaryFD, 0, SEEK_SET) == 0 else {
+                    throw unavailable(url, operation: "sync replacement state", code: errno)
+                }
+                let staged = try readExactly(fd: temporaryFD, byteCount: byteCount, url: temporaryURL)
+                guard staged == generated else {
+                    throw Unavailable(path: url.path, detail: "replacement state failed read-back verification")
+                }
 
-        let generated: Data
-        do {
-            generated = try generate()
-        } catch {
-            throw Unavailable(
-                path: url.path,
-                detail: "secret generation failed: \(error.localizedDescription)"
-            )
-        }
-        guard generated.count == byteCount else {
-            throw Unavailable(
-                path: url.path,
-                detail: "generator returned \(generated.count) bytes; expected \(byteCount)"
-            )
-        }
-
-        let temporaryURL = parent.appendingPathComponent(".\(url.lastPathComponent).rotate.\(UUID().uuidString)")
-        let temporaryFD = Darwin.open(
-            temporaryURL.path,
-            O_CREAT | O_EXCL | O_RDWR | O_NOFOLLOW | O_CLOEXEC,
-            0o600
-        )
-        guard temporaryFD >= 0 else {
-            throw unavailable(url, operation: "create replacement state", code: errno)
-        }
-
-        var swapped = false
-        var complete = false
-        defer {
-            Darwin.close(temporaryFD)
-            var mayRemoveTemporary = !swapped
-            if swapped, !complete {
-                mayRemoveTemporary = renameatx_np(
+                var currentInfo = stat()
+                guard lstat(url.path, &currentInfo) == 0,
+                      currentInfo.st_dev == originalInfo.st_dev,
+                      currentInfo.st_ino == originalInfo.st_ino else {
+                    throw Unavailable(path: url.path, detail: "existing state changed during rotation")
+                }
+                guard renameatx_np(
                     AT_FDCWD, temporaryURL.path,
                     AT_FDCWD, url.path,
                     UInt32(RENAME_SWAP)
-                ) == 0
-            }
-            if mayRemoveTemporary,
-               (!complete || fileManager.fileExists(atPath: temporaryURL.path)) {
-                _ = unlink(temporaryURL.path)
-            }
-        }
+                ) == 0 else {
+                    throw unavailable(url, operation: "atomically swap replacement state", code: errno)
+                }
+                swapped = true
 
-        do {
-            guard fchmod(temporaryFD, 0o600) == 0 else {
-                throw unavailable(url, operation: "secure replacement state", code: errno)
+                let persisted = try readAndVerify(at: url, byteCount: byteCount)
+                guard persisted == generated else {
+                    throw Unavailable(path: url.path, detail: "replacement state failed canonical read-back")
+                }
+                let directoryFD = Darwin.open(parent.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+                guard directoryFD >= 0 else {
+                    throw unavailable(url, operation: "open secret directory for sync", code: errno)
+                }
+                defer { Darwin.close(directoryFD) }
+                guard fsync(directoryFD) == 0 else {
+                    throw unavailable(url, operation: "sync replacement directory entry", code: errno)
+                }
+                guard unlink(temporaryURL.path) == 0 else {
+                    throw unavailable(url, operation: "remove superseded secret", code: errno)
+                }
+                // The canonical replacement was already directory-fsync'd while
+                // the old inode still existed for rollback. Once unlink succeeds,
+                // there is no honest rollback path left; a second directory fsync
+                // is best-effort cleanup durability and must not report rotation as
+                // failed while leaving the verified new canonical bytes active.
+                _ = fsync(directoryFD)
+                complete = true
+                return persisted
+            } catch let error as Unavailable {
+                throw error
+            } catch {
+                throw Unavailable(path: url.path, detail: error.localizedDescription)
             }
-            try writeAll(generated, fd: temporaryFD, url: temporaryURL)
-            guard fsync(temporaryFD) == 0,
-                  lseek(temporaryFD, 0, SEEK_SET) == 0 else {
-                throw unavailable(url, operation: "sync replacement state", code: errno)
-            }
-            let staged = try readExactly(fd: temporaryFD, byteCount: byteCount, url: temporaryURL)
-            guard staged == generated else {
-                throw Unavailable(path: url.path, detail: "replacement state failed read-back verification")
-            }
-
-            var currentInfo = stat()
-            guard lstat(url.path, &currentInfo) == 0,
-                  currentInfo.st_dev == originalInfo.st_dev,
-                  currentInfo.st_ino == originalInfo.st_ino else {
-                throw Unavailable(path: url.path, detail: "existing state changed during rotation")
-            }
-            guard renameatx_np(
-                AT_FDCWD, temporaryURL.path,
-                AT_FDCWD, url.path,
-                UInt32(RENAME_SWAP)
-            ) == 0 else {
-                throw unavailable(url, operation: "atomically swap replacement state", code: errno)
-            }
-            swapped = true
-
-            let persisted = try readAndVerify(at: url, byteCount: byteCount)
-            guard persisted == generated else {
-                throw Unavailable(path: url.path, detail: "replacement state failed canonical read-back")
-            }
-            let directoryFD = Darwin.open(parent.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
-            guard directoryFD >= 0 else {
-                throw unavailable(url, operation: "open secret directory for sync", code: errno)
-            }
-            defer { Darwin.close(directoryFD) }
-            guard fsync(directoryFD) == 0 else {
-                throw unavailable(url, operation: "sync replacement directory entry", code: errno)
-            }
-            guard unlink(temporaryURL.path) == 0 else {
-                throw unavailable(url, operation: "remove superseded secret", code: errno)
-            }
-            // The canonical replacement was already directory-fsync'd while
-            // the old inode still existed for rollback. Once unlink succeeds,
-            // there is no honest rollback path left; a second directory fsync
-            // is best-effort cleanup durability and must not report rotation as
-            // failed while leaving the verified new canonical bytes active.
-            _ = fsync(directoryFD)
-            complete = true
-            return persisted
-        } catch let error as Unavailable {
-            throw error
-        } catch {
-            throw Unavailable(path: url.path, detail: error.localizedDescription)
         }
     }
 

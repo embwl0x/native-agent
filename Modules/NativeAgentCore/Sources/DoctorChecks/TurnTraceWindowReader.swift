@@ -9,11 +9,8 @@ import TurnTrace
 // Shared by prefix health, subconscious vitals and model compensations. It
 // keeps their three measurement rules in one place:
 //
-//   1. BOUNDED. The feed is 20k rows/day and grows without a ceiling. A health
-//      row may not turn into an unbounded read, so each day file is TAILED to
-//      `budgetPerDay` bytes and the first partial line of a tailed read is
-//      dropped. A day that had to be tailed is REPORTED, so "n rows" can never
-//      be mistaken for "all rows".
+//   1. BOUNDED. Daily storage is capped; Doctor tails each file to `budgetPerDay`
+//      bytes, drops an initial partial line and reports truncated coverage.
 //   2. OFF THE TURN. Nothing here is wired to a timer, a chat hook, or the
 //      cognition runtime. Reading only happens inside `DoctorCheck.run()`,
 //      which is a nonisolated async function executed on the cooperative pool
@@ -41,20 +38,32 @@ struct TurnTraceScanSummary: Sendable {
     var matchedRows: Int = 0
 
     var isEmptyFeed: Bool { daysPresent.isEmpty && unreadableDays.isEmpty }
+
+    /// What the read did not cover: a bounded read is coverage, not a fault.
+    var coverageParts: [String] {
+        var parts: [String] = []
+        if !truncatedDays.isEmpty {
+            parts.append(
+                "\(truncatedDays.count) day file(s) were tailed to the read budget"
+                    + " (\(truncatedDays.joined(separator: ", "))), so earlier turns"
+                    + " that day were not scanned"
+            )
+        }
+        if malformedLines > 0 {
+            parts.append("\(malformedLines) trace line(s) did not parse")
+        }
+        return parts
+    }
+
+    var coverageDetail: String {
+        let parts = coverageParts
+        return parts.isEmpty ? "" : "; " + parts.joined(separator: "; ")
+    }
 }
 
 // MARK: - DoctorMeasurementWindow
 //
-// 2026-09-02, live incident: both new rows graded a rolling 7-day window, so
-// they were grading PRE-FIX history — turns from before the change they exist
-// to watch. The verdicts were arithmetically true and operationally a lie:
-// "prefix cache is broken" described a build that is no longer running.
-//
-// The floor is therefore the moment the CURRENT BUILD started running, read
-// from build_launch.json. A DIFFERENT build says nothing about
-// this one, so it is refused rather than used. With no usable stamp the floor
-// falls back to the last 24h — short enough that pre-fix history cannot
-// dominate, and the row SAYS which floor it used either way.
+// The window uses this launch's valid build_launch.json stamp, or explicitly reports a 24h floor.
 
 struct DoctorMeasurementWindow: Sendable {
     /// Rows older than this are not this build's behavior and are not read.
@@ -132,16 +141,9 @@ enum TurnTraceWindowReader {
     /// busier day is tailed and SAYS it was tailed.
     static let defaultBudgetPerDay = 1 * 1024 * 1024
 
-    /// Scan the last `days` day files under `<root>/turn_traces`, newest day
-    /// first is irrelevant — rows are handed to `handle` in file order and the
-    /// callers sort by `ts` themselves.
-    ///
-    /// `kinds` is a cheap prefilter applied as a substring test on the raw line
-    /// before any JSON parsing, which is what keeps a 20k-row day affordable.
-    /// `floor` is the measurement window's lower bound — rows older than it
-    /// belong to a build that is no longer running and are not this row's
-    /// business. `days` still caps how many day FILES may be opened, so the
-    /// read stays bounded no matter what the floor says.
+    /// Scan at most `days` calendar-day files under `root`, with a byte budget per file.
+    /// Canonical decoding precedes kind/time filtering; `floor` bounds the measurement window.
+    /// Rows reach `handle` in file order; callers sort by timestamp.
     static func scan(
         root: URL,
         now: Date,
@@ -149,24 +151,18 @@ enum TurnTraceWindowReader {
         floor: Date,
         kinds: Set<String>,
         budgetPerDay: Int = defaultBudgetPerDay,
-        handle: (TurnTraceRow) -> Void
+        handle: (TurnTraceEvent) -> Void
     ) async -> TurnTraceScanSummary {
         var summary = TurnTraceScanSummary()
-        let dir = root.appendingPathComponent("turn_traces", isDirectory: true)
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone.current
-        formatter.dateFormat = "yyyy-MM-dd"
 
         // The floor wins over the day count: opening yesterday's file is fine,
         // counting a row from before this build launched is not.
         let cutoff = floor
 
         for offset in 0..<max(days, 1) {
-            let day = now.addingTimeInterval(-Double(offset) * 24 * 60 * 60)
-            let name = formatter.string(from: day)
-            let path = dir.appendingPathComponent("\(name).jsonl")
+            guard let day = TurnTracePersistLane.dayCalendar.date(byAdding: .day, value: -offset, to: now) else { continue }
+            let path = TurnTraceReplayReader.fileURL(for: day, root: root)
+            let name = TurnTracePersistLane.dayString(from: day)
             guard FileManager.default.fileExists(atPath: path.path) else { continue }
 
             guard let result = await TurnTraceReplayReader.scan(
@@ -191,29 +187,8 @@ enum TurnTraceWindowReader {
 
 extension JSONValue {
     var intValue: Int? {
-        switch self {
-        case .int(let value): return Int(value)
-        case .double(let value): return Int(exactly: value.rounded())
-        default: return nil
-        }
-    }
-
-    var doubleValue: Double? {
-        switch self {
-        case .int(let value): return Double(value)
-        case .double(let value): return value
-        default: return nil
-        }
-    }
-
-    var boolValue: Bool? {
-        if case .bool(let value) = self { return value }
-        return nil
-    }
-
-    var stringValue: String? {
-        if case .string(let value) = self { return value }
-        return nil
+        if case .double(let number) = self { return Int(exactly: number.rounded()) }
+        return integerValue.flatMap(Int.init(exactly:))
     }
 }
 

@@ -1,4 +1,5 @@
 import EngineRuntime
+import ApprovalTransactions
 import Foundation
 import NativeAgentCore
 import SwiftUI
@@ -11,7 +12,7 @@ import DoctorChecks
 import Research
 import TelegramBot
 import Connectors
-// Blueprint: | `AppModel+SkillsIntegrations.swift` | `AppModel`: built-in skill guidance and part Keep/off-switch; workspace creation, SearXNG autodetection and projection readback, Telegram settings/log actions and Doctor commands; `refreshTelegramSettingsDraft` captures and merges untouched form fields through one newest-started `LatestRead.refreshDraft` owner; connector updates verify through `engine.connectors.update` |
+// Blueprint: | `AppModel+SkillsIntegrations.swift` | `AppModel`: built-in skill guidance and part Keep/off-switch; toolbar Tools refresh and inbox actions; workspace creation, SearXNG autodetection and projection readback, Telegram settings/log actions and Doctor commands; `refreshTelegramSettingsDraft` captures and merges untouched form fields through one newest-started `LatestRead.refreshDraft` owner; connector updates verify through `engine.connectors.update` |
 
 struct TelegramSettingsDraftSnapshot: Equatable {
     var enabled: Bool
@@ -29,9 +30,7 @@ extension AppModel {
 
 @MainActor
 extension AppModel {
-    /// All reads that can rebase this form share newest-started ordering.
-    /// A refresh may replace only fields unchanged since it began and clean
-    /// against its captured baseline; user edits remain drafts across reads.
+    /// Newest-started reads rebase only untouched clean fields; user edits remain drafts.
     func refreshTelegramSettingsDraft<Value>(
         _ load: () async -> Value,
         snapshot: (Value) -> TelegramSettingsDraftSnapshot?,
@@ -56,12 +55,11 @@ extension AppModel {
         })
     }
 
-    @MainActor
     func loadSkillManifests() async {
         isLoadingSkillManifests = true
         do {
             try await engine.tools.refreshSkills(includingSource: true)
-            if skillLifecycleFeedback?.kind == .failure { dismissSkillManifestFeedback() }
+            dismissSkillManifestFeedback()
         } catch {
             ModuleLog.app("%@", "[skills] learned skills read failed: \(error)")
             recordSkillManifestFailure("Couldn't read learned skills. Try again; if it keeps happening, the details are in the log.")
@@ -84,7 +82,7 @@ extension AppModel {
     }
 
     @MainActor
-    func promoteTool(_ tool: ToolRecord, userRequested: Bool = true) async {
+    func promoteTool(_ tool: ToolRecord) async {
         if let refusal = engine.tools.keepRefusal(tool) {
             recordToolOperationStatus("Keeping unavailable: \(refusal)", outcome: .failed)
             return
@@ -232,7 +230,7 @@ extension AppModel {
     @MainActor
     /// `restartPollLoop` false: the caller restarts it (the door's
     /// telegram.disconnect, which may run inside a Telegram turn the restart awaits).
-    func clearTelegramToken(restartPollLoop: Bool = true) async {
+    func clearTelegramToken(restartPollLoop: Bool = true) async -> AppMutationResult {
         isSavingTelegram = true
         statusText = "Clearing Telegram bot token..."
         defer { isSavingTelegram = false }
@@ -255,8 +253,10 @@ extension AppModel {
             if telegramToken == submittedToken { telegramToken = "" }
             await refreshAll()
             statusText = "Telegram bot token cleared"
+            return .success("Telegram bot token cleared")
         } catch {
             setFailureStatus("Removing the Telegram token failed. " + UserFacingError.cause(error, action: "remove the Telegram token"), cause: error)
+            return .failure(statusText, cause: error.localizedDescription)
         }
     }
 
@@ -300,7 +300,7 @@ extension AppModel {
     }
 
     @MainActor
-    func testTelegram() async {
+    func testTelegram() async -> AppMutationResult {
         isTestingTelegram = true
         statusText = "Sending Telegram test reply..."
         defer { isTestingTelegram = false }
@@ -310,8 +310,10 @@ extension AppModel {
             let result = try await engine.telegram.sendTelegramTestReply(chatId: chatId, manager: backgroundLoopsManager)
             await refreshAll()
             statusText = TelegramTestReplyPresentation.summary(for: result)
+            return .init(succeeded: result.ok, userMessage: TelegramTestReplyPresentation.summary(for: result))
         } catch {
             setFailureStatus("Telegram test failed. " + UserFacingError.cause(error, action: "test Telegram"), cause: error)
+            return .failure(statusText, cause: error.localizedDescription)
         }
     }
 
@@ -338,10 +340,7 @@ extension AppModel {
     @MainActor
     @discardableResult
     func runDoctor(repair: Bool, repairScope: DoctorRepairScope = .automatic, checkID: String? = nil) async -> DoctorFacade.RunOutcome {
-        // PATCH-2026-05-30: surface in-flight state to the UI so the user
-        // sees a spinner + "Running…" text instead of an apparent freeze.
-        // Block concurrent invocations — clicking Run while a run is in
-        // flight should be a no-op, not a queued duplicate.
+        // Show in-flight state and reject concurrent Doctor invocations.
         let doctor = engine.doctor
         guard doctor.admitRun() else {
             return .unavailable("Health checks are already running.")
@@ -361,8 +360,8 @@ extension AppModel {
             let status = await DoctorFacade.statusChecks(dataRoot: engine.dataRoot, approvals: engine.approvals, repairDesk: buttonRepair, stuckReason: DeskPageContent.stuckReason, safeDetail: EngineDoctorRuntime<AppDoctorPort>.safeDetail)
             report = EngineDoctorRuntime<AppDoctorPort>.mergeReport(report, liveChecks: status.checks)
             report.repaired = report.repaired || status.repaired
-            report.checks = await DoctorStatusProjection.repairProjection(report.checks, dataRoot: engine.dataRoot)
-            report.status = DoctorStatusProjection.doctorRollup(report.checks.map(\.status))
+            report.checks = await DoctorReadout.repairProjection(report.checks, dataRoot: engine.dataRoot)
+            report.status = DoctorReadout.doctorRollup(report.checks.map(\.status))
             doctor.finishRun(report)
             statusText = repair
                 ? DoctorFacade.repairCompletionMessage(report: report)
@@ -392,8 +391,8 @@ extension AppModel {
         let withoutRetiredProbe = DoctorReport(status: current.status, repaired: current.repaired,
                                                checks: current.checks.filter { $0.id != "status.app_health" && $0.id != "status.living_sources" })
         var refreshed = EngineDoctorRuntime<AppDoctorPort>.mergeReport(withoutRetiredProbe, liveChecks: liveChecks + statusChecks)
-        refreshed.checks = await DoctorStatusProjection.repairProjection(refreshed.checks, dataRoot: engine.dataRoot)
-        refreshed.status = DoctorStatusProjection.doctorRollup(refreshed.checks.map(\.status))
+        refreshed.checks = await DoctorReadout.repairProjection(refreshed.checks, dataRoot: engine.dataRoot)
+        refreshed.status = DoctorReadout.doctorRollup(refreshed.checks.map(\.status))
         return refreshed
         }, publish: { engine.doctor.report = $0 })
     }
@@ -405,4 +404,34 @@ extension AppModel {
             .filter { !$0.isEmpty }
     }
 
+}
+
+extension AppModel {
+    @MainActor
+    @discardableResult
+    func refreshToolsFromToolbar() async -> ToolsRefreshPresentation.State {
+        guard !isRefreshingTools else {
+            return .alreadyRefreshing
+        }
+        isRefreshingTools = true
+        toolsRefreshState = .refreshing
+        defer { isRefreshingTools = false }
+
+        await refreshForSidebarItem(.tools)
+        let result = ToolsRefreshPresentation.completion(
+            panelRefresh: panelRefreshStatus[.tools],
+            catalogLoadFailed: engine.tools.catalogLoadError != nil,
+            hasCatalog: engine.tools.catalog != nil
+        )
+        toolsRefreshState = result
+        if let message = ToolsRefreshPresentation.message(for: result) {
+            statusText = message
+        }
+        return result
+    }
+
+    // MARK: Integrations / inbox
+    func inboxAction(_ id: String, action: String) async throws {
+        try await InboxCardActions.perform(id, action: action, dataRootOverride: engine.dataRoot, effects: AppInboxCardActionEffects(inbox: engine.inbox))
+    }
 }

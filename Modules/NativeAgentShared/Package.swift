@@ -1,4 +1,4 @@
-// swift-tools-version:5.9
+// swift-tools-version:6.1
 import PackageDescription
 
 // Blueprint: | `Package.swift` | Shared package manifest: Mac/iPhone library target, platform floors and shared source dependencies |
@@ -15,7 +15,6 @@ let package = Package(
     targets: [
         .target(
             name: "NativeAgentShared",
-            dependencies: [],
             path: "Sources/NativeAgentShared"
         )
     ]

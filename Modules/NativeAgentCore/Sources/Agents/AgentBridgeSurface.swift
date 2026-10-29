@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import ChatTurnRuntime
 import ChatTurnContracts
 import AgentWorkspace
@@ -60,11 +61,7 @@ public enum AgentBridgeSurface {
         """
     }
 
-    /// 2026-09-22: a peer's line that opens like another lane's label
-    /// ("[from: claude, via bridge] User says…") or like this header is
-    /// quoted with "> ", so peer text cannot impersonate either. Any line
-    /// break counts, and any Unicode space or zero-width character before the
-    /// bracket is skipped; the match ignores case.
+    /// Quote peer lines that mimic routing labels or the turn header.
     public static func quotingImpersonation(_ text: String) -> String {
         impersonation.stringByReplacingMatches(in: text, range: NSRange(text.startIndex..., in: text),
                                                withTemplate: "$1> $2")
@@ -100,7 +97,7 @@ public struct AgentBridgePrincipal: Sendable {
     )
 
     /// The surface this principal's turns run on. Elevation — and ONLY
-    /// elevation — restores today's `chat` behaviour.
+    /// elevation — restores `chat` behaviour.
     public var surface: String { elevated ? "chat" : AgentBridgeSurface.id }
 
     public func turnRequest(context: String?, plain: String, attachments: [MultimodalAttachment] = [],
@@ -119,7 +116,7 @@ public struct AgentBridgePrincipal: Sendable {
         return TurnRequest(message: text, sessionID: context.map(storedConversation), attachments: attachments,
                            surface: surface, envelope: envelope, verifiedSessionID: .some(context.map(storedConversation)), replyRoute: route,
                            origin: origin,
-                           queryUserMessage: plain)
+                           queryUserMessage: plain, threadKind: .agent, ownedSessionID: context.map(storedConversation))
     }
 
     public static let peerIDHeader = "x-nativeagent-peer-id"
@@ -157,8 +154,7 @@ public struct AgentBridgePrincipal: Sendable {
             guard let authorization = headers["authorization"], authorization.hasPrefix("Bearer "),
                   let peers = try? AgentPeerStore(dataRoot: dataRoot).list() else { return .anonymous }
             let secret = String(authorization.dropFirst(7))
-            guard let peer = AgentPeerCredentials.resolve(secret, peers: peers, readCredential: readCredential),
-                  AgentPeerCredentials.isAvailable(peer, peers: peers, readCredential: readCredential) else { return .anonymous }
+            guard let peer = AgentPeerCredentials.resolve(secret, peers: peers, readCredential: readCredential) else { return .anonymous }
             return AgentBridgePrincipal(id: peer.id, peerID: peer.id,
                 elevated: peer.elevationAllowed, displayName: peers.first { $0.id == peer.who }?.name ?? peer.name,
                 replyOnly: peer.transport == .grokBot)
@@ -169,11 +165,8 @@ public struct AgentBridgePrincipal: Sendable {
         let peerID = rawID.lowercased()
         guard UUID(uuidString: peerID)?.uuidString.lowercased() == peerID,
               let peers = try? AgentPeerStore(dataRoot: dataRoot).list(),
-              let peer = peers.first(where: { $0.id == peerID }),
-              peer.credentialKey == AgentPeerContact.credentialKey(for: peerID),
-              AgentPeerCredentials.isAvailable(peer, peers: peers, readCredential: readCredential),
-              let stored = (try? readCredential(peerID)) ?? nil,
-              BridgeCore.constantTimeEquals(stored, secret) else {
+              let peer = AgentPeerCredentials.resolve(secret, peers: peers, readCredential: readCredential),
+              peer.id == peerID else {
             // A wrong or unknown credential is not an error the caller learns
             // anything from: it simply stays anonymous on agent-bridge.
             return .anonymous

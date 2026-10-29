@@ -6,7 +6,6 @@ import Foundation
 /// These ids cross the persisted inbox boundary, so an unknown value must be
 /// rejected before a card reaches the UI with a button no executor understands.
 public enum HeartbeatCardAction: String, CaseIterable, Sendable {
-    case repair
     case openApprovals = "open_approvals"
     case archive
     case dismiss
@@ -19,12 +18,6 @@ public enum HeartbeatCardAction: String, CaseIterable, Sendable {
 
     public var noticeAction: HeartbeatNoticeAction {
         switch self {
-        case .repair:
-            HeartbeatNoticeAction(
-                id: rawValue,
-                label: "Repair",
-                description: "Close resolved Doctor self-heal proposals"
-            )
         case .openApprovals:
             HeartbeatNoticeAction(
                 id: rawValue,

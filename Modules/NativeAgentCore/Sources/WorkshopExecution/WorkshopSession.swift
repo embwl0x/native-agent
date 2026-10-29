@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import ChatTurnContracts
 import Darwin
 import NativeAgentCore
@@ -7,29 +8,13 @@ import Desk
 import TrustCenter
 // Blueprint: | `WorkshopSession.swift` | `WorkshopSession` struct; `run`, `trimSummary` |
 
-// Wave B — the bounded work session (H5, M6).
-//
-// A session runs exactly ONE turn through the normal chat orchestration on the
-// "workshop" surface, behind the WorkshopToolProfile membrane. Two hard
-// properties:
-//
-//  * H5 (unforgeable trigger): the ONLY authorization a session accepts is a
-//    pump-minted request whose reservationId is a REAL reservation on that
-//    pursuit in the Desk store. A
-//    chat turn cannot set that (it is minted by the pump against a durable
-//    reservation, SwiftNativeDeskStore.reserveWorkSession) — an absent/forged/stale
-//    reservation refuses BEFORE any LLM call.
-//  * M6 (no infinite wedge): the turn runs under a FINITE deadline. Contrast
-//    Executions+Executor.swift:154, where the approval-wait timeout is disabled by
-//    default and a blocked execution can freeze forever. A workshop session that
-//    can't finish (a wedged tool, a needs-User outward step) resolves to a finite
-//    `blocked` receipt within the deadline — in-flight, then done, never stuck.
+// Run one normal chat turn on the workshop surface; a live pump-minted Desk reservation is required before any provider call.
+// Join worker settlement before publishing its single terminal receipt (docs/STOP.md).
 
 public struct WorkshopSession: Sendable {
     let dataRoot: URL
     let store: SwiftNativeDeskStore
-    /// Hard per-session deadline (M6). Kept modest — one short conversation of
-    /// tokens, honest and bounded.
+    /// Active-work deadline (M6), renewed by progress and paused for human waits.
     let deadlineSeconds: TimeInterval
     let now: @Sendable () -> Date
     let claimStore: WorkshopReservationClaimStore
@@ -103,90 +88,84 @@ public struct WorkshopSession: Sendable {
             artifactWriter: WorkshopArtifactWriter(dataRoot: dataRoot, handle: request.handle),
             collector: collector,
             progressCollector: progressCollector,
-            // Owner-cadence jobs are not pursuits, and desk_work_log's store
-            // method refuses every non-pursuit target (lane1 finding 3).
+            // desk_work_log accepts pursuits only.
             allowsDeskWorkLog: claimedItem.isPursuit
         )
         let executor = effects.productionTurnExecutor(dataRoot: dataRoot)
 
-        let outcome = await runWithDeadline(request: request, tools: profile, executor: executor)
-        // User, 2026-09-06: seal the membrane before reading the artifact set.
-        // The deadline cancels the turn but cannot stop an executor that
-        // ignores cancellation, and its later `workshop_artifact_write` calls
-        // used to keep landing — making this receipt's `artifactPaths` stale
-        // the moment it was saved.
-        let artifacts = await collector.close()
-        let progress = await progressCollector.latest()
+        let (outcome, returned) = await runWithDeadline(request: request, tools: profile, executor: executor,
+            expiresAt: claimedItem.pursuitExpiresAt)
+        return await settle {
+            // The actual body has exited; seal its artifacts and save one receipt.
+            let artifacts = await collector.close()
+            let progress = await progressCollector.latest()
 
-        let receipt: WorkshopSessionReceipt
-        switch outcome {
-        case .done(let model, let output):
-            let failedCalls = await progressCollector.failedCalls()
-            // lane1 finding 2: a turn that ENDED is not a turn that PROGRESSED.
-            // Without a valid workshop_progress report the session never stated
-            // its own outcome, so the honest receipt is the finite needs-User
-            // shape — never an affirmative `progress` minted from silence. Tool
-            // failures are named, so a failed recording is distinguishable from
-            // a deliberately artifact-free observation.
-            guard let progress else {
-                var why = failedCalls.isEmpty
-                    ? "session ended without a \(WorkshopToolProfile.progressToolName) report — its outcome was never recorded"
-                    : "session recorded no progress; \(failedCalls.count) tool call(s) failed: "
-                        + failedCalls.joined(separator: "; ")
-                let tail = output.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !tail.isEmpty { why += ". Final text: \(tail)" }
+            var receipt: WorkshopSessionReceipt
+            switch outcome {
+            case .done(let model, let output):
+                let failedCalls = await progressCollector.failedCalls()
+                // Missing workshop_progress is blocked, never inferred progress; name recording failures in the receipt.
+                guard let progress else {
+                    var why = failedCalls.isEmpty
+                        ? "session ended without a \(WorkshopToolProfile.progressToolName) report — its outcome was never recorded"
+                        : "session recorded no progress; \(failedCalls.count) tool call(s) failed: "
+                            + failedCalls.joined(separator: "; ")
+                    let tail = output.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !tail.isEmpty { why += ". Final text: \(tail)" }
+                    receipt = WorkshopSessionReceipt(
+                        handle: request.handle, reservationId: request.reservationId,
+                        status: .blocked, summary: Self.trimSummary(why),
+                        model: model, artifactPaths: artifacts, generatedAt: now(), disposition: .blocked)
+                    break
+                }
+                let requested = progress.disposition
+                // A typed completion without a durable artifact is not enough to
+                // close a large project. Keep it as progress; Pump re-verifies the
+                // handle-scoped paths again at the owner CAS boundary.
+                var disposition: DeskWorkDisposition = requested == .goalSatisfied && artifacts.isEmpty
+                    ? .progress
+                    : requested
+                var summary = progress.summary
+                // A reported `progress` whose own recording calls failed is not
+                // evidence of progress either; say so and keep it needs-User.
+                if !failedCalls.isEmpty {
+                    summary = Self.trimSummary(summary + " [tool failures: " + failedCalls.joined(separator: "; ") + "]")
+                    if disposition == .progress || disposition == .goalSatisfied { disposition = .blocked }
+                }
                 receipt = WorkshopSessionReceipt(
                     handle: request.handle, reservationId: request.reservationId,
-                    status: .blocked, summary: Self.trimSummary(why),
-                    model: model, artifactPaths: artifacts, generatedAt: now(), disposition: .blocked)
-                break
+                    status: failedCalls.isEmpty ? .completed : .blocked, summary: summary,
+                    model: model, artifactPaths: artifacts, generatedAt: now(), disposition: disposition)
+            case .timedOut:
+                // Finite needs-User state — the anti-wedge (M6).
+                receipt = WorkshopSessionReceipt(
+                    handle: request.handle, reservationId: request.reservationId,
+                    status: .blocked, summary: "session exceeded its deadline; work stopped and its returned output was retained",
+                    model: nil, artifactPaths: artifacts, generatedAt: now(), disposition: .blocked)
+            case .incomplete(let reason, let output):
+                // Same finite needs-User shape as the deadline: artifacts already
+                // written are kept, the partial text is reported as partial, and
+                // the disposition never claims the goal was satisfied.
+                receipt = WorkshopSessionReceipt(
+                    handle: request.handle, reservationId: request.reservationId,
+                    status: .blocked,
+                    summary: Self.trimSummary("session did not finish: \(reason)"
+                        + (output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            ? "" : " Partial output: \(output)")),
+                    model: nil, artifactPaths: artifacts, generatedAt: now(), disposition: .blocked)
+            case .failed(let reason):
+                receipt = WorkshopSessionReceipt(
+                    handle: request.handle, reservationId: request.reservationId,
+                    status: .blocked, summary: "session could not finish: \(Self.trimSummary(reason))",
+                    model: nil, artifactPaths: artifacts, generatedAt: now(), disposition: .blocked)
             }
-            let requested = progress.disposition
-            // A typed completion without a durable artifact is not enough to
-            // close a large project. Keep it as progress; Pump re-verifies the
-            // handle-scoped paths again at the owner CAS boundary.
-            var disposition: DeskWorkDisposition = requested == .goalSatisfied && artifacts.isEmpty
-                ? .progress
-                : requested
-            var summary = progress.summary
-            // A reported `progress` whose own recording calls failed is not
-            // evidence of progress either; say so and keep it needs-User.
-            if !failedCalls.isEmpty {
-                summary = Self.trimSummary(summary + " [tool failures: " + failedCalls.joined(separator: "; ") + "]")
-                if disposition == .progress || disposition == .goalSatisfied { disposition = .blocked }
-            }
-            receipt = WorkshopSessionReceipt(
-                handle: request.handle, reservationId: request.reservationId,
-                status: failedCalls.isEmpty ? .completed : .blocked, summary: summary,
-                model: model, artifactPaths: artifacts, generatedAt: now(), disposition: disposition)
-        case .timedOut:
-            // Finite needs-User state — the anti-wedge (M6).
-            receipt = WorkshopSessionReceipt(
-                handle: request.handle, reservationId: request.reservationId,
-                status: .blocked, summary: "session exceeded the \(Int(deadlineSeconds))s deadline; left in-flight for the user",
-                model: nil, artifactPaths: artifacts, generatedAt: now(), disposition: .blocked)
-        case .incomplete(let reason, let output):
-            // Same finite needs-User shape as the deadline: artifacts already
-            // written are kept, the partial text is reported as partial, and
-            // the disposition never claims the goal was satisfied.
-            receipt = WorkshopSessionReceipt(
-                handle: request.handle, reservationId: request.reservationId,
-                status: .blocked,
-                summary: Self.trimSummary("session did not finish: \(reason)"
-                    + (output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        ? "" : " Partial output: \(output)")),
-                model: nil, artifactPaths: artifacts, generatedAt: now(), disposition: .blocked)
-        case .failed(let reason):
-            receipt = WorkshopSessionReceipt(
-                handle: request.handle, reservationId: request.reservationId,
-                status: .blocked, summary: "session could not finish: \(Self.trimSummary(reason))",
-                model: nil, artifactPaths: artifacts, generatedAt: now(), disposition: .blocked)
+            // Terminal result is durable before control returns to the pump. If the
+            // app exits between here and Desk settlement, startup reconciliation
+            // can finish the exact same attempt without another provider turn.
+            receipt.output = returned?.output
+            _ = resultStore.save(receipt)
+            return receipt
         }
-        // Terminal result is durable before control returns to the pump. If the
-        // app exits between here and Desk settlement, startup reconciliation
-        // can finish the exact same attempt without another provider turn.
-        _ = resultStore.save(receipt)
-        return receipt
     }
 
     private func refused(_ why: String, _ request: WorkshopSessionRequest, disposition: DeskWorkDisposition = .blocked) -> WorkshopSessionReceipt {
@@ -198,39 +177,68 @@ public struct WorkshopSession: Sendable {
     private enum TurnOutcome: Sendable {
         case done(model: String, output: String)
         case timedOut
-        // User, 2026-09-06: the turn ENDED but never produced a completed final
-        // reply (budget exhaustion, iteration cap). Its retained text is a
-        // fallback, and its attempted effects are unverified — a distinct
-        // outcome so it can never be read as a finished session.
+        // Retained text without a completed final reply leaves effects unverified and cannot count as a finished session.
         case incomplete(reason: String, output: String)
         case failed(String)
+
+        var output: String? {
+            switch self {
+            case .done(_, let output), .incomplete(_, let output): return output
+            default: return nil
+            }
+        }
     }
 
-    /// Race the turn against the deadline. Whichever finishes first wins; the
-    /// loser is cancelled. This is the finite bound M6 requires.
+    /// Select the deadline/Stop verdict, then join the actual returned outcome.
     private func runWithDeadline(
         request: WorkshopSessionRequest,
         tools: any ToolDispatchClient,
-        executor: @escaping @Sendable (_ request: WorkshopSessionRequest, _ tools: any ToolDispatchClient) async throws -> (model: String, output: String)
-    ) async -> TurnOutcome {
-        // User, 2026-09-06: this was a task group, and leaving a group waits for
-        // its cancelled children — a turn that ignored its cancellation held the
-        // Workshop pump past the very ceiling this exists to enforce. Same
-        // resume-once shape the provider wall and the tool-dispatch deadline
-        // use; the loser is still cancelled.
-        let outcome = await TurnDeadline.withDeadline(
-            seconds: max(0.001, deadlineSeconds)
-        ) { () -> TurnOutcome in
-            do {
-                let (model, output) = try await executor(request, tools)
-                return .done(model: model, output: output)
-            } catch let incomplete as EphemeralToolTurnIncomplete {
-                return .incomplete(reason: incomplete.reason, output: incomplete.output)
-            } catch {
-                return .failed(String(describing: error))
+        executor: @escaping @Sendable (_ request: WorkshopSessionRequest, _ tools: any ToolDispatchClient) async throws -> (model: String, output: String),
+        expiresAt: Date?
+    ) async -> (TurnOutcome, TurnOutcome?) {
+        let body = TurnBodyLifetime<TurnOutcome>()
+        let outcome: TurnOutcome
+        do {
+            guard deadlineSeconds > 0 else { return (.timedOut, nil) }
+            let runActiveWork: @Sendable () async throws -> TurnOutcome = { [deadlineSeconds] in
+                try await TurnDeadline.withThrowingDeadline(seconds: deadlineSeconds, clock: .activeWork) {
+                    try await body.run {
+                        do {
+                            try Task.checkCancellation()
+                            let (model, output) = try await executor(request, tools)
+                            return .done(model: model, output: output)
+                        } catch let incomplete as EphemeralToolTurnIncomplete {
+                            return .incomplete(reason: incomplete.reason, output: incomplete.output)
+                        } catch {
+                            return .failed(String(describing: error))
+                        }
+                    }
+                }
             }
+            // Only pursuit lifetime is an absolute cutoff. The inner clock
+            // still renews on progress and pauses while awaiting a person.
+            if let expiresAt {
+                let remainingLifetime = expiresAt.timeIntervalSince(now())
+                guard remainingLifetime > 0 else { return (.timedOut, nil) }
+                outcome = try await TurnDeadline.withThrowingDeadline(
+                    seconds: remainingLifetime, clock: .wallClock, runActiveWork)
+            } else {
+                outcome = try await runActiveWork()
+            }
+        } catch is TurnDeadline.DeadlineExceeded {
+            outcome = .timedOut
+        } catch is CancellationError {
+            outcome = .incomplete(reason: "stopped", output: "")
+        } catch {
+            outcome = .failed(error.localizedDescription)
         }
-        return outcome ?? .timedOut
+        let returned = await body.finish()
+        return (outcome, returned.map { result in
+            switch result {
+            case .success(let value): return value
+            case .failure(let error): return .failed(String(describing: error))
+            }
+        })
     }
 
     static func trimSummary(_ s: String) -> String {
@@ -290,7 +298,7 @@ struct WorkshopReservationClaimStore: Sendable {
         let row: JSONValue = .object([
             "handle": .string(safeHandle),
             "reservationId": .string(safeReservation),
-            "claimedAt": .string(ISO8601DateFormatter().string(from: Date())),
+            "claimedAt": .string(NativeTimestampFormat.plainZulu(Date())),
             "unstarted": .bool(unstarted),
         ])
         guard var payload = try? row.serialize(pretty: false) else { return false }

@@ -1,25 +1,14 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `MemoryStatusProjection.swift` | MemoryV2 and embedding runtime status projections and recent misses; hygiene reads use MemoryConsolidationHygiene's schema; embedding settings act through MemoryFacade's canonical owner; `MemoryV2NativeStackSnapshot` reads native stack health |
+// Blueprint: | `MemoryStatusProjection.swift` | MemoryV2 and embedding runtime status projections and recent misses; embedding settings act through MemoryFacade's canonical owner; `MemoryV2NativeStackSnapshot` reads native stack health |
 
-/// Read-only status and hygiene projections using the existing stores and runtime.
-public enum MemoryStatusProjection {
-    public static func embeddingRuntime(dataRoot: URL) async throws -> EmbeddingRuntimeSnapshot {
-        guard let runtime = await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).embeddingRuntimeSnapshot() else {
-            throw MemoryV2Error.storageUnavailable
-        }
-        return runtime
-    }
-
-    public static func afterTurnRecovery(dataRoot: URL) -> AfterTurnMemoryRecoveryStatus {
-        do {
-            let held = try AdaptiveMemoryPromoter.readHeld(dataRoot: dataRoot)
-            let latest = held.compactMap(\.failure).max { $0.at < $1.at }
-            return AfterTurnMemoryRecoveryStatus(status: held.isEmpty ? "ready" : "held",
-                                                heldCount: held.count, failure: latest)
-        } catch {
-            return AfterTurnMemoryRecoveryStatus(status: "unavailable", heldCount: nil, failure: nil)
-        }
+/// Read-only status projections using the existing stores and runtime.
+public enum MemoryRecoveryReadout {
+    /// The journal's owed turns (recorded, not yet lived).
+    public static func afterTurnRecovery(dataRoot: URL) async -> AfterTurnMemoryRecoveryStatus {
+        let owed = await AdaptiveMemoryPromoter.shared.owedMomentCount(dataRoot: dataRoot)
+        return AfterTurnMemoryRecoveryStatus(status: owed.map { $0 == 0 ? "ready" : "owed" } ?? "unavailable",
+                                             owedCount: owed)
     }
 
     public static func getMemoryV2Status(dataRoot: URL) async throws -> MemoryV2Status {
@@ -40,7 +29,7 @@ public enum MemoryStatusProjection {
         } catch {
             storageReadable = false
         }
-        let runtimeSnapshot = await SwiftNativeMemoryV2.shared.embeddingRuntimeSnapshot()
+        let runtimeSnapshot = await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).embeddingRuntimeSnapshot()
         let effective = runtimeSnapshot?.effectiveBackend
         let isReal = (effective == ManagedEmbeddingProvider.coreMLBackend)
         let backend = runtimeSnapshot.map { "\($0.modelId)/d\($0.dimensions)" }
@@ -50,15 +39,12 @@ public enum MemoryStatusProjection {
             case ManagedEmbeddingProvider.mockBackend:
                 return "Semantic embeddings are explicitly set to mock (config or NATIVE_AGENT_EMBEDDING_MOCK)"
             case ManagedEmbeddingProvider.failClosedBackend:
-                return "CoreML semantic embeddings unavailable; recall is fail-closed until the MiniLM bundle is installed"
+                return "bge-large-en-v1.5 semantic embeddings unavailable; recall is fail-closed. \(runtimeSnapshot?.lastLoadError ?? "Read Doctor for the model file and failure.")"
             default:
                 // Snapshot was nil (runtime not yet wired) — surface that honestly.
                 return "Semantic embedding runtime is unavailable"
             }
         }()
-        // F2: surface hygiene_last_run.json so the UI can show "last run at X /
-        // next ~24h" instead of an empty hygiene slot that reads as "never".
-        let hygieneReport = Self.readHygieneLastRun(dataRoot: dataRoot)
         return MemoryV2Status(
             // An unreadable store is not an empty store. The Memory screen
             // uses this provenance to avoid claiming no memories are saved
@@ -76,15 +62,9 @@ public enum MemoryStatusProjection {
                 pinned: pinnedCount,
                 pendingProposals: pendingProposals
             ),
-            hygiene: hygieneReport,
-            vault: nil,
-            afterTurn: afterTurnRecovery(dataRoot: dataRoot),
+            afterTurn: await afterTurnRecovery(dataRoot: dataRoot),
             createdAt: ISO8601DateFormatter().string(from: Date())
         )
-    }
-
-    public static func readHygieneLastRun(dataRoot: URL = PersistenceCore.defaultDataRoot()) -> MemoryHygieneReport? {
-        try? MemoryConsolidationHygiene.read(dataRoot: dataRoot)
     }
 
     /// The miss ledger for the ISO `weeks` asked: every time she was given a
@@ -97,20 +77,20 @@ public enum MemoryStatusProjection {
     /// counts but shows no text (nil: the Mac's own page, which sees all).
     public static func misses(dataRoot: URL, weeks: [String], surface: String? = nil) async throws -> [MemoryMissLesson] {
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-        var lessons: [MemoryMissLesson] = []
+        var lessons: [String: (firstSeen: Int, misses: [(date: Date, miss: MemoryMiss)])] = [:]
         for m in try await storage.listMemories(persona: nil, status: nil, limit: nil)
-        where m.status != "deleted" && MemoryMoments.metadataString(m.metadata, "kind") == "correction" {
-            let session = MemoryMoments.metadataString(m.metadata, "session_id")
+        where m.status != "deleted" && m.metadata?.objectValue?["kind"]?.stringValue == "correction" {
+            let session = m.metadata?.objectValue?["session_id"]?.stringValue
             // Dated by the turn that gave it (a held or recovered correction is
             // kept later); rows kept before turns were stamped, by their insert.
-            var occurrences = [(at: MemoryMoments.metadataString(m.metadata, "turn_at") ?? m.createdAt, session: session,
-                                history: MemoryMoments.metadataString(m.metadata, "history"))]
+            var occurrences = [(at: m.metadata?.objectValue?["turn_at"]?.stringValue ?? m.createdAt, session: session,
+                                history: m.metadata?.objectValue?["history"]?.stringValue)]
             if case .object(let meta)? = m.metadata, case .array(let repeats)? = meta["duplicate_occurrences"] {
                 for case .object(let repeated) in repeats {
                     guard case .string(let at)? = repeated["turn_at"] else { continue }
                     // A key the repeat shares with the row is left out of it.
-                    occurrences.append((at, MemoryMoments.metadataString(.object(repeated), "session_id") ?? session,
-                                        MemoryMoments.metadataString(.object(repeated), "history")))
+                    occurrences.append((at, repeated["session_id"]?.stringValue ?? session,
+                                        repeated["history"]?.stringValue))
                 }
             }
             // Scope only: a graduated or archived miss is history, not hidden.
@@ -121,24 +101,28 @@ public enum MemoryStatusProjection {
                 personaID: record.personaId, status: "active", lifecycle: nil, tags: record.tags, metadata: record.extras
             )?.permits(surface: surface, personaID: nil) == true
             let name = !shown ? "not shown on this surface"
-                : MemoryMoments.metadataString(m.metadata, "lesson") ?? lesson(metadata: m.metadata, text: m.content)
+                : m.metadata?.objectValue?["lesson"]?.stringValue ?? lesson(metadata: m.metadata, text: m.content)
             let text = shown ? m.content : ""
             for occurrence in occurrences {
-                let week = isoWeek(MemoryMoments.parseTimestamp(occurrence.at) ?? .distantPast)
+                let date = MemoryMoments.parseTimestamp(occurrence.at) ?? .distantPast
+                let week = isoWeek(date)
                 guard weeks.contains(week) else { continue }
                 let miss = MemoryMiss(memoryId: m.id, text: text, at: occurrence.at, week: week,
                                       sessionId: occurrence.session, history: occurrence.history)
-                if let index = lessons.firstIndex(where: { $0.lesson == name }) {
-                    lessons[index].misses.append(miss)
-                } else {
-                    lessons.append(MemoryMissLesson(lesson: name, misses: [miss]))
-                }
+                let firstSeen = lessons.count
+                lessons[name, default: (firstSeen, [])].misses.append((date, miss))
             }
         }
-        // Newest first, each lesson's misses and the lessons themselves.
-        func newest(_ miss: MemoryMiss) -> Date { MemoryMoments.parseTimestamp(miss.at) ?? .distantPast }
-        for index in lessons.indices { lessons[index].misses.sort { newest($0) > newest($1) } }
-        return lessons.sorted { newest($0.misses[0]) > newest($1.misses[0]) }
+        var groups: [(name: String, firstSeen: Int, misses: [(date: Date, miss: MemoryMiss)])] = []
+        for (name, group) in lessons {
+            let misses = group.misses.sorted { $0.date > $1.date }
+            groups.append((name: name, firstSeen: group.firstSeen, misses: misses))
+        }
+        groups.sort { a, b in
+            let latestA = a.misses[0].date, latestB = b.misses[0].date
+            return latestA == latestB ? a.firstSeen < b.firstSeen : latestA > latestB
+        }
+        return groups.map { group in MemoryMissLesson(lesson: group.name, misses: group.misses.map(\.miss)) }
     }
 
     /// "2026-W41": the ISO week `date` falls in, on this Mac's clock. `ago`
@@ -162,7 +146,7 @@ public enum MemoryStatusProjection {
         func tag(_ text: String) -> String {
             text.lowercased().split { !$0.isLetter && !$0.isNumber }.prefix(4).joined(separator: "-")
         }
-        var labels = [MemoryMoments.metadataString(metadata, "correction_subject")].compactMap { $0 }
+        var labels = [metadata?.objectValue?["correction_subject"]?.stringValue].compactMap { $0 }
         if case .object(let meta)? = metadata {
             for key in ["tags", "context_topics"] {
                 guard case .array(let values)? = meta[key] else { continue }
@@ -195,6 +179,7 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
     public var effectiveEmbeddingBackend: String
     public var spotlightReindexed: Bool
     public var spotlightIndexedCount: Int
+    public var spotlightLastError: String? = nil
     public var cloudKitAccountStatus: String
     public var dataRootPath: String
 
@@ -251,8 +236,8 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
         sqliteProposalCount: 0,
         storageReadable: nil,
         coreMLReady: false,
-        coreMLModelLabel: "MiniLM-L6-v2 (pending .mlpackage)",
-        embedderDimensions: 384,
+        coreMLModelLabel: "bge-large-en-v1.5 (not loaded)",
+        embedderDimensions: CoreMLEmbeddingProvider.bundledDimensions,
         coreMLLoaded: false,
         coreMLLastLoadError: nil,
         coreMLLoadCount: 0,
@@ -282,35 +267,22 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
             snap.storageReadable = true
             snap.sqliteRecordCount = counts.active
             spotlightEligibleCount = counts.active
-            storageGeneration = try await store.spotlightGenerationFingerprint()
+            storageGeneration = try await store.spotlightSnapshot().fingerprint
             snap.sqliteProposalCount = counts.pendingProposals
+            snap.spotlightLastError = await store.spotlightProjectionFailure
         } catch {
             snap.storageReadable = false
         }
 
-        // Core ML MiniLM probe. 2026-06-07 task #88: this used to roll its
-        // own `Bundle.main.url(forResource: "MiniLM_L6_v2", ...)` check that
-        // (a) used the wrong filename (the actual SPM resource is
-        // `minilm.mlpackage`) and (b) couldn't traverse into the
-        // NativeAgentCore_MemoryV2.bundle sub-bundle where the runtime
-        // actually looks. Result: page perpetually said "pending .mlpackage"
-        // even with a fully staged model. Now we ask the runtime's own
-        // resolver — single source of truth, both `bundled` and
-        // installedAppFallbackBundle paths covered. An installed model whose
-        // manifest is unusable is NOT ready and never reads as the bundled
-        // MiniLM (S12, 2026-09-26); applyEmbeddingRuntime() below carries
-        // the reason as the load error.
+        // Ask the runtime's resolver; missing or broken bge assets are never
+        // ready. applyEmbeddingRuntime() below carries the named load error.
         do {
-            if let installed = try CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot) {
-                snap.coreMLReady = true
-                snap.coreMLModelLabel = installed.modelID + " (installed)"
-                snap.embedderDimensions = installed.dimensions
-            } else if CoreMLEmbeddingProvider.bundledResourcesAvailable() {
-                snap.coreMLReady = true
-                snap.coreMLModelLabel = CoreMLEmbeddingProvider.bundledModelID + " (bundled)"
-            }
+            let installed = try CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot)
+            snap.coreMLReady = true
+            snap.coreMLModelLabel = installed.modelID
+            snap.embedderDimensions = installed.dimensions
         } catch {
-            snap.coreMLModelLabel = "installed model did not load"
+            snap.coreMLModelLabel = "bge-large-en-v1.5 unavailable"
         }
 
         // Runtime truth fields — the disk probe above tells us if
@@ -320,13 +292,9 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
         // SwiftNativeMemoryV2's snapshot.
         snap.applyEmbeddingRuntime(await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).embeddingRuntimeSnapshot())
 
-        // Spotlight — the `.spotlight_reindexed` sentinel is written by
-        // MemorySpotlightBootstrap on first launch after the
-        // cutover. Presence alone is not proof: a failed reindex can clear the
-        // domain after a previous marker was written. The marker is valid only
-        // when it names the current canonical projection generation.
+        // Spotlight proof is valid only for the current canonical generation.
         let spotMarker = SwiftNativeMemoryIndexer.markerURL(dataRoot: dataRoot)
-        if let storageGeneration,
+        if snap.spotlightLastError == nil, let storageGeneration,
            let markerData = try? Data(contentsOf: spotMarker),
            String(data: markerData, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) == storageGeneration {
@@ -349,220 +317,12 @@ public struct MemoryV2NativeStackSnapshot: Sendable, Equatable {
     }
 }
 
-extension MemoryStatusProjection {
-    /// Project a status from one runtime snapshot.
-    public static func embeddingsStatus(from runtime: EmbeddingRuntimeSnapshot) -> EmbeddingsStatus {
-        let readiness = MemoryStatusProjection.embeddingReadiness(runtime)
-        let requestedCoreML = readiness.requestedCoreML
-        // effectiveCoreML must be TRUE only when the runtime is ACTUALLY
-        // serving CoreML vectors — not when it's mock and not when it's
-        // fail-closed (CoreML failed + no NATIVE_AGENT_EMBEDDING_MOCK opt-in).
-        // The earlier check `effectiveBackend != mockBackend` returned true
-        // for "fail-closed" too, so the UI reported "local"/"Active" while
-        // every embed() call was throwing. Match against the canonical CoreML
-        // backend instead.
-        let isFailClosed = readiness.isFailClosed
-        let modelName: String = {
-            if isFailClosed {
-                return "Unavailable / \(runtime.dimensions)d (\(runtime.lastLoadError ?? "CoreML resources missing"))"
-            }
-            if requestedCoreML {
-                let loaded = runtime.coreMLLoaded ? "loaded" : "idle"
-                return "\(runtime.modelId) / \(runtime.dimensions)d (\(loaded))"
-            }
-            return "Deterministic mock / \(runtime.dimensions)d (semantic embeddings off)"
-        }()
-        let modeDetail = EmbeddingsMemoryModeDetail(
-            mode: runtime.mode,
-            title: embeddingModeTitle(runtime.mode),
-            detail: embeddingModeDetail(runtime, requestedCoreML: requestedCoreML),
-            idleUnloadSeconds: runtime.idleUnloadSeconds
-        )
-        let reindexState = EmbeddingsInstallState(
-            state: "complete",
-            currentStep: embeddingCurrentStep(runtime, requestedCoreML: requestedCoreML),
-            progress: 100,
-            error: runtime.lastLoadError,
-            detail: embeddingStatusDetail(runtime, requestedCoreML: requestedCoreML),
-            startedAt: nil,
-            failedAt: nil,
-            completedAt: ISO8601DateFormatter().string(from: Date()),
-            extrasPath: nil,
-            hfCachePath: nil,
-            total: nil,
-            candidates: nil,
-            embedded: nil,
-            skipped: nil,
-            failed: nil,
-            reason: nil,
-            lastUpdatedAt: nil
-        )
-        return EmbeddingsStatus(
-            libraryAvailable: runtime.coreMLResourcesAvailable,
-            modelLoadable: runtime.modelLoadable,
-            configBackend: runtime.requestedBackend,
-            envEnabled: true,
-            effectiveBackend: readiness.effectiveBackend,
-            modelName: modelName,
-            requestedEnabled: requestedCoreML,
-            memoryMode: runtime.mode,
-            memoryModeDetail: modeDetail,
-            idleUnloadSeconds: runtime.idleUnloadSeconds,
-            modelState: EmbeddingsModelState(
-                mode: runtime.mode,
-                loaded: runtime.coreMLLoaded,
-                parentLoaded: runtime.coreMLLoaded,
-                workerRunning: false,
-                workerPid: nil,
-                lastUsedAt: runtime.lastUsedAt,
-                lastLoadedAt: runtime.lastLoadedAt,
-                lastUnloadedAt: runtime.lastUnloadedAt,
-                unloadReason: runtime.unloadReason,
-                loadCount: runtime.loadCount,
-                unloadCount: runtime.unloadCount,
-                cacheSize: nil,
-                cacheMaxSize: nil
-            ),
-            installState: nil,
-            reindexState: reindexState,
-            extrasPath: nil
-        )
-    }
-
-    private static func embeddingModeTitle(_ mode: String) -> String {
-        switch mode {
-        case "performance": return "Fast"
-        case "low_memory": return "Low"
-        default: return "Balanced"
-        }
-    }
-
-    // gpt-5.5 review-3 NEEDS_FIX: the three UI-string helpers below now drive
-    // off `runtime.effectiveBackend` so the env-mock-opt-in case
-    // (NATIVE_AGENT_EMBEDDING_MOCK=1 with requestedCoreML=true) doesn't get
-    // mislabeled as fail-closed when embed() is actually returning mock
-    // vectors. Snapshot already computes the right `effectiveBackend` value
-    // (coreml-minilm / mock / fail-closed); these strings just have to honor
-    // it instead of re-deriving from individual fields.
-
-    private static func embeddingModeDetail(_ runtime: EmbeddingRuntimeSnapshot, requestedCoreML: Bool) -> String {
-        guard requestedCoreML else {
-            return EmbeddingPlainCopy.headline(.turnedOff)
-        }
-        // Env-mock opt-in path: user wanted CoreML, set the env var, runtime
-        // returns mock vectors. Say so honestly.
-        if runtime.effectiveBackend == ManagedEmbeddingProvider.mockBackend {
-            return EmbeddingPlainCopy.headline(.testVectors)
-        }
-        if runtime.effectiveBackend == ManagedEmbeddingProvider.failClosedBackend {
-            return EmbeddingPlainCopy.headline(runtime.lastLoadError == nil ? .modelMissing : .modelFailed)
-        }
-        return EmbeddingPlainCopy.modeLine(mode: runtime.mode)
-    }
-
-    private static func embeddingCurrentStep(_ runtime: EmbeddingRuntimeSnapshot, requestedCoreML: Bool) -> String {
-        if !requestedCoreML { return "Semantic CoreML embedder disabled by user" }
-        if runtime.effectiveBackend == ManagedEmbeddingProvider.mockBackend {
-            return "Mock embedder active (NATIVE_AGENT_EMBEDDING_MOCK opt-in)"
-        }
-        if runtime.coreMLLoaded { return "CoreML semantic embedder loaded" }
-        if runtime.effectiveBackend == ManagedEmbeddingProvider.coreMLBackend
-            && runtime.lastLoadError == nil {
-            return "CoreML semantic embedder ready to lazy-load"
-        }
-        return "Semantic embedder fail-closed (CoreML resources missing or load failed)"
-    }
-
-    // This value lands in the SECONDARY line under a plain headline
-    // (SlimSettingsView.modelUnavailableRow), so it is where the identifiers
-    // are allowed to live — the headline above it never carries them.
-    private static func embeddingStatusDetail(_ runtime: EmbeddingRuntimeSnapshot, requestedCoreML: Bool) -> String? {
-        if !requestedCoreML { return EmbeddingPlainCopy.technicalDetail(.turnedOff) }
-        if runtime.effectiveBackend == ManagedEmbeddingProvider.mockBackend {
-            return EmbeddingPlainCopy.technicalDetail(.testVectors)
-        }
-        if let error = runtime.lastLoadError {
-            return EmbeddingPlainCopy.technicalDetail(.modelFailed, error: error)
-        }
-        if runtime.coreMLLoaded { return nil }
-        if runtime.effectiveBackend == ManagedEmbeddingProvider.failClosedBackend {
-            return EmbeddingPlainCopy.technicalDetail(.modelMissing)
-        }
-        return EmbeddingPlainCopy.notLoadedYetLine
-    }
-
-}
-
-public enum EmbeddingPlainCopy {
-
-    /// What the embedding runtime is actually doing for search right now.
-    public enum SearchState: Equatable {
-        /// The user opted out of semantic embeddings in settings.
-        case turnedOff
-        /// NATIVE_AGENT_EMBEDDING_MOCK opt-in: deterministic test vectors.
-        case testVectors
-        /// Model resources are not on disk.
-        case modelMissing
-        /// Model resources exist but failed to load.
-        case modelFailed
-    }
-
-    /// Leads with the user's loss, never with a backend name.
-    public static func headline(_ state: SearchState) -> String {
-        switch state {
-        case .turnedOff:
-            return "Memory search by meaning is turned off."
-        case .testVectors:
-            return "Memory search is running on test data, so results will not match meaning."
-        case .modelMissing:
-            return "Memory search is unavailable because a required model is not installed."
-        case .modelFailed:
-            return "Memory search is unavailable because the search model could not load."
-        }
-    }
-
-    /// The secondary line. Nil when there is nothing technical worth naming.
-    public static func technicalDetail(_ state: SearchState, error: String? = nil) -> String? {
-        switch state {
-        case .turnedOff:
-            return "Semantic embeddings are off in settings. Turn them on to use the bundled Core ML MiniLM model."
-        case .testVectors:
-            return "NATIVE_AGENT_EMBEDDING_MOCK is set, so search uses deterministic test vectors instead of the bundled Core ML MiniLM model."
-        case .modelMissing:
-            return "Search model: Core ML MiniLM. The bundled resources are not on disk."
-        case .modelFailed:
-            let trimmed = error?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            if trimmed.isEmpty {
-                return "Search model: Core ML. Load failed."
-            }
-            return "Search model: Core ML. Load failed: \(trimmed)"
-        }
-    }
-
-    /// Idle-retention mode, described by what the user feels rather than by
-    /// which model unloads when.
-    public static func modeLine(mode: String) -> String {
-        switch mode {
-        case "performance":
-            return "The search model stays loaded, so searches return as fast as possible."
-        case "low_memory":
-            return "The search model unloads after 45 seconds of no use, to keep memory free."
-        default:
-            return "The search model loads when you search and unloads after 5 minutes of no use."
-        }
-    }
-
-    /// Transient: the model is fine, just not resident this second.
-    public static let notLoadedYetLine =
-        "The search model is not loaded right now. It loads on your next search."
-}
-
-extension MemoryStatusProjection {
+extension MemoryRecoveryReadout {
     /// This ISO week's and last week's misses by lesson; nil when the ledger
     /// could not be read.
     public static func recentMisses(dataRoot: URL) async -> [MemoryMissLesson]? {
-        try? await MemoryStatusProjection.misses(
-            dataRoot: dataRoot, weeks: [MemoryStatusProjection.isoWeek(), MemoryStatusProjection.isoWeek(ago: 1)])
+        try? await MemoryRecoveryReadout.misses(
+            dataRoot: dataRoot, weeks: [MemoryRecoveryReadout.isoWeek(), MemoryRecoveryReadout.isoWeek(ago: 1)])
     }
 
 }

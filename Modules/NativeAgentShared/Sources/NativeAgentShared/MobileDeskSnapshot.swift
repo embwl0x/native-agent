@@ -1,6 +1,33 @@
 import Foundation
 
-// Blueprint: | `MobileDeskSnapshot.swift` | `WorkOverview` and mobile Desk values: bounded canonical-identity reading copies, owner counts and execution movement; no second decision owner |
+// Blueprint: | `MobileDeskSnapshot.swift` | `DeskKind`, `DeskStatus`, `WorkOverview` and mobile Desk values: bounded canonical-identity reading copies, owner counts and execution movement; no second decision owner |
+
+public enum DeskKind: String, Sendable, CaseIterable, Equatable {
+    case watch, plan, project, gh, standing
+}
+
+public enum DeskStatus: String, Sendable, CaseIterable, Equatable {
+    case watch, flag, now, next, todo, done, blocked, canceled
+
+    /// done / canceled are terminal — an item is archivable only once terminal,
+    /// and a parent refuses archive while any child is non-terminal.
+    public var isTerminal: Bool { self == .done || self == .canceled }
+}
+
+public extension DeskStatus {
+    var displayLabel: String {
+        switch self {
+        case .now: "now"
+        case .next: "next"
+        case .blocked: "blocked"
+        case .flag: "needs attention"
+        case .done: "done"
+        case .todo: "to do"
+        case .watch: "watching"
+        case .canceled: "cancelled"
+        }
+    }
+}
 
 /// A reading copy, never a second work or decision owner. References use the
 /// canonical identity rather than a title, alias, path, or chat draft.
@@ -110,10 +137,7 @@ public enum DeskActivityState: String, Sendable {
     public static let movementWindow: TimeInterval = 5 * 60
 
     public static func movementDate(_ raw: String?) -> Date? {
-        guard let raw else { return nil }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.date(from: raw) ?? ISO8601DateFormatter().date(from: raw)
+        raw.flatMap(NativeTimestampFormat.parseISO8601FractionalFirst)
     }
 
     public static func execution(_ evidence: DeskExecutionEvidence?, now: Date) -> Self {
@@ -257,14 +281,7 @@ public struct MobileDeskItemReadingCopy: Codable, Equatable, Identifiable, Senda
     }
 }
 
-/// The published bounds of the Desk projection, shared so a companion device
-/// can show where the boundary is instead of presenting a clipped projection as
-/// the whole store. Silent truncation was the defect, not the bounds.
-/// What the Mac LEFT OUT of the Desk projection, published explicitly.
-/// 2026-09-12: the phone used to infer truncation from "I received at least 300
-/// rows", which missed every drop made to satisfy the encoded-size bound (a
-/// projection cut to 180 fat rows showed no boundary at all) and said nothing
-/// when the rows it did receive were all in non-history sections.
+/// Published Desk omissions are authoritative for both row and size bounds; readers never infer them.
 public struct MobileDeskProjectionReport: Codable, Equatable, Sendable {
     /// Desk items the Mac holds, before any bound was applied.
     public var totalRows: Int

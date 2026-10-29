@@ -1,14 +1,12 @@
 import Foundation
 
-// Blueprint: | `InlineInteractionDescriptor.swift` | `InlineInteractionDescriptor`: registry-supplied existing control/location bindings; renderers switch on interaction kind, not connector name |
+// Blueprint: | `InlineInteractionDescriptor.swift` | Registry-supplied control/location bindings and shared `InlineCardField` connector vocabulary for Mac and phone |
 
 /// What the card needs to know about the thing being asked for, and WHICH
 /// existing control resolves it.
 ///
-/// The point of the descriptor is that the card renderer switches on six
-/// interaction kinds and never on a service name. Adding a connector adds a
-/// row to the connector registry; it adds no card code, no button code, and
-/// no branch here.
+/// Renderers select an existing control and render its shared field description.
+/// Connector setup and field vocabulary add no service branch to either renderer.
 ///
 /// A descriptor never carries a URL, a selector, a settings path, or anything
 /// else executable. `control` is a CLOSED enum of controls this app already
@@ -61,9 +59,8 @@ public struct InlineInteractionDescriptor: Codable, Sendable, Equatable {
         }
     }
 
-    /// Where the action can actually be completed. API keys, OAuth that needs
-    /// the Mac, and macOS permission prompts are Mac-only; the phone shows
-    /// "Continue on Mac" instead of a dead control.
+    /// The setup's owning surface. Native setup and browser sign-in stay on
+    /// the Mac; supported phone controls can submit sealed input.
     public enum Location: String, Codable, Sendable, Equatable {
         case anywhere
         case macRequired = "mac_required"
@@ -103,4 +100,54 @@ public struct InlineInteractionDescriptor: Codable, Sendable, Equatable {
     }
 
     public var isActionable: Bool { control.isActionable }
+
+    public var connectorFields: [InlineCardField] {
+        let stays = "Your key stays on this Mac. It never goes into the chat."
+        switch target.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "telegram":
+            return [
+                InlineCardField(label: "Bot token", placeholder: "123456789:ABC… from @BotFather",
+                                helper: stays, id: "token"),
+                InlineCardField(label: "Allowed chat ID", placeholder: "Numeric chat ID",
+                                helper: "Send your bot a message, then open Telegram setup and use Check sender to find your ID. Only a recipient you admit can reach the agent.",
+                                isSecret: false, id: "allowed_chat_id"),
+            ]
+        case "slack":
+            return [
+                InlineCardField(label: "Slack bot token", placeholder: "xoxb-...", helper: stays, id: "token"),
+                InlineCardField(label: "Socket Mode app token (optional)", placeholder: "xapp-...",
+                                helper: "Slack chat needs it; it can be added later.",
+                                id: "app_token", isOptional: true),
+                InlineCardField(label: "Allowed channel IDs", placeholder: "C0123, C0456",
+                                isSecret: false, id: "allowed_channels", isOptional: true),
+                InlineCardField(label: "Allowed user IDs", placeholder: "U0123",
+                                helper: "Add at least one channel or user.",
+                                isSecret: false, id: "allowed_users", isOptional: true),
+            ]
+        default:
+            return []
+        }
+    }
+}
+
+/// One value the card collects. Secrets never become transcript content.
+public struct InlineCardField: Sendable, Equatable {
+    public var label: String
+    public var placeholder: String
+    public var helper: String?
+    public var isSecret: Bool
+    /// The key the value travels under when a card collects several.
+    public var id: String
+    /// An optional field never holds the primary back.
+    public var isOptional: Bool
+
+    public init(label: String, placeholder: String, helper: String? = nil, isSecret: Bool = true,
+         id: String = "value", isOptional: Bool = false) {
+        self.label = label
+        self.placeholder = placeholder
+        self.helper = helper
+        self.isSecret = isSecret
+        self.id = id
+        self.isOptional = isOptional
+    }
 }

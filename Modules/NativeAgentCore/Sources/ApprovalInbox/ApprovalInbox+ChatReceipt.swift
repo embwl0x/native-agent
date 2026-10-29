@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Transcripts
@@ -20,8 +21,8 @@ extension SwiftNativeApprovalInbox {
         }
         let path = root.appendingPathComponent("chat/messages")
             .appendingPathComponent("\(sessionID).jsonl")
-        return try await persistence.withFileLock(path) { [persistence] in
-            let rows = try await persistence.readJSONL(path)
+        return try await SwiftNativePersistenceCore.withFileLock(path) {
+            let rows = try await SwiftNativePersistenceCore.readJSONL(path)
             let existingIndex = rows.firstIndex { row in
                 guard case .object(let object) = row,
                       case .object(let metadata)? = object["metadata"],
@@ -105,7 +106,7 @@ extension SwiftNativeApprovalInbox {
                 updated.insert(row, at: insertionIndex)
                 try ContactThread.replace(updated, to: path)
             } else {
-                try await ContactThread.append(row, to: path, using: persistence)
+                try await ContactThread.append(row, to: path)
             }
             guard legacyStarted else { return nil }
             if case .string(let date)? = priorObject["createdAt"] { return date }

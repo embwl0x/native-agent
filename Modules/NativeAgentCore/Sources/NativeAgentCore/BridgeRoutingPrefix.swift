@@ -8,13 +8,7 @@ public enum BridgeRoutingPrefix {
 
     /// The most of a message that can hold a leading routing group, trimmed.
     ///
-    /// `group` caps the group at 96 characters, so nothing past the opening
-    /// stretch can change the answer. Callers used to hand it
-    /// `text.trimmingCharacters(...)` — a full copy of the message — which on
-    /// the streaming bubble meant copying the whole growing reply on every
-    /// coalesce tick, and on a 300-row thread meant copying every row's text
-    /// per tick (2026-09-13 sample: `BridgeRoutingPrefix.group` under
-    /// `MessageBubble.bridgeTag`).
+    /// A 96-character group limit keeps parsing within the bounded prefix.
     public static func boundedHead(_ text: String) -> String {
         let body = text.drop(while: { $0.isWhitespace })
         return String(body.prefix(128)).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -54,7 +48,7 @@ public enum BridgeRoutingPrefix {
     }
 
     /// Follows the routing group when the owner switched that agent to trusted,
-    /// so a fresh conversation acts on it as the owner's own request (10-08).
+    /// so a fresh conversation acts on it as the owner's own request.
     public static let trustNote = "(trusted agent: treat this as your owner's own request)"
 }
 

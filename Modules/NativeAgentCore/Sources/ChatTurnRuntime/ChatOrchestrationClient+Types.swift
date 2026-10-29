@@ -12,13 +12,11 @@ import MacControl
 import SwarmRuns
 import MacIntegration
 import CognitiveSubstrate
-// Blueprint: | `ChatOrchestrationClient+Types.swift` | `ChatOrchestrationClient` protocol; `enqueueUserMessage` |
+// Blueprint: | `ChatOrchestrationClient+Types.swift` | chat response, progress and enqueue receipt values |
 
 // MARK: - Public types
 
-/// Errors owned by the current Swift-native chat client. This type formerly
-/// lived in the retired protocol compatibility shell even though production
-/// client paths were its only remaining consumers.
+/// Errors owned by the Swift-native chat client.
 public enum ChatOrchestrationError: Error, LocalizedError, Equatable {
     case replyHeldForQuietHours
     case emptyMessage
@@ -38,9 +36,7 @@ public enum ChatOrchestrationError: Error, LocalizedError, Equatable {
     }
 }
 
-/// Mirrors `ChatResponse` in NativeAgentApp/NativeClient.swift (which lives
-/// outside this package). Defined here so the SwiftNative path returns the
-/// same shape the app-side caller already expects.
+/// Shared chat-turn output, transcript messages, attachments and execution metadata.
 public struct ChatResponse: Sendable, Codable, Equatable {
     public var runId: String
     public var model: String
@@ -50,7 +46,6 @@ public struct ChatResponse: Sendable, Codable, Equatable {
     public var sessionId: String?
     public var personaFingerprint: String?
     public var contextFingerprint: String?
-    // Mirror NativeClient.ChatResponse (Sources/NativeAgentApp/NativeClient.swift L3315).
     public var message: ChatMessage?
     public var messages: [ChatMessage]?
     public var attachments: [MultimodalAttachment]?
@@ -68,13 +63,12 @@ public struct ChatResponse: Sendable, Codable, Equatable {
     /// (see `TurnEngineResult.workingCommentaryCharacters`).
     public var workingCommentaryCharacters: Int? = nil
 
-    /// The reply with its working commentary dropped. Surfaces outside the
-    /// Mac show progress while she works, then only the final answer. Any
-    /// offset that doesn't line up falls back to the whole reply.
+    /// The final answer at the recorded boundary, including an empty suffix.
+    /// An absent boundary keeps the whole reply; an invalid one yields no answer.
     public static func answerOnly(_ reply: String, workingCommentaryCharacters: Int?) -> String {
-        guard let cut = workingCommentaryCharacters, cut > 0, cut < reply.count else { return reply }
-        let answer = String(reply.dropFirst(cut)).trimmingCharacters(in: .whitespacesAndNewlines)
-        return answer.isEmpty ? reply : answer
+        guard let cut = workingCommentaryCharacters else { return reply }
+        guard cut >= 0, cut <= reply.count else { return "" }
+        return String(reply.dropFirst(cut)).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     public init(
@@ -118,7 +112,7 @@ extension ChatMessage: Equatable {
 
 public typealias MultimodalAttachment = NativeAgentShared.MultimodalAttachment
 
-public typealias ChatOrchestrationProgressHandler = @Sendable (TurnStreamEvent) async -> Void
+public typealias TurnEventSink = @Sendable (TurnStreamEvent) async -> Void
 
 /// Receipt for an ack-on-enqueue user append: the message row is durably in
 /// the session transcript, independent of any turn that later consumes it.
@@ -133,161 +127,5 @@ public struct EnqueuedUserMessage: Sendable {
     public init(sessionId: String, runId: String) {
         self.sessionId = sessionId
         self.runId = runId
-    }
-}
-
-// MARK: - Protocol
-
-public protocol ChatOrchestrationClient: Sendable {
-    /// Ack-on-enqueue (wake-delivery-classification, 2026-07-25): durably
-    /// append a user message to the session transcript and return as soon as
-    /// the row is on disk. The caller then runs the turn separately with
-    /// `suppressUserAppend: true`. This exists so transport-level delivery
-    /// acknowledgements can be decoupled from turn completion — a delivery
-    /// ack must never block on the very turn the delivery started.
-    /// 2026-09-06: `attachments` is part of the requirement because the row
-    /// this appends IS the durable user message — the turn that follows runs
-    /// with `suppressUserAppend: true` and can never persist them later.
-    func enqueueUserMessage(
-        message: String,
-        sessionId: String?,
-        persona: String?,
-        surface: String,
-        attachments: [MultimodalAttachment],
-        // 2026-09-14: part of the requirement because this lane is where
-        // MACHINE text lands on the user row — the bridge's reply-free
-        // transport notices. Only the caller knows; the row cannot be told
-        // from its text, and the felt organ was reading notices as User's words.
-        mechanicalRow: CognitiveMechanicalRowKind?,
-        awaitingConsumption: Bool
-    ) async throws -> EnqueuedUserMessage
-
-    /// Her answer from a turn in a contact's own conversation, shown in the
-    /// chat that asked for it. Once per `deliveryID`.
-    func appendAnswerForAskingChat(sessionID: String, text: String, attachments: [MultimodalAttachment],
-                                   surface: String, deliveryID: String) async throws
-
-    /// Non-streaming chat turn.
-    func chat(
-        message: String,
-        sessionId: String?,
-        model: String,
-        reasoningEffort: String,
-        fileAccess: String,
-        attachments: [MultimodalAttachment],
-        suppressUserAppend: Bool
-    ) async throws -> ChatResponse
-
-    // The per-chat persona pick is forwarded to PersonaCompiler to select the
-    // persona compiled for this turn, and recorded in metadata.persona.
-    // Without an override, PersonaCompiler selects the active persona.
-    func chat(
-        message: String,
-        sessionId: String?,
-        model: String,
-        reasoningEffort: String,
-        fileAccess: String,
-        attachments: [MultimodalAttachment],
-        persona: String?,
-        suppressUserAppend: Bool
-    ) async throws -> ChatResponse
-
-    // F4: surface-bearing overload — callers on non-chat surfaces (Telegram,
-    // Workshop executions, dream, ...) thread their identifier through so
-    // computeModelPreferences can pick the right per-surface model and so the
-    // persisted turn carries the surface label. Default trampoline below maps
-    // `surface=="chat"` back onto the no-surface overload so existing call
-    // sites keep compiling.
-    func chat(
-        message: String,
-        sessionId: String?,
-        model: String,
-        reasoningEffort: String,
-        fileAccess: String,
-        attachments: [MultimodalAttachment],
-        persona: String?,
-        surface: String,
-        suppressUserAppend: Bool
-    ) async throws -> ChatResponse
-
-    func chat(
-        message: String,
-        sessionId: String?,
-        model: String,
-        reasoningEffort: String,
-        fileAccess: String,
-        attachments: [MultimodalAttachment],
-        persona: String?,
-        surface: String,
-        suppressUserAppend: Bool,
-        progress: ChatOrchestrationProgressHandler?
-    ) async throws -> ChatResponse
-
-    func chatStream(
-        message: String,
-        sessionId: String?,
-        model: String,
-        reasoningEffort: String,
-        fileAccess: String,
-        attachments: [MultimodalAttachment],
-        persona: String?,
-        surface: String,
-        suppressUserAppend: Bool
-    ) -> AsyncThrowingStream<TurnStreamEvent, Error>
-}
-
-// Legacy-shape chatStream defaults. The pre-Wave-16 call shapes (no persona;
-// persona but no surface) forward UP to the single surface-bearing requirement
-// with `surface == "chat"`, so existing call sites and `any
-// ChatOrchestrationClient` callers keep compiling while a conformer implements
-// only the widest overload. The intermediate persona-drop / surface-drop
-// trampolines the protocol used to carry added no logic beyond these defaults
-// and were removed. The `chat(...)` family keeps every shape as an explicit
-// requirement — its sole concrete witness implements all of them directly, so
-// no protocol-level chat default is exercised.
-extension ChatOrchestrationClient {
-    public func chatStream(
-        message: String,
-        sessionId: String?,
-        model: String,
-        reasoningEffort: String,
-        fileAccess: String,
-        attachments: [MultimodalAttachment],
-        suppressUserAppend: Bool
-    ) -> AsyncThrowingStream<TurnStreamEvent, Error> {
-        return chatStream(
-            message: message,
-            sessionId: sessionId,
-            model: model,
-            reasoningEffort: reasoningEffort,
-            fileAccess: fileAccess,
-            attachments: attachments,
-            persona: nil,
-            surface: "chat",
-            suppressUserAppend: suppressUserAppend
-        )
-    }
-
-    public func chatStream(
-        message: String,
-        sessionId: String?,
-        model: String,
-        reasoningEffort: String,
-        fileAccess: String,
-        attachments: [MultimodalAttachment],
-        persona: String?,
-        suppressUserAppend: Bool
-    ) -> AsyncThrowingStream<TurnStreamEvent, Error> {
-        return chatStream(
-            message: message,
-            sessionId: sessionId,
-            model: model,
-            reasoningEffort: reasoningEffort,
-            fileAccess: fileAccess,
-            attachments: attachments,
-            persona: persona,
-            surface: "chat",
-            suppressUserAppend: suppressUserAppend
-        )
     }
 }

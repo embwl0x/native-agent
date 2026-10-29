@@ -1,16 +1,20 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `AgentPeerHTTP.swift` | `AgentPeerHTTP` enum; `send`, `get`; each exchange retains its live-update forwarder and closes/cancels it on settlement, cancellation or deinit |
+// Blueprint: | `AgentPeerHTTP.swift` | `AgentPeerHTTP` enum; `send` owns the bounded live-update channel and forwarder for either binding; `get` |
 
 /// One bounded exchange. This layer never retries a potentially accepted send.
 public enum AgentPeerHTTP {
-    public typealias LiveUpdateHandler = @Sendable (AgentA2AStream.LiveUpdate) async -> Void
-    public static let maximumResponseBytes = 2 * 1_024 * 1_024
+    public typealias LiveUpdateSink = @Sendable (AgentA2AStream.LiveUpdate) async -> Void
+    /// Encoded output parts, shared with the producer. Complete replies also
+    /// carry task/status metadata and retained completion artifacts.
+    package static let maximumOutputBytes = 16_000_000
+    public static let maximumResponseBytes = 32 * 1_024 * 1_024
     public struct Response: Sendable, Equatable {
         public let statusCode: Int
         /// Nil for an empty or non-JSON response; raw bodies are never errors.
         public let json: JSONValue?
-        public var receipt: Result<AgentA2AStream.Receipt, AgentA2AWire.WireError>?
+        public var receipt: AgentA2AStream.Receipt?
         public var interrupted = false
     }
     public enum TransportError: Error, LocalizedError, Equatable {
@@ -28,22 +32,40 @@ public enum AgentPeerHTTP {
     }
 
     public static func send(_ request: AgentA2AWire.Request, bearerToken: String? = nil,
-                            timeout: TimeInterval = 45, liveUpdate: LiveUpdateHandler?) async throws -> Response {
-        if request.grpcMethod != nil {
-            return try await AgentA2AGRPC.send(request, bearerToken: bearerToken, timeout: timeout,
-                liveUpdate: liveUpdate)
+                            timeout: TimeInterval = 45, liveUpdate: LiveUpdateSink?) async throws -> Response {
+        let liveFeed: AsyncStream<AgentA2AStream.LiveUpdate>.Continuation?
+        let forwarder: Task<Void, Never>?
+        if request.streamInterface != nil, let liveUpdate {
+            let (updates, feed) = AsyncStream.makeStream(of: AgentA2AStream.LiveUpdate.self, bufferingPolicy: .bufferingNewest(1))
+            liveFeed = feed
+            forwarder = Task {
+                for await update in updates {
+                    guard !Task.isCancelled else { return }
+                    await liveUpdate(update)
+                }
+            }
+        } else { liveFeed = nil; forwarder = nil }
+        defer { liveFeed?.finish(); forwarder?.cancel() }
+        return try await withTaskCancellationHandler {
+            if request.grpcMethod != nil {
+                return try await AgentA2AGRPC.send(request, bearerToken: bearerToken, timeout: timeout,
+                    liveFeed: liveFeed)
+            }
+            return try await exchange(url: request.url, method: request.httpMethod, headers: request.headers,
+                                      body: request.body, bearerToken: bearerToken, timeout: timeout,
+                                      liveFeed: liveFeed,
+                                      streamInterface: request.streamInterface, requestID: request.requestID,
+                                      expectedTaskID: request.expectedTaskID)
+        } onCancel: {
+            liveFeed?.finish()
+            forwarder?.cancel()
         }
-        return try await exchange(url: request.url, method: request.httpMethod, headers: request.headers,
-                                  body: request.body, bearerToken: bearerToken, timeout: timeout,
-                                  liveUpdate: liveUpdate,
-                                  streamInterface: request.streamInterface, requestID: request.requestID,
-                                  expectedTaskID: request.expectedTaskID)
     }
 
     public static func get(_ url: URL, bearerToken: String? = nil, headers: [String: String] = [:],
-                           timeout: TimeInterval = 30, liveUpdate: LiveUpdateHandler?) async throws -> Response {
+                           timeout: TimeInterval = 30) async throws -> Response {
         return try await exchange(url: url, method: "GET", headers: headers, body: nil,
-                                  bearerToken: bearerToken, timeout: timeout, liveUpdate: liveUpdate)
+                                  bearerToken: bearerToken, timeout: timeout, liveFeed: nil)
     }
 
     /// Automatic discovery has no credentials, DNS lookup, redirects or system proxy.
@@ -52,7 +74,7 @@ public enum AgentPeerHTTP {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.connectionProxyDictionary = ["HTTPEnable": 0, "HTTPSEnable": 0, "SOCKSEnable": 0]
         return try await exchange(url: url, method: "GET", headers: [:], body: nil,
-                                  bearerToken: nil, timeout: 0.6, configuration: configuration, liveUpdate: nil)
+                                  bearerToken: nil, timeout: 0.6, configuration: configuration, liveFeed: nil)
     }
 
     package static func validateLoopbackCandidate(_ url: URL) throws {
@@ -64,7 +86,7 @@ public enum AgentPeerHTTP {
     static func exchange(url: URL, method: String, headers: [String: String], body: JSONValue?,
                          bearerToken: String?, timeout: TimeInterval,
                          configuration: URLSessionConfiguration = .ephemeral,
-                         liveUpdate: LiveUpdateHandler?, streamInterface: AgentA2AWire.Interface? = nil,
+                         liveFeed: AsyncStream<AgentA2AStream.LiveUpdate>.Continuation?, streamInterface: AgentA2AWire.Interface? = nil,
                          requestID: String? = nil, expectedTaskID: String? = nil) async throws -> Response {
         try validateURL(url)
         guard ["GET", "POST", "DELETE"].contains(method), timeout.isFinite, timeout > 0, timeout <= 600 else { throw TransportError.invalidRequest }
@@ -91,7 +113,7 @@ public enum AgentPeerHTTP {
         configuration.urlCache = nil
         configuration.waitsForConnectivity = false
         let exchange = Exchange(streaming: headers["Accept"] == "text/event-stream",
-            liveUpdate: liveUpdate, accumulator: streamInterface.map {
+            liveFeed: liveFeed, accumulator: streamInterface.map {
                 AgentA2AStream.Accumulator(interface: $0, requestID: requestID,
                     expectedTaskID: expectedTaskID, bearerToken: bearerToken)
             })
@@ -146,48 +168,33 @@ public enum AgentPeerHTTP {
         private var status: Int?
         private let streaming: Bool
         private var eventStream = false
-        /// Display and final evidence share the accumulator; only complete
-        /// frames advance the capture offset.
+        private var parser = SSEEventParser()
+        /// Complete frames enter the one accumulator and leave the buffer.
+        /// Stream framing and final artifact replacement do not add retained bytes.
         private let liveFeed: AsyncStream<AgentA2AStream.LiveUpdate>.Continuation?
-        private let liveForwarder: Task<Void, Never>?
-        private var liveOffset = 0
         private var accumulator: AgentA2AStream.Accumulator?
 
-        init(streaming: Bool, liveUpdate: LiveUpdateHandler?, accumulator: AgentA2AStream.Accumulator?) {
+        init(streaming: Bool, liveFeed: AsyncStream<AgentA2AStream.LiveUpdate>.Continuation?, accumulator: AgentA2AStream.Accumulator?) {
             self.streaming = streaming
+            self.liveFeed = liveFeed
             self.accumulator = accumulator
-            guard streaming, accumulator != nil, let liveUpdate else { liveFeed = nil; liveForwarder = nil; return }
-            let (updates, feed) = AsyncStream.makeStream(of: AgentA2AStream.LiveUpdate.self, bufferingPolicy: .bufferingNewest(1))
-            liveFeed = feed
-            liveForwarder = Task {
-                for await update in updates {
-                    guard !Task.isCancelled else { return }
-                    await liveUpdate(update)
-                }
-            }
         }
 
-        deinit { liveFeed?.finish(); liveForwarder?.cancel() }
-
         private func forwardLive() {
-            guard let liveFeed, eventStream, let status, (200..<300).contains(status) else { return }
-            // Frames end in a blank line (\n\n or \r\n\r\n); both end in LF.
-            var end = data.endIndex - 1
-            while end > data.startIndex + liveOffset {
-                if data[end] == 0x0A, data[end - 1] == 0x0A || (data[end - 1] == 0x0D && end - 2 >= data.startIndex && data[end - 2] == 0x0A) { break }
-                end -= 1
-            }
-            guard end > data.startIndex + liveOffset else { return }
-            let complete = data[(data.startIndex + liveOffset)...end]
-            liveOffset = end + 1 - data.startIndex
+            guard streaming, eventStream, let status, (200..<300).contains(status) else { return }
+            defer { data.removeAll(keepingCapacity: true) }
             do {
-                for event in try AgentA2AStream.events(in: Data(complete)) {
-                    if let update = try accumulator?.receive(event) { liveFeed.yield(update) }
+                for byte in data {
+                    if let event = try parser.consume(byte: byte, maximumBytes: maximumResponseBytes) {
+                        let payload = try JSONValue.parse(Data(event.data.utf8))
+                        if let update = try accumulator?.receive(payload) { liveFeed?.yield(update) }
+                    }
                 }
             } catch {
                 accumulator = nil
-                liveFeed.finish()
-                finish(.failure(error))
+                let failure: Error = (error as? CocoaError)?.code == .fileReadTooLarge ? TransportError.tooLarge
+                    : (error is CocoaError ? AgentA2AWire.WireError.invalid("unreadable stream") : error)
+                finish(.failure(failure))
             }
         }
 
@@ -207,8 +214,6 @@ public enum AgentPeerHTTP {
         func cancel() {
             lock.lock(); cancelled = true; lock.unlock()
             // Cancellation may arrive before start() attaches its continuation.
-            liveFeed?.finish()
-            liveForwarder?.cancel()
             finish(.failure(TransportError.cancelled))
         }
         private func finish(_ result: Swift.Result<Response, Error>) {
@@ -220,8 +225,6 @@ public enum AgentPeerHTTP {
             self.session = nil
             self.task = nil
             lock.unlock()
-            liveFeed?.finish()
-            liveForwarder?.cancel()
             session?.invalidateAndCancel()
             continuation.resume(with: result)
         }
@@ -244,11 +247,11 @@ public enum AgentPeerHTTP {
             guard !(300...399).contains(response.statusCode) else {
                 completionHandler(.cancel); finish(.failure(TransportError.redirected)); return
             }
-            guard response.expectedContentLength <= Int64(maximumResponseBytes) else {
+            eventStream = response.value(forHTTPHeaderField: "Content-Type")?.lowercased().hasPrefix("text/event-stream") == true
+            guard (streaming && eventStream) || response.expectedContentLength <= Int64(maximumResponseBytes) else {
                 completionHandler(.cancel); finish(.failure(TransportError.tooLarge)); return
             }
             status = response.statusCode
-            eventStream = response.value(forHTTPHeaderField: "Content-Type")?.lowercased().hasPrefix("text/event-stream") == true
             completionHandler(.allow)
         }
         func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive bytes: Data) {
@@ -262,19 +265,8 @@ public enum AgentPeerHTTP {
             if streaming, eventStream, let status {
                 // Only blank-line-delimited events are evidence. A truncated tail
                 // and even a clean EOF do not establish task completion.
-                let events: [JSONValue]
-                do { events = try AgentA2AStream.events(in: Data(data.dropFirst(liveOffset))) }
-                catch { finish(.failure(TransportError.unavailable)); return }
-                do {
-                    if (200..<300).contains(status) {
-                        for event in events { _ = try accumulator?.receive(event) }
-                    }
-                    finish(.success(Response(statusCode: status, json: nil,
-                        receipt: accumulator.map { .success($0.receipt) }, interrupted: error != nil)))
-                } catch let failure as AgentA2AWire.WireError {
-                    finish(.success(Response(statusCode: status, json: nil,
-                        receipt: .failure(failure), interrupted: error != nil)))
-                } catch { finish(.failure(error)) }
+                finish(.success(Response(statusCode: status, json: nil,
+                    receipt: accumulator?.receipt, interrupted: error != nil)))
                 return
             }
             guard error == nil, let status else { finish(.failure(TransportError.unavailable)); return }

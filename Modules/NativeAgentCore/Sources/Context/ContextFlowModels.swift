@@ -100,19 +100,12 @@ public struct ContextSurface: RawRepresentable, Codable, Hashable, Sendable, Com
     public init(rawValue: String) {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if normalized.isEmpty { self.rawValue = "unknown"; return }
-        // Same fold, same reason (2026-09-15): `agent-bridge` matched no
-        // ContextFlow surface, so `kernel(for:)` threw `kernelUnavailable` and
-        // an inbound peer turn ran with no fluid-context packet and no persona
-        // kernel at all. A peer turn is a normal session; it gets the bridge
-        // kernel like the other bridges.
+        // Peer turns use the bridge context kernel.
         if normalized == "agent-bridge" || normalized == "agent_bridge" {
             self.rawValue = "bridge"
             return
         }
-        // Studio Wander (2026-10-01) is her own unattended hour: no one is in
-        // the conversation and the work is self-directed, which is what the
-        // workshop kernel and its local-private sources are for. Its routing
-        // row stays `studio_wander`; only the context kernel folds.
+        // Studio Wander uses the workshop kernel and local-private sources; routing stays `studio_wander`.
         if normalized == "studio_wander" {
             self.rawValue = WorkshopSurfaceVocabulary.canonical
             return
@@ -126,11 +119,7 @@ public struct ContextSurface: RawRepresentable, Codable, Hashable, Sendable, Com
     public static let slack = ContextSurface(rawValue: "slack")
     public static let workshop = ContextSurface(rawValue: WorkshopSurfaceVocabulary.canonical)
     public static let bridge = ContextSurface(rawValue: "bridge")
-    /// A standing bot's run (Astra audit 2, finding 3, 2026-09-11). A bot is one
-    /// of Agent's own little agents executing her brief under her Trust, so it
-    /// belongs on the ordinary context path: without this name there is no
-    /// kernel for surfaceVariant "bot" and every bot turn failed
-    /// `kernelUnavailable`, fell back to legacy, and recalled zero memories.
+    /// Standing bots use ordinary context under the agent's Trust.
     public static let bot = ContextSurface(rawValue: "bot")
 
     public static func < (lhs: Self, rhs: Self) -> Bool {
@@ -225,6 +214,20 @@ public struct ContextSourceRange: Codable, Equatable, Hashable, Sendable {
         let start = max(0, utf8Start)
         self.utf8Start = start
         self.utf8End = max(start, utf8End)
+    }
+
+    private enum CodingKeys: String, CodingKey { case utf8Start, utf8End }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let start = try values.decode(Int.self, forKey: .utf8Start)
+        let end = try values.decode(Int.self, forKey: .utf8End)
+        guard start >= 0, end >= start else {
+            throw DecodingError.dataCorruptedError(forKey: .utf8End, in: values,
+                debugDescription: "Invalid UTF-8 source range")
+        }
+        utf8Start = start
+        utf8End = end
     }
 }
 

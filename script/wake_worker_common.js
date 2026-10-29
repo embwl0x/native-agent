@@ -318,24 +318,26 @@ function postBridgeRequest(transport, requestOptions, token, body, onResponse, o
   });
 }
 
-// Codex keeps its explicit reply fields and existing failed/retry
-// classification. Calls backed by a completion lifecycle retain transport
-// uncertainty for same-ID reconciliation. Transport success alone is not delivery.
+// Turn execution, reply presence and onward delivery remain independent facts.
 function postWakeCompletion(transport, requestOptions, token, body, sessionId, completionLifecycle = false) {
   return postBridgeRequest(transport, requestOptions, token, body,
     ({ res, raw, parsed, httpOK, replyStatus }, resolve) => {
-      const ok = httpOK && (replyStatus === "ok" || (replyStatus === "completion_already_settled"
-        && parsed.completionDelivery && parsed.completionDelivery.status === "completed"));
-      const uncertain = completionLifecycle && ["outcome_unknown", "completion_in_progress", "delivery_in_progress", "in_progress"].includes(
-        parsed && parsed.completionDelivery ? parsed.completionDelivery.status : replyStatus
-      );
+      const onward = parsed && parsed.completionDelivery;
+      const hasReply = Boolean(parsed && ((typeof parsed.reply === "string" && parsed.reply.trim()) || parsed.attachments?.length));
+      const ok = httpOK && (replyStatus === "ok" || (replyStatus === "completion_already_settled" && onward?.status === "completed")
+        || (parsed?.execution_result_class === "succeeded" && hasReply)) && (!onward || onward.status === "completed");
+      const uncertain = completionLifecycle && ["outcome_unknown", "completion_in_progress", "in_progress", "owed", "sent_unconfirmed"].includes(onward ? onward.status : replyStatus);
+      const reason = parsed?.execution_result_class === "succeeded" && !hasReply ? "no_reply" : onward?.status || replyStatus;
       resolve({
         status: ok ? "delivered" : (uncertain ? "unknown" : "failed"),
-        reason: ok ? null : (httpOK ? `nativeagent_reply_${replyStatus || "missing_status"}` : `http_${res.statusCode}`),
+        reason: ok ? null : (httpOK ? `nativeagent_reply_${reason || "missing_status"}` : `http_${res.statusCode}`),
         delivery: "nativeagent_bridge_message",
         httpStatus: res.statusCode,
         sessionId: sessionId || null,
         replyStatus,
+        execution_result_class: parsed?.execution_result_class || null,
+        execution_terminal: parsed?.execution_terminal === true,
+        hasReply,
         replyPersisted: parsed && parsed.replyPersisted === true,
         nativeAgentSessionId: parsed && parsed.sessionId ? parsed.sessionId : null,
         nativeAgentRunId: parsed && parsed.runId ? parsed.runId : null,
@@ -345,8 +347,7 @@ function postWakeCompletion(transport, requestOptions, token, body, sessionId, c
       });
     }, (req, resolve) => {
       if (completionLifecycle) {
-        // Settle uncertainty before destroy can emit an error. Legacy Codex
-        // keeps its existing error-handler resolution after destruction.
+        // Settle uncertainty before destroy can emit an error.
         resolve({
           status: "unknown",
           reason: `bridge_reply_timeout_after_${requestOptions.timeout}ms`,

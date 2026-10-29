@@ -134,12 +134,11 @@ public enum REMGrowthEvictionHistory {
         let url = fileURL(dataRoot: dataRoot)
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(url) {
+        try await SwiftNativePersistenceCore.withFileLock(url) {
             if try existingKeys(url: url).contains(dedupeKey(record)) { return }
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
-            try await persistence.appendJSONL(JSONValue.parse(encoder.encode(record)), to: url)
+            try await SwiftNativePersistenceCore.appendJSONL(JSONValue.parse(encoder.encode(record)), to: url)
         }
     }
 

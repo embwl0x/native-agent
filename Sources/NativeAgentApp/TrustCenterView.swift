@@ -10,192 +10,6 @@ import PersistenceCore
 import TrustCenter
 // Blueprint: | `TrustCenterView.swift` | `TrustCenterView`; confirmation states a normal backup is kept before scope replacement, failure replaces nothing, and previous-life work stays stopped until fresh Resume |
 
-enum TrustFeaturePermissionCard: String, CaseIterable, Identifiable {
-    case multimodal
-    case chromeControl
-    case selfImprovement
-    case deskAutonomy
-    case livingMemory
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .multimodal: "Multimodal"
-        case .chromeControl: "Chrome Control"
-        case .selfImprovement: "Self-Improvement"
-        case .deskAutonomy: "Desk Autonomy"
-        case .livingMemory: "Living Memory"
-        }
-    }
-
-    @ViewBuilder
-    func content() -> some View {
-        switch self {
-        case .multimodal:
-            MultimodalPermissionsView()
-        case .chromeControl:
-            ChromeControlPermissionsView()
-        case .selfImprovement:
-            TrainingPermissionsView()
-        case .deskAutonomy:
-            WorkshopPermissionsView()
-        case .livingMemory:
-            LivingMemoryPermissionsView()
-        }
-    }
-}
-
-/// Visual severity for a boundary receipt. These values describe the loaded
-/// policy only; they do not authorize an action or replace effect-time gates.
-enum TrustSafetyBoundaryTone: Equatable {
-    case neutral
-    case caution
-    case danger
-    case unavailable
-}
-
-struct TrustSafetyBoundaryRow: Identifiable, Equatable {
-    let id: String
-    let title: String
-    let detail: String
-    let systemImage: String
-    let tone: TrustSafetyBoundaryTone
-}
-
-/// Derives the Safety Boundaries panel from the same loaded `TrustPolicy` used
-/// by the rest of Trust Center. Static reassurance is intentionally avoided:
-/// a missing policy produces an unavailable receipt, never default-safe prose.
-enum TrustSafetyBoundariesPresentation {
-    struct State: Equatable {
-        let rows: [TrustSafetyBoundaryRow]
-        let unavailableMessage: String?
-    }
-
-    static func state(policy: TrustPolicy?, accessMode: String) -> State {
-        guard let policy else {
-            return State(
-                rows: [],
-                unavailableMessage: "Safety boundaries are not confirmed until the current Trust policy loads."
-            )
-        }
-        return State(
-            rows: [
-                fileAccessRow(accessMode: accessMode),
-                // No "Runnable tools" row: `toolPolicy` (auto-run, promote,
-                // risky-tool approval) is read by no gate. Execution follows
-                // toolAutonomy, autonomyDefault and Full Mac, which the
-                // guardrail summary already says; a line here could claim a
-                // boundary the gate does not hold.
-                externalSendRow(TrustAccessModeCapabilityCatalog.posture(policy)),
-                macControlRow(TrustAccessModeCapabilityCatalog.effectiveMacControlPolicy(policy)),
-                receiptsRow(policy.workshopPolicy),
-            ],
-            unavailableMessage: nil
-        )
-    }
-
-    private static func fileAccessRow(accessMode: String) -> TrustSafetyBoundaryRow {
-        switch TrustAccessModeCapabilityCatalog.normalizedMode(accessMode) {
-        case "read_only":
-            TrustSafetyBoundaryRow(
-                id: "files", title: "File changes", detail: "Read-only access is active; the agent cannot change or delete files.",
-                systemImage: "folder.badge.minus", tone: .neutral
-            )
-        case "workspace":
-            TrustSafetyBoundaryRow(
-                id: "files", title: "File changes", detail: "Changes are limited to the workspaces you added; access outside them stays gated.",
-                systemImage: "folder.badge.gearshape", tone: .caution
-            )
-        case "full":
-            TrustSafetyBoundaryRow(
-                id: "files", title: "File changes", detail: "Full Mac access is active. Files outside configured workspaces can be reached, subject to macOS permission prompts.",
-                systemImage: "exclamationmark.triangle.fill", tone: .danger
-            )
-        default:
-            TrustSafetyBoundaryRow(
-                id: "files", title: "File changes", detail: "Automatic access is active: changes step up through the current Trust policy when needed.",
-                systemImage: "folder", tone: .neutral
-            )
-        }
-    }
-
-    /// A send is a write on the person's side: the posture alone decides it.
-    private static func externalSendRow(_ posture: PermissionPosture) -> TrustSafetyBoundaryRow {
-        switch posture {
-        case .fullMac:
-            TrustSafetyBoundaryRow(
-                id: "external_send", title: "External messages",
-                detail: "Under Full Mac I can send messages without asking you first. Your connected accounts' own limits still apply. Agents you enabled in Trust inherit your authority. Other agents do not, and their requests can require approval.",
-                systemImage: "paperplane.fill", tone: .caution
-            )
-        case .work:
-            TrustSafetyBoundaryRow(
-                id: "external_send", title: "External messages",
-                detail: "Messages to other people wait for your approval before they are sent.",
-                systemImage: "paperplane", tone: .neutral
-            )
-        case .readOnly:
-            TrustSafetyBoundaryRow(
-                id: "external_send", title: "External messages",
-                detail: "Safe sends nothing to other people.",
-                systemImage: "paperplane", tone: .neutral
-            )
-        }
-    }
-
-    private static func macControlRow(_ mac: TrustMacControlPolicy?) -> TrustSafetyBoundaryRow {
-        guard let mac else {
-            return TrustSafetyBoundaryRow(
-                id: "mac_control", title: "Mac control", detail: "Mac-control policy is unavailable, so its action boundary is not confirmed.",
-                systemImage: "macbook", tone: .unavailable
-            )
-        }
-        guard mac.enabled else {
-            return TrustSafetyBoundaryRow(
-                id: "mac_control", title: "Mac control", detail: "Mac control is off.",
-                systemImage: "macbook", tone: .neutral
-            )
-        }
-
-        let granted = TrustAccessModeCapabilityCatalog.grantedMacCategories(mac)
-        guard !granted.isEmpty else {
-            return TrustSafetyBoundaryRow(
-                id: "mac_control", title: "Mac control", detail: "Mac control is on, but no action category is granted.",
-                systemImage: "macbook", tone: .neutral
-            )
-        }
-
-        let (free, asks, hasUnguardedRisk) = TrustAccessModeCapabilityCatalog.macControlRiskGroups(mac)
-        let detail = [free.isEmpty ? nil : "Runs without asking: \(TrustGuardrailSummary.sentenceList(free)).",
-                      asks.isEmpty ? nil : "Asks you first: \(TrustGuardrailSummary.sentenceList(asks))."]
-            .compactMap { $0 }.joined(separator: " ")
-        return TrustSafetyBoundaryRow(
-            id: "mac_control", title: "Mac control", detail: detail,
-            systemImage: hasUnguardedRisk ? "macbook.badge.exclamationmark" : "macbook",
-            tone: hasUnguardedRisk ? .danger : .caution
-        )
-    }
-
-    private static func receiptsRow(_ workshop: TrustWorkshopPolicy?) -> TrustSafetyBoundaryRow {
-        guard let required = workshop?.requireReceipts else {
-            return TrustSafetyBoundaryRow(
-                id: "receipts", title: "Workflow records", detail: "The workflow record setting is unavailable.",
-                systemImage: "doc.text.magnifyingglass", tone: .unavailable
-            )
-        }
-        return TrustSafetyBoundaryRow(
-            id: "receipts",
-            title: "Workflow records",
-            detail: required
-                ? "Every workflow run leaves a record you can check later."
-                : "Workflow runs do not have to leave a record.",
-            systemImage: "doc.text.magnifyingglass",
-            tone: required ? .neutral : .danger
-        )
-    }
-}
-
 /// The Advanced tab's backup read. Keep unavailable/stale data
 /// distinguishable from a legitimately empty backup history.
 enum TrustCenterAdvancedDisclosurePresentation {
@@ -251,8 +65,7 @@ enum TrustCenterActionPresentation {
         let label: String
         let text: String
         let badgeText: String
-        let badgeStatus: String
-        let systemImage: String
+        let tone: TrustTone
     }
 
     static func state(for outcome: TrustCenterActionOutcome) -> State {
@@ -262,16 +75,14 @@ enum TrustCenterActionPresentation {
                 label: "Latest Trust action",
                 text: bounded(text),
                 badgeText: "Saved",
-                badgeStatus: "ok",
-                systemImage: "checkmark.circle.fill"
+                tone: .calm
             )
         case .failed(let text):
             State(
                 label: "Latest Trust action",
                 text: bounded(text),
                 badgeText: "Failed",
-                badgeStatus: "warn",
-                systemImage: "exclamationmark.triangle.fill"
+                tone: .trouble
             )
         }
     }
@@ -287,14 +98,12 @@ enum TrustCenterActionPresentation {
 enum TrustCenterPolicyStatusPresentation {
     static func line(
         policy: TrustPolicy?, accessMode: String?,
-        permissionLevel: String, autonomyDefault: String,
-        requireBackups: Bool, outsideDefault: String,
         isApplying: Bool = false, needsConfirmation: Bool = false,
         policyReadFailed: Bool = false
     ) -> String {
         guard !policyReadFailed, let policy else { return "Effective access unavailable · Reload Trust to check saved policy" }
         let access: String
-        let matched = TrustPolicyPreset.matching(policy: policy, accessMode: accessMode)
+        let matched = MobileTrustAction.Preset.matching(policy: policy, accessMode: accessMode)
         if let preset = matched {
             access = preset.title
         } else {
@@ -310,9 +119,7 @@ enum TrustCenterPolicyStatusPresentation {
         let state = needsConfirmation ? "Confirmation required"
             : isApplying ? "Applying changes…"
             : "Saved"
-        // 2026-09-10: Full Mac has no timer any more, and nothing on the page
-        // said so. The saved line is the only place a person looks after
-        // picking the card, so it carries the persistence — and only there.
+        // Full Mac remains active until the person changes it.
         if matched == .fullMac, state == "Saved" {
             return "\(access) · \(state) · stays on until you change it"
         }
@@ -320,9 +127,7 @@ enum TrustCenterPolicyStatusPresentation {
     }
 }
 
-/// The Trust page's tabs (Fluid Glass plan, 2026-10-04: one page of about
-/// thirteen sections became tabs). Each raw value is the key `TrustRailPage`
-/// stores; the first keeps "trust" so a remembered tab still lands.
+/// Raw values are persisted TrustRailPage keys; the first remains "trust" for saved selections.
 enum TrustTab: String, CaseIterable {
     case access = "trust"
     case features
@@ -335,15 +140,7 @@ struct TrustCenterView: View {
     /// with no tab row (Simple view's Trust card, Settings).
     private let tab: TrustTab?
     @Environment(AppModel.self) private var appModel
-    @State private var agentAccessMode = "auto"
-    @State private var permissionLevel = "balanced"
-    @State private var autonomyDefault = "supervised"
-    @State private var requireBackups = true
-    @State private var outsideDefault = "deny"
-    // PATCH-2026-05-06: bug-2 full-mac friction alert state
     @State private var showFullMacAlert = false
-    // PATCH-2026-05-06: dev-mode local binding mirrors trustPolicy.developerMode
-    @State private var developerMode = false
     @State private var isApplyingPolicy = false
     @State private var pendingRestore: BackupRecord?
     @State private var restoringBackupID: String?
@@ -362,10 +159,7 @@ struct TrustCenterView: View {
             // laying out the entire long page on every scroll update.
             LazyVStack(alignment: .leading, spacing: 24) {
                 if shows(.access) {
-                    // Sweep R4 C10 (2026-08-06): the summary is derived — a
-                    // pure function of `appModel.engine.trust.policy` plus the
-                    // access mode this page resolved, so it cannot drift from
-                    // the switches. Read-only: it renders no controls.
+                    // The read-only summary derives from the loaded Trust policy.
                     accessAndPolicyPanel
                     TrustGuardrailSummaryPanel(accessMode: appModel.engine.trust.policy.map { accessMode(from: $0) } ?? "auto")
                     NativeSecurityCenterPanel(modeTitle: activePreset?.title)
@@ -380,9 +174,18 @@ struct TrustCenterView: View {
                     // unattended gate is read fresh on every tick
                     // (WorkshopBackgroundWork.unattendedWorkAllowed), so
                     // nothing here waits for a restart.
-                    ForEach(TrustFeaturePermissionCard.allCases.filter { $0 != .chromeControl }) { card in
-                        AdvancedSection(title: card.title, card: .bare) {
-                            card.content()
+                    AdvancedSection(title: "Multimodal", card: .bare) {
+                        MultimodalPermissionsView()
+                    }
+                    AdvancedSection(title: "Self-Improvement", card: .bare) {
+                        TrainingPermissionsView()
+                    }
+                    AdvancedSection(title: "Desk Autonomy", card: .bare) {
+                        WorkshopPermissionsView()
+                    }
+                    AdvancedSection(title: "Living Memory", card: .bare) {
+                        AliveGroupCard(waiting: appModel.engine.memory.proposals.contains { $0.status == "pending" }) {
+                            LivingMemoryPermissionsView()
                         }
                     }
                     Text("Background work picks up a change the next time it runs. Everything else applies right away, with no restart.")
@@ -390,9 +193,7 @@ struct TrustCenterView: View {
                         .foregroundStyle(NativeAgentShell.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    // W8 (2026-08-14): the only feature that records what the
-                    // person does when they are not talking to me, with its
-                    // honest limits on title redaction, so its own panel.
+                    // Activity recording has its own panel to state title-redaction limits.
                     ActivityCapturePermissionsView()
                 }
 
@@ -407,7 +208,6 @@ struct TrustCenterView: View {
                 }
 
                 if shows(.advanced) {
-                    safetyBoundariesPanel
                     privacyMapPanel
                     backupsPanel
                 }
@@ -415,7 +215,7 @@ struct TrustCenterView: View {
                 if let outcome = appModel.trustCenterActionOutcome {
                     let status = TrustCenterActionPresentation.state(for: outcome)
                     HStack(alignment: .top, spacing: 8) {
-                        TrustStatusChip(text: status.badgeText, tone: TrustTone.named(status.badgeStatus))
+                        TrustStatusChip(text: status.badgeText, tone: status.tone)
                         VStack(alignment: .leading, spacing: 2) {
                             Text(status.label)
                                 .font(ShellType.captionSemibold)
@@ -429,10 +229,6 @@ struct TrustCenterView: View {
                     .accessibilityLabel("\(status.label): \(status.text)")
                 }
             }
-            // Taste pass 2026-08-11 (User: "spread out... not centered with
-            // eachother... sloppy"): the page frame pins one readable column,
-            // so every section shares the same left edge instead of
-            // stretching controls across the full window width.
             .padding(.bottom, 32)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -461,21 +257,19 @@ struct TrustCenterView: View {
         }
     }
 
-    // MARK: - Access & Policy (2026-07-22 trust-tighten: Presets + Agent
-    // Access + Policy merged into one panel; Policy Map lives here as a
-    // disclosure — it documents the modes rather than controlling anything).
+    // MARK: - Access & Policy
 
     private var accessAndPolicyPanel: some View {
         // The radios and their status line sit in one card, like every
         // other control on Trust; loose above the next card they floated.
         AdvancedSection(title: "Access and policy", card: .single) {
             VStack(alignment: .leading, spacing: 12) {
-                // The Mac's own radio group (User 09-27: all controls native).
-                Picker("Access", selection: Binding<TrustPolicyPreset?>(
+                // Trust postures use the Mac's native radio group.
+                Picker("Access", selection: Binding<MobileTrustAction.Preset?>(
                     get: { activePreset },
                     set: { if let preset = $0 { applyTrustPreset(preset) } }
                 )) {
-                    ForEach(TrustPolicyPreset.allCases, id: \.quietID) { preset in
+                    ForEach(MobileTrustAction.Preset.allCases, id: \.rawValue) { preset in
                         VStack(alignment: .leading, spacing: 2) {
                             Text(preset.title)
                             Text(preset.summary)
@@ -496,7 +290,7 @@ struct TrustCenterView: View {
                         Task { @MainActor in
                             defer { isApplyingPolicy = false }
                             do {
-                                let policy = try await SwiftNativeTrustCenter().reauthorizeSafePolicy()
+                                let policy = try await SwiftNativeTrustCenter(dataRoot: appModel.engine.dataRoot).reauthorizeSafePolicy()
                                 appModel.engine.trust.publishPolicy(policy)
                                 applyPolicy(policy)
                                 appModel.statusText = "The damaged policy was preserved beside trust/policy.json. Safe is now authorized; choose any further access here."
@@ -540,10 +334,6 @@ struct TrustCenterView: View {
         TrustCenterPolicyStatusPresentation.line(
             policy: appModel.engine.trust.policy,
             accessMode: appModel.engine.trust.policy.map { accessMode(from: $0) },
-            permissionLevel: permissionLevel,
-            autonomyDefault: autonomyDefault,
-            requireBackups: requireBackups,
-            outsideDefault: outsideDefault,
             isApplying: isApplyingPolicy,
             needsConfirmation: showFullMacAlert,
             policyReadFailed: appModel.panelRefreshStatus[.trust]?.failedEndpoints.contains {
@@ -552,13 +342,11 @@ struct TrustCenterView: View {
         )
     }
 
-    private var activePreset: TrustPolicyPreset? {
+    private var activePreset: MobileTrustAction.Preset? {
         guard let policy = appModel.engine.trust.policy,
               appModel.panelRefreshStatus[.trust]?.failedEndpoints.contains("trust policy") != true else { return nil }
-        return TrustPolicyPreset.matching(policy: policy, accessMode: accessMode(from: policy))
+        return MobileTrustAction.Preset.matching(policy: policy, accessMode: accessMode(from: policy))
     }
-
-    // MARK: - Feature permission grouping (2026-07-22 trust-tighten)
 
     // MARK: - Advanced tab: safety boundaries, privacy map and backups.
 
@@ -569,30 +357,6 @@ struct TrustCenterView: View {
             hasRefreshAttempt: refresh != nil,
             failedEndpoints: refresh?.failedEndpoints ?? []
         )
-    }
-
-    private var safetyBoundariesPanel: some View {
-        AdvancedSection(title: "Safety boundaries", card: .single) {
-            let state = TrustSafetyBoundariesPresentation.state(
-                policy: appModel.engine.trust.policy,
-                accessMode: agentAccessMode
-            )
-            if let unavailable = state.unavailableMessage {
-                Text(unavailable)
-                    .font(ShellType.label)
-                    .foregroundStyle(NativeAgentShell.trouble)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else {
-                ForEach(state.rows) { boundary in
-                    TrustBoundaryRow(
-                        title: boundary.title,
-                        detail: boundary.detail,
-                        systemImage: boundary.systemImage,
-                        tone: boundary.tone
-                    )
-                }
-            }
-        }
     }
 
     private var privacyMapPanel: some View {
@@ -664,12 +428,7 @@ struct TrustCenterView: View {
     }
 
     private func applyPolicy(_ policy: TrustPolicy) {
-        permissionLevel = policy.permissionLevel
-        autonomyDefault = policy.autonomyDefault ?? "supervised"
-        requireBackups = policy.filePolicy?.requireBackupBeforeWrite ?? true
-        outsideDefault = policy.filePolicy?.outsideWorkspaceDefault ?? "deny"
-        developerMode = policy.developerMode
-        agentAccessMode = accessMode(from: policy)
+        let agentAccessMode = accessMode(from: policy)
         if appModel.chatFileAccess != agentAccessMode {
             appModel.chatFileAccess = agentAccessMode
         }
@@ -692,7 +451,7 @@ struct TrustCenterView: View {
         showFullMacAlert = false
     }
 
-    private func applyTrustPreset(_ preset: TrustPolicyPreset) {
+    private func applyTrustPreset(_ preset: MobileTrustAction.Preset) {
         guard !isApplyingPolicy else { return }
         if preset == .fullMac {
             showFullMacAlert = true
@@ -710,8 +469,6 @@ struct TrustCenterView: View {
         appModel.statusText = TrustPolicyPresetActionPresentation.statusText(for: outcome)
         switch outcome {
         case .confirmationRequired:
-            agentAccessMode = appModel.engine.trust.policy.map { accessMode(from: $0) }
-                ?? TrustAccessModeCapabilityCatalog.normalizedMode(appModel.chatFileAccess)
             showFullMacAlert = true
         case .applied(let policy):
             applyPolicy(policy)
@@ -760,7 +517,7 @@ enum PrivacyMapPanelPresentation {
         var roots = [map.dataRoot]
         for category in map.categories {
             let path = (category.path as NSString).standardizingPath
-            guard path != data, !path.hasPrefix(data + "/"), !roots.contains(category.path) else { continue }
+            guard NativeAgentWorkspaceRoot.relativePath(path, under: data) == nil, !roots.contains(category.path) else { continue }
             roots.append(category.path)
         }
         return roots
@@ -842,10 +599,10 @@ private struct PrivacyMapPanelCategoryRow: View {
 /// underneath it refuses instead of applying.
 @MainActor
 enum TrustPolicyPresetAction {
-    typealias Outcome = TrustPolicyPreset.Outcome
+    typealias Outcome = MobileTrustAction.Preset.Outcome
 
     static func apply(
-        _ preset: TrustPolicyPreset,
+        _ preset: MobileTrustAction.Preset,
         appModel: AppModel,
         fullMacConfirmed: Bool = false,
         guardedByLockedPolicy: (@Sendable ([String: JSONValue]) throws -> Void)? = nil
@@ -893,43 +650,22 @@ enum TrustPolicyPresetActionPresentation {
 }
 
 
-// MARK: - Page kit (2026-09-03 Advanced refinement)
-//
-// Trust used to be a stack of `NativePanel`s: a thin-material slab each, an
-// icon and a tint per title, and rules drawn between the controls inside. On
-// the shell's one sheet that read as a dozen plates dropped on the glass. A
-// section is now the Advanced list's own shape — an eyebrow, then one card —
-// and the only colours left are the room's four roles.
+// MARK: - Page kit
 
-/// The tone a status word carries. Three states and a quiet default, no raw
-/// colours.
-private enum TrustTone {
+/// The room tone carried by a Trust status.
+enum TrustTone: Equatable {
     case calm
     case trouble
-    case needsYou
     case quiet
 
     var color: Color {
         switch self {
         case .calm: NativeAgentShell.calm
         case .trouble: NativeAgentShell.trouble
-        case .needsYou: NativeAgentShell.needsYou
         case .quiet: NativeAgentShell.secondary
         }
     }
 
-    /// The tone behind one of the status words the Trust presentations return.
-    static func named(_ status: String?) -> TrustTone {
-        switch status?.lowercased() {
-        case "ok", "done", "passed", "active", "valid", "ready", "low", "saved":
-            return .calm
-        case "warn", "warning", "blocked", "needs_setup", "medium", "high",
-             "fail", "failed", "error", "critical", "timeout":
-            return .trouble
-        default:
-            return .quiet
-        }
-    }
 }
 
 /// A short status word beside the thing it describes.
@@ -956,7 +692,7 @@ struct TrustFold<Label: View, Trailing: View, Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
-        // The Mac's own disclosure (User 09-27: all controls native).
+        // The Mac's native disclosure.
         DisclosureGroup(isExpanded: $isExpanded) {
             content
                 .padding(.top, 12)
@@ -967,16 +703,6 @@ struct TrustFold<Label: View, Trailing: View, Content: View>: View {
                 trailing
             }
         }
-    }
-}
-
-extension TrustFold where Trailing == EmptyView {
-    init(
-        isExpanded: Binding<Bool>,
-        @ViewBuilder label: () -> Label,
-        @ViewBuilder content: () -> Content
-    ) {
-        self.init(isExpanded: isExpanded, label: label, trailing: { EmptyView() }, content: content)
     }
 }
 

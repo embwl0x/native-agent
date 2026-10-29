@@ -11,8 +11,6 @@ import PersistenceCore
 typealias AgentContactRow = EngineRuntime.AgentContactRow
 
 struct AgentContactsSection: View {
-    var refresh = 0
-    var fixtureRows: [AgentContactRow]? = nil
     @Environment(AppModel.self) private var appModel
     private var contacts: ContactListFacade { appModel.engine.contacts }
     private var rows: [AgentContactRow] { contacts.rows }
@@ -28,14 +26,14 @@ struct AgentContactsSection: View {
             if let loadError {
                 AgentContactReadFailure(message: loadError, dataRoot: root) { Task { _ = try? await contacts.refresh() } }
             }
-            if loading && fixtureRows == nil { ProgressView("Looking for agents…") }
-            if !loading && (fixtureRows ?? rows).isEmpty && loadError == nil {
-                ConnectorsCard { ConnectorsNote(text: "No agent contacts or supported apps found on this Mac.") }
+            if loading { ProgressView("Looking for agents…") }
+            if !loading && rows.isEmpty && loadError == nil {
+                ConnectorsNote(text: "No agent contacts or supported apps found on this Mac.")
+                    .padding(16).settingsCardSurface()
             }
-            // Alive glass (2026-09-23): one group card, a row per agent.
-            if !(fixtureRows ?? rows).isEmpty {
+            if !rows.isEmpty {
             AliveGroupCard {
-            ForEach(fixtureRows ?? rows) { row in
+            ForEach(rows) { row in
                     VStack(alignment: .leading, spacing: 8) {
                         HStack(alignment: .center, spacing: 8) {
                             Text(row.displayName)
@@ -65,7 +63,7 @@ struct AgentContactsSection: View {
                             ConnectorsNote(text: "Sent a message · \(at)")
                         }
                         HStack {
-                            if row.contact == nil && !row.builtIn {
+                            if row.contact == nil {
                                 Button("Connect") { perform(row, .connect) }
                                     .buttonStyle(.bordered)
                                     .controlSize(.small)
@@ -77,13 +75,11 @@ struct AgentContactsSection: View {
                                     .controlSize(.small)
                                     .accessibilityLabel("Send a test message to \(row.displayName)")
                                 }
-                                if !row.builtIn {
                                 Button("Disconnect agent") { perform(row, .disconnect) }
                                     .buttonStyle(.bordered)
                                     .controlSize(.small)
                                     .accessibilityLabel("Disconnect \(row.displayName) agent contact")
                                     .help("Remove this agent connection. Your model provider sign-in stays connected.")
-                                }
                             }
                         }
                         .font(ShellType.caption)
@@ -102,13 +98,11 @@ struct AgentContactsSection: View {
         // A screenshot's offscreen copy reads the contacts once, from the
         // last discovery, and is counted so the capture waits for it.
         .quietReadTask(live: false) {
-            guard fixtureRows == nil else { return }
             _ = try? await contacts.refresh()
         }
         // A refresh offers what it finds (discovery.json, her wake), so the
         // offscreen copy never runs it.
-        .liveTask(id: refresh + refreshGeneration) {
-            guard fixtureRows == nil else { return }
+        .liveTask(id: refreshGeneration) {
             _ = await AgentDiscoverySession.shared.candidates(refresh: true, dataRoot: root)
             contacts.watch()
             _ = try? await contacts.refresh()
@@ -118,7 +112,7 @@ struct AgentContactsSection: View {
     private func perform(_ row: AgentContactRow, _ action: AgentContactRow.Action) {
         guard !busy else { return }
         busy = true
-        NativeAgentAppCoordinator.shared.request(.sidebar(.chat))
+        ApplicationLifetime.shared.request(.sidebar(.chat))
         Task { @MainActor in
             defer { busy = false }
             let previousSessionID = appModel.activeChatSessionId

@@ -16,7 +16,7 @@ extension SwiftNativeChatOrchestrationClient {
                      tokenLimit: Int, surface: String,
                      fileAccess: String = "auto", suppressUserAppend: Bool = false,
                      mechanicalRow: CognitiveMechanicalRowKind? = nil,
-                     progress: ChatOrchestrationProgressHandler? = nil) async throws -> ChatResponse {
+                     progress: TurnEventSink? = nil) async throws -> ChatResponse {
         guard tokenLimit > 0 else { throw ChatOrchestrationError.underlying("The turn token limit must be positive.") }
         let budget = TurnTokenBudget(tokens: tokenLimit)
         let execution = ChatTurnExecution(mechanicalRow: mechanicalRow)

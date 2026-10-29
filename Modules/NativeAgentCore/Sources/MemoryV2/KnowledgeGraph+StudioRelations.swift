@@ -1,12 +1,8 @@
 // The studio journal's relations, become KNOWLEDGE-GRAPH EDGES.
 //
-// Desk 903 phase 3, in the agent's own words: "Relations become KG edges; kill
-// the mini-graph outright. Works and creators become entities once; edges carry
-// the journal entry id as provenance; same selection rule as the other 94."
-//
 // ── WHAT THIS WRITES ─────────────────────────────────────────────────────────
 // From the append-only journal:
-//   • one entity per WORK      (type `work`)    — deduped by name, written once
+//   • one entity per WORK      (type `work`)    — keyed by title + creator
 //   • one entity per CREATOR   (type `creator`) — deduped by name, written once
 //   • work —created_by→ creator
 //   • work —deepens|contradicts|revises|echoes→ work, from an entry's typed link
@@ -64,13 +60,6 @@ public struct StudioGraphIndexReport: Sendable, Equatable {
     )
 }
 
-/// One typed studio edge, derived in Swift before any SQL runs.
-struct StudioDerivedEdge: Hashable {
-    let fromKey: String
-    let toKey: String
-    let type: String
-}
-
 extension SwiftNativeKnowledgeGraphIndexer {
 
     /// Stamp on every studio-written row. Deliberately NOT a `swift-memory-kg-*`
@@ -112,14 +101,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         let edges = derived.edges
         let unresolved = derived.unresolvedRelations
 
-        // User, 2026-09-06: every id this pass could mint deterministically. The
-        // name+type fallback must never hand one key the row that IS another
-        // key's derived id — after a migration off the title-only key, the
-        // first creator can be sitting on the legacy row while the second holds
-        // its derived one, and the fallback (ORDER BY mention_count) would then
-        // pick that derived row for the wrong key on a later pass. Both keys
-        // would resolve to one id and the edge between them would die at the
-        // `fromID != toID` guard below.
+        // Reserve every derived id so name/type matching cannot assign another key's node.
         let reservedDerivedIDs = Set(
             (Array(works.keys) + Array(creators.keys)).map(Self.studioEntityID(forKey:))
         )
@@ -165,14 +147,14 @@ extension SwiftNativeKnowledgeGraphIndexer {
             // creator, so the cleanup below leaves them alone.
             var incompleteCreatorWorkKeys = Set<String>()
             for edge in edges.keys.sorted(by: {
-                ($0.fromKey, $0.toKey, $0.type) < ($1.fromKey, $1.toKey, $1.type)
+                ($0.from, $0.to, $0.type) < ($1.from, $1.to, $1.type)
             }) {
-                guard let fromID = idByKey[edge.fromKey],
-                      let toID = idByKey[edge.toKey],
+                guard let fromID = idByKey[edge.from],
+                      let toID = idByKey[edge.to],
                       fromID != toID,
                       let entryIDs = edges[edge] else {
                     if edge.type == Self.studioCreatedByRelationType {
-                        incompleteCreatorWorkKeys.insert(edge.fromKey)
+                        incompleteCreatorWorkKeys.insert(edge.from)
                     }
                     continue
                 }
@@ -189,15 +171,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 }
                 edgesWritten += 1
             }
-            // User, 2026-09-06: a work re-keyed off the title-only identity gets
-            // its former node back through the name/type fallback — and that
-            // node still carries the `created_by` edges the old identity minted.
-            // This pass re-derives the WHOLE journal, so the creators it just
-            // linked are the work's creators; any other studio-written
-            // `created_by` edge out of that node names a creator the current
-            // identity does not have. Studio-written only, by the indexer stamp:
-            // a creator edge another writer put there is not this pass's to
-            // retire.
+            // Retire only studio-owned created_by edges absent from this work's current creators.
             for key in works.keys.sorted() {
                 guard let workID = idByKey[key],
                       !incompleteCreatorWorkKeys.contains(key) else { continue }
@@ -226,7 +200,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         }
     }
 
-    // MARK: - Encounter intake (desk 903 phase 1)
+    // MARK: - Encounter intake
 
     /// Works the graph holds that the journal has never answered.
     ///
@@ -271,9 +245,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 let name = Self.studioClean(row["name"] ?? "")
                 guard !name.isEmpty else { continue }
                 let creator = (row["creator"] as String?).map(Self.studioClean)
-                // User, 2026-09-06: title BY SOMEONE. Suppressing on the folded title
-                // alone hid a work she has never answered because a different work
-                // by a different creator shares its title.
+                // Suppress by title + creator so same-title works remain distinct.
                 guard !journaledWorks.contains(SwiftNativeStudioStore.journaledWorkIdentity(
                     title: name, creator: creator)) else { continue }
                 candidates.append(StudioEncounterCandidate(
@@ -301,7 +273,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
     struct StudioDerivedGraph {
         var works: [String: StudioNode] = [:]
         var creators: [String: StudioNode] = [:]
-        var edges: [StudioDerivedEdge: [String]] = [:]
+        var edges: [StudioEdgeKey: [String]] = [:]
         var unresolvedRelations = 0
     }
 
@@ -348,8 +320,8 @@ extension SwiftNativeKnowledgeGraphIndexer {
             creator.lastSeen = max(creator.lastSeen, entry.recordedAt)
             graph.creators[creatorKey] = creator
             graph.edges[
-                StudioDerivedEdge(
-                    fromKey: workKey, toKey: creatorKey, type: studioCreatedByRelationType
+                StudioEdgeKey(
+                    from: workKey, to: creatorKey, type: studioCreatedByRelationType
                 ),
                 default: []
             ].append(entry.id)
@@ -368,27 +340,19 @@ extension SwiftNativeKnowledgeGraphIndexer {
                 // edge would say nothing the entity does not already say.
                 guard fromKey != toKey else { continue }
                 graph.edges[
-                    StudioDerivedEdge(fromKey: fromKey, toKey: toKey, type: relation.kind.rawValue),
+                    StudioEdgeKey(from: fromKey, to: toKey, type: relation.kind.rawValue),
                     default: []
                 ].append(entry.id)
             }
         }
 
-        for key in graph.edges.keys {
+        for key in Array(graph.edges.keys) {
             graph.edges[key] = studioUnique(graph.edges[key] ?? [])
         }
         return graph
     }
 
-    /// User, 2026-09-06: a WORK is a title BY SOMEONE, not a title. Keying works
-    /// on the title alone merged two unrelated works that happen to share one
-    /// ("Untitled", "Study", a remake and its original) into a single node —
-    /// and a relation drawn between them came out as `fromKey == toKey` and was
-    /// silently dropped by the self-loop guard, so the one edge that recorded
-    /// the connection disappeared. Creator is the discriminator; medium/date
-    /// stay OUT of the key because they are optional per entry, and a work
-    /// journaled once with a medium and once without would split into two nodes
-    /// — the same wrong-identity failure in the other direction.
+    /// A work's key is title + creator; optional medium and date never split its identity.
     static func studioWorkNodeKey(title: String, creator: String) -> String {
         studioNodeKey(type: studioWorkEntityType, name: title)
             + "|" + studioFold(creator)
@@ -447,9 +411,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         let derivedRowExists = try Row.fetchOne(
             db, sql: "SELECT id FROM kg_entities WHERE id = ?", arguments: [derivedID]
         ) != nil
-        // User, 2026-09-06: claiming applies to EVERY branch, not just the
-        // fallback. Two keys resolving to one id re-collapses the nodes and the
-        // edge between them dies at the `fromID != toID` guard.
+        // Every resolution branch rejects ids already claimed by another key.
         if derivedRowExists, claimedIDs.contains(derivedID) { return nil }
         let existingID: String? = try {
             if derivedRowExists { return derivedID }

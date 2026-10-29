@@ -27,24 +27,14 @@ public enum MacScreenPageCompiler {
         public let blocks: JSONValue
     }
 
-    public static func compile(snapshot: MacAXTreeSnapshot, percept: MacLookPercept,
-                               frameID: String, isFront: Bool,
+    public static func compile(snapshot: MacAXTreeSnapshot, redactedNodes: [JSONValue], percept: MacLookPercept,
+                               frameID: String, isFront: Bool, menuTitles: [String] = [],
                                settableAttributes: (MacAXNode) -> [String]) throws -> Compilation {
         let bundle = percept.app?.bundleIdentifier ?? "*"
         let corner = SenseCorner.app(bundleID: bundle)
         let ordered = snapshot.nodes.sorted { MacPerceptionCompiler.pathIsBefore($0.path, $1.path) }
-        let fullValueChars = max(1, ordered.reduce(0) {
-            max($0, max($1.attributes.title?.count ?? 0,
-                max($1.attributes.displayTitle?.count ?? 0, $1.attributes.value?.count ?? 0)))
-        })
-        // Use the existing full-context redactor, before comparing or printing
-        // any text. A long paragraph is not a forty-character control hint.
-        let secretContext = MacScreenViewTextRedaction.nodeSecretContext(ordered)
-        let redacted = ordered.map {
-            MacScreenViewTextRedaction.redactedNodeJSON($0, valueChars: fullValueChars, context: secretContext)
-        }
         var words: [[Int]: (title: String?, value: String?)] = [:]
-        for (node, json) in zip(ordered, redacted) {
+        for (node, json) in zip(snapshot.nodes, redactedNodes) {
             guard case .object(let fields) = json else { continue }
             // Words are never dropped on a guess about what they are.
             words[node.path] = (display(fields["title"]), display(fields["value"]))
@@ -84,6 +74,10 @@ public enum MacScreenPageCompiler {
         let appName = percept.app?.name ?? "App"
         let windowTitle = percept.windowTitleJSON.flatMap { display($0) }
         append(appName + (windowTitle.map { " · " + $0 } ?? "") + (isFront ? " · FRONT" : " · not front"), at: [])
+        // Menu titles make a menu path known without another read.
+        if !menuTitles.isEmpty {
+            append("Menus: " + menuTitles.joined(separator: " · ") + " — act target \"File > Save\" presses an item; mac.menu lists them whole.", at: [])
+        }
         append(SenseScreenThings.accessibilityReadLine, at: [])
         var shellStarted = false
         var pageNumber = 0
@@ -127,13 +121,27 @@ public enum MacScreenPageCompiler {
             Self.ownName(node.attributes, text: words[node.path]?.title ?? words[node.path]?.value)
         }
         func staticRuns(_ node: MacAXNode) -> [MacAXNode] {
-            descendants(node).filter { child in
+            let leaves = descendants(node).filter { child in
                 child.attributes.role == "AXStaticText"
                     && !descendants(child).contains { $0.attributes.role == "AXStaticText" }
                     && !ancestors(child.path).prefix(while: { $0.path != node.path }).contains {
                         $0.attributes.role == "AXWebArea" || $0.attributes.role == "AXImage"
                             || (controls[$0.path] != nil && !["AXGroup", "AXStaticText"].contains($0.attributes.role))
                     }
+            }
+            return distinctTextNodes(leaves)
+        }
+        func distinctTextNodes(_ nodes: [MacAXNode]) -> [MacAXNode] {
+            // Equal words at different source positions remain separate runs.
+            // Fold only duplicate nodes or coincident representations.
+            var paths = Set<[Int]>()
+            var names: [MacAXFrame: Set<String?>] = [:]
+            return nodes.filter { leaf in
+                guard !paths.contains(leaf.path) else { return false }
+                if let frame = leaf.attributes.frame, frame.w > 0, frame.h > 0,
+                   !names[frame, default: []].insert(ownName(leaf)).inserted { return false }
+                paths.insert(leaf.path)
+                return true
             }
         }
         func runText(_ nodes: [MacAXNode]) -> String? {
@@ -224,13 +232,12 @@ public enum MacScreenPageCompiler {
                 // Compare already-redacted content, not AX level/state values.
                 // Whitespace can separate runs; literal punctuation is content.
                 // Partial children must not erase the complete editor value.
-                var parts: [String] = []
-                for child in children where ["AXStaticText", "AXHeading", "AXLink", "AXCheckBox"].contains(child.attributes.role) {
-                    guard !descendants(child).contains(where: { $0.attributes.role == "AXStaticText" }),
-                          let text = ownName(child),
-                          child.attributes.role != "AXHeading" || words[child.path]?.title != nil else { continue }
-                    if !same(parts.last, text) { parts.append(text) }
+                let textNodes = children.filter { child in
+                    ["AXStaticText", "AXHeading", "AXLink", "AXCheckBox"].contains(child.attributes.role)
+                        && !descendants(child).contains(where: { $0.attributes.role == "AXStaticText" })
+                        && (child.attributes.role != "AXHeading" || words[child.path]?.title != nil)
                 }
+                let parts = distinctTextNodes(textNodes).compactMap(ownName)
                 let value = words[node.path]?.value
                 let complete = value.map {
                     $0 != "⟨redacted⟩" && (same($0, parts.joined(separator: " ")) || same($0, parts.joined()))
@@ -294,13 +301,10 @@ public enum MacScreenPageCompiler {
         func headingText(_ node: MacAXNode) -> String? {
             // AXHeading's numeric AXValue is its LEVEL, not its name.
             // Chromium frequently exposes the actual name in static children.
-            let captions = descendants(node).filter { controls[$0.path] != nil }.compactMap(controlLabel)
-            if captions.isEmpty, let title = words[node.path]?.title, readable(title) { return inline(title) }
-            let parts = staticRuns(node).compactMap(ownName).filter { part in
-                !captions.contains(where: { same(part, $0) })
-            }
+            // staticRuns excludes control-owned captions by source structure.
+            let parts = staticRuns(node).compactMap(ownName)
             if !parts.isEmpty {
-                return Array(NSOrderedSet(array: parts).array.compactMap { $0 as? String }).joined(separator: " ")
+                return parts.joined(separator: " ")
             }
             // Numeric values are levels. An aggregate title that includes child
             // controls is not a heading label either.
@@ -501,8 +505,8 @@ public enum MacScreenPageCompiler {
         let documentTitles = Dictionary(webAreas.map { ($0.path, documentName($0)) }, uniquingKeysWith: { first, _ in first })
         for editor in ordered where editor.attributes.role == "AXDocument"
             || structuredDocuments.contains(editor.path) || aggregateDocuments.contains(editor.path) {
-            if let area = ancestors(editor.path).first(where: { $0.attributes.role == "AXWebArea" }) {
-                let title = documentTitles[area.path]!
+            if let area = ancestors(editor.path).first(where: { $0.attributes.role == "AXWebArea" }),
+               let title = documentTitles[area.path] {
                 captions[editor.path] = title
                 if controls[editor.path] != nil { controlNames[editor.path] = title }
             } else if let heading = ancestors(editor.path).compactMap({ scope in
@@ -836,11 +840,7 @@ public enum MacScreenPageCompiler {
                (a.role == "AXStaticText" || oneLine),
                !descendants(node).contains(where: { controls[$0.path] != nil || ["AXHeading", "AXWebArea"].contains($0.attributes.role) }),
                let text = runText(runs) {
-                let unique = Set(runs.compactMap(ownName))
-                // Duplicate aggregate labels are one read; actual different
-                // runs still join in source order.
-                let label = unique.count == 1 ? unique.first! : text
-                append(label, at: node.path)
+                append(text, at: node.path)
                 consumed.formUnion(descendants(node).map(\.path))
                 continue
             }
@@ -870,11 +870,15 @@ public enum MacScreenPageCompiler {
             // Named, read-only status wrappers repeat in Chromium's tree.
             // Fold only a status-shaped subtree, never repeated prose or two
             // independently actionable controls with the same caption.
-            if a.role == "AXGroup", let name = ownName(node),
+            if a.role == "AXGroup", let name = ownName(node), staticRuns(node).count <= 1,
                !descendants(node).contains(where: { controls[$0.path] != nil || !["AXGroup", "AXImage", "AXStaticText"].contains($0.attributes.role) }),
                descendants(node).compactMap(ownName).allSatisfy({ same($0, name) }) {
                 let scope = ancestors(node.path).first { $0.attributes.role == "AXWebArea" || sectionName($0) != nil }?.path ?? []
-                let key = "\(scope):\(name)"
+                let identity: String
+                if let frame = node.attributes.frame, frame.w > 0, frame.h > 0 {
+                    identity = [frame.x, frame.y, frame.w, frame.h].map { String($0) }.joined(separator: ",")
+                } else { identity = "path:" + node.path.map(String.init).joined(separator: ".") }
+                let key = "\(scope):\(name):\(identity)"
                 if statusGroups.insert(key).inserted { append(name, at: node.path) }
                 consumed.formUnion(descendants(node).map(\.path))
                 continue

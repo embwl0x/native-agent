@@ -3,6 +3,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Observation
+import NativeAgentShared
 // Blueprint: | `MemoryV2+EmbeddingRuntime.swift` | `EmbeddingRuntimeSnapshot`; canonical runtime embedding backend with performance residency and the query form (bge queries carry its retrieval instruction, stored text never); durable action-index updates at warm-up and inventory changes, with serialized missing-text fills and background epoch rebuilds; engine termination closes admission, removes passive observations and cancels/drains both convergence flights through actual exit |
 
 public struct EmbeddingRuntimeSnapshot: Sendable, Equatable {
@@ -26,7 +27,6 @@ public struct EmbeddingRuntimeSnapshot: Sendable, Equatable {
     public var lastLoadError: String?
     public var loadCount: Int
     public var unloadCount: Int
-    public var idleUnloadSeconds: Int?
 }
 
 /// config/embeddings.json owns the backend selection; excluded from local
@@ -35,7 +35,7 @@ public struct EmbeddingRuntimeSnapshot: Sendable, Equatable {
 /// embeddings.json: excluded from local backup/export and phone sync;
 /// off-disk includes it; PrivacyMap lists config/embeddings.json.
 public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Sendable {
-    public static let coreMLBackend = "coreml-minilm"
+    public static let coreMLBackend = "coreml-bge"
     public static let mockBackend = "mock"
     /// Reported by `snapshot()` when the user wanted CoreML, CoreML couldn't
     /// load, AND the `NATIVE_AGENT_EMBEDDING_MOCK` developer-test env var is
@@ -68,32 +68,18 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         self.mock = MockEmbeddingProvider(dimensions: dimensions)
     }
 
-    /// The id of the CoreML model that would load: the installed extras model
-    /// when present, else the bundled one.
-    private var resolvedModelID: String {
-        (try? CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot))?.modelID
-            ?? CoreMLEmbeddingProvider.bundledModelID
-    }
-
     public var dimensions: Int {
         guard Self.readBackend(dataRoot: dataRoot) != Self.mockBackend else { return mock.dimensions }
         if let loaded = lock.withLock({ state.coreMLProvider?.dimensions }) { return loaded }
         // Not resident yet: report the model that WOULD load, not the mock's
         // width, so status surfaces do not read "384d" beside a 1024-d model.
-        return resolvedModelDimensions
-    }
-
-    private var resolvedModelDimensions: Int {
-        if let installed = try? CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot) {
-            return installed.dimensions
-        }
-        return 384
+        return CoreMLEmbeddingProvider.bundledDimensions
     }
 
     public var modelId: String {
         let config = Self.readBackend(dataRoot: dataRoot)
         guard config != Self.mockBackend else { return mock.modelId }
-        return lock.withLock { state.coreMLProvider?.modelId ?? resolvedModelID }
+        return lock.withLock { state.coreMLProvider?.modelId ?? CoreMLEmbeddingProvider.bundledModelID }
     }
 
     public var embeddingEpoch: MemoryEmbeddingEpoch {
@@ -107,7 +93,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
             return mock.embeddingEpoch
         }
         return (try? CoreMLEmbeddingProvider.bundledEmbeddingEpoch(extrasRoot: dataRoot))
-            ?? FailClosedEmbeddingProvider(dimensions: mock.dimensions).embeddingEpoch
+            ?? FailClosedEmbeddingProvider().embeddingEpoch
     }
 
     /// The loaded model's space, or the mock's; never a hash or a load.
@@ -116,7 +102,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         return lock.withLock { state.coreMLProvider?.embeddingEpoch }
     }
 
-    /// Embed `texts` via the CoreML MiniLM backend.
+    /// Embed `texts` via the CoreML bge backend.
     ///
     /// FAIL-CLOSED CONTRACT: when CoreML is unavailable (resources missing,
     /// model load throws, runtime mismatch) we THROW. Earlier versions of
@@ -145,15 +131,21 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         _ = try await provider.embed(["warmup"])
     }
 
-    /// Phase 5 D: embed ONLY on the model already resident — never load it,
-    /// never take `loadLock`. Nil when cold, mismatched or mock; the caller
-    /// falls back to what it can do without vectors.
-    public func embedIfResident(_ texts: [String]) async -> [[Float]]? {
+    /// Embed with a resident, matching, non-mock model without loading or taking `loadLock`; otherwise return nil.
+    public func embedIfResident(_ texts: [String], requireFullText: Bool = false) async -> [[Float]]? {
         let config = Self.readBackend(dataRoot: dataRoot)
         guard config != Self.mockBackend, !texts.isEmpty else { return nil }
         guard let provider = lock.withLock({ state.coreMLProvider }) else { return nil }
         noteUse()
+        if requireFullText {
+            return try? await (provider as? CoreMLEmbeddingProvider)?.embedCompleteTexts(texts)
+        }
         return try? await provider.embed(texts)
+    }
+
+    func coversCompleteTextsIfResident(_ texts: [String]) -> Bool? {
+        guard let provider = lock.withLock({ state.coreMLProvider }) as? CoreMLEmbeddingProvider else { return nil }
+        return provider.coversCompleteTexts(texts)
     }
 
     public func embedWithEpoch(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
@@ -161,8 +153,8 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     }
 
     /// BGE v1.5 is trained asymmetric: a search query carries this
-    /// instruction, the stored passages it is scored against do not. Other
-    /// models (MiniLM, the mock) embed a query like any text.
+    /// instruction, the stored passages it is scored against do not. The
+    /// explicit mock embeds a query like any text.
     static func queryInstruction(forModel modelID: String) -> String? {
         modelID.lowercased().contains("bge") ? "Represent this sentence for searching relevant passages: " : nil
     }
@@ -177,12 +169,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
             return try await mock.embedWithEpoch(texts)
         }
 
-        // Split load from predict: recordLoadFailure unloads the provider
-        // and stamps lastLoadError (status panel reports the install as
-        // broken, next embed pays the full reload). That treatment is right
-        // for LOAD failures only — a cancelled or transient PREDICTION
-        // failure was evicting a healthy model and lying about the install
-        // (audit 2026-06-09).
+        // Only load failures unload the provider and stamp lastLoadError; prediction failures preserve the loaded model.
         let provider: any EmbeddingProvider
         do {
             provider = try loadCoreMLProvider(config: config)
@@ -196,7 +183,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
                 domain: "NativeAgentMemoryV2",
                 code: -100,
                 userInfo: [NSLocalizedDescriptionKey:
-                    "CoreML memory search model \(resolvedModelID) did not load: "
+                    "CoreML memory search model \(CoreMLEmbeddingProvider.bundledModelID) did not load: "
                     + "\(error.localizedDescription)"]
             )
         }
@@ -212,15 +199,13 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         // A broken installed model is named before the first embed() tries it,
         // so status never shows a plain "missing" for a model that is there
         // but unusable.
-        let installedModel: CoreMLEmbeddingProvider.InstalledExtrasModel?
         let installedModelProblem: String?
         let resourcesAvailable: Bool
         do {
-            installedModel = try CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot)
+            _ = try CoreMLEmbeddingProvider.installedExtrasModel(root: dataRoot)
             installedModelProblem = nil
-            resourcesAvailable = installedModel != nil || CoreMLEmbeddingProvider.bundledFloorResourcesAvailable()
+            resourcesAvailable = true
         } catch {
-            installedModel = nil
             installedModelProblem = config == Self.mockBackend ? nil : error.localizedDescription
             resourcesAvailable = false
         }
@@ -244,19 +229,13 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
                 // return deterministic mock vectors. Report mock honestly.
                 effectiveBackend = Self.mockBackend
             } else {
-                // gpt-5.5 review MEDIUM: report fail-closed even BEFORE the
-                // first embed() call when CoreML resources aren't on disk.
-                // Previously this branch returned `coreMLBackend` whenever
-                // `lastLoadError == nil`, hiding a broken install behind a
-                // green status panel until the first recall actually fired.
+                // Missing CoreML resources report fail-closed before the first embed call.
                 effectiveBackend = Self.failClosedBackend
             }
             let modelId: String = {
-                if !requestedCoreML { return mock.modelId }
+                if effectiveBackend == Self.mockBackend { return mock.modelId }
                 if let loadedProvider { return loadedProvider.modelId }
-                return resourcesAvailable
-                    ? installedModel?.modelID ?? CoreMLEmbeddingProvider.bundledModelID
-                    : mock.modelId
+                return CoreMLEmbeddingProvider.bundledModelID
             }()
             return EmbeddingRuntimeSnapshot(
                 requestedBackend: config,
@@ -264,7 +243,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
                 mode: Self.performanceMode,
                 modelId: modelId,
                 dimensions: effectiveBackend == Self.mockBackend
-                    ? mock.dimensions : loadedProvider?.dimensions ?? installedModel?.dimensions ?? 384,
+                    ? mock.dimensions : loadedProvider?.dimensions ?? CoreMLEmbeddingProvider.bundledDimensions,
                 embeddingEpoch: effectiveBackend == Self.mockBackend
                     ? mock.embeddingEpoch.rawValue
                     : loadedProvider?.embeddingEpoch.rawValue,
@@ -277,13 +256,18 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
                 unloadReason: state.unloadReason,
                 lastLoadError: state.lastLoadError ?? installedModelProblem,
                 loadCount: state.loadCount,
-                unloadCount: state.unloadCount,
-                idleUnloadSeconds: nil
+                unloadCount: state.unloadCount
             )
         }
     }
 
-    public func setBackend(enabled: Bool) async throws {
+    /// Load the requested space while the current selection continues serving.
+    func prepareBackend(enabled: Bool) throws -> any EmbeddingProvider {
+        if !enabled { return mock }
+        return try loadCoreMLProvider(config: Self.readBackend(dataRoot: dataRoot))
+    }
+
+    func setBackend(enabled: Bool) async throws {
         let previous = Self.readBackend(dataRoot: dataRoot)
         try await writeConfigValue(
             path: Self.backendPath(dataRoot: dataRoot),
@@ -320,7 +304,6 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
             return (state.coreMLProvider, state.loadGeneration)
         }
         if let existing { return existing }
-        let modelID = resolvedModelID
         let provider: any EmbeddingProvider
         do {
             provider = try CoreMLEmbeddingProvider.bundled(extrasRoot: dataRoot)
@@ -332,8 +315,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
         }
         return try lock.withLock {
             guard state.loadGeneration == generation,
-                  Self.readBackend(dataRoot: dataRoot) == config,
-                  resolvedModelID == modelID else { throw CancellationError() }
+                  Self.readBackend(dataRoot: dataRoot) == config else { throw CancellationError() }
             state.coreMLProvider = provider
             state.lastLoadedAt = Date()
             state.unloadReason = nil
@@ -350,12 +332,7 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     }
 
     private func recordLoadFailure(_ error: Error, generation: UInt64) {
-        // gpt-5.5 review-2 NEEDS_FIX: post-fail-closed wording. Previously
-        // this said "using mock fallback" — that was honest when embed()
-        // silently mocked on load failure. Now embed() throws unless the
-        // developer-test env var opts in, so the load-failure terminal
-        // state is fail-closed (or mock-if-opt-in). Reason mirrors the
-        // snapshot() branch logic so UI panels and the unload reason agree.
+        // Match snapshot status: load failure is fail-closed unless mock use is explicitly enabled.
         let mockOptIn = ProcessInfo.processInfo.environment["NATIVE_AGENT_EMBEDDING_MOCK"] == "1"
         lock.withLock {
             guard state.loadGeneration == generation else { return }
@@ -369,9 +346,8 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     }
 
     private func writeConfigValue(path: URL, key: String, value: String) async throws {
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
-            try await persistence.writeJSON(.object([key: .string(value)]), to: path)
+        try await SwiftNativePersistenceCore.withFileLock(path) {
+            try await SwiftNativePersistenceCore.writeJSON(.object([key: .string(value)]), to: path)
         }
     }
 
@@ -407,14 +383,6 @@ public final class ManagedEmbeddingProvider: EmbeddingProvider, @unchecked Senda
     }
 }
 
-private extension NSLock {
-    func withLock<T>(_ work: () throws -> T) rethrows -> T {
-        lock()
-        defer { unlock() }
-        return try work()
-    }
-}
-
 extension SwiftNativeMemoryV2 {
     public func installActionIndex(paths: [URL], notifications: [Notification.Name],
                                    source: @escaping @Sendable () async throws -> [String]) {
@@ -423,18 +391,10 @@ extension SwiftNativeMemoryV2 {
         actionIndexWatcher = FileChangeWatcher(paths: paths) { [weak self] _ in
             Task { await self?.requestActionIndexUpdate() }
         }
-        observeActionIndexChanges(notifications)
-        requestActionIndexUpdate()
-    }
-
-    private nonisolated func observeActionIndexChanges(_ notifications: [Notification.Name]) {
-        actionIndexObservers.withLock { tokens in
-            tokens = notifications.map { name in
-                NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
-                    Task { await self?.requestActionIndexUpdate() }
-                }
-            }
+        actionIndexObservers = ObservationNotifications(names: notifications) { [weak self] in
+            Task { await self?.requestActionIndexUpdate() }
         }
+        requestActionIndexUpdate()
     }
 
     /// Coalesce owner changes, including changes arriving while a batch embeds.
@@ -473,10 +433,8 @@ extension SwiftNativeMemoryV2 {
         embeddingEpochDirty = false
         actionIndexWatcher?.cancel()
         actionIndexWatcher = nil
-        actionIndexObservers.withLock { tokens in
-            tokens.forEach { NotificationCenter.default.removeObserver($0) }
-            tokens.removeAll()
-        }
+        actionIndexObservers?.cancel()
+        actionIndexObservers = nil
         actionIndexUpdate?.cancel()
         embeddingEpochReconcile?.cancel()
         await actionIndexUpdate?.value
@@ -492,27 +450,32 @@ extension SwiftNativeMemoryV2 {
         SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
-    /// The published index only. A find whose actions are not all indexed in
-    /// the resident model's space is told so and ranks by words that once;
-    /// the fill is requested, never awaited.
-    public func indexedActionVectors(_ texts: [String]) async throws -> MemoryEmbeddingBatch {
+    /// A find's own actions the catalog index never holds (the verbs of the
+    /// page a sense just served her, a turn's own parts) are embedded with
+    /// her ask; only a fill that is behind leaves more than this missing.
+    public static let actionIndexMissesEmbeddedWithAsk = 16
+
+    /// The published index, one entry per text: its vector, or nil where the
+    /// index lacks it, for the caller to embed with the ask. Any miss requests
+    /// a fill, never awaited. More misses than the ask carries, or no resident
+    /// model, fail: that find ranks by words and is told so.
+    public func indexedActionVectors(_ texts: [String]) async throws -> (epoch: MemoryEmbeddingEpoch, vectors: [[Float]?]) {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         guard let epoch = residentEmbeddingEpoch() else {
             requestActionIndexUpdate()
             throw MemoryV2Error.underlying(actionIndexFailure ?? "Action search awaits the memory search model; an index update was requested.")
         }
-        let indexed = try await storage.underlyingStorage().actionEmbeddings(epoch: epoch)
-        let hashes = texts.map(Self.actionTextHash)
+        let indexed = try await storage.actionEmbeddings(epoch: epoch)
         let dimensions = embedder?.dimensions
-        guard hashes.allSatisfy({ indexed[$0]?.count == dimensions }) else {
-            requestActionIndexUpdate()
-            if let actionIndexFailure {
-                throw MemoryV2Error.underlying("Action search index could not be built: \(actionIndexFailure)\nEpoch evidence: \(epoch.rawValue)")
-            }
-            throw MemoryV2Error.underlying("Action search index is incomplete; an update was requested.\nEpoch evidence: \(epoch.rawValue)")
+        let vectors = texts.map { indexed[Self.actionTextHash($0)].flatMap { $0.count == dimensions ? $0 : nil } }
+        let misses = vectors.filter { $0 == nil }.count
+        if misses > 0 { requestActionIndexUpdate() }
+        guard misses > Self.actionIndexMissesEmbeddedWithAsk else { return (epoch, vectors) }
+        if let actionIndexFailure {
+            throw MemoryV2Error.underlying("Action search index could not be built: \(actionIndexFailure)\nEpoch evidence: \(epoch.rawValue)")
         }
-        return MemoryEmbeddingBatch(epoch: epoch, vectors: hashes.compactMap { indexed[$0] })
+        throw MemoryV2Error.underlying("Action search index is incomplete (\(misses) of \(texts.count) actions not yet indexed); an update was requested.\nEpoch evidence: \(epoch.rawValue)")
     }
 
     /// Only the background updater fills, in bounded chunks on a detached
@@ -521,7 +484,7 @@ extension SwiftNativeMemoryV2 {
         try await ensureCanonicalAttachment()
         try checkEmbeddingConvergence()
         guard let storage, let embedder else { throw MemoryV2Error.storageUnavailable }
-        let disk = await storage.underlyingStorage()
+        let disk = storage
         try checkEmbeddingConvergence()
         let fill = Task.detached(priority: .utility) {
             let epoch = embedder.embeddingEpoch
@@ -532,7 +495,13 @@ extension SwiftNativeMemoryV2 {
             let missing = byHash.keys.filter { indexed[$0] == nil }.sorted()
             for start in stride(from: 0, to: missing.count, by: 8) {
                 let hashes = Array(missing[start..<min(start + 8, missing.count)])
-                let batch = try await embedder.embedWithEpoch(hashes.map { byHash[$0]! })
+                let texts = try hashes.map { hash in
+                    guard let text = byHash[hash] else {
+                        throw MemoryV2Error.underlying("An action index source is missing for \(hash).")
+                    }
+                    return text
+                }
+                let batch = try await embedder.embedWithEpoch(texts)
                 try await self.checkEmbeddingConvergence()
                 guard batch.epoch == epoch, embedder.embeddingEpoch == epoch else {
                     await self.requestActionIndexUpdate()
@@ -579,7 +548,7 @@ extension SwiftNativeMemoryV2 {
         nativeLog("[embedding-warmup] attempting load — modelLoadable=\(snapshot.modelLoadable)")
         do {
             try await warmUpEmbedder()
-            nativeLog("[embedding-warmup] SUCCESS: MiniLM eagerly warmed for Fast mode")
+            nativeLog("[embedding-warmup] SUCCESS: bge-large-en-v1.5 eagerly warmed for Fast mode")
             OrganPulse.record("embedding_warmup", .worked, note: "embedder loaded")
             let after = embeddingRuntimeSnapshot()
             nativeLog("[embedding-warmup] post-load snapshot: coreMLLoaded=\(after?.coreMLLoaded ?? false) effectiveBackend=\(after?.effectiveBackend ?? "nil")")
@@ -589,17 +558,15 @@ extension SwiftNativeMemoryV2 {
     }
 
     public func configureEmbeddingBackendAndReindex(enabled: Bool) async throws {
-        let before = embeddingRuntimeSnapshot()
-        do {
-            try await configureEmbeddingBackend(enabled: enabled)
-            _ = try await reindexAllMemoryEmbeddingsForCurrentProvider()
-        } catch {
-            // A backend is not allowed to change while canonical vectors stay
-            // in the prior space. Restore the requested backend so recall
-            // immediately returns to the previously active epoch.
-            let wasEnabled = before?.requestedBackend != ManagedEmbeddingProvider.mockBackend
-            try? await configureEmbeddingBackend(enabled: wasEnabled)
-            throw error
+        try await ensureCanonicalAttachment()
+        guard let managed = embedder as? ManagedEmbeddingProvider else {
+            throw MemoryV2Error.underlying("embedding runtime is not configurable")
         }
+        let candidate = try managed.prepareBackend(enabled: enabled)
+        _ = try await reindexMemoryEmbeddings(using: candidate)
+        // The epoch owner has committed a complete space. Publish selection
+        // only now; a failed build never writes configuration to undo later.
+        try await managed.setBackend(enabled: enabled)
+        requestActionIndexUpdate()
     }
 }

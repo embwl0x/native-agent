@@ -22,24 +22,56 @@ actor BuilderWorktreeAllocator {
 
     // Aliases of one checkout share its token. Keep ownership across Git
     // suspensions; actor isolation alone does not exclude retirement.
-    private var checkoutReservations: [String: [CheckedContinuation<Void, Never>]] = [:]
-    private var allocationReservations: [String: [CheckedContinuation<Void, Never>]] = [:]
+    private enum Reservation: Hashable {
+        case checkout(String)
+        case allocation(String)
+    }
+    private struct Waiter {
+        let id: UUID
+        let continuation: CheckedContinuation<Void, Error>
+    }
+    private var reservations: [Reservation: [Waiter]] = [:]
 
-    private func reserveCheckout(_ token: String) async {
-        if checkoutReservations[token] == nil {
-            checkoutReservations[token] = []
+    private func reserve(_ key: Reservation) async throws {
+        try Task.checkCancellation()
+        if reservations[key] == nil {
+            reservations[key] = []
             return
         }
-        await withCheckedContinuation { checkoutReservations[token, default: []].append($0) }
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                guard !Task.isCancelled else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                reservations[key, default: []].append(Waiter(id: id, continuation: continuation))
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(id, for: key) }
+        }
+        // Release ownership if cancellation raced the successful handoff.
+        if Task.isCancelled {
+            release(key)
+            throw CancellationError()
+        }
     }
 
-    private func releaseCheckout(_ token: String) {
-        if var waiters = checkoutReservations[token], !waiters.isEmpty {
+    private func cancelWaiter(_ id: UUID, for key: Reservation) {
+        guard var waiters = reservations[key],
+              let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+        let waiter = waiters.remove(at: index)
+        reservations[key] = waiters
+        waiter.continuation.resume(throwing: CancellationError())
+    }
+
+    private func release(_ key: Reservation) {
+        if var waiters = reservations[key], !waiters.isEmpty {
             let next = waiters.removeFirst()
-            checkoutReservations[token] = waiters
-            next.resume()
+            reservations[key] = waiters
+            next.continuation.resume()
         } else {
-            checkoutReservations[token] = nil
+            reservations[key] = nil
         }
     }
 
@@ -52,17 +84,27 @@ actor BuilderWorktreeAllocator {
     struct Assignment: Sendable, Equatable {
         let workingDirectory: String
         fileprivate let token: String
-        /// A follow-up that named a different directory than the one this
-        /// conversation was assigned. The assignment wins; this records what
-        /// was asked so the receipt can say so (2026-09-11: Agent's follow-ups
-        /// to Claude were refused for naming the main checkout).
+        /// The assigned directory wins; the receipt records any differing request.
         var ignoredRequestedDirectory: String? = nil
+
+        static func decode(_ raw: String, pointer: URL) throws -> Self {
+            let lines = raw.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            guard lines.count >= 2 else {
+                throw BuilderWorktreeAllocator.pointerFailure(pointer, field: "lines 1–2", detail: "Expected a working directory followed by its 16-character token.")
+            }
+            let directory = lines[0].trimmingCharacters(in: .whitespacesAndNewlines)
+            let token = lines[1].trimmingCharacters(in: .whitespacesAndNewlines)
+            guard directory.hasPrefix("/") else {
+                throw BuilderWorktreeAllocator.pointerFailure(pointer, field: "line 1 (working directory)", detail: "Expected an absolute directory path.")
+            }
+            guard token.count == 16, token.unicodeScalars.allSatisfy({ (48...57).contains($0.value) || (97...102).contains($0.value) }) else {
+                throw BuilderWorktreeAllocator.pointerFailure(pointer, field: "line 2 (token)", detail: "Expected 16 lowercase hexadecimal characters.")
+            }
+            return Self(workingDirectory: directory, token: token)
+        }
     }
 
-    /// The one wording behind the receipt clause all three bridge schemas
-    /// promise ("ignored and noted on the receipt"). Shared so Claude, Codex,
-    /// and OMP cannot drift — only Claude published it before
-    /// (astra-comb-3 lane3 #4 / lane1 #4).
+    /// All three bridges share the receipt wording for an ignored directory request.
     static let ignoredDirectoryNote =
         "This conversation keeps its assigned worktree; the working_directory you passed was ignored. Omit working_directory on follow-ups."
 
@@ -92,22 +134,8 @@ actor BuilderWorktreeAllocator {
         let identity = conversationId ?? "message:\(messageId)"
         let allocationKey = pointerURL(agent: agent, identity: identity, configRoot: configRoot)
             .standardizedFileURL.resolvingSymlinksInPath().path
-        if allocationReservations[allocationKey] != nil {
-            await withCheckedContinuation {
-                allocationReservations[allocationKey, default: []].append($0)
-            }
-        } else {
-            allocationReservations[allocationKey] = []
-        }
-        defer {
-            if var waiters = allocationReservations[allocationKey], !waiters.isEmpty {
-                let next = waiters.removeFirst()
-                allocationReservations[allocationKey] = waiters
-                next.resume()
-            } else {
-                allocationReservations[allocationKey] = nil
-            }
-        }
+        try await reserve(.allocation(allocationKey))
+        defer { release(.allocation(allocationKey)) }
         let baseDirectory = requestedDirectory ?? defaultDirectory
 
         if isFollowUp, let conversationId,
@@ -161,7 +189,7 @@ actor BuilderWorktreeAllocator {
         let repoRoot = URL(fileURLWithPath: topLevel.stdout.trimmingCharacters(
             in: .whitespacesAndNewlines
         )).standardizedFileURL.resolvingSymlinksInPath()
-        guard baseURL.path == repoRoot.path || baseURL.path.hasPrefix(repoRoot.path + "/") else {
+        guard let suffix = NativeAgentWorkspaceRoot.relativePath(baseURL.path, under: repoRoot.path) else {
             return .failed(
                 reason: "builder_worktree_source_invalid",
                 detail: "Git reported a repository root that does not contain the requested builder directory."
@@ -188,8 +216,8 @@ actor BuilderWorktreeAllocator {
             isDirectory: true
         )
 
-        await reserveCheckout(token)
-        defer { releaseCheckout(token) }
+        try await reserve(.checkout(token))
+        defer { release(.checkout(token)) }
 
         if !FileManager.default.fileExists(atPath: worktreeRoot.path) {
             let branchExists = await git(
@@ -236,9 +264,7 @@ actor BuilderWorktreeAllocator {
             )
         }
 
-        let suffix = String(baseURL.path.dropFirst(repoRoot.path.count))
-        let isolatedDirectory = URL(fileURLWithPath: worktreeRoot.path + suffix)
-            .standardizedFileURL
+        let isolatedDirectory = worktreeRoot.appendingPathComponent(suffix).standardizedFileURL
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(
             atPath: isolatedDirectory.path,
@@ -285,8 +311,12 @@ actor BuilderWorktreeAllocator {
         conversationId: String,
         configRoot: URL
     ) async -> AllocationResult {
-        await reserveCheckout(assignment.token)
-        defer { releaseCheckout(assignment.token) }
+        do {
+            try await reserve(.checkout(assignment.token))
+        } catch {
+            return .failed(reason: "builder_worktree_stopped", detail: "Stopped while waiting to bind the builder checkout.")
+        }
+        defer { release(.checkout(assignment.token)) }
         guard FileManager.default.fileExists(atPath: assignment.workingDirectory) else {
             return .failed(
                 reason: "builder_worktree_verification_failed",
@@ -321,43 +351,30 @@ actor BuilderWorktreeAllocator {
         } catch CocoaError.fileReadNoSuchFile where !pathEntryExists(pointer, fileManager: .default) {
             return nil
         } catch {
-            throw pointerFailure(pointer, field: "contents", detail: error.localizedDescription)
+            throw Self.pointerFailure(pointer, field: "contents", detail: error.localizedDescription)
         }
-        let lines = raw.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        guard lines.count >= 2 else {
-            throw pointerFailure(pointer, field: "lines 1–2", detail: "Expected a working directory followed by its 16-character token.")
-        }
-        let workingDirectory = lines[0].trimmingCharacters(in: .whitespacesAndNewlines)
-        let token = lines[1].trimmingCharacters(in: .whitespacesAndNewlines)
-        guard workingDirectory.hasPrefix("/") else {
-            throw pointerFailure(pointer, field: "line 1 (working directory)", detail: "Expected an absolute directory path.")
-        }
-        guard token.count == 16,
-              token.unicodeScalars.allSatisfy({ scalar in
-                  (48...57).contains(scalar.value) || (97...102).contains(scalar.value)
-              }) else {
-            throw pointerFailure(pointer, field: "line 2 (token)", detail: "Expected 16 lowercase hexadecimal characters.")
-        }
-        await reserveCheckout(token)
-        defer { releaseCheckout(token) }
+        let assignment = try Assignment.decode(raw, pointer: pointer)
+        let token = assignment.token
+        try await reserve(.checkout(token))
+        defer { release(.checkout(token)) }
         // Retirement may have finished while this reuse waited. Reread under
         // checkout ownership before checking Git or publishing a fresh touch.
         if !pathEntryExists(pointer, fileManager: .default) { return nil }
         guard try String(contentsOf: pointer, encoding: .utf8) == raw else {
-            throw pointerFailure(pointer, field: "contents", detail: "The assignment changed while waiting to reuse its checkout.")
+            throw Self.pointerFailure(pointer, field: "contents", detail: "The assignment changed while waiting to reuse its checkout.")
         }
-        let directory = URL(fileURLWithPath: workingDirectory)
+        let directory = URL(fileURLWithPath: assignment.workingDirectory)
             .standardizedFileURL
             .resolvingSymlinksInPath()
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
               isDirectory.boolValue else {
-            throw pointerFailure(pointer, field: "line 1 (working directory)", detail: "The assigned directory does not exist: \(directory.path)")
+            throw Self.pointerFailure(pointer, field: "line 1 (working directory)", detail: "The assigned directory does not exist: \(directory.path)")
         }
         let root = await git(["rev-parse", "--show-toplevel"], cwd: directory)
         let branch = await git(["rev-parse", "--abbrev-ref", "HEAD"], cwd: directory)
         guard root.status == 0, branch.status == 0 else {
-            throw pointerFailure(pointer, field: "line 1 (working directory)",
+            throw Self.pointerFailure(pointer, field: "line 1 (working directory)",
                                  detail: "Git could not verify \(directory.path): \(boundedDetail(root)) \(boundedDetail(branch))")
         }
         guard branch.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -365,14 +382,14 @@ actor BuilderWorktreeAllocator {
               URL(fileURLWithPath: root.stdout.trimmingCharacters(
                 in: .whitespacesAndNewlines
               )).lastPathComponent.hasSuffix("-wt-\(agent.rawValue)-\(token)") else {
-            throw pointerFailure(pointer, field: "lines 1–2 (assignment)",
+            throw Self.pointerFailure(pointer, field: "lines 1–2 (assignment)",
                                  detail: "Expected branch nativeagent/\(agent.rawValue)-\(token) in a checkout ending -wt-\(agent.rawValue)-\(token); found branch \(branch.stdout.trimmingCharacters(in: .whitespacesAndNewlines)) at \(root.stdout.trimmingCharacters(in: .whitespacesAndNewlines)).")
         }
         touchPointer(agent: agent, identity: identity, configRoot: configRoot)
         return Assignment(workingDirectory: directory.path, token: token)
     }
 
-    private func pointerFailure(_ pointer: URL, field: String, detail: String) -> ToolFailureError {
+    private static func pointerFailure(_ pointer: URL, field: String, detail: String) -> ToolFailureError {
         ToolFailureError("Builder assignment is unreadable or invalid; no builder started. \(detail) Repair the retained assignment or checkout before resending.",
                          effects: .none, owner: "\(pointer.path) > \(field)",
                          code: "builder_assignment_invalid", instruction: ToolFailureError.fileRepairInstruction(pointer,
@@ -493,20 +510,17 @@ actor BuilderWorktreeAllocator {
         var removed = 0
         for pointer in pointerFiles.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
             if removed >= Self.retirementRemovalsPerSweep { break }
-            guard let raw = try? String(contentsOf: pointer, encoding: .utf8) else { continue }
-            guard let firstLine = raw.split(separator: "\n", omittingEmptySubsequences: false).first else { continue }
-            let pointedDirectory = URL(fileURLWithPath: String(firstLine).trimmingCharacters(in: .whitespacesAndNewlines))
-                .standardizedFileURL.resolvingSymlinksInPath().path
-            let lines = raw.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-            guard lines.count >= 2 else { continue }
-            let recordedDirectory = lines[0].trimmingCharacters(in: .whitespacesAndNewlines)
-            let token = lines[1].trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !recordedDirectory.isEmpty, token.count == 16 else { continue }
+            guard let raw = try? String(contentsOf: pointer, encoding: .utf8),
+                  let assignment = try? Assignment.decode(raw, pointer: pointer) else { continue }
+            let directory = URL(fileURLWithPath: assignment.workingDirectory)
+                .standardizedFileURL.resolvingSymlinksInPath()
+            let pointedDirectory = directory.path
+            let token = assignment.token
             // A reuse already checking Git wins. Otherwise retirement owns
             // this checkout through every Git await and pointer deletion.
-            guard checkoutReservations[token] == nil else { continue }
-            checkoutReservations[token] = []
-            defer { releaseCheckout(token) }
+            guard reservations[.checkout(token)] == nil else { continue }
+            reservations[.checkout(token)] = []
+            defer { release(.checkout(token)) }
             guard let aliases = try? FileManager.default.contentsOfDirectory(
                 at: pointerDirectory, includingPropertiesForKeys: nil
             ).filter({ $0.pathExtension == "path" }) else { continue }
@@ -515,8 +529,8 @@ actor BuilderWorktreeAllocator {
             var newestTouch: Date?
             for alias in aliases {
                 guard let aliasRaw = try? String(contentsOf: alias, encoding: .utf8),
-                      let first = aliasRaw.split(separator: "\n", omittingEmptySubsequences: false).first,
-                      URL(fileURLWithPath: String(first).trimmingCharacters(in: .whitespacesAndNewlines))
+                      let aliasAssignment = try? Assignment.decode(aliasRaw, pointer: alias),
+                      URL(fileURLWithPath: aliasAssignment.workingDirectory)
                         .standardizedFileURL.resolvingSymlinksInPath().path == pointedDirectory,
                       let touched = (try? URL(fileURLWithPath: alias.path).resourceValues(
                         forKeys: [.contentModificationDateKey]
@@ -524,8 +538,6 @@ actor BuilderWorktreeAllocator {
                 newestTouch = max(newestTouch ?? .distantPast, touched)
             }
             guard let touchedAt = newestTouch, touchedAt < cutoff else { continue }
-            let directory = URL(fileURLWithPath: recordedDirectory)
-                .standardizedFileURL.resolvingSymlinksInPath()
             if keptPaths.contains(directory.path) { continue }
             var isDirectory: ObjCBool = false
             guard FileManager.default.fileExists(
@@ -577,8 +589,8 @@ actor BuilderWorktreeAllocator {
                 // one that led here, so no alias is left dangling.
                 for alias in aliases {
                     if let aliasRaw = try? String(contentsOf: alias, encoding: .utf8),
-                       let aliasFirst = aliasRaw.split(separator: "\n", omittingEmptySubsequences: false).first,
-                       URL(fileURLWithPath: String(aliasFirst).trimmingCharacters(in: .whitespacesAndNewlines))
+                       let aliasAssignment = try? Assignment.decode(aliasRaw, pointer: alias),
+                       URL(fileURLWithPath: aliasAssignment.workingDirectory)
                            .standardizedFileURL.resolvingSymlinksInPath().path == pointedDirectory {
                         try? FileManager.default.removeItem(at: alias)
                     }
@@ -601,7 +613,7 @@ actor BuilderWorktreeAllocator {
         var environment = ProcessInfo.processInfo.environment
         environment["GIT_TERMINAL_PROMPT"] = "0"
         do {
-            let result = try await SystemProcessAdapter().run(
+            let result = try await ProcessExecution().run(
                 executable: "/usr/bin/git", arguments: arguments,
                 currentDirectory: cwd, environment: environment,
                 standardInput: nil, timeoutSeconds: 30

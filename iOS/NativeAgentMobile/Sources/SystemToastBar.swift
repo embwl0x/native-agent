@@ -1,141 +1,27 @@
-// SystemToastBar.swift — iOS parity for the Mac SystemToastBar.
-//
-// Mirrors Sources/NativeAgentApp/SystemToastBar.swift: same `SystemToast`
-// shape (info/warn/error/success), same auto-dismiss semantics, same
-// replace-by-id behavior so a sticky re-push of an auto-dismissing toast
-// doesn't get killed by the old timer.
-//
-// Differences from the Mac version:
-//   • Renamed types — `iOSSystemToast`, `iOSSystemToastCenter`,
-//     `iOSSystemToastBar` — so this file can coexist with the shared
-//     Mac type names if either side later gets pulled into a shared
-//     module.
-//   • Top-of-screen overlay under the status bar (Mac shows under the
-//     title bar; iOS drops in like a system banner).
-//   • Taller hit target on the dismiss X (44 pt minimum).
-//
-// Wired as an overlay on ContentView's TabView root.
-
 import Foundation
 import SwiftUI
 import NativeAgentShared
 
-@MainActor
-public struct iOSSystemToast: Identifiable, Sendable, Equatable {
-    public let id: UUID
-    public let kind: Kind
-    public let text: String
-    public let createdAt: Date
-    public let autoDismissAfter: TimeInterval?
-
-    public enum Kind: String, Sendable { case info, warn, error, success }
-
-    public init(
-        id: UUID = UUID(),
-        kind: Kind,
-        text: String,
-        createdAt: Date = Date(),
-        autoDismissAfter: TimeInterval? = 3
-    ) {
-        self.id = id
-        self.kind = kind
-        self.text = text
-        self.createdAt = createdAt
-        self.autoDismissAfter = autoDismissAfter
-    }
-
-    public nonisolated static func == (lhs: iOSSystemToast, rhs: iOSSystemToast) -> Bool {
-        lhs.id == rhs.id
-    }
-}
-
-@MainActor
-public final class iOSSystemToastCenter: ObservableObject {
-    public static let shared = iOSSystemToastCenter()
-
-    @Published public private(set) var queue: [iOSSystemToast] = []
-
-    private var dismissTasks: [UUID: Task<Void, Never>] = [:]
-
-    public init() {}
-
-    static func dismissDelayNanoseconds(after: TimeInterval?) -> UInt64? {
-        guard let after, after.isFinite, after > 0 else { return nil }
-        let nanoseconds = after * 1_000_000_000
-        guard nanoseconds <= Double(UInt64.max) else { return nil }
-        return UInt64(nanoseconds)
-    }
-
-    public func push(_ toast: iOSSystemToast) {
-        // Replace-by-id semantics — match the Mac SystemToastCenter so a
-        // re-push of the same id (rare but possible if a caller hand-stamps
-        // an id for sticky updates) doesn't see the old timer kill the new
-        // entry, and ForEach doesn't trip on duplicate ids.
-        dismissTasks.removeValue(forKey: toast.id)?.cancel()
-        queue.removeAll { $0.id == toast.id }
-        queue.append(toast)
-
-        guard let delay = Self.dismissDelayNanoseconds(after: toast.autoDismissAfter) else { return }
-        dismissTasks[toast.id] = Task {
-            try? await Task.sleep(nanoseconds: delay)
-            if Task.isCancelled { return }
-            self.dismiss(toast.id)
-        }
-    }
-
-    public func push(info text: String, autoDismissAfter: TimeInterval? = 3) {
-        push(iOSSystemToast(kind: .info, text: text, autoDismissAfter: autoDismissAfter))
-    }
-
-    public func push(warn text: String, autoDismissAfter: TimeInterval? = 5) {
-        push(iOSSystemToast(kind: .warn, text: text, autoDismissAfter: autoDismissAfter))
-    }
-
-    public func push(error text: String, autoDismissAfter: TimeInterval? = 8) {
-        push(iOSSystemToast(kind: .error, text: text, autoDismissAfter: autoDismissAfter))
-    }
-
-    public func push(success text: String, autoDismissAfter: TimeInterval? = 3) {
-        push(iOSSystemToast(kind: .success, text: text, autoDismissAfter: autoDismissAfter))
-    }
-
-    public func dismiss(_ id: UUID) {
-        dismissTasks[id]?.cancel()
-        dismissTasks[id] = nil
-        queue.removeAll { $0.id == id }
-    }
-
-    public func dismissAll() {
-        for task in dismissTasks.values { task.cancel() }
-        dismissTasks.removeAll()
-        queue.removeAll()
-    }
-}
-
 public struct iOSSystemToastBar: View {
     private static let maxVisible = 3
 
-    @ObservedObject var center: iOSSystemToastCenter
+    @ObservedObject var center: SystemToastCenter
 
-    public init(center: iOSSystemToastCenter) {
+    public init(center: SystemToastCenter) {
         self.center = center
     }
 
     public var body: some View {
-        // Show NEWEST toasts when capped. Mirrors the Mac SystemToastBar
-        // 2026-06-06 fix where prefix(3) could let a 4th short-lived toast
-        // dismiss before ever being seen.
+        // Show the newest notices; dismissal timers start on push.
         let visibleToasts = Array(center.queue.suffix(Self.maxVisible))
 
-        // Liquid Glass pilot (2026-07-02): stacked glass pills must live in
-        // a GlassEffectContainer — glass can't sample other glass, the
-        // container coordinates the shared sampling region.
+        // The container coordinates sampling for stacked glass pills.
         GlassEffectContainer(spacing: 8) {
             pillStack(visibleToasts)
         }
     }
 
-    private func pillStack(_ visibleToasts: [iOSSystemToast]) -> some View {
+    private func pillStack(_ visibleToasts: [SystemToast]) -> some View {
         VStack(spacing: 8) {
             ForEach(visibleToasts) { toast in
                 iOSSystemToastPill(toast: toast) {
@@ -155,17 +41,8 @@ public struct iOSSystemToastBar: View {
 }
 
 private struct iOSSystemToastPill: View {
-    let toast: iOSSystemToast
+    let toast: SystemToast
     let onDismiss: () -> Void
-
-    private var tint: Color {
-        switch toast.kind {
-        case .info: return .secondary
-        case .warn: return .secondary
-        case .error: return .red
-        case .success: return .secondary
-        }
-    }
 
     private var icon: String {
         switch toast.kind {
@@ -178,9 +55,7 @@ private struct iOSSystemToastPill: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            // Keep the icon+text and dismiss Button as SEPARATE a11y
-            // elements (Mac SystemToastBar 2026-06-06 fix) so VoiceOver
-            // users can actuate dismiss instead of just hearing the text.
+            // Keep dismissal separate so VoiceOver can actuate it.
             HStack(spacing: 12) {
                 Image(systemName: icon)
                     .foregroundStyle(toast.kind == .error ? Color.red : AlivePalette.secondary)
@@ -208,38 +83,15 @@ private struct iOSSystemToastPill: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .frame(maxWidth: 520)
-        .modifier(ToastPillSurface(tint: tint))
+        .aliveGlass(in: RoundedRectangle(cornerRadius: NativeAgentMobileTheme.Radius.composer, style: .continuous),
+                    interactive: true, tint: AlivePalette.room.opacity(0.5))
         .accessibilityElement(children: .contain)
     }
 }
 
-/// Toast pill chrome. Toasts are a floating control over content — exactly
-/// the layer the iOS 26 HIG assigns to Liquid Glass — using the real material
-/// (lensing, motion highlights, auto contrast).
-private struct ToastPillSurface: ViewModifier {
-    let tint: Color
+// MARK: - Mac connection chip
 
-    func body(content: Content) -> some View {
-        content.aliveGlass(in: RoundedRectangle(cornerRadius: NativeAgentMobileTheme.Radius.composer,
-                                                style: .continuous),
-                           interactive: true,
-                           // A little of the room in the glass so a toast over
-                           // the serif header still reads first.
-                           tint: AlivePalette.room.opacity(0.5))
-    }
-}
-
-// MARK: - Mac connection chip (Sweep R4 C11.4)
-//
-// Until now the phone's connection state rendered on exactly two screens:
-// Diagnostics → Status and Settings → Connection. On Chat, Activity, Memory
-// and Skills the app looked completely normal while the Mac was asleep — you
-// found out by sending a message and waiting for a timeout.
-//
-// This is the SAME source of truth those two screens already read
-// (`MacBridgeClient.bridgeStatus`, refreshed by the existing 5s poll in
-// MacBridgeClient.init). No new timer, no new fetch — a second reader of a
-// value that was already being computed.
+// Connection presentation reads the phone's assessment without another fetch.
 
 /// A compact connection indicator for a navigation bar. Every state is named:
 /// a green dot alone makes a healthy connection look like unexplained chrome,
@@ -249,12 +101,10 @@ struct MacStatusChip: View {
     /// words and the header's type, instead of an icon and a system label.
     var speaksAsAgent = false
     @EnvironmentObject private var bridgeClient: MacBridgeClient
-    @EnvironmentObject private var pairingStore: PairingStore
     private let sync = iCloudSyncEngine.shared
     @State private var showDetail = false
 
-    private var status: BridgeStatus { bridgeClient.bridgeStatus }
-    private var isHealthy: Bool { status == .online }
+    private var connection: NAPhoneConnection { bridgeClient.connection }
 
     var body: some View {
         Button {
@@ -262,13 +112,13 @@ struct MacStatusChip: View {
         } label: {
             Group {
                 if speaksAsAgent {
-                    Text(AliveConnection.line(bridgeClient.connection))
+                    Text(AliveConnection.line(connection))
                         .font(.subheadline)
                         .foregroundStyle(AlivePalette.secondary)
                         .lineLimit(1)
                         .minimumScaleFactor(0.85)
                 } else {
-                    Label(shortLabel, systemImage: isHealthy ? "checkmark.icloud" : "icloud.slash")
+                    Label(AliveConnection.line(connection), systemImage: connection.holds ? "checkmark.icloud" : "icloud.slash")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -280,39 +130,16 @@ struct MacStatusChip: View {
             .frame(minWidth: 44, minHeight: 44)
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Mac connection: \(AliveConnection.line(bridgeClient.connection))")
+        .accessibilityLabel("Mac connection: \(AliveConnection.line(connection))")
         .popover(isPresented: $showDetail) {
-            MacStatusDetail(status: status, connection: bridgeClient.connection,
+            MacStatusDetail(connection: connection,
                             lastSeenAt: bridgeClient.lastSeenAt, lastSnapshotReadAt: sync.lastSyncAt)
                 .presentationCompactAdaptation(.popover)
-        }
-    }
-
-    /// Navigation bars are tight — the full `displayName` ("Connected via
-    /// iCloud", "Last seen 4m ago") does not fit beside a title. The popover
-    /// carries the full sentence.
-    private var shortLabel: String {
-        MacStatusChipPresentation.shortLabel(for: status)
-    }
-}
-
-enum MacStatusChipPresentation {
-    static func shortLabel(for status: BridgeStatus) -> String {
-        switch status {
-        case .online: return "Live"
-        case .awaitingMacActivity: return "Waiting for Mac"
-        case .offline: return "No iCloud"
-        case .macUnreachable: return "Mac unavailable"
-        case .deviceOffline: return "iPhone offline"
-        case .iCloudAccountAttention: return "iCloud sign-in"
-        case .stale(let minutesAgo): return "\(minutesAgo)m ago"
-        case .connecting: return "Connecting"
         }
     }
 }
 
 private struct MacStatusDetail: View {
-    let status: BridgeStatus
     let connection: NAPhoneConnection
     let lastSeenAt: Date?
     let lastSnapshotReadAt: Date?
@@ -320,7 +147,9 @@ private struct MacStatusDetail: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 7) {
-                Circle().fill(status.color).frame(width: 9, height: 9)
+                Circle().fill(connection.headline.state == .holds ? Color.green
+                              : connection.headline.state == .waiting ? Color.orange : Color.red)
+                    .frame(width: 9, height: 9)
                 Text(AliveConnection.line(connection))
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -348,23 +177,12 @@ private struct MacStatusDetail: View {
 
 }
 
-// MARK: - Sync error banner (Sweep R4 C11.3)
-//
-// `iCloudSyncEngine.syncError` has always been `@Published` and read by
-// nothing — a CloudKit decode failure (iCloudSyncEngine+Setup.swift) set a
-// string that no view rendered, so a screen showing stale data looked
-// identical to a screen showing fresh data.
-//
-// RENDER-ONLY. This adds no retry, no polling and no sync machinery; it shows
-// the string the engine already writes.
+// MARK: - Sync error banner
 
-/// One-line dismissible banner over the top of a screen. Tap to see the full
-/// text, X to dismiss. A NEW error text un-dismisses itself — dismissing
-/// "snapshots downloading" must not also silence a later decode failure.
+/// Shows the full engine warning; a new message or cleared error releases dismissal.
 struct MacSyncErrorBanner: View {
     private let sync = iCloudSyncEngine.shared
     @State private var dismissedMessage: String?
-    @State private var isExpanded = false
     @State private var showsConnection = false
 
     private var message: String? {
@@ -378,32 +196,23 @@ struct MacSyncErrorBanner: View {
         Group {
             if let message {
                 HStack(alignment: .top, spacing: 8) {
-                    Button {
-                        isExpanded.toggle()
-                    } label: {
-                        HStack(alignment: .top, spacing: 8) {
-                            Image(systemName: "exclamationmark.icloud")
-                                .foregroundStyle(.secondary)
-                                .accessibilityHidden(true)
-                            Text(message)
-                                .font(.footnote)
-                                .foregroundStyle(.primary)
-                                .lineLimit(nil)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .contentShape(Rectangle())
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "exclamationmark.icloud")
+                            .foregroundStyle(.secondary)
+                            .accessibilityHidden(true)
+                        Text(message)
+                            .font(.footnote)
+                            .foregroundStyle(.primary)
+                            .lineLimit(nil)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .accessibilityLabel("Sync warning: \(message)")
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Sync warning: \(message)")
-                    .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
-                    .accessibilityHint(isExpanded ? "Collapses the warning" : "Reads the full warning")
                     Button("Connection") { showsConnection = true }
                         .font(.footnote)
                         .buttonStyle(.plain)
                     Button {
                         dismissedMessage = message
-                        isExpanded = false
                     } label: {
                         Image(systemName: "xmark")
                             .font(.caption.weight(.semibold))
@@ -429,7 +238,6 @@ struct MacSyncErrorBanner: View {
         .sheet(isPresented: $showsConnection) {
             NavigationStack { SettingsViewFull(opensConnection: true) }
         }
-        .animation(AppMotion.snappy, value: isExpanded)
         // The latch must only survive as long as the condition does. Without
         // this, dismissing "snapshots still downloading", letting a sync
         // succeed, and then hitting the SAME failure again would leave the
@@ -438,7 +246,6 @@ struct MacSyncErrorBanner: View {
         .onChange(of: sync.syncError) { _, newValue in
             if MacSyncErrorBannerPresentation.normalizedMessage(newValue) == nil {
                 dismissedMessage = nil
-                isExpanded = false
             }
         }
     }

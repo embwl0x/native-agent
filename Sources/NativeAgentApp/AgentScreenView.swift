@@ -4,11 +4,7 @@ import AppToolRuntime
 
 // Blueprint: | `AgentScreenView.swift` | `AgentScreenView`: read-only agent home/room projection; preview never marks seen, writes or dispatches tools |
 
-/// Agent view (her-screen Phase 8, User 2026-09-23: "I want to see her view"):
-/// the glance line and her home or any room on it, exactly the text she
-/// receives, read-only in a monospace pane. HerScreenPreview reads without
-/// looking (nothing marked seen, nothing written) and never runs a tool; the
-/// engine projection re-reads on a tab switch or when her world's files change.
+/// The read-only projection shows the agent's text without marking it seen, writing state or running tools.
 struct AgentScreenView: View {
     private struct Watch: Equatable { let scope: String; let room: String }
 

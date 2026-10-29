@@ -2,14 +2,20 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ChatTurnContracts
-// Blueprint: | `ChatToolSessionInjection.swift` | `ChatToolSessionInjection`: verified-session → tool-loop-session selection and shared internal/tool-specific session injection |
+// Blueprint: | `ChatToolSessionInjection.swift` | `ChatToolSessionInjection`: explicit-input extraction, verified-session → tool-loop-session selection and shared internal/tool-specific session injection |
 
-/// Single source of truth for injecting the per-turn session id into tool input
-/// before dispatch, so the LLM doesn't have to remember to pass it. Both the
-/// structured tool loop AND the Anthropic text-compat tool loop call this — an
-/// earlier divergence between the two copies bounced calls with
-/// missing_session_id. Keep this the ONLY implementation.
+/// Shared session input handling; explicit caller fields confer no verified identity.
 package enum ChatToolSessionInjection {
+    package static func explicitSessionId(in input: [String: JSONValue]) -> String {
+        for key in ["__session_id", "session_id", "sessionId"] {
+            if case .string(let raw)? = input[key] {
+                let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { return trimmed }
+            }
+        }
+        return ""
+    }
+
     /// Transport-verified session first, then the direct tool loop's session.
     /// Without either, leave the caller's explicit input intact.
     package static var currentSession: String? {

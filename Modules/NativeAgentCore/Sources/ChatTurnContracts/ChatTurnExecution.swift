@@ -19,18 +19,7 @@ package final class ChatTurnExecution: @unchecked Sendable {
         persistedHistoryRunID = id
     }
 
-    /// PROVENANCE CARRIED BY THE CALLER, for the whole of this invocation.
-    ///
-    /// A bot run's own two rows — the brief that started it and the reply it
-    /// produced — are the bot's machinery, not a moment she lived, exactly as
-    /// the imported shelf receipts are (Agent, item 5, 2026-09-14). Until this
-    /// existed only the IMPORT was stamped, so a live run's brief and reply
-    /// went through ordinary persistence unmarked and fed felt appraisal.
-    ///
-    /// Set explicitly by the entry that knows what it is starting; never
-    /// inferred from `surface`, because a PERSON steering into a bot session
-    /// arrives on that same surface and what she hears from a person is
-    /// something she lived.
+    /// The caller marks mechanical bot rows explicitly; the surface cannot distinguish person-authored input.
     private let invocationRow: CognitiveMechanicalRowKind?
     package init(mechanicalRow: CognitiveMechanicalRowKind? = nil) {
         self.invocationRow = mechanicalRow
@@ -48,10 +37,7 @@ package final class ChatTurnExecution: @unchecked Sendable {
         let text = [detail, capabilityNote].compactMap { $0 }.joined(separator: "\n")
         return text.isEmpty ? nil : text
     }
-    /// Her-screen Phase 6 — the source-frame fingerprint of the last image
-    /// `screen` attached per window this turn. A match means the window has
-    /// not changed, so the picture already in her context stands, while that
-    /// picture's pixels are still there (`keepPixels`).
+    /// A matching source fingerprint reuses the window's frame while its image remains in context.
     private var attachedPixels: [String: (fingerprint: String, frameID: String, image: String)] = [:]
     package func attachedPixelFrame(window: String, fingerprint: String) -> String? {
         lock.lock(); defer { lock.unlock() }
@@ -112,9 +98,7 @@ package final class ChatTurnExecution: @unchecked Sendable {
         waitingRow = row
         waitingRowSynthesized = synthesized
     }
-    /// True when the kept row is the card lane's stock sentence, not words the
-    /// model wrote. Only that row is mechanical to the felt organ; the model's
-    /// own prose beside a card is still an experience she had (Sol, 2026-09-14).
+    /// Only synthesized card prose is mechanical to the felt organ; model-authored prose remains experience.
     private var waitingRowSynthesized = false
     package var waitingTranscriptRowIsSynthesized: Bool {
         lock.lock(); defer { lock.unlock() }
@@ -139,36 +123,20 @@ package final class ChatTurnExecution: @unchecked Sendable {
         guard let execution = ChatTurnExecution.current,
               let need = execution.waitingInteraction
         else { return prose }
-        // THE TRANSCRIPT ROW IS THE CARD LANE'S, ON EVERY LANE. The card is
-        // persisted on the row beneath it whatever surface raised it, so the
-        // Mac draws both — and a bridge turn that persisted the long compat
-        // sentence showed Agent's reader the sentence AND the card saying the
-        // same thing twice (Agent, live on 4fe15f5ea). The long sentence is a
-        // TRANSPORT fact — it exists because Telegram, Slack, the bridge and
-        // iOS delivery have text and nothing else — so it is handed back to
-        // the caller and never written to the conversation.
+        // Every surface persists the card-lane row; expanded transport prose stays out of the transcript.
         let row = prose.isEmpty ? need.cardLaneProse : prose
         execution.keepWaitingRow(row, synthesized: prose.isEmpty)
-        // A lane that DRAWS the card gets one sentence in her voice and
-        // nothing more: the card under it already carries the reason, the way
-        // forward and the cost of saying no, so repeating them in prose is the
-        // card said twice (Agent, 2026-09-13). Her own words, when the model
-        // wrote any, always win.
+        // Card-rendering surfaces keep her prose when present and add no transport explanation.
         guard ChatToolSessionContext.replyIsTextOnly else { return row }
         let spoken = need.textLaneProse
         guard !spoken.isEmpty else { return prose }
         let suffix = prose.isEmpty ? spoken : "\n\n" + spoken
-        // This sentence exists only in the TERMINAL result: no delta ever
-        // carried it, because the model never wrote it. A streaming consumer
-        // that rebuilds the reply from deltas — and a pure tool-to-card turn
-        // streams none at all — then sees a final its deltas do not match.
-        // Kept here so the lane about to yield `.final` can stream it first.
+        // Progress carries the synthesized suffix before the execution scope ends.
         execution.keepStreamSuffix(suffix)
         return prose + suffix
     }
 
-    /// The text-lane sentence `waitingReply` added after the last delta, taken
-    /// exactly once by the lane that is about to yield `.final`.
+    /// The text-lane sentence `waitingReply` added, consumed once through progress.
     private var streamSuffix: String?
     package func keepStreamSuffix(_ text: String) {
         lock.lock(); defer { lock.unlock() }
@@ -189,12 +157,7 @@ package final class ChatTurnExecution: @unchecked Sendable {
         ChatTurnExecution.current?.waitingTranscriptRow ?? reply
     }
 
-    /// True when `transcriptReply` is handing back the card lane's row rather
-    /// than an ordinary reply. The felt organ reads this as PROVENANCE: a row
-    /// the interaction lane produced is not an experience she had, and the only
-    /// honest way to know that is to be told by the writer. It used to be
-    /// guessed from text fragments, which dropped a genuine reply that happened
-    /// to contain one of the card lane's stock phrases.
+    /// The writer marks synthesized card rows as mechanical; text matching never determines provenance.
     package static var transcriptReplyIsCardLane: Bool {
         ChatTurnExecution.current?.waitingTranscriptRowIsSynthesized ?? false
     }

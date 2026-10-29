@@ -7,42 +7,6 @@ import PersistenceCore
 import Foundation
 import ProviderRouting
 // Blueprint: | `EngineProviderHelpers.swift` | ProvidersFacade checked settings refresh, credential/OAuth verdicts, model grouping, eligibility, snapshot-owned model/account inheritance, auth normalization and quiet provider policy; routing-derived selections share SettingsSnapshot. LatestRead orders settings and failures; committed routing publishes through write and retires prior session reads before checked session refresh. |
-extension ProvidersFacade {
-    public nonisolated static func readModelRoutingConfig(dataRoot: URL) async throws -> ModelRoutingConfig {
-        let snapshot = try await SwiftNativeProviderRouting(dataRoot: dataRoot).checkedRoutingSnapshot()
-        return try modelRoutingConfig(from: snapshot)
-    }
-
-    public nonisolated static func modelRoutingConfig(from snapshot: ProviderRoutingSnapshot) throws -> ModelRoutingConfig {
-        func pref(_ surface: String) throws -> ModelSurfacePreference {
-            guard let value = snapshot.preferences[surface] else {
-                throw ProviderRoutingError.underlying("canonical routing snapshot is incomplete")
-            }
-            return ModelSurfacePreference(
-                surface: surface, model: value.model, reasoningEffort: value.reasoningEffort,
-                serviceTier: value.serviceTier, source: snapshot.activeProviders[surface],
-                modelKnown: value.modelKnown
-            )
-        }
-        return try ModelRoutingConfig(
-            status: "ok", defaultModel: pref("chat").model, fallbackModels: [],
-            reasoningEfforts: defaultReasoningEffortOptions,
-            current: ModelRoutingCurrent(
-                chat: pref("chat"), telegram: pref("telegram"), ios: pref("ios"),
-                executions: pref(WorkshopSurfaceVocabulary.canonical), autonomy: pref("autonomy"),
-                swarms: pref("swarms"), dream: pref("dream"), training: pref("training")
-            )
-        )
-    }
-
-    public nonisolated static func stringValue(_ value: Any?) -> String? {
-        if let string = value as? String { return string }
-        if let number = value as? NSNumber { return number.stringValue }
-        return nil
-    }
-
-}
-
 @MainActor
 extension ProvidersFacade {
     public struct SettingsSnapshot: Sendable {
@@ -90,7 +54,7 @@ extension ProvidersFacade {
             }.value
             if catalog == nil {
                 do {
-                    catalog = try await facade.modelCatalog(refresh: false, routingSnapshot: snapshot.routing)
+                    catalog = try await facade.modelCatalog(refresh: false)
                 } catch { catalogError = cause(error, "load the model list") }
             }
             return .loaded(try settingsSnapshot(
@@ -109,19 +73,20 @@ extension ProvidersFacade {
         routing: ProviderRoutingSnapshot, providers: [ProviderInfo], catalog: ModelCatalogResponse?,
         catalogError: String?, rowSet: ProviderSurfaceRowSet
     ) throws -> SettingsSnapshot {
-        var catalog = catalog
-        let config = try Self.modelRoutingConfig(from: routing)
-        catalog?.current = config.current
-        catalog?.defaultModel = config.current.chat.model
+        var choices: [String: [String: Bool]] = [:]
+        var unavailableModels: [String: Bool] = [:]
+        for (surface, preference) in routing.preferences {
+            let providerID = routing.activeProviders[surface] ?? ""
+            if choices[providerID]?[preference.model] == nil {
+                choices[providerID, default: [:]][preference.model] = Self.savedModelIsKnownAbsent(
+                    providerId: providerID, model: preference.model, providers: providers, dataRoot: dataRoot)
+            }
+            unavailableModels[surface] = choices[providerID]?[preference.model]
+        }
         return SettingsSnapshot(
             routing: routing, providers: providers, catalog: catalog, catalogError: catalogError,
             rowSet: rowSet,
-            unavailableModels: Dictionary(uniqueKeysWithValues: routing.preferences.map { surface, preference in
-                (surface, Self.savedModelIsKnownAbsent(
-                    providerId: routing.activeProviders[surface] ?? "", model: preference.model,
-                    providers: providers, dataRoot: dataRoot
-                ))
-            }),
+            unavailableModels: unavailableModels,
             oauthStatuses: Dictionary(uniqueKeysWithValues: ["openai_oauth_direct", "anthropic_oauth_direct", "xai_oauth_direct"].map {
                 ($0, NativeOAuthFlow.signInStatus(providerID: $0, dataRoot: dataRoot))
             }),
@@ -145,11 +110,11 @@ extension ProvidersFacade {
 extension ProvidersFacade {
     public var hasReadyConnection: Bool { connections.contains { $0.auth_status.eligible } }
 
-    public func selection(for surface: String) -> SurfaceSelection {
+    public func selection(for surface: String) -> ProviderTurnChoice {
         let preference = settings?.preferences[surface]
-        return SurfaceSelection(provider: settings?.activeProviders[surface] ?? "",
+        return ProviderTurnChoice(provider: settings?.activeProviders[surface] ?? "",
             model: preference?.model ?? "", reasoningEffort: preference?.reasoningEffort ?? "",
-            fastMode: preference?.serviceTier == "priority")
+            fast: preference?.serviceTier == "priority")
     }
 
     public nonisolated static func chatModelIsReady(providers: [ProviderInfo], providerID: String, model: String) -> Bool {
@@ -227,8 +192,7 @@ extension ProvidersFacade {
 
     private nonisolated static let fallbackReasoningEfforts = ["low", "medium", "high", "xhigh"]
     public nonisolated static func modelsForProvider(_ providerId: String, providers: [ProviderInfo], catalogModels: [ModelCatalogItem]) -> [SurfaceModelChoice] {
-        // S12a: a fetched catalog that could not load is empty and says why
-        // (`models_note`); it never borrows the provider-neutral list below.
+        // A failed fetched catalog stays empty with `models_note`; it never borrows the provider-neutral list.
         if let prov = providers.first(where: { $0.provider_id == providerId }),
            !prov.models.isEmpty || Self.dynamicCatalogProviders.contains(providerId) {
             return prov.models.map {
@@ -261,23 +225,11 @@ extension ProvidersFacade {
     /// be loaded, so its silence about a model is not evidence of anything.
     private nonisolated static let dynamicCatalogProviders: Set<String> = ["openrouter", "moonshot"]
 
-    /// Whether a LIVE catalogue for this provider says the saved model is gone.
-    ///
-    /// 2026-09-06: the old test was "the choice list is non-empty", and
-    /// `modelsForProvider` substitutes the provider-neutral global catalogue
-    /// whenever a provider's own list is empty — so a dynamic provider with no
-    /// catalogue yet borrowed someone else's list and the saved model was
-    /// labelled Unavailable on it. Evidence now has to come from the provider
-    /// itself: OpenRouter's own live-backed cache (`.unknown` until one exists),
-    /// or a static provider's compiled-in list, which is the whole truth about
-    /// that provider. Moonshot has no live/fallback discriminator, so it never
-    /// convicts. Anything unproven shows the saved model plainly.
+    /// Absence requires this provider's complete, fresh catalog or compiled-in
+    /// list. Moonshot cannot prove completeness; unknown choices stay visible.
     private nonisolated static func savedModelIsKnownAbsent(providerId: String, model: String, providers: [ProviderInfo], dataRoot: URL) -> Bool {
         if providerId == "openrouter" {
-            // User, 2026-09-06: this read the DEFAULT data root while the rest
-            // of the screen works off the model's scoped one, so under an
-            // override the verdict came from a catalog belonging to another
-            // root — including the "Unavailable" label on a saved model.
+            // Availability belongs to this settings read's data root.
             return OpenRouterModelCatalog.cachedAvailability(
                 of: model,
                 dataRoot: dataRoot
@@ -316,42 +268,28 @@ extension ProvidersFacade {
         routing.modelOverrideSurfaces
     }
 
-    public nonisolated static func pickerProviders(_ providers: [ProviderInfo], activeProviders: [String: String]) -> [ProviderInfo] {
-        let activeIds = Set(activeProviders.values)
+    public nonisolated static func pickerProviders(_ providers: [ProviderInfo], selections: [String: ProviderTurnChoice]) -> [ProviderInfo] {
+        let activeIds = Set(selections.values.map(\.provider))
         return providers.filter { $0.provider_id == "codex" || $0.auth_status.eligible
             || activeIds.contains($0.provider_id) }
     }
 }
 
 extension ProvidersFacade {
-    public struct SurfaceSelection: Hashable, Sendable {
-        public let provider: String
-        public let model: String
-        public let reasoningEffort: String
-        public let fastMode: Bool
-
-        public init(provider: String, model: String, reasoningEffort: String, fastMode: Bool) {
-            self.provider = provider
-            self.model = model
-            self.reasoningEffort = reasoningEffort
-            self.fastMode = fastMode
-        }
-
-        fileprivate static let empty = SurfaceSelection(provider: "codex", model: "", reasoningEffort: "", fastMode: false)
-    }
+    private nonisolated static let emptySelection = ProviderTurnChoice(provider: "codex", model: "", reasoningEffort: "", fast: false)
 
     /// The surface a group's row reads from: the most common choice among its
     /// surfaces, ties going to the group's first surface — so the Chat group
     /// keeps speaking for `chat`.
-    public nonisolated static func leadSurface(_ group: ProviderSurfaceGroup, selections: [String: SurfaceSelection]) -> String {
+    public nonisolated static func leadSurface(_ group: ProviderSurfaceGroup, selections: [String: ProviderTurnChoice]) -> String {
         // Chat is the root the others inherit from, so its group always shows Chat's own choice.
         if group.surfaces.contains("chat") { return "chat" }
         guard var lead = group.surfaces.first else { return "chat" }
-        var counts: [SurfaceSelection: Int] = [:]
-        for surface in group.surfaces { counts[(selections[surface] ?? .empty), default: 0] += 1 }
-        var best = counts[(selections[lead] ?? .empty)] ?? 0
+        var counts: [ProviderTurnChoice: Int] = [:]
+        for surface in group.surfaces { counts[(selections[surface] ?? emptySelection), default: 0] += 1 }
+        var best = counts[(selections[lead] ?? emptySelection)] ?? 0
         for surface in group.surfaces.dropFirst() {
-            let count = counts[(selections[surface] ?? .empty)] ?? 0
+            let count = counts[(selections[surface] ?? emptySelection)] ?? 0
             if count > best { best = count; lead = surface }
         }
         return lead
@@ -359,11 +297,11 @@ extension ProvidersFacade {
 
     /// Independent effort does not make an inheriting group mixed. Only a
     /// model/account override makes its members' saved choices relevant here.
-    public nonisolated static func groupIsMixed(_ group: ProviderSurfaceGroup, selections: [String: SurfaceSelection], explicitSurfaces: Set<String>) -> Bool {
-        guard groupHasOverride(group, explicitSurfaces: explicitSurfaces), let first = group.surfaces.first.map({ selections[$0] ?? .empty }) else {
+    public nonisolated static func groupIsMixed(_ group: ProviderSurfaceGroup, selections: [String: ProviderTurnChoice], explicitSurfaces: Set<String>) -> Bool {
+        guard groupHasOverride(group, explicitSurfaces: explicitSurfaces), let first = group.surfaces.first.map({ selections[$0] ?? emptySelection }) else {
             return false
         }
-        return group.surfaces.dropFirst().contains { (selections[$0] ?? .empty) != first }
+        return group.surfaces.dropFirst().contains { (selections[$0] ?? emptySelection) != first }
     }
 
     /// Whether the group holds its own model/account choice.
@@ -398,15 +336,7 @@ extension ProvidersFacade {
             + FirstPartyModelCatalog.anthropicModels
             + FirstPartyModelCatalog.xAIModels
         ).enumerated().map { index, model in
-            ModelCatalogItem(
-                id: model.id,
-                displayName: model.name,
-                description: nil,
-                defaultReasoningEffort: model.defaultReasoningEffort,
-                supportedReasoningEfforts: model.supportedReasoningEfforts,
-                supportsFast: model.supportsFast,
-                priority: index
-            )
+            ModelCatalogItem(model, priority: index)
         }
         let sourceModels = catalog?.models ?? CodexSelectableModelCatalog.modelCatalogItems() + fallbackModels
         var seen: Set<String> = []
@@ -427,7 +357,7 @@ extension ProvidersFacade {
     }
 
     public nonisolated static func reasoningOptions(from catalog: ModelCatalogResponse?, model: String) -> [ReasoningEffortOption] {
-        ProviderRouting.reasoningOptions(available: catalog?.reasoningEfforts ?? defaultReasoningEffortOptions,
+        NativeAgentShared.reasoningOptions(available: catalog?.reasoningEfforts ?? defaultReasoningEffortOptions,
             supported: catalog?.models.first(where: { $0.id == model })?.supportedReasoningEfforts, id: { $0.id })
     }
 
@@ -578,7 +508,7 @@ extension ProvidersFacade {
         if verb == "list" {
             return .object(["status": .string("ok"), "accounts": .array(accounts.map { quietProviderRow($0) })])
         }
-        let id = AppToolExecutor.inputString(input["provider"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let id = input["provider"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard let account = accounts.first(where: { $0.provider_id == id }) else {
             return AppToolExecutor.failure(
                 "unknown_provider",
@@ -618,7 +548,7 @@ extension ProvidersFacade {
                     "no_model_list",
                     "\(name)'s model list isn't loaded, so there is nothing to choose from. Run provider.refresh, then try again.")
             }
-            let model = AppToolExecutor.inputString(input["model"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let model = input["model"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             guard offered.contains(model) else {
                 return AppToolExecutor.failure(
                     "bad_model",
@@ -654,7 +584,7 @@ extension ProvidersFacade {
                     extra: ["provider": .string(id), "effects": .string("unknown")])
             }
             HarnessDecidedRow.post(requester: "Full Mac", tool: "provider.disconnect \(id)",
-                                   sessionID: AppToolExecutor.inputString(input["__session_id"]),
+                                   sessionID: input["__session_id"]?.scalarText,
                                    dataRoot: dataRoot)
             return .object(["status": .string("ok"), "provider": .string(id), "changed": .bool(true),
                             "detail": .string("\(name) is disconnected. \(outcome.detail) Signing back in is the owner's.")])

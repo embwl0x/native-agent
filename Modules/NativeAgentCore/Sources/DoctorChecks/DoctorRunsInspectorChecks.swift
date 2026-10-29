@@ -3,6 +3,7 @@ import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 import TurnTrace
+import SwarmRuns
 // Blueprint: | `DoctorRunsInspectorChecks.swift` | Inspector health verdict from the engine's persisted-trace observation state |
 
 /// Reads runs.json exactly as the Runs page does (bare array or {"runs": [...]}).
@@ -13,21 +14,13 @@ private enum DoctorRunLedgerRead {
         guard let size = try path.resourceValues(forKeys: [.fileSizeKey]).fileSize,
               size <= 12 * 1024 * 1024 else { throw ReadError.oversized }
         let data = try Data(contentsOf: path)
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601  // same as JSONDecoder.nativeAgent
-        if let rows = try? decoder.decode([RunRecord].self, from: data) { return rows.count }
-        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let runs = object["runs"],
-           let runsData = try? JSONSerialization.data(withJSONObject: runs),
-           let rows = try? decoder.decode([RunRecord].self, from: runsData) { return rows.count }
-        throw ReadError.malformed
+        return try RunLedger.records(from: data).count
     }
 
-    enum ReadError: Error { case oversized, malformed }
+    enum ReadError: Error { case oversized }
 }
 
-/// The ledger heals itself: the next append sets an unreadable file aside as
-/// runs.json.corrupt-*.bak and starts fresh. Doctor reports; it never rewrites.
+/// Doctor reports damaged history without rewriting its retained rows.
 public struct RunLedgerIntegrityCheck: DoctorCheck {
     public let id = "runs.ledger_integrity"
     public let title = "Runs history"
@@ -138,7 +131,8 @@ public struct TurnTraceIntegrityCheck: RepairingDoctorCheck {
             repair: salvageable ? "Press Repair in Diagnostics → Health checks to back up each damaged trace and keep its readable rows." : nil,
             receipt: receipt, repairApplied: !receipts.isEmpty,
             human_action: file.map { ToolFailureError.fileRepairInstruction($0,
-                shape: "This day file holds one persisted TurnTraceEvent JSON object per line, with its original event identity, timestamp and payload.") })
+                shape: "This day file holds one persisted TurnTraceEvent JSON object per line, with its original event identity, timestamp and payload.") },
+            repair_available: salvageable)
     }
 
     private enum TraceReadError: Error { case oversized }

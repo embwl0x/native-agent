@@ -1,38 +1,42 @@
 import CryptoKit
 import Foundation
 import NativeAgentShared
+import ChatTurnContracts
+import PersistenceCore
+import TrustCenter
 
-// Blueprint: | `InlineInteractionSignatureWitness.swift` | `InlineInteractionSignatureWitness`: cryptographic witness for signed card continuation; persisted transcript claims confer no signing authority |
+// Blueprint: | `InlineInteractionSignatureWitness.swift` | Shared continuation stamping binds replay identity, peer steering, DataRootLife and the persisted origin to a cryptographic witness; persisted transcript claims confer no signing authority |
 
-/// The seam that lets a card raised by a SIGNED turn resume as one, without
-/// ever writing "this was signed" into the transcript as a fact.
-///
-/// A signed iOS turn carries `commandSignatureVerified` from cryptographic
-/// evidence the inbound path checked against the live pairing secret. The
-/// persisted envelope deliberately does NOT carry that flag — a persisted
-/// trust verdict is exactly the "authority from history" `TurnEnvelope`
-/// forbids — so a card raised on the phone used to replay with no signature at
-/// all and the iOS trust gate refused it.
-///
-/// The fix is not to persist the boolean. It is to persist a RECEIPT: a MAC
-/// over this continuation's own identity, minted from the same pairing secret
-/// at the moment the signed turn raised the card, and RE-VERIFIED against the
-/// live secret at replay. A transcript nobody signed cannot produce one, and a
-/// receipt minted under a secret that has since been rotated — the phone was
-/// unpaired — stops verifying, which is the honest answer: sign in again.
-///
-/// What the MAC covers is the whole `Witness` below, not just the resume id.
-/// A MAC over the resume id alone is a receipt for "some card", so a valid one
-/// lifted off any signed card could be pasted onto an edited row — a different
-/// tool, different arguments, another session — and that row would replay with
-/// signed authority. The witness binds the receipt to the exact row being
-/// replayed: which session, which interaction, which origin, which tool, and a
-/// digest of the exact argument text. Change any of it and the MAC no longer
-/// verifies.
-///
-/// The key material lives in the app (`PairingSecretManager`), so the two
-/// halves are installed at launch. Uninstalled, minting returns nil and
-/// verification refuses: a build with no pairing owner grants nothing.
+extension InlineInteraction.Continuation {
+    /// Stamp replay input once; the witness covers the exact origin the writer persists.
+    package static func stamped(
+        for interaction: InlineInteraction, sessionID: String,
+        originRunId: String? = nil, toolCallId: String? = nil,
+        toolName: String?, toolArgumentsJSON: String?, mode: Mode,
+        state: ResumeState = .waiting, resumeText: String? = nil,
+        peerSurface: String, originEnvelope: TurnEnvelope?, dataRoot: URL
+    ) throws -> Self {
+        let steer = PeerDataTaint.carried(
+            peerBridge: PeerTurnEffectPolicy.isPeerBridge(surface: peerSurface),
+            peerID: ChatToolSessionContext.envelope?.verifiedUserId)
+        var continuation = Self(
+            originRunId: originRunId, toolCallId: toolCallId,
+            toolName: toolName, toolArgumentsJSON: toolArgumentsJSON,
+            mode: mode, state: state, resumeRunId: "interaction-\(interaction.id)",
+            resumeText: resumeText, peerSources: steer.sources, elevatedPeerSources: steer.elevated)
+        continuation.lifeID = try DataRootLife.current(in: dataRoot)
+        continuation.signatureReceipt = InlineInteractionSignatureWitness.receipt(for: .init(
+            sessionID: sessionID, interactionID: interaction.id, continuation: continuation,
+            originEnvelope: originEnvelope, interaction: interaction))
+        return continuation
+    }
+}
+
+/// A signed card resumes only through a MAC over its full witness, verified
+/// against live pairing material. Persisted envelopes carry no signing verdict.
+/// The receipt binds the session, card, origin, replay arguments and text;
+/// editing those fields or rotating the pairing secret invalidates it.
+/// The app installs the pairing owner; without it minting grants nothing.
 public enum InlineInteractionSignatureWitness {
     /// Everything the receipt is bound to. Assembled identically at mint time
     /// and at replay — the replay side rebuilds it from the persisted row, so

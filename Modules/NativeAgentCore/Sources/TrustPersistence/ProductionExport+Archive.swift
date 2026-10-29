@@ -5,7 +5,7 @@ import PersistenceCore
 import MemoryV2
 import Privacy
 import SystemOps
-// Blueprint: | `ProductionExport+Archive.swift` | Production archives consume PrivacyMap.productionExportRelativePaths; production, support and local backup input scopes are complete allowlists with unselected scopes excluded; the backup owner's recursive copier snapshots nested memory SQLite and omits lock/journal sidecars; canonical memory backup and persona root, credential exclusions with actual skipped paths; support bundles keep their separate selection and registry rows |
+// Blueprint: | `ProductionExport+Archive.swift` | Production archives consume PrivacyMap.productionExportRelativePaths; production, support and local backup input scopes are complete allowlists with unselected scopes excluded; the backup owner's recursive copier snapshots nested memory SQLite and omits lock/journal sidecars; canonical memory backup and persona root, credential exclusions with actual skipped paths; support bundles keep their separate selection and registry rows; staging is removed on return or failure and archives use the backup owner's streaming digest |
 
 extension ProductionExport {
     public typealias ArtifactProcessRunner = @Sendable (String, [String], URL, TimeInterval) async throws -> (status: Int32, stdout: String, stderr: String)
@@ -14,7 +14,7 @@ extension ProductionExport {
     /// (memory through a consistent SQLite backup), a manifest, as one
     /// checksummed tar.gz recorded in the export registry.
     public static func createArchive<Hardening: Encodable>(
-        dataRoot root: URL, host: TrustBackupHost, runProcess: ArtifactProcessRunner,
+        dataRoot root: URL, runProcess: ArtifactProcessRunner,
         hardening: () async throws -> Hardening
     ) async throws -> ProductionExport {
         let now = TrustBackupPersistence.nativeArtifactTimestamp()
@@ -27,9 +27,9 @@ extension ProductionExport {
 
         let fm = FileManager.default
         try fm.createDirectory(at: exportRoot, withIntermediateDirectories: true)
-        try? fm.removeItem(at: stageDir)
         try? fm.removeItem(at: archiveURL)
         try fm.createDirectory(at: stageDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: stageDir) }
 
         try TrustBackupPersistence.writeCodableJSON(try await hardening(), to: stageDir.appendingPathComponent("production_hardening.json"))
         try TrustBackupPersistence.writeCodableJSON(PrivacyMap(dataRoot: root, generatedAt: SwiftNativeManifestSigner.isoTimestamp(Date())), to: stageDir.appendingPathComponent("privacy_map.json"))
@@ -69,37 +69,16 @@ extension ProductionExport {
         var scope = TrustBackupPersistence.scopeNames(for: copied)
         if !scope.contains("diagnostics") { scope.insert("diagnostics", at: 0) }
 
-        let manifest = Self.artifactManifest(
-            id: id,
-            kind: "export",
-            createdAt: now,
-            scope: scope,
-            copied: copied,
-            redactions: excluded,
-            host: host
+        return try await Self.createArchive(
+            id: id, kind: "export", createdAt: now, scope: scope, copied: copied, redactions: excluded,
+            sourceDirectory: stageDir, archiveURL: archiveURL, registryRoot: exportRoot, runProcess: runProcess
         )
-        try TrustBackupPersistence.writeJSONValue(manifest, to: stageDir.appendingPathComponent("manifest.json"))
-
-        try await Self.createTarGz(sourceDirectory: stageDir, archiveURL: archiveURL, runProcess: runProcess)
-        let checksum = try await Self.sha256Hex(ofFile: archiveURL, currentDirectory: exportRoot, runProcess: runProcess)
-        let sizeBytes = try Self.fileSizeBytes(archiveURL)
-        let record = ProductionExport(
-            id: id,
-            kind: "export",
-            path: archiveURL.path,
-            scope: scope,
-            checksum: checksum,
-            sizeBytes: sizeBytes,
-            createdAt: now
-        )
-        try await Self.appendProductionExport(record, registryRoot: exportRoot)
-        return record
     }
 
     /// A support bundle: diagnostics and health plus logs-and-state paths,
     /// with transcripts and the memory database left out.
     public static func createSupportBundle<Diagnostics: Encodable, Health: Encodable>(
-        dataRoot root: URL, host: TrustBackupHost, runProcess: ArtifactProcessRunner,
+        dataRoot root: URL, runProcess: ArtifactProcessRunner,
         diagnostics: () async throws -> Diagnostics, health: () throws -> Health
     ) async throws -> ProductionExport {
         let now = TrustBackupPersistence.nativeArtifactTimestamp()
@@ -116,9 +95,9 @@ extension ProductionExport {
         let fm = FileManager.default
         try fm.createDirectory(at: supportRoot, withIntermediateDirectories: true)
         try fm.createDirectory(at: exportRoot, withIntermediateDirectories: true)
-        try? fm.removeItem(at: stageDir)
         try? fm.removeItem(at: archiveURL)
         try fm.createDirectory(at: stageDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: stageDir) }
 
         try TrustBackupPersistence.writeCodableJSON(try await diagnostics(), to: stageDir.appendingPathComponent("support_diagnostics.json"))
         try TrustBackupPersistence.writeCodableJSON(try health(), to: stageDir.appendingPathComponent("health.json"))
@@ -134,31 +113,10 @@ extension ProductionExport {
         var scope = TrustBackupPersistence.scopeNames(for: copied)
         if !scope.contains("diagnostics") { scope.insert("diagnostics", at: 0) }
 
-        let manifest = Self.artifactManifest(
-            id: id,
-            kind: "support",
-            createdAt: now,
-            scope: scope,
-            copied: copied,
-            redactions: excluded,
-            host: host
+        return try await Self.createArchive(
+            id: id, kind: "support", createdAt: now, scope: scope, copied: copied, redactions: excluded,
+            sourceDirectory: stageDir, archiveURL: archiveURL, registryRoot: exportRoot, runProcess: runProcess
         )
-        try TrustBackupPersistence.writeJSONValue(manifest, to: stageDir.appendingPathComponent("manifest.json"))
-
-        try await Self.createTarGz(sourceDirectory: stageDir, archiveURL: archiveURL, runProcess: runProcess)
-        let checksum = try await Self.sha256Hex(ofFile: archiveURL, currentDirectory: supportRoot, runProcess: runProcess)
-        let sizeBytes = try Self.fileSizeBytes(archiveURL)
-        let record = ProductionExport(
-            id: id,
-            kind: "support",
-            path: archiveURL.path,
-            scope: scope,
-            checksum: checksum,
-            sizeBytes: sizeBytes,
-            createdAt: now
-        )
-        try await Self.appendProductionExport(record, registryRoot: exportRoot)
-        return record
     }
 
 
@@ -178,16 +136,19 @@ extension ProductionExport {
         "cutover",
     ]
 
-    private static func artifactManifest(
+    private static func createArchive(
         id: String,
         kind: String,
         createdAt: String,
         scope: [String],
         copied: [String],
         redactions: [String],
-        host: TrustBackupHost
-    ) -> JSONValue {
-        .object([
+        sourceDirectory: URL,
+        archiveURL: URL,
+        registryRoot: URL,
+        runProcess: ArtifactProcessRunner
+    ) async throws -> ProductionExport {
+        let manifest: JSONValue = .object([
             "app": .string("NativeAgent"),
             "createdAt": .string(createdAt),
             "id": .string(id),
@@ -195,11 +156,9 @@ extension ProductionExport {
             "scope": .array(scope.map { .string($0) }),
             "copied": .array(copied.map { .string($0) }),
             "redactions": .array(redactions.map { .string($0) }),
-            "version": .string(host.applicationVersion()),
+            "version": .string(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev"),
         ])
-    }
-
-    private static func createTarGz(sourceDirectory: URL, archiveURL: URL, runProcess: ArtifactProcessRunner) async throws {
+        try TrustBackupPersistence.writeJSONValue(manifest, to: sourceDirectory.appendingPathComponent("manifest.json"))
         let result = try await runProcess(
             "/usr/bin/tar",
             ["-czf", archiveURL.path, "-C", sourceDirectory.path, "."],
@@ -211,35 +170,18 @@ extension ProductionExport {
                 NSLocalizedDescriptionKey: "tar failed: \(SystemGitActions.processDetail(result))"
             ])
         }
-    }
-
-    private static func sha256Hex(ofFile file: URL, currentDirectory: URL, runProcess: ArtifactProcessRunner) async throws -> String {
-        let result = try await runProcess(
-            "/usr/bin/shasum",
-            ["-a", "256", file.path],
-            currentDirectory,
-            60
+        let digest = try TrustBackupPersistence.fileDigest(archiveURL)
+        let record = ProductionExport(
+            id: id,
+            kind: kind,
+            path: archiveURL.path,
+            scope: scope,
+            checksum: digest.sha256,
+            sizeBytes: Int(digest.sizeBytes),
+            createdAt: createdAt
         )
-        guard result.status == 0 else {
-            throw NSError(domain: "NativeAgentArtifact", code: Int(result.status), userInfo: [
-                NSLocalizedDescriptionKey: "shasum failed: \(SystemGitActions.processDetail(result))"
-            ])
-        }
-        guard let first = result.stdout.split(whereSeparator: \.isWhitespace).first else {
-            throw NSError(domain: "NativeAgentArtifact", code: -1, userInfo: [
-                NSLocalizedDescriptionKey: "shasum returned no checksum"
-            ])
-        }
-        return String(first)
-    }
-
-    private static func fileSizeBytes(_ url: URL) throws -> Int {
-        let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
-        return (attrs[.size] as? NSNumber)?.intValue ?? 0
-    }
-
-    private static func appendProductionExport(_ record: ProductionExport, registryRoot: URL) async throws {
         let path = registryRoot.appendingPathComponent("registry.json")
         try await TrustBackupPersistence.appendRegistryRow(record.row, path: path, id: record.id)
+        return record
     }
 }

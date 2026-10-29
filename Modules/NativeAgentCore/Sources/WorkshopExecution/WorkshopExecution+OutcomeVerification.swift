@@ -1,18 +1,12 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
+import ChatToolParsing
 // Blueprint: | `WorkshopExecution+OutcomeVerification.swift` | `WorkshopExecutorLoop`: `unmetSuccessCriterion`, `verifyCompletedOutcome` |
 
 extension WorkshopExecutorLoop {
-    /// W3 success-criterion check, pure and testable. Returns a human detail
-    /// string when the execution's own definition of success is unmet, nil
-    /// when satisfied or when no criterion exists.
-    ///
-    /// Two criterion sources, both matched by CONTAINMENT against the joined
-    /// result content, excluding receipt metadata (exact equality would
-    /// false-fail on quoting/wrapping):
-    /// 1. Every non-empty string entry in `expected_outputs`.
-    /// 2. An exact-output objective: "Return exactly: <phrase>" (case-
-    ///    insensitive marker; phrase runs to the first sentence end).
+    /// Explicit output phrases match produced content, excluding receipt metadata.
+    /// Objective prose never creates a criterion.
     static func unmetSuccessCriterion(_ record: WorkshopExecutionRecord) -> String? {
         let combinedOutput = record.stepsCompleted.compactMap { step -> String? in
             guard case .object(let obj) = step else { return nil }
@@ -28,24 +22,6 @@ extension WorkshopExecutorLoop {
             }
         }
 
-        let marker = "return exactly:"
-        if let range = record.objective.range(of: marker, options: .caseInsensitive) {
-            let remainder = record.objective[range.upperBound...]
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let phrase: String = {
-                // Sentence end = "." followed by ANY whitespace (space or
-                // newline) — "Return exactly: X.\nUse no tools…" must extract
-                // only "X." or the gate false-fails on the trailing
-                // instruction (review round 3, finding 3).
-                if let sentenceEnd = remainder.range(of: #"\.\s"#, options: .regularExpression) {
-                    return String(remainder[..<sentenceEnd.lowerBound]) + "."
-                }
-                return remainder
-            }()
-            if !phrase.isEmpty, !combinedOutput.contains(phrase) {
-                return "objective requires exact phrase not present: \(phrase.prefix(120))"
-            }
-        }
         return nil
     }
 
@@ -63,17 +39,8 @@ extension WorkshopExecutorLoop {
         }
     }
 
-    /// Verify only outcomes for which Workshop owns exact local evidence.
-    /// This deliberately does not ask an LLM to judge its own work and does
-    /// not infer external success from a tool's absence of an error.
-    ///
-    /// Currently provable:
-    /// - explicit textual success criteria already stored on the execution;
-    /// - `write_file` bytes, read back from the exact resolved result path.
-    ///
-    /// Read/synthesis steps are evidence-neutral. Any other action step keeps
-    /// the overall execution `unverified` even when its tool returned success.
-    /// A verifiable claim whose evidence disagrees fails the execution.
+    /// Verify resolved operations from their own evidence and declared postconditions.
+    /// Unknown external outcomes stay unverified; missing proof does not create a dependency.
     static func verifyCompletedOutcome(
         _ record: WorkshopExecutionRecord,
         checkedAt: String,
@@ -92,26 +59,40 @@ extension WorkshopExecutorLoop {
         let hasTextCriterion = record.expectedOutputs.contains {
             guard case .string(let value) = $0 else { return false }
             return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        } || record.objective.range(of: "return exactly:", options: .caseInsensitive) != nil
+        }
         if hasTextCriterion { methods.append("exact_output") }
 
         var hasExactEvidence = hasTextCriterion
         var unsupportedAction = false
         var writes: [String: [WorkshopExecutionStep]] = [:]
         for step in record.plan {
-            let tool = step.toolOrAction.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if tool == "write_file" {
-                guard let path = fileWriteReceiptPath(step: step, record: record) else {
-                    return WorkshopVerificationRecord(status: .failed, checkedAt: checkedAt,
-                        methods: methods + ["file_bytes"], detail: "write_file completed without an exact success receipt")
+            let call = Self.resolvedStepCall(step, execution: record)
+            let completed = record.stepsCompleted.last { $0.objectValue?["step_id"] == .string(step.id) }?.objectValue
+            let output = completed?["output"] ?? .null
+            if call.tool == "write_file" {
+                guard completed?["status"] == .string("succeeded"), output.objectValue?["ok"] == .bool(true),
+                      let path = output.objectValue?["path"]?.stringValue else {
+                    unsupportedAction = true
+                    continue
                 }
-                writes[path, default: []].append(step)
-            } else if !isVerificationNeutral(tool: tool) {
-                unsupportedAction = true
-            }
+                let resolvedPath = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
+                writes[resolvedPath, default: []].append(step)
+            } else if ["shell", "bash", "git"].contains(call.tool) {
+                if output.objectValue?["exit_code"]?.numberValue(coercingStrings: false, finiteOnly: true) == 0,
+                   output.objectValue?["timed_out"] == .bool(false), ChatToolOutcome.exactResultClass(output) == .succeeded {
+                    hasExactEvidence = true
+                    if !methods.contains("command_exit") { methods.append("command_exit") }
+                } else { unsupportedAction = true }
+            } else if call.readOnly {
+                if let coverage = completed?["read_coverage"]?.stringValue, ["complete", "partial"].contains(coverage) {
+                    hasExactEvidence = true
+                    if !methods.contains("read_evidence") { methods.append("read_evidence") }
+                } else { unsupportedAction = true }
+            } else if !Self.llmStepKinds.contains(call.tool) { unsupportedAction = true }
         }
         for path in writes.keys.sorted() {
-            switch verifyFileWrites(steps: writes[path]!, path: path, record: record, fileManager: fileManager) {
+            guard let steps = writes[path] else { continue }
+            switch verifyFileWrites(steps: steps, path: path, record: record, fileManager: fileManager) {
             case .satisfied:
                 hasExactEvidence = true
                 if !methods.contains("file_bytes") { methods.append("file_bytes") }
@@ -132,7 +113,7 @@ extension WorkshopExecutorLoop {
                 status: .satisfied,
                 checkedAt: checkedAt,
                 methods: methods,
-                detail: "Declared outcome matched exact local evidence."
+                detail: "Operations matched their retained evidence and declared outcomes."
             )
         }
         return WorkshopVerificationRecord(
@@ -140,7 +121,7 @@ extension WorkshopExecutorLoop {
             checkedAt: checkedAt,
             methods: methods,
             detail: unsupportedAction
-                ? "At least one action has no exact domain verifier."
+                ? "At least one operation has no confirmed outcome evidence."
                 : "No exact outcome criterion was declared."
         )
     }
@@ -151,26 +132,6 @@ extension WorkshopExecutorLoop {
         case unverifiable
     }
 
-    /// One bounded terminal read. The verifier never persists file content or
-    /// the path; it records only the evidence method and verdict.
-    private static func fileWriteReceiptPath(
-        step: WorkshopExecutionStep,
-        record: WorkshopExecutionRecord
-    ) -> String? {
-        guard let completed = record.stepsCompleted.last(where: { value in
-                  guard case .object(let object) = value,
-                        case .string(let stepID)? = object["step_id"] else { return false }
-                  return stepID == step.id
-              }),
-              case .object(let completedObject) = completed,
-              case .string("succeeded")? = completedObject["status"],
-              case .object(let output)? = completedObject["output"],
-              case .bool(true)? = output["ok"],
-              case .string(let path)? = output["path"]
-        else { return nil }
-        return URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
-    }
-
     private static func verifyFileWrites(
         steps: [WorkshopExecutionStep], path: String,
         record: WorkshopExecutionRecord, fileManager: FileManager
@@ -178,7 +139,7 @@ extension WorkshopExecutorLoop {
         var expected = Data()
         var append = true
         for step in steps {
-            guard case .object(let args) = resolveStepReferences(in: step.args, execution: record),
+            guard case .object(let args) = Self.resolvedStepCall(step, execution: record).args,
                   case .string(let content)? = args["content"] else {
                 return .failed("write_file has no exact declared content")
             }
@@ -226,15 +187,4 @@ extension WorkshopExecutorLoop {
         }
     }
 
-    private static func isVerificationNeutral(tool: String) -> Bool {
-        if tool.isEmpty { return false }
-        let exact: Set<String> = [
-            "chat.synthesize", "llm", "report", "read_file", "list_dir",
-            "file_excerpt", "grep", "recall_memory", "recall_search", "search_kg",
-        ]
-        if exact.contains(tool) { return true }
-        let leaf = tool.split(separator: ".").last.map(String.init) ?? tool
-        return ["read", "list", "search", "get", "fetch", "status", "availability", "screenshot"]
-            .contains { leaf == $0 || leaf.hasPrefix("\($0)_") }
-    }
 }

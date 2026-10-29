@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import UserNotifications
 // Blueprint: | `MobileNotificationActions.swift` | `MobileNotificationActions` enum; `handle` |
 
@@ -34,28 +35,35 @@ enum MobileNotificationActions {
                 }
                 let approve = response.action == MobileNotificationRouting.approve
                 try await MobileIntentRuntime.decide(id: id, approve: approve)
-                iOSSystemToastCenter.shared.push(success: approve ? "Approved on your Mac." : "Denied on your Mac.")
+                SystemToastCenter.shared.push(success: approve ? "Approved on your Mac." : "Denied on your Mac.")
             case (MobileNotificationRouting.messageCategory, MobileNotificationRouting.reply):
                 guard let session = response.sessionID, !session.isEmpty,
                       let text = response.text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     throw MobileIntentRuntime.failure("This notification has no conversation or the reply is empty.")
                 }
                 open(screen: "chat", sessionID: session)
-                try MobileIntentRuntime.prepare()
-                _ = try await MacBridgeClient().sendMessage(text, sessionID: session)
-                iOSSystemToastCenter.shared.push(info: "Reply sent. Waiting for your Mac.")
+                let store = ChatStore.shared
+                await store.restorationTask?.value
+                let queued = QueuedChatSend(id: UUID(), sessionID: session, text: text,
+                                            controls: .defaults, attachments: [], createdAt: Date(),
+                                            pairingFingerprint: AgentNameCache.fingerprint(iCloudBridge.shared.pairingSecretForPhoneRequests))
+                guard store.enqueueSend(queued) else {
+                    throw MobileIntentRuntime.failure(store.errorBanner ?? "The chat queue is full.")
+                }
+                try await store.checkpointQueuedSend(queued.id)
+                store.scheduleQueuedSendDrain()
+                SystemToastCenter.shared.push(info: "Reply queued for your Mac.")
             default:
                 throw MobileIntentRuntime.failure("This notification action is unavailable.")
             }
         } catch {
-            iOSSystemToastCenter.shared.push(error: error.localizedDescription, autoDismissAfter: nil)
+            SystemToastCenter.shared.push(error: error.localizedDescription, autoDismissAfter: nil)
         }
     }
 
     @MainActor
     private static func open(screen: String, sessionID: String? = nil) {
-        MobileNotifiedChatSessionIntent.stage(sessionID)
-        NativeAgentNotificationLaunchIntent.markOpenActivityPending(screen: screen)
+        NativeAgentNotificationLaunchIntent.stage(screen: screen, sessionID: sessionID)
         NotificationCenter.default.post(name: .nativeagentOpenActivity, object: nil, userInfo: ["screen": screen])
     }
 }

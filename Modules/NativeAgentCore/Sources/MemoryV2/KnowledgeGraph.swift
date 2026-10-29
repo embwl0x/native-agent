@@ -5,12 +5,14 @@
 // through the shared pool, including memory and studio projections.
 
 import Foundation
+import NativeAgentShared
+import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `KnowledgeGraph.swift` | Graph normalization, checked legacy JSON admission and entity search |
 
 // MARK: - Stopwords + tokenizer
 
-/// Mirrors `GRAPH_STOPWORDS` in the retired daemon (L25-30).
+/// Common words excluded from graph name tokens.
 public let knowledgeGraphStopwords: Set<String> = [
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "he", "her",
     "his", "i", "in", "is", "it", "me", "my", "of", "on", "or", "our", "she",
@@ -18,18 +20,11 @@ public let knowledgeGraphStopwords: Set<String> = [
     "with", "you", "your",
 ]
 
-/// Mirrors `_name_tokens(name)` in the retired daemon (L38-39):
-///   `{tok for tok in re.findall(r"\w+", name.lower()) if tok not in STOPWORDS}`
-///
-/// Python's `\w` under the default (Unicode) flags matches `[a-zA-Z0-9_]` plus
-/// any Unicode word character. Swift's `CharacterSet.alphanumerics` plus `_`
-/// is the closest faithful match; we lower-case first (matching `.lower()`).
+/// Lowercase Unicode alphanumeric/underscore runs, excluding stopwords.
 public func knowledgeGraphNameTokens(_ name: String) -> Set<String> {
     let lowered = name.lowercased()
     var tokens: Set<String> = []
     var current = ""
-    // `\w` == letters, digits, marks, and underscore. Build runs of those,
-    // splitting on everything else — matches re.findall(r"\w+", ...).
     var wordChars = CharacterSet.alphanumerics
     wordChars.insert(charactersIn: "_")
     for scalar in lowered.unicodeScalars {
@@ -46,7 +41,7 @@ public func knowledgeGraphNameTokens(_ name: String) -> Set<String> {
     return tokens
 }
 
-// MARK: - JSON load error (U5 W-C empty-vs-error)
+// MARK: - JSON load error
 
 /// Error for the checked JSON load path: the file exists but cannot be read
 /// or parsed. A missing file is NOT an error (legitimate empty graph).
@@ -65,8 +60,7 @@ public enum KnowledgeGraphJSONLoadError: Error, Sendable {
 public struct KnowledgeGraphStore: Sendable {
     /// Normalized entities keyed by id (insertion order preserved via `entityOrder`).
     public let entities: [String: JSONValue]
-    /// Stable iteration order of entity ids (matches Python dict insertion order,
-    /// which `all_entities` paginates over with `list(self._data["entities"].values())`).
+    /// Stable entity iteration and pagination order.
     public let entityOrder: [String]
     /// Normalized, orphan-pruned edge list.
     public let edges: [JSONValue]
@@ -104,26 +98,17 @@ public struct KnowledgeGraphStore: Sendable {
         return normalize(raw, entityKeyOrder: extractEntitiesKeyOrder(from: data))
     }
 
-    /// Apply the legacy skeleton-merge + entity/edge normalization.
-    ///
-    /// `entityKeyOrder`, when supplied, pins the iteration/pagination order to
-    /// the file's textual key order (== Python insertion order). When nil
-    /// (in-memory documents with no source bytes), keys are visited in a stable
-    /// lexicographic order so behavior is still deterministic.
+    /// Normalize entities and edges in textual key order, or lexicographic order when none is supplied.
     public static func normalize(
         _ raw: [String: JSONValue],
         entityKeyOrder: [String]? = nil
     ) -> KnowledgeGraphStore {
-        // entities: dict[str, dict] — drop non-dict / nameless; reconcile kind→type.
         var entities: [String: JSONValue] = [:]
         var order: [String] = []
         if case .object(let rawEntities)? = raw["entities"] {
-            // Visit keys in file/insertion order when known, else stable lexicographic.
             let orderedKeys: [String] = {
                 if let pinned = entityKeyOrder {
-                    // Keep only keys that actually exist in the parsed object,
-                    // in the pinned order; append any parsed keys the byte-scan
-                    // missed (defensive — should be empty in practice).
+                    // Keep existing pinned keys, then append unscanned keys.
                     var seen = Set<String>()
                     var out: [String] = []
                     for k in pinned where rawEntities[k] != nil {
@@ -139,15 +124,9 @@ public struct KnowledgeGraphStore: Sendable {
             for k in orderedKeys {
                 guard let v = rawEntities[k] else { continue }
                 guard case .object(var e) = v else { continue }
-                // Must have a TRUTHY name. Python: `if not isinstance(v, dict)
-                // or not v.get("name")` — drops when name is missing/None/""/0/
-                // false/[]/{}. Preserve retired truthiness exactly rather than
-                // routing through a stringifier (which would turn 0/false into
-                // the kept strings "0"/"False"). gpt-5.5 review finding #5.
-                guard jsonValueIsPythonTruthy(e["name"]) else { continue }
-                // Python: `str(e.get("type") or "").strip()` — falsy collapses
-                // to "" FIRST (so type:0 -> "" -> default-concept), and .strip()
-                // is whitespacesAndNewlines.
+                // Drop falsy names before string conversion can make them nonempty.
+                guard e["name"]?.isTruthy == true else { continue }
+                // Falsy type/kind values become empty before whitespace trimming.
                 let typeS = (e["type"]?.pythonStrOrEmpty ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 let kindS = (e["kind"]?.pythonStrOrEmpty ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 if !typeS.isEmpty {
@@ -164,14 +143,12 @@ public struct KnowledgeGraphStore: Sendable {
             }
         }
 
-        // edges: list[dict] — reconcile kind→type, default-mentions, drop
-        // endpoint-less / orphan edges. Mirror Python L147-200.
+        // Reconcile edge kind→type, default to mentions, and drop missing/orphan endpoints.
         var normalizedEdges: [JSONValue] = []
         let entityIds = Set(entities.keys)
         if case .array(let rawEdges)? = raw["edges"] {
             for ev in rawEdges {
                 guard case .object(var e) = ev else { continue }
-                // type/kind: `str(x or "").strip()` (falsy -> "", .strip() incl. newlines).
                 let typeS = (e["type"]?.pythonStrOrEmpty ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 let kindS = (e["kind"]?.pythonStrOrEmpty ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 if !typeS.isEmpty && !kindS.isEmpty && typeS != kindS {
@@ -185,27 +162,20 @@ public struct KnowledgeGraphStore: Sendable {
                     e.removeValue(forKey: "kind")
                 } else {
                     e.removeValue(forKey: "kind")
-                    // Python: `if e.get("from") and e.get("to")` — TRUTHINESS, not
-                    // string-emptiness. A non-string-but-truthy endpoint (e.g.
-                    // int 5) passes here in Python (it's later orphan-dropped).
-                    if jsonValueIsPythonTruthy(e["from"]) && jsonValueIsPythonTruthy(e["to"]) {
+                    if e["from"]?.isTruthy == true && e["to"]?.isTruthy == true {
                         e["type"] = .string("mentions")
                         if e["provenance"] == nil { e["provenance"] = .string("default-mentions") }
                     } else {
                         e.removeValue(forKey: "type")
                     }
                 }
-                // Final keep-gate preserves the retired L182 behavior: `if e.get("from") and
-                // e.get("to") and e.get("type")` — TRUTHINESS on all three.
-                guard jsonValueIsPythonTruthy(e["from"]),
-                      jsonValueIsPythonTruthy(e["to"]),
-                      jsonValueIsPythonTruthy(e["type"]) else { continue }
-                // Orphan drop preserves the retired L189 behavior: `e.get("from") in _entity_ids`
-                // — RAW value membership against the set of (string) entity KEYS.
-                // A non-string endpoint can never match a string key, so use the
-                // string-only key view (nil -> never matches).
-                guard let fromKey = e["from"]?.graphStringKey,
-                      let toKey = e["to"]?.graphStringKey,
+                // Endpoints and type must all be truthy.
+                guard e["from"]?.isTruthy == true,
+                      e["to"]?.isTruthy == true,
+                      e["type"]?.isTruthy == true else { continue }
+                // Only string endpoints can match entity keys; never stringify them.
+                guard let fromKey = e["from"]?.stringValue,
+                      let toKey = e["to"]?.stringValue,
                       entityIds.contains(fromKey), entityIds.contains(toKey) else { continue }
                 normalizedEdges.append(.object(e))
             }
@@ -218,29 +188,14 @@ public struct KnowledgeGraphStore: Sendable {
         )
     }
 
-    /// Recover the textual key order of the top-level `"entities"` object from
-    /// the raw JSON bytes. Swift's JSONSerialization discards object key order;
-    /// the daemon writes the file with insertion order intact (no sort_keys), so
-    /// scanning the bytes is the only way to reproduce Python's pagination /
-    /// stable-sort order. Returns nil on any structural surprise (caller then
-    /// falls back to stable lexicographic order — deterministic, just not
-    /// byte-for-byte Python order).
-    ///
-    /// The scanner is a tiny string-aware, brace-depth-aware tokenizer: it finds
-    /// the value of the top-level `"entities"` key, then collects the keys that
-    /// appear at depth 1 INSIDE that object (i.e. immediate entity-id keys),
-    /// skipping nested objects/arrays and string contents.
+    /// Recover textual entity-key order before JSONSerialization discards it; skip nested values and strings.
     static func extractEntitiesKeyOrder(from data: Data) -> [String]? {
         let bytes = [UInt8](data)
         let n = bytes.count
-        // Locate the top-level "entities" key. We do a depth-aware scan of the
-        // root object and only accept the key when we are at root depth 1.
         var i = 0
-        // Skip to first '{'
         while i < n && bytes[i] != UInt8(ascii: "{") { i += 1 }
         guard i < n else { return nil }
         i += 1 // past root '{'
-        // Find the "entities" key at root level.
         func scanString(_ start: Int) -> (value: [UInt8], next: Int)? {
             var j = start
             guard j < n && bytes[j] == UInt8(ascii: "\"") else { return nil }
@@ -249,8 +204,6 @@ public struct KnowledgeGraphStore: Sendable {
             while j < n {
                 let c = bytes[j]
                 if c == UInt8(ascii: "\\") {
-                    // Keep the escape + next char verbatim (we only need raw key
-                    // matching for ASCII id keys; escapes are rare in ids).
                     if j + 1 < n { out.append(c); out.append(bytes[j + 1]); j += 2; continue }
                 }
                 if c == UInt8(ascii: "\"") { return (out, j + 1) }
@@ -258,21 +211,17 @@ public struct KnowledgeGraphStore: Sendable {
             }
             return nil
         }
-        // Walk root-level members until we hit key == "entities".
         var entitiesBodyStart: Int? = nil
         while i < n {
-            // skip whitespace/commas
             while i < n, bytes[i] == UInt8(ascii: " ") || bytes[i] == UInt8(ascii: "\n")
                 || bytes[i] == UInt8(ascii: "\t") || bytes[i] == UInt8(ascii: "\r")
                 || bytes[i] == UInt8(ascii: ",") { i += 1 }
             guard i < n, bytes[i] == UInt8(ascii: "\"") else { break }
             guard let (keyBytes, afterKey) = scanString(i) else { return nil }
             i = afterKey
-            // skip to ':'
             while i < n && bytes[i] != UInt8(ascii: ":") { i += 1 }
             guard i < n else { return nil }
             i += 1
-            // skip whitespace
             while i < n, bytes[i] == UInt8(ascii: " ") || bytes[i] == UInt8(ascii: "\n")
                 || bytes[i] == UInt8(ascii: "\t") || bytes[i] == UInt8(ascii: "\r") { i += 1 }
             guard i < n else { return nil }
@@ -286,7 +235,6 @@ public struct KnowledgeGraphStore: Sendable {
             if i < 0 { return nil }
         }
         guard let bodyStart = entitiesBodyStart else { return [] }
-        // Collect depth-1 keys inside the entities object.
         var keys: [String] = []
         var k = bodyStart
         while k < n {
@@ -361,19 +309,10 @@ public struct KnowledgeGraphStore: Sendable {
 
     // MARK: Queries
 
-    /// Mirrors `all_entities(page, page_size=100)` in knowledge_graph.py (L802-822).
-    /// This mirrors the Python METHOD exactly: it does NOT clamp `page` — it
-    /// echoes whatever it is given. The daemon ROUTE is what clamps the param
-    /// with `max(0, int(...))`, so a negative page never
-    /// reaches the method over HTTP. `SwiftNativeKnowledgeGraphReader.allEntitiesChecked`
-    /// reproduces that route-level clamp before calling this method (gpt-5.5
-    /// wave-30 review finding — negative-page echo parity). Slicing uses a
-    /// non-negative start so a (route-clamped, always ≥0) page never under-runs;
-    /// Swift arrays cannot take Python's negative-index slices.
+    /// Echo the supplied page; the checked reader clamps it before calling. Slice offsets are nonnegative.
     public func allEntities(page: Int = 0, pageSize: Int = 100) -> JSONValue {
         let allIds = entityOrder
-        // 2026-09-06: pages beyond the collection are empty even when their
-        // offset overflows; bound the remaining slice before adding its size.
+        // Out-of-range or overflowing offsets yield an empty page.
         let (start, overflow) = max(0, page).multipliedReportingOverflow(by: pageSize)
         let pageKeys: [String]
         if pageSize > 0, !overflow, start < allIds.count {
@@ -383,22 +322,17 @@ public struct KnowledgeGraphStore: Sendable {
             pageKeys = []
         }
         let pageEnts: [JSONValue] = pageKeys.compactMap { entities[$0] }
-        // Python scopes page edges by the entity `id` FIELD of the returned
-        // entities (`page_ent_ids = {e.get("id") for e in page_ents if e.get("id")}`),
-        // NOT the dict key — they usually coincide but can diverge (gpt-5.5
-        // review finding #3). Match Python by reading the id field. The id set
-        // is string-keyed (graphStringKey), and surviving edge from/to are
-        // guaranteed string keys (orphan-drop on load), so membership is exact.
+        // Scope page edges by returned entities' string id fields, which may differ from their dictionary keys.
         var pageIdSet = Set<String>()
         for ent in pageEnts {
-            if case .object(let o) = ent, let idStr = o["id"]?.graphStringKey, !idStr.isEmpty {
+            if case .object(let o) = ent, let idStr = o["id"]?.stringValue, !idStr.isEmpty {
                 pageIdSet.insert(idStr)
             }
         }
         let pageEdges: [JSONValue] = edges.filter { edge in
             guard case .object(let e) = edge else { return false }
-            let from = e["from"]?.graphStringKey ?? ""
-            let to = e["to"]?.graphStringKey ?? ""
+            let from = e["from"]?.stringValue ?? ""
+            let to = e["to"]?.stringValue ?? ""
             return pageIdSet.contains(from) || pageIdSet.contains(to)
         }
         return .object([
@@ -410,37 +344,19 @@ public struct KnowledgeGraphStore: Sendable {
         ])
     }
 
-    /// Mirrors `search_entities(q)` in knowledge_graph.py (L824-865).
-    /// Returns the matching entity JSONValue objects in descending score order.
-    /// NOTE: Python uses a STABLE sort on score only (`scored.sort(key=score, reverse=True)`),
-    /// so ties keep iteration (insertion) order. Swift's `sorted(by:)` is NOT
-    /// guaranteed stable; we therefore decorate with the original index and use
-    /// it as a deterministic tie-breaker to match Python's stable behavior.
+    /// Rank matching entities by descending score, preserving entity order on ties.
     public func searchEntities(_ q: String) -> [JSONValue] {
         searchEntities(q, now: Date())
     }
 
-    /// Maximum score a perfectly fresh entity can earn from `last_seen`.
-    /// Deliberately equal to the popularity term's ceiling (`min(10,
-    /// mention_count) * 0.03`), which is the smallest existing signal in this
-    /// ranker: recency can break a tie between two comparable matches and can
-    /// never outweigh a single name-token overlap (2.0) let alone an exact name
-    /// hit (6.0). A dominance flip was explicitly out of scope for B5.
+    /// Recency is capped at popularity's ceiling, below one name-token overlap.
     static let recencyMaximumScore = 0.30
 
-    /// Bounded recency bonus in [0, `recencyMaximumScore`] from an entity's
-    /// `last_seen` timestamp. Bucketed rather than continuous so the score stays
-    /// a stable, explainable number: two entities seen the same week rank
-    /// identically no matter which hour the search runs.
-    ///
-    /// Absent, empty, unparseable, or future `last_seen` values score 0 — a row
-    /// that cannot prove it is recent does not get to claim it. That is also
-    /// what keeps this change inert for the JSON-import and fixture stores,
-    /// whose entities carry no `last_seen` at all.
+    /// Bucketed recency bonus; absent, invalid or future timestamps earn zero.
     static func recencyScore(lastSeen: String?, now: Date) -> Double {
         guard let raw = lastSeen?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty,
-              let seen = parseGraphTimestamp(raw) else { return 0 }
+              let seen = NativeTimestampFormat.parseISO8601FractionalFirst(raw) else { return 0 }
         let ageDays = now.timeIntervalSince(seen) / 86_400
         guard ageDays >= 0 else { return 0 }
         switch ageDays {
@@ -452,26 +368,9 @@ public struct KnowledgeGraphStore: Sendable {
         }
     }
 
-    /// The indexer writes ISO-8601 with fractional seconds; JSON imports and
-    /// hand-built fixtures carry the plain internet-date-time form. Accept both
-    /// and treat everything else as "no usable timestamp" (score 0).
-    private static func parseGraphTimestamp(_ raw: String) -> Date? {
-        let withFraction = ISO8601DateFormatter()
-        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = withFraction.date(from: raw) { return d }
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        return plain.date(from: raw)
-    }
-
-    /// `now`-injectable form. Production calls the zero-argument overload; tests
-    /// pin the clock so the recency buckets are deterministic.
+    /// Rank against an explicit clock for recency buckets.
     public func searchEntities(_ q: String, now: Date) -> [JSONValue] {
-        // Python: `q_lower = q.lower().strip()` — str.strip() removes ALL
-        // leading/trailing whitespace incl. newlines/tabs, so we must use
-        // .whitespacesAndNewlines (NOT .whitespaces, which excludes \n/\r — a
-        // query like "\nNativeAgent\n" would otherwise lose its exact-name
-        // bonus). gpt-5.5 wave-30 review finding (trim parity).
+        // Trim newlines and tabs as well as spaces before exact-name matching.
         let qLower = q.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         let qTokens = knowledgeGraphNameTokens(q)
         if qLower.isEmpty && qTokens.isEmpty { return [] }
@@ -481,8 +380,6 @@ public struct KnowledgeGraphStore: Sendable {
         for id in entityOrder {
             defer { idx += 1 }
             guard case .object(let ent)? = entities[id] else { continue }
-            // Python: `str(ent.get("name") or "")`, `[str(a or "") for a in ...]`,
-            // `str(ent.get("summary") or "")` — falsy collapses to "" first.
             let name = ent["name"]?.pythonStrOrEmpty ?? ""
             let aliases: [String] = {
                 guard case .array(let a)? = ent["aliases"] else { return [] }
@@ -506,10 +403,7 @@ public struct KnowledgeGraphStore: Sendable {
 
             if !(exactName || exactSummary || !overlap.isEmpty) { continue }
 
-            // Python: `mentions = min(10, int(ent.get("mention_count") or 0))`
-            // — note NO lower clamp, so a negative mention_count legitimately
-            // REDUCES the score (mentions * 0.03). Earlier draft clamped at 0;
-            // that diverged on negative counts (gpt-5.5 review finding #4).
+            // Negative mention counts reduce popularity; only the upper bound is clamped.
             let mentions: Int = {
                 guard let v = ent["mention_count"] else { return 0 }
                 let n = v.intForGraph ?? 0
@@ -523,7 +417,6 @@ public struct KnowledgeGraphStore: Sendable {
                 score += 2.5
             }
             score += Double(nameOverlap.count) * 2.0
-            // Python: sum(min(2.5, len(token)/8) for token in name_overlap if len(token) >= 8)
             for token in nameOverlap where token.count >= 8 {
                 score += min(2.5, Double(token.count) / 8.0)
             }
@@ -532,10 +425,6 @@ public struct KnowledgeGraphStore: Sendable {
                 score += Double(overlap.count) / Double(max(qTokens.count, 1))
             }
             score += Double(mentions) * 0.03
-            // B5 (2026-08-28): the only consultation of `last_seen` in this
-            // ranker. Bounded at the popularity term's ceiling — a tiebreak
-            // weight, not a re-ranking axis. Divergence from the retired Python
-            // ranker is intentional and scoped to this line.
             score += Self.recencyScore(
                 lastSeen: ent["last_seen"]?.pythonStrOrEmpty, now: now
             )
@@ -543,8 +432,6 @@ public struct KnowledgeGraphStore: Sendable {
             scored.append((score, idx, .object(ent)))
         }
 
-        // Descending by score; stable tie-break by original index (mirrors
-        // Python's stable sort preserving insertion order on equal scores).
         scored.sort { a, b in
             if a.score != b.score { return a.score > b.score }
             return a.index < b.index
@@ -556,26 +443,19 @@ public struct KnowledgeGraphStore: Sendable {
         }
     }
 
-    /// Mirrors `neighbors(entity_id)` in knowledge_graph.py (L867-884).
-    /// Returns nil-entity payload when the id is unknown (matches Python, which
-    /// returns `{"entity": None, ...}`; the daemon route 404s only when the
-    /// entity is missing — see note in makeKnowledgeGraphReader).
+    /// Return touching edges and neighbors; an unknown id has a null entity.
     public func neighbors(_ entityId: String) -> JSONValue {
-        // Python: `e.get("from") == entity_id` — raw equality against the
-        // (string) route id. Surviving edges have string from/to (orphan-drop on
-        // load), so the string-key view is exact; a non-string endpoint yields ""
-        // and never equals a real id.
         let touching: [JSONValue] = edges.filter { edge in
             guard case .object(let e) = edge else { return false }
-            let from = e["from"]?.graphStringKey ?? ""
-            let to = e["to"]?.graphStringKey ?? ""
+            let from = e["from"]?.stringValue ?? ""
+            let to = e["to"]?.stringValue ?? ""
             return from == entityId || to == entityId
         }
         var neighborIds: Set<String> = []
         for edge in touching {
             guard case .object(let e) = edge else { continue }
-            let from = e["from"]?.graphStringKey ?? ""
-            let to = e["to"]?.graphStringKey ?? ""
+            let from = e["from"]?.stringValue ?? ""
+            let to = e["to"]?.stringValue ?? ""
             neighborIds.insert(from == entityId ? to : from)
         }
         var neighborObj: [String: JSONValue] = [:]
@@ -589,7 +469,6 @@ public struct KnowledgeGraphStore: Sendable {
         ])
     }
 
-    /// True iff the entity id is present (used by the daemon-route 404 contract).
     public func hasEntity(_ entityId: String) -> Bool {
         entities[entityId] != nil
     }
@@ -597,31 +476,8 @@ public struct KnowledgeGraphStore: Sendable {
 
 // MARK: - JSONValue graph helpers
 
-/// Retired truthiness for a JSON value, matching `if not v.get(key)` /
-/// `if v.get(key)`: None/missing, "", 0, 0.0, false, [], {} are falsy;
-/// everything else is truthy.
-func jsonValueIsPythonTruthy(_ v: JSONValue?) -> Bool {
-    guard let v else { return false }
-    switch v {
-    case .null: return false
-    case .bool(let b): return b
-    case .int(let i): return i != 0
-    case .double(let d): return d != 0
-    case .string(let s): return !s.isEmpty
-    case .array(let a): return !a.isEmpty
-    case .object(let o): return !o.isEmpty
-    }
-}
-
 extension JSONValue {
-    /// Mirrors Python `str(x or "")` for the scalar text fields the graph reads
-    /// via that idiom (type, kind, name, summary, aliases). Python's `x or ""`
-    /// collapses EVERY falsy value (None / 0 / 0.0 / False / "" / [] / {}) to the
-    /// empty string FIRST, so only TRUTHY values are stringified. Earlier this
-    /// rendered `0`→"0" and `False`→"False" (the old `stringForGraph`), diverging
-    /// from Python where `str(0 or "")` == "" — e.g. an entity `{name:"x",
-    /// kind:0}` defaulted to type "concept" in Python but became type "0" here.
-    /// gpt-5.5 wave-30 review finding (falsy-stringify parity).
+    /// Scalar text view: falsy values and collections become empty strings.
     fileprivate var pythonStrOrEmpty: String {
         switch self {
         case .null: return ""
@@ -634,21 +490,7 @@ extension JSONValue {
         }
     }
 
-    /// Endpoint-key view for edge `from`/`to` matching + orphan-drop. Python
-    /// compares the RAW value against `set(self._data["entities"].keys())`
-    /// (all str keys) and against other raw endpoint values, so a NON-string
-    /// endpoint (e.g. int `1`) can NEVER match a string key `"1"`. Returns the
-    /// string itself ONLY for `.string`; nil otherwise so non-string endpoints
-    /// never match. gpt-5.5 wave-30 review finding (raw-membership parity).
-    fileprivate var graphStringKey: String? {
-        if case .string(let s) = self { return s }
-        return nil
-    }
-
-    /// Int view used for `mention_count`. `.int` -> itself; `.double` -> floored;
-    /// `.string` -> parsed (Python: `int(ent.get("mention_count") or 0)` raises on
-    /// non-numeric strings, caught and treated as 0 — we mirror by returning nil
-    /// on parse failure, and the caller defaults to 0).
+    /// Mention counts truncate doubles toward zero; unparseable values return nil.
     fileprivate var intForGraph: Int? {
         switch self {
         case .int(let i): return Int(i)

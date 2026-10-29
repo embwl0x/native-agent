@@ -2,10 +2,11 @@ import Cognition
 import EngineRuntime
 import ApprovalTransactions
 import Foundation
+import NativeAgentShared
 import AttentionRouting
 import UserNotifications
 import AppKit
-// Blueprint: | `NativeAgentNotificationActions.swift` | Native response mapping, notification categories and mounted window/conversation dispatch; effects stay in EngineNotificationActions |
+// Blueprint: | `NativeAgentNotificationActions.swift` | Native response mapping, shared category registration and mounted window/conversation dispatch; effects stay in EngineNotificationActions |
 
 extension NativeAgentNotificationActions.Response {
     init(_ response: UNNotificationResponse) {
@@ -21,19 +22,10 @@ extension NativeAgentNotificationActions.Response {
 
 extension NativeAgentNotificationActions {
     static func register() {
-        let options: UNNotificationActionOptions = [.foreground, .authenticationRequired]
-        UNUserNotificationCenter.current().setNotificationCategories([
-            UNNotificationCategory(identifier: approvalCategory, actions: [
-                UNNotificationAction(identifier: approve, title: "Approve", options: options),
-                UNNotificationAction(identifier: deny, title: "Deny", options: options.union(.destructive)),
-            ], intentIdentifiers: [], options: []),
-            UNNotificationCategory(identifier: messageCategory, actions: [
-                UNTextInputNotificationAction(
-                    identifier: reply, title: "Reply", options: options,
-                    textInputButtonTitle: "Send", textInputPlaceholder: "Message"
-                ),
-            ], intentIdentifiers: [], options: []),
-        ])
+        UNUserNotificationCenter.current().setNotificationCategories(nativeAgentNotificationCategories(
+            approvalCategory: approvalCategory, messageCategory: messageCategory,
+            approve: approve, deny: deny, reply: reply, replyPlaceholder: "Message"
+        ))
     }
 
     @MainActor
@@ -41,14 +33,14 @@ extension NativeAgentNotificationActions {
         guard response.action != UNNotificationDismissActionIdentifier else { return }
         if response.action == UNNotificationDefaultActionIdentifier {
             if response.category == approvalCategory {
-                _ = NativeAgentAppCoordinator.shared.request(.activity(.approvals))
+                _ = ApplicationLifetime.shared.request(.activity(.approvals))
             } else if let sessionID = response.sessionID {
                 await openConversation(sessionID)
             } else if response.category == messageCategory {
-                _ = NativeAgentAppCoordinator.shared.request(.sidebar(.chat))
+                _ = ApplicationLifetime.shared.request(.sidebar(.chat))
             } else if let handle = response.deskHandle {
-                _ = NativeAgentAppCoordinator.shared.request(.sidebar(.desk))
-                NativeAgentAppCoordinator.shared.appModel?.pendingDeskHandle = handle
+                _ = ApplicationLifetime.shared.request(.sidebar(.desk))
+                ApplicationLifetime.shared.appModel?.pendingDeskHandle = handle
             } else if let pageRoute = response.pageRoute {
                 let parts = pageRoute.split(separator: "/", maxSplits: 1).map(String.init)
                 if let page = parts.first,
@@ -60,7 +52,7 @@ extension NativeAgentNotificationActions {
         }
 
         do {
-            guard let appModel = NativeAgentAppCoordinator.shared.appModel else {
+            guard let appModel = ApplicationLifetime.shared.appModel else {
                 switch (response.category, response.action) {
                 case (approvalCategory, approve), (approvalCategory, deny):
                     throw actionError("Approvals are not ready. Open NativeAgent to review the request.")
@@ -72,7 +64,7 @@ extension NativeAgentNotificationActions {
             }
             try await appModel.engine.handleNotificationAction(
                 response,
-                showApprovals: { _ = NativeAgentAppCoordinator.shared.request(.activity(.approvals)) },
+                showApprovals: { _ = ApplicationLifetime.shared.request(.activity(.approvals)) },
                 openConversation: { await openConversation($0) },
                 resolveApproval: { id, decision in
                     await ApprovalDecisionAction.resolve(id: id, decision: decision, appModel: appModel)
@@ -84,10 +76,10 @@ extension NativeAgentNotificationActions {
                 }
             )
         } catch {
-            _ = NativeAgentAppCoordinator.shared.request(
+            _ = ApplicationLifetime.shared.request(
                 response.category == approvalCategory ? .activity(.approvals) : .sidebar(.chat)
             )
-            NativeAgentAppCoordinator.shared.appModel?.systemToasts.push(
+            ApplicationLifetime.shared.appModel?.systemToasts.push(
                 error: UserFacingError.message(error, action: "do that from the notification")
             )
         }
@@ -96,8 +88,8 @@ extension NativeAgentNotificationActions {
     /// Opens the conversation; with `messageID`, lands on that message.
     @MainActor
     static func openConversation(_ sessionID: String, messageID: String? = nil) async {
-        _ = NativeAgentAppCoordinator.shared.request(.sidebar(.chat))
-        guard let appModel = NativeAgentAppCoordinator.shared.appModel else { return }
+        _ = ApplicationLifetime.shared.request(.sidebar(.chat))
+        guard let appModel = ApplicationLifetime.shared.appModel else { return }
         await appModel.refreshChatSessionIndex()
         if let session = appModel.engine.transcripts.sessions.first(where: { $0.id == sessionID }) {
             await appModel.selectChatSession(session)
@@ -130,7 +122,7 @@ enum NativeAgentApprovalNotifications {
             notifications: [NSApplication.didBecomeActiveNotification, .NSSystemClockDidChange, UserDefaults.didChangeNotification]) {
             await delivery.refresh(
                 router: .shared,
-                telegram: { TelegramApprovalFilerRef.shared.current() },
+                telegram: { ApprovalChatCards.runningTelegram },
                 post: { title, body, userInfo in
                     await NativeAgentNotifications.postAndReport(title: title, body: body, userInfo: userInfo)
                 },

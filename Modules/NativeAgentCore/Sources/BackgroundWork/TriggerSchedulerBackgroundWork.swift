@@ -1,10 +1,9 @@
-import ActivityWatch
 import Foundation
 import BackgroundLoops
 import NativeAgentCore
 import TriggerScheduler
 import StandingBots
-// Blueprint: | `TriggerSchedulerBackgroundWork.swift` | `TriggerSchedulerBackgroundWork` enum; `makeJobWork`; event/deadline runner for canonical scheduler jobs and inbox occurrences; briefing prompt and synthesis policy live in `native-morning-brief.js` |
+// Blueprint: | `TriggerSchedulerBackgroundWork.swift` | `TriggerSchedulerBackgroundWork` composes sequential jobs, bots and continuations inside the managed tick; `BackgroundLoopLifetimes` alone owns task lifetime and shutdown settlement; event/deadline runner for canonical scheduler jobs and inbox occurrences; briefing prompt and synthesis policy live in `native-morning-brief.js` |
 
 public enum TriggerSchedulerBackgroundWork {
     public struct JobWork: Sendable {
@@ -21,10 +20,13 @@ public enum TriggerSchedulerBackgroundWork {
         bots: BotRunnerScheduler,
         continuations: DeskContinuationScheduler? = nil
     ) -> JobWork {
-        JobWork(
+        return JobWork(
             runDueJobs: {
                 let jobs = await runDueJobs(5)
-                return jobs + (await bots.runDue()) + (await continuations?.runDue() ?? [])
+                guard !Task.isCancelled else { return jobs }
+                let botJobs = await bots.runDue()
+                guard !Task.isCancelled else { return jobs + botJobs }
+                return jobs + botJobs + (await continuations?.runDue() ?? [])
             },
             activityFailure: {
                 let jobs = await activityFailure()
@@ -63,7 +65,6 @@ public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
     /// quiet "nothing due" tick that lets later trigger effects proceed.
     let schedulerActivityFailure: @Sendable () async -> String?
     let nextSchedulerJobDeadline: @Sendable (Date) async -> Date?
-    let mirrorFire: @Sendable (TriggerFireResult) async -> Bool
 
     public init(
         dataRoot: URL,
@@ -73,8 +74,7 @@ public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
         runDueJobs: @escaping @Sendable () async -> [String],
         shutdownJobs: @escaping @Sendable () async -> Void,
         schedulerActivityFailure: @escaping @Sendable () async -> String? = { nil },
-        nextSchedulerJobDeadline: @escaping @Sendable (Date) async -> Date?,
-        mirrorFire: @escaping @Sendable (TriggerFireResult) async -> Bool
+        nextSchedulerJobDeadline: @escaping @Sendable (Date) async -> Date?
     ) {
         self.events = events
         self.dataRoot = dataRoot
@@ -84,7 +84,6 @@ public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
         self.shutdownJobs = shutdownJobs
         self.schedulerActivityFailure = schedulerActivityFailure
         self.nextSchedulerJobDeadline = nextSchedulerJobDeadline
-        self.mirrorFire = mirrorFire
     }
 
     public func physiologyEvents() -> AsyncStream<Void> {
@@ -104,9 +103,8 @@ public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
             triggerScheduler.inboxStatePath,
             triggerScheduler.workshopExecutionsPath,
             triggerScheduler.workshopExecutionStatePath,
-            // Retained activity watches wake reconciliation; only `time` triggers are clock-due.
+            // Session changes wake reconciliation; only `time` triggers are clock-due.
             dataRoot.appendingPathComponent("chat/sessions.json"),
-            HumanPresenceStamp.transitionURL(dataRoot: dataRoot),
         ], loopId)
     }
 
@@ -127,15 +125,6 @@ public struct TriggerSchedulerEventDeadlineRunner: EventDeadlineLoopRunner {
 
         let fires = await triggerScheduler.evaluateAndFireDetailed()
         let failures = fires.filter { $0.status != "fired" }
-        var mirrorFailures = 0
-        for fire in fires where fire.status == "fired" {
-            guard !Task.isCancelled else { return .skipped(reason: "cancelled") }
-            if !(await mirrorFire(fire)) { mirrorFailures += 1 }
-        }
-        guard mirrorFailures == 0 else {
-            return .failed(error: "Could not add \(mirrorFailures) trigger notification(s) to the inbox.")
-        }
-
         guard failures.isEmpty else {
             return .failed(error: failures.map { $0.error ?? "Trigger \($0.name ?? "unknown") remains owed." }.joined(separator: "\n"))
         }

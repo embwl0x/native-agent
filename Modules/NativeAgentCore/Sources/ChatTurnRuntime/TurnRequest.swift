@@ -1,8 +1,10 @@
 import Foundation
+import NativeAgentShared
 import Transcripts
 import CognitiveSubstrate
 import NativeAgentCore
 import TrustCenter
+import TurnTrace
 // Blueprint: | `TurnRequest.swift` | `TurnRequest`: shared turn binding; `TurnAdmission`: per-session serialization, bounded admission queues and release/cancellation capacity signals for durable arrivals |
 
 enum TurnRelevanceContext {
@@ -31,6 +33,8 @@ public struct TurnRequest: Sendable {
     public var persona: String?
     /// The tool-authorization surface. Not provenance: see `origin`.
     public var surface: String
+    public var threadKind: ChatThreadKind?
+    public var ownedSessionID: String?
     public var suppressUserAppend: Bool
 
     /// `ChatToolSessionContext.envelope`: authoritative surface identity.
@@ -42,8 +46,8 @@ public struct TurnRequest: Sendable {
     /// `ChatToolSessionContext.verifiedUserId`.
     public var verifiedUserID: String??
     /// Bound through `ChatToolSessionContext.withReplyRoute`, so the turn
-    /// trace names the same destination and thread. Nil = unbound.
-    public var replyRoute: ChatToolSessionContext.ReplyRoute?
+    /// trace names the same destination and thread. Outer nil inherits; inner nil clears.
+    public var replyRoute: ChatToolSessionContext.ReplyRoute??
     /// `ChatPersistenceContext.originProvenance`, stamped on the user row.
     public var origin: ChatMessageOrigin??
     /// `ChatPersistenceContext.pinnedTurnRunID`: the enqueued row's run.
@@ -76,7 +80,9 @@ public struct TurnRequest: Sendable {
         codexCompletion: CodexCompletionTranscriptBinding?? = nil,
         replacementAssistantMessageID: String?? = nil,
         serviceTier: String?? = nil,
-        queryUserMessage: String?? = nil
+        queryUserMessage: String?? = nil,
+        threadKind: ChatThreadKind? = nil,
+        ownedSessionID: String? = nil
     ) {
         self.message = message
         self.queryUserMessage = queryUserMessage
@@ -87,12 +93,14 @@ public struct TurnRequest: Sendable {
         self.attachments = attachments
         self.persona = persona
         self.surface = surface
+        self.threadKind = threadKind
+        self.ownedSessionID = ownedSessionID
         self.suppressUserAppend = suppressUserAppend
         self.envelope = envelope
         self.verifiedSessionID = verifiedSessionID
         self.verifiedChatID = verifiedChatID
         self.verifiedUserID = verifiedUserID
-        self.replyRoute = replyRoute
+        self.replyRoute = replyRoute.map { Optional($0) }
         self.origin = origin
         self.pinnedRunID = pinnedRunID
         self.codexCompletion = codexCompletion
@@ -114,8 +122,8 @@ public struct TurnRequest: Sendable {
     /// async overload for the whole of `operation`. Anything `operation`
     /// spawns inherits them for its life.
     ///
-    /// A turn an agent's words start is peer-steered from its first line
-    /// (Agent, 10-02): a named lane (Claude, Codex, OMP) latches the taint
+    /// A turn an agent's words start is peer-steered from its first line:
+    /// a named lane latches the taint
     /// with its line. The generic peer lane unelevated is the peer's by its
     /// surface and keeps its line; elevated, it marks the peer as elevated,
     /// so only the floor acts card.
@@ -147,8 +155,10 @@ public struct TurnRequest: Sendable {
         return try await Self.bound(PeerDataTaint.$current, taint) { try await bindContext(operation) }
     }
 
-    private func bindContext<T>(isolation: isolated (any Actor)? = #isolation,
-                               _ operation: () async throws -> T) async rethrows -> T {
+    func bindContext<T>(isolation: isolated (any Actor)? = #isolation,
+                        _ operation: () async throws -> T) async rethrows -> T {
+        try await Self.bound(ChatPersistenceContext.$threadKind, .some(threadKind)) {
+        try await Self.bound(ChatPersistenceContext.$ownedSessionID, .some(ownedSessionID)) {
         try await Self.bound(ChatToolSessionContext.$envelope, envelope) {
             try await Self.bound(ChatToolSessionContext.$verifiedSessionId, verifiedSessionID) {
                 try await Self.bound(ChatToolSessionContext.$verifiedChatId, verifiedChatID) {
@@ -171,11 +181,13 @@ public struct TurnRequest: Sendable {
                 }
             }
         }
+        }
+        }
     }
 
     /// Durably append the user row under this request's bindings.
     public func enqueue(
-        on client: any ChatOrchestrationClient,
+        on client: SwiftNativeChatOrchestrationClient,
         mechanicalRow: CognitiveMechanicalRowKind? = nil,
         awaitingConsumption: Bool = true
     ) async throws -> EnqueuedUserMessage {
@@ -196,8 +208,8 @@ public struct TurnRequest: Sendable {
 
     /// Run the turn under this request's bindings.
     public func chat(
-        on client: any ChatOrchestrationClient,
-        progress: ChatOrchestrationProgressHandler? = nil
+        on client: SwiftNativeChatOrchestrationClient,
+        progress: TurnEventSink? = nil
     ) async throws -> ChatResponse {
         try await bind {
             try await client.chat(
@@ -320,7 +332,7 @@ public actor TurnAdmission {
 
     private func acquire(_ key: String, id: UUID, runID: String?, waitForCapacity: Bool) async throws {
         try Task.checkCancellation()
-        while restoring, ChatSessionRetention.isContactSession(key), !(runID.map { backlog[key]?.contains($0) == true } ?? false) {
+        while restoring, SessionConversation.kind(key)?.isPeerConversation == true, !(runID.map { backlog[key]?.contains($0) == true } ?? false) {
             try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                     if Task.isCancelled { continuation.resume(throwing: CancellationError()) }

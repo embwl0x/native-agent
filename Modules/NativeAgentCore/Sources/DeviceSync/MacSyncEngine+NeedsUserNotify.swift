@@ -5,18 +5,7 @@ import Desk
 import NativeAgentShared
 // Blueprint: | `MacSyncEngine+NeedsUserNotify.swift` | `NeedsUserEdgeNotifier` actor; `evaluate`, `stableDigest` |
 
-// Needs-User edge notifier (User, 2026-07-12: "if she ever does turn to needs
-// User I should get an apns about it so I know").
-//
-// Fires one push per new or changed explicit owner-waiting Desk question.
-// Pending approvals use their existing approval notification lanes; generic
-// blocked work and organism trouble remain visible attention but are not a
-// request for the owner. Item identity and reason define the edge; cleared
-// waits disappear silently. State persists at
-// data/notify/needs_user_edge.json so restarts
-// neither re-ping nor forget. The FIRST evaluation ever seeds the baseline
-// without pinging — a cold start must not alarm User about a state he may
-// already be looking at.
+// Notify once per new or changed owner-waiting Desk question; seed the persisted baseline silently.
 actor NeedsUserEdgeNotifier {
     typealias Sender = @Sendable (
         _ title: String,
@@ -31,7 +20,8 @@ actor NeedsUserEdgeNotifier {
 
     private struct State: Codable {
         var seeded: Bool
-        // Missing in the old count-based format: seed without replaying waits.
+        // Missing in the old count-based format: existing incomplete state
+        // needs repair; only an absent store may seed a baseline.
         var requests: [String: Wait]?
     }
 
@@ -58,7 +48,14 @@ actor NeedsUserEdgeNotifier {
         guard !evaluating else { return }
         evaluating = true
         defer { evaluating = false }
-        var state = load()
+        do { try await evaluateChecked(items: items) }
+        catch {
+            nativeLog("needs_user_notify: state unavailable; bytes and pending edges preserved: \(error.localizedDescription)")
+        }
+    }
+
+    private func evaluateChecked(items: [DeskItem]) async throws {
+        var state = try load()
         let items = items.filter(\.requiresOwnerInput).sorted { $0.handle < $1.handle }
         func fingerprint(_ item: DeskItem) -> String {
             Self.stableDigest(item.handle + "\n" + item.title + "\n" + (item.blockedReason ?? item.summary ?? ""))
@@ -77,7 +74,7 @@ actor NeedsUserEdgeNotifier {
         }
         for item in items {
             let digest = fingerprint(item)
-            var current = load()
+            var current = try load()
             let previous = current.requests?[item.handle]
             guard previous?.fingerprint != digest else { continue }
             let episode = previous?.episodeID ?? UUID().uuidString
@@ -94,7 +91,7 @@ actor NeedsUserEdgeNotifier {
                     ["kind": "agent_needs_user", "screen": "desk", "taskId": item.handle,
                      "dedupKey": "needs_user+\(episode)+\(digest)"]
                 )
-                current = load()
+                current = try load()
                 guard current.requests?[item.handle]?.episodeID == episode else { continue }
                 current.requests?[item.handle] = Wait(fingerprint: digest, episodeID: episode)
                 guard persist(current) else { return }
@@ -104,12 +101,15 @@ actor NeedsUserEdgeNotifier {
         }
     }
 
-    private func load() -> State {
+    private func load() throws -> State {
         if let cached { return cached }
-        guard let data = try? Data(contentsOf: stateURL),
-              let state = try? JSONDecoder().decode(State.self, from: data) else {
+        let data: Data
+        do { data = try Data(contentsOf: stateURL) }
+        catch let error as CocoaError where error.code == .fileReadNoSuchFile {
             return State(seeded: false, requests: nil)
         }
+        let state = try JSONDecoder().decode(State.self, from: data)
+        guard state.seeded, state.requests != nil else { throw CocoaError(.fileReadCorruptFile) }
         cached = state
         return state
     }
@@ -117,11 +117,8 @@ actor NeedsUserEdgeNotifier {
     @discardableResult
     private func persist(_ state: State) -> Bool {
         do {
-            try FileManager.default.createDirectory(
-                at: stateURL.deletingLastPathComponent(), withIntermediateDirectories: true
-            )
             let data = try JSONEncoder().encode(state)
-            try data.write(to: stateURL, options: .atomic)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: stateURL)
             // Do not advance the process cache until the durable state landed.
             // A post-delivery persistence failure may cause a duplicate retry,
             // which is safer than permanently suppressing the edge.

@@ -4,14 +4,7 @@ import SwiftUI
 
 // Blueprint: | `AppearanceController.swift` | `AppearanceController`: one explicit light/dark answer applied consistently to SwiftUI and AppKit |
 
-/// The one answer to "is the window dark?".
-///
-/// User, 2026-09-02: turning the dark window OFF used to hand SwiftUI a nil
-/// colour scheme and AppKit a nil appearance. Neither reliably undoes an
-/// explicit dark: the title bar and rail stayed dark while the page repainted
-/// white with white labels. So the window is never told "nil". It is told
-/// dark or light, explicitly, on both layers, and "off" means whatever the
-/// system is doing right now, tracked live.
+/// SwiftUI and AppKit receive explicit light/dark values; dark mode off follows the live system appearance.
 @MainActor
 @Observable
 final class AppearanceController {
@@ -31,8 +24,7 @@ final class AppearanceController {
     var appearance: NSAppearance? { NSAppearance(named: isDark ? .darkAqua : .aqua) }
 
     private init() {
-        // User, 2026-09-06: dark is the default. An unset preference means
-        // dark; only an explicit false means follow the system.
+        // An unset preference means dark; only explicit false follows the system.
         preferDark = (UserDefaults.standard.object(forKey: Self.preferenceKey) as? Bool) ?? true
         systemIsDark = Self.readSystemIsDark()
         DistributedNotificationCenter.default().addObserver(

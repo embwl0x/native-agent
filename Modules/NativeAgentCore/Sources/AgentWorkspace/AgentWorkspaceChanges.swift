@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import PersistenceCore
+import ChatToolParsing
 // Blueprint: | `AgentWorkspaceChanges.swift` | `AgentWorkspaceChanges` enum; `evaluate`, `evaluateHumanListing`, conversation change observations through the bound owner port |
 
 /// Small comparison receipts, never another content store or unread-message
@@ -54,14 +55,14 @@ enum AgentWorkspaceChanges {
         guard let source = source(location) else { return nil }
         guard let identity = identity(location: location),
               let evidence = evidence(tool: source.tool, result: result),
-              var digestInput = object(evidence),
+              var digestInput = evidence.objectValue,
               !digestInput.isEmpty else {
             return .init(state: .unavailable, nextStamp: previous,
                          detail: "A successful comparable read is unavailable; the previous successful view is retained.")
         }
         // A contact's latest conversation may change between reads. Keep that
         // owner-supplied identity distinct even when the open locator is broad.
-        if source.tool == "agent_read", let row = object(result) {
+        if source.tool == "agent_read", let row = result.objectValue {
             digestInput["source_conversation"] = row["conversation"] ?? row["conversation_id"]
         }
         guard let fingerprint = hash(.object(digestInput)) else {
@@ -70,14 +71,14 @@ enum AgentWorkspaceChanges {
         let replyFingerprint: String?
         if source.tool == "agent_read" {
             if case .array(let exchanges)? = digestInput["exchanges"] {
-                replyFingerprint = hash(.array(exchanges.map { selected(object($0) ?? [:], ["text", "message_id", "conversation_id", "task_id", "artifacts"]) }))
+                replyFingerprint = hash(.array(exchanges.map { selected($0.objectValue ?? [:], ["text", "message_id", "conversation_id", "task_id", "artifacts"]) }))
             } else {
                 replyFingerprint = hash(selected(digestInput, ["reply", "parts", "artifacts"]))
             }
         } else if source.tool == "chat_conversations" {
             replyFingerprint = hash(digestInput["messages"] ?? .array([]))
         } else { replyFingerprint = nil }
-        let revisionValue = source.tool == "chat_conversations" ? object(result)?["source_revision"] : nil
+        let revisionValue = source.tool == "chat_conversations" ? result.objectValue?["source_revision"] : nil
         let ownerRevision = revisionValue.flatMap(hash)
         let stamp = Stamp(identity: identity, fingerprint: fingerprint, replyFingerprint: replyFingerprint, ownerRevisionFingerprint: ownerRevision)
         guard let previous, previous.isValid, previous.identity == stamp.identity else {
@@ -89,7 +90,7 @@ enum AgentWorkspaceChanges {
         } else { kind = "source_changed" }
         return previous.fingerprint == stamp.fingerprint
             ? .init(state: .unchanged, nextStamp: stamp, detail: "Returned evidence matches the last successful workspace view.")
-            // 2026-09-22: no fixed prose per read; state + change carry it.
+            // State and change kind carry the update without fixed prose.
             : .init(state: .changed, nextStamp: stamp, detail: "", kind: kind)
     }
 
@@ -116,14 +117,7 @@ enum AgentWorkspaceChanges {
     /// of the comparison receipt. Exact input pages remain separate baselines.
     static func identity(location: AgentWorkspaceLocation) -> String? {
         guard let source = source(location) else { return nil }
-        var input = source.input.filter { !["__session_id", "details"].contains($0.key) }
-        // Details and conversation views can expose different owner fields or
-        // coverage for the same exchange. Compare each with its own prior view,
-        // so switching presentation never manufactures a changed reply. Omitted
-        // and false remain the same normal-view baseline; routing is unchanged.
-        if source.tool == "agent_read", source.input["details"] == .bool(true) {
-            input["details"] = .bool(true)
-        }
+        let input = source.input.filter { !["__session_id", "details"].contains($0.key) }
         return hash(.object(["tool": .string(source.tool), "input": .object(input)]))
     }
 
@@ -150,18 +144,18 @@ enum AgentWorkspaceChanges {
             // A successful history page can contain failed/interrupted jobs
             // and shortened headlines. Those are recorded outcomes, not a
             // failure to read this page. Compare only its disclosed index.
-            guard let row = object(result), row["status"] == .string("ok"),
+            guard let row = result.objectValue, row["status"] == .string("ok"),
                   row["ok"] != .bool(false), row["error"] == nil, row["error_code"] == nil,
                   case .array(let entries)? = row["entries"],
                   entries.allSatisfy({ value in
-                      guard let entry = object(value), case .string? = entry["id"], case .string? = entry["bot"] else { return false }
+                      guard let entry = value.objectValue, case .string? = entry["id"], case .string? = entry["bot"] else { return false }
                       return true
                   }) else { return nil }
             return .object(["entries": .array(entries.map {
-                selected(object($0) ?? [:], ["id", "bot", "agent_name", "runAt", "headline", "status", "changedSinceLastGood"])
+                selected($0.objectValue ?? [:], ["id", "bot", "agent_name", "runAt", "headline", "status", "changedSinceLastGood"])
             }), "truncated": row["truncated"] ?? .bool(false), "order": row["order"] ?? .string("oldest_first")])
         }
-        guard let row = object(result), successful(row) else { return nil }
+        guard let row = result.objectValue, successful(row) else { return nil }
         switch tool {
         case "read_file":
             guard case .string? = row["content"] else { return nil }
@@ -171,31 +165,28 @@ enum AgentWorkspaceChanges {
             return selected(row, ["url", "title", "content", "text", "markdown"])
         case "agent_read":
             if case .array(let exchanges)? = row["exchanges"] {
-                // Lean excerpts (reply_truncated) and aborted earlier jobs are
-                // recorded history, not a failed read; excerpts are stable, so
-                // they compare cleanly (2026-09-22: every Codex window read
-                // "comparison unavailable"). Same rule as shelf_read.
-                guard exchanges.allSatisfy({ object($0) != nil }) else { return nil }
+                // Stable excerpts and aborted jobs remain comparable recorded history.
+                guard exchanges.allSatisfy({ $0.objectValue != nil }) else { return nil }
                 return .object(["exchanges": .array(exchanges.map { exchange in
-                    selected(object(exchange) ?? [:], ["from", "text", "message_id", "conversation_id", "task_id", "reply_state", "execution_state", "needs_input", "needs_authentication", "artifacts"])
+                    selected(exchange.objectValue ?? [:], ["from", "text", "message_id", "conversation_id", "task_id", "reply_state", "execution_state", "needs_input", "needs_authentication", "artifacts"])
                 }), "state": row["state"] ?? row["status"] ?? .null])
             }
             guard row["reply"] != nil || row["state"] != nil else { return nil }
             return selected(row, ["agent", "conversation", "state", "status", "reply", "last_send_completed", "last_send_terminal", "last_send_needs_input", "last_send_needs_authentication", "completed", "terminal", "needs_input", "needs_authentication", "artifacts", "parts"])
         case "chat_conversations":
             guard row["conversation_session_id"] != nil, case .array(let messages)? = row["messages"],
-                  messages.allSatisfy({ object($0).map(successful) == true }),
+                  messages.allSatisfy({ $0.objectValue.map(successful) == true }),
                   row["coverage"] != .string("incomplete_transcript") else { return nil }
             return .object(["conversation_session_id": row["conversation_session_id"] ?? .null,
                 "last_message_id": row["last_message_id"] ?? .null,
-                "messages": .array(messages.map { selected(object($0) ?? [:], ["role", "text", "message_id"]) }),
+                "messages": .array(messages.map { selected($0.objectValue ?? [:], ["role", "text", "message_id"]) }),
                 "reply_available": row["reply_available"] ?? .null])
         case "read_chat_message":
             guard row["content"] != nil || row["text"] != nil else { return nil }
             return selected(row, ["session_id", "message_id", "role", "content", "text", "has_more"])
         case "work_context":
-            guard let current = object(row["current_work"]), successful(current),
-                  let history = object(row["supporting_history"]), successful(history) else { return nil }
+            guard let current = row["current_work"]?.objectValue, successful(current),
+                  let history = row["supporting_history"]?.objectValue, successful(history) else { return nil }
             return .object([
                 "current_work": selected(current, ["items", "matched_count", "has_more"]),
                 "supporting_history": selected(history, ["excerpts", "hit_count", "has_more"])
@@ -209,15 +200,7 @@ enum AgentWorkspaceChanges {
     }
 
     private static func successful(_ row: [String: JSONValue]) -> Bool {
-        if row["ok"] == .bool(false) || row["success"] == .bool(false) { return false }
-        if ["error", "error_code"].contains(where: { row[$0] != nil && row[$0] != .null }) { return false }
-        if ["partial", "truncated", "reply_truncated"].contains(where: { row[$0] == .bool(true) }) { return false }
-        if let coverage = object(row["coverage"]), coverage["complete"] == .bool(false) { return false }
-        let failures: Set<String> = ["partial", "error", "failed", "unavailable", "blocked", "denied", "blocked_by_trust", "approval_required", "approval_filed", "needs_setup", "needs_topic", "no_outbound_route", "requires_interaction", "outcome_unknown", "not_found"]
-        for key in ["status", "source_availability"] {
-            if case .string(let state)? = row[key], failures.contains(state) { return false }
-        }
-        return true
+        ChatToolOutcome.hasReadEvidence(.object(row), completeOnly: true)
     }
 
     private static func selected(_ row: [String: JSONValue], _ keys: Set<String>) -> JSONValue {
@@ -235,11 +218,6 @@ enum AgentWorkspaceChanges {
         default: return value
         }
     }
-
-    private static func object(_ value: JSONValue?) -> [String: JSONValue]? {
-        if case .object(let row)? = value { return row }; return nil
-    }
-
     private static func hash(_ value: JSONValue) -> String? {
         guard let data = try? value.serializedData(pretty: false), data.count <= 512 * 1024 else { return nil }
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()

@@ -60,43 +60,22 @@ public struct ScheduledJob: Identifiable, Codable, Hashable, Sendable {
     /// a present field of the wrong type makes the row malformed, never
     /// silently absent.
     public init(row: JSONValue) throws {
-        guard case .object(let obj) = SchedulerJobNormalizer.decorateNextRunAt(row) else {
-            throw RowError.notAnObject
-        }
-        func string(_ key: String) throws -> String {
-            guard case .string(let value)? = obj[key] else { throw RowError.field(key) }
-            return value
-        }
-        func optionalString(_ key: String) throws -> String? {
-            switch obj[key] {
-            case nil, .null?: return nil
-            case .string(let value)?: return value
-            default: throw RowError.field(key)
+        do {
+            let row = try JSONRow(SchedulerJobNormalizer.decorateNextRunAt(row))
+            self.id = try row.string("id")
+            self.name = try row.string("name")
+            self.kind = try row.string("kind")
+            self.oneShot = try row.optionalBool("oneShot")
+            self.intervalSeconds = try row.optionalInt("intervalSeconds")
+            guard let enabled = try row.optionalBool("enabled") else { throw RowError.field("enabled") }
+            self.enabled = enabled
+            self.nextRunAt = try row.optionalString("nextRunAt")
+            self.lastRunAt = try row.optionalString("lastRunAt")
+        } catch let error as JSONRow.Malformed {
+            switch error {
+            case .notAnObject: throw RowError.notAnObject
+            case .field(let key): throw RowError.field(key)
             }
         }
-        self.id = try string("id")
-        self.name = try string("name")
-        self.kind = try string("kind")
-        switch obj["oneShot"] {
-        case nil, .null?: self.oneShot = nil
-        case .bool(let value)?: self.oneShot = value
-        default: throw RowError.field("oneShot")
-        }
-        switch obj["intervalSeconds"] {
-        case nil, .null?:
-            self.intervalSeconds = nil
-        case .int(let value)?:
-            guard let seconds = Int(exactly: value) else { throw RowError.field("intervalSeconds") }
-            self.intervalSeconds = seconds
-        case .double(let value)?:
-            guard let seconds = Int(exactly: value) else { throw RowError.field("intervalSeconds") }
-            self.intervalSeconds = seconds
-        default:
-            throw RowError.field("intervalSeconds")
-        }
-        guard case .bool(let enabled)? = obj["enabled"] else { throw RowError.field("enabled") }
-        self.enabled = enabled
-        self.nextRunAt = try optionalString("nextRunAt")
-        self.lastRunAt = try optionalString("lastRunAt")
     }
 }

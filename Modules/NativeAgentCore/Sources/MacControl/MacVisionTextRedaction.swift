@@ -1,6 +1,6 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `MacVisionTextRedaction.swift` | `VisionTextRedaction`, `VisionRedactionConfig`, `VisionRedactedText`; pixel-unit adapter to shared AX caption geometry; one positional caption/overlap redaction boundary for both OCR readers |
+// Blueprint: | `MacVisionTextRedaction.swift` | `VisionTextRedaction`, `VisionRedactedText`; fixed OCR caption/proximity rules with caller-owned text limits; one positional caption/overlap redaction boundary for both OCR readers |
 
 // MARK: - Shared positional OCR redaction
 //
@@ -22,12 +22,14 @@ public struct VisionRedactedText: Sendable, Equatable {
     /// What the percept emits: the clear string, or the redactor's
     /// `{redacted, sha256, reason}` digest object.
     public let json: JSONValue
-    public let secret: Bool
+    public var secret: Bool {
+        if case .string = json { return false }
+        return true
+    }
 
-    public init(raw: String, json: JSONValue, secret: Bool) {
+    public init(raw: String, json: JSONValue) {
         self.raw = raw
         self.json = json
-        self.secret = secret
     }
 
     /// The clear text when redaction let it through, nil when it withheld it.
@@ -36,33 +38,12 @@ public struct VisionRedactedText: Sendable, Equatable {
     public var display: String? { secret ? nil : raw }
 }
 
-public struct VisionRedactionConfig: Sendable, Equatable {
-    /// A caption has to be SHORT — the redactor's own bar for "this line names
-    /// a secret" rather than "this line is prose about one".
-    public let maxCaptionChars: Int
-    /// How far a caption may sit from its value, in IMAGE PIXELS. The AX
-    /// channel uses 240 points; pixels are points × backing scale, so this is
-    /// expressed relative to the frame and floored, rather than assuming 1×.
-    public let proximityFraction: Double
-    public let proximityFloorPixels: Double
-    public let valueChars: Int
-
-    public init(
-        maxCaptionChars: Int = 32,
-        proximityFraction: Double = 0.25,
-        proximityFloorPixels: Double = 120,
-        valueChars: Int = 120
-    ) {
-        self.maxCaptionChars = maxCaptionChars
-        self.proximityFraction = proximityFraction
-        self.proximityFloorPixels = proximityFloorPixels
-        self.valueChars = valueChars
-    }
-
-    public static let `default` = VisionRedactionConfig()
-}
-
 public enum VisionTextRedaction {
+    /// OCR captions name a secret in at most 32 characters; proximity uses image pixels.
+    private static let maxCaptionChars = 32
+    private static let proximityFraction = 0.25
+    private static let proximityFloorPixels = 120.0
+
     /// Is `caption` immediately left of the value on the same line, or directly
     /// above with horizontal overlap? Coordinates and proximity must share units.
     public static func isCaption(
@@ -71,11 +52,11 @@ public enum VisionTextRedaction {
         proximity: Double
     ) -> Bool {
         guard caption != value else { return false }
-        return MacScreenViewTextRedaction.isLabel(
+        return MacScreenViewTextRedaction.labelDistance(
             MacAXFrame(x: caption.x, y: caption.y, w: caption.w, h: caption.h),
             forValueAt: MacAXFrame(x: value.x, y: value.y, w: value.w, h: value.h),
             proximity: proximity
-        )
+        ) != nil
     }
 
     /// Every OCR string, redacted under the shared rules, BEFORE anything
@@ -84,20 +65,18 @@ public enum VisionTextRedaction {
     public static func redact(
         boxes: [VisionTextBox],
         imageSize: VisionSize,
-        config: VisionRedactionConfig = .default
+        valueChars: Int = 120
     ) -> [VisionRedactedText] {
         let proximity = max(
-            config.proximityFloorPixels,
-            max(imageSize.width, imageSize.height) * config.proximityFraction
+            proximityFloorPixels,
+            max(imageSize.width, imageSize.height) * proximityFraction
         )
-        // Candidate captions: SHORT lines only, the same bar the AX channel
-        // applies before a line is allowed to darken its neighbour.
-        let captions = boxes.filter { $0.text.count <= config.maxCaptionChars }
+        let captions = boxes.filter { $0.text.count <= maxCaptionChars }
 
         var redacted = boxes.map { box in
             var json = MacScreenViewTextRedaction.redactedLegendString(
                 box.text,
-                valueChars: config.valueChars
+                valueChars: valueChars
             )
             // A generic caption must not mask a CVV or recovery-phrase label.
             for caption in captions where isCaption(
@@ -105,13 +84,10 @@ public enum VisionTextRedaction {
             ) {
                 guard case .string = json else { break }
                 json = MacScreenViewTextRedaction.redactedLegendString(
-                    box.text, valueChars: config.valueChars, under: caption.text
+                    box.text, valueChars: valueChars, under: caption.text
                 )
             }
-            if case .string = json {
-                return VisionRedactedText(raw: box.text, json: json, secret: false)
-            }
-            return VisionRedactedText(raw: box.text, json: json, secret: true)
+            return VisionRedactedText(raw: box.text, json: json)
         }
         // Whole-frame and tile OCR can observe the same secret as different
         // strings. Withhold every overlapping fragment before any text escapes.
@@ -121,8 +97,7 @@ public enum VisionTextRedaction {
                 && boxes[index].rect.intersection(boxes[secretIndex].rect).area > 0 {
                 redacted[index] = VisionRedactedText(
                     raw: boxes[index].text,
-                    json: MacScreenViewTextRedaction.redactedText(boxes[index].text, reason: "overlapping_secret"),
-                    secret: true
+                    json: MacScreenViewTextRedaction.redactedText(boxes[index].text, reason: "overlapping_secret")
                 )
                 pending.append(index)
             }

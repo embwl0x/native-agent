@@ -1,7 +1,7 @@
 import Foundation
 import PersistenceCore
 import TriggerScheduler
-// Blueprint: | `BotRunnerScheduler.swift` | `BotRunnerScheduler` actor; `effectiveSchedule` shares reconciled timing and admission with live deadlines; `savedDates` is editor-only reservation state |
+// Blueprint: | `BotRunnerScheduler.swift` | `BotRunnerScheduler` actor; `effectiveSchedule` shares reconciled timing and admission with live deadlines |
 
 /// One persisted due/reservation record per definition, projected into the
 /// existing BackgroundLoops deadline owner. Definitions remain canonical.
@@ -41,7 +41,7 @@ public actor BotRunnerScheduler {
     private let isAutonomyEnabled: @Sendable () async -> Bool
     public private(set) var failure: String?
     private var inFlight: [UUID: Task<Void, Never>] = [:]
-    private var lifecycleGeneration: UInt64 = 0
+    private var isShutDown = false
     private var settled: [String] = []
     private var deadlineFailures: [UUID: String] = [:]
 
@@ -61,26 +61,14 @@ public actor BotRunnerScheduler {
 
     private var path: URL { disk.root.appendingPathComponent("runner-jobs.json") }
 
-    /// Saved dates for editing a cadence, including reservations; not runnable deadlines.
-    public static func savedDates(dataRoot: URL) throws -> [UUID: Date] {
-        let disk = StandingBotsDisk(dataRoot: dataRoot)
-        return try disk.locked {
-            let jobs = try disk.read([String: Job].self, at: disk.root.appendingPathComponent("runner-jobs.json")) ?? [:]
-            return Dictionary(jobs.compactMap { key, job -> (UUID, Date)? in
-                guard let id = UUID(uuidString: key), job.reason == nil, job.next != .distantFuture else { return nil }
-                return (id, job.next)
-            }, uniquingKeysWith: { first, _ in first })
-        }
-    }
-
-    public struct Projection: Sendable {
+    public struct BotSchedule: Sendable {
         public let dates: [UUID: Date]
         public let missed: [UUID: BotMissedRun]
         public let unattended: Bool
     }
 
     /// Read-only reconciliation: no deadline writes, claims or missed-run mutations.
-    public func effectiveSchedule() async throws -> Projection {
+    public func effectiveSchedule() async throws -> BotSchedule {
         let unattended = await isAutonomyEnabled()
         let bots = try definitions.list()
         let jobs = try disk.locked {
@@ -91,7 +79,7 @@ public actor BotRunnerScheduler {
         return projection(bots, jobs: jobs, unattended: unattended)
     }
 
-    private func projection(_ bots: [BotDefinition], jobs: [String: Job], unattended: Bool) -> Projection {
+    private func projection(_ bots: [BotDefinition], jobs: [String: Job], unattended: Bool) -> BotSchedule {
         let dates = bots.compactMap { bot -> (UUID, Date)? in
             guard unattended, !bot.paused, inFlight[bot.id] == nil,
                   let job = jobs[bot.id.uuidString], job.reason == nil, job.next != .distantFuture else { return nil }
@@ -101,7 +89,7 @@ public actor BotRunnerScheduler {
             guard let id = UUID(uuidString: key), let missed = job.missed else { return nil }
             return (id, missed)
         }
-        return Projection(dates: Dictionary(dates, uniquingKeysWith: { first, _ in first }),
+        return BotSchedule(dates: Dictionary(dates, uniquingKeysWith: { first, _ in first }),
                           missed: Dictionary(missed, uniquingKeysWith: { first, _ in first }), unattended: unattended)
     }
 
@@ -270,9 +258,9 @@ public actor BotRunnerScheduler {
     /// The unattended gates, re-read after an event-woken request has won its
     /// claim. `paused` is the definition the claim itself read, under the store
     /// lock. Returns true — having recorded the hold — when nothing may be spent.
-    private func holdUnattendedRun(bot id: UUID, paused: Bool, lifecycle: UInt64) async -> Bool {
+    private func holdUnattendedRun(bot id: UUID, paused: Bool) async -> Bool {
         let enabled = await isAutonomyEnabled()
-        let stopped = lifecycle != lifecycleGeneration
+        let stopped = isShutDown || Task.isCancelled
         guard stopped || !enabled || paused else { return false }
         let detail = stopped ? "Background work stopped" : (enabled ? "the bot is paused" : "Autonomy is off")
         // There is no `.paused` reason; `.notRun` plus the gate's own words is
@@ -295,6 +283,7 @@ public actor BotRunnerScheduler {
     }
 
     public func nextDeadline(after now: Date) async -> Date? {
+        guard !isShutDown else { return nil }
         do {
             let bots = try definitions.list()
             let jobs = try reconciled(bots)
@@ -306,15 +295,17 @@ public actor BotRunnerScheduler {
         } catch { failure = "Bot scheduling unavailable: \(error)"; return nil }
     }
 
-    public func shutdown() {
-        // Stop closes admission. Accepted sessions and their budget reporters
-        // keep their claims and handles until actual exit; Stop is a separate act.
-        lifecycleGeneration &+= 1
+    public func shutdown() async {
+        isShutDown = true
+        let tasks = Array(inFlight.values)
+        for task in tasks { task.cancel() }
+        // Bodies keep claims until session, shelf, accounting and deadline
+        // reporters have all settled; concurrent shutdown callers join too.
+        for task in tasks { await task.value }
     }
 
     public func runDue() async -> [String] {
-        let lifecycle = lifecycleGeneration
-        guard await BotRunGate.isReady(), lifecycle == lifecycleGeneration, !Task.isCancelled else { return [] }
+        guard !isShutDown, await BotRunGate.isReady(), !isShutDown, !Task.isCancelled else { return [] }
         failure = deadlineFailures.values.sorted().first
         let completed = settled
         settled.removeAll()
@@ -340,7 +331,7 @@ public actor BotRunnerScheduler {
                 // where it was taken in. A manual Run once is the person asking.
                 if request.isEvent {
                     let enabled = await isAutonomyEnabled()
-                    guard lifecycle == lifecycleGeneration, !Task.isCancelled else { return completed }
+                    guard !isShutDown, !Task.isCancelled else { return completed }
                     let paused = (try? definitions.get(id))?.paused ?? false
                     if !enabled || paused {
                         try queue.rejectPending(bot: id, requestID: requestID)
@@ -357,7 +348,7 @@ public actor BotRunnerScheduler {
                 let isEvent = request.isEvent
                 let holdUnattended: @Sendable (BotDefinition) async -> Bool = { claimed in
                     guard isEvent else { return false }
-                    return await self.holdUnattendedRun(bot: id, paused: claimed.paused, lifecycle: lifecycle)
+                    return await self.holdUnattendedRun(bot: id, paused: claimed.paused)
                 }
                 try Task.checkCancellation()
                 inFlight[id] = Task {
@@ -373,7 +364,7 @@ public actor BotRunnerScheduler {
                 }
             }
             let autonomyEnabled = await isAutonomyEnabled()
-            guard lifecycle == lifecycleGeneration, !Task.isCancelled else { return completed }
+            guard !isShutDown, !Task.isCancelled else { return completed }
             let scheduledBots = try definitions.list()
             let scheduledJobs = try reconciled(scheduledBots)
             noteMissed(scheduledBots, autonomyEnabled: autonomyEnabled)
@@ -384,7 +375,7 @@ public actor BotRunnerScheduler {
                 guard inFlight[bot.id] == nil else { continue }
                 try Task.checkCancellation()
                 guard scheduledJobs[bot.id.uuidString]?.reason == nil else { continue }
-                guard await isAutonomyEnabled(), lifecycle == lifecycleGeneration, !Task.isCancelled else { break }
+                guard await isAutonomyEnabled(), !isShutDown, !Task.isCancelled else { break }
                 let live = try definitions.list()
                 guard let fresh = live.first(where: { $0.id == bot.id }), !fresh.paused else { continue }
                 do {
@@ -419,7 +410,7 @@ public actor BotRunnerScheduler {
                         let botID = bot.id
                         lastUnattendedHold.removeValue(forKey: botID)
                         let holdUnattended: @Sendable (BotDefinition) async -> Bool = { claimed in
-                            await self.holdUnattendedRun(bot: botID, paused: claimed.paused, lifecycle: lifecycle)
+                            await self.holdUnattendedRun(bot: botID, paused: claimed.paused)
                         }
                         if let entry = try await runner.run(bot: bot.id, holdUnattended: holdUnattended,
                                                           deadlineExceeded: { await self.reportDeadline(bot.id, detail: $0) }) {

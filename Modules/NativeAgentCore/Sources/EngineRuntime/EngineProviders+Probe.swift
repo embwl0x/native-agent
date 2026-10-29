@@ -4,21 +4,10 @@ import NativeAgentShared
 import PersistenceCore
 import ProviderRouting
 import ChatTurnRuntime
-import Cognition
 // Blueprint: | `EngineProviders+Probe.swift` | `ProvidersFacade`: `testProvider`, `clearProvider` |
 
 extension ProvidersFacade {
-    // DAEMON-DEAD PORT (2026-06-02): native reachability probe. Resolves the
-    // API key via LLMCredentialResolver (providers/<id>.json), then for
-    // OpenAI hits GET /v1/models with a Bearer token and reports latency.
-    // Anthropic (GET /v1/models, x-api-key) and OpenRouter (GET /api/v1/key)
-    // are probed the same way; 401 (and Anthropic 403) reads "key rejected".
-    //
-    // User, 2026-09-06: `apiKeyOverride` is the key typed into the provider
-    // sheet but not saved yet. Without it the button tested the credential on
-    // disk while the sheet showed the result beside an unrelated draft — a bad
-    // pasted key could read "Saved and tested" off the old saved one, and a
-    // fresh install reported "no api key configured" for a valid pasted key.
+    // Probe the supplied API-key draft or this root's saved credential through the provider's native route.
     public nonisolated func testProvider(_ id: String, apiKeyOverride: String? = nil) async throws -> NativeAgentShared.ProviderTestResult {
         // This write is deliberately attached to the canonical, user-initiated
         // reachability probe rather than to a provider-list refresh. A readable
@@ -29,34 +18,18 @@ extension ProvidersFacade {
             let trimmed = apiKeyOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed?.isEmpty == false ? trimmed : nil
         }()
-        func recordProbeResult(_ result: NativeAgentShared.ProviderTestResult, checkedAt: Date = Date()) async -> NativeAgentShared.ProviderTestResult {
-            // A draft key is not this provider's credential — it has not been
-            // saved. Its probe answers the sheet only; writing it to the status
-            // feed would claim a configured provider was reachable when the
-            // configured one was never touched (User, 2026-09-06).
+        func recordProbeResult(_ result: NativeAgentShared.ProviderTestResult) async -> NativeAgentShared.ProviderTestResult {
+            // Draft probes answer only the sheet; they cannot claim the configured credential was checked.
             guard draftKey == nil else { return result }
             do {
-                try await LLMProviderStatusFeed.write(result, dataRoot: dataRoot, checkedAt: checkedAt)
+                try await LLMProviderStatusFeed.write(result, dataRoot: dataRoot, checkedAt: Date())
             } catch {
                 nativeLog("provider_status: could not persist provider check: \(error.localizedDescription)")
             }
             return result
         }
-        // Successful traffic already proves the OAuth path within the probe's
-        // freshness window. Keep its actual date; reading it does not renew it.
+        // An explicit connection check probes the current saved credential.
         if id.hasSuffix("_oauth_direct") {
-            let now = Date()
-            if draftKey == nil, let evidence = try await NativeCognitionRuntime.providerPathEvidence(
-                providerID: id, dataRoot: dataRoot,
-                since: now.addingTimeInterval(-LLMProviderStatusFeed.staleAfter), now: now
-            ) {
-                return await recordProbeResult(NativeAgentShared.ProviderTestResult(
-                    provider_id: id, status: "ok", tested: true, response: nil,
-                    model_used: evidence.model,
-                    detail: "Recent successful model call at \(evidence.observedAt.formatted(.iso8601)) proves this provider path.",
-                    error: nil
-                ), checkedAt: evidence.observedAt)
-            }
             let snapshot = try await SwiftNativeProviderRouting(dataRoot: dataRoot).checkedProviderSnapshot()
             let probeModel = try snapshot.probeModel(for: id)
             let llm = makeResidentProviderLLMClient(dataRoot: dataRoot)
@@ -64,7 +37,7 @@ extension ProvidersFacade {
             // No turn context may override the probe's provider or budget.
             let probe = Task.detached {
                 try await LLMCallContext.$providerId.withValue(id) {
-                    try await llm.complete(prompt: "ping", system: "This is a provider connection check.", model: probeModel, surface: "chat", purpose: "probe")
+                    try await llm.complete(prompt: "ping", system: "This is a provider connection check.", model: probeModel, surface: "chat", purpose: "probe", tools: nil)
                 }
             }
             // The sign-in this check sends, hashed before it is sent, as a key's
@@ -86,6 +59,7 @@ extension ProvidersFacade {
                 // The caller gave up; that says nothing about the provider.
                 throw CancellationError()
             } catch {
+                try Task.checkCancellation()
                 return await recordProbeResult(NativeAgentShared.ProviderTestResult(
                     provider_id: id, status: "error", tested: true,
                     response: nil, model_used: probeModel,
@@ -95,17 +69,16 @@ extension ProvidersFacade {
             }
         }
 
-        return await recordProbeResult(try await SwiftNativeProviderRouting.probeAPIProvider(id, dataRoot: dataRoot, draftKey: draftKey))
+        let result = try await SwiftNativeProviderRouting.probeAPIProvider(id, dataRoot: dataRoot, draftKey: draftKey)
+        try Task.checkCancellation()
+        return await recordProbeResult(result)
     }
 
     // Remove the matching registry entry under its lock; damaged authority
     // must remain byte-preserved rather than becoming an empty registry.
     public nonisolated func clearProvider(_ id: String) async throws {
-        // User, 2026-09-06: the facade's own root, not the process default — a
-        // removal against an override root was deleting the default install's
-        // registry row and credential file and leaving the intended one intact.
+        // Provider removal is confined to the facade's data root.
         let path = dataRoot.appendingPathComponent("providers/registry.json")
-        let persistence = SwiftNativePersistenceCore()
         guard !id.isEmpty, id != ".", id != "..",
               id.allSatisfy({ "abcdefghijklmnopqrstuvwxyz0123456789_-".contains($0) }),
               !["registry", "models", "active", "surfaces", "pending-surface-configuration",
@@ -115,20 +88,16 @@ extension ProvidersFacade {
         let credFile = dataRoot
             .appendingPathComponent("providers", isDirectory: true)
             .appendingPathComponent("\(id).json")
-        let reference = try await persistence.withFileLock(path) {
+        let reference = try await SwiftNativePersistenceCore.withFileLock(path) {
             _ = try SwiftNativeProviderRouting.loadProviderRegistryChecked(at: path)
-            return try await persistence.withFileLock(credFile) { () async throws -> String? in
+            return try await SwiftNativePersistenceCore.withFileLock(credFile) { () async throws -> String? in
                 // Validate the target row and credential before the first write.
                 // Unrelated rows survive; credential deletion still happens last.
                 let remaining = try ProviderStateValidation.registryRemovingProvider(at: path, providerID: id)
                 let credential = try ProviderStateValidation.credential(at: credFile)
-                let fields = try SwiftNativeProviderRouting.loadProviderStateObjectChecked(
-                    at: credFile, description: "provider \(id) configuration"
-                )
-                try SwiftNativeProviderRouting.validateProviderConfiguration(fields)
                 let reference = credential[ProviderAPIKeyStore.referenceField] as? String
                 if let remaining {
-                    try await persistence.writeJSON(.array(remaining), to: path)
+                    try await SwiftNativePersistenceCore.writeJSON(.array(remaining), to: path)
                 }
                 do {
                     try FileManager.default.removeItem(at: credFile)
@@ -155,7 +124,7 @@ extension ProvidersFacade {
     public func testConfiguredProvider(
         _ provider: ProviderInfo, authMode: String, apiKey: String
     ) async throws -> (result: NativeAgentShared.ProviderTestResult, credentialReady: Bool) {
-        let current = try await list().first { $0.provider_id == provider.provider_id }
+        let current = try await list().providers.first { $0.provider_id == provider.provider_id }
         let credentialReady = current?.auth_status.eligible == true
             && (current?.auth_mode == authMode || (current?.auth_mode == nil && provider.auth_modes.count == 1))
         let result: NativeAgentShared.ProviderTestResult

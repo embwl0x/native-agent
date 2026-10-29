@@ -1,5 +1,7 @@
 import ProviderRouting
 import Foundation
+import NativeAgentShared
+import NativeAgentCore
 import PersistenceCore
 import SlackBot
 // Blueprint: | `NativeOAuthFlow+Slack.swift` | `saveSlackToken` validates explicit setup tokens through `SlackWebAPI` and records the person's connected decision; canonical auth metadata and grant publication delegate to SlackCredentials without a legacy copy. Saved fields describe setup, while runtime health requires action proof; publication checks its captured revision under the commit locks, and disconnect advances the registry credential generation |
@@ -15,7 +17,6 @@ extension NativeOAuthFlow {
         allowedChannelIds: Set<String>? = nil,
         allowedUserIds: Set<String>? = nil,
         requireMention: Bool? = nil,
-        validateWithSlack: Bool = true,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) async -> OAuthFlowResult {
         let providedToken = rawToken.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -29,7 +30,7 @@ extension NativeOAuthFlow {
         }
         catch {
             return OAuthFlowResult(ok: false,
-                error: "Could not save Slack token: \(NativeOAuthSupport.redact(error.localizedDescription))")
+                error: "Could not save Slack token: \(OAuthGrantOperations.redact(error.localizedDescription))")
         }
         let token = snapshot.token
         guard isPlausibleSlackToken(token) else {
@@ -49,21 +50,16 @@ extension NativeOAuthFlow {
         }
 
         let authFields: [String: String]
-        if validateWithSlack {
-            do {
-                authFields = slackAuthFields(try await slackAuthTest(token: token))
-            } catch {
-                return OAuthFlowResult(ok: false,
-                    error: "Slack token validation failed: \(NativeOAuthSupport.redact(error.localizedDescription))")
-            }
-        } else {
-            authFields = [:]
+        do {
+            authFields = slackAuthFields(try await slackAuthTest(token: token))
+        } catch {
+            return OAuthFlowResult(ok: false,
+                error: "Slack token validation failed: \(OAuthGrantOperations.redact(error.localizedDescription))")
         }
 
         let root = dataRoot
-        let now = NativeOAuthSupport.isoBasic(Date())
-        let connectorPath = SlackCredentials.files(dataRoot: root)[0]
-        let persistence = SwiftNativePersistenceCore()
+        let now = NativeTimestampFormat.basicZulu(Date())
+        let connectorPath = TransportAllowlist.slackMetadataPath(dataRoot: root)
 
         // Stage an immutable, verified grant before a durable save intent.
         // Startup finishes that exact intent before admitting the connection.
@@ -74,7 +70,7 @@ extension NativeOAuthFlow {
                 provider: "slack",
                 createIfMissing: true,
                 publish: { registry, _ in
-                    try await persistence.withFileLock(connectorPath) {
+                    try await SwiftNativePersistenceCore.withFileLock(connectorPath) {
                         guard try slackSaveRevision(dataRoot: root) == snapshot.revision else {
                             throw PersistenceCoreError.ioFailure("Slack credentials changed while saving. The token was not saved.")
                         }
@@ -98,7 +94,7 @@ extension NativeOAuthFlow {
                             into: &connector
                         )
                         mergeSlackAuthFields(authFields, into: &connector)
-                        connector["validated_at"] = validateWithSlack ? .string(now) : nil
+                        connector["validated_at"] = .string(now)
                         try SlackCredentials.commitSave(connector: .object(connector),
                                                         registry: registry, dataRoot: root)
                     }
@@ -122,7 +118,7 @@ extension NativeOAuthFlow {
             }
         } catch {
             return OAuthFlowResult(ok: false,
-                error: "Could not save Slack token: \(NativeOAuthSupport.redact(error.localizedDescription))")
+                error: "Could not save Slack token: \(OAuthGrantOperations.redact(error.localizedDescription))")
         }
 
         return OAuthFlowResult(ok: true, error: nil)
@@ -138,7 +134,7 @@ extension NativeOAuthFlow {
     /// also detects revocation when there were no credential files to remove.
     private static func slackSaveRevision(dataRoot: URL) throws -> [JSONValue] {
         let registry = try ConnectorOAuthRegistry.readRegistry(at: ConnectorOAuthRegistry.connectorRegistryPath(root: dataRoot))
-        let row = try ConnectorOAuthRegistry.checkedConnectorRows(from: registry).first {
+        let row = registry.first {
             ConnectorOAuthRegistry.connectorRow($0, matches: "slack")
         }
         return try [.object(SlackCredentials.metadata(dataRoot: dataRoot)),

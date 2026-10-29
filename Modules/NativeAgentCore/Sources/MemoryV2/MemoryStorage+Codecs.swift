@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import NativeAgentShared
 import GRDB
 import NativeAgentCore
 import PersistenceCore
@@ -35,9 +36,7 @@ extension MemoryStorage {
     }
 
     public static func nowISO8601() -> String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f.string(from: Date())
+        NativeTimestampFormat.fractionalZulu(Date())
     }
 
     static func metadataString(

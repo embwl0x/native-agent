@@ -1,4 +1,3 @@
-import GrokLink
 import Foundation
 import ChatTurnRuntime
 import ChatTurnContracts
@@ -10,7 +9,7 @@ import MacControl
 
 public enum GrokBotConnection {
     public static func perform(plan: [String: JSONValue], dataRoot: URL, inner: any ToolDispatchClient, surface: String,
-                               port: any GrokBotConnectionPort) async -> JSONValue {
+                               port: DesktopAgentConversationRoute) async -> JSONValue {
         guard case .string(let peerID)? = plan["peer_id"],
               let contact = try? AgentPeerStore(dataRoot: dataRoot).list().first(where: { $0.id == peerID && $0.transport == .grokBot }) else {
             return result("unavailable", "Grok Bot contact unavailable.")
@@ -20,7 +19,7 @@ public enum GrokBotConnection {
             switch plan["status"] {
             case .string("grok_send"):
                 if contact.grokSetup != "set up" { return GrokBotRoute.setupRequired(contact) }
-                try await port.ensureRunning()
+                try await GrokRoutineAccessibility.ensureRunning()
                 guard case .string(let text)? = plan["text"], case .string(let id)? = plan["message_id"],
                       case .string(let conversation)? = plan["conversation_id"] else { return result("invalid", "Missing message.") }
                 // The asking turn's door, as its conversation row keeps it.
@@ -28,8 +27,9 @@ public enum GrokBotConnection {
                 let route = AgentBridgeCompletionRoute(surface: asked?.surface ?? surface, sessionId: conversation,
                     destinationId: asked?.destinationId, threadId: asked?.threadId, sourceKey: asked?.sourceKey,
                     replyTo: asked?.replyTo, correlationId: asked?.correlationId, requesterUserId: asked?.requesterUserId)
-                return try await port.send(peer: contact, text: text, conversation: conversation, route: route,
+                return try await GrokBotRoute.send(peer: contact, text: text, conversation: conversation, route: route,
                     messageID: id, dataRoot: dataRoot,
+                    credential: GrokLinkCredential.read(peer: contact.id),
                     quiet: PersonInitiatedSend.current?.admitted == true)
             case .string("grok_disconnect"):
                 guard contact.grokBootstrapConfirmed == true, contact.grokConversation != nil else {

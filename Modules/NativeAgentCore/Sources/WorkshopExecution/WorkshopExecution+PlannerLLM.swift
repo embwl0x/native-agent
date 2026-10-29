@@ -10,59 +10,30 @@ import ProviderRouting
 
 // MARK: - Swift-native planner LLM
 
-/// Production planner used by `makeWorkshopRunner`. Connector actions are
-/// intentionally empty until the connector action
-/// registry is wired in Swift. The LLM call goes through the in-app
-/// `SwiftNativeLLMClient`: one checked routing snapshot admits the complete
-/// executions provider/model/effort/tier tuple, and the task-local admission is
-/// passed through `LLMClient.complete(prompt:system:model:surface:)`. Model calls
-/// await provider/transport termination or caller cancellation, without an
-/// elapsed-time cut. The surface is carried through the final client call
-/// so active-provider selection and the surface's Think/Fast controls cannot
-/// fall back to chat. CancellationError propagates distinctly from WorkshopExecutionError
-/// so a cancelled submit() never lands a stub.
-/// Process-global tool catalog for the execution planner. WorkshopExecution
-/// can't import ChatToolRuntime (the tool-catalog source), so the APP
-/// configures this ONCE at launch (BackgroundLoopsManager.start) with a
-/// provider built from SwiftToolDispatcher's schemas. Every planner that isn't
-/// given an explicit provider — notably the trigger scheduler's
-/// makeWorkshopRunner — reads it, so AUTONOMOUS triggered executions get the same
-/// real tools as manually-submitted ones. Unconfigured (tests) → empty →
-/// synthesis-only, preserving prior behaviour. Set-once-at-launch; lock-guarded.
+/// Shared planner catalog configured by EngineLaunch from the app's live schemas; unconfigured means synthesis-only.
 public enum WorkshopPlannerCatalog {
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var provider: @Sendable () async -> [JSONValue] = { [] }
+    private static let provider = OSAllocatedUnfairLock<@Sendable () async -> [JSONValue]>(initialState: { [] })
 
     public static func configure(_ p: @escaping @Sendable () async -> [JSONValue]) {
-        lock.lock(); defer { lock.unlock() }
-        provider = p
-    }
-
-    /// Synchronous lock-guarded read — keeps the NSLock out of the async
-    /// `current()` (Swift 6 bans lock/unlock across suspension points).
-    private static func snapshot() -> @Sendable () async -> [JSONValue] {
-        lock.lock(); defer { lock.unlock() }
-        return provider
+        provider.withLock { $0 = p }
     }
 
     public static func current() async -> [JSONValue] {
-        await snapshot()()
+        let current = provider.withLock { $0 }
+        return await current()
     }
 }
 
+/// Checked execution routing carries provider/model/effort/tier through the final call; transport termination or caller cancellation bounds it.
+/// Cancellation propagates distinctly and never queues a substitute plan.
 public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
-    public var directProviderCallCountPerInvocation: Int? { 1 }
     private let llm: any LLMClient
-    private let router: any ProviderRoutingProtocol
+    private let router: SwiftNativeProviderRouting
     /// Where the per-run RunLedger row lands (<root>/runs/runs.json). nil
     /// disables ledger writes — the hermetic-test posture, so a mock-LLM
     /// planner test never appends rows to the developer's live ledger.
     private let runLedgerDataRoot: URL?
-    /// Tool-menu source for the planner. WorkshopExecution cannot import
-    /// ChatToolRuntime (its only tool-catalog source), so the real catalog
-    /// is injected from the APP layer. Defaults empty for back-compat — with
-    /// an empty list the planner can only ever emit chat.synthesize steps,
-    /// which is the pre-2026-06-15 behaviour every test relies on.
+    /// Injected tool schemas; the shared live catalog is the default and an empty menu permits synthesis only.
     private let connectorActionsProvider: @Sendable () async -> [JSONValue]
 
     /// A secondary data root is a separate runtime body. It may use the
@@ -87,7 +58,7 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
             }
             environment["HOME"] = dataRoot.standardizedFileURL.path
         }
-        // Credential selection belongs to CodexAdapter, using this same root
+        // Credential selection belongs to CodexProcess, using this same root
         // and the same process overrides that readiness evaluates.
         return environment
     }
@@ -102,49 +73,11 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
         lifecycleObserver: (any LLMCallLifecycleObserving)? = nil
     ) {
         let rootedRouter = SwiftNativeProviderRouting(dataRoot: dataRoot)
-        let providers = dataRoot.appendingPathComponent("providers", isDirectory: true)
-        let codexEnvironment = Self.codexEnvironment(dataRoot: dataRoot)
-        let rootedLLM = SwiftNativeLLMClient(
-            router: rootedRouter,
-            codex: CodexAdapter(processEnvironmentOverride: codexEnvironment, dataRootOverride: dataRoot),
-            anthropic: AnthropicAdapter(
-                session: ProviderStreamGuard.stallOnlySession,
-                dataRootOverride: dataRoot,
-                telemetryDataRootOverride: dataRoot
-            ),
-            openAI: OpenAIAdapter(
-                session: ProviderStreamGuard.stallOnlySession,
-                dataRootOverride: dataRoot,
-                telemetryDataRootOverride: dataRoot
-            ),
-            openAIOAuthDirect: OpenAIOAuthDirectAdapter(
-                session: ProviderStreamGuard.stallOnlySession,
-                dataRootOverride: dataRoot,
-                telemetryDataRootOverride: dataRoot
-            ),
-            anthropicOAuthDirect: AnthropicOAuthDirectAdapter(
-                session: ProviderStreamGuard.stallOnlySession,
-                authPathOverride: providers.appendingPathComponent("anthropic_oauth_direct.json"),
-                telemetryDataRootOverride: dataRoot
-            ),
-            xaiOAuthDirect: XAIOAuthDirectAdapter(
-                session: ProviderStreamGuard.stallOnlySession,
-                tokenPathOverride: XAIOAuthDirectAdapter.tokenPath(dataRoot: dataRoot),
-                telemetryDataRootOverride: dataRoot
-            ),
-            moonshot: MoonshotAdapter(
-                session: ProviderStreamGuard.stallOnlySession,
-                dataRootOverride: dataRoot,
-                telemetryDataRootOverride: dataRoot
-            ),
-            kimiCode: AnthropicAdapter.kimiCode(
-                session: ProviderStreamGuard.stallOnlySession,
-                dataRootOverride: dataRoot,
-                telemetryDataRootOverride: dataRoot
-            ),
-            openRouter: OpenRouterAdapter(session: ProviderStreamGuard.stallOnlySession, dataRootOverride: dataRoot),
+        let rootedLLM = makeResidentProviderLLMClient(
+            dataRoot: dataRoot, providersRoot: dataRoot, router: rootedRouter,
             lifecycleObserver: lifecycleObserver,
-            moonshotCatalogDataRoot: dataRoot
+            processEnvironmentOverride: Self.codexEnvironment(dataRoot: dataRoot),
+            stallOnlyTransport: true
         )
         self.init(
             llm: rootedLLM,
@@ -157,66 +90,34 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
 
     public init(
         llm: (any LLMClient)? = nil,
-        router: (any ProviderRoutingProtocol)? = nil,
-        // Default reads the process-global catalog (WorkshopPlannerCatalog),
-        // which the APP configures once at launch. This is what makes EVERY
-        // planner construction — incl. the trigger scheduler's makeWorkshopRunner
-        // and any unwired path — tool-aware, not just the call sites that pass
-        // an explicit provider. In tests the global is unconfigured → empty →
-        // pre-2026-06-15 synthesis-only behaviour preserved (2026-06-15).
+        router: SwiftNativeProviderRouting? = nil,
+        // Every planner uses the app-configured catalog unless one is supplied.
         connectorActionsProvider: @escaping @Sendable () async -> [JSONValue] = { await WorkshopPlannerCatalog.current() },
         lifecycleObserver: (any LLMCallLifecycleObserving)? = nil,
         // Default ON at the real data root so every production construction
-        // records runs without a call-site change. Tests that drive runCodex
+        // records runs without a call-site change. Tests that drive plan
         // with a mock LLM pass nil so they never touch the live ledger.
         runLedgerDataRoot: URL? = PersistenceCore.defaultDataRoot()
     ) {
         self.connectorActionsProvider = connectorActionsProvider
         self.runLedgerDataRoot = runLedgerDataRoot
-        let resolvedRouter: any ProviderRoutingProtocol = router ?? SwiftNativeProviderRouting()
+        let resolvedRouter: SwiftNativeProviderRouting = router ?? SwiftNativeProviderRouting()
         self.router = resolvedRouter
         // Default adapters use the same credential resolver as the default
         // router. Explicit secondary roots use the rooted initializer above.
-        self.llm = llm ?? SwiftNativeLLMClient(
-            router: resolvedRouter,
-            codex: CodexAdapter(),
-            anthropic: AnthropicAdapter(session: ProviderStreamGuard.stallOnlySession),
-            openAI: OpenAIAdapter(session: ProviderStreamGuard.stallOnlySession),
-            openAIOAuthDirect: OpenAIOAuthDirectAdapter(session: ProviderStreamGuard.stallOnlySession),
-            anthropicOAuthDirect: AnthropicOAuthDirectAdapter(session: ProviderStreamGuard.stallOnlySession),
-            xaiOAuthDirect: XAIOAuthDirectAdapter(session: ProviderStreamGuard.stallOnlySession),
-            moonshot: MoonshotAdapter(session: ProviderStreamGuard.stallOnlySession),
-            kimiCode: AnthropicAdapter.kimiCode(session: ProviderStreamGuard.stallOnlySession),
-            openRouter: OpenRouterAdapter(session: ProviderStreamGuard.stallOnlySession),
-            lifecycleObserver: lifecycleObserver
+        self.llm = llm ?? makeResidentProviderLLMClient(
+            router: resolvedRouter, lifecycleObserver: lifecycleObserver,
+            stallOnlyTransport: true
         )
     }
 
-    public func availableConnectorActions() async -> [JSONValue] {
-        await connectorActionsProvider()
-    }
-
-    private func providerFailure(_ error: Error, surface: String, provider: String? = nil) -> Error {
+    private func admissionFailure(_ error: Error, surface: String) -> Error {
         if error is ToolFailureError { return error }
         if case .invalidRequest = error as? ProviderRoutingError { return error }
         if case .invalidResponse = error as? ProviderRoutingError { return error }
         let cause = ProviderFailure.classify(error)
         guard [.authExpired, .codexCLISessionExpired, .routingUnavailable, .modelUnavailable].contains(cause) else { return error }
         let detail = ProviderFailure.diagnosticDescription(error)
-        var account = cause == .codexCLISessionExpired ? "codex" : provider
-        var signIn = cause == .authExpired || cause == .codexCLISessionExpired
-        if let failure = error as? LLMError {
-            switch failure {
-            case .notConfigured(let id) where id != "router", .authRejected(let id, _): account = id; signIn = true
-            default: break
-            }
-        }
-        if signIn, let account {
-            let control = ["openai", "anthropic", "moonshot", "kimi-code", "openrouter"].contains(account)
-                ? "Manage > Key > Paste the key here > Save" : "Sign in"
-            return ToolFailureError(detail, effects: .none, owner: "Providers > \(account) > credentials",
-                tap: "Providers > Accounts & API keys > \(account) > \(control)")
-        }
         guard let root = runLedgerDataRoot else { return error }
         let owner = root.appendingPathComponent("providers").path + " > surfaces.json (\(surface).model), active.json (\(surface)), pending-surface-configuration.json, registry.json"
         return ToolFailureError(detail, effects: .none, owner: owner,
@@ -225,16 +126,62 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
             tap: "Providers", instruction: "Inspect providers.routing_repair; ask the person to resolve the reported provider configuration failure in Providers.")
     }
 
-    public func runCodex(prompt: String, surface: String, timeoutSeconds: Int) async throws -> (model: String, output: String) {
-        // Admit the complete execution tuple from one checked generation. The
-        // shared LLM client may reread authority to detect corruption, but the
-        // task-local tuple prevents a valid picker change from splicing a new
-        // provider/effort/tier into this already-started planner call.
-        // P2-3: the routing vocabulary used to be `missions` and this line
-        // translated INTO it. It is `workshop` now, so the translation runs the
-        // other way and a caller still passing `missions` lands on the same
-        // preference instead of falling through to the chat-surface seed.
-        let routingSurface = canonicalRoutingSurface(surface)
+    public func plan(spec: WorkshopExecutionSpec, dataRoot: URL, now: Date) async throws
+        -> (steps: [WorkshopExecutionStep], providerCallCount: Int?, binding: WorkshopCompiledFileCopyBinding?) {
+        try Task.checkCancellation()
+        let workspaceDirectory = NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot).path
+
+        // Build tools_summary. Always include chat.synthesize.
+        let connectorActions = await connectorActionsProvider()
+        try Task.checkCancellation()
+        var availableTools: [(id: String, description: String)] = []
+        var schemas: [String: JSONValue] = [:]
+        for action in connectorActions {
+            guard case .object(let obj) = action,
+                  case .string(let aid) = obj["id"] ?? .null,
+                  !aid.isEmpty else { continue }
+            let desc: String = {
+                if case .string(let s) = obj["description"] ?? .null { return s }
+                return aid
+            }()
+            if case .object? = obj["parameters"] { schemas[aid] = obj["parameters"] }
+            availableTools.append((id: aid, description: desc))
+        }
+        if !availableTools.contains(where: { $0.id == "chat.synthesize" }) {
+            availableTools.append((
+                id: "chat.synthesize",
+                description: "Use the AI to synthesize, draft, analyze, or reason over text"
+            ))
+        }
+        // Include the tool menu up to the 200-tool prompt-size bound.
+        let toolsSummary = availableTools.prefix(200).map { t in
+            let schema = schemas[t.id].flatMap { try? $0.serialize(pretty: false) }
+            return "  - \(t.id): \(t.description)" + (schema.map { " [schema=\($0)]" } ?? "")
+        }.joined(separator: "\n")
+
+        // Both date renderings use the injected clock and local timezone.
+        let nowDate = now
+        let humanDateFmt = DateFormatter()
+        humanDateFmt.locale = Locale(identifier: "en_US_POSIX")
+        humanDateFmt.dateFormat = "EEEE, MMMM d, yyyy"
+        let humanDate = humanDateFmt.string(from: nowDate)
+        let isoDateFmt = DateFormatter()
+        isoDateFmt.locale = Locale(identifier: "en_US_POSIX")
+        isoDateFmt.dateFormat = "yyyy-MM-dd"
+        let isoDate = isoDateFmt.string(from: nowDate)
+
+        let prompt = try completionPolicy("workshop-plan", section: "prompt", arguments: [
+            humanDate,
+            isoDate,
+            spec.title,
+            spec.objective,
+            workspaceDirectory,
+            (spec.expectedOutputs ?? []).joined(separator: "\n"),
+            toolsSummary
+        ])
+
+        // Freeze the checked provider/model/Think/Fast tuple for this plan.
+        let routingSurface = canonicalRoutingSurface(WorkshopSurfaceVocabulary.canonical)
         let routingSnapshot: ProviderRoutingSnapshot
         do {
             routingSnapshot = try await router.checkedRoutingSnapshot()
@@ -245,125 +192,166 @@ public struct SwiftNativeWorkshopPlannerLLM: WorkshopPlannerLLM {
             if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
                 throw CancellationError()
             }
-            throw providerFailure(error, surface: routingSurface)
+            throw admissionFailure(error, surface: routingSurface)
         }
-        // Read through the vocabulary bridge, not a raw subscript: a router
-        // conformer whose snapshot is still keyed `missions` would otherwise
-        // miss and fall back to the CHAT model — a silent wrong-model run, not
-        // a failure anyone would notice.
-        let preference = ProviderRoutingSurfaceLookup.value(routingSnapshot.preferences, routingSurface)
-            ?? routingSnapshot.preferences["chat"]
-        guard let preference,
-              !preference.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw providerFailure(ProviderFailure.routingUnavailable, surface: routingSurface)
-        }
-        let resolvedModel = preference.model
-        let resolvedEffort = preference.reasoningEffort
-        // S12a: the explicit route, never one inferred from the model name.
-        let resolvedProvider = ProviderRoutingSurfaceLookup
-            .value(routingSnapshot.activeProviders, routingSurface)
-            ?? routingSnapshot.activeProviders["chat"]
-        let resolvedTier = preference.serviceTier
+        let route: TurnRouteAdmission
+        do { route = try routingSnapshot.routeAdmission(for: routingSurface, choice: nil) }
+        catch { throw admissionFailure(ProviderFailure.routingUnavailable, surface: routingSurface) }
+        let resolvedModel = route.modelId
         // Re-check cancellation between router-prefs resolution and the LLM
         // call — both are `await` points and either could have been cancelled
         // without throwing CancellationError directly.
         try Task.checkCancellation()
         let modelForCall = resolvedModel
         let localLLM = llm
-        // Runs-ledger row per LLM run (Runs UI + iOS runs snapshot): this is
-        // the Swift heir of the daemon's run_codex, which was the original
-        // writer of <dataRoot>/runs/runs.json. Success and failure both land a
-        // row; cancellation records nothing (the turn was torn down).
+        // Success and failure write the run ledger; cancellation writes no row.
         let ledgerStarted = Date()
+        let terminal: Result<String, Error>
         do {
-            let output: String = try await LLMCallContext.$admittedModel.withValue(resolvedModel) {
-            try await LLMCallContext.$providerId.withValue(resolvedProvider) {
-            try await LLMCallContext.$reasoningEffort.withValue(resolvedEffort) {
-            try await LLMCallContext.$serviceTier.withValue(resolvedTier) {
-            // The compatibility timeout argument cannot establish a stall.
-            // Provider/transport completion and caller cancellation own this call.
-                    // The plan's or step's instructions are in `prompt`; this
-                    // only says what the call is.
-                    let system = "This is a Workshop task step."
-                    if let rootedTraceDataRoot = runLedgerDataRoot {
-                        return try await LLMCallContext.$traceDataRootOverride.withValue(
-                            rootedTraceDataRoot
-                        ) {
-                            try await localLLM.complete(
-                                prompt: prompt,
-                                system: system,
-                                model: modelForCall,
-                                surface: routingSurface, purpose: "workshop"
-                            )
-                        }
-                    }
-                    return try await localLLM.complete(
+            terminal = .success(try await route.withModelContext {
+                try await LLMCallContext.$traceDataRootOverride.withValue(
+                    runLedgerDataRoot ?? LLMCallContext.traceDataRootOverride
+                ) {
+                    try await localLLM.complete(
                         prompt: prompt,
-                        system: system,
+                        system: try completionPolicy("workshop-plan", section: "system"),
                         model: modelForCall,
-                        surface: routingSurface, purpose: "workshop"
+                        surface: routingSurface, purpose: "workshop", tools: nil
                     )
-            }
-            }
-            }
-            }
-            if let ledgerRoot = runLedgerDataRoot {
-                await RunLedger.append(
-                    kind: "mission",
-                    status: "succeeded",
-                    model: resolvedModel,
-                    prompt: prompt,
-                    output: output,
-                    createdAt: ledgerStarted,
-                    durationSeconds: Date().timeIntervalSince(ledgerStarted),
-                    dataRoot: ledgerRoot
-                )
-            }
-            return (model: resolvedModel, output: output)
-        } catch let e as WorkshopExecutionError {
-            if let ledgerRoot = runLedgerDataRoot {
-                await RunLedger.append(
-                    kind: "mission",
-                    status: "failed",
-                    model: resolvedModel,
-                    prompt: prompt,
-                    error: String(describing: e),
-                    createdAt: ledgerStarted,
-                    durationSeconds: Date().timeIntervalSince(ledgerStarted),
-                    dataRoot: ledgerRoot
-                )
-            }
-            throw e
+                }
+            })
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            // Cancellation propagates via typed `CancellationError` (from
-            // cooperative `Task.checkCancellation` / `Task.sleep`) or
-            // `NSURLErrorDomain` + `NSURLErrorCancelled` (from URLSession
-            // cancellation). Other errors retain their owner's repair evidence.
-            // BLOCKING #4 (wave-24-amendment): if the outer task was cancelled
-            // but the underlying throw is some other error type, honor the
-            // cancellation before passing the failure through.
             try Task.checkCancellation()
             let nsError = error as NSError
             if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
                 throw CancellationError()
             }
-            if let ledgerRoot = runLedgerDataRoot {
-                await RunLedger.append(
-                    kind: "mission",
-                    status: "failed",
-                    model: resolvedModel,
-                    prompt: prompt,
-                    error: String(describing: error),
-                    createdAt: ledgerStarted,
-                    durationSeconds: Date().timeIntervalSince(ledgerStarted),
-                    dataRoot: ledgerRoot
-                )
+            terminal = .failure(error)
+        }
+        let (output, failure): (String?, Error?) = switch terminal {
+        case .success(let output): (output, nil)
+        case .failure(let error): (nil, error)
+        }
+        if let ledgerRoot = runLedgerDataRoot {
+            await RunLedger.append(
+                kind: "mission",
+                status: failure == nil ? "succeeded" : "failed",
+                model: resolvedModel,
+                prompt: prompt,
+                output: output,
+                error: failure.map { String(describing: $0) },
+                createdAt: ledgerStarted,
+                durationSeconds: Date().timeIntervalSince(ledgerStarted),
+                dataRoot: ledgerRoot
+            )
+        }
+        switch terminal {
+        case .success(let output):
+            try Task.checkCancellation()
+            let raw = Self.stripMarkdownFences(output).trimmingCharacters(in: .whitespacesAndNewlines)
+            let object = try JSONValue.parse(Data(raw.utf8))
+            let directory = try JSONRow(object).string("working_directory")
+            if directory.isEmpty { throw JSONRow.Malformed.field("working_directory") }
+            let workingDirectory = NativeAgentWorkspaceRoot.resolveFileMutationPath(directory, dataRoot: dataRoot).path
+            let steps = try Self.parsePlanJSON(object, validTools: Set(availableTools.map(\.id)), schemas: schemas)
+            guard !steps.isEmpty else {
+                throw WorkshopExecutionError.plannerFailure("planner returned no steps")
             }
-            throw providerFailure(error, surface: routingSurface, provider: resolvedProvider)
+            let boundSteps = steps.map { step in
+                var step = step
+                if case .object(let schema)? = schemas[step.toolOrAction],
+                   case .object(let properties)? = schema["properties"],
+                   case .object(var args) = step.args {
+                    for key in ["cwd", "package_path"] where properties[key] != nil && args[key] == nil {
+                        args[key] = .string(workingDirectory)
+                    }
+                    step.args = .object(args)
+                }
+                return step
+            }
+            return (boundSteps, 1, nil)
+        case .failure(let error):
+            if error is WorkshopExecutionError { throw error }
+            if let repair = (error as? ProviderFailure.Diagnostic)?.repair { throw repair }
+            throw error
         }
     }
+    // MARK: parse helpers
+
+    /// Strip leading and trailing Markdown fences.
+    private static func stripMarkdownFences(_ s: String) -> String {
+        let stripped = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !stripped.hasPrefix("```") { return stripped }
+        let lines = stripped.components(separatedBy: "\n")
+        let kept = lines.filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("```") }
+        return kept.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Validate at most eight steps; unknown autonomy hints become auto.
+    private static func parsePlanJSON(_ parsed: JSONValue, validTools: Set<String>, schemas: [String: JSONValue] = [:]) throws -> [WorkshopExecutionStep] {
+        guard case .object(let obj) = parsed,
+              case .array(let stepsRaw) = obj["steps"] ?? .null else {
+            throw WorkshopExecutionError.plannerFailure("plan missing 'steps' list")
+        }
+        var out: [WorkshopExecutionStep] = []
+        for (i, s) in stepsRaw.prefix(8).enumerated() {
+            guard case .object(let sobj) = s else {
+                throw WorkshopExecutionError.plannerFailure("step \(i + 1) must be a JSON object")
+            }
+            guard case .string(let tool)? = sobj["tool_or_action"], !tool.isEmpty else {
+                throw WorkshopExecutionError.plannerFailure("step \(i + 1).tool_or_action is missing")
+            }
+            guard validTools.contains(tool) || tool == "chat.synthesize" else {
+                throw WorkshopExecutionError.plannerFailure("step \(i + 1).tool_or_action '\(tool)' is unavailable; the intended action was not replaced")
+            }
+            var hint: String = {
+                if case .string(let v) = sobj["autonomy_hint"] ?? .null { return v }
+                return "auto"
+            }()
+            if hint != "auto" && hint != "needs_approval" {
+                hint = "auto"
+            }
+            // Missing or empty IDs receive their one-based step name.
+            let id: String = {
+                if case .string(let v) = sobj["id"] ?? .null, !v.isEmpty { return v }
+                return "step-\(i + 1)"
+            }()
+            let desc: String = {
+                if case .string(let v) = sobj["description"] ?? .null, !v.isEmpty { return v }
+                return "Step \(i + 1)"
+            }()
+            // Null/missing args become {}; every other non-object refuses the plan.
+            let args: JSONValue
+            switch sobj["args"] ?? .null {
+            case .null:
+                args = .object([:])
+            case .object(let o):
+                args = .object(o)
+            default:
+                throw WorkshopExecutionError.plannerFailure("step args must be a JSON object")
+            }
+            let optional: Bool
+            switch sobj["optional"] {
+            case .bool(let value)?: optional = value
+            case nil: optional = false // Existing callers without this extension remain required.
+            default: throw WorkshopExecutionError.plannerFailure("step optional must be a boolean")
+            }
+            out.append(WorkshopExecutionStep(
+                id: id,
+                description: desc,
+                toolOrAction: tool,
+                args: args,
+                autonomy: hint,
+                argumentSchema: schemas[tool],
+                optional: optional
+            ))
+        }
+        try SwiftNativeWorkshopRunner.validateStepIDs(out)
+        return out
+    }
+
 }
 
 // MARK: - Factory

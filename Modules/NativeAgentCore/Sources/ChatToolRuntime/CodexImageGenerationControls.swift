@@ -2,7 +2,7 @@ import Foundation
 import ImageIO
 import CryptoKit
 import NativeAgentCore
-// Blueprint: | `CodexImageGenerationControls.swift` | `CodexImageGenerationRequest`: `normalizedForBuiltIn`, `normalized` |
+// Blueprint: | `CodexImageGenerationControls.swift` | `CodexImageGenerationRequest`: `normalizedForBuiltIn` |
 
 /// Prepared only after the dispatcher's ordinary file authorization. No remote URLs.
 struct CodexImageReference: Sendable, Equatable {
@@ -60,34 +60,9 @@ struct CodexImageRaster {
 
 extension CodexImageGenerationRequest {
     func normalizedForBuiltIn() throws -> Self {
-        var validation = self
-        validation.size = "auto"
-        validation.quality = quality ?? "auto"
-        var result = try validation.normalized()
-        let requestedSize = size?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "auto"
-        guard requestedSize.count <= 100 else {
-            throw ImageGenerationToolError.unsupportedControl("Size/aspect preference is too long.")
-        }
-        result.size = requestedSize.isEmpty ? "auto" : requestedSize
-        result.background = background.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard ["auto", "opaque", "transparent"].contains(result.background),
-              result.background != "transparent" || result.outputFormat != "jpeg" else {
-            throw ImageGenerationToolError.unsupportedControl("Background preference must be auto, opaque or transparent; transparency requires PNG/WebP.")
-        }
-        return result
-    }
-
-    func normalized() throws -> Self {
         func clean(_ raw: String?) -> String { raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "" }
         var result = self
-        switch clean(size) {
-        case "", "1024x1024", "square", "1:1": result.size = "1024x1024"
-        case "1536x1024", "landscape", "wide", "16:9", "3:2": result.size = "1536x1024"
-        case "1024x1536", "portrait", "vertical", "2:3", "9:16": result.size = "1024x1536"
-        case "auto": result.size = "auto"
-        default: throw ImageGenerationToolError.unsupportedControl("Codex size must be auto, 1024x1024, 1536x1024 or 1024x1536 (or a legacy aspect alias). Custom/4K sizes are not exposed by this route.")
-        }
-        switch clean(quality) {
+        switch clean(quality ?? "auto") {
         case "", "medium", "gpt-image-2", "gpt-image-2-medium": result.quality = "medium"
         case "low", "gpt-image-2-low": result.quality = "low"
         case "high", "gpt-image-2-high": result.quality = "high"
@@ -112,6 +87,16 @@ extension CodexImageGenerationRequest {
         }
         result.count = max(1, min(4, count))
         result.timeoutSeconds = max(30, min(1800, timeoutSeconds))
+        let requestedSize = size?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "auto"
+        guard requestedSize.count <= 100 else {
+            throw ImageGenerationToolError.unsupportedControl("Size/aspect preference is too long.")
+        }
+        result.size = requestedSize.isEmpty ? "auto" : requestedSize
+        result.background = background.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard ["auto", "opaque", "transparent"].contains(result.background),
+              result.background != "transparent" || result.outputFormat != "jpeg" else {
+            throw ImageGenerationToolError.unsupportedControl("Background preference must be auto, opaque or transparent; transparency requires PNG/WebP.")
+        }
         return result
     }
 }

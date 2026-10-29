@@ -1,69 +1,49 @@
 import Context
 import Foundation
+import NativeAgentShared
 import MemoryV2
-import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `NativeMemoryContextProjection.swift` | `NativeMemoryContextProjection`: canonical memory projection, including immutable untrusted-source entities and source hashes |
+// Blueprint: | `NativeMemoryContextProjection.swift` | `MemoryContext`: canonical memory projection, including immutable untrusted-source entities and source hashes |
 
 private enum NativeMemoryContextProjectionLimits {
     static let maximumRecords = memoryStoredRowCap
     static let maximumTextUTF8Bytes = 16 * 1_024
-    static let maximumEmbeddingBatchSize = 32
     static let maximumTagsPerRecord = 32
     static let maximumTagUTF8Bytes = 128
     static let maximumProvenanceUTF8Bytes = 2 * 1_024
 }
 
-enum NativeMemoryContextProjectionError: Error, Equatable, Sendable {
-    case invalidModelFingerprint
-    case embeddingCountMismatch(expected: Int, actual: Int)
-    case invalidEmbedding(batchIndex: Int)
-}
-
-/// Packet provenance (2026-07-11): atomID → memory RECORD ID, accepted with
-/// each published generation. Atom/source IDs are one-way digests, so this index is
-/// the ONLY way back from a packet's memory atoms to record identity — and it
-/// lives with the projection owner, never in core. Pure derived state:
-/// rebuildable, never persisted. Pinned turns retain their generation's mapping;
-/// attention lookup uses only the current accepted generation.
+/// Attention's record-to-atom lookup for the current accepted generation.
 public final class MemoryAtomRecordIndex: @unchecked Sendable {
     private let lock = NSLock()
-    private var atomToRecord: [ContextAtomID: String] = [:]
-    private var generationMappings: [Int64: [ContextAtomID: String]] = [:]
     private var recordToAtom: [String: ContextAtomID] = [:]
 
-    func publish(
-        _ mapping: [ContextAtomID: String]?,
-        generationID: Int64,
-        liveAtomIDs: Set<ContextAtomID>,
-        retaining generationIDs: Set<Int64>
-    ) {
+    func publish(_ generation: ContextStoredGeneration) {
+        let records = Dictionary(generation.sources.compactMap { source -> (ContextSourceID, String)? in
+            guard source.descriptor.owner == MemoryContext.owner,
+                  let recordID = MemoryContext.recordID(inLocator: source.descriptor.canonicalLocator) else { return nil }
+            return (source.descriptor.id, recordID)
+        }, uniquingKeysWith: { first, _ in first })
+        let mapping = Dictionary(generation.atoms.compactMap { atom -> (String, ContextAtomID)? in
+            guard atom.validToGeneration == nil, let recordID = records[atom.draft.sourceID] else { return nil }
+            return (recordID, atom.draft.id)
+        }, uniquingKeysWith: { first, _ in first })
         lock.withLock {
-            atomToRecord = (mapping ?? atomToRecord).filter { liveAtomIDs.contains($0.key) }
-            generationMappings = generationMappings.filter { generationIDs.contains($0.key) }
-            generationMappings[generationID] = atomToRecord
-            recordToAtom = Dictionary(atomToRecord.map { ($0.value, $0.key) }, uniquingKeysWith: { first, _ in first })
+            recordToAtom = mapping
         }
     }
 
     func atomID(forRecordID recordID: String) -> ContextAtomID? {
-        let normalized = NativeMemoryContextProjection.normalizedRecordID(recordID)
+        let normalized = MemoryContext.normalizedRecordID(recordID)
         return lock.withLock { recordToAtom[normalized] }
     }
 
-    func recordMap(for atomIDs: [ContextAtomID], generationID: Int64) -> [ContextAtomID: String] {
-        let requested = Set(atomIDs)
-        return lock.withLock {
-            (generationMappings[generationID] ?? [:]).filter { requested.contains($0.key) }
-        }
-    }
-
     var count: Int {
-        lock.withLock { atomToRecord.count }
+        lock.withLock { recordToAtom.count }
     }
 }
 
-struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendable {
+struct MemoryContext: ContextCompiledProjectionProvider, Sendable {
     static let owner = "nativeagent.memory-v2"
 
     var projectionIdentifier: String { Self.owner }
@@ -71,7 +51,7 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
     let invalidationSourceURL: URL?
     private let dataRoot: URL
 
-    // v3: creation time is separate from update freshness for memory age tags.
+    // Creation time is separate from update freshness for memory age tags.
     private static let schemaVersion = "memory-context-projection-v4"
     private let memory: SwiftNativeMemoryV2
     private let provenanceIndex: MemoryAtomRecordIndex
@@ -91,94 +71,27 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
     func compiledProjection(
         previousSources: [ContextSourceID: ContextCompiledSource]
     ) async throws -> ContextCompiledProjectionResult {
-        let listed = try await memory.listMemory(kind: nil)
-        let active = listed.filter(Self.isActive)
-        let prepared = Self.prepareUnique(active, dataRoot: dataRoot)
-            .sorted { $0.recordID < $1.recordID }
+        guard let storage = await memory.underlyingStorage() else { throw MemoryV2Error.storageUnavailable }
+        let listed = try await storage.listMemories(persona: nil, status: "active", limit: nil)
+            .filter { MemoryLifecycle.isRecallEligible($0.lifecycle) }
+        let prepared = Self.prepareUnique(listed, dataRoot: dataRoot)
         let selected = Array(prepared.prefix(NativeMemoryContextProjectionLimits.maximumRecords))
-        let selectedIDs = Set(selected.map(\.sourceID))
+        let selectedIDs = Set(selected.map(\.descriptor.id))
         let previousOwnedIDs = Set(previousSources.values.lazy
             .filter { $0.descriptor.owner == Self.owner }
             .map(\.descriptor.id))
         let removed = previousOwnedIDs.subtracting(selectedIDs)
 
-        let atomRecordIDs = Dictionary(
-            selected.map { ($0.atomID, $0.recordID) },
-            uniquingKeysWith: { first, _ in first }
-        )
-
-        guard !selected.isEmpty else {
-            return ContextCompiledProjectionResult(
-                changedSources: [],
-                removedSourceIDs: removed,
-                atomRecordIDs: atomRecordIDs
-            )
-        }
-
-        guard let epoch = await memory.embeddingEpoch() else {
-            throw MemoryV2Error.storageUnavailable
-        }
-        let modelFingerprint = epoch.rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !modelFingerprint.isEmpty else {
-            throw NativeMemoryContextProjectionError.invalidModelFingerprint
-        }
-
-        // Unchanged words keep their vector; a source whose descriptor moved
-        // (its locator now carries the record id) republishes with that vector.
-        var redescribed: [ContextCompiledSource] = []
-        let changed = selected.filter { item in
-            guard let previous = previousSources[item.sourceID],
-                  previous.sourceHash == item.sourceHash,
-                  previous.atoms.count == 1,
-                  let embedding = previous.atoms[0].embedding,
-                  embedding.modelFingerprint == modelFingerprint,
-                  !embedding.values.isEmpty,
-                  embedding.values.allSatisfy(\.isFinite) else {
-                return true
-            }
-            if previous.descriptor != item.descriptor { redescribed.append(item.compiledSource(embedding: embedding)) }
-            return false
-        }
-
-        var vectors: [[Float]] = []
-        vectors.reserveCapacity(changed.count)
-        var offset = 0
-        while offset < changed.count {
-            let end = min(offset + NativeMemoryContextProjectionLimits.maximumEmbeddingBatchSize, changed.count)
-            let texts = changed[offset..<end].map(\.embeddingText)
-            let batch = try await memory.embedForDerivedContextWithEpoch(texts)
-            guard batch.epoch.rawValue == modelFingerprint else {
-                throw NativeMemoryContextProjectionError.invalidModelFingerprint
-            }
-            guard batch.vectors.count == texts.count else {
-                throw NativeMemoryContextProjectionError.embeddingCountMismatch(
-                    expected: texts.count,
-                    actual: batch.vectors.count
-                )
-            }
-            for (index, vector) in batch.vectors.enumerated() {
-                guard !vector.isEmpty, vector.allSatisfy(\.isFinite) else {
-                    throw NativeMemoryContextProjectionError.invalidEmbedding(
-                        batchIndex: offset + index
-                    )
-                }
-            }
-            vectors.append(contentsOf: batch.vectors)
-            offset = end
-        }
-
-        let changedSources = zip(changed, vectors).map { item, vector in
-            item.compiledSource(
-                embedding: ContextEmbedding(
-                    modelFingerprint: modelFingerprint,
-                    values: vector
-                )
-            )
+        let changedSources = selected.compactMap { item -> ContextCompiledSource? in
+            if let previous = previousSources[item.descriptor.id],
+               previous.sourceHash == item.sourceHash,
+               previous.descriptor == item.descriptor,
+               previous.atoms.count == 1, previous.atoms[0].embedding == item.atoms[0].embedding { return nil }
+            return item
         }
         return ContextCompiledProjectionResult(
-            changedSources: changedSources + redescribed,
-            removedSourceIDs: removed,
-            atomRecordIDs: atomRecordIDs
+            changedSources: changedSources,
+            removedSourceIDs: removed
         )
     }
 
@@ -211,7 +124,7 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
     }
 
     /// Active, recall-eligible, no newer than what was compiled, and disclosed here.
-    static func speakable(_ record: MemoryRecord?, compiledAt: Date, on surface: ContextSurface) -> Bool {
+    static func speakable(_ record: MemoryV2.MemoryRecord?, compiledAt: Date, on surface: ContextSurface) -> Bool {
         guard let record, isActive(record), !pendingAdmission(record), MemoryLifecycle.isRecallEligible(record.lifecycle),
               let version = parseDate(record.updatedAt) ?? parseDate(record.createdAt),
               version.timeIntervalSince(compiledAt) <= 0.001,
@@ -220,7 +133,7 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
         return true
     }
 
-    static func pendingAdmission(_ record: MemoryRecord) -> Bool {
+    static func pendingAdmission(_ record: MemoryV2.MemoryRecord) -> Bool {
         guard case .object(let extras)? = record.extras else { return false }
         return extras[MemoryStorage.pendingAdmissionKey] == .bool(true)
     }
@@ -231,80 +144,16 @@ struct NativeMemoryContextProjection: ContextCompiledProjectionProvider, Sendabl
         return String(locator[range.upperBound...])
     }
 
-    func didPublish(
-        _ result: ContextCompiledProjectionResult?,
-        generation: ContextStoredGeneration,
-        retaining generationIDs: Set<Int64>
-    ) {
-        provenanceIndex.publish(
-            result?.atomRecordIDs,
-            generationID: generation.generation.id,
-            liveAtomIDs: Set(generation.atoms.lazy
-                .filter { $0.validToGeneration == nil }
-                .map(\.draft.id)),
-            retaining: generationIDs
-        )
+    func didPublish(generation: ContextStoredGeneration) {
+        provenanceIndex.publish(generation)
     }
 }
 
-private extension NativeMemoryContextProjection {
-    struct PreparedRecord: Sendable {
-        let recordID: String
-        let sourceID: ContextSourceID
-        let descriptor: ContextSourceDescriptor
-        let atomID: ContextAtomID
-        let atomKind: ContextAtomKind
-        let contentRole: ContextContentRole
-        let body: String
-        let embeddingText: String
-        let sourceHash: String
-        let authority: ContextAuthority
-        let confidence: Double
-        let freshness: ContextFreshness
-        let tags: [String]
-        let entities: [ContextEntity]
-        let importance: Double
-        let sourceQuality: Double
-        let decayState: Double
-
-        func compiledSource(embedding: ContextEmbedding) -> ContextCompiledSource {
-            let atom = ContextAtomDraft(
-                id: atomID,
-                sourceID: sourceID,
-                kind: atomKind,
-                headingPath: [],
-                sourceRange: ContextSourceRange(
-                    utf8Start: 0,
-                    utf8End: body.utf8.count
-                ),
-                sourceHash: sourceHash,
-                body: body,
-                authority: authority,
-                confidence: confidence,
-                freshness: freshness,
-                privacy: descriptor.privacy,
-                permittedSurfaces: descriptor.permittedSurfaces,
-                injectionPolicy: .adaptive,
-                contentRole: contentRole,
-                entities: entities,
-                triggers: tags,
-                activation: importance,
-                recentUsefulness: sourceQuality,
-                decayState: decayState,
-                embedding: embedding
-            )
-            return ContextCompiledSource(
-                descriptor: descriptor,
-                sourceHash: sourceHash,
-                atoms: [atom]
-            )
-        }
-    }
-
+private extension MemoryContext {
     static func prepareUnique(
-        _ records: [MemoryRecord],
+        _ records: [StoredMemory],
         dataRoot: URL
-    ) -> [PreparedRecord] {
+    ) -> [ContextCompiledSource] {
         let grouped = Dictionary(grouping: records, by: { normalizedID($0.id) })
         return grouped.keys.sorted().compactMap { key in
             guard !key.isEmpty,
@@ -317,9 +166,10 @@ private extension NativeMemoryContextProjection {
     }
 
     static func prepare(
-        _ record: MemoryRecord,
+        _ stored: StoredMemory,
         dataRoot: URL
-    ) -> PreparedRecord? {
+    ) -> ContextCompiledSource? {
+        let record = MemoryV2.MemoryRecord(stored: stored)
         let recordID = normalizedID(record.id)
         guard !recordID.isEmpty,
               recordID.utf8.count <= 512,
@@ -360,7 +210,7 @@ private extension NativeMemoryContextProjection {
             ? .explicitCorrection
             : (pinned ? .canonical : .inferred)
         let atomKind: ContextAtomKind = correction ? .correction : .memory
-        // Phase 5 C3: what happened between them rides its own lane.
+        // What happened between them is marked as personal.
         let personal = !correction && Self.personalKinds.contains(
             (record.memoryKind ?? MemoryRecallScoring.kind(of: record.extras) ?? "").lowercased())
         let contentRole: ContextContentRole = personal ? .personal : .memory
@@ -423,10 +273,17 @@ private extension NativeMemoryContextProjection {
             id: correction ? "correction" : (pinned ? "pinned" : "adaptive"),
             label: correction ? "explicit correction" : (pinned ? "pinned memory" : "adaptive memory")
         ))
-        if case .array(let values)? = objectValue(record.extras, key: "context_topics") {
+        if case .array(let values)? = record.extras?.objectValue?["context_topics"] {
+            // Identity is read from this projection's injected root, through
+            // the profile cache that observes renames, never a default install.
+            let names = MemoryRecallQueryExpansion.names(storeDirectory: dataRoot.appendingPathComponent("memory"))
+            func topicKey(_ text: String) -> String {
+                text.lowercased().split { !$0.isLetter && !$0.isNumber }.joined(separator: " ")
+            }
+            let identities = Set([names.agent, names.user].compactMap { $0 }.map(topicKey))
             for case .string(let topic) in values.prefix(8) {
                 let clean = topic.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !clean.isEmpty, clean.count <= 120 else { continue }
+                guard !clean.isEmpty, clean.count <= 120, !identities.contains(topicKey(clean)) else { continue }
                 entities.append(ContextEntity(
                     kind: ContextCorrectionScope.entityKind,
                     id: ContextStableID.digest(parts: [clean.lowercased()]),
@@ -468,35 +325,57 @@ private extension NativeMemoryContextProjection {
             record.validTo ?? "",
             record.observedAt ?? "",
             canonicalJSONString(record.evidence) ?? "",
-            canonicalJSONString(objectValue(record.extras, key: "context_topics")) ?? "",
+            canonicalJSONString(record.extras?.objectValue?["context_topics"]) ?? "",
+            entities.filter { $0.kind == ContextCorrectionScope.entityKind }.map(\.label).joined(separator: "\u{1f}"),
             canonicalJSONString(.object(MemoryDataProvenance.fields(in: record.extras, dataRoot: dataRoot))) ?? "",
         ] + (body == embeddingText ? [] : [embeddingText]))
 
-        return PreparedRecord(
-            recordID: recordID,
+        // Canonical saves and epoch convergence own the vector; metadata
+        // changes can republish an atom without predicting its words again.
+        let embedding: ContextEmbedding?
+        if let epoch = stored.embeddingEpoch, !epoch.isEmpty,
+           let vector = stored.embedding, !vector.isEmpty, vector.allSatisfy(\.isFinite) {
+            embedding = ContextEmbedding(modelFingerprint: epoch, values: vector)
+        } else {
+            embedding = nil
+        }
+        let atom = ContextAtomDraft(
+            id: atomID,
             sourceID: sourceID,
-            descriptor: descriptor,
-            atomID: atomID,
-            atomKind: atomKind,
-            contentRole: contentRole,
-            body: body,
-            embeddingText: embeddingText,
+            kind: atomKind,
+            headingPath: [],
+            sourceRange: ContextSourceRange(utf8Start: 0, utf8End: body.utf8.count),
             sourceHash: sourceHash,
+            body: body,
             authority: authority,
             confidence: confidence,
-            freshness: ContextFreshness(updatedAt: updatedAt, createdAt: createdAt),
-            tags: tags,
+            // A closed truth interval expires the atom from automatic context.
+            freshness: ContextFreshness(updatedAt: updatedAt, expiresAt: parseDate(record.validTo), createdAt: createdAt),
+            privacy: descriptor.privacy,
+            permittedSurfaces: descriptor.permittedSurfaces,
+            injectionPolicy: .adaptive,
+            contentRole: contentRole,
             entities: entities,
-            importance: importance,
-            sourceQuality: sourceQuality,
-            decayState: decayState
+            triggers: tags,
+            activation: importance,
+            recentUsefulness: sourceQuality,
+            decayState: decayState,
+            embedding: embedding
+        )
+        return ContextCompiledSource(
+            descriptor: descriptor,
+            sourceHash: sourceHash,
+            atoms: [atom]
         )
     }
 
-    /// Memory kinds the personal lane carries (Phase 5 C3).
-    static let personalKinds: Set<String> = ["moment", "relationship", "lesson_origin"]
+    /// Memory kinds that are what happened between them: marked
+    /// `.personal`; they compete in the one memory lane like any memory. A
+    /// kept moment from the retired lane is an ordinary memory: what moved her
+    /// lives in her cares.
+    static let personalKinds: Set<String> = ["relationship", "lesson_origin"]
 
-    static func isActive(_ record: MemoryRecord) -> Bool {
+    static func isActive(_ record: MemoryV2.MemoryRecord) -> Bool {
         let status = record.status?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -529,7 +408,7 @@ private extension NativeMemoryContextProjection {
         return Array(Set(valid).sorted().prefix(NativeMemoryContextProjectionLimits.maximumTagsPerRecord))
     }
 
-    static func provenanceText(_ record: MemoryRecord, limit: Int) -> String? {
+    static func provenanceText(_ record: MemoryV2.MemoryRecord, limit: Int) -> String? {
         var components: [String] = []
         if let source = record.sourceRunId?.trimmingCharacters(in: .whitespacesAndNewlines),
            !source.isEmpty {
@@ -537,7 +416,7 @@ private extension NativeMemoryContextProjection {
                   !source.contains(";"), !source.contains("=") else { return nil }
             components.append("source_run_id=\(source)")
         }
-        if let provenance = record.provenance ?? objectValue(record.extras, key: "provenance") {
+        if let provenance = record.provenance ?? record.extras?.objectValue?["provenance"] {
             guard let data = try? canonicalEncoder.encode(provenance),
                   let value = String(data: data, encoding: .utf8) else {
                 return nil
@@ -553,7 +432,7 @@ private extension NativeMemoryContextProjection {
         // delimiter would be read back as another field: it is dropped here, and
         // the reader takes the FIRST value per key, so neither side alone has to
         // be the one that holds.
-        if let raw = stringValue(record.extras, key: "provenance_by"),
+        if let raw = record.extras?.objectValue?["provenance_by"]?.stringValue,
            let by = ContextMemoryLead.validDisplayName(raw) {
             components.append("provenance_by=\(by)")
         }
@@ -573,33 +452,40 @@ private extension NativeMemoryContextProjection {
         return combined
     }
 
-    /// Dates are presentation evidence, not vector input or a valid-now test.
+    /// Dates are presentation evidence, not vector input; `valid_to` also
+    /// expires the atom (`prepare`).
     /// Prefix them so the existing bounded context_expand prefix also retains
     /// them. Reserve their bytes inside the existing body cap, never above it.
     static func presentationBody(
-        _ text: String, record: MemoryRecord, maximumUTF8Bytes: Int
+        _ text: String, record: MemoryV2.MemoryRecord, maximumUTF8Bytes: Int
     ) -> String {
         let warning = MemorySenseProvenance.warning(in: record.extras)
-        let fields = [
-            ("valid_from", record.validFrom),
-            ("valid_to", record.validTo),
-            ("observed_at", record.observedAt),
-        ].compactMap { key, raw -> String? in
-            guard let raw else { return nil }
-            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard value.utf8.count <= 64,
+        // Days, said once: the block's own note already says these are records,
+        // not live readings, so each memory carries only its dates (10-29: the
+        // long per-memory label was a third of the memory block).
+        func day(_ raw: String?) -> String? {
+            guard let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines), value.utf8.count <= 64,
                   !NativeContextProjectionText.containsDisallowedControl(value), parseDate(value) != nil else { return nil }
-            return "\(key)=\(value)"
+            return String(value.prefix(10))
         }
+        let from = day(record.validFrom), until = day(record.validTo), observed = day(record.observedAt)
+        let fields = [
+            from.map { "from " + $0 },
+            until.map { "until " + $0 },
+            observed.flatMap { $0 == from ? nil : "observed " + $0 },
+        ].compactMap { $0 }
         guard !fields.isEmpty || warning != nil else { return text }
-        let prefix = (warning.map { "[\($0)]\n" } ?? "")
-            + (fields.isEmpty ? "" : "[Recorded dates; not a live-status check; observed_at is evidence time: "
-                + fields.joined(separator: "; ") + "]\n")
-        if prefix.utf8.count + text.utf8.count <= maximumUTF8Bytes {
+        let prefix = MemorySenseProvenance.presentation("", metadata: record.extras)
+            + (fields.isEmpty ? "" : "[" + fields.joined(separator: ", ") + "]\n")
+        let prefixBytes = prefix.utf8.count
+        guard maximumUTF8Bytes >= prefixBytes else { return text }
+        if text.utf8.count <= maximumUTF8Bytes - prefixBytes {
             return prefix + text
         }
         let suffix = "\n[Excerpt; full_content_chars=\(text.count)]"
-        let available = maximumUTF8Bytes - prefix.utf8.count - suffix.utf8.count
+        let afterPrefix = maximumUTF8Bytes - prefixBytes
+        guard afterPrefix > suffix.utf8.count else { return text }
+        let available = afterPrefix - suffix.utf8.count
         // A custom tiny budget must not discard the canonical fact merely
         // because a complete date label cannot fit. Standard budget is 16 KiB.
         guard available > 0 else { return text }
@@ -607,7 +493,7 @@ private extension NativeMemoryContextProjection {
         var bytes = 0
         for character in text {
             let size = String(character).utf8.count
-            guard bytes + size <= available else { break }
+            guard size <= available - bytes else { break }
             excerpt.append(character)
             bytes += size
         }
@@ -645,20 +531,10 @@ private extension NativeMemoryContextProjection {
         }
     }
 
-    static func objectValue(_ value: JSONValue?, key: String) -> JSONValue? {
-        guard case .object(let object)? = value else { return nil }
-        return object[key]
-    }
-
-    static func stringValue(_ value: JSONValue?, key: String) -> String? {
-        guard case .string(let result)? = objectValue(value, key: key) else { return nil }
-        return result
-    }
-
 }
 
 // Record lookup uses the projection's canonical identity normalization.
-extension NativeMemoryContextProjection {
+extension MemoryContext {
     static func normalizedRecordID(_ value: String) -> String {
         normalizedID(value)
     }

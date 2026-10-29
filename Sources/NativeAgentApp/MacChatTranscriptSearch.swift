@@ -3,6 +3,7 @@ import Observation
 import SwiftUI
 import ChatSessionWork
 import NativeAgentCore
+import NativeAgentShared
 // Blueprint: | `MacChatTranscriptSearch.swift` | `MacChatTranscriptSearch` alias to `ChatSessionWork.TranscriptSearch`; `MacChatTranscriptSearchCursor`, `MacChatTranscriptSearchController`, `MacChatTranscriptSearchBar`; source preparation and search results publish through `LatestRead`, with input revisions retained only for coalescing; `TranscriptSearch.scrollTargetID` |
 
 typealias MacChatTranscriptSearchDocument = TranscriptSearchDocument
@@ -70,12 +71,6 @@ final class MacChatTranscriptSearchController {
     @ObservationIgnored private var sourceRevision: UInt = 0
     @ObservationIgnored private let searchRead = LatestRead()
     @ObservationIgnored private var searchTask: Task<Void, Never>?
-    typealias SearchOperation = @Sendable (String, [MacChatTranscriptSearchDocument]) async -> MacChatTranscriptSearchResponse?
-    @ObservationIgnored private let search: SearchOperation
-
-    init(search: @escaping SearchOperation = MacChatTranscriptSearchController.searchOffMainActor) {
-        self.search = search
-    }
 
     var selectedMessageID: String? {
         guard let selectedIndex = cursor.selectedIndex, results.indices.contains(selectedIndex) else {
@@ -236,7 +231,7 @@ final class MacChatTranscriptSearchController {
                 try? await Task.sleep(for: .milliseconds(120))
                 guard !Task.isCancelled, let self else { return }
                 let revision = self.sourceRevision
-                let response = await self.searchRead.read({ await self.search(rawQuery, self.documents) }, publish: { response in
+                let response = await self.searchRead.read({ await Self.searchOffMainActor(query: rawQuery, documents: self.documents) }, publish: { response in
                     if let response { self.apply(response, preserving: self.selectedMessageID) }
                 })
                 guard !Task.isCancelled else { return }

@@ -1,58 +1,20 @@
-// The studio journal, ON the cognitive bus — desk 903 phase 2.
-//
-// The agent's own framing, verbatim: "delta comes from the ENTRY, not the act:
-// sign from `stance`, magnitude from the response actually written; a neutral
-// entry moves nothing; no fixed '+0.1 for filing'."
-//
-// ── WHERE THE SIGN COMES FROM ────────────────────────────────────────────────
-// `stance` is {open | formed | abstained} and carries NO polarity, so it cannot
-// supply a sign on its own. It supplies the GATE and the SCALE instead:
-//   • abstained → exactly zero. An encounter doesn't owe a verdict, and the one
-//     stance that may stand without a response must cost nothing.
-//   • open      → half. A judgment still forming moves less than a settled one.
-//   • formed    → full.
-// The sign and the magnitude both come from the RESPONSE, read through the one
-// appraisal this system already has (`conversationalAppraisal`). No new sentiment
-// scorer is introduced, and none may be: there is exactly one lexicon here and
-// this reads its output, exactly as `landingScore` does.
-//
-// A response that matches nothing scores exactly 0 and moves nothing. That is
-// the property that makes "no fixed delta for filing" true rather than merely
-// intended — silence is the default, not a floor.
-//
-// ── THIS IS NOT THE C3 SELF-APPRAISAL ────────────────────────────────────────
-// Audit C3 forbids appraising HER from her own text, because a warm reply
-// stamping itself warm is a self-reinforcing ratchet through mood. The rule is
-// about the SUBJECT of the appraisal, not the authorship of the string: there,
-// her reply was being read as evidence about her; here, her judgment is being
-// read as what it is — the content of an entry about a work. Nothing derived
-// here touches socialWarmth, uncertainty, or taskPressure; the ONLY thing it
-// produces is this one event's own felt valence. The gate in `emotionTag`
-// remains untouched for every other event.
-//
-// ── DESCRIPTION-ONLY, WEIGHTED DOWN ──────────────────────────────────────────
-// A description-only consult can never become an entry at all — the store
-// refuses it at both ends, so it cannot reach this file. The nearest honest
-// analogue that CAN reach it is an entry carrying no artifact refs of its own:
-// thinner evidence of an actual encounter, so it moves half as much.
-//
-// ── THE DREAM-CITATION SEAM ──────────────────────────────────────────────────
-// The event carries `studioEntryId` in its metadata AND as `subject.id`. The
-// dream felt-summary owner (DreamREMCycle, another builder's fence) reads the
-// felt node's subject/metadata to cite what a feeling came from; both fields
-// are here and pinned by a test so that citation can be written without
-// touching this file. Nothing here writes a dream, and nothing here should.
+// Studio feeling reads lexical valence from the written judgment through studioValence.
+// Stance gates and scales: abstained is silent, open weighs half, formed weighs full;
+// empty or neutral responses move nothing, and entries without artifact refs weigh half again.
+// Description-only consults cannot enter the journal. Valence concerns the work,
+// never her socialWarmth, uncertainty or taskPressure; this file writes no dreams.
+// Dream-citation seam: stable `studio_journal:<entry.id>` events carry the entry id
+// in `subject.id` (type `studio_entry`) and metadata `studioEntryId`.
 
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Studio
 // Blueprint: | `CognitiveSubstrate+StudioEvents.swift` | `CognitiveSubstrate`: `studioJournalFelt`, `studioJournalEvent`, `ingestStudioJournalEntry` |
 
 public extension CognitiveEvent {
-    /// Metadata key for a felt valence its OWNER measured rather than the
-    /// substrate inferring one. Pre-existing usage: the organism's resolution
-    /// drain. Studio journal entries are the second.
+    /// Metadata key for valence measured by the event's owner.
     static let feltValenceMetadataKey = "feltValence"
     static let feltArousalMetadataKey = "feltArousal"
     /// The journal entry this event came from. The dream felt-summary cites it.
@@ -70,8 +32,7 @@ public extension CognitiveEvent {
     }
 }
 
-/// The felt size of one filed entry. Deliberately a struct so the law is
-/// testable without a substrate, an event, or a database.
+/// The measured feeling of one filed entry.
 public struct StudioJournalFelt: Sendable, Equatable {
     /// −1…1, bounded. Zero means "this entry moves nothing", which is a real
     /// and common outcome, not a failure to score.
@@ -90,29 +51,22 @@ public extension CognitiveSubstrate {
     /// measured resolutions use — composed, never melodrama.
     static let studioJournalFeltCeiling = 0.7
 
-    /// The law, in one place: stance gates and scales, the response signs and
-    /// sizes. Pure apart from reading the shared appraisal lexicon.
     func studioJournalFelt(for entry: StudioJournalEntry) -> StudioJournalFelt {
-        // An abstention costs nothing. This is checked FIRST so no later term
-        // can smuggle a delta onto a deliberate "not enough to judge yet".
         guard entry.stance.kind != .abstained else { return .still }
         let response = (entry.response ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !response.isEmpty else { return .still }
-        let appraised = conversationalAppraisal(in: response).valence
+        let appraised = studioValence(in: response)
         guard appraised != 0 else { return .still }
 
         var value = appraised
         if entry.stance.kind == .open { value *= 0.5 }
-        // Thin evidence of an actual encounter — see the file note.
         if entry.artifactRefs.isEmpty { value *= 0.5 }
         let ceiling = Self.studioJournalFeltCeiling
         let bounded = min(ceiling, max(-ceiling, value))
         return StudioJournalFelt(valence: bounded, arousal: abs(bounded).clamped01())
     }
 
-    /// Mint the event for one filed entry. Returns nil only when the entry has
-    /// no title to name, which the store already refuses — belt and braces so a
-    /// malformed row cannot mint an anonymous feeling.
+    /// Mint a filed entry's event only when its title and id are nonempty.
     func studioJournalEvent(
         for entry: StudioJournalEntry,
         at now: Date? = nil
@@ -160,26 +114,10 @@ public extension CognitiveSubstrate {
     }
 }
 
-/// THE ONE SEAM between a filed journal entry and the cognitive bus.
-///
-/// The tool lane that writes the journal (`SwiftToolDispatcher`) holds no
-/// cognition reference — deliberately: cognition lives on the chat client, not
-/// the dispatcher. Rather than give the dispatcher a substrate, the studio lane
-/// publishes here and whoever owns the live `CognitiveSubstrate` installs the
-/// sink once at startup:
-///
-///     StudioJournalCognitiveBus.install { entry in
-///         await substrate.ingestStudioJournalEntry(entry)
-///     }
-///
-/// Until that install exists the bus is INERT, and it says so out loud the first
-/// time an entry is published into nothing. An inert seam that announces itself
-/// is a missing wire; a quiet one is theater.
+/// Delivers durable journal entries to one sink; logs once while no sink is installed.
 public actor StudioJournalCognitiveBus {
     public typealias Sink = @Sendable (StudioJournalEntry) async -> Void
 
-    // Tests can bind an isolated bus across dispatcher calls without replacing
-    // the resident sink. Unbound production tasks retain the process-wide bus.
     @TaskLocal static var shared = StudioJournalCognitiveBus()
     private var sink: Sink?
     private var warnedAboutMissingSink = false

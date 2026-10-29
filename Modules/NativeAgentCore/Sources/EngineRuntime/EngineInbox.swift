@@ -1,5 +1,4 @@
 import Foundation
-import BackgroundWork
 import NativeAgentShared
 import NativeAgentCore
 import AuthoredCapabilities
@@ -8,7 +7,8 @@ import NotificationInbox
 import PersistenceCore
 import TriggerScheduler
 import Cognition
-// Blueprint: | `EngineInbox.swift` | InboxFacade publishes checked items, triggers and read errors through LatestRead; each caller receives its own rows; markRead and committed trigger changes use write; owner-scoped observe/observeTriggers, including canonical ability invalidations for authored trigger defaults, loading and availability; InboxItemRecord action/proactive prominence and newest physical row per stable card id. |
+import BackgroundWork
+// Blueprint: | `EngineInbox.swift` | InboxFacade publishes checked items, triggers and read errors through LatestRead; each caller receives its own rows; markRead and committed trigger changes use write; owner-scoped observe/observeTriggers, including canonical ability invalidations for authored trigger defaults, loading and availability; newest physical row per stable card id. |
 
 extension InboxItemRecord {
     public var isUnread: Bool { normalizedStatus == "unread" }
@@ -62,19 +62,13 @@ public final class InboxFacade {
 
     public nonisolated init(dataRoot: URL) {
         self.dataRoot = dataRoot
-        let path = LiveNotificationInbox.livePath(dataRoot: dataRoot)
-        self.store = path == LiveNotificationInbox.livePath(dataRoot: PersistenceCore.defaultDataRoot())
-            ? .shared
-            : LiveNotificationInbox(path: path)
+        self.store = LiveNotificationInbox.live(dataRoot: dataRoot)
     }
 
     /// Cards newest first by `created_at` (blank last, then id). A row that
     /// is not a card is skipped, but a feed where no row reads is corruption,
     /// never an empty inbox, and throws.
-    ///
-    /// 2026-06-06: newest first — the file is append-only, so without the
-    /// sort the just-fired card lands at the bottom. The phone's inbox
-    /// snapshot inherits this order.
+    /// The phone's inbox snapshot shares this order.
     public func list(unreadOnly: Bool = false) async throws -> [InboxItemRecord] {
         pendingItemReads += 1
         defer { pendingItemReads -= 1 }
@@ -195,57 +189,6 @@ extension InboxFacade {
     }
 }
 
-extension InboxItemRecord {
-    public var isHiddenFromDefaultInbox: Bool {
-        normalizedStatus == "archived" || normalizedStatus == "dismissed"
-    }
-    public var hasLinkedApproval: Bool { !(related_approval_id ?? "").isEmpty }
-    public var isProactiveCard: Bool { source.lowercased().hasPrefix("proactive_autonomy:") }
-    public var isApprovalBacklogCard: Bool {
-        let lowerSource = source.lowercased()
-        let lowerDetail = (detail ?? "").lowercased()
-        return hasLinkedApproval
-            || lowerSource.hasPrefix("proactive_autonomy:approval_backlog:")
-            || lowerDetail.contains("suggested action: approvals.triage")
-    }
-
-    public var fallbackPrimaryAction: InboxActionRecord? {
-        if isApprovalBacklogCard {
-            return InboxActionRecord(
-                id: "open_approvals",
-                label: "Open Approvals",
-                description: "Review pending approvals"
-            )
-        }
-        if isProactiveCard {
-            return nil
-        }
-        if severity.lowercased() == "actionable" || relatedWorkshopExecutionId != nil {
-            return InboxActionRecord(id: "act", label: "Act", description: "Take primary action")
-        }
-        return nil
-    }
-
-    public var effectiveActions: [InboxActionRecord] {
-        if !actions.isEmpty { return actions }
-        var fallback = [InboxActionRecord(id: "view", label: "View", description: "See full detail")]
-        if let primary = fallbackPrimaryAction {
-            fallback.append(primary)
-        }
-        fallback.append(contentsOf: [
-            InboxActionRecord(id: "archive", label: "Archive", description: "Archive this item"),
-            InboxActionRecord(id: "dismiss", label: "Dismiss", description: "Dismiss this item"),
-        ])
-        return fallback
-    }
-
-    public var actionIDs: Set<String> {
-        Set(effectiveActions.map(\.id))
-    }
-
-    public var isForYouLane: Bool { !isSystemLane }
-}
-
 extension InboxRelatedGroup {
     public func matches(_ item: InboxItemRecord) -> Bool {
         matches(itemID: item.id, title: item.title)
@@ -258,9 +201,6 @@ extension InboxRelatedGroup {
 /// surface offers exactly the native action that its button will invoke.
 public enum InboxVisibleActionsPresentation {
     private static let hiddenActionIDs: Set<String> = ["view", "read", "reply"]
-    private static let executableActionIDs: Set<String> = Set([
-        "act", "approve", "reject",
-    ]).union(HeartbeatCardAction.ids)
 
     public static func actions(for item: InboxItemRecord) -> [InboxActionRecord] {
         guard !item.isHiddenFromDefaultInbox else { return [] }
@@ -268,12 +208,11 @@ public enum InboxVisibleActionsPresentation {
         var visible: [InboxActionRecord] = []
 
         for action in item.effectiveActions {
-            let normalizedID = action.id
+            let canonicalID = InboxActionVocabulary.normalizedAction(action.id
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
-            let canonicalID = normalizedID == "deny" ? "reject" : normalizedID
+                .lowercased())
             guard !hiddenActionIDs.contains(canonicalID),
-                  executableActionIDs.contains(canonicalID)
+                  InboxActionVocabulary.nativeActionIDs.contains(canonicalID)
             else { continue }
 
             let label = action.label.trimmingCharacters(in: .whitespacesAndNewlines)

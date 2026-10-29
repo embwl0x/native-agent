@@ -1,3 +1,4 @@
+import ApprovalTransactions
 import AuthoredCapabilities
 import Foundation
 import Agents
@@ -22,21 +23,11 @@ import Senses
 import PersonaEngine
 // Blueprint: | `AppChatToolDispatcher.swift` | Composed tool dispatch, Security Center admission and settled-result observers; `withAuthoredProgramHost` is the one host binding for turns and native scheduled/UI owners, retaining their originating gated reentry |
 
-/// Core's composed gate in front of the tool router on chat surfaces.
-///
-/// Every tool — Core's and the app's own — is listed, catalogued, loaded and
-/// lazily gated by Core; the app's executors reach Core's catalog through the
-/// engine's port (`AppToolExecutor`). This owner keeps the composed side of the
-/// call: the Security Center gate, trust on the full catalog, the live-body
-/// routes a result hands back (self-window, desktop and Grok sends), and
-/// the settled-result motor outcomes.
-public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolValidating, BuiltInAgentLaneProviding, @unchecked Sendable {
-    private let interactions: any ToolInteractionResolving
+/// Composes the engine's tool catalog with Security Center admission,
+/// app effects and settled-result motor observations.
+public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolValidating {
     private let platform: ChatToolPlatformPort
     private let inner: any ToolDispatchClient
-    public func builtInAgentLaneUsable(_ name: String) -> Bool {
-        (inner as? any BuiltInAgentLaneProviding)?.builtInAgentLaneUsable(name) == true
-    }
     private let securityCenter: SwiftNativeSecurityCenter
     /// The app's own tool executors: here only for the self-window handoff an
     /// `act`/`go`/`screen` result asks this process to finish.
@@ -56,10 +47,8 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         includeAppOwnedTools: Bool = true,
         appTools: AppToolExecutor? = nil,
         motorOutcomeObserver: @escaping @Sendable (ToolCausalBoundary.MotorReference) async -> Void = { _ in },
-        interactions: any ToolInteractionResolving,
         platform: ChatToolPlatformPort
     ) {
-        self.interactions = interactions
         self.platform = platform
         self.inner = inner
         self.securityCenter = securityCenter
@@ -105,13 +94,7 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
     }
 
     private func dispatchNormalized(tool: String, input: [String: JSONValue], surface: String) async throws -> JSONValue {
-        // 2026-09-06: the bridge canonicalizes `mobile.notify` to `mobile_notify`
-        // before this dispatcher sees it, and the fence matched the dotted
-        // spelling only — so on a synthetic root the call fell through to
-        // `runMobileNotify` and attempted a real push. Fence the canonical
-        // notification name too. 2026-09-26: aliases resolve before this
-        // dispatcher (ToolNameAliases); the other app tools are simply absent
-        // from a body with no app executor.
+        // Aliases resolve before dispatch; notifications require an app executor.
         if !includeAppOwnedTools, ["mac_notify", "mobile_notify"].contains(tool) {
             return .object([
                 "status": .string("failed"),
@@ -168,7 +151,7 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
                     guard let session = ChatToolSessionContext.verifiedSessionId else {
                         return AppToolExecutor.failure("door_unavailable", "A card needs the originating conversation.")
                     }
-                    return await self.interactions.waitForAnswer(need, tool: tool, input: input,
+                    return await InlineInteractionResolver.waitForAnswer(need, tool: tool, input: input,
                         sessionID: session, dataRoot: self.securityCenter.dataRoot)
                 }) {
                     try await operation()
@@ -209,7 +192,7 @@ public final class AppChatToolDispatcher: ToolDispatchClient, PreApprovalToolVal
         // nobody. The owner's answer goes back instead, and she carries on.
         if includeAppOwnedTools, tool == InlineInteractionWire.toolName,
            let need = InlineInteractionNeed.interaction(in: result),
-           let done = await interactions.liveOutcomeSummary(need, dataRoot: PersistenceCore.defaultDataRoot()) {
+           let done = await InlineInteractionResolver.liveProjection(need, dataRoot: PersistenceCore.defaultDataRoot()).state.outcome?.summary {
             var settled: [String: JSONValue] = [
                 "status": .string("ok"),
                 "already_done": .bool(true),

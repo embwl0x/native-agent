@@ -1,3 +1,4 @@
+import NativeAgentShared
 import EngineRuntime
 import Foundation
 import SwiftUI
@@ -63,7 +64,7 @@ struct NativeSecurityCenterPanel: View {
     }
 
     var body: some View {
-        NativePanel(title: "Security Center", systemImage: "shield.lefthalf.filled") {
+        NativePanel(title: "Security Center") {
             if let status = trust.securityStatus {
                 // The four counts were tinted tiles in a grid — a plate each,
                 // inside the card. They are bare stat rows now.
@@ -107,9 +108,7 @@ struct NativeSecurityCenterPanel: View {
                 }
 
                 VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                    // ui-taste-sweep 2026-06-07: was exposing the full
-                    // /Users/<home>/Library/... path. Tildify it and use the
-                    // tooltip for the full path power users may want to copy.
+                    // Display a tilde path and expose the full path in the tooltip.
                     Text(UserDisplayFormatters.tildifyPath(status.auditReceiptsPath))
                         .font(ShellType.code)
                         .foregroundStyle(NativeAgentShell.secondary)
@@ -292,10 +291,7 @@ private struct SecurityReceiptRow: View {
                     .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(2)
             }
-            // ui-taste-sweep 2026-06-07: receipt.at is raw ISO with
-            // fractional seconds + timezone offset. Show relative phrase
-            // (uses the shared formatter that landed in batch 2), keep
-            // raw ISO in the tooltip for power users.
+            // Show relative time while retaining the raw ISO timestamp in the tooltip.
             Text(UserDisplayFormatters.humanizeISOTimestamp(receipt.at))
                 .font(ShellType.caption)
                 .foregroundStyle(NativeAgentShell.tertiary)

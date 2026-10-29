@@ -22,7 +22,7 @@ enum WorkspaceReadout {
     }
 
     static func project(input: JSONValue, dataRoot: URL, items: [String: AgentWorkspaceItem],
-                        actions: [String: AgentWorkspaceButton], native: [String: JSONValue] = [:]) async -> AgentWorkspaceProjection {
+                        actions: [String: AgentWorkspaceButton], native: [String: JSONValue] = [:]) async -> WorkspacePage {
         do {
             let value = try await AgentWorkspacePorts.current.tools.readout(input, dataRoot: dataRoot)
             let decision = try JSONDecoder().decode(Decision.self, from: value.serializedData(pretty: false))
@@ -58,7 +58,7 @@ enum WorkspaceReadout {
         }
     }
 
-    static func bots(input: [String: JSONValue], result: JSONValue, dataRoot: URL) async -> AgentWorkspaceProjection {
+    static func bots(input: [String: JSONValue], result: JSONValue, dataRoot: URL) async -> WorkspacePage {
         let selected = input["id"]?.stringValue.flatMap(UUID.init(uuidString:)) != nil
         if result.objectValue?["bots"]?.arrayValue == nil {
             return .init(title:"My helpers",content:.object(["status":.string("unavailable"),"source":result]),items:[],actions:[])
@@ -86,7 +86,8 @@ enum WorkspaceReadout {
                     ("settings",.init(label:"settings",action:.configure(tool:"bot_update",input:["id": .string(id)],title:"settings")))
                 ]
                 for (verb,button) in candidates { actions[key+":"+verb] = button; keys.append(key+":"+verb) }
-                if case .bool(let paused)? = row["paused"] {
+                if case .bool(let paused)? = row["paused"],
+                   row["actions"]?.objectValue?[paused ? "resume" : "pause"] != nil {
                     actions[key+":pause"] = .init(label:"pause",
                         action:.perform(tool:"bot_pause",input:["id": .string(id),"paused":.bool(!paused)],
                             title:"pause",textField:nil,isEffect:true))

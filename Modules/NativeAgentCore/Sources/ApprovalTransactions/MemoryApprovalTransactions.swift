@@ -5,24 +5,11 @@ import ApprovalInbox
 import MemoryV2
 import ProviderRouting
 import TrustCenter
-// Blueprint: | `MemoryApprovalTransactions.swift` | `MemoryApprovalTransactions` enum; `applyResolvedKindBackfill`, `reconcileUnappliedMemoryRepairs` |
+import DreamREMCycle
+import NativeAgentShared
+// Blueprint: | `MemoryApprovalTransactions.swift` | `MemoryApprovalTransactions` enum; `applyResolvedKindBackfill`, `stageKindBackfillIfNeeded` |
 
 public enum MemoryApprovalTransactions {
-    /// Settle resolved memory.repair records missing their execution annotation.
-    /// Canonical truncated-row repairs stale-skip already applied rows;
-    /// retired kinds receive the executor's unknown-kind terminal outcome.
-    @discardableResult
-    public static func reconcileUnappliedMemoryRepairs(
-        dataRoot: URL, records: [ApprovalRecord]
-    ) async -> Int {
-        await ApprovalTransactionCoordinator.reconcileUnappliedApprovalExecutions(kinds: [
-            ApprovalTransactionCoordinator.ApprovalExecutionReconcileKind(
-                action: MemoryRepairOneShot.action,
-                shouldReconcile: { _ in true },
-                execute: { await MemoryRepairOneShot.applyResolvedMemoryRepair(from: $0, dataRoot: dataRoot) })
-        ], records: records)
-    }
-
     /// Applies a resolved memory.kind_backfill record (U3 wave-2 item 5 —
     /// mirror of applyResolvedMemoryRepair's shape). Approved → stamp each
     /// row's LLM-proposed kind through the store's own write path; the
@@ -45,10 +32,7 @@ public enum MemoryApprovalTransactions {
             do {
                 let rows = MemoryKindBackfill.rowProposals(fromPayload: rec.payload)
                 guard !rows.isEmpty else {
-                    // Fix-round (gpt-5.5 review, 2026-06-10): a malformed
-                    // card is apply-failure shaped — clear the stamp BEFORE
-                    // annotating, or the stamp dead-ends every future
-                    // staging behind a card that can never apply.
+                    // Clear the malformed card's stamp before annotating failure so future staging remains possible.
                     MemoryKindBackfill.clearStamp(dataRoot: dataRoot)
                     try? await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
                         rec.id,
@@ -93,21 +77,6 @@ public enum MemoryApprovalTransactions {
         }
     }
 
-    /// Crash-window reconciliation for memory.kind_backfill (same shape as
-    /// reconcileUnappliedMemoryRepairs): resolved records lacking an
-    /// execution annotation get the idempotent executor re-run on launch.
-    @discardableResult
-    public static func reconcileUnappliedKindBackfills(
-        dataRoot: URL, records: [ApprovalRecord]
-    ) async -> Int {
-        await ApprovalTransactionCoordinator.reconcileUnappliedApprovalExecutions(kinds: [
-            ApprovalTransactionCoordinator.ApprovalExecutionReconcileKind(
-                action: MemoryKindBackfill.action,
-                shouldReconcile: { _ in true },
-                execute: { await applyResolvedKindBackfill(from: $0, dataRoot: dataRoot) })
-        ], records: records)
-    }
-
     /// Stages the kind-backfill approval card if the legacy kind-less rows
     /// still exist and no card was staged before (U3 wave-2 item 5).
     /// MemoryV2 never imports ApprovalInbox (module-boundary rule), so the
@@ -119,7 +88,6 @@ public enum MemoryApprovalTransactions {
     ) async {
         let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
             .fullMacYoloAuthority(
-                tool: MemoryKindBackfill.action,
                 origin: SecurityOriginContext(
                     surface: "desk",
                     source: "memory_kind_backfill_stager",
@@ -137,48 +105,20 @@ public enum MemoryApprovalTransactions {
             return
         }
         let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-        // Classifier: Apple FM on-device when available (free, instant),
-        // else WHICHEVER MODEL AGENT IS ON — resolved through the "memory"
-        // picker surface with the dream/rem pin-only pattern: a pin on
-        // "memory" wins (so the user can point this at something cheap from the
-        // Providers panel), otherwise the chat surface's current pick
-        // (Anthropic OR GPT-5.5 OAuth — never a hardcoded provider; the user's
-        // call, 2026-06-10: she regularly runs on codex OAuth models to
-        // save Anthropic tokens). Same no-fabrication contract as FM: a
-        // reply outside the taxonomy throws → the row drops from the card
-        // instead of carrying a made-up kind.
+        // Prefer on-device classification; remote classification uses the resolved Memory route.
+        // Both accept only an exact supplied category.
         let llm = makeLLMClient()
-        let routerForPins = SwiftNativeProviderRouting()
         let classifier: @Sendable (String, [String]) async throws -> String = { content, taxonomy in
-            if AppleFoundationModelsAdapter.isAvailable {
+            if OnDeviceClassification.isAvailable {
                 return try await MemoryKindBackfill.foundationModelsClassifier(
                     content: content, taxonomy: taxonomy)
             }
-            // Surface-scoped resolution (gpt-5.5 review blocker): the
-            // surface-less complete() defaults to "chat", whose active.json
-            // provider entry can REMAP a pinned model to chat's provider —
-            // bypassing the pin. Routing under "memory" keeps the Memory row's
-            // own pin and its own provider.
-            // User, 2026-09-06: an UNPINNED Memory row used to fall back to the
-            // chat surface entirely, so assigning a provider to Memory without
-            // also pinning a model did nothing. The Memory row now takes its
-            // own surface whenever it says anything (a pin OR an assigned
-            // provider). A BLANK row still routes on "chat": on "memory" it
-            // would carry no active-provider entry and dispatch would infer the
-            // transport from the model prefix, sending Memory to ChatGPT OAuth
-            // while chat runs on the Codex CLI or the OpenAI API.
-            let surface = await routerForPins.surfaceHasOwnRouting("memory") ? "memory" : "chat"
-            let model = await routerForPins.modelStringForSurface(surface)
-            let system = "# Background Personality Context\nYou classify one memory snippet into exactly one of these kinds: "
-                + taxonomy.joined(separator: ", ")
-                + ". Reply with ONLY the kind word, lowercase, nothing else."
-            let raw = try await llm.complete(
-                prompt: content, system: system, model: model, surface: surface, purpose: "kind_backfill")
-            // Classification never repairs a reply into a taxonomy member.
-            if taxonomy.contains(raw) { return raw }
-            throw NSError(domain: "NativeAgentKindBackfill", code: 422, userInfo: [
-                NSLocalizedDescriptionKey: "classifier reply not in taxonomy: \(raw.prefix(80))"
-            ])
+            let raw = try await PrivateWorkContextAssembly.$current.withValue(.taskOnly) {
+                try await llm.complete(
+                    prompt: OnDeviceClassification.classifyPrompt(content: content, categories: taxonomy),
+                    system: try completionPolicy("kind-classification", section: "system"), model: nil, surface: "memory", purpose: "kind_backfill", tools: nil)
+            }
+            return try OnDeviceClassification.matchCategory(reply: raw, categories: taxonomy)
         }
         _ = await MemoryKindBackfill.stageIfNeeded(
             dataRoot: dataRoot,
@@ -187,10 +127,15 @@ public enum MemoryApprovalTransactions {
             createApproval: { body in
                 // Classification may outlive a Trust change. Admission and the
                 // canonical writes share Trust's existing policy-file lock.
-                try await SwiftNativePersistenceCore().withFileLock(SavedTrustPolicyAuthority.policyURL(dataRoot: dataRoot)) {
+                try await SwiftNativePersistenceCore.withFileLock(SavedTrustPolicyAuthority.policyURL(dataRoot: dataRoot)) {
                     let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
-                        .fullMacYoloAuthority(tool: MemoryKindBackfill.action, origin: SecurityOriginContext(
+                        .fullMacYoloAuthority(origin: SecurityOriginContext(
                             surface: "desk", source: "memory_kind_backfill_stager", isRemote: false))
+                    if yolo.state == .explicitlyBlocked {
+                        throw NSError(domain: "MemoryKindBackfill", code: 403, userInfo: [
+                            NSLocalizedDescriptionKey: yolo.reason
+                        ])
+                    }
                     if yolo.admitted {
                         guard case .object(let object) = body,
                               let payload = object["payload"] else {
@@ -224,7 +169,7 @@ public enum MemoryApprovalTransactions {
             },
             listPendingBackfills: {
                 let yolo = await SwiftNativeSecurityCenter(dataRoot: dataRoot)
-                    .fullMacYoloAuthority(tool: MemoryKindBackfill.action, origin: SecurityOriginContext(
+                    .fullMacYoloAuthority(origin: SecurityOriginContext(
                         surface: "desk", source: "memory_kind_backfill_stager", isRemote: false))
                 if yolo.admitted { return [] }
                 return try await inbox.list(

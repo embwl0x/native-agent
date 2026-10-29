@@ -94,8 +94,6 @@ extension TelegramFacade {
             model: nil,
             reasoningEffort: nil,
             voiceTranscriptionEnabled: existing?.voiceTranscriptionEnabled ?? TelegramBot.TelegramConfig.defaultVoiceTranscriptionEnabled,
-            voiceTranscriptionBackend: existing?.voiceTranscriptionBackend ?? TelegramBot.TelegramConfig.defaultVoiceTranscriptionBackend,
-            voiceTranscriptionModel: existing?.voiceTranscriptionModel ?? TelegramBot.TelegramConfig.defaultVoiceTranscriptionModel,
             voiceMaxBytes: existing?.voiceMaxBytes ?? TelegramBot.TelegramConfig.defaultVoiceMaxBytes
         )
         do {
@@ -137,7 +135,7 @@ extension TelegramFacade {
         return ids
     }
 
-    public nonisolated func sendTelegramTestReply(chatId: String?, manager: BackgroundLoopsManager) async throws -> TelegramTestResponse {
+    public nonisolated func sendTelegramTestReply(chatId: String?, manager: BackgroundLoopLifetimes) async throws -> TelegramTestResponse {
         let testMessage = "NativeAgent Telegram test reply: online."
         let root = dataRoot
         guard let configuration = TelegramBot.TelegramConfig.loadFromDisk(dataRoot: root),
@@ -166,8 +164,7 @@ extension TelegramFacade {
             try await recordTelegramTestStatus(root: root, error: reason)
             throw TelegramBotError.underlying(reason)
         }
-        // SwiftNative Telegram test path. The module reads the saved config and
-        // calls Telegram directly; no daemon URL is required.
+        // The module reads the saved config and calls Telegram directly.
         let impl = SwiftNativeTelegramBot(dataRoot: root)
         let result: TelegramTestResult
         do {
@@ -177,7 +174,7 @@ extension TelegramFacade {
             throw error
         }
         try await recordTelegramTestSuccess(root: root)
-        var response = try TelegramTestResponse(result: result)
+        var response = TelegramTestResponse(result: result)
         let loopStatus = await manager.status()
             .first { $0.name == "telegram_poll" }
         response.tokenConfigured = !configuration.botToken.isEmpty
@@ -188,7 +185,7 @@ extension TelegramFacade {
         return response
     }
 
-    public nonisolated func clearTelegramDiagnostics(manager: BackgroundLoopsManager) async throws -> TelegramDiagnosticsClearReceipt {
+    public nonisolated func clearTelegramDiagnostics(manager: BackgroundLoopLifetimes) async throws -> TelegramDiagnosticsClearReceipt {
         // SwiftNative clear + refreshed status. Take the receipt count before
         // deletion, so the UI can distinguish a completed no-op from a clear
         // that removed diagnostic evidence.
@@ -248,48 +245,37 @@ extension TelegramFacade {
 extension TelegramFacade {
     private enum TelegramReloadError: Error { case pollerUnavailable }
 
-    public nonisolated func changeTelegramSettings(_ change: MobileTelegramChange, restartPollLoop: @Sendable () async -> Bool) async throws {
+    public nonisolated func disconnectTelegram(restartPollLoop: @Sendable () async -> Bool) async throws {
         let root = dataRoot
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(root.appendingPathComponent("telegram/config.json")) {
+        try await SwiftNativePersistenceCore.withFileLock(root.appendingPathComponent("telegram/config.json")) {
             try TelegramConfig.validateMobileConfiguration(at: root)
             let existing = TelegramConfig.loadFromDisk(dataRoot: root, includeDisconnected: true)
-            var token = existing?.botToken ?? ""
-            var enabled = existing?.enabled ?? false
-            let requireMention = existing?.requireMention ?? false
-            switch change {
-            case .disconnect:
-                token = ""
-                enabled = false
-            }
             // Validate readback before replacing config, including on disconnect.
             _ = try await SwiftNativeProviderRouting(dataRoot: root).checkedRoutingSnapshot()
             try TelegramConfig.saveToDisk(TelegramConfig(
-                botToken: token,
+                botToken: "",
                 allowedChatIds: existing?.allowedChatIds ?? [],
                 allowedUserIds: existing?.allowedUserIds ?? [],
-                requireMention: requireMention,
-                enabled: enabled,
+                requireMention: existing?.requireMention ?? false,
+                enabled: false,
                 model: existing?.model,
                 reasoningEffort: existing?.reasoningEffort,
                 voiceTranscriptionEnabled: existing?.voiceTranscriptionEnabled ?? TelegramConfig.defaultVoiceTranscriptionEnabled,
-                voiceTranscriptionBackend: existing?.voiceTranscriptionBackend ?? TelegramConfig.defaultVoiceTranscriptionBackend,
-                voiceTranscriptionModel: existing?.voiceTranscriptionModel ?? TelegramConfig.defaultVoiceTranscriptionModel,
                 voiceMaxBytes: existing?.voiceMaxBytes ?? TelegramConfig.defaultVoiceMaxBytes
             ), dataRoot: root)
         }
         // A draining turn must not hold the settings lock; reload from latest disk state.
-        try await persistence.withFileLock(root.appendingPathComponent("telegram/poll_reload")) {
+        try await SwiftNativePersistenceCore.withFileLock(root.appendingPathComponent("telegram/poll_reload")) {
             guard await restartPollLoop() else {
                 throw TelegramReloadError.pollerUnavailable
             }
         }
     }
 
-    public nonisolated func mobileTelegramSnapshot(manager: BackgroundLoopsManager) async throws -> MobileTelegramSnapshot {
+    public nonisolated func mobileTelegramSnapshot(manager: BackgroundLoopLifetimes) async throws -> MobileTelegramSnapshot {
         let root = dataRoot
         let url = root.appendingPathComponent("telegram/config.json")
-        return try await SwiftNativePersistenceCore().withFileLock(url) {
+        return try await SwiftNativePersistenceCore.withFileLock(url) {
             let observedAt = Date().timeIntervalSince1970
             // Validate before decoding legacy spellings or a disconnected state,
             // so malformed settings never appear as saved defaults.

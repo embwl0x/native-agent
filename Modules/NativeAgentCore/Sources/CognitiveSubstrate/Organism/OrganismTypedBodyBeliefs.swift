@@ -1,169 +1,6 @@
-import CryptoKit
 import Foundation
 
-// Blueprint: | `OrganismTypedBodyBeliefs.swift` | Typed body belief projections: secret-free evidence references, locally received freshness and bounded capability/integrity/presence metrics |
-
-/// Secret-free evidence classes shared by the narrow body-read projections.
-/// These are correlation references only; payloads, credentials, paths, user
-/// text, and provider output never enter the body belief layer.
-public enum BodyEvidenceClass: String, Codable, Sendable, Equatable, CaseIterable {
-    case signedPeerContact
-    case apnsAcceptance
-    case notificationTransportFailure
-    case deviceProcessReceipt
-    case deviceProcessFailure
-    case displayReceipt
-    case explicitUserReaction
-    case localStorePresence
-    case maintenanceReceipt
-    case dreamCompletion
-    case toolConfiguration
-    case liveToolCapability
-    case approvalStore
-    case processThermalState
-    /// Read only from body evidence saved before 10-24; Low Power Mode is no longer sensed.
-    case lowPowerMode
-}
-
-public struct BodyEvidenceReference: Codable, Sendable, Equatable, Identifiable {
-    public let id: String
-    public let evidenceClass: BodyEvidenceClass
-    /// Source-domain time. Retained for provenance, but never used to settle
-    /// physiology. Freshness is always computed from locally received time.
-    public let observedAt: Date
-    public let receivedAt: Date
-    public let reliability: Double
-
-    public init(
-        id: String,
-        evidenceClass: BodyEvidenceClass,
-        observedAt: Date,
-        receivedAt: Date,
-        reliability: Double = 1
-    ) {
-        self.id = Self.digest(id)
-        self.evidenceClass = evidenceClass
-        self.observedAt = observedAt
-        self.receivedAt = receivedAt
-        self.reliability = Self.clamp(reliability, fallback: 0)
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case id, evidenceClass, observedAt, receivedAt, reliability
-    }
-
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        let rawID = try container.decode(String.self, forKey: .id)
-        self.id = ProviderPathEvidence.isCanonicalDigest(rawID) ? rawID : Self.digest(rawID)
-        self.evidenceClass = try container.decode(BodyEvidenceClass.self, forKey: .evidenceClass)
-        self.observedAt = try container.decode(Date.self, forKey: .observedAt)
-        self.receivedAt = try container.decode(Date.self, forKey: .receivedAt)
-        self.reliability = Self.clamp(
-            try container.decode(Double.self, forKey: .reliability),
-            fallback: 0
-        )
-    }
-
-    private static func digest(_ value: String) -> String {
-        let clean = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        let bounded = clean.isEmpty ? "anonymous" : String(clean.prefix(512))
-        return SHA256.hash(data: Data(bounded.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
-    }
-
-    fileprivate static func clamp(_ value: Double, fallback: Double) -> Double {
-        guard value.isFinite else { return fallback }
-        return (value).clamped01()
-    }
-}
-
-/// Common bounded metrics used by every typed body read. It is a projection,
-/// never a canonical evidence store. Hostile decoding is normalized, evidence
-/// is deduplicated and capped, and future local-receipt times are discarded.
-public struct BodyBeliefMetrics: Codable, Sendable, Equatable {
-    public let generatedAt: Date
-    public let estimate: Double
-    public let uncertainty: Double
-    public let freshness: Double
-    public let evidence: [BodyEvidenceReference]
-    public let observedAt: Date?
-    public let receivedAt: Date?
-    public let nextMeaningfulExpiry: Date?
-
-    public init(
-        generatedAt: Date,
-        estimate: Double,
-        uncertainty: Double,
-        freshness: Double,
-        evidence: [BodyEvidenceReference] = [],
-        observedAt: Date? = nil,
-        receivedAt: Date? = nil,
-        nextMeaningfulExpiry: Date? = nil
-    ) {
-        self.generatedAt = generatedAt
-        self.estimate = BodyEvidenceReference.clamp(estimate, fallback: 0.5)
-        self.uncertainty = BodyEvidenceReference.clamp(uncertainty, fallback: 1)
-        let bounded = Self.boundedEvidence(evidence, generatedAt: generatedAt)
-        self.freshness = evidence.isEmpty || !bounded.isEmpty
-            ? BodyEvidenceReference.clamp(freshness, fallback: 0)
-            : 0
-        self.evidence = bounded
-        self.observedAt = bounded.map(\.observedAt).max() ?? observedAt
-        self.receivedAt = bounded.map(\.receivedAt).max() ?? receivedAt
-        self.nextMeaningfulExpiry = nextMeaningfulExpiry
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case generatedAt, estimate, uncertainty, freshness, evidence
-        case observedAt, receivedAt, nextMeaningfulExpiry
-    }
-
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.init(
-            generatedAt: try container.decode(Date.self, forKey: .generatedAt),
-            estimate: try container.decode(Double.self, forKey: .estimate),
-            uncertainty: try container.decode(Double.self, forKey: .uncertainty),
-            freshness: try container.decode(Double.self, forKey: .freshness),
-            evidence: try container.decodeIfPresent([BodyEvidenceReference].self, forKey: .evidence) ?? [],
-            observedAt: try container.decodeIfPresent(Date.self, forKey: .observedAt),
-            receivedAt: try container.decodeIfPresent(Date.self, forKey: .receivedAt),
-            nextMeaningfulExpiry: try container.decodeIfPresent(Date.self, forKey: .nextMeaningfulExpiry)
-        )
-    }
-
-    fileprivate static func boundedEvidence(
-        _ evidence: [BodyEvidenceReference],
-        generatedAt: Date,
-        maximum: Int = 8
-    ) -> [BodyEvidenceReference] {
-        var seen = Set<String>()
-        return evidence
-            .filter { $0.receivedAt.timeIntervalSince(generatedAt) <= 5 }
-            .sorted {
-                if $0.receivedAt != $1.receivedAt { return $0.receivedAt > $1.receivedAt }
-                return $0.id < $1.id
-            }
-            .filter { seen.insert($0.id).inserted }
-            .prefix(max(0, maximum))
-            .map { $0 }
-    }
-
-    fileprivate static func freshness(
-        receivedAt: Date?,
-        now: Date,
-        halfLife: TimeInterval,
-        staleAfter: TimeInterval
-    ) -> Double {
-        guard let receivedAt,
-              receivedAt.timeIntervalSince(now) <= 5 else { return 0 }
-        let age = max(0, now.timeIntervalSince(receivedAt))
-        guard age <= max(1, staleAfter) else { return 0 }
-        return exp(-log(2) * age / max(1, halfLife))
-    }
-}
+// Blueprint: | `OrganismTypedBodyBeliefs.swift` | Seven typed domain readings: evidence-bounded categories, freshness and compatibility values |
 
 public enum PeerPresenceCategory: String, Codable, Sendable, Equatable {
     case present
@@ -175,13 +12,6 @@ public struct PeerPresenceBelief: Codable, Sendable, Equatable {
     public let category: PeerPresenceCategory
     public let metrics: BodyBeliefMetrics
 
-    public var estimate: Double { metrics.estimate }
-    public var uncertainty: Double { metrics.uncertainty }
-    public var freshness: Double { metrics.freshness }
-    public var evidence: [BodyEvidenceReference] { metrics.evidence }
-    public var observedAt: Date? { metrics.observedAt }
-    public var receivedAt: Date? { metrics.receivedAt }
-    public var nextMeaningfulExpiry: Date? { metrics.nextMeaningfulExpiry }
     public var compatibilityReachable: Bool { category == .present }
 
     public init(
@@ -258,17 +88,10 @@ public struct NotificationDeliveryBelief: Codable, Sendable, Equatable {
     public let userSeen: Bool
     public let transportFailed: Bool
 
-    public var estimate: Double { metrics.estimate }
-    public var uncertainty: Double { metrics.uncertainty }
-    public var freshness: Double { metrics.freshness }
-    public var evidence: [BodyEvidenceReference] { metrics.evidence }
-    public var observedAt: Date? { metrics.observedAt }
-    public var receivedAt: Date? { metrics.receivedAt }
-    public var nextMeaningfulExpiry: Date? { metrics.nextMeaningfulExpiry }
     public var compatibilityPathHealthy: Bool? {
         if !transportConfigured { return true }
         if transportFailed { return false }
-        if deviceReceived && freshness > 0 { return true }
+        if deviceReceived && metrics.freshness > 0 { return true }
         return nil
     }
 
@@ -421,13 +244,6 @@ public struct MemoryIntegrityReading: Codable, Sendable, Equatable {
     public let category: MemoryIntegrityCategory
     public let metrics: BodyBeliefMetrics
 
-    public var estimate: Double { metrics.estimate }
-    public var uncertainty: Double { metrics.uncertainty }
-    public var freshness: Double { metrics.freshness }
-    public var evidence: [BodyEvidenceReference] { metrics.evidence }
-    public var observedAt: Date? { metrics.observedAt }
-    public var receivedAt: Date? { metrics.receivedAt }
-    public var nextMeaningfulExpiry: Date? { metrics.nextMeaningfulExpiry }
     public var compatibilityHealthy: Bool? {
         switch category {
         case .healthy: true
@@ -443,7 +259,9 @@ public struct MemoryIntegrityReading: Codable, Sendable, Equatable {
         evidence: [BodyEvidenceReference]
     ) {
         let estimate = storeAvailable ? (maintenanceSucceeded == false ? 0.25 : 1) : 0
-        let uncertainty = storeAvailable && maintenanceSucceeded == nil ? 0.25 : 0
+        // A successful canonical read proves readability, not successful
+        // maintenance. Presence alone supplies neither proof.
+        let uncertainty = storeAvailable && maintenanceSucceeded == nil ? 1.0 : 0
         self.metrics = BodyBeliefMetrics(
             generatedAt: generatedAt,
             estimate: estimate,
@@ -483,13 +301,6 @@ public struct DreamIntegrityReading: Codable, Sendable, Equatable {
     public let metrics: BodyBeliefMetrics
     public let storeAvailable: Bool
 
-    public var estimate: Double { metrics.estimate }
-    public var uncertainty: Double { metrics.uncertainty }
-    public var freshness: Double { metrics.freshness }
-    public var evidence: [BodyEvidenceReference] { metrics.evidence }
-    public var observedAt: Date? { metrics.observedAt }
-    public var receivedAt: Date? { metrics.receivedAt }
-    public var nextMeaningfulExpiry: Date? { metrics.nextMeaningfulExpiry }
     public var compatibilityHealthy: Bool? {
         switch category {
         case .healthy, .idle: true
@@ -559,13 +370,6 @@ public struct ToolCapabilityReading: Codable, Sendable, Equatable {
     public let configured: Bool
     public let liveCapabilityObserved: Bool
 
-    public var estimate: Double { metrics.estimate }
-    public var uncertainty: Double { metrics.uncertainty }
-    public var freshness: Double { metrics.freshness }
-    public var evidence: [BodyEvidenceReference] { metrics.evidence }
-    public var observedAt: Date? { metrics.observedAt }
-    public var receivedAt: Date? { metrics.receivedAt }
-    public var nextMeaningfulExpiry: Date? { metrics.nextMeaningfulExpiry }
     public var compatibilityAvailable: Bool? {
         category == .unknown ? nil : category != .unavailable
     }
@@ -644,27 +448,20 @@ public struct ApprovalPathReading: Codable, Sendable, Equatable {
     public let metrics: BodyBeliefMetrics
     public let writable: Bool
 
-    public var estimate: Double { metrics.estimate }
-    public var uncertainty: Double { metrics.uncertainty }
-    public var freshness: Double { metrics.freshness }
-    public var evidence: [BodyEvidenceReference] { metrics.evidence }
-    public var observedAt: Date? { metrics.observedAt }
-    public var receivedAt: Date? { metrics.receivedAt }
-    public var nextMeaningfulExpiry: Date? { metrics.nextMeaningfulExpiry }
     public var compatibilityOpen: Bool? { category == .unknown ? nil : category == .open }
 
-    public init(generatedAt: Date, writable: Bool, evidence: [BodyEvidenceReference]) {
-        self.writable = writable
+    public init(generatedAt: Date, writable: Bool?, evidence: [BodyEvidenceReference]) {
+        self.writable = writable == true
         self.metrics = BodyBeliefMetrics(
             generatedAt: generatedAt,
-            estimate: writable ? 1 : 0,
-            uncertainty: 0,
-            freshness: 1,
+            estimate: writable == true ? 1 : 0,
+            uncertainty: writable == nil ? 1 : 0,
+            freshness: writable == nil ? 0 : 1,
             evidence: evidence,
             observedAt: generatedAt,
             receivedAt: generatedAt
         )
-        self.category = writable ? .open : .closed
+        self.category = writable.map { $0 ? .open : .closed } ?? .unknown
     }
 
     private enum CodingKeys: String, CodingKey { case category, metrics, writable }
@@ -679,179 +476,17 @@ public struct ApprovalPathReading: Codable, Sendable, Equatable {
     }
 }
 
-// MARK: - Lossless posture decisions
-
-/// Item 47 (2026-09-01) — the rule that used to live only on the provider path,
-/// made general.
-///
-/// `ProviderPathBeliefProjector` has always refused to hand an optimistic
-/// compatibility Boolean to an `.uncertain` or `.stale` projection: unknown is
-/// not good news, and a reading of the past is not a reading of now. Every OTHER
-/// typed body read collapsed to its CATEGORY before posture saw it, and the
-/// category is a label over the numerics rather than the numerics themselves. So
-/// ~31 KB of estimate/uncertainty/freshness/evidence reduced to a Boolean that
-/// said "fine" for a tool path that was merely CONFIGURED and never exercised,
-/// and for a phone delivery receipt that arrived two days ago.
-///
-/// This is that same refusal, lifted out of the provider path and applied to
-/// every read: a typed belief may license an optimistic posture only when it is
-/// BOTH confident and current. It can only ever move posture toward caution, so
-/// no read that was cautious becomes optimistic here.
-public enum BodyBeliefOptimism {
-    /// The three thresholds are DELIBERATELY the provider projector's own
-    /// (`ProviderPathBeliefProjector.project` / `categorize`), not new numbers.
-    /// That is what makes this the general case of an existing rule rather than
-    /// a second, differently-tuned rule beside it: a `ProviderPathBeliefProjection`
-    /// in state `.healthy` satisfies all three by construction, so the provider
-    /// path's behaviour is unchanged to the bit.
-
-    /// Past this the read disagrees with itself or rests on too little support.
-    public static let maximumOptimisticUncertainty = 0.55
-    /// Below this the newest evidence has decayed past meaning — the projector's
-    /// `.stale` cutoff.
-    public static let minimumOptimisticFreshness = 0.05
-    /// Below this the read is not actually saying the good thing. It is the bar
-    /// that separates `.healthy` from `.uncertain` upstream, and here it is what
-    /// stops a tool path that is merely CONFIGURED (estimate 0.6 — real evidence
-    /// that a config file exists, no evidence that a tool ever ran) from reading
-    /// as capability. Same refusal `providersAvailable` already meets: mere
-    /// configuration never becomes health.
-    public static let minimumOptimisticEstimate = 0.65
-
-    public static func licenses(
-        estimate: Double,
-        uncertainty: Double,
-        freshness: Double
-    ) -> Bool {
-        guard estimate.isFinite, uncertainty.isFinite, freshness.isFinite else { return false }
-        return estimate > minimumOptimisticEstimate
-            && uncertainty <= maximumOptimisticUncertainty
-            && freshness >= minimumOptimisticFreshness
-    }
-
-    public static func licenses(_ metrics: BodyBeliefMetrics) -> Bool {
-        licenses(
-            estimate: metrics.estimate,
-            uncertainty: metrics.uncertainty,
-            freshness: metrics.freshness
-        )
-    }
-
-    public static func licenses(_ projection: ProviderPathBeliefProjection) -> Bool {
-        licenses(
-            estimate: projection.estimate,
-            uncertainty: projection.uncertainty,
-            freshness: projection.freshness
-        )
-    }
-}
-
-public extension BodySchema {
-    /// Decision helpers consume typed evidence when it exists. Compatibility
-    /// booleans remain available for old readers and persistence, but an
-    /// uncertainty-bearing read must not silently inherit an optimistic bit
-    /// from an earlier sample.
-    var providerPathRequiresCaution: Bool {
-        guard providersAvailable else { return true }
-        guard let belief = providerPathBelief else { return !providersHealthy }
-        guard belief.state == .healthy else { return true }
-        return !BodyBeliefOptimism.licenses(belief)
-    }
-
-    /// Caution is reserved for evidence that something is WRONG — unavailable
-    /// hands, or a read that cannot say. Deliberately NOT widened to unproven or
-    /// stale reads (review fix 4): a merely configured tool path, or a live
-    /// receipt that aged out over a quiet weekend, is UNKNOWN, and turning every
-    /// quiet Monday and every fresh install into a global `careful` posture
-    /// would be the body crying wolf. Unknown withholds confidence; it does not
-    /// manufacture alarm. See `toolPathIsUnprovenOrStale` for where it lands.
-    var toolPathRequiresCaution: Bool {
-        guard let reading = toolCapabilityReading else { return !toolHandsAvailable }
-        switch reading.category {
-        case .available, .configured:
-            return false
-        case .unavailable, .unknown:
-            return true
-        }
-    }
-
-    /// TRUE when the tool read says the optimistic thing by category but cannot
-    /// back it with confident, current evidence — configured but never
-    /// exercised (estimate 0.6, uncertainty 0.5), or a live capability receipt
-    /// decayed past its stale horizon.
-    ///
-    /// This is the honest middle the collapsed Bool had no room for. It does not
-    /// raise caution; it withholds the OPTIMISTIC move — `preferKnownPath`, the
-    /// strategy that says "lean on the path you know works" — because she does
-    /// not currently know that it works.
-    var toolPathIsUnprovenOrStale: Bool {
-        guard let reading = toolCapabilityReading else { return false }
-        switch reading.category {
-        case .available, .configured:
-            return !BodyBeliefOptimism.licenses(reading.metrics)
-        case .unavailable, .unknown:
-            return true
-        }
-    }
-
-    var memoryRequiresCurrentContext: Bool {
-        guard let reading = memoryIntegrityReading else { return !memoryHealthy }
-        switch reading.category {
-        case .healthy:
-            return !BodyBeliefOptimism.licenses(reading.metrics)
-        case .degraded, .unavailable, .unknown:
-            return true
-        }
-    }
-
-    var approvalRequiresPause: Bool {
-        guard let reading = approvalPathReading else { return !approvalChannelsOpen }
-        guard reading.category == .open else { return true }
-        return !BodyBeliefOptimism.licenses(reading.metrics)
-    }
-
-    var notificationRequiresReceipt: Bool {
-        guard let belief = notificationDeliveryBelief else { return !notificationPathHealthy }
-        switch belief.category {
-        case .unconfigured:
-            // Exact configuration truth, not a belief: with no transport there
-            // is no delivery whose receipt could be missing. Deliberately NOT
-            // subject to the freshness floor — an absent transport does not go
-            // stale, and inventing a receipt requirement for a phone she cannot
-            // reach would be posture theater.
-            return false
-        case .deviceReceived, .displayed, .userSeen:
-            // A receipt is evidence about the notification it acknowledged, and
-            // it ages. Past the 36h stale horizon this read describes a
-            // delivery that already happened, not the next one.
-            return !BodyBeliefOptimism.licenses(belief.metrics)
-        case .configured, .transportAccepted, .failed, .unknown:
-            return true
-        }
-    }
-
-}
-
 public struct ResourcePressureReading: Codable, Sendable, Equatable {
     public let category: OrganismResourcePressure
     public let metrics: BodyBeliefMetrics
     public let thermalPressure: OrganismResourcePressure
-
-    public var estimate: Double { metrics.estimate }
-    public var uncertainty: Double { metrics.uncertainty }
-    public var freshness: Double { metrics.freshness }
-    public var evidence: [BodyEvidenceReference] { metrics.evidence }
-    public var observedAt: Date? { metrics.observedAt }
-    public var receivedAt: Date? { metrics.receivedAt }
-    public var nextMeaningfulExpiry: Date? { metrics.nextMeaningfulExpiry }
 
     public init(
         generatedAt: Date,
         thermalPressure: OrganismResourcePressure,
         evidence: [BodyEvidenceReference]
     ) {
-        // Heat is her body's only resource pressure: Low Power Mode never
-        // changes what she does (User 10-24).
+        // Heat alone sets resource pressure; Low Power Mode never changes her work.
         self.thermalPressure = thermalPressure
         self.category = thermalPressure
         self.metrics = BodyBeliefMetrics(
@@ -895,12 +530,4 @@ public struct ResourcePressureReading: Codable, Sendable, Equatable {
         }
     }
 
-    private static func severity(_ pressure: OrganismResourcePressure) -> Int {
-        switch pressure {
-        case .nominal: 0
-        case .elevated: 1
-        case .high: 2
-        case .critical: 3
-        }
-    }
 }

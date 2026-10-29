@@ -43,70 +43,6 @@ struct SlackPreparedReply: Codable, Equatable, Sendable {
     }
 }
 
-struct SlackDurableInboundPayload: Codable, Equatable, Sendable {
-    struct File: Codable, Equatable, Sendable {
-        let downloadURL: String
-        let mimeType: String
-        let name: String?
-        let byteSize: Int?
-    }
-
-    let eventId: String
-    let teamId: String
-    let channelId: String
-    let userId: String
-    let eventType: String
-    let text: String
-    let ts: String
-    let threadTs: String?
-    let channelType: String?
-    let isDirectMessage: Bool
-    let files: [File]
-    // Missing on older receipts: keep their original top-level reply route.
-    let opensReplyThread: Bool?
-
-    init(_ inbound: SlackInboundMessage) {
-        eventId = inbound.eventId
-        teamId = inbound.teamId
-        channelId = inbound.channelId
-        userId = inbound.userId
-        eventType = inbound.eventType
-        text = inbound.text
-        ts = inbound.ts
-        threadTs = inbound.threadTs
-        channelType = inbound.channelType
-        isDirectMessage = inbound.isDirectMessage
-        opensReplyThread = inbound.opensReplyThread
-        files = inbound.files.map {
-            File(downloadURL: $0.downloadURL, mimeType: $0.mimeType, name: $0.name, byteSize: $0.byteSize)
-        }
-    }
-
-    var inbound: SlackInboundMessage {
-        SlackInboundMessage(
-            eventId: eventId,
-            teamId: teamId,
-            channelId: channelId,
-            userId: userId,
-            eventType: eventType,
-            text: text,
-            ts: ts,
-            threadTs: threadTs,
-            channelType: channelType,
-            isDirectMessage: isDirectMessage,
-            files: files.map {
-                SlackInboundFile(
-                    downloadURL: $0.downloadURL,
-                    mimeType: $0.mimeType,
-                    name: $0.name,
-                    byteSize: $0.byteSize
-                )
-            },
-            opensReplyThread: opensReplyThread ?? false
-        )
-    }
-}
-
 struct SlackInboundDeliveryRecord: Codable, Equatable, Sendable {
     var lifeID: String? = nil
     struct Rejection: Codable, Equatable, Sendable {
@@ -115,7 +51,7 @@ struct SlackInboundDeliveryRecord: Codable, Equatable, Sendable {
         let at: Date
     }
 
-    let inbound: SlackDurableInboundPayload
+    let inbound: SlackInboundMessage
     var phase: SlackInboundDeliveryPhase
     var prepared: SlackPreparedReply?
     var dispatchStartedAt: Date?
@@ -129,6 +65,10 @@ struct SlackInboundDeliveryRecord: Codable, Equatable, Sendable {
     var lastRejection: Rejection? = nil
     var confirmedText: Bool? = nil
     var confirmedUploadCount: Int? = nil
+
+    var hasValidUploadProgress: Bool {
+        (0...(prepared?.uploads.count ?? 0)).contains(confirmedUploadCount ?? 0)
+    }
 }
 
 enum SlackInboundClaimOutcome: Sendable, Equatable {
@@ -265,7 +205,7 @@ public actor SlackInboundDeliveryJournal {
             guard pending < pendingCap else { throw SlackInboundJournalError.saturated(pendingCap) }
             let record = SlackInboundDeliveryRecord(
                 lifeID: try DataRootLife.current(in: dataRoot),
-                inbound: SlackDurableInboundPayload(inbound),
+                inbound: inbound,
                 phase: .claimed,
                 prepared: nil,
                 dispatchStartedAt: nil,
@@ -284,24 +224,15 @@ public actor SlackInboundDeliveryJournal {
 
     /// Accepted human work belongs to the journal, not a socket session. Claim
     /// before launching, retain through settlement, and retire at actual exit.
-    /// The stream lets a history reader stop waiting without cancelling a turn.
-    func startHandler(eventId: String, operation: @escaping @Sendable () async -> Bool) -> AsyncStream<Bool> {
-        let (results, completion) = AsyncStream<Bool>.makeStream()
+    func startHandler(eventId: String, operation: @escaping @Sendable () async -> Void) {
         let key = path.path + "\u{0}" + eventId
         Self.handlerLock.withLock {
-            guard Self.activeHandlers.insert(key).inserted else {
-                completion.yield(false)
-                completion.finish()
-                return
-            }
+            guard Self.activeHandlers.insert(key).inserted else { return }
             Self.handlerTasks[key] = Task(priority: .userInitiated) {
-                let delivered = await operation()
+                await operation()
                 self.releaseHandler(eventId: eventId)
-                completion.yield(delivered)
-                completion.finish()
             }
         }
-        return results
     }
 
     func reserveReply(_ inbound: SlackInboundMessage, reply: SlackPreparedReply, runId: String,
@@ -315,7 +246,7 @@ public actor SlackInboundDeliveryJournal {
                 return record
             }
             guard file.records.filter({ !$0.phase.isTerminal }).count < pendingCap else { throw SlackInboundJournalError.saturated(pendingCap) }
-            let record = SlackInboundDeliveryRecord(lifeID: try DataRootLife.current(in: dataRoot), inbound: SlackDurableInboundPayload(inbound),
+            let record = SlackInboundDeliveryRecord(lifeID: try DataRootLife.current(in: dataRoot), inbound: inbound,
                 phase: priorVerdict == "completed" ? .delivered : priorVerdict == nil ? .prepared : .sentUnconfirmed,
                 prepared: reply, dispatchStartedAt: nil, updatedAt: Date(),
                 outcomeDetail: priorVerdict == "sent_unconfirmed" ? "legacy_completion_dispatch_unconfirmed" : nil,
@@ -419,7 +350,11 @@ public actor SlackInboundDeliveryJournal {
     func confirmReplyPart(eventId: String, isText: Bool) throws -> SlackInboundDeliveryRecord {
         try mutate(eventId: eventId) {
             if isText { $0.confirmedText = true }
-            else { $0.confirmedUploadCount = ($0.confirmedUploadCount ?? 0) + 1 }
+            else {
+                let count = $0.confirmedUploadCount ?? 0
+                guard count < ($0.prepared?.uploads.count ?? 0) else { throw SlackInboundJournalError.malformed }
+                $0.confirmedUploadCount = count + 1
+            }
             $0.phase = .prepared
             $0.dispatchStartedAt = nil
             $0.updatedAt = Date()
@@ -460,7 +395,7 @@ public actor SlackInboundDeliveryJournal {
             $0.phase == .sentUnconfirmed && $0.inbound.teamId == inbound.teamId
                 && $0.inbound.channelId == inbound.channelId && $0.inbound.userId == inbound.userId
                 && ($0.inbound.threadTs == inbound.threadTs
-                    || inbound.threadTs != nil && $0.inbound.inbound.replyThreadTs == inbound.threadTs)
+                    || inbound.threadTs != nil && $0.inbound.replyThreadTs == inbound.threadTs)
         }.max { $0.updatedAt < $1.updatedAt }
     }
 
@@ -475,7 +410,7 @@ public actor SlackInboundDeliveryJournal {
                           && record.inbound.teamId == inbound.teamId && record.inbound.channelId == inbound.channelId
                           && record.inbound.userId == inbound.userId
                           && (record.inbound.threadTs == inbound.threadTs
-                              || inbound.threadTs != nil && record.inbound.inbound.replyThreadTs == inbound.threadTs)
+                              || inbound.threadTs != nil && record.inbound.replyThreadTs == inbound.threadTs)
                   }).max(by: { file.records[$0].updatedAt < file.records[$1].updatedAt }) else { return nil }
             file.records[rejected].lastRejection = nil
             file.records[rejected].outcomeDetail = nil
@@ -502,7 +437,7 @@ public actor SlackInboundDeliveryJournal {
 
     private func mutate(
         eventId: String,
-        update: (inout SlackInboundDeliveryRecord) -> Void
+        update: (inout SlackInboundDeliveryRecord) throws -> Void
     ) throws -> SlackInboundDeliveryRecord {
         try CredentialFileLock.withLock(path) {
             var file = try load()
@@ -510,7 +445,7 @@ public actor SlackInboundDeliveryJournal {
                 throw SlackInboundJournalError.missingClaim(eventId)
             }
             let previous = file.records[index]
-            update(&file.records[index])
+            try update(&file.records[index])
             let result = file.records[index]
             if result != previous { try save(file) }
             return result
@@ -531,12 +466,12 @@ public actor SlackInboundDeliveryJournal {
             guard file.version == 1,
                   Set(file.records.map { $0.inbound.eventId }).count == file.records.count,
                   file.records.allSatisfy({
-                      !$0.inbound.eventId.isEmpty
+                      !$0.inbound.eventId.isEmpty && $0.hasValidUploadProgress
                         && ($0.phase == .claimed || $0.phase == .generating || $0.phase == .interrupted
                             || $0.phase == .outcomeUnknown || $0.phase == .failedBeforeAnswer || $0.phase == .stopped || $0.prepared != nil)
                   }) else { throw SlackInboundJournalError.malformed }
-            for i in file.records.indices where try !DataRootLife.isCurrent(file.records[i].lifeID, in: path.deletingLastPathComponent().deletingLastPathComponent())
-                && file.records[i].phase != .delivered {
+            let life = try DataRootLife.current(in: path.deletingLastPathComponent().deletingLastPathComponent())
+            for i in file.records.indices where file.records[i].phase != .delivered && DataRootLife.life(of: file.records[i].lifeID) != life {
                 file.records[i].phase = .stopped
                 file.records[i].outcomeDetail = DataRootLife.stoppedReason
             }
@@ -548,12 +483,13 @@ public actor SlackInboundDeliveryJournal {
     }
 
     private func save(_ source: File) throws {
+        guard source.records.allSatisfy(\.hasValidUploadProgress) else { throw SlackInboundJournalError.malformed }
         var file = source
         let terminal = file.records
             .filter { $0.phase.isTerminal }
             .sorted { $0.updatedAt > $1.updatedAt }
         let unresolved = file.records.filter { !$0.phase.isTerminal }
-        let referenced = try? CodexCompletionLifecycleProjection.unsettledAnswerRuns(
+        let referenced = try? CodexCompletionReadout.unsettledAnswerRuns(
             configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot), dataRoot: dataRoot)
         let protected = terminal.filter { record in
             guard let referenced else { return true }

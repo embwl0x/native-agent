@@ -29,7 +29,7 @@ package enum AgentACPApproval {
     package static func request(_ request: JSONValue, peer: AgentPeerContact,
                         context: Context = .current,
                         dataRoot: URL,
-                        inbox: any ApprovalInboxProtocol) async throws -> Bool {
+                        inbox: SwiftNativeApprovalInbox) async throws -> Bool {
         try Task.checkCancellation()
         if PeerTrust.ownerTrusts("peer:" + peer.id, dataRoot: dataRoot) { return true }
         // Only a redacted, bounded preview leaves this live request. The raw
@@ -50,7 +50,7 @@ package enum AgentACPApproval {
     }
 
     package static func connect(_ proposal: AgentHostConnection.Proposal, appName: String,
-                        inbox: any ApprovalInboxProtocol) async throws -> Bool {
+                        inbox: SwiftNativeApprovalInbox) async throws -> Bool {
         try await resolve(.object([
             "title": .string("Connect \(proposal.row.displayName)?"),
             "action": .string("agent.acp.connect"), "risk": .string("confirm"),
@@ -64,7 +64,7 @@ package enum AgentACPApproval {
         ]), inbox: inbox)
     }
 
-    private static func resolve(_ content: JSONValue, inbox: any ApprovalInboxProtocol) async throws -> Bool {
+    private static func resolve(_ content: JSONValue, inbox: SwiftNativeApprovalInbox) async throws -> Bool {
         try Task.checkCancellation()
         let events = await ApprovalLifecycleBus.shared.events()
         let record = try await inbox.create(content)

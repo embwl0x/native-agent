@@ -1,6 +1,6 @@
 # Siri and Mac notification actions
 
-## Siri
+## Siri on Mac
 
 **Ask Your Agent** offers these phrases, with the configured persona name:
 
@@ -8,9 +8,10 @@
 - “Tell NativeAgent's [name]”
 - “Ask my agent in NativeAgent”
 
-Siri asks for the Message separately. `ResidentAgentEntity` reads its name
-from `PersonaCompiler.agentDisplayName()`; launch and profile-name changes
-refresh shortcut parameters.
+Siri asks for the Message separately. `ResidentAgentEntity` loads the canonical
+persona profile through `NativeAgentEngine.live.persona.loadProfile()` and
+projects its name with `NativeAgentIdentity.displayName(profile.name)`; launch
+and profile-name changes refresh shortcut parameters.
 
 `AskResidentAgentIntent` delegates to `NativeAgentChatIntent.reply(to:)`.
 It continues `ConversationAnchor.currentSessionId()` or creates a conversation
@@ -22,6 +23,27 @@ directly.
 The source also defines Status, Doctor, Approvals, Desk Task, Query Memory,
 Remember and Pending Memory Proposals intents. The App Shortcuts list includes
 the two Ask actions and these actions except Desk Task.
+
+## iPhone and iPad
+
+Native App Shortcuts expose five actions:
+
+| Action | Result |
+|---|---|
+| Ask Your Agent | Sends a message in the current conversation and waits for the Mac's reply. |
+| Remember | Sends “Please remember this: …” through the same chat path. |
+| Approve | Rereads a remotely decidable pending request, asks for confirmation and sends the decision. |
+| Status | Reads the last synced live status with its timestamp. |
+| Quick Ask | Opens Chat and focuses the composer; also available as a Control. |
+
+Ask, Remember, Approve and Status require authentication and the current paired
+agent over CloudKit. New work needs the Mac awake with NativeAgent open.
+Ask/Remember wait up to 300 seconds on iOS 27, 25 on iOS 26, after sending.
+A timeout does not cancel the sent message: open the app for its reply;
+invoking the shortcut again sends a new message.
+
+Notification Reply retains the text in its conversation's durable chat queue
+before delivery. A failed send stays queued for recovery in Chat.
 
 ## Mac notification actions
 
@@ -57,3 +79,5 @@ source declarations alone do not establish either.
 Source: `Sources/NativeAgentApp/NativeAgentIntents.swift`, `MemoryAppIntents.swift`,
 `NativeAgentNotificationActions.swift`, `AppDelegate+Launch.swift`, and
 `AppModel.swift`.
+Mobile source under `iOS/NativeAgentMobile/`: `Sources/MobileAppIntents.swift`,
+`Sources/MobileIntentRuntime.swift` and `ControlSupport/MobileQuickAskIntent.swift`.

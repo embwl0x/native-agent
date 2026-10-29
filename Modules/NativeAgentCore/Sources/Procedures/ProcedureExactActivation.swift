@@ -1,5 +1,6 @@
 import NativeAgentCore
 import Foundation
+import NativeAgentShared
 import PersistenceCore
 // Blueprint: | `ProcedureExactActivation.swift` | Exact activation manifests and active pointers; artifact revalidation and pointer publication share retention's invocation-ledger lock, acquired before the pointer lock |
 
@@ -118,17 +119,17 @@ public struct ProcedureExactActivationProposal: Codable, Sendable, Equatable {
 
     public var validates: Bool {
         schema == Self.schema
-            && procedureExactDigest(artifactID)
-            && procedureExactDigest(procedureShapeIdentity)
-            && procedureExactToken(procedureID, maximum: 80)
-            && procedureExactDigest(implementationIdentity)
+            && ProcedureTrajectoryExtractor.isOpaqueIdentity(artifactID)
+            && ProcedureTrajectoryExtractor.isOpaqueIdentity(procedureShapeIdentity)
+            && ProcedureArtifactStore.token(procedureID, maximum: 80)
+            && ProcedureTrajectoryExtractor.isOpaqueIdentity(implementationIdentity)
             && qualifyingInvocationIDs.count >= Self.minimumVerifiedExecutions
             && qualifyingInvocationIDs.count <= 64
-            && qualifyingInvocationIDs.allSatisfy(procedureExactDigest)
+            && qualifyingInvocationIDs.allSatisfy(ProcedureTrajectoryExtractor.isOpaqueIdentity)
             && Set(qualifyingInvocationIDs).count == qualifyingInvocationIDs.count
             && qualifyingInvocationIDs == qualifyingInvocationIDs.sorted()
             && qualifyingTrajectoryIDs.count == qualifyingInvocationIDs.count
-            && qualifyingTrajectoryIDs.allSatisfy(procedureExactDigest)
+            && qualifyingTrajectoryIDs.allSatisfy(ProcedureTrajectoryExtractor.isOpaqueIdentity)
             && Set(qualifyingTrajectoryIDs).count == qualifyingTrajectoryIDs.count
             && qualifyingTrajectoryIDs == qualifyingTrajectoryIDs.sorted()
             && verifiedExecutionCount == qualifyingInvocationIDs.count
@@ -146,9 +147,7 @@ public struct ProcedureExactActivationProposal: Codable, Sendable, Equatable {
     }
 
     public func toJSON() -> JSONValue {
-        guard let data = try? JSONEncoder().encode(self),
-              let value = try? JSONValue.parse(data) else { return .null }
-        return value
+        (try? JSONValue.fromEncodable(self)) ?? .null
     }
 
     public init?(json: JSONValue) {
@@ -186,10 +185,10 @@ public struct ProcedureExactActivationReviewerDecision: Codable, Sendable, Equat
 
     public var validates: Bool {
         schema == Self.schema
-            && procedureExactDigest(proposalDigest)
+            && ProcedureTrajectoryExtractor.isOpaqueIdentity(proposalDigest)
             && verdict == .approve
-            && procedureExactDigest(reviewerIdentity)
-            && procedureExactDigest(approvalReceiptIdentity)
+            && ProcedureTrajectoryExtractor.isOpaqueIdentity(reviewerIdentity)
+            && ProcedureTrajectoryExtractor.isOpaqueIdentity(approvalReceiptIdentity)
             && procedureExactTimestamp(decidedAt)
     }
 }
@@ -229,7 +228,7 @@ public struct ProcedureExactActivationManifest: Codable, Sendable, Equatable, Id
 
     public var validates: Bool {
         schema == Self.schema
-            && procedureExactDigest(id)
+            && ProcedureTrajectoryExtractor.isOpaqueIdentity(id)
             && proposal.validates
             && reviewerDecision.validates
             && reviewerDecision.proposalDigest == proposal.bindingDigest
@@ -274,22 +273,12 @@ package struct ProcedureExactActivationPointer: Codable, Sendable, Equatable {
 
     var validates: Bool {
         schema == Self.schema
-            && procedureExactDigest(activationID)
-            && procedureExactDigest(artifactID)
-            && procedureExactToken(procedureID, maximum: 80)
-            && procedureExactDigest(implementationIdentity)
-            && procedureExactDigest(proposalDigest)
+            && ProcedureTrajectoryExtractor.isOpaqueIdentity(activationID)
+            && ProcedureTrajectoryExtractor.isOpaqueIdentity(artifactID)
+            && ProcedureArtifactStore.token(procedureID, maximum: 80)
+            && ProcedureTrajectoryExtractor.isOpaqueIdentity(implementationIdentity)
+            && ProcedureTrajectoryExtractor.isOpaqueIdentity(proposalDigest)
     }
-}
-
-package func procedureExactDigest(_ raw: String) -> Bool {
-    raw.count == 64 && raw.allSatisfy { $0.isHexDigit && !$0.isUppercase }
-}
-
-package func procedureExactToken(_ raw: String, maximum: Int) -> Bool {
-    guard !raw.isEmpty, raw.count <= maximum else { return false }
-    let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._:"))
-    return raw.unicodeScalars.allSatisfy(allowed.contains)
 }
 
 package func procedureExactTimestamp(_ raw: String) -> Bool {
@@ -336,38 +325,32 @@ extension ProcedureArtifactStore {
         guard candidate.validates else { throw ProcedureExactActivationError.invalidDecision }
         let manifestPath = exactActivationManifestPath(candidate.id)
         let candidateValue = try JSONValue.parse(JSONEncoder().encode(candidate))
-        let manifest: ProcedureExactActivationManifest = try await persistence.withFileLock(
+        let manifest: ProcedureExactActivationManifest = try await SwiftNativePersistenceCore.withFileLock(
             manifestPath
         ) {
             if FileManager.default.fileExists(atPath: manifestPath.path) {
-                guard let data = try? Data(contentsOf: manifestPath),
-                      data.count <= 2 * 1_024 * 1_024,
-                      let existing = try? JSONDecoder().decode(
-                        ProcedureExactActivationManifest.self,
-                        from: data
-                      ), existing.validates,
-                      existing.id == candidate.id,
+                guard let existing = try? Self.checkedActivationManifest(manifestPath),
                       existing.proposal == proposal,
                       existing.reviewerDecision == reviewerDecision else {
                     throw ProcedureExactActivationError.immutableConflict
                 }
                 return existing
             }
-            try await persistence.writeJSON(candidateValue, to: manifestPath)
+            try await SwiftNativePersistenceCore.writeJSON(candidateValue, to: manifestPath)
             return candidate
         }
 
         let pointer = ProcedureExactActivationPointer(manifest: manifest)
         let pointerPath = exactActivationPointerPath(proposal.procedureID)
         let invocationPath = root.appendingPathComponent("invocations.jsonl")
-        try await persistence.withFileLock(invocationPath) {
+        try await SwiftNativePersistenceCore.withFileLock(invocationPath) {
             // The earlier load may predate a retention pass. Revalidate while
             // excluding deletion, then publish before releasing that exclusion.
             guard try await loadForInvocation(proposal.artifactID) == artifact else {
                 throw ProcedureExactActivationError.artifactMismatch
             }
-            try await persistence.withFileLock(pointerPath) {
-                try await persistence.writeJSON(
+            try await SwiftNativePersistenceCore.withFileLock(pointerPath) {
+                try await SwiftNativePersistenceCore.writeJSON(
                     try JSONValue.parse(JSONEncoder().encode(pointer)),
                     to: pointerPath
                 )
@@ -384,38 +367,24 @@ extension ProcedureArtifactStore {
         procedureID: String,
         implementationIdentity: String
     ) async throws -> ProcedureExactActiveResolution {
-        guard procedureExactToken(procedureID, maximum: 80),
-              procedureExactDigest(implementationIdentity) else {
+        guard Self.token(procedureID, maximum: 80),
+              ProcedureTrajectoryExtractor.isOpaqueIdentity(implementationIdentity) else {
             throw ProcedureExactActivationError.activationNotFound
         }
-        let pointerPath = exactActivationPointerPath(procedureID)
-        guard let pointerData = Self.checkedRegularFile(pointerPath, maximumBytes: 64 * 1_024),
-              let pointer = try? JSONDecoder().decode(
-                ProcedureExactActivationPointer.self,
-                from: pointerData
-              ), pointer.validates else {
-            if FileManager.default.fileExists(atPath: pointerPath.path) {
-                throw ProcedureExactActivationError.activationCorrupt
-            }
-            throw ProcedureExactActivationError.activationNotFound
-        }
+        let pointer = try Self.checkedActivationPointer(exactActivationPointerPath(procedureID))
         guard pointer.procedureID == procedureID,
               pointer.implementationIdentity == implementationIdentity else {
             throw ProcedureExactActivationError.activationBindingMismatch
         }
+        return try await loadActiveExactProcedure(pointer)
+    }
+
+    private func loadActiveExactProcedure(
+        _ pointer: ProcedureExactActivationPointer
+    ) async throws -> ProcedureExactActiveResolution {
         let manifestPath = exactActivationManifestPath(pointer.activationID)
-        guard let manifestData = Self.checkedRegularFile(
-            manifestPath,
-            maximumBytes: 2 * 1_024 * 1_024
-        ),
-              let manifest = try? JSONDecoder().decode(
-                ProcedureExactActivationManifest.self,
-                from: manifestData
-              ), manifest.validates else {
-            throw ProcedureExactActivationError.activationCorrupt
-        }
-        guard manifest.id == pointer.activationID,
-              manifest.proposal.artifactID == pointer.artifactID,
+        let manifest = try Self.checkedActivationManifest(manifestPath)
+        guard manifest.proposal.artifactID == pointer.artifactID,
               manifest.proposal.procedureID == pointer.procedureID,
               manifest.proposal.implementationIdentity == pointer.implementationIdentity,
               manifest.proposal.bindingDigest == pointer.proposalDigest else {
@@ -438,12 +407,7 @@ extension ProcedureArtifactStore {
         var validActivations = 0
         var corruptActivations = 0
         for url in activationURLs {
-            guard let data = Self.checkedRegularFile(url, maximumBytes: 2 * 1_024 * 1_024),
-                  let manifest = try? JSONDecoder().decode(
-                    ProcedureExactActivationManifest.self,
-                    from: data
-                  ), manifest.validates,
-                  url.deletingPathExtension().lastPathComponent == manifest.id else {
+            guard (try? Self.checkedActivationManifest(url)) != nil else {
                 corruptActivations += 1
                 continue
             }
@@ -455,20 +419,13 @@ extension ProcedureArtifactStore {
         ).prefix(128)
         var active = 0
         for url in activeURLs {
-            guard let data = Self.checkedRegularFile(url, maximumBytes: 64 * 1_024),
-                  let pointer = try? JSONDecoder().decode(
-                    ProcedureExactActivationPointer.self,
-                    from: data
-                  ), pointer.validates,
+            guard let pointer = try? Self.checkedActivationPointer(url),
                   url.deletingPathExtension().lastPathComponent == pointer.procedureID else {
                 unreadable.append("active/\(url.lastPathComponent): unreadable or invalid pointer")
                 continue
             }
             do {
-                _ = try await loadActiveExactProcedure(
-                    procedureID: pointer.procedureID,
-                    implementationIdentity: pointer.implementationIdentity
-                )
+                _ = try await loadActiveExactProcedure(pointer)
                 active += 1
             } catch {
                 unreadable.append("active/\(url.lastPathComponent): \(error)")
@@ -485,6 +442,31 @@ extension ProcedureArtifactStore {
     private func exactActivationManifestPath(_ id: String) -> URL {
         root.appendingPathComponent("activations", isDirectory: true)
             .appendingPathComponent("\(id).json")
+    }
+
+    nonisolated static func checkedActivationPointer(_ url: URL) throws -> ProcedureExactActivationPointer {
+        guard let data = checkedRegularFile(url, maximumBytes: 64 * 1_024),
+              let pointer = try? JSONDecoder().decode(ProcedureExactActivationPointer.self, from: data),
+              pointer.validates else {
+            throw FileManager.default.fileExists(atPath: url.path)
+                ? ProcedureExactActivationError.activationCorrupt
+                : ProcedureExactActivationError.activationNotFound
+        }
+        return pointer
+    }
+
+    private nonisolated static func checkedActivationManifest(
+        _ url: URL
+    ) throws -> ProcedureExactActivationManifest {
+        guard let data = checkedRegularFile(url, maximumBytes: 2 * 1_024 * 1_024),
+              let manifest = try? JSONDecoder().decode(ProcedureExactActivationManifest.self, from: data),
+              manifest.validates else {
+            throw ProcedureExactActivationError.activationCorrupt
+        }
+        guard manifest.id == url.deletingPathExtension().lastPathComponent else {
+            throw ProcedureExactActivationError.activationBindingMismatch
+        }
+        return manifest
     }
 
     package func exactActivationPointerPath(_ procedureID: String) -> URL {

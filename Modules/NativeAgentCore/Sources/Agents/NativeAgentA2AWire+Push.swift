@@ -1,7 +1,9 @@
 import Foundation
+import NativeAgentShared
 import Darwin
 import PersistenceCore
 import AgentConversations
+import MacControl
 
 // Blueprint: | `NativeAgentA2AWire+Push.swift` | `AgentContactCallback` and `AgentContactPushConfig`: durable callback obligations, Keychain destination references and bounded push delivery |
 
@@ -29,7 +31,7 @@ struct AgentContactPushConfig: Codable, Sendable {
     private enum CodingKeys: String, CodingKey { case id, taskId, url, token, authentication }
 
     static func parse(_ value: JSONValue, taskID: String) async throws -> Self {
-        guard let object = AgentContactPart.object(value) as? [String: Any],
+        guard let object = value.foundationObject as? [String: Any],
               let rawURL = object["url"] as? String, rawURL.utf8.count <= 4096,
               object["taskId"] == nil || object["taskId"] as? String == "" || object["taskId"] as? String == taskID else { throw invalid }
         let identifier: String
@@ -54,7 +56,7 @@ struct AgentContactPushConfig: Codable, Sendable {
         _ = try await destination(rawURL)
         return Self(id: identifier, taskId: taskID, url: rawURL, token: token, authentication: authentication)
     }
-    var value: JSONValue { get throws { try JSONDecoder().decode(JSONValue.self, from: JSONEncoder().encode(self)) } }
+    var value: JSONValue { get throws { try JSONValue.fromEncodable(self) } }
 
     private struct Secret: Codable { let url: String; let token: String?; let scheme: String?; let credentials: String? }
     var account: String { "a2a-push:" + taskId + ":" + id }
@@ -81,31 +83,15 @@ struct AgentContactPushConfig: Codable, Sendable {
     typealias Destination = (host: String, port: Int, address: String)
 
     static func destination(_ raw: String) async throws -> Destination {
-        try await withCheckedThrowingContinuation { continuation in
-            let resolution = Resolution(continuation)
-            // getaddrinfo itself cannot be canceled. Race its background result
-            // against a deadline without blocking the task actor or awaiting an
-            // uncooperative resolver in a structured task group.
-            DispatchQueue.global(qos: .utility).async {
-                resolution.finish(Result { try resolveDestination(raw) })
-            }
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3) {
-                resolution.finish(.failure(invalid))
-            }
+        let resolution = ContinuationOnce<Result<Destination, Error>>()
+        // getaddrinfo cannot be canceled or joined at the deadline.
+        DispatchQueue.global(qos: .utility).async {
+            resolution.resume(Result { try resolveDestination(raw) })
         }
-    }
-
-    private final class Resolution: @unchecked Sendable {
-        private let lock = NSLock()
-        private var continuation: CheckedContinuation<Destination, Error>?
-        init(_ continuation: CheckedContinuation<Destination, Error>) { self.continuation = continuation }
-        func finish(_ result: Result<Destination, Error>) {
-            lock.lock()
-            let pending = continuation
-            continuation = nil
-            lock.unlock()
-            pending?.resume(with: result)
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3) {
+            resolution.resume(.failure(invalid))
         }
+        return try await resolution.wait().get()
     }
 
     private static func resolveDestination(_ raw: String) throws -> Destination {
@@ -171,40 +157,30 @@ struct AgentContactPushConfig: Codable, Sendable {
             if attempt > 0 { try? await Task.sleep(for: .seconds(attempt == 1 ? 1 : 2)) }
             guard !Task.isCancelled else { return false }
             guard let target = try? await Self.destination(url), !Task.isCancelled else { return false }
-            let succeeded = await Task.detached(priority: .utility) { () -> Bool in
-                func quoted(_ value: String) -> String {
-                    "\"" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-                        .replacingOccurrences(of: "\n", with: "\\n").replacingOccurrences(of: "\r", with: "\\r").replacingOccurrences(of: "\t", with: "\\t") + "\""
-                }
-                let ip = target.address.contains(":") ? "[\(target.address)]" : target.address
-                var config = "url = \(quoted(url))\n"
-                // A literal IPv6 URL already fixes the network destination.
-                if !target.host.contains(":") {
-                    config += "resolve = \(quoted("\(target.host):\(target.port):\(ip)"))\n"
-                }
-                config += "header = \(quoted("Content-Type: application/a2a+json"))\n"
-                if let authentication {
-                    let header = authentication.scheme + (authentication.credentials.map { " " + $0 } ?? "")
-                    config += "header = \(quoted("Authorization: " + header))\n"
-                }
-                if let token { config += "header = \(quoted("X-A2A-Notification-Token: " + token))\n" }
-                config += "data-binary = \(quoted(String(decoding: payload, as: UTF8.self)))\n"
-                let process = Process(), input = Pipe(), output = Pipe()
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-                process.arguments = ["-q", "--globoff", "--config", "-", "--silent", "--noproxy", "*", "--proto", "=http,https", "--max-redirs", "0", "--connect-timeout", "3", "--max-time", "10", "--max-filesize", "1024", "--output", "/dev/null", "--write-out", "%{http_code}"]
-                process.environment = ["PATH": "/usr/bin:/bin"]
-                process.standardInput = input; process.standardOutput = output; process.standardError = FileHandle.nullDevice
-                do {
-                    try process.run()
-                    try input.fileHandleForWriting.write(contentsOf: Data(config.utf8))
-                    try input.fileHandleForWriting.close()
-                    process.waitUntilExit()
-                    let response = try output.fileHandleForReading.readToEnd() ?? Data()
-                    let status = Int(String(decoding: response, as: UTF8.self)) ?? 0
-                    return process.terminationStatus == 0 && (200..<300).contains(status)
-                } catch { if process.isRunning { process.terminate() }; return false }
-            }.value
-            if succeeded { return true }
+            func quoted(_ value: String) -> String {
+                "\"" + value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+                    .replacingOccurrences(of: "\n", with: "\\n").replacingOccurrences(of: "\r", with: "\\r").replacingOccurrences(of: "\t", with: "\\t") + "\""
+            }
+            let ip = target.address.contains(":") ? "[\(target.address)]" : target.address
+            var config = "url = \(quoted(url))\n"
+            // A literal IPv6 URL already fixes the network destination.
+            if !target.host.contains(":") {
+                config += "resolve = \(quoted("\(target.host):\(target.port):\(ip)"))\n"
+            }
+            config += "header = \(quoted("Content-Type: application/a2a+json"))\n"
+            if let authentication {
+                let header = authentication.scheme + (authentication.credentials.map { " " + $0 } ?? "")
+                config += "header = \(quoted("Authorization: " + header))\n"
+            }
+            if let token { config += "header = \(quoted("X-A2A-Notification-Token: " + token))\n" }
+            config += "data-binary = \(quoted(String(decoding: payload, as: UTF8.self)))\n"
+            do {
+                let result = try await ProcessExecution().run(executable: "/usr/bin/curl",
+                    arguments: ["-q", "--globoff", "--config", "-", "--silent", "--noproxy", "*", "--proto", "=http,https", "--max-redirs", "0", "--connect-timeout", "3", "--max-time", "10", "--max-filesize", "1024", "--output", "/dev/null", "--write-out", "%{http_code}"],
+                    currentDirectory: nil, environment: ["PATH": "/usr/bin:/bin"],
+                    standardInput: Data(config.utf8), timeoutSeconds: 12, outputByteLimit: 1024)
+                if result.exitCode == 0, (200..<300).contains(Int(result.stdout) ?? 0) { return true }
+            } catch { if Task.isCancelled { return false } }
         }
         return false
     }

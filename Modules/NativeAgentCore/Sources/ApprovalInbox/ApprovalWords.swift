@@ -2,10 +2,7 @@ import Foundation
 
 // Blueprint: | `ApprovalWords.swift` | `ApprovalWords.title`: shared plain-language approval names for Today and agent home |
 
-/// An approval's name in plain words, shared by the Today page and the
-/// agent's home (2026-09-23). A skill proposal's own title is a tool sequence
-/// ("Keep this as a skill: workspace → workspace"), which is not a name: say
-/// what would be kept and from how many runs.
+/// Names approvals plainly for Today and agent home, including skill routines and run counts.
 public enum ApprovalWords {
     public static func title(action: String, title: String, reason: String) -> String {
         guard action == "skill.proposal" else { return title }

@@ -1,67 +1,34 @@
-// CognitiveSubstrate+AttentionSignals.swift
-// Mind-into-circulation (2026-07-10, fence A). See docs/build_plans/mind-into-circulation.md
-//
-// A bounded, PURE read of what she is currently holding, shaped for Fluid
-// Context's dormant NeedSignal inputs. No mutation, no persistence, no LLM —
-// this is a projection of live state the turn engine folds into context
-// selection so her selection follows her mind, not just the message. When
-// there is genuinely nothing to add the result is `nil`, which the default
-// protocol path treats as inert (turn preparation stays byte-identical).
+// A bounded projection of resident attention for context selection.
+// Publication compiles accepted state; cancellation belongs to the turn read.
+// Empty attention contributes no packet input.
 
 import Foundation
 import PersistenceCore
 
-// Blueprint: | `CognitiveSubstrate+AttentionSignals.swift` | `CognitiveSubstrate.attentionSignals`: pure bounded workspace/question/subject projection and resident handoff publication |
+// Blueprint: | `CognitiveSubstrate+AttentionSignals.swift` | `CognitiveSubstrate.makeAttentionSignals`: pure bounded workspace/question/subject projection for resident handoff publication |
 
 extension CognitiveSubstrate {
-    public func attentionSignals(at date: Date) async -> CognitiveAttentionSignals? {
-        makeAttentionSignals(at: date)
-    }
-
-    /// Actor-isolated synchronous compiler used both by the compatibility read
-    /// above and by owner-published resident snapshots after mutations.
-    func makeAttentionSignals(
-        at date: Date,
-        honorCancellation: Bool = true
-    ) -> CognitiveAttentionSignals? {
-        guard !honorCancellation || !Task.isCancelled else { return nil }
+    /// Actor-isolated compiler for owner-published resident snapshots.
+    func makeAttentionSignals(at date: Date) -> CognitiveAttentionSignals? {
         // Gate exactly the way the capsule path does: disabled cognition adds
         // nothing; workspace off yields no items below.
         guard configuration.enabled else { return nil }
 
-        // PURE hot-set read (gpt-5.5 HIGH, 2026-07-10): `workspaceSnapshot()`
-        // routes through the field's MUTATING snapshot (decay writes, anchor
-        // advances, capacity eviction) — reading her attention must never
-        // change her mind. This peek path computes the SAME decayed
-        // activations on copies (`peekDecayedNodes`), reuses the same
-        // eligibility + scoring, and takes the same top-N — but leaves the
-        // field untouched. Deliberately omitted vs the capsule workspace:
-        // association-edge reasons (mutating read; attention doesn't need
-        // reasons) and the per-session user-turn/system caps (machine subjects
-        // never become terms anyway, so the caps don't change this output).
+        // Read decayed copies with workspace eligibility and scoring; attention reads never mutate the field.
         let dyn = dynamics
         let currentAffect = projectedAffect(at: date, dynamics: dyn)
         let mood = derivedMood(at: date, dynamics: dyn, affect: currentAffect)
         let hotItems = field.peekDecayedNodes(at: date)
-            .map { node in
-                (node: node, turnKind: field.cachedTurnKind(for: node))
-            }
             .filter {
-                workspaceEligible(
-                    $0.node,
-                    currentSessionId: nil,
-                    at: date,
-                    turnKind: $0.turnKind
-                )
+                ablations["workspace"] != false && workspaceEligible($0)
             }
             .map { candidate in
                 (
-                    node: candidate.node,
+                    node: candidate,
                     score: workspaceScore(
-                        for: candidate.node,
+                        for: candidate,
                         mood: mood,
-                        affect: currentAffect,
-                        turnKind: candidate.turnKind
+                        affect: currentAffect
                     )
                 )
             }
@@ -75,23 +42,9 @@ extension CognitiveSubstrate {
             guard let term = Self.lexicalTerm(from: item.node.subjectReference) else { continue }
             terms[term] = max(terms[term] ?? 0, (item.score).clamped01())
         }
-        // 1b. SUMMARY keywords (live-battery finding, 2026-07-10): in
-        //    production EVERY node subject is machine-keyed (chat.user_turn /
-        //    tool — verified against her real store: 256/256 nodes), so
-        //    subject-derived terms alone never fire. What she's actually
-        //    thinking about lives in the node SUMMARIES — human prose. Pull
-        //    salient content words from the hottest few summaries, weighted by
-        //    the node's score and discounted so a subject-level topic (when one
-        //    exists) still outranks summary shrapnel.
+        // Summary keywords are score-weighted and discounted below subject-level topics.
         for item in hotItems.prefix(6) {
-            // 2026-07-21 audit: .system-turn nodes (toolObservation /
-            // feltResolution) are workspace-eligible but their summaries are
-            // machine status text ("Exact tool receipt says failed."), not
-            // what she's thinking about — tokenizing them re-opened the
-            // machine-handle leak lexicalTerm guards on the subject path.
-            // Mirror capsuleEligibleWorkspaceNode's live-only gate: system
-            // nodes still count toward the hot set, they just never mint
-            // terms.
+            // System nodes count toward the hot set but never mint attention terms from machine status text.
             guard item.node.turnKind == .live else { continue }
             let weight = (item.score).clamped01() * 0.8
             for word in Self.summaryKeywords(from: item.node.summary) {
@@ -99,31 +52,26 @@ extension CognitiveSubstrate {
             }
         }
 
-        // 2. UNRESOLVED QUESTION — the U1 pendingCompletion slot, if one is open:
+        // 2. UNRESOLVED QUESTION — the pendingCompletion slot, if one is open:
         //    her latest completed turn still waiting to find out how it landed.
-        let unresolvedQuestion = unresolvedQuestionFromPendingCompletion(at: date)
+        let completion = unresolvedQuestionFromPendingCompletion(at: date)
 
-        // 3. MEMORY ACTIVATION — hot nodes that reference MemoryV2 records
-        //    carry those RECORD ids; map each to the node's clamped activation.
-        //    Record ids (never atom ids) cross the seam; the app layer owns the
-        //    projection's record→atom derivation (Decision, 2026-07-10).
+        // Memory activation carries record IDs; the app projection derives atom IDs.
         var memoryActivation: [String: Double] = [:]
-        var workingMemoryRecordIDs: Set<String> = []
         for item in hotItems {
             let recordIDs = Self.memoryRecordIDs(from: item.node)
             guard !recordIDs.isEmpty else { continue }
             let activation = (item.node.activation).clamped01()
             for recordID in recordIDs {
                 memoryActivation[recordID] = max(memoryActivation[recordID] ?? 0, activation)
-                workingMemoryRecordIDs.insert(recordID)
             }
         }
 
         let signals = CognitiveAttentionSignals(
             terms: terms,
-            unresolvedQuestion: unresolvedQuestion,
+            unresolvedQuestion: completion?.question,
+            completionWindow: completion?.window,
             memoryActivation: memoryActivation,
-            workingMemoryRecordIDs: workingMemoryRecordIDs,
             suppressedMemory: suppressedMemoryAssociations()
         )
         // Empty → nil, so the default inert path stays byte-identical. Never
@@ -133,32 +81,26 @@ extension CognitiveSubstrate {
 
     func publishAttentionProjection(at date: Date) {
         dependencies.attentionProjectionSink(
-            makeAttentionSignals(at: date, honorCancellation: false),
-            date
+            makeAttentionSignals(at: date)
         )
     }
 
     // MARK: - Unresolved question
 
-    /// Phrase the open U1 completion as a short, human "what's unresolved" line.
+    /// Phrase the open completion as a short, human "what's unresolved" line.
     /// Returns nil when no slot is open, the slot has aged past
     /// `pendingCompletionMaxAge` (a stale completion is no longer a live
     /// question), or the remembered node was evicted since it was recorded.
-    private func unresolvedQuestionFromPendingCompletion(at now: Date) -> String? {
-        guard let pending = pendingCompletion else { return nil }
-        // The read is defensive about expiry: the reconsolidation sweep only
-        // drops a stale slot on the NEXT ingest, so a read between turns could
-        // otherwise surface a completion that has already gone quiet.
-        let age = now.timeIntervalSince(pending.recordedAt)
-        guard age >= 0, age <= Self.pendingCompletionMaxAge else { return nil }
-        guard let node = field.node(forKey: pending.nodeKey) else { return nil }
+    private func unresolvedQuestionFromPendingCompletion(at now: Date) -> (question: String, window: OpenCompletionRead)? {
+        guard let window = openCompletion(at: now), let pending = pendingCompletion,
+              let node = field.node(forKey: pending.nodeKey) else { return nil }
 
         let summary = node.summary.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !summary.isEmpty else { return nil }
         // The constructor bounds to 200; clip the summary first so the framing
         // prefix always survives the bound.
         let snippet = bounded(summary, maxCharacters: 150)
-        return "Still waiting to see how this landed: \(snippet)"
+        return ("Still waiting to see how this landed: \(snippet)", window)
     }
 
     // MARK: - Subject → lexical term cleaning
@@ -244,10 +186,7 @@ extension CognitiveSubstrate {
         "yeah", "yes", "okay", "hey", "well", "also", "really", "actually",
         "thing", "things", "today", "tonight", "day", "long", "via", "bridge",
         "assistant", "agent", "owner",
-        // Apostrophe-less contractions and function verbs. Live felt-moment
-        // subjects read `dont`, `went`, `those` (2026-09-02): a feeling about
-        // "went" is a feeling about nothing. Evaluations ("great") are not
-        // topics either.
+        // Contractions, function verbs and evaluations do not name attention topics.
         "dont", "cant", "wont", "didnt", "isnt", "arent", "wasnt", "werent",
         "doesnt", "hasnt", "havent", "youre", "thats", "theyre", "whats",
         "wheres", "hows", "those", "these", "went", "goes", "going", "gone",
@@ -310,29 +249,8 @@ extension CognitiveSubstrate {
     ///   - a subject of type `memory` / `memory_record` whose `id` IS the record
     ///     id (the natural shape a recalled-memory node would take; `memory_record`
     ///     already exists as a projection entity kind).
-    /// LIVE since the chat path began stamping `memoryRecordIds` onto
-    /// assistant-turn events (ChatOrchestrationClient+MessagePersistence,
-    /// deduped, capped 32; the key is priority-protected in ContinuityField's
-    /// metadata bounding). Verified against the live store + turn traces
-    /// 2026-08-20: stamped nodes present and per-turn
-    /// contextFlow.attentionWorkingAtoms > 0. An earlier note here claimed the
-    /// lane was inert — that predated the producer and cost an investigation;
-    /// re-verify from traces, not from this comment, before declaring it dead.
     static func memoryRecordIDs(from node: CognitiveNode) -> [String] {
-        var ids: [String] = []
-
-        if case .array(let values)? = node.metadata["memoryRecordIds"] {
-            for value in values {
-                if case .string(let id) = value {
-                    let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty { ids.append(trimmed) }
-                }
-            }
-        }
-        if case .string(let id)? = node.metadata["memoryRecordId"] {
-            let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty { ids.append(trimmed) }
-        }
+        var ids = memoryRecordIDs(fromEventMetadata: node.metadata)
         let subjectType = node.subjectReference.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if subjectType == "memory" || subjectType == "memory_record" {
             let recordID = node.subjectReference.id.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -10,7 +10,7 @@ extension BrowserActionRoutes {
         input: [String: Any],
         dataRoot: URL
     ) async throws -> NativeActionReceipt {
-        let jsonInput = try NativeActionRouteSupport.jsonValueBody(input)
+        let jsonInput = try NativeActionWire.jsonValueBody(input)
         switch action.id {
         case "browser.open_url", "browser.navigate":
             let url = Self.stringInput(input, "url")
@@ -49,7 +49,7 @@ extension BrowserActionRoutes {
                 screenshotReceipt: run.screenshotReceipt
             )
 
-        case "browser.read_text":
+        case "browser.read_text", "browser.read_links", "browser.screenshot":
             if dryRun {
                 return try await effects.appendNativeActionReceipt(
                     action: action,
@@ -60,82 +60,41 @@ extension BrowserActionRoutes {
                 )
             }
             let capture = try await captureCurrentVisibleBrowser(
-                readText: true,
-                readLinks: false,
-                screenshot: false
+                readText: action.id == "browser.read_text",
+                readLinks: action.id == "browser.read_links",
+                screenshot: action.id == "browser.screenshot"
             )
-            Self.retainRead?(capture)
-            let receipt = try await persistBrowserTextCapture(
-                id: "browser-text-\(UUID().uuidString.lowercased())",
-                url: capture.url,
-                text: capture.text ?? "",
-                links: nil,
-                dataRoot: dataRoot
-            )
-            return try await effects.appendNativeActionReceipt(
-                action: action,
-                status: "completed",
-                dryRun: false,
-                output: .object(receipt),
-                dataRoot: dataRoot
-            )
-
-        case "browser.read_links":
-            if dryRun {
-                return try await effects.appendNativeActionReceipt(
-                    action: action,
-                    status: "dry_run",
-                    dryRun: true,
-                    output: .object(["actionId": .string(action.id), "status": .string("dry_run")]),
+            if action.id != "browser.screenshot" { Self.retainRead?(capture) }
+            let receipt: [String: JSONValue]
+            switch action.id {
+            case "browser.read_text":
+                receipt = try await persistBrowserTextCapture(
+                    id: "browser-text-\(UUID().uuidString.lowercased())",
+                    url: capture.url,
+                    text: capture.text ?? "",
+                    links: nil,
+                    dataRoot: dataRoot
+                )
+            case "browser.read_links":
+                receipt = try await persistBrowserLinksCapture(
+                    id: "browser-links-\(UUID().uuidString.lowercased())",
+                    url: capture.url,
+                    links: capture.links ?? [],
+                    dataRoot: dataRoot
+                )
+            default:
+                guard let png = capture.screenshot else {
+                    throw NSError(domain: "NativeAgentBrowser", code: -500, userInfo: [
+                        NSLocalizedDescriptionKey: "Browser screenshot capture returned no image data"
+                    ])
+                }
+                receipt = try await persistBrowserScreenshotCapture(
+                    id: "browser-shot-\(UUID().uuidString.lowercased())",
+                    url: capture.url,
+                    png: png,
                     dataRoot: dataRoot
                 )
             }
-            let capture = try await captureCurrentVisibleBrowser(
-                readText: false,
-                readLinks: true,
-                screenshot: false
-            )
-            Self.retainRead?(capture)
-            let receipt = try await persistBrowserLinksCapture(
-                id: "browser-links-\(UUID().uuidString.lowercased())",
-                url: capture.url,
-                links: capture.links ?? [],
-                dataRoot: dataRoot
-            )
-            return try await effects.appendNativeActionReceipt(
-                action: action,
-                status: "completed",
-                dryRun: false,
-                output: .object(receipt),
-                dataRoot: dataRoot
-            )
-
-        case "browser.screenshot":
-            if dryRun {
-                return try await effects.appendNativeActionReceipt(
-                    action: action,
-                    status: "dry_run",
-                    dryRun: true,
-                    output: .object(["actionId": .string(action.id), "status": .string("dry_run")]),
-                    dataRoot: dataRoot
-                )
-            }
-            let capture = try await captureCurrentVisibleBrowser(
-                readText: false,
-                readLinks: false,
-                screenshot: true
-            )
-            guard let png = capture.screenshot else {
-                throw NSError(domain: "NativeAgentBrowser", code: -500, userInfo: [
-                    NSLocalizedDescriptionKey: "Browser screenshot capture returned no image data"
-                ])
-            }
-            let receipt = try await persistBrowserScreenshotCapture(
-                id: "browser-shot-\(UUID().uuidString.lowercased())",
-                url: capture.url,
-                png: png,
-                dataRoot: dataRoot
-            )
             return try await effects.appendNativeActionReceipt(
                 action: action,
                 status: "completed",
@@ -145,7 +104,7 @@ extension BrowserActionRoutes {
             )
 
         default:
-            throw NativeActionRouteSupport.notImplemented(
+            throw NativeActionWire.notImplemented(
                 method: "runNativeAction",
                 reason: "Swift browser action '\(action.id)' is not implemented",
                 followup: "vault://nativeagent/zombie_stub_audit#runNativeAction"

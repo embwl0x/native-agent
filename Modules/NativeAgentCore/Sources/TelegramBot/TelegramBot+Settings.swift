@@ -55,20 +55,9 @@ public func parseTelegramNumericIDs(_ value: String) -> TelegramNumericIDParseRe
 
 extension TelegramConfig {
     public static func validateMobileConfiguration(at root: URL) throws {
-        let url = root
-            .appendingPathComponent("telegram", isDirectory: true)
-            .appendingPathComponent("config.json")
         do {
-            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-            guard attributes[.type] as? FileAttributeType == .typeRegular else {
-                throw TelegramConfigurationError.existingConfigurationUnreadable
-            }
-        } catch CocoaError.fileReadNoSuchFile { return }
-        catch { throw TelegramConfigurationError.existingConfigurationUnreadable }
-        try TelegramConfig.validateSavedConfiguration(dataRoot: root)
-        guard TelegramConfig.loadFromDisk(dataRoot: root, includeDisconnected: true) != nil else {
-            throw TelegramConfigurationError.existingConfigurationUnreadable
-        }
+            _ = try TelegramConfig.loadSavedConfiguration(dataRoot: root)
+        } catch { throw TelegramConfigurationError.existingConfigurationUnreadable }
     }
 
 }

@@ -2,13 +2,8 @@ import Foundation
 
 // Blueprint: | `OrganismResolutionFelt.swift` | `OrganismResolutionFelt`: pure notable resolution events with aboutness and per-path rate bounds; kernel retains state ownership |
 
-// Round 3 Wave A2 — anticipation RESOLVES into feeling. A1 gave the body a
-// sized exhale in chemistry; this pure diff read turns notable resolutions
-// into events the substrate can remember with aboutness: relief ("the thing
-// I was braced for landed fine") and earned disappointment ("the thing I
-// counted on fell through"). Rate-bounded per path kind so retry storms
-// never flood her memory. Pure: same inputs → same outputs; the caller
-// (OrganismKernel.ingest) owns state.
+// Pure ledger differences yield notable relief and disappointment with
+// aboutness and per-path rate bounds; OrganismKernel owns the state.
 
 public struct OrganismResolutionFeltEvent: Sendable, Equatable {
     public enum Kind: String, Sendable {
@@ -25,16 +20,9 @@ public struct OrganismResolutionFeltEvent: Sendable, Equatable {
     /// even odds the expectation sat (0…0.5).
     public let magnitude: Double
     public let occurredAt: Date
-    /// Item 46 (review fix 6): PROVENANCE for a `.semanticExpectation`
-    /// resolution — the session and completion turn the resolved row was minted
-    /// under. Nil for every other path kind.
-    ///
-    /// D-2's gate 1 no longer admits the semantic label unconditionally: a felt
-    /// event carrying `semanticExpectation` as its `subject.label` but no
-    /// provenance could otherwise skip the aboutness gate entirely. The runtime
-    /// composing the cognitive event stamps these as
-    /// `OrganismSemanticExpectation.sessionMetadataKey` /`.turnMetadataKey`, and
-    /// the gate requires them.
+    /// Semantic resolution provenance, nil for other path kinds. The runtime
+    /// nests `sessionField` and `turnField` under
+    /// `OrganismSemanticExpectation.mintMetadataKey` on the felt cognitive event.
     public let semanticScope: OrganismSemanticScope?
 
     public init(
@@ -55,18 +43,17 @@ public struct OrganismResolutionFeltEvent: Sendable, Equatable {
 }
 
 public enum OrganismResolutionFelt {
-    /// A resolution only FEELS like something past these floors — mild
-    /// outcomes stay chemistry-only (A1) and never mint a memory.
+    /// Resolutions below these floors stay chemistry-only and never mint a memory.
     static let reliefBracingFloor = 0.35
     static let disappointmentExpectationFloor = 0.6
     /// At most one felt resolution per path kind per hour.
     static let feltInterval: TimeInterval = 3600
 
-    /// Diffs the ledger across ONE OrganismPredictiveBody.applying pass and
+    /// Diffs the ledger across one OrganismPredictiveBody.applying pass and
     /// returns the felt events plus the ledger with rate stamps applied.
     /// `before` must be the ledger as it stood when the resolving signal's
     /// bracing was measured (pre-application), so the felt magnitude matches
-    /// the exhale A1 actually released.
+    /// the chemistry actually released.
     public static func events(
         before: OrganismPredictionLedger,
         after: OrganismPredictionLedger,
@@ -77,18 +64,7 @@ public enum OrganismResolutionFelt {
         for (id, resolved) in after.predictions {
             guard let prior = before.predictions[id], prior.status == .pending else { continue }
             guard OrganismProspectiveAffect.carriesFeeling(prior.kind) else { continue }
-            // Item 5 (2026-09-02): HORIZON rows share `.semanticExpectation`'s
-            // kind but not its feeling. This buffer is drained by
-            // `NativeCognitionRuntime.drainFeltResolutionsIntoSubstrate`, whose
-            // composer knows exactly two sentences — "the <organ> path I was
-            // braced for landed fine" and its letdown — and has no third for a
-            // horizon that simply passed with no answer. A horizon that landed
-            // early, fell through, or went unanswered is composed by the
-            // runtime's own horizon lane
-            // (`NativeCognitionRuntime+Expectations.swift`), which owns all
-            // three phrasings including `waiting`, and reads them from the
-            // ledger rather than from this buffer. Excluding them here is what
-            // keeps one moment from being announced twice, in two voices.
+            // The runtime composes horizon resolutions from the ledger; excluding them here prevents duplicate announcements.
             guard prior.horizon == nil else { continue }
             switch resolved.status {
             case .satisfied:

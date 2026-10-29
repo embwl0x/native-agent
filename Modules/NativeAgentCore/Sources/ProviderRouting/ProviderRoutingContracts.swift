@@ -1,111 +1,10 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `ProviderRoutingContracts.swift` | `ProviderRoutingSnapshot` carries its checked source revision and owns modelOverrideSurfaces independently of effort/Fast for settings and UI inheritance reads; `ProviderRoutingProtocol`: `listProviders`, `getProvider`, `configureProvider` |
+// Blueprint: | `ProviderRoutingContracts.swift` | `ProviderRoutingSnapshot` carries its checked source revision and owns modelOverrideSurfaces independently of effort/Fast for settings and UI inheritance reads; `TurnRouteAdmission` and checked snapshot admission bind one execution tuple with explicit inheritance; `SwiftNativeProviderRouting` surface lookup conveniences |
 
-/// The Providers page offers exactly THREE choices — **Chat**, **Work**, and
-/// **Memory and mind** — and this table is the only place that says which
-/// activity belongs to which. User, 2026-09-13: the grouping is the ROUTING rule,
-/// not a layout ("Dream, REM, everything should go to the memory model; I
-/// already specified that when we compressed provider picks"), and "if you've
-/// missed anything, it needs to be up there on Providers".
-///
-/// The page's member captions and the router's membership are generated from the
-/// SAME list, so they cannot disagree, and every routed surface is claimed by one
-/// group — there is no "one row per unclaimed surface" path any more. The
-/// resolver keeps no per-surface exception. Members share the group's choice;
-/// a group without a model/account override follows Chat's, with effort stored
-/// independently when explicitly set.
-///
-/// What this replaced: hand-written per-surface seeds (`dream`/`rem`/
-/// `studio_wander` on a cheap model, `workshop`/`autonomy`/`swarms` on the
-/// primary, `training` on another), which could aim a lane at a model the
-/// group's connected route cannot serve. On a fresh 0.4.11 install whose only
-/// account was a ChatGPT one, the cheap dream seed was refused by that backend
-/// and dreams could never run.
-public struct ProviderSurfaceMember: Sendable, Equatable {
-    /// The routing surface id, as written in `providers/surfaces.json`.
-    public let surface: String
-    /// What the Providers page calls it, in a person's words.
-    public let label: String
-
-    public init(_ surface: String, _ label: String) {
-        self.surface = surface
-        self.label = label
-    }
-}
-
-public struct ProviderSurfaceGroup: Sendable, Equatable, Identifiable {
-    public let id: String
-    public let title: String
-    public let members: [ProviderSurfaceMember]
-
-    public init(id: String, title: String, members: [ProviderSurfaceMember]) {
-        self.id = id
-        self.title = title
-        self.members = members
-    }
-
-    public var surfaces: [String] { members.map(\.surface) }
-
-    /// The caption under a group's row: what this choice actually governs.
-    public var caption: String {
-        let names = members.map(\.label)
-        guard names.count > 1 else { return names.first ?? "" }
-        return names.dropLast().joined(separator: ", ") + " and " + names[names.count - 1]
-    }
-}
-
-public enum ProviderSurfaceGroups {
-    public static let chat = ProviderSurfaceGroup(
-        id: "chat", title: "Chat",
-        members: [
-            .init("chat", "Chat"),
-            .init("ios", "iPhone"),
-            .init("telegram", "Telegram"),
-            .init("slack", "Slack"),
-        ]
-    )
-    public static let work = ProviderSurfaceGroup(
-        id: "work", title: "Work",
-        members: [
-            .init("desk", "Desk"),
-            .init("workshop", "Task execution"),
-            .init("autonomy", "Independent tasks"),
-            .init("swarms", "Coordinated tasks"),
-            .init("training", "Skill practice"),
-            .init("heartbeat", "Background check-ins"),
-            .init("diagnostics", "Diagnostics"),
-        ]
-    )
-    public static let mind = ProviderSurfaceGroup(
-        id: "memory_and_mind", title: "Memory and mind",
-        members: [
-            .init("memory", "Memory"),
-            .init("dream", "Dreams"),
-            .init("rem", "REM"),
-            .init("cognition_reflection", "Reflection"),
-            .init("compaction", "Conversation summaries"),
-            .init("self_improvement", "Learning"),
-            .init("studio_wander", "Creative exploration"),
-        ]
-    )
-    public static let all: [ProviderSurfaceGroup] = [chat, work, mind]
-
-    /// Every label, keyed by surface — the page reads its row names from here so
-    /// a name can never drift from the group that owns it.
-    public static func rows(visible: [String]) -> [ProviderSurfaceGroup] {
-        all.compactMap { group in
-            let members = group.members.filter { visible.contains($0.surface) }
-            guard !members.isEmpty else { return nil }
-            return ProviderSurfaceGroup(id: group.id, title: group.title, members: members)
-        }
-    }
-
-    public static let labels: [String: String] = Dictionary(
-        uniqueKeysWithValues: all.flatMap(\.members).map { ($0.surface, $0.label) }
-    )
-
+extension ProviderSurfaceGroups {
     public static func group(for surface: String) -> ProviderSurfaceGroup? {
         let canonical = canonicalRoutingSurface(surface)
         return all.first { $0.surfaces.contains(canonical) }
@@ -115,38 +14,10 @@ public enum ProviderSurfaceGroups {
         group(for: surface)?.surfaces ?? [canonicalRoutingSurface(surface)]
     }
 
-    /// The two tables must cover each other exactly: every routed surface has a
-    /// Providers row, and no group names a surface that is not routed. Called at
-    /// startup so a new surface cannot be added without deciding where it shows.
-    public static func membershipMismatch() -> String? {
-        let grouped = all.flatMap(\.surfaces)
-        let routed = Set(MODEL_SURFACES)
-        var problems: [String] = []
-        let duplicates = grouped.filter { surface in grouped.filter { $0 == surface }.count > 1 }
-        if !duplicates.isEmpty {
-            problems.append("in more than one group: \(Set(duplicates).sorted().joined(separator: ", "))")
-        }
-        let ungrouped = routed.subtracting(grouped).sorted()
-        if !ungrouped.isEmpty {
-            problems.append("routed but in no Providers group: \(ungrouped.joined(separator: ", "))")
-        }
-        let unrouted = Set(grouped).subtracting(routed).sorted()
-        if !unrouted.isEmpty {
-            problems.append("in a Providers group but not routed: \(unrouted.joined(separator: ", "))")
-        }
-        return problems.isEmpty ? nil : problems.joined(separator: "; ")
-    }
 }
 
-/// One answer to "can this route actually run this model at this effort?",
-/// used wherever a provider/model/effort tuple is CHOSEN rather than resolved
-/// — the Bots editor, the bot tools, and the bot runner before it spends a turn.
-///
-/// User, 2026-09-13: "Bots has no default model; Agent is supposed to pick the
-/// model when she makes one." A bot carries its own tuple, so nothing downstream
-/// re-resolves it; that makes it the one place a nonsense tuple could reach a
-/// provider, and this is the check that stops it. The route's supplied catalog
-/// takes precedence over shipped rows; routes without either accept any id.
+/// Bots carry an explicit provider/model/effort tuple that is validated without downstream reselection.
+/// Route-supplied catalogs precede shipped rows; routes without either accept any model ID.
 public enum ProviderModelChoice {
     /// nil when the tuple is usable, else a sentence naming what is wrong.
     public static func rejection(
@@ -154,7 +25,7 @@ public enum ProviderModelChoice {
         model: String?,
         reasoningEffort: String?,
         accountModels: [CodexAccountModelCatalog.Model]? = nil,
-        moonshotModels: [ProviderModelDescriptor]? = nil
+        moonshotModels: [ProviderModelInfo]? = nil
     ) -> String? {
         let route = provider?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let id = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -270,21 +141,12 @@ public struct Provider: Sendable, Codable, Equatable {
         "extras",
     ]
 
-    private struct AnyKey: CodingKey, Hashable {
-        var stringValue: String
-        var intValue: Int? { nil }
-        init(_ s: String) { self.stringValue = s }
-        init?(stringValue: String) { self.stringValue = stringValue }
-        init?(intValue: Int) { return nil }
-    }
-
     public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: AnyKey.self)
+        let c = try decoder.container(keyedBy: JSONKey.self)
         func str(_ keys: String...) throws -> String? {
             var result: String?
             for k in keys {
-                if let key = AnyKey(stringValue: k),
-                   let v = try c.decodeIfPresent(String.self, forKey: key) {
+                if let v = try c.decodeIfPresent(String.self, forKey: JSONKey(k)) {
                     if result == nil { result = v }
                 }
             }
@@ -293,8 +155,7 @@ public struct Provider: Sendable, Codable, Equatable {
         func bool(_ keys: String...) throws -> Bool? {
             var result: Bool?
             for k in keys {
-                if let key = AnyKey(stringValue: k),
-                   let v = try c.decodeIfPresent(Bool.self, forKey: key) {
+                if let v = try c.decodeIfPresent(Bool.self, forKey: JSONKey(k)) {
                     if result == nil { result = v }
                 }
             }
@@ -302,8 +163,7 @@ public struct Provider: Sendable, Codable, Equatable {
         }
         func jv(_ keys: String...) throws -> JSONValue? {
             for k in keys {
-                if let key = AnyKey(stringValue: k),
-                   let v = (try? c.decodeIfPresent(JSONValue.self, forKey: key)) ?? nil {
+                if let v = (try? c.decodeIfPresent(JSONValue.self, forKey: JSONKey(k))) ?? nil {
                     return v
                 }
             }
@@ -322,12 +182,7 @@ public struct Provider: Sendable, Codable, Equatable {
         self.lastTestedAt = try str("lastTestedAt", "last_tested_at")
         self.lastError = try str("lastError", "last_error")
 
-        var unknown: [String: JSONValue] = [:]
-        for key in c.allKeys where !Self.knownKeys.contains(key.stringValue) {
-            if let v = try? c.decode(JSONValue.self, forKey: key) {
-                unknown[key.stringValue] = v
-            }
-        }
+        var unknown = c.unknownFields(excluding: Self.knownKeys)
         if let explicit = try jv("extras"), case .object(let obj) = explicit {
             for (k, v) in obj { unknown[k] = v }
         }
@@ -335,22 +190,18 @@ public struct Provider: Sendable, Codable, Equatable {
     }
 
     public func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: AnyKey.self)
-        try c.encode(id, forKey: AnyKey("id"))
-        try c.encodeIfPresent(displayName, forKey: AnyKey("displayName"))
-        try c.encodeIfPresent(kind, forKey: AnyKey("kind"))
-        try c.encodeIfPresent(configured, forKey: AnyKey("configured"))
-        try c.encodeIfPresent(active, forKey: AnyKey("active"))
-        try c.encodeIfPresent(surface, forKey: AnyKey("surface"))
-        try c.encodeIfPresent(modelCatalog, forKey: AnyKey("modelCatalog"))
-        try c.encodeIfPresent(oauthStatus, forKey: AnyKey("oauthStatus"))
-        try c.encodeIfPresent(lastTestedAt, forKey: AnyKey("lastTestedAt"))
-        try c.encodeIfPresent(lastError, forKey: AnyKey("lastError"))
-        if case .object(let obj)? = extras {
-            for (k, v) in obj where !Self.knownKeys.contains(k) {
-                try c.encode(v, forKey: AnyKey(k))
-            }
-        }
+        var c = encoder.container(keyedBy: JSONKey.self)
+        try c.encode(id, forKey: JSONKey("id"))
+        try c.encodeIfPresent(displayName, forKey: JSONKey("displayName"))
+        try c.encodeIfPresent(kind, forKey: JSONKey("kind"))
+        try c.encodeIfPresent(configured, forKey: JSONKey("configured"))
+        try c.encodeIfPresent(active, forKey: JSONKey("active"))
+        try c.encodeIfPresent(surface, forKey: JSONKey("surface"))
+        try c.encodeIfPresent(modelCatalog, forKey: JSONKey("modelCatalog"))
+        try c.encodeIfPresent(oauthStatus, forKey: JSONKey("oauthStatus"))
+        try c.encodeIfPresent(lastTestedAt, forKey: JSONKey("lastTestedAt"))
+        try c.encodeIfPresent(lastError, forKey: JSONKey("lastError"))
+        try c.encodeUnknownFields(extras, excluding: Self.knownKeys)
     }
 }
 
@@ -376,14 +227,6 @@ public struct ModelPreferences: Sendable, Codable, Equatable {
         case defaultModel = "default_model"
         case extras
     }
-}
-
-// MARK: - ProviderTestResult
-
-public struct ProviderTestResult: Sendable, Codable, Equatable {
-    public var rawResponse: JSONValue
-    public init(rawResponse: JSONValue) { self.rawResponse = rawResponse }
-    enum CodingKeys: String, CodingKey { case rawResponse = "raw_response" }
 }
 
 // MARK: - Errors
@@ -505,17 +348,7 @@ public struct ProviderRoutingSnapshot: Sendable, Equatable {
                 || (activeProviders[surface] ?? activeProviders["chat"]) != activeProviders["chat"])
         })
     }
-    /// Surfaces whose saved pick cannot be used, keyed to the sentence that says
-    /// why — ready to show on the Providers row and to refuse a turn with.
-    ///
-    /// 2026-09-13, second review: NOTHING is ever substituted for such a pick,
-    /// not a literal and not the route's own default. Both ways it could fail
-    /// read the same to a person ("my model quietly changed"), so both end the
-    /// same way: the surface is unset and this says what to fix.
-    ///   * gone from every catalog — "Your Chat model, gpt-5.4, is no longer
-    ///     offered. Choose one."
-    ///   * not served by the route it sits on — "claude-opus-4-8 isn't offered
-    ///     on openai_oauth_direct. Choose one."
+    /// Unusable saved picks leave the surface unset with a reason; no replacement is selected.
     public let unusablePicks: [String: String]
 
     public init(
@@ -542,18 +375,14 @@ public struct ProviderRoutingSnapshot: Sendable, Equatable {
 // MARK: - Routing vocabulary
 
 /// Every in-process LLM consumer routes through one of these surfaces.
-/// `ProviderSurfaceGroups` assigns each to Chat, Work, or Memory and mind.
+/// `ProviderSurfaceGroups` owns the inventory in Chat, Work, then Memory and mind order.
 /// Members share their group's model, account, effort and service tier; Work
 /// and Memory and mind inherit Chat's model/account until a unanimous override
 /// is saved; setting effort alone preserves that inheritance.
 /// A provider-only override uses that account's default and requires a model
 /// selection when no usable default exists. Legacy `missions` keys fold to
 /// `workshop` at the checked read and write boundaries.
-public let MODEL_SURFACES: [String] = [
-    "chat", "ios", "telegram", "slack", "desk", "workshop", "autonomy", "swarms", "dream", "rem", "training",
-    "memory", "heartbeat", "diagnostics", "cognition_reflection", "compaction", "self_improvement",
-    "studio_wander",
-]
+public let MODEL_SURFACES: [String] = ProviderSurfaceGroups.all.flatMap(\.surfaces)
 
 /// Persisted picker keys that deliberately no longer have a routed surface.
 /// Keep the retirement date and reason beside the key so a missing Provider
@@ -606,48 +435,8 @@ public let SERVICE_TIER_OPTIONS: [String] = ["default", "priority"]
 /// Default reasoning control before model/account compatibility normalization.
 public let DEFAULT_REASONING_EFFORT: String = "high"
 
-// MARK: - Protocol
-
-public protocol ProviderRoutingProtocol: Sendable {
-    func listProviders() async throws -> [Provider]
-    func getProvider(id: String) async throws -> Provider
-    func configureProvider(id: String, config: JSONValue) async throws -> Provider
-    func testProvider(id: String) async throws -> ProviderTestResult
-    func saveModelConfig(_ body: JSONValue) async throws -> ModelPreferences
-    /// Swift-native per-surface picker. Reads `providers/surfaces.json`
-    /// and `providers/active.json`, then returns seeded preferences for
-    /// every MODEL_SURFACE (sans `modelKnown`, which needs the model catalog).
-    func computeModelPreferences() async throws -> [String: SurfacePreference]
-    /// Atomic checked view of preferences, active providers, and explicit pins.
-    /// The Swift-native owner derives all three from one reconciled tuple.
-    func checkedRoutingSnapshot() async throws -> ProviderRoutingSnapshot
-    /// Pin-only lookup: returns the model string ONLY when this surface
-    /// is explicitly pinned in `providers/surfaces.json`. Used by dream /
-    /// REM so they can fall back to the chat-surface model when nothing
-    /// is pinned (preserving Agent's current voice by default).
-    func pinnedModelStringForSurface(_ surface: String) async -> String?
-    /// Throwing execution seam. Corrupt provider authority is unavailable,
-    /// never equivalent to an unpinned surface.
-    func pinnedModelStringForSurfaceChecked(_ surface: String) async throws -> String?
-    /// Read `<dataRoot>/providers/active.json` (surface → provider hint
-    /// written by `setActiveProvider`). Empty map when missing. The LLM
-    /// dispatch layer uses this as a tiebreaker for ambiguous model ids.
-    func activeProvidersForSurfaces() async -> [String: String]
-    /// Throwing execution seam. Corrupt provider authority is unavailable,
-    /// never equivalent to an empty active-provider map.
-    func activeProvidersForSurfacesChecked() async throws -> [String: String]
-    /// Best-effort provider inference for a model id. This is used by
-    /// prompt/runtime introspection paths when no explicit active provider is
-    /// pinned for the current surface.
-    func inferProviderForModel(_ modelId: String) -> String?
-}
-
-extension ProviderRoutingProtocol {
-    /// Convenience: per-surface model lookup via the picker. Returns nil
-    /// when the surface is unknown or the picker has no entry. Dream / REM
-    /// / Workshop executions / telegram callers use this to pass an explicit model
-    /// into LLMClient.complete instead of falling through to the "chat"
-    /// surface seed.
+extension SwiftNativeProviderRouting {
+    /// Independent model lookup for sizing or an explicitly injected routing choice.
     public func modelStringForSurface(_ surface: String) async -> String? {
         guard let prefs = try? await computeModelPreferences() else { return nil }
         if let m = ProviderRoutingSurfaceLookup.value(prefs, surface)?.model, !m.isEmpty {
@@ -655,37 +444,113 @@ extension ProviderRoutingProtocol {
         }
         return nil
     }
-
-    /// True when `surface` has a routing identity of its own: a model pin, or
-    /// a provider assigned to its Providers row (onboarding writes assignments
-    /// with no pin, so a pin-only test misses them).
-    ///
-    /// User, 2026-09-06: a surface with NEITHER must follow chat's model AND
-    /// chat's provider. Routing a blank surface on its own key hands dispatch a
-    /// surface with no `active.json` entry, and the adapter is then inferred
-    /// from the model prefix — so a bare `gpt-` id chat serves over the Codex
-    /// CLI or the OpenAI API would silently take ChatGPT OAuth instead.
-    public func surfaceHasOwnRouting(_ surface: String) async -> Bool {
-        if await pinnedModelStringForSurface(surface) != nil { return true }
-        let assigned = ProviderRoutingSurfaceLookup
-            .value(await activeProvidersForSurfaces(), surface)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return assigned?.isEmpty == false
-    }
 }
 
-/// P2-3 reader bridge for any surface-keyed routing map.
-///
-/// Both vocabularies can appear on EITHER side here: a caller still passing
-/// `missions` (iOS a version behind, an old script), and a preferences map
-/// persisted before the rename. Trying the
-/// canonical key and then the legacy key is what keeps a mismatched pair from
-/// resolving to nil and silently falling back to the chat-surface model.
+/// Surface maps accept either vocabulary, checking the canonical key before its persisted alias.
 public enum ProviderRoutingSurfaceLookup {
     public static func value<V>(_ map: [String: V], _ surface: String) -> V? {
         let canonical = WorkshopSurfaceVocabulary.canonicalSurface(surface)
         if let hit = map[canonical] { return hit }
         guard canonical == WorkshopSurfaceVocabulary.canonical else { return nil }
         return map[WorkshopSurfaceVocabulary.legacy]
+    }
+}
+
+/// One immutable provider-routing generation admitted before a chat facade
+/// chooses its execution branch. This is execution context only; the
+/// ProviderRouting store remains the sole authority and adapters still use a
+/// checked reread to detect corrupt/revoked authority.
+public struct TurnRouteAdmission: Sendable, Equatable {
+    public let routingSurface: String
+    public let modelId: String
+    public let reasoningEffort: String
+    public let providerId: String?
+    public let serviceTier: String?
+    public init(routingSurface: String, modelId: String, reasoningEffort: String,
+                providerId: String?, serviceTier: String?) {
+        self.routingSurface = routingSurface; self.modelId = modelId
+        self.reasoningEffort = reasoningEffort; self.providerId = providerId; self.serviceTier = serviceTier
+    }
+
+    public func withModelContext<T: Sendable>(model: String? = nil, reasoningEffort: String? = nil,
+        isolation: isolated (any Actor)? = #isolation,
+        _ body: () async throws -> T) async rethrows -> T {
+        try await LLMCallContext.$admittedModel.withValue(model ?? modelId) {
+        try await LLMCallContext.$providerId.withValue(providerId) {
+        try await LLMCallContext.$reasoningEffort.withValue(reasoningEffort ?? self.reasoningEffort) {
+        try await LLMCallContext.$serviceTier.withValue(serviceTier, operation: body)
+        } } }
+    }
+}
+
+extension ProviderRoutingSnapshot {
+    public func routeAdmission(for surface: String, requestedModel: String? = nil,
+        requestedReasoningEffort: String? = nil, suppliedModel: String = "",
+        choice: ProviderTurnChoice? = ProviderTurnChoice.current,
+        inheritingCall: Bool = false, inheritChat: Bool = true) throws -> TurnRouteAdmission {
+        let normalized = surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let routingSurface = canonicalRoutingSurface(normalized)
+        // Dispatch inherits its bound admission before considering an ambient picker choice.
+        let inheritedModel = inheritingCall ? LLMCallContext.admittedModel?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "" : ""
+        if let choice, inheritedModel.isEmpty {
+            guard !choice.provider.isEmpty, !choice.model.isEmpty, !choice.reasoningEffort.isEmpty else {
+                throw LLMError.providerError(message: "Choose a provider, model and Think level.")
+            }
+            return TurnRouteAdmission(routingSurface: routingSurface, modelId: choice.model,
+                reasoningEffort: choice.reasoningEffort, providerId: choice.provider,
+                serviceTier: choice.fast ? "priority" : "default")
+        }
+        let preference = ProviderRoutingSurfaceLookup.value(self.preferences, routingSurface)
+            ?? (inheritChat ? self.preferences["chat"] : nil)
+        let configuredModel = preference?.model
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let supplied = suppliedModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requested = requestedModel?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let admittedModel: String
+        if !inheritedModel.isEmpty {
+            admittedModel = inheritedModel
+        } else if !supplied.isEmpty {
+            admittedModel = supplied
+        } else if ProviderRoutingSurfaceLookup.value(self.activeProviders, routingSurface) != nil {
+            admittedModel = configuredModel
+        } else {
+            admittedModel = requested.isEmpty ? configuredModel : requested
+        }
+        guard !admittedModel.isEmpty else {
+            if inheritingCall { throw LLMError.notConfigured(provider: "router") }
+            let notice = self.unusablePickNotice(for: routingSurface)
+                ?? ProviderSurfaceGroups.members(of: routingSurface)
+                    .compactMap { self.unusablePickNotice(for: $0) }.first
+                ?? self.unusablePickNotice(for: "chat")
+            throw LLMError.providerError(
+                message: notice.map { "\($0) Open Providers to pick one." }
+                    ?? "No model is set up yet. Open Providers and choose one for Chat."
+            )
+        }
+        let requestedEffort = requestedReasoningEffort?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let inheritedProvider = inheritingCall ? LLMCallContext.providerId?
+            .trimmingCharacters(in: .whitespacesAndNewlines) : nil
+        return TurnRouteAdmission(
+            routingSurface: routingSurface,
+            modelId: admittedModel,
+            reasoningEffort: inheritingCall ? (LLMCallContext.reasoningEffort ?? preference?.reasoningEffort ?? DEFAULT_REASONING_EFFORT) : requestedEffort.isEmpty
+                ? (preference?.reasoningEffort ?? DEFAULT_REASONING_EFFORT)
+                : requestedEffort,
+            providerId: inheritedProvider?.isEmpty == false ? inheritedProvider
+                : ProviderRoutingSurfaceLookup.value(self.activeProviders, routingSurface)
+                ?? (inheritChat ? self.activeProviders["chat"] : nil),
+            serviceTier: (inheritingCall ? LLMCallContext.serviceTier : nil) ?? preference?.serviceTier ?? (inheritingCall ? nil : "default")
+        )
+    }
+}
+
+extension SwiftNativeProviderRouting {
+    public func checkedRouteAdmission(for surface: String, requestedModel: String? = nil,
+        requestedReasoningEffort: String? = nil, suppliedModel: String = "") async throws -> TurnRouteAdmission {
+        try await checkedRoutingSnapshot().routeAdmission(for: surface, requestedModel: requestedModel,
+            requestedReasoningEffort: requestedReasoningEffort, suppliedModel: suppliedModel)
     }
 }

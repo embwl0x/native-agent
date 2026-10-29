@@ -23,12 +23,6 @@ extension ToolDispatchClient {
     }
 }
 
-/// Narrow protocol so tests can substitute the trust source without
-/// constructing a full SwiftNativeTrustCenter actor.
-public protocol AutonomyResolver: Sendable {
-    func autonomyLevel(forTool toolName: String, surface: String) async throws -> String
-}
-
 /// An engine-owned incomplete terminal, not a provider/transport failure.
 /// Preserve the existing reply for the caller's ordinary retained-output cap.
 public struct EphemeralToolTurnIncomplete: Error, Sendable {

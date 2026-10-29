@@ -1,49 +1,32 @@
 import Foundation
+import Darwin
+import Synchronization
 
 // Blueprint: | `SnapshotTailOpLog.swift` | `SnapshotTailOpLog`: shared base-plus-tail replay, feed integrity and bounded compaction bookkeeping |
 
-// MARK: - SnapshotTailOpLog — shared snapshot+tail op-log engine
-//
-// Three append-only op-log stores (DeskStore, GitHubCommandStore, and — as of
-// B4/2026-07-17 — SwiftNativeTaskLedger) bound their feeds the same way: once
-// the feed crosses a threshold, the reduced state through some `lastCompactedOpId`
-// is snapshotted into a base file and the op-log is truncated to a kept tail.
-// Replay is then `base + ops that FOLLOW lastCompactedOpId`.
-//
-// WHY A HELPER SET, NOT A SINGLE GENERIC `SnapshotTailOpLog<Op, State>`:
-// the three base FILES are byte-incompatible on disk and must stay so (live
-// data must keep loading, and both Desk's and GitHubCommand's decoders were
-// review-hardened TODAY — "preserve exactly"):
-//   • DeskCompactionBase carries two extra top-level ledgers folded from RAW op
-//     history (`aliasHighWater`, `lastNonTerminal`) plus a strict round-trip
-//     decode gate.
-//   • GitHubCommandCompactionBase carries `tailFirstOpId` — the lock-free
-//     reader's torn-read consistency proof — and keeps a NON-empty tail.
-//   • TaskLedgerCompactionBase carries an ordered array of compacted per-task
-//     states.
-// A single generic envelope could not reproduce all three layouts without
-// changing every existing base file's bytes and breaking those hardened
-// decoders. So each store keeps its OWN base type and its own read-consistency
-// wrapper, and they share only the two byte-neutral pieces of the engine that
-// are provably identical across all three:
-//   1. `dropCompactedPrefix` — the prefix-drop scan (return the ops that follow
-//      `lastCompactedOpId`; a no-op when the id is absent — genesis / already-tail).
-//   2. `commitCompaction` — the atomic snapshot-BEFORE-truncate write sequence
-//      (write the base, THEN rewrite the op-log to the kept tail). Base-first is
-//      the crash-safety invariant: a crash between the two leaves the full
-//      op-log intact and the replay prefix-drop heals it (never lost, never
-//      double-applied).
+/// Shared replay and compaction; each store retains its persisted base layout and read-consistency rules.
 public enum SnapshotTailOpLog {
 
-    // Replay memos are valid only while both feed files retain their stat
-    // identities. Missing bases are normal before the first compaction;
-    // unreadable identities return nil and must never authorize a cache hit.
+    // Observation caches compare shared stat identities after their own admission
+    // checks. Absence is distinct from failed inspection, which cannot authorize a hit.
     public enum FileStamp: Sendable, Equatable {
         case absent
         /// `changeSeconds`/`changeNanoseconds` are the status-change time, so
         /// a permission or ownership change counts as a change too.
         case present(device: Int32, inode: UInt64, size: Int64, seconds: Int, nanoseconds: Int,
                      changeSeconds: Int, changeNanoseconds: Int)
+
+        public init(_ info: stat) {
+            self = .present(
+                device: info.st_dev,
+                inode: info.st_ino,
+                size: Int64(info.st_size),
+                seconds: info.st_mtimespec.tv_sec,
+                nanoseconds: info.st_mtimespec.tv_nsec,
+                changeSeconds: info.st_ctimespec.tv_sec,
+                changeNanoseconds: info.st_ctimespec.tv_nsec
+            )
+        }
     }
 
     public struct FeedStamp: Sendable, Equatable {
@@ -59,69 +42,21 @@ public enum SnapshotTailOpLog {
     public static func fileStamp(_ url: URL) -> FileStamp? {
         var info = stat()
         if stat(url.path, &info) == 0 {
-            return .present(
-                device: info.st_dev,
-                inode: info.st_ino,
-                size: Int64(info.st_size),
-                seconds: info.st_mtimespec.tv_sec,
-                nanoseconds: info.st_mtimespec.tv_nsec,
-                changeSeconds: info.st_ctimespec.tv_sec,
-                changeNanoseconds: info.st_ctimespec.tv_nsec
-            )
+            return FileStamp(info)
         }
         return errno == ENOENT ? .absent : nil
     }
 
-    // MARK: - The unknown-row policy (audit 2026-08-02, finding 1)
-    //
-    // COMPACTION IS THE ONLY IRREVERSIBLE STEP IN THIS ENGINE. Reading is
-    // tolerant by design — an op token a build does not recognise is skipped,
-    // and a torn trailing line is ignored — and that tolerance is correct for
-    // READS: an older binary should still be able to show the desk rather than
-    // refuse to start. But `commitCompaction` snapshots the state folded from
-    // the rows this build COULD decode and then rewrites the op-log, so every
-    // row it could not decode is deleted from the only place it existed.
-    //
-    // The realistic trigger is a version skew, not corruption: DeskSweepCLI and
-    // task-ledger ship as separate SwiftPM products and nothing forces them to
-    // match the running .app. A newer app writes `set_defer_until`; a stale CLI
-    // reads the feed, skips those rows, appends one op, crosses the threshold —
-    // and every defer on the desk is gone, silently and unrecoverably.
-    //
-    // POLICY: REFUSE TO COMPACT WHILE ANY ROW IS UNUSABLE. Not "carry the
-    // unknown rows into the new tail" — that alternative loses on all three
-    // counts: (a) Desk keeps an EMPTY tail and GitHubCommand's tail head is its
-    // torn-read consistency proof (`tailFirstOpId`), so smuggling foreign rows
-    // into either tail breaks a hardened invariant; (b) the carried rows sit
-    // BEFORE `lastCompactedOpId` positionally, so the very next
-    // `dropCompactedPrefix` would drop them anyway — preservation in name only;
-    // (c) it would still be wrong on ORDER, since a preserved row would replay
-    // after ops that originally preceded it.
-    //
-    // Refusing costs an unbounded op-log; it never costs data. The feed keeps
-    // growing until a build that understands the rows compacts it — which is
-    // exactly the self-healing behaviour we want, and it is loud (see
-    // `noteIntegrity`) rather than quiet.
-
-    /// What one read of an op-log FILE could not use.
+    /// What one op-log read could not use.
     public struct OpLogIntegrity: Sendable, Equatable {
         /// Lines that are not parseable JSON at all — EXCLUDING a tolerated
         /// torn trailing line (see `trailingPartialLine`).
         public var malformedLineCount: Int
-        /// Rows that parsed as JSON but carried an op token this build does not
-        /// know. A NEWER writer's op seen through an OLDER binary.
+        /// JSON rows whose op token this build does not recognize.
         public var undecodableRowCount: Int
-        /// The final line was torn (the file does not end in a newline) — an
-        /// append that had not landed whole when we read. Tolerated by design;
-        /// reported so "we dropped something" is never invisible.
+        /// A tolerated torn trailing line, reported separately from unusable rows.
         public var trailingPartialLine: Bool
-        /// PHYSICAL rows in the feed file — decodable or not. THE COMPACTION
-        /// THRESHOLD KEYS ON THIS (gpt-5.5 review 2026-08-02, finding 2), never
-        /// on the decoded-op count: a stale binary looking at 100k rows it does
-        /// not understand plus 10 it does would otherwise compute a feed size of
-        /// 10, sit under every threshold, and never reach `mayCompact` — so the
-        /// refusal warning that is the only signal of the wedge never fires
-        /// while the file grows without bound.
+        /// Physical rows in the feed, including rows this build cannot use.
         public var physicalRowCount: Int
 
         public init(
@@ -138,22 +73,13 @@ public enum SnapshotTailOpLog {
 
         public static let clean = OpLogIntegrity()
 
-        /// Rows this build could not use. A torn trailing line does NOT count:
-        /// it is a write in flight, not a row we are about to destroy, and the
-        /// writer re-appends it. Blocking compaction on it would let one
-        /// unlucky read wedge compaction for good.
+        /// Malformed and unknown rows; the tolerated trailing partial is excluded.
         public var unusableRowCount: Int { malformedLineCount + undecodableRowCount }
 
-        /// True when nothing was skipped — the only state in which compaction
-        /// may rewrite the feed.
+        /// True when no unusable row was skipped.
         public var isClean: Bool { unusableRowCount == 0 }
 
-        /// The row count a compaction threshold must be compared against: the
-        /// PHYSICAL size of the feed, never the decoded-op count. `max` with a
-        /// caller-supplied decoded count is deliberate belt-and-braces — a
-        /// conformer that under-reports physical rows (0 from a stale
-        /// `JSONLReadReport`) then still thresholds on what it could decode,
-        /// i.e. the old behaviour, instead of never compacting at all.
+        /// Threshold on physical rows, at least the decoded count if a caller under-reports them.
         public func feedRowCount(decodedCount: Int) -> Int {
             max(decodedCount, physicalRowCount)
         }
@@ -172,20 +98,7 @@ public enum SnapshotTailOpLog {
         }
     }
 
-    // MARK: - The health surface (gpt-5.5 review 2026-08-02, finding 3)
-    //
-    // Refusing to compact trades liveness for safety, and the trade was only
-    // ever visible as a deduped stderr line — invisible in a GUI app. One
-    // future-format row can wedge compaction for weeks while every append
-    // replays an ever-longer feed, and the first symptom User would see is the
-    // desk getting slow. `OpLogHealth` is the readable version of that state:
-    // one value per feed, carrying BOTH the undecodable-row count and the
-    // physical size, so Doctor can say "this feed is stuck AND it is now 40k
-    // rows" before it hurts. The Doctor check that renders it lives in
-    // DoctorChecks (`OpLogHealthCheck`) — this type is the shared vocabulary,
-    // not a parallel reporting lane.
-
-    /// One op-log feed's health: what it cannot decode plus how big it has got.
+    /// Feed integrity and physical size for Doctor's OpLogHealthCheck.
     public struct OpLogHealth: Sendable, Equatable {
         public enum Status: String, Sendable, Equatable {
             /// Nothing skipped and the feed is within its normal band.
@@ -266,23 +179,19 @@ public enum SnapshotTailOpLog {
     /// Process-wide dedupe for the integrity log so a stale binary appending in
     /// a loop reports once per distinct signature instead of flooding stderr.
     /// Counts CHANGING re-arms it — new damage is new news.
-    private static let integrityLogLock = NSLock()
-    nonisolated(unsafe) private static var loggedIntegritySignatures: Set<String> = []
+    private static let loggedIntegritySignatures = Mutex<Set<String>>([])
     /// The dedupe memo is keyed on counts, so a feed accruing damage one line at
     /// a time mints a new signature each time. Cap it and start over rather than
     /// letting a long-lived process grow the set without bound — re-logging a
     /// signature is the harmless direction.
     private static let integrityLogMemoCap = 256
 
-    /// Insert `signature`, returning true when it is new. Caller must not hold
-    /// the lock.
+    /// Insert `signature`, returning true when it is new.
     private static func claimLogSlot(_ signature: String) -> Bool {
-        integrityLogLock.lock()
-        defer { integrityLogLock.unlock() }
-        if loggedIntegritySignatures.count >= integrityLogMemoCap {
-            loggedIntegritySignatures.removeAll(keepingCapacity: true)
+        loggedIntegritySignatures.withLock {
+            if $0.count >= integrityLogMemoCap { $0.removeAll(keepingCapacity: true) }
+            return $0.insert(signature).inserted
         }
-        return loggedIntegritySignatures.insert(signature).inserted
     }
 
     /// Report an unclean read on stderr, once per distinct (feed, path, counts).
@@ -296,10 +205,7 @@ public enum SnapshotTailOpLog {
         ))
     }
 
-    /// The compaction gate. Returns `true` when it is safe to rewrite the feed;
-    /// returns `false` AND logs when any row was unusable. Every op-log store
-    /// calls this immediately after its threshold check, so the one policy lives
-    /// in one place instead of wearing three filenames.
+    /// Refuse and report compaction while any row is unusable, preserving its original bytes and order.
     public static func mayCompact(_ integrity: OpLogIntegrity, feed: String, path: URL) -> Bool {
         guard !integrity.isClean else { return true }
         if claimLogSlot("refuse|\(feed)|\(path.path)|\(integrity.summary)") {
@@ -315,12 +221,8 @@ public enum SnapshotTailOpLog {
         return false
     }
 
-    /// Return the ops that FOLLOW `lastCompactedOpId` (the compaction tail).
-    /// Scans from the END so the LAST occurrence of the id wins — matching every
-    /// store's `lastIndex(where:)`. If the id is not present (a genesis feed, or
-    /// an already-truncated feed whose head is past the compacted op), `ops` is
-    /// returned unchanged. This also HEALS a crash between base-write and
-    /// truncate: a stale full op-log simply replays as its post-base suffix.
+    /// Replay after the last occurrence of the compacted id; an absent id leaves ops unchanged.
+    /// Prefix removal prevents double application after a crash between base and tail writes.
     public static func dropCompactedPrefix<Op>(
         _ ops: [Op],
         lastCompactedOpId: String,
@@ -330,25 +232,16 @@ public enum SnapshotTailOpLog {
         return Array(ops[(idx + 1)...])
     }
 
-    /// Atomic snapshot-BEFORE-truncate. Writes the compaction base first (via
-    /// the durable writer's full flush + rename), THEN
-    /// rewrites the op-log to exactly `tailRows`. Desk passes an EMPTY tail;
-    /// GitHubCommand and TaskLedger pass the kept newest-K. The caller must hold
-    /// the ops flock.
+    /// Durably write the base before replacing the tail; the caller holds the ops flock.
     public static func commitCompaction(
         baseJSON: JSONValue,
         tailRows: [JSONValue],
         basePath: URL,
-        opsPath: URL,
-        persistence: any PersistenceCoreProtocol
+        opsPath: URL
     ) async throws {
         let baseData = try baseJSON.serializedData(pretty: true)
-        var tailData = Data()
-        for row in tailRows {
-            tailData.append(contentsOf: try row.serialize(pretty: false).utf8)
-            tailData.append(0x0A)
-        }
-        try await persistence.writeDataAtomicDurable(baseData, to: basePath)
-        try await persistence.writeDataAtomicDurable(tailData, to: opsPath)
+        let tailData = try SwiftNativePersistenceCore.serializeJSONL(tailRows)
+        try await SwiftNativePersistenceCore.writeDataAtomicDurableAsync(baseData, to: basePath)
+        try await SwiftNativePersistenceCore.writeDataAtomicDurableAsync(tailData, to: opsPath)
     }
 }

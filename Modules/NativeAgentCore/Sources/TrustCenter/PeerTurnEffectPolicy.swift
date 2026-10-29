@@ -84,8 +84,7 @@ public enum PeerTurnEffectPolicy {
             + "\(tool) is not a read, so it waits for you."
     }
 
-    /// The floor's card: whose turn it was, the line of theirs that led
-    /// here (Agent, 10-02), and what the call is by its declared class.
+    /// The floor's card names the peer, quotes its request and states the call's declared class.
     public static func floorReason(tool: String, input: [String: JSONValue] = [:],
                                    requester: String, quote: String) -> String {
         let who = requester.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -103,18 +102,7 @@ public enum PeerTurnEffectPolicy {
             + "\(shown) is \(kind), so it waits for you."
     }
 
-    /// Agent's ruling, 2026-09-15: her OWN memory notes stay allowed on a peer
-    /// turn — attributed. What a peer cannot do is make her record its claims
-    /// as established fact, or as something the person wants. So the only
-    /// requirement on `commit_memory` here is PROVENANCE: the note has to say
-    /// where it came from. Persona and preference writers are not exempted by
-    /// wording — they are effects above, and they ask the person regardless.
-    ///
-    /// Provenance tagging plus the effect gate is the whole mechanism. There
-    /// is deliberately no classifier trying to detect steering.
-    /// The authenticated peer behind this turn. Identity comes from the
-    /// credential the transport verified and the contact record it resolves
-    /// to — never from anything the peer wrote in its message.
+    /// Peer identity comes from the verified transport credential and contact record, never message text.
     public struct PeerIdentity: Sendable, Equatable {
         public let id: String?
         public let name: String?
@@ -151,13 +139,7 @@ public enum PeerTurnEffectPolicy {
         let who = peer.display
         let name = normalized(ToolNameAliases.ranTool(tool, input: input))
         guard name == "commit_memory" else { return nil }
-        // Sol, 2026-09-15: this used to scan every argument for the substring
-        // "peer", which any sentence satisfies by accident and which rejected
-        // an honest "Sam told me…" because the turn only knew to look for the
-        // literal word. `commit_memory` already HAS the fields — provenance
-        // ∈ {verified, told, inferred} and provenance_by — so the requirement
-        // is simply that they are set and name this peer. No string scanning,
-        // and nothing the peer writes in prose can satisfy it.
+        // Peer-turn memory notes require provenance="told" and provenance_by naming the peer.
         let kind = string(input["provenance"])?
             .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard kind == "told" else {

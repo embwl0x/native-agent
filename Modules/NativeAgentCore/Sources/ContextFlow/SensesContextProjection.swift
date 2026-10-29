@@ -2,10 +2,10 @@ import Context
 import Foundation
 import MemoryV2
 import Senses
-// Blueprint: | `SensesContextProjection.swift` | `SensesContextProjection`: four bounded unread `news` atoms from `SenseNewsBoard`, selected from the published generation, verified for expiry/seen state before delivery, separately rendered and acknowledged only on provider output; expiry/seen exclusion also protects retained generations |
+// Blueprint: | `SensesContextProjection.swift` | `UnreadSenseNews`: four bounded unread `news` atoms from `SenseNewsBoard`, selected from the published generation, verified still unread before delivery (unread news does not expire), separately rendered and acknowledged only on provider output; seen exclusion also protects retained generations |
 
 /// A bounded unread-news slot, separate from topic-selected memories.
-public struct SensesContextProjection: ContextCompiledProjectionProvider, Sendable {
+public struct UnreadSenseNews: ContextCompiledProjectionProvider, Sendable {
     public static let maximumItems = 4
     public static let maximumUTF8Bytes = 4_096
     public static let maximumItemUTF8Bytes = 1_024
@@ -97,7 +97,7 @@ public struct SensesContextProjection: ContextCompiledProjectionProvider, Sendab
                 sourceID: id, kind: .news, headingPath: [],
                 sourceRange: ContextSourceRange(utf8Start: 0, utf8End: body.utf8.count),
                 sourceHash: hash, body: body, authority: .inferred, confidence: 0.5,
-                freshness: ContextFreshness(updatedAt: item.at, expiresAt: item.at.addingTimeInterval(SenseNewsBoard.maximumAge)), privacy: .localPrivate,
+                freshness: ContextFreshness(updatedAt: item.at), privacy: .localPrivate,
                 permittedSurfaces: surfaces, injectionPolicy: .always, contentRole: .untrustedExternalData,
                 entities: [ContextEntity(kind: "sense", id: senseID, label: senseID)],
                 triggers: NativeContextProjectionText.triggers(body), activation: 0,

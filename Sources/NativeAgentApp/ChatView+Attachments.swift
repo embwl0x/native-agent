@@ -9,71 +9,35 @@ import ScreenVision
 // Blueprint: | `ChatView+Attachments.swift` | `ChatView`: `endDictation`, `toggleVoice`, `captureScreen` |
 
 extension ChatView {
-    /// Stop recognition without writing anything through the composer. Called
-    /// when the dictating conversation stops being the one on screen — the
-    /// composer is already pointed elsewhere, so the stop has nothing to say
-    /// to it (2026-09-06).
+    /// Stop recognition without writing into the newly selected conversation's composer.
     func endDictation() {
         voiceSessionId = ""
         voiceDraftBeforeListening = ""
-        // 2026-09-06: also cancels a start that is still waiting on the
-        // microphone permission prompt, which has no recognition to stop yet.
+        // Invalidate starts still waiting for microphone permission.
         voiceGeneration &+= 1
         guard voiceInput.isListening else { return }
-        Task { @MainActor in _ = await voiceInput.stopListening() }
+        Task { @MainActor in _ = await voiceInput.stopListeningResult() }
     }
 
     func toggleVoice() {
         if voiceInput.isListening {
             Task { @MainActor in _ = await finishDictation() }
         } else {
-            // Starting to talk ends her talking. Opening the microphone while
-            // playback is still running means she is speaking into her own
-            // input and he is talking over her; the person reaching for the
-            // mic has already said which of the two matters (2026-09-13).
             voiceOutput.stop()
-            VoiceOutputController.sharedMessagePlayback.stop()
-            // Clear any prior error so we can detect fresh failures from the
-            // current attempt (requestPermission may set errorMessage too).
-            voiceInput.errorMessage = nil
-            showToast("Checking microphone...")
-            // 2026-09-06: the conversation this dictation belongs to is the
-            // one the button was pressed in. Reading it after the permission
-            // prompt started listening on whichever conversation the person
-            // had moved to, and `endDictation` on the way out could not stop
-            // a start that had not happened yet.
             let startSessionId = appModel.activeChatSessionId
             let startGeneration = voiceGeneration
             Task {
                 if !voiceSessionId.isEmpty { _ = await finishDictation() }
-                let granted = await voiceInput.requestPermission()
-                guard granted else {
-                    // requestPermission already set a specific errorMessage
-                    // (speech vs mic) — surface it.
-                    let msg = voiceInput.errorMessage
-                        ?? "Microphone or speech permission denied. Enable in System Settings → Privacy & Security."
-                    showToast(msg)
-                    return
-                }
-                // The prompt suspends. If the conversation moved on while it
-                // was up, this dictation has nothing to dictate into.
-                // The composer may also have LEFT while the prompt was up
-                // (Chat → Settings) with the same conversation still active,
-                // which the session fence alone cannot see.
-                guard appModel.activeChatSessionId == startSessionId,
-                      voiceGeneration == startGeneration
-                else { return }
-                voiceDraftBeforeListening = text
-                voiceDraftRevision = draft.manualEditRevision
-                voiceSessionId = startSessionId
-                voiceInput.startListening()
-                // startListening sets errorMessage if the audio engine refused
-                // (busy device, no input route, etc.) — surface that too.
-                if let msg = voiceInput.errorMessage, !voiceInput.isListening {
-                    showToast(msg)
-                } else if voiceInput.isListening {
-                    showToast("Listening")
-                }
+                _ = await ChatAttachmentTypeResolver.beginDictation(
+                    voiceInput, draft: draft,
+                    isCurrent: { appModel.activeChatSessionId == startSessionId && voiceGeneration == startGeneration },
+                    prepareDraft: { base, revision in
+                        voiceDraftBeforeListening = base
+                        voiceDraftRevision = revision
+                        voiceSessionId = startSessionId
+                    },
+                    showToast: showToast
+                )
             }
         }
     }
@@ -81,25 +45,14 @@ extension ChatView {
     func finishDictation() async -> Bool {
         let listeningSession = voiceSessionId
         let stoppedGeneration = voiceGeneration
-        let stoppedDraftRevision = voiceDraftRevision
-        let wasListening = voiceInput.isListening
-        let result = await voiceInput.stopListeningResult()
-        guard listeningSession == appModel.activeChatSessionId,
-              voiceSessionId == listeningSession,
-              stoppedGeneration == voiceGeneration else { return false }
-        guard draft.manualEditRevision == stoppedDraftRevision else {
-            // The person's own edit stands over late recognition, and the
-            // action they asked for (Send, capture) goes on with it.
+        return await ChatAttachmentTypeResolver.finishDictation(
+            voiceInput, draft: draft, revision: voiceDraftRevision,
+            isCurrent: { listeningSession == appModel.activeChatSessionId
+                && voiceSessionId == listeningSession && stoppedGeneration == voiceGeneration },
+            base: { voiceDraftBeforeListening }, finished: {
             voiceSessionId = ""
             voiceDraftBeforeListening = ""
-            return true
-        }
-        let accepted = ChatComposerSupport.finishDictation(
-            result, wasListening: wasListening, base: &voiceDraftBeforeListening,
-            draft: &text, attachments: &pendingAttachments,
-            attachment: voiceInput.attachment, showToast: showToast)
-        voiceSessionId = ""
-        return accepted
+        }, attach: { pendingAttachments.append($0) }, showToast: showToast)
     }
 
     func captureScreen() {
@@ -108,10 +61,7 @@ extension ChatView {
             return
         }
         guard !isCapturing else { return }
-        // 2026-09-06: a screenshot send is a send, so it takes the send latch
-        // too. Admission suspends before it marks the session busy, so a
-        // Return whose send is still in flight leaves `isBusy` false and the
-        // capture button live — the screenshot was admitted as a second turn.
+        // Screenshot sends share the send latch because admission suspends before marking the session busy.
         guard !isSubmittingSend else { return }
         guard appModel.engine.trust.policy?.multimodalPolicy?.screen_capture == true else {
             showToast("Enable screen capture in Trust → Features → Multimodal")
@@ -122,93 +72,47 @@ extension ChatView {
             return
         }
         let captureSessionId = appModel.activeChatSessionId
-        let capturedDraft = text
-        // 2026-09-06: the snapshot's own edit time, for the send-clear below.
-        let capturedDraftEditedAt = draftEditedAt
-        let capturedAttachments = pendingAttachments
-        let capturedAttachmentIds = Set(capturedAttachments.map(\.id))
+        let captured = ChatAttachmentTypeResolver.ScreenshotDraft(draft, attachments: pendingAttachments)
         isCapturing = true
         isSubmittingSend = true
         showToast("Capturing screen...")
-        let prompt = capturedDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? "Look at this screenshot and tell me what you see."
-            : capturedDraft
         Task {
             defer {
                 isCapturing = false
                 isSubmittingSend = false
             }
-            do {
-                // ScreenVision v1 (2026-06-06): the mouse-display hint is
-                // dropped — the new module captures the primary
-                // (CGMainDisplayID) display only. Multi-display selection is
-                // v2 scope. Skip the MainActor hop that used to compute the
-                // hint; the static func still accepts (and ignores) a
-                // preferredDisplayID for source-compat with other callers.
-                let capture = try await Task.detached(priority: .userInitiated) {
-                    try await NativeScreenCapture.captureImageBase64()
-                }.value
+            await ChatAttachmentTypeResolver.sendScreenshot(captured, canSubmit: {
                 guard appModel.activeChatSessionId == captureSessionId else {
                     showToast("Screen capture canceled because the chat changed")
-                    return
+                    return false
                 }
-                let mb = Double(capture.byteSize) / (1024.0 * 1024.0)
-                showToast(String(format: "Sending screenshot (%.1f MB)...", mb))
-                let attachment = MultimodalAttachment(
-                    type: "image",
-                    base64: capture.base64,
-                    mime: capture.mime,
-                    name: capture.name,
-                    byteSize: capture.byteSize
-                )
-                let attachments = capturedAttachments + [attachment]
+                return true
+            }, submit: { prompt, attachments in
                 scrollCoordinator.forceFollow()
-                let acceptance = await appModel.startActiveChatTurn(
-                    prompt,
-                    attachments: attachments,
-                    expectedSessionId: captureSessionId
-                )
-                switch acceptance {
-                case .accepted(let acceptedSessionId), .queued(let acceptedSessionId, _):
-                    // 2026-09-06: admission suspends; only clear the captured chat's visible draft.
-                    guard acceptedSessionId == captureSessionId,
-                          appModel.activeChatSessionId == acceptedSessionId,
-                          draftSessionId == acceptedSessionId
-                    else { return }
-                    // 2026-09-06: reveal the accepted exchange even when newer draft edits remain.
-                    transcriptLatestRequest &+= 1
-                    scrollCoordinator.forceFollow()
-                    let currentAttachmentIds = Set(pendingAttachments.map(\.id))
-                    guard text == capturedDraft,
-                          currentAttachmentIds == capturedAttachmentIds
-                    else { return }
-                    appModel.clearChatDraftAfterSend(
-                        capturedDraft,
-                        sessionId: captureSessionId,
-                        editedAt: capturedDraftEditedAt
-                    )
-                    pendingAttachments = []
+                return await appModel.startActiveChatTurn(
+                    prompt, attachments: attachments, expectedSessionId: captureSessionId)
+            }, accepted: { acceptedSessionId in
+                guard acceptedSessionId == captureSessionId,
+                      appModel.activeChatSessionId == acceptedSessionId,
+                      draftSessionId == acceptedSessionId else { return }
+                transcriptLatestRequest &+= 1
+                scrollCoordinator.forceFollow()
+                if captured.clearIfUnchanged(appModel: appModel, draft: draft, attachments: &pendingAttachments) {
                     endDictation()
-                case .rejected(let message):
-                    showToast(message)
                 }
-            } catch let error as NativeScreenCapture.CaptureError {
-                showToast(error.localizedDescription)
-            } catch {
-                showToast(UserFacingError.message(error, action: "send the screenshot"))
-            }
+            }, showToast: showToast)
         }
     }
 
     func composeVoiceDraft(_ transcript: String) {
-        draft.dictate(ChatComposerSupport.voiceDraft(base: voiceDraftBeforeListening, transcript: transcript),
+        draft.dictate(ChatAttachmentTypeResolver.voiceDraft(base: voiceDraftBeforeListening, transcript: transcript),
                       revision: voiceDraftRevision)
     }
 
     /// Prefer a copied image; otherwise let the person choose files.
     func attachFromClipboardOrPickFile() {
         let destination = appModel.activeChatSessionId
-        ChatComposerSupport.attachFromClipboardOrPickFile(
+        ChatAttachmentTypeResolver.attachFromClipboardOrPickFile(
             appendImage: { appModel.chatPendingAttachments[destination, default: []].append($0) },
             attachFile: { attachLocalFile($0, sessionId: destination) },
             showToast: showToast,
@@ -218,7 +122,7 @@ extension ChatView {
 
     /// Picker, paste and drop share the same bounded file intake.
     func attachLocalFile(_ url: URL, sessionId: String) {
-        ChatComposerSupport.attachLocalFile(
+        ChatAttachmentTypeResolver.attachLocalFile(
             url,
             to: appModel,
             sessionId: sessionId,
@@ -229,7 +133,7 @@ extension ChatView {
 
     func handleDrop(providers: [NSItemProvider]) {
         let destination = appModel.activeChatSessionId
-        ChatComposerSupport.attachProviders(
+        ChatAttachmentTypeResolver.attachProviders(
             providers,
             appendImage: { appModel.chatPendingAttachments[destination, default: []].append($0) },
             attachFile: { attachLocalFile($0, sessionId: destination) },

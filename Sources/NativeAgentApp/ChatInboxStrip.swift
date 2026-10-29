@@ -6,25 +6,18 @@ import NotificationInbox
 import ApprovalInbox
 import AppKit
 import CoreGraphics
-import ScreenCaptureKit
 import ScreenVision
-import Speech
-import AVFoundation
 import UniformTypeIdentifiers
 import NativeAgentShared
 import MemoryV2
 import PersistenceCore
-#if canImport(CoreSpotlight)
-import CoreSpotlight
-#endif
-#if canImport(CloudKit)
-import CloudKit
 import DeviceSync
-#endif
 
 // Blueprint: | `ChatInboxStrip.swift` | `InboxStripContainer`: compact unread-note/approval/card projection; reading does not resolve and settled origins archive their pointer |
 
 struct InboxStripContainer<Header: View>: View {
+    let sessionID: String
+    let interactionBinding: InlineInteractionChatBinding
     /// Fluid glass A2: unread notes are one capsule; the host places it (the
     /// chat header) and the strip keeps other chats' approvals and cards.
     @ViewBuilder let header: (InboxNotesCapsule) -> Header
@@ -45,14 +38,15 @@ struct InboxStripContainer<Header: View>: View {
     private var stripApprovals: [ApprovalRecord] {
         appModel.engine.approvals.records.filter {
             $0.status == "pending" && !$0.isAgentsOwnDecision
-                && (!$0.chatCardDelivered || $0.chatCardSessionId != appModel.activeChatSessionId)
+                && (!$0.chatCardDelivered || $0.chatCardSessionId != sessionID)
         }
     }
     private var stripCards: [InboxItemRecord] {
-        items.filter { $0.source == InlineInteractionDelivery.source && $0.chat_session_id != appModel.activeChatSessionId }
+        items.filter { $0.source == InlineInteractionDelivery.source && $0.chat_session_id != sessionID }
     }
 
     var body: some View {
+        let originSessions = Set(stripCards.prefix(2).compactMap { (try? InlineInteractionDelivery.Pointer(item: $0))?.sessionID })
         VStack(alignment: .leading, spacing: 4) {
         header(InboxNotesCapsule(
             items: items.filter { $0.source != InlineInteractionDelivery.source && !$0.hasLinkedApproval },
@@ -63,11 +57,7 @@ struct InboxStripContainer<Header: View>: View {
                 // lingering until the next file event, then publish the same state
                 // to peripheral surfaces.
                 await appModel.engine.inbox.refresh()
-                if let inboxSnapshotWriterOverride = appModel.inboxSnapshotWriterOverride {
-                    await inboxSnapshotWriterOverride()
-                } else {
-                    await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots()
-                }
+                await NativeAgentEngine.liveDeviceSync.engine.writeSnapshots()
             }
         ))
         if let approvalError = appModel.engine.approvals.refreshErrorText {
@@ -87,7 +77,7 @@ struct InboxStripContainer<Header: View>: View {
                     .padding(.bottom, 8)
                 }
                 ForEach(stripCards.prefix(2)) { item in
-                    InteractionInboxCard(item: item)
+                    InteractionInboxCard(item: item, binding: interactionBinding)
                 }
             }
             .padding(.horizontal, 16)
@@ -105,14 +95,15 @@ struct InboxStripContainer<Header: View>: View {
             guard scenePhase == .active else { return }
             await appModel.engine.inbox.observe()
         }
-        .onChange(of: appModel.inboxReloadGeneration) { _, _ in
-            Task { await appModel.engine.inbox.refresh() }
+        .task(id: originSessions) {
+            for session in originSessions.sorted() {
+                guard !Task.isCancelled else { return }
+                await appModel.engine.transcripts.refreshCards(in: session)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: InlineInteractionWire.changedNotification)) { event in
+            guard let session = event.object as? String, originSessions.contains(session) else { return }
+            Task { await appModel.engine.transcripts.refreshCards(in: session) }
         }
     }
 }
-// PATCH-2026-05-07: chat-provider-picker Now shows Provider → Model
-// dual picker. Provider list comes from /v1/providers (cached on AppModel
-// as providersList). Model list narrows to whatever the SELECTED provider
-// exposes — so picking Anthropic shows Claude models, picking ChatGPT
-// shows GPT models, etc. Falls back to the catalog-based static list when
-// no provider is matched (codex / local / etc).

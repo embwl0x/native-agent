@@ -8,14 +8,12 @@
   const TYPE_YIELD_EVERY = 32;
   const snapshots = new Map();
   let scrollObservation = null;
-  const documentIdentity = crypto.randomUUID();
   const elementIdentities = new WeakMap();
   const elementFragments = new WeakMap();
   const fragmentCounts = new Map();
   const allocatedFragments = new Set();
   let documentLinkTargets = new WeakMap();
-  const typingRuns = new Set();
-  const waitingRuns = new Set();
+  const activeRuns = new Set();
   const cancelledActions = new Set();
   let domGeneration = 0;
   // Coalesce mutation bursts in the page. This is a publication cadence, not
@@ -23,31 +21,27 @@
   const CHANGE_DEBOUNCE_MS = 250;
   let observedTab = null;
   let changeTimer = null;
-  const changeObserver = new MutationObserver(queuePageChange);
   const inputBindings = [];
 
-  for (const kind of ["pointerdown", "keydown", "wheel", "touchstart"]) {
+  for (const [kind, input] of [["pointerdown", "pointer"], ["keydown", "keyboard"], ["wheel", "scroll"], ["touchstart", "touch"]]) {
     const listener = (event) => {
       if (event.isTrusted !== true) return;
       stopChangeStream();
       snapshots.clear();
       scrollObservation = null;
-      for (const run of typingRuns) run.stopReason = "user_takeover";
-      for (const run of waitingRuns) run.stopReason = "user_takeover";
+      for (const run of activeRuns) stopRun(run, "user_takeover");
+      notifyHost({ type: "nativeagent.user-touch", kind: input });
     };
     inputBindings.push([kind, listener]);
     window.addEventListener(kind, listener, { capture: true, passive: true });
   }
 
   const MUTATION_SCOPE = { subtree: true, childList: true, attributes: true, characterData: true };
-  // 2026-09-06: a MutationObserver on `document` does not see inside an open
-  // shadow root, but the snapshot walker does — so a component that swapped its
-  // own button out left every node id looking fresh. Each root the walker
-  // entered is observed too.
-  // Strong, on purpose: a MutationObserver already holds every node it observes
-  // strongly, so a WeakSet only hid the roots from us — it never let one go.
+  // Observe open shadow roots entered by the walker as well as the document.
+  // A MutationObserver retains every root it observes strongly.
   const observedShadowRoots = new Set();
   const domObserver = new MutationObserver((records) => {
+    queuePageChange();
     domGeneration += 1;
     const invalidatedSnapshotIds = [...snapshots.keys()];
     const retainedNavigationNodes = {};
@@ -74,7 +68,6 @@
 
   function stopChangeStream() {
     observedTab = null;
-    changeObserver.disconnect();
     clearTimeout(changeTimer);
     changeTimer = null;
   }
@@ -82,11 +75,6 @@
   function startChangeStream(message) {
     const newlyAttached = observedTab?.tabId !== message.tabId;
     observedTab = { tabId: message.tabId, userSequence: message.userSequence };
-    changeObserver.disconnect();
-    changeObserver.observe(document, MUTATION_SCOPE);
-    for (const root of observedShadowRoots) {
-      if (root.host?.isConnected === true) changeObserver.observe(root, MUTATION_SCOPE);
-    }
     if (newlyAttached) queuePageChange();
   }
 
@@ -108,21 +96,14 @@
       observedShadowRoots.add(root);
       try {
         domObserver.observe(root, MUTATION_SCOPE);
-        if (observedTab) changeObserver.observe(root, MUTATION_SCOPE);
       } catch {
-        // A root that cannot be observed simply keeps the old behaviour for
-        // its subtree; it must never cost the caller the whole snapshot.
+        // An unobservable root must not cost the caller the whole snapshot.
         observedShadowRoots.delete(root);
       }
     }
   }
 
-  // 2026-09-06: a MutationObserver cannot drop one of its targets, so every
-  // shadow root the walker ever entered stayed observed — and alive — for the
-  // life of the page, long after its host left the document. Each snapshot
-  // rebuilds the observation set from the roots still attached. Records queued
-  // before the rebuild describe a DOM the snapshot about to be taken already
-  // reflects, so losing them costs nothing.
+  // Rebuild observation from attached roots; the next snapshot reflects queued mutations.
   function pruneObservedShadowRoots() {
     let stale = false;
     for (const root of observedShadowRoots) {
@@ -134,12 +115,9 @@
     if (!stale) return;
     domObserver.disconnect();
     domObserver.observe(document, MUTATION_SCOPE);
-    changeObserver.disconnect();
-    if (observedTab) changeObserver.observe(document, MUTATION_SCOPE);
     for (const root of observedShadowRoots) {
       try {
         domObserver.observe(root, MUTATION_SCOPE);
-        if (observedTab) changeObserver.observe(root, MUTATION_SCOPE);
       } catch {
         observedShadowRoots.delete(root);
       }
@@ -149,89 +127,79 @@
   const messageListener = (message, _sender, sendResponse) => {
     if (!message?.type?.startsWith("nativeagent.page.")) return false;
     try {
+      // The same request identity governs synchronous and suspended handlers.
+      if (cancelledActions.has(message.actionId)) throw pageError("action_cancelled", "The page action was cancelled before dispatch.");
+      let result;
       switch (message.type) {
         case "nativeagent.page.observe":
           startChangeStream(message);
-          sendResponse({ ok: true, result: { observing: observedTab !== null,
-            ready: document.readyState !== "loading", url: location.href } });
+          result = { observing: observedTab !== null,
+            ready: document.readyState !== "loading", url: location.href };
           break;
         case "nativeagent.page.tab.invalidated":
           if (observedTab?.tabId === message.tabId) stopChangeStream();
           if (scrollObservation?.tabId === message.tabId) scrollObservation = null;
-          for (const run of typingRuns) {
-            if (run.tabId === message.tabId) run.stopReason = "tab_not_owned";
-          }
-          for (const run of waitingRuns) {
-            if (run.tabId === message.tabId) run.stopReason = "tab_not_owned";
+          for (const run of activeRuns) {
+            if (run.tabId === message.tabId) stopRun(run, "tab_not_owned");
           }
           for (const [id, snapshot] of snapshots) {
             if (snapshot.tabId === message.tabId) snapshots.delete(id);
           }
-          sendResponse({ ok: true, result: { invalidated: true } });
+          result = { invalidated: true };
           break;
         case "nativeagent.page.action.cancel":
           cancelledActions.add(message.requestId);
           if (cancelledActions.size > 128) cancelledActions.delete(cancelledActions.values().next().value);
-          for (const run of typingRuns) if (run.actionId === message.requestId) run.stopReason = "action_cancelled";
-          for (const run of waitingRuns) if (run.actionId === message.requestId) run.stopReason = "action_cancelled";
-          sendResponse({ ok: true, result: { cancelled: true } });
+          for (const run of activeRuns) if (run.actionId === message.requestId) stopRun(run, "action_cancelled");
+          result = { cancelled: true };
           break;
         case "nativeagent.page.snapshot":
-          sendResponse({ ok: true, result: createSnapshot(message) });
+          result = createSnapshot(message);
           break;
         case "nativeagent.page.click":
-          sendResponse({ ok: true, result: clickNode(message) });
+          result = clickNode(message);
           break;
         case "nativeagent.page.fill":
-          sendResponse({ ok: true, result: fillNode(message) });
+          result = fillNode(message);
           break;
         case "nativeagent.page.type":
-          void typeIntoNode(message).then(
-            (result) => sendResponse({ ok: true, result }),
-            (error) => sendPageError(sendResponse, error),
-          );
-          return true;
+          result = typeIntoNode(message);
+          break;
         case "nativeagent.page.select":
-          sendResponse({ ok: true, result: selectNode(message) });
+          result = selectNode(message);
           break;
         case "nativeagent.page.keypress":
-          sendResponse({ ok: true, result: keypressNode(message) });
+          result = keypressNode(message);
           break;
         case "nativeagent.page.set_checked":
-          sendResponse({ ok: true, result: setCheckedNode(message) });
+          result = setCheckedNode(message);
           break;
         case "nativeagent.page.double_click":
-          sendResponse({ ok: true, result: doubleClickNode(message) });
+          result = doubleClickNode(message);
           break;
         case "nativeagent.page.drag":
-          sendResponse({ ok: true, result: dragNode(message) });
+          result = dragNode(message);
           break;
         case "nativeagent.page.wait":
-          void waitForNodeState(message).then(
-            (result) => sendResponse({ ok: true, result }),
-            (error) => sendPageError(sendResponse, error),
-          );
-          return true;
-        case "nativeagent.page.history":
-          // After the reply, so it is not lost to the page unloading.
-          setTimeout(() => history.go(message.delta < 0 ? -1 : 1), 0);
-          sendResponse({ ok: true, result: { length: history.length } });
+          result = waitForNodeState(message);
           break;
         case "nativeagent.page.scroll":
-          void scrollPage(message).then(
-            (result) => sendResponse({ ok: true, result }),
-            (error) => sendPageError(sendResponse, error),
-          );
-          return true;
+          result = scrollPage(message);
+          break;
         case "nativeagent.page.media":
-          void controlMedia(message).then(
-            (result) => sendResponse({ ok: true, result }),
-            (error) => sendPageError(sendResponse, error),
-          );
-          return true;
+          result = controlMedia(message);
+          break;
         default:
-          sendResponse({ ok: false, error: { code: "unknown_page_action", message: "Unknown page action." } });
+          throw pageError("unknown_page_action", "Unknown page action.");
       }
+      if (result instanceof Promise) {
+        void result.then(
+          (value) => sendResponse({ ok: true, result: value }),
+          (error) => sendPageError(sendResponse, error),
+        );
+        return true;
+      }
+      sendResponse({ ok: true, result });
     } catch (error) {
       sendPageError(sendResponse, error);
     }
@@ -247,8 +215,7 @@
     snapshots.clear();
     scrollObservation = null;
     for (const [kind, listener] of inputBindings) window.removeEventListener(kind, listener, { capture: true });
-    for (const run of typingRuns) run.stopReason = "tab_not_owned";
-    for (const run of waitingRuns) run.stopReason = "tab_not_owned";
+    for (const run of activeRuns) stopRun(run, "tab_not_owned");
     // An invalidated extension context has already lost its runtime listener.
     if (runtime.id) runtime.onMessage.removeListener(messageListener);
   };
@@ -287,17 +254,23 @@
     const nodeIdByElement = new Map();
     const nodes = [];
     const truncationReasons = [];
-    if (message.readCursor && (message.readCursor.frameURL ?? message.readCursor.url) !== location.href) throw pageError("page_changed", "This continuation belongs to another page. Read the current page again.");
+    let pageMoved = Boolean(message.readCursor && (message.readCursor.frameURL ?? message.readCursor.url) !== location.href);
     const viewportObservationId = message.readCursor?.viewportObservationId;
-    const observation = viewportObservationId ? scrollObservation : null;
-    if (viewportObservationId && (!observation || observation.id !== viewportObservationId
-      || observation.tabId !== message.tabId || (observation.target !== window && !observation.target.isConnected))) {
-      throw pageError("read_address_missing", "The scroll viewport is no longer available. Read the page again.");
-    }
+    const observation = viewportObservationId && scrollObservation?.id === viewportObservationId
+      && scrollObservation.tabId === message.tabId
+      && (scrollObservation.target === window || scrollObservation.target.isConnected) ? scrollObservation : null;
+    if (viewportObservationId && !observation) pageMoved = true;
+    const target = observation?.target ?? window;
     const viewportRoot = observation?.target === window ? document.body : observation?.target;
+    const view = readingViewport(target);
+    let cursor = !pageMoved ? message.readCursor : null;
+    if (cursor?.position && (cursor.position.scrollX !== view.scrollX || cursor.position.scrollY !== view.scrollY)) {
+      pageMoved = true;
+      cursor = null;
+    }
     languageNavigationCache = new WeakMap();
-    let walk = composedElementWalk(viewportRoot ?? document.body, 5_000, Boolean(observation), message.readCursor?.elementPath);
-    const viewportChanged = observation ? viewportChange(observation.before, captureViewport(observation.target, walk)) : null;
+    let walk = readingElementWalk([viewportRoot ?? document.body], target, 5_000, cursor?.position);
+    const viewportChanged = observation ? viewportChange(observation.before, captureViewport(observation.target)) : null;
     pruneObservedShadowRoots();
     observeShadowRoots(walk.shadowRoots);
     const modalSelector = "dialog, [role=dialog][aria-modal=true], [role=alertdialog][aria-modal=true]";
@@ -313,45 +286,40 @@
     const articleRegions = [...new Set(regions)].filter((element) => isVisible(element)
       && element.matches("article, [role=article], [role=document], [itemprop~=articleBody]"));
     const bodies = articleRegions.filter(element => !articleRegions.some(other => other !== element && withinElement(element, other)));
-    const contentRegions = mainRegions.length ? mainRegions : bodies;
-    // Spend the walk budget inside semantic content, not the surrounding nav.
-    // A single authored body leads the same main; repeated cards keep DOM order.
-    if (readingScope === "main_content" && !observation) {
-      const firstBody = bodies.length === 1 && (!mainRegions.length || mainRegions.some(main => withinElement(bodies[0], main))) ? bodies : [];
-      const roots = [...new Set([...firstBody, ...contentRegions, ...modals])];
-      walk = composedElementWalk(document.body, 5_000, false, message.readCursor?.elementPath, roots, true);
+    const mainContentAvailable = mainRegions.length > 0 || bodies.length > 0;
+    const contentRegions = mainRegions.length ? mainRegions : bodies.length ? bodies : [document.body].filter(Boolean);
+    // Scope and viewport priority apply before either the walk or row budget.
+    if (readingScope === "main_content" && !viewportRoot) {
+      const roots = [...new Set([...contentRegions, ...modals])];
+      walk = readingElementWalk(roots, target, 5_000, cursor?.position);
       observeShadowRoots(walk.shadowRoots);
       for (const root of walk.shadowRoots) modalRoots.add(root);
       modals = [...new Set([...modalRoots].flatMap(root => [...root.querySelectorAll(modalSelector)]))]
         .filter((element) => isVisible(element) && isModal(element));
     }
-    if (message.readCursor?.elementPath && message.readCursor?.addressFragment) {
-      const target = walk.elements.find(element => stableElementPath(element) === message.readCursor.elementPath);
-      const expected = message.readCursor.addressFragment.replace(/^frame\/\d+\//, "");
-      if (!target || readableElementFragment(target, message.readCursor.name || "") !== expected) {
-        throw pageError("read_address_missing", "This reading place changed or disappeared. Read the current page again.");
-      }
-    }
     // Scope before spending the node/text budget. A long visible sidebar must
     // not consume all available evidence before the adjacent article. The
     // shadow walk cap, redaction, and modal action checks still apply. Scroll
-    // readbacks use their observed viewport; ordinary reads retain DOM order.
+    // reads all begin in the current viewport and then reach nearby material.
     let candidates = readingScope === "page" ? walk.elements : walk.elements.filter((element) =>
       modals.some((modal) => withinElement(element, modal))
       || (contentRegions.some((region) => withinElement(element, region)) && !insideNavigation(element)));
-    if (message.readCursor?.elementOnly === true) {
-      const element = walk.elements.find(element => stableElementPath(element) === message.readCursor.elementPath);
-      if (!element || element.tagName.toLowerCase() !== "select") throw pageError("invalid_read_cursor", "The folded select control is no longer present.");
-      candidates = [element];
+    // A continuation is a place in the rendered page, never a DOM address.
+    // Recycled/removed rows simply leave whatever is now beyond that place.
+    if (cursor?.position) candidates = candidates.filter(element => compareReadingPosition(walk.positions.get(element), cursor.position) >= 0);
+    const continuedElement = cursor?.position && candidates.find(element => compareReadingPosition(walk.positions.get(element), cursor.position) === 0);
+    if (cursor?.position && !continuedElement) pageMoved = true;
+    if (cursor?.elementOnly === true) {
+      if (continuedElement?.tagName.toLowerCase() === "select") candidates = [continuedElement];
+      else { pageMoved = true; cursor = null; }
     }
+    const readAt = (element, offsets = {}) => ({ position: walk.positions.get(element),
+      ...(observation ? { viewportObservationId: observation.id } : {}), name: sectionName, ...offsets });
     const glyphCounts = fragmentedTextGlyphCounts(candidates);
     const collapsedText = new Set();
     let nextRead = null;
     let aggregateNodeText = 0;
-    // 2026-09-23: node text honors max_text_chars too; only the summary was
-    // bounded, so a 1k-char ask still shipped up to 200k chars of nodes.
-    // The caller can enlarge both budgets. Oversized controls fold their own
-    // content instead of becoming an impassable page continuation.
+    // Node text shares the summary budget; oversized controls fold their content.
     const nodeByteBudget = Math.max(12_000, maxTextChars);
     const utf8 = new TextEncoder();
     let aggregateNodeBytes = 0;
@@ -373,11 +341,48 @@
         for (const ids of actionNodeIds.values()) ids.delete(node.nodeId);
       }
       aggregateNodeText = boundary.chars; aggregateNodeBytes = boundary.bytes;
-      nextRead = { elementPath: stableElementPath(boundary.element), addressFragment: readableElementFragment(boundary.element, boundary.sectionName), textOffset: 0,
-        name: boundary.sectionName };
+      nextRead = readAt(boundary.element, { textOffset: 0, name: boundary.sectionName });
       return true;
     };
     if (walk.truncated) truncationReasons.push("walk_limit");
+
+    function retainNode(element, presentation, fullText, selectInfo = null) {
+      const nodeId = `n${nodes.length + 1}`;
+      if (!elementIdentities.has(element)) elementIdentities.set(element, crypto.randomUUID());
+      nodeIdByElement.set(element, nodeId); elementByNodeId.set(nodeId, element);
+      // Presentation compaction never changes the full action identity.
+      identityByNodeId.set(nodeId, nodeIdentity(element, bounded(accessibleName(element, fullText), 500)));
+      if (selectInfo) selectProofs.set(nodeId, {
+        description: JSON.stringify(selectDescription(element, 0, Infinity)), observed: selectInfo.options,
+      });
+      const navigationProof = captureNavigationProof(element);
+      if (navigationProof) navigationProofs.set(nodeId, navigationProof);
+      const rect = element.getBoundingClientRect();
+      const role = element.getAttribute("role") ?? implicitRole(element);
+      const blockedByModal = modals.length > 0 && (modals.length !== 1 || !withinElement(element, modals[0]));
+      const actions = snapshotActions(element, role, blockedByModal);
+      let parent = composedParent(element);
+      while (parent && !nodeIdByElement.has(parent)) parent = composedParent(parent);
+      nodes.push({
+        nodeId, elementIdentity: elementIdentities.get(element), elementPath: stableElementPath(element),
+        addressFragment: readableElementFragment(element, presentation.sectionName),
+        parentNodeId: parent ? nodeIdByElement.get(parent) : null,
+        kind: elementKind(element), role, ...readingStructure(element), value: safeValue(element),
+        level: headingLevel(element), visible: true,
+        states: {
+          disabled: isEffectivelyDisabled(element), checked: ariaBoolean(element, "aria-checked", "checked"),
+          selected: ariaBoolean(element, "aria-selected", "selected"),
+          expanded: nullableAriaBoolean(element.getAttribute("aria-expanded")), editable: isEditable(element), blockedByModal,
+        },
+        actions, url: safeURL(element), scrollable: actions.includes("scroll"),
+        bounds: { x: finite(rect.x), y: finite(rect.y), width: Math.max(0, finite(rect.width)), height: Math.max(0, finite(rect.height)) },
+        ...presentation,
+      });
+      for (const action of actions) {
+        if (!actionNodeIds.has(action)) actionNodeIds.set(action, new Set());
+        actionNodeIds.get(action).add(nodeId);
+      }
+    }
 
     for (const element of candidates) {
       if (collapsedText.has(element)) {
@@ -389,9 +394,10 @@
       if (kind === "image" && !meaningfulImageName(element)) continue;
       if (kind === "link" && representedLinks.has(stableElementPath(element))) continue;
       const fragmented = element.children.length > 0 && glyphCounts.get(element) >= 2 && !element.closest("pre, code");
-      const fullText = fragmented ? normalizedText(visibleFragmentedText(element)) : snapshotText(element);
-      const textOffset = message.readCursor?.elementPath === stableElementPath(element) ? (message.readCursor.textOffset ?? 0) : 0;
-      if (!Number.isSafeInteger(textOffset) || textOffset < 0 || textOffset > fullText.length) throw pageError("invalid_read_cursor", "The page text continuation is no longer present.");
+      const runs = fragmented ? [] : inlineText(element);
+      const fullText = fragmented ? normalizedText(visibleFragmentedText(element)) : snapshotText(element, runs);
+      let textOffset = element === continuedElement ? (cursor?.textOffset ?? 0) : 0;
+      if (textOffset > fullText.length) { pageMoved = true; textOffset = 0; }
       let text = fullText.slice(textOffset);
       let name = bounded(accessibleName(element, text), 500);
       // Layout wrappers repeat the entire feed at every nesting level. Keep
@@ -406,17 +412,17 @@
       if (block !== paragraph) { paragraph = block; paragraphStart = checkpoint(element); }
       if (nodes.length >= maxNodes) {
         truncationReasons.push("node_limit");
-        if (!foldAtBoundary()) nextRead = { elementPath: stableElementPath(element), addressFragment: readableElementFragment(element, sectionName), textOffset: 0, name: sectionName };
+        if (!foldAtBoundary()) nextRead = readAt(element, { textOffset: 0 });
         break;
       }
-      const optionOffset = message.readCursor?.elementPath === stableElementPath(element) ? (message.readCursor.optionOffset ?? 0) : 0;
+      let optionOffset = element === continuedElement ? (cursor?.optionOffset ?? 0) : 0;
+      if (element.options && optionOffset > element.options.length) { pageMoved = true; optionOffset = 0; }
       let selectInfo = element.tagName.toLowerCase() === "select" ? selectDescription(element, optionOffset) : null;
       if (selectInfo) name = bounded(accessibleName(element, fullText), 500);
       let elementMore = null;
       if (selectInfo && (optionOffset || selectInfo.optionsTruncated
         || name.length + text.length + JSON.stringify(selectInfo).length > maxTextChars - aggregateNodeText
         || utf8.encode(name + text + JSON.stringify(selectInfo)).length > nodeByteBudget - aggregateNodeBytes)) {
-        if (!Number.isSafeInteger(optionOffset) || optionOffset < 0 || optionOffset > selectInfo.optionCount) throw pageError("invalid_read_cursor", "The select option continuation is no longer present.");
         selectInfo.optionOffset = optionOffset;
         const room = maxTextChars - aggregateNodeText - name.length;
         const byteRoom = nodeByteBudget - aggregateNodeBytes - utf8.encode(name).length;
@@ -429,7 +435,7 @@
         }
         if (choices.length > room || utf8.encode(choices).length > byteRoom || (offered && !selectInfo.options.length)) {
           if (foldAtBoundary()) { truncationReasons.push("text_limit"); break; }
-          nextRead = { elementPath: stableElementPath(element), addressFragment: readableElementFragment(element, sectionName), textOffset, optionOffset, ...(message.readCursor?.elementOnly ? { elementOnly: true } : {}), name: sectionName };
+          nextRead = readAt(element, { textOffset, optionOffset, ...(cursor?.elementOnly ? { elementOnly: true } : {}) });
           if (!nodes.length) throw pageError("read_budget_too_small", "The read budget cannot hold this control's name and next choice. Increase max_text_chars.");
           truncationReasons.push("text_limit");
           break;
@@ -444,13 +450,13 @@
         const nextOption = optionOffset + selectInfo.options.length;
         if (end < text.length || nextOption < selectInfo.optionCount) {
           if (!end && nextOption === optionOffset) {
-            nextRead = { elementPath: stableElementPath(element), addressFragment: readableElementFragment(element, sectionName), textOffset, optionOffset, ...(message.readCursor?.elementOnly ? { elementOnly: true } : {}), name: sectionName };
+            nextRead = readAt(element, { textOffset, optionOffset, ...(cursor?.elementOnly ? { elementOnly: true } : {}) });
             if (!nodes.length) throw pageError("read_budget_too_small", "The read budget cannot hold the next character. Increase max_text_chars.");
             truncationReasons.push("text_limit");
             break;
           }
-          elementMore = { url: location.href, elementPath: stableElementPath(element), addressFragment: readableElementFragment(element, sectionName), elementOnly: true,
-            textOffset: textOffset + end, optionOffset: nextOption, name: sectionName };
+          elementMore = { url: location.href, ...readAt(element, { elementOnly: true,
+            textOffset: textOffset + end, optionOffset: nextOption }) };
           text = text.slice(0, end);
         }
         if (!optionOffset && !elementMore) delete selectInfo.optionOffset;
@@ -465,7 +471,7 @@
         const room = maxTextChars - aggregateNodeText - name.length - choiceText.length;
         const byteRoom = nodeByteBudget - aggregateNodeBytes - nameBytes;
         if (room <= 0 || byteRoom <= 0) {
-          nextRead = { elementPath: stableElementPath(element), addressFragment: readableElementFragment(element, sectionName), textOffset, name: sectionName };
+          nextRead = readAt(element, { textOffset });
           if (!nodes.length) throw pageError("read_budget_too_small", "The read budget cannot hold this element's name and choices. Increase max_text_chars.");
           break;
         }
@@ -476,59 +482,27 @@
           end += character.length; bytes += size;
         }
         if (!end && text.length) {
-          nextRead = { elementPath: stableElementPath(element), addressFragment: readableElementFragment(element, sectionName), textOffset, name: sectionName };
+          nextRead = readAt(element, { textOffset });
           if (!nodes.length) throw pageError("read_budget_too_small", "The read budget cannot hold the next character. Increase max_text_chars.");
           break;
         }
         text = text.slice(0, end);
-        nextRead = { elementPath: stableElementPath(element), addressFragment: readableElementFragment(element, sectionName), textOffset: textOffset + end, name: sectionName };
+        nextRead = readAt(element, { textOffset: textOffset + end });
       } else {
         aggregateNodeText += nodeTextCost;
         aggregateNodeBytes += nameBytes + textBytes;
       }
 
-      const nodeId = `n${nodes.length + 1}`;
-      if (!elementIdentities.has(element)) elementIdentities.set(element, `${documentIdentity}:${crypto.randomUUID()}`);
-      nodeIdByElement.set(element, nodeId);
-      elementByNodeId.set(nodeId, element);
-      // 2026-09-06: what this id claimed to be, so an action can refuse a node
-      // that is now something else. A shadow-root swap keeps the same element
-      // object and connection while the label and role move on.
-      // Text compaction changes presentation, not the identity used by wait/drop.
-      const identityName = bounded(accessibleName(element, snapshotText(element)), 500);
-      identityByNodeId.set(nodeId, nodeIdentity(element, identityName));
-      if (selectInfo) selectProofs.set(nodeId, {
-        description: JSON.stringify(selectDescription(element, 0, Infinity)),
-        observed: selectInfo.options,
-      });
-      const navigationProof = captureNavigationProof(element);
-      if (navigationProof) navigationProofs.set(nodeId, navigationProof);
-      const rect = element.getBoundingClientRect();
-      const role = element.getAttribute("role") ?? implicitRole(element);
-      const blockedByModal = modals.length > 0
-        && (modals.length !== 1 || !withinElement(element, modals[0]));
-      const actions = snapshotActions(element, role, blockedByModal);
-
-      let parent = composedParent(element);
-      while (parent && !nodeIdByElement.has(parent)) parent = composedParent(parent);
-      nodes.push({
-        nodeId,
-        elementIdentity: elementIdentities.get(element),
-        elementPath: stableElementPath(element),
-        addressFragment: readableElementFragment(element, sectionName),
-        parentNodeId: parent ? nodeIdByElement.get(parent) : null,
-        kind,
-        role,
+      retainNode(element, {
+        readPosition: walk.positions.get(element),
         name,
         text,
         textOffset,
         sectionName,
         sectionPath: sectionStart ? stableElementPath(sectionStart.element) : null,
         paragraphPath: stableElementPath(paragraph),
-        inlineText: fragmented ? [] : inlineTextWindow(element, textOffset, text.length),
+        inlineText: inlineTextWindow(runs, textOffset, text.length),
         inline: ["inline", "inline-block", "contents"].includes(getComputedStyle(element).display),
-        ...readingStructure(element),
-        value: safeValue(element),
         ...(selectInfo ? { select: selectInfo } : {}),
         ...(elementMore ? { more: elementMore } : {}),
         ...(!isPasswordField(element) && element.validity ? {
@@ -540,35 +514,15 @@
               .filter((key) => element.validity[key] === true),
           },
         } : {}),
-        level: headingLevel(element),
-        visible: true,
-        states: {
-          disabled: isEffectivelyDisabled(element),
-          checked: ariaBoolean(element, "aria-checked", "checked"),
-          selected: ariaBoolean(element, "aria-selected", "selected"),
-          expanded: nullableAriaBoolean(element.getAttribute("aria-expanded")),
-          editable: isEditable(element),
-          blockedByModal,
-        },
-        actions,
-        url: safeURL(element),
-        bounds: {
-          x: finite(rect.x), y: finite(rect.y), width: Math.max(0, finite(rect.width)), height: Math.max(0, finite(rect.height)),
-        },
-        scrollable: actions.includes("scroll"),
-      });
-      // Earlier runs of an oversized paragraph are already read. Do not
-      // replay their links as ordinary rows after its final text window.
-      if (!fragmented) for (const part of inlineText(element)) if (part.elementPath) representedLinks.add(part.elementPath);
-      for (const action of actions) {
-        if (!actionNodeIds.has(action)) actionNodeIds.set(action, new Set());
-        actionNodeIds.get(action).add(nodeId);
-      }
+      }, fragmented ? snapshotText(element) : fullText, selectInfo);
+      // Earlier windows already represented these links, even after the last window.
+      for (const part of runs) if (part.elementPath) representedLinks.add(part.elementPath);
       if (nextRead) break;
     }
-    if (!message.readCursor?.elementOnly && !nextRead && walk.nextElement) {
+    if (!cursor?.elementOnly && !nextRead && walk.nextElement
+      && (!cursor?.position || compareReadingPosition(walk.positions.get(walk.nextElement), cursor.position) > 0)) {
       const nextSection = bounded(sectionHeading(walk.nextElement) || sectionName, 160);
-      if (!foldAtBoundary()) nextRead = { elementPath: stableElementPath(walk.nextElement), addressFragment: readableElementFragment(walk.nextElement, nextSection), textOffset: 0, name: nextSection };
+      if (!foldAtBoundary()) nextRead = readAt(walk.nextElement, { textOffset: 0, name: nextSection });
     }
     // A prose row and the links it names are one semantic unit. Retain their
     // action proofs together, even when the next ordinary row is folded.
@@ -579,7 +533,7 @@
     for (const element of elementByNodeId.values()) for (const link of element.querySelectorAll("a")) inlineElements.add(link);
     for (const element of inlineElements) {
       if (nodeIdByElement.has(element) || !inlinePaths.has(stableElementPath(element))) continue;
-      const nodeId = `n${nodes.length + 1}`, text = snapshotText(element), name = bounded(accessibleName(element, text), 500);
+      const text = snapshotText(element), name = bounded(accessibleName(element, text), 500);
       // A proof is a row like any other: it spends the same node and text
       // budgets (its name is also its text), and running out is truncation.
       const proofBytes = 2 * utf8.encode(name).length;
@@ -589,29 +543,10 @@
       }
       aggregateNodeText += 2 * name.length;
       aggregateNodeBytes += proofBytes;
-      if (!elementIdentities.has(element)) elementIdentities.set(element, `${documentIdentity}:${crypto.randomUUID()}`);
-      nodeIdByElement.set(element, nodeId); elementByNodeId.set(nodeId, element);
-      identityByNodeId.set(nodeId, nodeIdentity(element, name));
-      const navigationProof = captureNavigationProof(element);
-      if (navigationProof) navigationProofs.set(nodeId, navigationProof);
-      const role = element.getAttribute("role") ?? implicitRole(element);
-      const blockedByModal = modals.length > 0 && (modals.length !== 1 || !withinElement(element, modals[0]));
-      const actions = snapshotActions(element, role, blockedByModal);
-      const rect = element.getBoundingClientRect();
-      nodes.push({ nodeId, elementIdentity: elementIdentities.get(element), elementPath: stableElementPath(element),
-        addressFragment: readableElementFragment(element, inlineSections.get(stableElementPath(element)) ?? sectionName),
+      retainNode(element, {
         sectionName: inlineSections.get(stableElementPath(element)) ?? sectionName,
-        parentNodeId: null, kind: elementKind(element), role, name, text: name, inlineProof: true, value: null, actions, url: safeURL(element),
-        ...readingStructure(element),
-        states: { disabled: isEffectivelyDisabled(element), blockedByModal,
-          checked: ariaBoolean(element, "aria-checked", "checked"), selected: ariaBoolean(element, "aria-selected", "selected"),
-          expanded: nullableAriaBoolean(element.getAttribute("aria-expanded")), editable: isEditable(element) },
-        level: headingLevel(element), visible: true, scrollable: actions.includes("scroll"), frameId: 0,
-        bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } });
-      for (const action of actions) {
-        if (!actionNodeIds.has(action)) actionNodeIds.set(action, new Set());
-        actionNodeIds.get(action).add(nodeId);
-      }
+        parentNodeId: null, name, text: name, inlineProof: true, value: null, frameId: 0,
+      }, text);
     }
 
     // A body prefix keeps returning old feed items after scrolling and can
@@ -630,6 +565,7 @@
       capturedAt: new Date().toISOString(),
       url: location.href,
       title: bounded(document.title ?? "", 1_024),
+      ...(document.contentType.startsWith("image/") ? { document: { kind: "image" } } : {}),
       ...(document.contentType === "application/pdf" || (!normalizedText(document.body?.innerText ?? "")
         && document.querySelector('embed[type="application/pdf"], object[type="application/pdf"]'))
         ? { document: { kind: "pdf", status: "unread" } } : {}),
@@ -639,9 +575,10 @@
         readyState: ["loading", "interactive", "complete"].includes(document.readyState) ? document.readyState : "unknown",
         scope: "rendered_dom_only",
       },
-      reading: { scope: readingScope, mainContentAvailable: contentRegions.length > 0,
+      reading: { scope: readingScope, mainContentAvailable,
         sections: [...new Set(nodes.filter(node => !node.inlineProof).map(node => node.sectionName).filter(Boolean))],
-        ...(observation ? { fromViewport: true, viewportChanged } : {}) },
+        fromViewport: true, pageMoved, viewportObservationId: observation?.id ?? null,
+        ...(observation ? { viewportChanged } : {}) },
       viewport: {
         width: finite(window.innerWidth),
         height: finite(window.innerHeight),
@@ -657,7 +594,7 @@
         truncationReasons: [...new Set(truncationReasons)],
       },
       nodes,
-      readMore: nextRead ? { url: location.href, ...nextRead, name: bounded(normalizedText(nextRead.name || nextRead.elementPath), 160) } : null,
+      readMore: nextRead ? { url: location.href, ...nextRead, name: bounded(normalizedText(nextRead.name || "Remaining page"), 160) } : null,
       frame: {
         name: bounded(frameName(), 500),
         url: location.href,
@@ -728,19 +665,15 @@
   function clickNode(message) {
     const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "click");
     if (!isVisible(element)) throw pageError("node_not_visible", "The snapshot node is no longer visible.");
-    // 2026-09-06: clicking a disabled control is a no-op the page never sees,
-    // and it used to come back as clicked: true — a refusal reported as done.
     requireEnabledNode(element, "click");
     element.click();
-    return { snapshotId: message.snapshotId, nodeId: message.nodeId, clicked: true };
+    return { snapshotId: message.snapshotId, nodeId: message.nodeId, clicked: true,
+      outcome: "succeeded", verification: "page_acknowledged" };
   }
 
   function fillNode(message) {
     const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "fill");
     if (!isVisible(element)) throw pageError("node_not_visible", "The snapshot node is no longer visible.");
-    // 2026-09-06: a mutation is refused by a disabled control the same way a
-    // click is. Only `clickNode`/`keypressNode` asked, so a fill into a control
-    // inside a `<fieldset disabled>` came back reported as done.
     requireEnabledNode(element, "fill");
     focusWithoutActivation(element);
     const contentEditable = element.isContentEditable;
@@ -757,13 +690,13 @@
       snapshotId: message.snapshotId,
       nodeId: message.nodeId,
       filled: true,
+      outcome: "succeeded", verification: "page_acknowledged",
       valueLength: message.value.length,
     };
   }
 
   async function typeIntoNode(message) {
     const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "type");
-    // 2026-09-06: see fillNode — inherited disabled state is a refusal here too.
     requireEnabledNode(element, "type");
     const snapshot = requireSnapshot(message.snapshotId);
     const identity = editableIdentity(element);
@@ -786,7 +719,7 @@
       if (!isVisible(element)) return "target_not_visible";
       return null;
     }
-    typingRuns.add(run);
+    activeRuns.add(run);
     try {
       run.stopReason = currentStopReason();
       if (!run.stopReason && characters.length > 0) focusWithoutActivation(element);
@@ -801,7 +734,7 @@
         dispatchEditableEvent(element, "input", character);
         if (typedCount < characters.length && (message.delayMs > 0 || typedCount % TYPE_YIELD_EVERY === 0)) {
           const remaining = MAX_TYPING_DURATION_MS - (performance.now() - startedAt);
-          await delay(Math.max(0, Math.min(message.delayMs ?? 0, remaining)));
+          await delay(Math.max(0, Math.min(message.delayMs ?? 0, remaining)), run);
         }
       }
       run.stopReason = currentStopReason();
@@ -813,24 +746,13 @@
       if (typedCount === 0) throw error;
       run.stopReason = "page_event_failed";
     } finally {
-      typingRuns.delete(run);
+      activeRuns.delete(run);
       cancelledActions.delete(run.actionId);
     }
-    // 2026-09-06: read the field back rather than trusting the loop's count.
-    // A sanitising input (number, date, time, week, month) or a page that
-    // reformats on input can keep less — or something other — than what was
-    // appended, and reporting the attempt as the outcome sent the caller on
-    // with a field it believes it filled. A mismatch is a partial result.
+    // Judge typing by what the field retained, excluding rewritten prior content.
     let valueAfter = null;
     let enteredText = null;
     let valueRetained = true;
-    // 2026-09-06: what was ENTERED is the difference between the readback and
-    // the value the field held before the loop. When the old value is not a
-    // prefix of the new one the page rewrote what was already there — a date
-    // input reformatting "12/2026" into "05/2026" — and reporting the whole
-    // readback as entered counted pre-existing, reformatted content as typed
-    // text, which the caller then read as a partial success. That case is now
-    // its own outcome, carrying both values, and nothing is claimed as typed.
     let valueRewritten = false;
     try {
       valueAfter = readEditableValue(element);
@@ -851,10 +773,14 @@
     }
     const completed = typedCount === characters.length && valueRetained
       && !valueRewritten && run.stopReason === null;
+    const enteredCharacterCount = valueRewritten ? 0 : enteredText === null ? null : Array.from(enteredText).length;
+    const landedCount = enteredCharacterCount ?? typedCount;
     return {
       snapshotId: message.snapshotId,
       nodeId: message.nodeId,
       typed: completed,
+      outcome: completed ? "succeeded" : landedCount > 0 ? "partially_completed" : "refused",
+      verification: !completed && landedCount === 0 ? "not_verified" : "page_acknowledged",
       completed,
       characterCount: typedCount,
       requestedCharacterCount: characters.length,
@@ -869,12 +795,7 @@
       valueBefore: valueRewritten && valueAfter !== null ? bounded(valueBefore, 500) : null,
       valueAfter: valueRewritten && valueAfter !== null ? bounded(valueAfter, 500) : null,
       enteredText: enteredText === null ? null : bounded(enteredText, 500),
-      // A rewrite entered nothing the caller asked for. Reporting 0 rather than
-      // null matters: null means "this page agent predates the readback" and
-      // sends the app back to the attempted count.
-      enteredCharacterCount: valueRewritten
-        ? 0
-        : enteredText === null ? null : Array.from(enteredText).length,
+      enteredCharacterCount,
       elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
       stopReason: completed ? null : run.stopReason,
     };
@@ -890,7 +811,6 @@
   function selectNode(message) {
     const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "select");
     if (!isVisible(element)) throw pageError("node_not_visible", "The snapshot node is no longer visible.");
-    // 2026-09-06: see fillNode — inherited disabled state is a refusal here too.
     requireEnabledNode(element, "select");
     const requested = new Set(message.values);
     const options = Array.from(element.options ?? []);
@@ -931,6 +851,7 @@
       snapshotId: message.snapshotId,
       nodeId: message.nodeId,
       selected: true,
+      outcome: "succeeded", verification: "page_acknowledged",
       values,
     };
   }
@@ -938,23 +859,18 @@
   function keypressNode(message) {
     const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "keypress");
     if (!isVisible(element)) throw pageError("node_not_visible", "The snapshot node is no longer visible.");
-    // 2026-09-06: a keypress is an activation route too — Enter clicks a button
-    // or submits a form, Space clicks a checkable. A disabled control receives
-    // no key events in a browser, so dispatching them here manufactured an
-    // effect the page would never have produced.
     requireEnabledNode(element, "keypress");
     const spec = parseKeySpec(message.key);
     focusWithoutActivation(element);
     const downAccepted = dispatchKeyboardEvent(element, "keydown", spec);
-    // 2026-09-24: a synthetic key never runs the browser's own default, so
-    // page keys (PageDown, Space, arrows, Home/End outside a field) scroll
-    // here and say how far; the host judges every other key by its effect.
+    // Synthetic keys need explicit defaults; report any scrolling they cause.
     const moved = downAccepted ? applyKeyDefault(element, spec) : null;
     dispatchKeyboardEvent(element, "keyup", spec);
     return {
       snapshotId: message.snapshotId,
       nodeId: message.nodeId,
       keypressed: true,
+      outcome: "succeeded", verification: "page_acknowledged",
       key: message.key,
       defaultPrevented: !downAccepted,
       ...(moved ? moved : {}),
@@ -964,27 +880,30 @@
   function setCheckedNode(message) {
     const element = requireActionableSnapshotNode(message.snapshotId, message.nodeId, "set_checked");
     if (!isVisible(element)) throw pageError("node_not_visible", "The snapshot node is no longer visible.");
-    // 2026-09-06: see fillNode — inherited disabled state is a refusal here too.
     requireEnabledNode(element, "set_checked");
-    const role = element.getAttribute("role") ?? implicitRole(element);
     const before = checkedState(element);
-    if (before !== message.checked) {
-      if (isNativeCheckable(element)) {
-        element.checked = message.checked;
-        dispatchEditableEvent(element, "input", null);
-        dispatchEditableEvent(element, "change", null);
-      } else {
-        element.click();
+    let after;
+    try {
+      if (before !== message.checked) {
+        if (isNativeCheckable(element)) {
+          element.checked = message.checked;
+          dispatchEditableEvent(element, "input", null);
+          dispatchEditableEvent(element, "change", null);
+        } else {
+          element.click();
+        }
       }
-    }
-    const after = checkedState(element);
-    if (after !== message.checked) {
-      throw pageError("checked_state_not_applied", `The ${role || "checkable"} node did not reach the requested state.`);
+      after = checkedState(element);
+      if (requireActionableSnapshotNode(message.snapshotId, message.nodeId, "set_checked") !== element
+        || after !== message.checked) throw new Error("checked_readback_mismatch");
+    } catch {
+      throw pageError("action_outcome_unknown", "Checkable control was dispatched but its immediate state could not be confirmed. Observe before retrying; do not blindly repeat the action.");
     }
     return {
       snapshotId: message.snapshotId,
       nodeId: message.nodeId,
       setChecked: true,
+      outcome: "succeeded", verification: "page_acknowledged",
       checked: after,
       changed: before !== after,
     };
@@ -999,7 +918,8 @@
     if (typeof MouseEvent === "function") {
       element.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, composed: true, detail: 2, button: 0 }));
     }
-    return { snapshotId: message.snapshotId, nodeId: message.nodeId, doubleClicked: true };
+    return { snapshotId: message.snapshotId, nodeId: message.nodeId, doubleClicked: true,
+      outcome: "succeeded", verification: "page_acknowledged" };
   }
 
   async function waitForNodeState(message) {
@@ -1007,7 +927,7 @@
     const snapshot = requireSnapshot(message.snapshotId);
     const deadline = performance.now() + message.timeoutMs;
     const run = { tabId: snapshot.tabId, actionId: message.actionId, stopReason: null };
-    waitingRuns.add(run);
+    activeRuns.add(run);
     try {
       while (true) {
         if (cancelledActions.has(run.actionId)) run.stopReason = "action_cancelled";
@@ -1024,10 +944,10 @@
             matched,
           };
         }
-        await delay(Math.min(50, Math.max(1, deadline - performance.now())));
+        await delay(Math.min(50, Math.max(1, deadline - performance.now())), run);
       }
     } finally {
-      waitingRuns.delete(run);
+      activeRuns.delete(run);
       cancelledActions.delete(run.actionId);
     }
   }
@@ -1096,6 +1016,7 @@
       throw pageError("drag_unavailable", "The drag could not start.");
     }
     return { snapshotId: message.snapshotId, nodeId: message.nodeId, targetNodeId: message.targetNodeId,
+      outcome: dropAcknowledged ? "succeeded" : "outcome_unknown", verification: dropAcknowledged ? "page_acknowledged" : "not_verified",
       dropDispatched, dropAcknowledged, reason, inputMechanism: "synthetic_html_drag", verificationRequired: "fresh_snapshot" };
   }
 
@@ -1113,6 +1034,7 @@
     const beforeTime = media.currentTime;
     let advancing = false, resumed = false;
     const state = (completed, reason = null) => ({ operation: message.operation, completed,
+      outcome: completed ? "succeeded" : "outcome_unknown", verification: completed ? "verified" : "not_verified",
       paused: media.paused, currentTime: media.currentTime, beforeTime,
       currentTimeAdvancing: advancing, playbackStarted: message.operation === "play" && advancing, reason });
     // The player's own events prove the effect, not an arbitrary sleep.
@@ -1124,7 +1046,7 @@
         done = true;
         clearTimeout(timer);
         for (const event of events) media.removeEventListener(event, observe);
-        waitingRuns.delete(run);
+        activeRuns.delete(run);
         resolve(state(completed, reason));
       };
       const observe = (event) => {
@@ -1141,7 +1063,7 @@
       };
       const run = { tabId: message.tabId, actionId: message.actionId,
         set stopReason(reason) { finish(false, reason); } };
-      waitingRuns.add(run);
+      activeRuns.add(run);
       for (const event of events) media.addEventListener(event, observe);
       if (message.operation === "pause") {
         // Pause must hold across a bounded observation window, including player-driven resumes.
@@ -1167,11 +1089,7 @@
       throw pageError("modal_target_required", "A modal is open; use a fresh scrollable node inside it rather than scrolling the page behind it.");
     }
     if (message.targetNodeId) {
-      // 2026-09-06: a targeted scroll used to take the raw snapshot node,
-      // skipping both the advertised-action check and the identity re-check
-      // every other act goes through — so it could scroll a container the
-      // caller never saw. `scroll` is an advertised action; go through the
-      // same door.
+      // Targeted scrolling requires an advertised action and captured identity.
       target = requireActionableSnapshotNode(message.snapshotId, message.targetNodeId, "scroll");
     }
     const position = () => ({
@@ -1211,6 +1129,7 @@
       snapshotId: message.snapshotId ?? null,
       targetNodeId: message.targetNodeId ?? null,
       scrolled: movedX !== 0 || movedY !== 0,
+      outcome: "succeeded", verification: "page_acknowledged",
       coordinateScope: target === window ? "window" : "element",
       scrollX: after.x,
       scrollY: after.y,
@@ -1230,9 +1149,9 @@
   // Keep the before evidence locally, bound to this exact scroll and tab.
   // The comparison happens in the read itself, so a load between the action
   // reply and readback cannot be mistaken for an unchanged viewport.
-  function captureViewport(target, walk = composedElementWalk(target === window ? document.body : target, 5_000, true)) {
-    if (walk.truncated) return null;
-    const rows = walk.elements.map(element => {
+  function captureViewport(target, walk = readingElementWalk([target === window ? document.body : target], target)) {
+    if (walk.truncated && walk.positions.get(walk.nextElement).distance === 0) return null;
+    const rows = walk.elements.filter(element => isPageContentElement(element) && isVisible(element) && intersectsViewport(element)).map(element => {
       const rect = element.getBoundingClientRect();
       const text = snapshotText(element);
       return { element, content: JSON.stringify([text, accessibleName(element, text), safeValue(element),
@@ -1251,13 +1170,6 @@
       || before.rows.some((item, index) => item.element !== after.rows[index].element || item.content !== after.rows[index].content);
   }
 
-  function requireSnapshotNode(snapshotId, nodeId) {
-    const snapshot = requireSnapshot(snapshotId);
-    const element = snapshot.elementByNodeId.get(nodeId);
-    if (!element?.isConnected) throw pageError("node_stale", "The snapshot node is no longer attached.");
-    return element;
-  }
-
   function nodeIdentity(element, name) {
     const role = element.getAttribute("role") ?? implicitRole(element);
     return `${element.tagName.toLowerCase()}\u0000${role}\u0000${name}`;
@@ -1268,24 +1180,21 @@
     return nodeIdentity(element, bounded(accessibleName(element, text), 500));
   }
 
-  function snapshotText(element) {
-    // Containers may span the whole retained feed even when only their bottom
-    // intersects the viewport. Their descendants carry their own text; copying
-    // innerText here would smuggle offscreen posts back into every new read.
+  function snapshotText(element, runs = null) {
+    // Visible inline runs keep offscreen feed text out of container prose.
     const kind = elementKind(element);
     if (!isPageContentElement(element) || kind === "image") return "";
     if (isPreformatted(element)) return element.innerText ?? element.textContent ?? "";
     if (element.tagName === "TIME") return normalizedText(element.innerText ?? element.textContent ?? "");
     const control = ["button", "link", "tab", "menuitem", "heading", "option", "select", "input"].includes(kind);
     const raw = !control && element.children?.length && element.childNodes
-      ? inlineText(element).map((part) => part.text).join("")
+      ? (runs ?? inlineText(element)).map((part) => part.text).join("")
       : (["button", "link", "tab", "menuitem", "heading"].includes(kind)
         ? visibleControlText(element) : (element.innerText ?? element.textContent ?? ""));
     return element.querySelector("code") && !element.closest("pre") ? raw : normalizedText(raw);
   }
 
-  // DOM order is the reading order. Inline descendants contribute their text
-  // where they occur; links also retain a structural address for their verb.
+  // Inline runs keep DOM order and each link's structural address.
   function inlineText(element) {
     const parts = [];
     const preformatted = isPreformatted(element);
@@ -1343,9 +1252,9 @@
     }).join("");
   }
 
-  function inlineTextWindow(element, offset, length) {
+  function inlineTextWindow(runs, offset, length) {
     let position = 0;
-    return inlineText(element).flatMap(part => {
+    return runs.flatMap(part => {
       const start = position; position += part.text.length;
       const text = part.text.slice(Math.max(0, offset - start), Math.max(0, Math.min(part.text.length, offset + length - start)));
       return text ? [{ ...part, text }] : [];
@@ -1371,8 +1280,7 @@
         || !["inline", "inline-block"].includes(getComputedStyle(child).display))) continue;
       const fragments = Array.from(element.childNodes).filter((node) => node.nodeType === 3)
         .map((node) => normalizedText(node.textContent ?? "")).filter(Boolean);
-      // 2026-09-28: longer direct text may sit between glyphs ("Read n·o·w
-      // please"); only single-character fragments count toward the run.
+      // Only single-character fragments count toward a glyph run.
       const glyphFragments = fragments.filter((text) => [...text].length === 1).length;
       const count = glyphFragments + children.reduce((sum, child) => sum + counts.get(child), 0);
       counts.set(element, count);
@@ -1411,10 +1319,7 @@
         throw pageError("snapshot_stale", "Refresh the page before acting across a modal or incomplete page boundary.");
       }
     }
-    // 2026-09-06: membership and connection are not identity. Inside an open
-    // shadow root a component can relabel the very element this id names
-    // without the document observer ever firing, so the act would land on a
-    // control the caller never saw.
+    // Recheck captured identity even when shadow-root changes bypass the document observer.
     const expected = snapshot.identityByNodeId?.get(nodeId);
     if (expected !== undefined && currentNodeIdentity(element) !== expected) {
       throw pageError("node_identity_changed", "The snapshot node is no longer the control it described.");
@@ -1460,10 +1365,7 @@
   }
 
   function isEffectivelyDisabled(element) {
-    // 2026-09-06: `element.disabled` reflects the node's OWN attribute only, so
-    // a control inside a `<fieldset disabled>` read as enabled and the act was
-    // dispatched into a page that never sees it. `:disabled` is the inherited
-    // state the browser itself uses.
+    // Include inherited browser-disabled state as well as own and ARIA attributes.
     let inheritedDisabled = false;
     try {
       inheritedDisabled = typeof element.matches === "function" && element.matches(":disabled");
@@ -1611,8 +1513,13 @@
     }
     if (elementKind(element) === "cell") {
       structure.tableCellPath = stableElementPath(element);
-      structure.columnSpan = element.colSpan || Number(element.getAttribute("aria-colspan")) || 1;
-      structure.rowSpan = element.rowSpan || Number(element.getAttribute("aria-rowspan")) || 1;
+      // Use HTML's bounded positive span domain for both native and ARIA
+      // cells. Page-authored fractions, infinities and unsafe integers cannot
+      // become host-side counts; absent/invalid spans occupy one cell.
+      const span = (value, maximum) => Number.isSafeInteger(value) && value > 0
+        ? Math.min(value, maximum) : 1;
+      structure.columnSpan = span(element.colSpan ?? Number(element.getAttribute("aria-colspan")), 1000);
+      structure.rowSpan = span(element.rowSpan ?? Number(element.getAttribute("aria-rowspan")), 65534);
     }
     if (elementKind(element) === "row") structure.tableRowPath = stableElementPath(element);
     // A sibling action drawn on the heading's line belongs to that heading,
@@ -1684,7 +1591,8 @@
     const rect = element.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0 || isTextClipped(element, style)) return false;
     for (let parent = composedParent(element); parent; parent = composedParent(parent)) {
-      if (isTextClipped(parent)) return false;
+      const parentStyle = getComputedStyle(parent);
+      if (Number(parentStyle.opacity) === 0 || isTextClipped(parent, parentStyle)) return false;
     }
     return true;
   }
@@ -1812,10 +1720,7 @@
     try { element.focus({ preventScroll: true }); } catch { element.focus(); }
   }
 
-  // 2026-09-06: what the field ACTUALLY holds. Typing counted the characters it
-  // attempted, and the setter has no readback — so on an input the browser
-  // sanitises (number, date, time, week, month) every appended character was
-  // discarded while the result still said typed: true with the full count.
+  // Read retained field content; attempted character counts do not prove retention.
   function readEditableValue(element) {
     if (element.isContentEditable) return String(element.textContent ?? "");
     return String(element.value ?? "");
@@ -1890,9 +1795,7 @@
     if (spec.key === "Enter") {
       const tag = element.tagName.toLowerCase();
       if (["button", "a", "summary"].includes(tag)) element.click();
-      // 2026-09-06: an unmodified Enter in a multi-line field is a newline, not
-      // a submit. Dispatching requestSubmit for any element inside a form sent
-      // half-written text the moment a newline was typed.
+      // Textarea Enter without Control or Meta inserts a newline.
       else if (tag === "textarea" && !spec.ctrlKey && !spec.metaKey) insertIntoEditable(element, "\n");
       else if (element.form && typeof element.form.requestSubmit === "function") element.form.requestSubmit();
       return;
@@ -1968,16 +1871,35 @@
     dispatchEditableEvent(element, "input", text);
   }
 
+  // Segment indices and DOM selections are both UTF-16 offsets. Keep complete
+  // user-perceived characters, including emoji and combining sequences.
+  const editingGraphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+  function adjacentGrapheme(text, offset, backward) {
+    let previous = 0;
+    for (const { index, segment } of editingGraphemes.segment(text)) {
+      const end = index + segment.length;
+      if (backward && end >= offset) return index;
+      if (!backward && end > offset) return end;
+      previous = end;
+    }
+    return backward ? previous : text.length;
+  }
+
   function deleteFromEditable(element, backward) {
     if (!isEditable(element) || !("value" in element) || typeof element.selectionStart !== "number" || typeof element.selectionEnd !== "number") return;
     let start = element.selectionStart;
     let end = element.selectionEnd;
+    const current = String(element.value ?? "");
     if (start === end) {
-      if (backward && start > 0) start -= 1;
-      if (!backward && end < String(element.value ?? "").length) end += 1;
+      for (const { index, segment } of editingGraphemes.segment(current)) {
+        const boundary = index + segment.length;
+        if (backward ? index < start && boundary >= start : index <= end && boundary > end) {
+          start = index; end = boundary;
+          break;
+        }
+      }
     }
     if (start === end) return;
-    const current = String(element.value ?? "");
     setNativeValue(element, `${current.slice(0, start)}${current.slice(end)}`);
     if (typeof element.setSelectionRange === "function") element.setSelectionRange(start, start);
     dispatchEditableEvent(element, "input", null);
@@ -1985,45 +1907,113 @@
 
   function moveEditableCaret(element, key) {
     if (!("value" in element) || typeof element.selectionStart !== "number") return;
-    const length = String(element.value ?? "").length;
+    const text = String(element.value ?? "");
+    const length = text.length;
     let caret = element.selectionStart;
-    if (key === "ArrowLeft") caret = Math.max(0, caret - 1);
-    if (key === "ArrowRight") caret = Math.min(length, caret + 1);
+    const selected = element.selectionEnd > caret;
+    if (key === "ArrowLeft") caret = selected ? caret : adjacentGrapheme(text, caret, true);
+    if (key === "ArrowRight") caret = selected ? element.selectionEnd : adjacentGrapheme(text, caret, false);
     if (key === "Home") caret = 0;
     if (key === "End") caret = length;
     if (typeof element.setSelectionRange === "function") element.setSelectionRange(caret, caret);
   }
 
-  function composedElementWalk(root, maximum = 5_000, viewportOnly = false, startPath = null, firstRoots = [], rootsOnly = false) {
+  function readingViewport(target) {
+    const box = target === window ? null : target.getBoundingClientRect();
+    return {
+      left: box ? Math.max(0, box.left + target.clientLeft) : 0,
+      top: box ? Math.max(0, box.top + target.clientTop) : 0,
+      right: box ? Math.min(window.innerWidth, box.left + target.clientLeft + target.clientWidth) : window.innerWidth,
+      bottom: box ? Math.min(window.innerHeight, box.top + target.clientTop + target.clientHeight) : window.innerHeight,
+      scrollX: finite(target === window ? window.scrollX : target.scrollLeft),
+      scrollY: finite(target === window ? window.scrollY : target.scrollTop),
+    };
+  }
+
+  function compareReadingPosition(left, right) {
+    for (const key of ["distance", "y", "x", "ordinal"]) {
+      const difference = left[key] - right[key];
+      if (difference) return difference;
+    }
+    return 0;
+  }
+
+  // Expand the nearest layout branches first. Offscreen feed rows cannot
+  // exhaust the walk before the viewport is reached. On continuation, the
+  // already-read prefix does not spend the next window's walk budget. Still
+  // descend through it: overflowing children can occupy an unread position.
+  function readingElementWalk(roots, target, maximum = 5_000, startPosition = null) {
+    const view = readingViewport(target), heap = [], entries = [], shadowRoots = [];
+    const seen = new Set(), coincident = new Map(), positions = new Map();
+    let sequence = 0;
+    const position = element => {
+      const box = element.getBoundingClientRect();
+      return { scrollX: view.scrollX, scrollY: view.scrollY,
+        distance: Math.max(0, view.top - box.bottom, box.top - view.bottom)
+          + Math.max(0, view.left - box.right, box.left - view.right),
+        y: finite(box.top - view.top + view.scrollY), x: finite(box.left - view.left + view.scrollX), ordinal: 0 };
+    };
+    const compare = (a, b) => compareReadingPosition(a.position, b.position) || a.order - b.order;
+    const offer = element => {
+      if (!element || seen.has(element)) return;
+      seen.add(element);
+      const entry = { element, position: position(element), order: sequence++ };
+      let index = heap.length;
+      heap.push(entry);
+      while (index > 0) {
+        const parent = (index - 1) >> 1;
+        if (compare(heap[parent], entry) <= 0) break;
+        heap[index] = heap[parent]; index = parent;
+      }
+      heap[index] = entry;
+    };
+    const take = () => {
+      const first = heap[0], tail = heap.pop();
+      if (heap.length) {
+        let index = 0;
+        while (index * 2 + 1 < heap.length) {
+          let child = index * 2 + 1;
+          if (child + 1 < heap.length && compare(heap[child + 1], heap[child]) < 0) child++;
+          if (compare(tail, heap[child]) <= 0) break;
+          heap[index] = heap[child]; index = child;
+        }
+        heap[index] = tail;
+      }
+      return first;
+    };
+    roots.forEach(offer);
+    let next = null;
+    while (heap.length) {
+      const entry = take(), element = entry.element;
+      const key = [entry.position.distance, entry.position.y, entry.position.x].join(":");
+      entry.position.ordinal = coincident.get(key) ?? 0;
+      coincident.set(key, entry.position.ordinal + 1);
+      if (!startPosition || compareReadingPosition(entry.position, startPosition) >= 0) {
+        positions.set(element, entry.position);
+        if (entries.length >= maximum) { next = entry; break; }
+        entries.push(entry);
+      }
+      if (!isPageContentElement(element)) continue;
+      if (element.shadowRoot) {
+        shadowRoots.push(element.shadowRoot);
+        Array.from(element.shadowRoot.children).forEach(offer);
+      }
+      Array.from(element.children ?? []).forEach(offer);
+    }
+    entries.sort(compare);
+    return { elements: entries.map(entry => entry.element),
+      positions, shadowRoots, truncated: Boolean(next), nextElement: next?.element, sectionName: "" };
+  }
+
+  function composedElementWalk(root, maximum = 5_000) {
     if (!root) return { elements: [], truncated: false, shadowRoots: [] };
     const result = [];
     const shadowRoots = [];
-    const stack = viewportOnly ? [root] : [...(rootsOnly ? [] : Array.from(root.children ?? []).reverse()), ...firstRoots.slice().reverse()];
-    const visitedRoots = new Set();
-    let started = !startPath;
-    let sectionName = "";
-    if (firstRoots.length) {
-      const headings = root.querySelectorAll("h1,h2,h3,h4,h5,h6,[role=heading]");
-      for (const heading of headings) {
-        if ((heading.compareDocumentPosition(firstRoots[0]) & Node.DOCUMENT_POSITION_FOLLOWING)
-          && isVisible(heading) && !insideNavigation(heading)) sectionName = sectionHeading(heading);
-      }
-    }
+    const stack = Array.from(root.children ?? []).reverse();
     while (stack.length > 0 && result.length < maximum) {
       const element = stack.pop();
       if (!isPageContentElement(element)) continue;
-      if (firstRoots.includes(element)) {
-        if (visitedRoots.has(element)) continue;
-        visitedRoots.add(element);
-      }
-      if (!started && isVisible(element) && !insideNavigation(element)) {
-        const heading = sectionHeading(element);
-        if (heading) sectionName = heading;
-      }
-      if (!started && stableElementPath(element) === startPath) started = true;
-      // Offscreen retained elements spend neither the walk nor read budget.
-      // Still traverse ancestors: fixed/overflowing descendants may be in view.
-      if (started && (!viewportOnly || (isVisible(element) && intersectsViewport(element)))) result.push(element);
+      result.push(element);
       if (element.shadowRoot) shadowRoots.push(element.shadowRoot);
       const descendants = [
         ...Array.from(element.shadowRoot?.children ?? []),
@@ -2031,9 +2021,7 @@
       ];
       for (let index = descendants.length - 1; index >= 0; index -= 1) stack.push(descendants[index]);
     }
-    if (!started) throw pageError("read_address_missing", "The folded element is no longer on this page. Read the page again.");
-    while (stack.length && visitedRoots.has(stack[stack.length - 1])) stack.pop();
-    return { elements: result, truncated: stack.length > 0, shadowRoots, nextElement: stack[stack.length - 1], sectionName };
+    return { elements: result, truncated: stack.length > 0, shadowRoots };
   }
 
   function composedParent(element) {
@@ -2147,7 +2135,22 @@
     });
   }
 
-  function delay(milliseconds) { return new Promise((resolve) => setTimeout(resolve, milliseconds)); }
+  function stopRun(run, reason) {
+    run.stopReason = reason;
+    run.wake?.();
+  }
+
+  function delay(milliseconds, run) {
+    return new Promise((resolve) => {
+      const finish = () => {
+        clearTimeout(timer);
+        if (run?.wake === finish) run.wake = null;
+        resolve();
+      };
+      const timer = setTimeout(finish, milliseconds);
+      if (run) { run.wake = finish; if (run.stopReason) finish(); }
+    });
+  }
 
   function isScrollable(element) {
     const style = getComputedStyle(element);

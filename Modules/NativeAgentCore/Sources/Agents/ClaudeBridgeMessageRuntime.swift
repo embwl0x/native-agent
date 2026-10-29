@@ -1,4 +1,5 @@
 import Foundation
+import ChatToolParsing
 import ChatTurnContracts
 import Darwin
 import CryptoKit
@@ -11,14 +12,14 @@ import PersistenceCore
 import Privacy
 import TurnTrace
 import Transcripts
-// Blueprint: | `ClaudeBridgeMessageRuntime.swift` | Bridge message admission/delivery and the retained chat client; event publication is a weak callback to the HTTP runtime |
+// Blueprint: | `ClaudeBridgeMessageRuntime.swift` | Bridge message admission/delivery and the retained chat client; replies omit working commentary at the turn's recorded boundary; an exact text reply records its durable receipt before publishing an inline answer, without starting another turn; event publication is a weak callback to the HTTP runtime |
 
 /// App selection, transport publication and existing delivery adapters used by
 /// the Core conversation owner. Authentication happens before this boundary.
 public protocol ClaudeBridgeMessagePort: Sendable {
     func activeSessionID(dataRoot: URL) -> String?
     func activePersona(dataRoot: URL) -> String?
-    func chatClient() -> any ChatOrchestrationClient
+    func chatClient() -> SwiftNativeChatOrchestrationClient
     func completionSender(dataRoot: URL) -> any AgentBridgeCompletionSending
     func publishChatTurnCompleted(sessionID: String?) async
 }
@@ -27,23 +28,15 @@ public protocol ClaudeBridgeMessagePort: Sendable {
 /// bridge conversation. This owner has no Network connection or listener.
 public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
     public typealias Response = @Sendable (Int, [String: Any]) -> Void
-    /// U5 W-G (2026-06-11): upper bound on the WORK phase of /claude/message
-    /// (one full LLM turn incl. tool loop). The read-phase deadline above is
-    /// cancelled in `route(...)` once the body lands, so before this nothing
-    /// bounded the detached work Task — a hung turn leaked the connection +
-    /// Task forever.
+    /// HTTP response deadline; accepted turns continue through durable settlement.
     public static let messageWorkDeadlineSeconds: Int = 600
-    /// Ack-on-enqueue lane (wake-delivery-classification, 2026-07-25): bound
-    /// on the ENQUEUE phase only — a durable transcript append, disk-bound,
-    /// measured in seconds. The turn that follows is deliberately unbounded
-    /// here (the engine's own guards bound it); its outcome reaches callers
-    /// through the durable reply JSONL and bridge events, never this response.
+    /// Enqueue acknowledgement deadline; expiry cancels enqueue before turn admission.
     public static let enqueueAckDeadlineSeconds: Int = 30
     private let port: any ClaudeBridgeMessagePort
     private let tasks: AgentContactTasks
     private let eventPublisher: @Sendable (String, [String: Any]) -> Void
     private let clientLock = NSLock()
-    private var cachedChatClient: (any ChatOrchestrationClient)?
+    private var cachedChatClient: (SwiftNativeChatOrchestrationClient)?
 
 
     public init(port: any ClaudeBridgeMessagePort, tasks: AgentContactTasks,
@@ -53,7 +46,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         self.eventPublisher = eventPublisher
     }
 
-    private func chatClient() -> any ChatOrchestrationClient {
+    private func chatClient() -> SwiftNativeChatOrchestrationClient {
         clientLock.withLock {
             if let cachedChatClient { return cachedChatClient }
             let client = port.chatClient()
@@ -64,19 +57,16 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
 
     /// Everything the inbound peer lanes know about ONE peer request: who the
     /// caller proved it is (never the shared bridge bearer alone), which
-    /// protocol it arrived on, the id that protocol carries, and a digest of
-    /// the exact bytes. See `AgentBridgePrincipal` and
+    /// protocol it arrived on, and a digest of the exact bytes. See `AgentBridgePrincipal` and
     /// `AgentPeerReplayClaimStore`.
     public struct PeerTurnContext: Sendable {
         public let principal: AgentBridgePrincipal
         public let protocolName: String
-        public let messageID: String?
         public let bodyDigest: String
 
-        public init(principal: AgentBridgePrincipal, protocolName: String, messageID: String?, bodyDigest: String) {
+        public init(principal: AgentBridgePrincipal, protocolName: String, bodyDigest: String) {
             self.principal = principal
             self.protocolName = protocolName
-            self.messageID = messageID
             self.bodyDigest = bodyDigest
         }
     }
@@ -97,10 +87,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
     /// Generic mounted-surface identity, before enqueue/persistence. A supplied
     /// identity is continued exactly or rejected; it never falls back to the
     /// user's selected chat. The acknowledgement retains newly created IDs.
-    /// A peer's conversations live under its own prefix, so a peer can never
-    /// name the person's session (or another peer's) and land a turn in it
-    /// (Astra comb, 2026-09-16). `owner` is the authenticated principal id;
-    /// a requested id must carry that peer's prefix or it is refused.
+    /// A requested id must carry the authenticated `owner`'s peer prefix.
     public static func genericAgentSessionID(requested: String?, owner: String? = nil) -> String? {
         let prefix = owner.map { AgentBridgePrincipal.genericAgentSessionPrefix(owner: $0) }
         guard let requested else {
@@ -133,23 +120,11 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         let owner = AgentContactIdentity(dataRoot: dataRoot).canonical("peer:" + principal.id)
         let threadOwner = owner.hasPrefix("peer:") ? String(owner.dropFirst(5)) : owner
         let requestedSessionId = json["sessionId"] as? String
-        // Real artifacts over the bridge (2026-09-02): a studio consult needs
-        // the image, not a description of it. `image_paths` are local files
-        // the caller already has; each becomes a chat attachment exactly as a
-        // pasted image in the Mac composer would. Bounded: image types only,
-        // 8 MB each, four per message; anything else is skipped, never a 400.
-        let attachments = Self.bridgeImageAttachments(json["image_paths"] as? [String] ?? [])
-        // Agent, 2026-09-02: an image that could not be attached used to
-        // vanish; the message now says so, so a header without pixels is
-        // never a mystery on her side.
-        let imageSkips = Self.bridgeImageSkips(json["image_paths"] as? [String] ?? [])
-        // A named lane's message that names no chat goes on in that lane's own
-        // conversation (below); a script's notice inherits the session the
-        // state route advertises. Completion callbacks keep their explicit
-        // routing semantics.
-        // Agent, 2026-09-02: a script's receipt must not wear a person's
-        // name. A small allowlist of non-human senders may name themselves in
-        // the body; everything else stays the route's default.
+        // Attach up to four local images, 8 MB each; report skipped images in the message.
+        let preparedImages = Self.prepareBridgeImages(json["image_paths"] as? [String] ?? [])
+        let attachments = preparedImages.attachments
+        let imageSkips = preparedImages.skips
+        // Only allowlisted script senders may override the route's sender name.
         let sender: String = {
             if let named = (json["sender"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
                Self.scriptSenders.contains(named) {
@@ -157,9 +132,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             }
             return defaultSender
         }()
-        // A lane's own message, naming no chat, goes on in its conversation
-        // with her (User 10-01), not in whatever chat the Mac has open; a
-        // script's notice still lands there.
+        // Peers default to their own conversation; scripts use the active chat; completions require explicit routing.
         let sessionId = Self.bridgeMessageSessionID(
             requested: requestedSessionId,
             active: isCodexCompletion ? nil
@@ -198,9 +171,26 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             )
         }()
         let claudeReplyID = Self.claudeReplyID(json, owner: owner)
+        if let claudeReplyID, attachments.isEmpty {
+            let from = principal.peerID.map { "peer:" + $0 } ?? "another agent"
+            do {
+                if try AgentConversationStore(dataRoot: dataRoot).offerBridgeReplyToInlineWait(
+                    agent: owner, messageID: claudeReplyID, text: rawText, from: from, steeredBy: [from],
+                    recordReply: {
+                        try Self.recordClaudeReplyReceipt(to: claudeReplyID, text: rawText, sessionId: sessionId, owner: owner)
+                    }) {
+                    response(200, ["status": "ok", "ack": "answered_inline", "messageId": claudeReplyID])
+                    return
+                }
+            } catch {
+                response(503, ["error": "reply_handoff_failed", "detail": error.localizedDescription])
+                return
+            }
+        }
         let baseRequest: TurnRequest = {
             var request = principal.turnRequest(context: nil, plain: rawText, attachments: attachments, originID: claudeReplyID)
             request.sessionID = sessionId
+            request.ownedSessionID = ContactThread.session(owner: threadOwner)
             request.verifiedSessionID = .some(sessionId)
             request.persona = port.activePersona(dataRoot: dataRoot)
             request.message = Self.withImageSkipNote(request.message, imageSkips)
@@ -217,19 +207,8 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             "textLen": text.count,
             "sessionId": sessionId ?? NSNull(),
         ])
-        // Ack-on-enqueue lane (wake-delivery-classification, 2026-07-25): a
-        // caller that sends `ackMode: "enqueue"` gets its HTTP response the
-        // moment the message row is durably in the session store — never
-        // coupled to turn completion. The legacy lane below couples the two,
-        // which self-deadlocks any caller whose POST both starts and waits on
-        // the same turn (the wake helper's structural false-negative class).
-        // Codex COMPLETIONS stay on the legacy lane: their response semantics
-        // (claim/settled/conflict) are load-bearing for at-most-once delivery.
-        // "enqueue_only" is the same durable-append lane with the turn
-        // suppressed (astra-comb-3 lane3 #1): the wake helper uses it for a
-        // reply-free transport event, which used to arrive as a full
-        // tool-capable decision turn and made the agent re-decide — and
-        // contradict — work its own in-flight turn had already decided.
+        // Enqueue acknowledges the durable row; enqueue_only starts no turn.
+        // Codex completions retain blocking claim/settled/conflict responses.
         let ackMode = (json["ackMode"] as? String)?.lowercased()
         if !isCodexCompletion, ackMode == "enqueue" || ackMode == "enqueue_only" {
             handleMessageAckOnEnqueue(
@@ -245,8 +224,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             )
             return
         }
-        // U5 W-G: bound the work phase. The latch makes the work Task and the
-        // deadline timer race for the single response write; the loser no-ops.
+        // The work task and HTTP deadline share one response latch.
         let progress = chatNoticeSink(requestID: requestID, sessionID: sessionId)
         let workLatch = ClaudeBridgeRuntime.WorkLatch()
         _ = Task.detached(priority: .userInitiated) { [weak self] in
@@ -292,7 +270,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     case .start:
                         lifecycleClaimed = true
                         var request = baseRequest
-                        request.replyRoute = completionRoute?.chatToolReplyRoute
+                        request.replyRoute = (completionRoute?.chatToolReplyRoute).map { Optional($0) }
                         request.pinnedRunID = responseRunID
                         request.codexCompletion = CodexCompletionTranscriptBinding(
                                 deliveryId: deliveryId,
@@ -358,103 +336,13 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     }
                     try await CodexCompletionLifecycle.shared.cacheResponse(resp, deliveryId: "bridge-http." + requestID, requestDigest: requestID)
                 }
-                if !callerResultIsTool {
-                    await self.port.publishChatTurnCompleted(sessionID: resp.sessionId ?? sessionId)
-                }
-                if let claudeReplyID {
-                    Self.recordClaudeReply(to: claudeReplyID, text: rawText, sessionId: resp.sessionId ?? sessionId, owner: owner,
-                                            principal: principal, request: baseRequest)
-                    await self.answerAskingChat(replyTo: claudeReplyID, response: resp, turnSession: resp.sessionId ?? sessionId, owner: owner)
-                }
-                let durationMs = Int(Date().timeIntervalSince(started) * 1000)
-                let trimmedReply = resp.output.trimmingCharacters(in: .whitespacesAndNewlines)
-                let attachmentPayload = Self.bridgeAttachmentPayload(resp.attachments)
-                // The chat return follows canonical assistant persistence. A
-                // later notification failure cannot undo that arrival.
-                let replyPersisted = responseCached && !callerResultIsTool && (!trimmedReply.isEmpty || !attachmentPayload.isEmpty)
-                let completionDelivery: AgentBridgeCompletionDelivery?
-                if let completionRoute,
-                   let deliveryId,
-                   let completionRequestDigest,
-                   !trimmedReply.isEmpty || !(resp.attachments ?? []).isEmpty {
-                    completionDelivery = await AgentBridgeCompletionRouter.deliver(
-                        deliveryId: deliveryId,
-                        requestDigest: completionRequestDigest,
-                        text: resp.output,
-                        attachments: resp.attachments ?? [],
-                        route: completionRoute,
-                        sender: self.port.completionSender(dataRoot: dataRoot),
-                        lifecycle: CodexCompletionLifecycle.shared
-                    )
-                } else {
-                    completionDelivery = nil
-                }
-                let replyStatus = Self.codexCompletionReplyStatus(
-                    terminalState: resp.terminalState,
-                    hasReplyText: !trimmedReply.isEmpty,
-                    attachmentCount: attachmentPayload.count,
-                    completionDeliveryStatus: completionDelivery?.status
-                )
-                var persistedReply: [String: Any] = [
-                    "at": ISO8601DateFormatter().string(from: Date()),
-                    "status": replyStatus,
-                    "sessionId": resp.sessionId ?? NSNull(),
-                    "model": resp.model,
-                    "runId": resp.runId,
-                    "durationMs": durationMs,
-                    "reply": resp.output,
-                    "attachments": attachmentPayload,
-                    "responseCached": responseCached,
-                    "servedFromCache": wasCached,
-                    "replyPersisted": replyPersisted,
-                ]
-                if let deliveryId { persistedReply["deliveryId"] = deliveryId }
-                if let completionDelivery {
-                    persistedReply["completionDelivery"] = completionDelivery.jsonObject
-                }
-                let receiptWritten = Self.persistMessageReply(persistedReply, requestID: requestID, principal: principal.id)
-                if deliveryId == nil, receiptWritten {
-                    try await CodexCompletionLifecycle.shared.recordDelivery(AgentBridgeCompletionDelivery(status: "completed",
-                        surface: "bridge-http", delivery: "receipt", artifactCount: 1, attempts: 0, reason: nil),
-                        deliveryId: "bridge-http." + requestID, requestDigest: requestID)
-                }
-                // Publish: bridge got the reply (her → me).
-                self.eventPublisher("message_out", [
-                    "requestId": requestID,
-                    "sessionId": resp.sessionId ?? NSNull(),
-                    "model": resp.model,
-                    "runId": resp.runId,
-                    "replyLen": resp.output.count,
-                    "attachmentCount": attachmentPayload.count,
-                    "durationMs": durationMs,
-                    "status": replyStatus,
-                    "completionDeliveryStatus": completionDelivery?.status ?? NSNull(),
-                    "deliveryId": deliveryId ?? NSNull(),
-                    "servedFromCache": wasCached,
-                ])
-                // Fail LOUD on empty: an empty reply is not a success — the
-                // caller must know the cargo didn't arrive (status field; HTTP
-                // stays 200 so existing callers' transport handling is unchanged).
-                // (Persist + publish above run even after a work-timeout — the
-                // durable JSONL drop is exactly for replies with nowhere to go.)
+                let responseObject = try await self.settleMessageReply(resp, request: baseRequest,
+                    principal: principal, owner: owner, claudeReplyID: claudeReplyID, replyText: rawText,
+                    requestID: requestID, started: started, sessionID: sessionId,
+                    callerResultIsTool: callerResultIsTool, responseCached: responseCached, wasCached: wasCached,
+                    completionRoute: completionRoute, deliveryID: deliveryId, completionDigest: completionRequestDigest)
+                // Settlement runs even when the HTTP deadline has already answered.
                 guard workLatch.claim() else { return }
-                var responseObject: [String: Any] = [
-                    "requestId": requestID,
-                    "status": replyStatus,
-                    "sessionId": resp.sessionId ?? NSNull(),
-                    "reply": resp.output,
-                    "attachments": attachmentPayload,
-                    "model": resp.model,
-                    "runId": resp.runId,
-                    "durationMs": durationMs,
-                    "responseCached": responseCached,
-                    "servedFromCache": wasCached,
-                    "replyPersisted": replyPersisted,
-                ]
-                if let deliveryId { responseObject["deliveryId"] = deliveryId }
-                if let completionDelivery {
-                    responseObject["completionDelivery"] = completionDelivery.jsonObject
-                }
                 response(200, responseObject)
             } catch is TurnAdmission.Full {
                 // Queue capacity was refused before the chat closure ran. Keep
@@ -474,20 +362,8 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 ])
             } catch is CancellationError {
                 await self.port.publishChatTurnCompleted(sessionID: sessionId)
-                // 2026-07-21 gpt-5.5 review: the bridge deadline cancels the
-                // work task — a cancel is NOT a chat failure. The cancelled
-                // partial already persisted via streamCancelled; writing a
-                // chat_failed/message_failed row after it double-books the
-                // turn. Reply 499-style (no failure row).
-                //
-                // 2026-07-31: the claim still has to be RELEASED. A cancel here
-                // means the 600s work deadline fired mid-turn; without the same
-                // outcome receipt the generic catch writes, the lifecycle stays
-                // .claimed under THIS ownerInstanceId, claim() answers
-                // .inProgress for us forever (reconcileInterruptedClaims only
-                // sweeps other instance ids), and every node-side retry gets
-                // 202 completion_in_progress until relaunch. Ambiguous, not
-                // failed — markOutcomeUnknown is exactly that receipt.
+                // Cancellation retains the persisted partial and releases the
+                // completion claim as unknown, without a duplicate failure row.
                 var cancelObject: [String: Any] = [
                     "requestId": requestID,
                     "status": "cancelled",
@@ -506,12 +382,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                             "outcome receipt failed: \(String(describing: error))"
                     }
                 }
-                // The outcome receipt above always runs — lifecycle truth is
-                // unconditional. The RESPONSE is not: the 600s deadline handler
-                // that cancelled us claims the latch before answering 504, so
-                // writing here without claiming would put a second HTTP
-                // response on the same connection (gpt-5.5 wave review,
-                // 2026-07-31). Loser of the race stays silent.
+                // Outcome settlement is unconditional; the response requires the latch.
                 guard workLatch.claim() else { return }
                 response(200, cancelObject)
             } catch {
@@ -537,10 +408,9 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     // not an ambiguous cognitive outcome.
                     failureStatus = "lifecycle_unavailable"
                 }
-                // Same envelope shape as the success row (gpt-5.5 review: don't
-                // make consumers special-case failures or lose timing context).
+                // Failure receipts retain the success envelope's timing context.
                 Self.persistMessageReply([
-                    "at": ISO8601DateFormatter().string(from: Date()),
+                    "at": NativeTimestampFormat.plainZulu(Date()),
                     "status": failureStatus,
                     "sessionId": sessionId ?? NSNull(),
                     "model": NSNull(),
@@ -566,18 +436,9 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 ])
             }
         }
-        // Release only the HTTP wait. The original turn is not cancelled;
-        // its existing durable reply can be correlated by request identity.
+        // Reply receipts remain correlated by request identity after the HTTP wait ends.
         workLatch.arm(afterSeconds: Self.messageWorkDeadlineSeconds) { [weak self] in
             guard let self, workLatch.claim() else { return }
-            // User, 2026-09-05: "her turn shouldn't be dying on her while she's
-            // working." This deadline used to cancel the work task, and the
-            // work task IS the turn: a bridge message that started a long
-            // curation turn had that turn killed ten minutes in, silently, at
-            // the next tool boundary (10:00:24 -> 10:10:24 -> died 10:12:15).
-            // The deadline now releases only the HTTP caller. The turn runs
-            // to its own end; its reply still lands in the transcript and in
-            // the bridge's reply record, and the caller reads it from there.
             self.eventPublisher("message_deadline_released", [
                 "requestId": requestID,
                 "seconds": Self.messageWorkDeadlineSeconds,
@@ -619,6 +480,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             var value = result
             value["evidence"] = evidence
             value["coverage"] = ["complete": complete, "scope": "retained_reply_receipts"]
+            value["retrieval_result_class"] = result["status"] as? String == "ok" ? "succeeded" : "failed"
             return value
         }
         guard !requestID.isEmpty, requestID.utf8.count <= 128,
@@ -652,10 +514,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             guard let text = String(data: line, encoding: .utf8) else { return "invalid_encoding" }
             if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return nil }
             guard let row = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { return "malformed_receipts" }
-            // Older receipts have several shapes, including rows without a
-            // reply/status. A fully decoded object with no matching request ID
-            // is demonstrably unrelated; validate the payload only after exact
-            // identity matches. Malformed JSON still cannot establish scope.
+            // Validate payloads only after request identity matches; malformed JSON invalidates scope.
             if let rawID = row["requestId"], !(rawID is String) { return "malformed_receipts" }
             guard row["requestId"] as? String == requestID else { return nil }
             if let principal, row["principal"] as? String != principal { return nil }
@@ -698,6 +557,15 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         result["status"] = "ok"
         result.removeValue(forKey: "original_outcome")
         result["original_status"] = row["status"]
+        // Historical combined statuses describe delivery after a completed turn.
+        let historical = row["status"] as? String ?? ""
+        let turnStatus = row["runId"] is String
+            && (historical.hasPrefix("delivery_") || ["ok", "no_reply", "outcome_unknown", "owed", "sent_unconfirmed"].contains(historical))
+            ? "completed" : historical
+        result["execution_result_class"] = row["execution_result_class"]
+            ?? ChatToolOutcome.exactResultClass(.object(["status": .string(turnStatus)])).rawValue
+        result["execution_terminal"] = row["execution_terminal"] ?? true
+        for key in ["attachments", "completionDelivery", "deliveryId"] { result[key] = row[key] }
         result["run_id"] = row["runId"] as? String ?? NSNull()
         result["reply"] = slice
         result["offset"] = offset
@@ -728,63 +596,98 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
     static func messageReplyRecord(_ payload: [String: Any], requestID: String) -> [String: Any] {
         var record = payload
         record["requestId"] = requestID
+        record["execution_result_class"] = ChatToolOutcome.exactResultClass(.object(["status": .string(payload["status"] as? String ?? "")])).rawValue
+        record["execution_terminal"] = true
         return record
     }
 
-    /// Ack-on-enqueue lane for /claude/message and plain /codex/message
-    /// (wake-delivery-classification, 2026-07-25). Two phases, one response:
-    ///
-    ///   1. ENQUEUE — durably append the user row; answer 200
-    ///      {status:"ok", ack:"enqueued", sessionId} immediately. Bounded by
-    ///      `enqueueAckDeadlineSeconds` (disk-bound work).
-    ///   2. TURN — run the chat turn detached with `suppressUserAppend: true`
-    ///      on the RESOLVED session. Unbounded here by design: the response is
-    ///      already written, so a long turn can no longer be misread as a lost
-    ///      delivery. The reply still lands in message-replies.jsonl and the
-    ///      message_out/message_failed event stream, same as the legacy lane.
-    ///
-    /// Honesty contract with callers: `enqueue_failed` and `enqueue_timeout`
-    /// mean "not proven enqueued", NOT "proven not enqueued" — post-append
-    /// bookkeeping inside the append seam can throw after the row is on disk.
-    /// Callers settle ambiguity against the session store itself.
+    /// Both HTTP modes settle completed replies here, independently of acknowledgement ownership.
+    private func settleMessageReply(_ resp: ChatTurnRuntime.ChatResponse, request: TurnRequest,
+        principal: AgentBridgePrincipal, owner: String, claudeReplyID: String?, replyText: String,
+        requestID: String, started: Date, sessionID: String?, enqueued: Bool = false,
+        callerResultIsTool: Bool = false, responseCached: Bool = false, wasCached: Bool = false,
+        completionRoute: AgentBridgeCompletionRoute? = nil, deliveryID: String? = nil,
+        completionDigest: String? = nil) async throws -> [String: Any] {
+        let turnSession = resp.sessionId ?? sessionID
+        if !callerResultIsTool { await port.publishChatTurnCompleted(sessionID: turnSession) }
+        if let claudeReplyID {
+            try Self.recordClaudeReply(to: claudeReplyID, text: replyText, sessionId: turnSession,
+                                       owner: owner, principal: principal, request: request)
+            await answerAskingChat(replyTo: claudeReplyID, response: resp, turnSession: turnSession, owner: owner)
+        }
+        let durationMs = Int(Date().timeIntervalSince(started) * 1000)
+        let reply = ChatResponse.answerOnly(resp.output, workingCommentaryCharacters: resp.workingCommentaryCharacters)
+        let hasText = !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let attachments = Self.bridgeAttachmentPayload(resp.attachments)
+        let completionDelivery: AgentBridgeCompletionDelivery?
+        if let completionRoute, let deliveryID, let completionDigest,
+           hasText || !(resp.attachments ?? []).isEmpty {
+            completionDelivery = await AgentBridgeCompletionRouter.deliver(deliveryId: deliveryID,
+                requestDigest: completionDigest, text: reply, attachments: resp.attachments ?? [],
+                route: completionRoute, sender: port.completionSender(dataRoot: PersistenceCore.defaultDataRoot()),
+                lifecycle: CodexCompletionLifecycle.shared)
+        } else { completionDelivery = nil }
+        let status = resp.terminalState?.rawValue ?? "incomplete"
+        var result = Self.messageReplyRecord(["status": status,
+            "sessionId": (enqueued ? turnSession : resp.sessionId) ?? NSNull(),
+            "model": resp.model, "runId": resp.runId, "durationMs": durationMs,
+            "reply": reply, "attachments": attachments], requestID: requestID)
+        if enqueued { result["ack"] = "enqueued" }
+        else {
+            result["responseCached"] = responseCached
+            result["servedFromCache"] = wasCached
+            // Canonical assistant persistence precedes any external notification.
+            result["replyPersisted"] = responseCached && !callerResultIsTool && (hasText || !attachments.isEmpty)
+        }
+        if let deliveryID { result["deliveryId"] = deliveryID }
+        if let completionDelivery { result["completionDelivery"] = completionDelivery.jsonObject }
+        var receipt = result
+        receipt["at"] = NativeTimestampFormat.plainZulu(Date())
+        let written = Self.persistMessageReply(receipt, requestID: requestID, principal: principal.id)
+        if deliveryID == nil, written {
+            try await CodexCompletionLifecycle.shared.recordDelivery(AgentBridgeCompletionDelivery(status: "completed",
+                surface: "bridge-http", delivery: "receipt", artifactCount: 1, attempts: 0, reason: nil),
+                deliveryId: "bridge-http." + requestID, requestDigest: requestID)
+        }
+        var event: [String: Any] = ["requestId": requestID, "sessionId": (enqueued ? turnSession : resp.sessionId) ?? NSNull(),
+            "model": resp.model, "runId": resp.runId, "replyLen": reply.count,
+            "attachmentCount": attachments.count, "durationMs": durationMs, "status": status]
+        if enqueued { event["ack"] = "enqueued" }
+        else {
+            event["completionDeliveryStatus"] = completionDelivery?.status ?? NSNull()
+            event["deliveryId"] = deliveryID ?? NSNull()
+            event["servedFromCache"] = wasCached
+        }
+        eventPublisher("message_out", event)
+        return result
+    }
+
+    /// Acknowledge the durable row before running its turn; replies use the shared receipt/event path.
+    /// `enqueue_failed` and `enqueue_timeout` leave enqueue unproven; resolve ambiguity in the session store.
     private func handleMessageAckOnEnqueue(
         response: @escaping Response,
-        client: any ChatOrchestrationClient,
+        client: SwiftNativeChatOrchestrationClient,
         request: TurnRequest,
         principal: AgentBridgePrincipal,
         claudeReplyID: String?,
         claudeReplyText: String,
         requestID: String,
         started: Date,
-        /// false = notice delivery: append the row, answer the ack, run NO
-        /// turn. The row is ordinary transcript history the agent reads on its
-        /// next real turn; it starts no decision and loads no tools.
+        /// false delivers transcript history without starting a turn or loading tools.
         runTurn: Bool = true
     ) {
         let enqueueLatch = ClaudeBridgeRuntime.WorkLatch()
         let owner = AgentContactIdentity(dataRoot: PersistenceCore.defaultDataRoot()).canonical("peer:" + principal.id)
         let sessionId = request.sessionID
         let text = request.message
-        // 2026-09-06: the enqueued row is the ONLY durable user message on
-        // this lane — the turn below runs with suppressUserAppend, so images
-        // that reached the model left no trace in the transcript at all.
+        // The enqueued row is the turn's durable user message, including its images.
         let workTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             let enqueued: EnqueuedUserMessage
             do {
                 enqueued = try await request.enqueue(
                     on: client,
-                    // TRANSPORT BOOKKEEPING, DECLARED BY THE SENDER (Agent,
-                    // item 5, 2026-09-14). `runTurn == false` is the
-                    // `enqueue_only` lane: a reply-free transport event that
-                    // starts no decision and loads no tools — the
-                    // "[claude-wake] [notice] Transport record only…" rows.
-                    // The felt organ was reading those as things User said to her.
-                    //
-                    // Off the LANE, never the text. The notice wording lives in
-                    // script/wake_reply_delivery.js, outside Swift entirely, so
-                    // matching it here would tie her inner life to a string in
-                    // another language's source. The protocol flag is the fact.
+                    // The protocol flag, never message text, identifies a transport notice.
                     mechanicalRow: runTurn ? nil : .transportNotice,
                     awaitingConsumption: runTurn
                 )
@@ -802,10 +705,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 return
             }
             guard enqueueLatch.claim() else {
-                // The enqueue deadline already answered 504. The row may be
-                // durably in the store; running the turn anyway would let a
-                // wake that LOOKS failed also speak. Stop — the caller's
-                // store check classifies the ambiguity honestly.
+                // The deadline owns the acknowledgement; a possibly persisted row must not start a turn.
                 return
             }
             let receipt: [String: Any] = [
@@ -813,7 +713,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 "requestId": requestID,
                 "ack": "enqueued",
                 "sessionId": enqueued.sessionId,
-                "enqueuedAt": ISO8601DateFormatter().string(from: Date()),
+                "enqueuedAt": NativeTimestampFormat.plainZulu(Date()),
                 "turn": runTurn ? "started" : "suppressed",
             ]
             response(200, receipt)
@@ -824,22 +724,14 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                 "textLen": text.count,
                 "turn": runTurn ? "started" : "suppressed",
             ])
-            // Notice delivery ends here. The caller's proof of delivery is the
-            // durable row itself (confirmDeliveryViaSessionStore reads the
-            // store, not this response), so suppressing the turn costs the
-            // delivery contract nothing.
+            // The durable row proves notice delivery without starting a turn.
             guard runTurn else {
-                // Same refresh edge a turn would publish, so the informational
-                // row actually appears in the Mac transcript and the iOS
-                // projection instead of waiting for the next turn.
+                // Publish the notice row to Mac and iOS transcripts.
                 await self.port.publishChatTurnCompleted(sessionID: enqueued.sessionId)
                 return
             }
             do {
-                // Pin the turn's runId to the enqueued row's runId so history
-                // exclusion drops the pre-appended user row (else the message
-                // enters the prompt twice) and user/assistant rows correlate
-                // exactly as on the normal append-inside-turn path.
+                // Reuse the enqueued run identity to exclude its user row from history and correlate the reply.
                 var turn = request.consuming(enqueued)
                 turn.codexCompletion = .some(.some(CodexCompletionTranscriptBinding(
                     deliveryId: "bridge-http." + requestID, requestDigest: requestID, model: "", reasoningEffort: nil)))
@@ -854,100 +746,38 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
                     ))
                 }
                 try await CodexCompletionLifecycle.shared.cacheResponse(resp, deliveryId: "bridge-http." + requestID, requestDigest: requestID)
-                await self.port.publishChatTurnCompleted(sessionID: resp.sessionId ?? enqueued.sessionId)
-                if let claudeReplyID {
-                    Self.recordClaudeReply(to: claudeReplyID, text: claudeReplyText, sessionId: resp.sessionId ?? enqueued.sessionId, owner: owner,
-                                            principal: principal, request: request)
-                    await self.answerAskingChat(replyTo: claudeReplyID, response: resp, turnSession: resp.sessionId ?? enqueued.sessionId, owner: owner)
-                }
-                let durationMs = Int(Date().timeIntervalSince(started) * 1000)
-                let trimmedReply = resp.output.trimmingCharacters(in: .whitespacesAndNewlines)
-                let attachmentPayload = Self.bridgeAttachmentPayload(resp.attachments)
-                let replyStatus = Self.codexCompletionReplyStatus(
-                    terminalState: resp.terminalState,
-                    hasReplyText: !trimmedReply.isEmpty,
-                    attachmentCount: attachmentPayload.count,
-                    completionDeliveryStatus: nil
-                )
-                let receiptWritten = Self.persistMessageReply([
-                    "at": ISO8601DateFormatter().string(from: Date()),
-                    "status": replyStatus,
-                    "ack": "enqueued",
-                    "sessionId": resp.sessionId ?? enqueued.sessionId,
-                    "model": resp.model,
-                    "runId": resp.runId,
-                    "durationMs": durationMs,
-                    "reply": resp.output,
-                    "attachments": attachmentPayload,
-                ], requestID: requestID, principal: principal.id)
-                if receiptWritten {
-                    try await CodexCompletionLifecycle.shared.recordDelivery(AgentBridgeCompletionDelivery(status: "completed",
-                        surface: "bridge-http", delivery: "receipt", artifactCount: 1, attempts: 0, reason: nil),
-                        deliveryId: "bridge-http." + requestID, requestDigest: requestID)
-                }
-                self.eventPublisher("message_out", [
-                    "requestId": requestID,
-                    "sessionId": resp.sessionId ?? enqueued.sessionId,
-                    "model": resp.model,
-                    "runId": resp.runId,
-                    "replyLen": resp.output.count,
-                    "attachmentCount": attachmentPayload.count,
-                    "durationMs": durationMs,
-                    "status": replyStatus,
-                    "ack": "enqueued",
-                ])
-            } catch is CancellationError {
-                await self.port.publishChatTurnCompleted(sessionID: enqueued.sessionId)
-                // A Stop on this session (cancelled.flag is per session, and
-                // bridge turns share the Mac's) cancels the turn after the
-                // ack. The caller was told to read the receipt, so write one:
-                // without it they wait forever. Receipt file only, no chat
-                // row (the cancelled partial is already in the transcript).
-                Self.persistMessageReply([
-                    "at": ISO8601DateFormatter().string(from: Date()),
-                    "status": "cancelled",
-                    "ack": "enqueued",
-                    "sessionId": enqueued.sessionId,
-                    "model": NSNull(),
-                    "runId": enqueued.runId,
-                    "durationMs": Int(Date().timeIntervalSince(started) * 1000),
-                    "reply": "",
-                    "detail": "turn stopped before it finished",
-                ], requestID: requestID, principal: principal.id)
-                self.eventPublisher("message_failed", [
-                    "requestId": requestID,
-                    "runId": enqueued.runId,
-                    "detail": "turn stopped before it finished",
-                    "status": "cancelled",
-                    "sessionId": enqueued.sessionId,
-                ])
+                _ = try await self.settleMessageReply(resp, request: request, principal: principal, owner: owner,
+                    claudeReplyID: claudeReplyID, replyText: claudeReplyText, requestID: requestID,
+                    started: started, sessionID: enqueued.sessionId, enqueued: true)
             } catch {
                 await self.port.publishChatTurnCompleted(sessionID: enqueued.sessionId)
+                let cancelled = error is CancellationError
+                let status = cancelled ? "cancelled" : "chat_failed"
+                let detail = cancelled ? "turn stopped before it finished" : String(describing: error)
+                // Cancellation retains the already-persisted partial; only a receipt is owed here.
                 Self.persistMessageReply([
-                    "at": ISO8601DateFormatter().string(from: Date()),
-                    "status": "chat_failed",
+                    "at": NativeTimestampFormat.plainZulu(Date()),
+                    "status": status,
                     "ack": "enqueued",
                     "sessionId": enqueued.sessionId,
                     "model": NSNull(),
-                    "runId": NSNull(),
+                    "runId": cancelled ? enqueued.runId as Any : NSNull(),
                     "durationMs": Int(Date().timeIntervalSince(started) * 1000),
                     "reply": "",
-                    "detail": String(describing: error),
+                    "detail": detail,
                 ], requestID: requestID, principal: principal.id)
                 self.eventPublisher("message_failed", [
                     "requestId": requestID,
                     "runId": enqueued.runId,
-                    "detail": String(describing: error),
-                    "status": "chat_failed",
+                    "detail": detail,
+                    "status": status,
                     "sessionId": enqueued.sessionId,
                 ])
             }
         }
         enqueueLatch.arm(afterSeconds: Self.enqueueAckDeadlineSeconds) { [weak self] in
             guard let self, enqueueLatch.claim() else { return }
-            // Cancel BEFORE the turn can start: the work task only proceeds
-            // past the enqueue when ITS latch claim succeeds, so a claimed
-            // deadline guarantees no ghost turn runs after this 504.
+            // Owning the enqueue latch prevents turn admission after this timeout.
             workTask.cancel()
             self.eventPublisher("message_enqueue_timeout", [
                 "seconds": Self.enqueueAckDeadlineSeconds,
@@ -961,14 +791,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         }
     }
 
-    /// Durable her→me drop: append one JSONL row per /claude/message turn to
-    /// ~/.config/claude-bridge/message-replies.jsonl (sibling of the token +
-    /// claude-inbox.jsonl). Survives client timeouts and empty turns — the two
-    /// observed ways a reply evaporated. Best-effort by design: a persistence
-    /// failure logs but never breaks the HTTP response path.
-    /// Serializes message-reply appends — two concurrent detached turns must
-    /// not interleave the existence-check/open/append sequence (gpt-5.5 review:
-    /// lost/overwritten JSONL rows on the durability path).
+    /// Serialize best-effort reply JSONL appends; persistence failures log without failing HTTP.
     private static let messageReplyLock = NSLock()
 
     /// Return attachment metadata to a local bridge caller without embedding
@@ -981,43 +804,53 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
     /// Non-human senders allowed to name themselves in a bridge message.
     static let scriptSenders: Set<String> = ["install_app.sh"]
 
-    static func bridgeImageSkips(_ paths: [String]) -> [String] {
-        let mimes: Set<String> = ["png", "jpg", "jpeg", "webp", "gif"]
-        var out: [String] = []
-        for (index, raw) in paths.enumerated() {
-            let url = URL(fileURLWithPath: raw.trimmingCharacters(in: .whitespacesAndNewlines))
-            let name = url.lastPathComponent
-            if index >= 4 { out.append("\(name): past the four-image limit"); continue }
-            guard mimes.contains(url.pathExtension.lowercased()) else { out.append("\(name): not an image type the bridge takes"); continue }
-            guard FileManager.default.fileExists(atPath: url.path) else { out.append("\(name): not found"); continue }
-            guard let data = try? Data(contentsOf: url) else { out.append("\(name): could not be read"); continue }
-            if data.isEmpty { out.append("\(name): empty file (still being written?)"); continue }
-            if data.count > 8 * 1024 * 1024 { out.append("\(name): over 8 MB"); continue }
-        }
-        return out
-    }
-
     static func withImageSkipNote(_ text: String, _ skips: [String]) -> String {
         guard !skips.isEmpty else { return text }
         let noun = skips.count == 1 ? "image" : "images"
-        // 2026-09-08 (Agent's acceptance): the notice must say how to recover, not only what failed.
+        // Attachment notices name the failure and how the sender can recover.
         return text + "\n\n[\(skips.count) \(noun) not attached: " + skips.joined(separator: "; ") + ". The sender can resend the file\(skips.count == 1 ? "" : "s").]"
     }
 
-    static func bridgeImageAttachments(_ paths: [String]) -> [ChatTurnRuntime.MultimodalAttachment] {
+    /// One descriptor read supplies both the pixels and any skip explanation.
+    /// Nonblocking open plus fstat rejects FIFOs/devices before any read; the
+    /// byte cap remains enforced if a regular file grows after fstat.
+    static func prepareBridgeImages(_ paths: [String]) -> (attachments: [ChatTurnRuntime.MultimodalAttachment], skips: [String]) {
         let mimes = ["png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp", "gif": "image/gif"]
         var out: [ChatTurnRuntime.MultimodalAttachment] = []
-        for raw in paths.prefix(4) {
+        var skips: [String] = []
+        let limit = 8 * 1024 * 1024
+        func read(_ url: URL) -> (Data?, String?) {
+            let fd = Darwin.open(url.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+            guard fd >= 0 else { return (nil, errno == ENOENT ? "not found" : "could not be opened") }
+            defer { Darwin.close(fd) }
+            var info = stat()
+            guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_size >= 0 else { return (nil, "not a readable regular file") }
+            guard info.st_size <= limit else { return (nil, "over 8 MB") }
+            var data = Data(), chunk = [UInt8](repeating: 0, count: 65_536)
+            while true {
+                guard !Task.isCancelled else { return (nil, "attachment read cancelled") }
+                let count = Darwin.read(fd, &chunk, min(chunk.count, limit - data.count + 1))
+                if count < 0, errno == EINTR { continue }
+                guard count >= 0 else { return (nil, "could not be read") }
+                if count == 0 { break }
+                guard count <= limit - data.count else { return (nil, "over 8 MB") }
+                data.append(contentsOf: chunk.prefix(count))
+            }
+            return data.isEmpty ? (nil, "empty file (still being written?)") : (data, nil)
+        }
+        for (index, raw) in paths.enumerated() {
             let url = URL(fileURLWithPath: raw.trimmingCharacters(in: .whitespacesAndNewlines))
-            guard let mime = mimes[url.pathExtension.lowercased()],
-                  let data = try? Data(contentsOf: url),
-                  !data.isEmpty, data.count <= 8 * 1024 * 1024 else { continue }
+            let name = url.lastPathComponent
+            if index >= 4 { skips.append("\(name): past the four-image limit"); continue }
+            guard let mime = mimes[url.pathExtension.lowercased()] else { skips.append("\(name): not an image type the bridge takes"); continue }
+            let result = read(url)
+            guard let data = result.0 else { skips.append("\(name): \(result.1 ?? "could not be read")"); continue }
             out.append(ChatTurnRuntime.MultimodalAttachment(
                 type: "image", base64: data.base64EncodedString(), mime: mime,
                 name: url.lastPathComponent, byteSize: data.count, path: url.path
             ))
         }
-        return out
+        return (out, skips)
     }
 
     static func bridgeAttachmentPayload(
@@ -1053,27 +886,6 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Keep the bridge's top-level settlement honest. Attachment-only responses
-    /// are real replies, while an ambiguous external send is terminal but is not
-    /// success and must not invite another unsafe dispatch.
-    static func codexCompletionReplyStatus(
-        terminalState: TurnEngineResult.TerminalState?,
-        hasReplyText: Bool,
-        attachmentCount: Int,
-        completionDeliveryStatus: String?
-    ) -> String {
-        guard terminalState == .completed else { return terminalState?.rawValue ?? "incomplete" }
-        guard hasReplyText || attachmentCount > 0 else { return "no_reply" }
-        switch completionDeliveryStatus {
-        case "failed_pre_dispatch": return "delivery_failed_pre_dispatch"
-        case "rejected": return "delivery_rejected"
-        case "lifecycle_unavailable": return "delivery_lifecycle_unavailable"
-        case "in_progress": return "delivery_in_progress"
-        case "outcome_unknown": return "outcome_unknown"
-        default: return "ok"
-        }
-    }
-
     /// An answer names an exact send owed to this who, through any of its doors.
     static func validClaudeReplyID(_ messageID: String, owner: String) -> String? {
         let root = PersistenceCore.defaultDataRoot()
@@ -1100,33 +912,50 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
     /// The answer's own row carries its door and steering (the stamp the
     /// request wrote); any copy of it carries the same, never the send's owner.
     static func recordClaudeReply(to messageID: String, text: String, sessionId: String?, owner: String,
-                                   principal: AgentBridgePrincipal, request: TurnRequest) {
+                                   principal: AgentBridgePrincipal, request: TurnRequest) throws {
         let dataRoot = PersistenceCore.defaultDataRoot()
         let steeredBy: [String] = if case .some(.some(let origin)) = request.origin { origin.peerSources ?? [] } else { [] }
-        _ = try? AgentConversationStore(dataRoot: dataRoot)
+        try recordClaudeReplyReceipt(to: messageID, text: text, sessionId: sessionId, owner: owner)
+        _ = try AgentConversationStore(dataRoot: dataRoot)
             .settleReply(agent: owner, messageID: messageID, text: text, landedIn: sessionId,
                          from: principal.peerID.map { "peer:" + $0 } ?? "another agent", steeredBy: steeredBy)
+    }
+
+    /// Both inline and turn-delivered answers use this one receipt writer.
+    /// Retrying a handoff after its exchange save failed must not append twice.
+    private static func recordClaudeReplyReceipt(to messageID: String, text: String, sessionId: String?, owner: String) throws {
+        let dataRoot = PersistenceCore.defaultDataRoot()
         guard AgentContactIdentity(dataRoot: dataRoot).aliases["claude"] == owner else { return }
         let dir = messageReplyURL().deletingLastPathComponent()
         // The answer as every job retains it, so an exact read returns it, not a preview.
         let row: [String: Any] = [
             "messageId": messageID, "sessionId": sessionId ?? NSNull(),
             "replyText": String(text.prefix(6000)), "replyTruncated": text.count > 6000,
-            "createdAt": ISO8601DateFormatter().string(from: Date()),
+            "createdAt": NativeTimestampFormat.plainZulu(Date()),
         ]
-        guard var line = try? JSONSerialization.data(withJSONObject: row) else { return }
+        var line = try JSONSerialization.data(withJSONObject: row)
         line.append(0x0A)
         let file = dir.appendingPathComponent("claude-replies.jsonl")
         messageReplyLock.lock()
         defer { messageReplyLock.unlock() }
-        if let handle = try? FileHandle(forWritingTo: file) {
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: line)
-            try? handle.close()
-        } else {
-            FileManager.default.createFile(atPath: file.path, contents: line, attributes: [.posixPermissions: 0o600])
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        if FileManager.default.fileExists(atPath: file.path) {
+            let bytes = try Data(contentsOf: file)
+            guard bytes.isEmpty || bytes.last == 0x0A else { throw CocoaError(.fileReadCorruptFile) }
+            let matches = try bytes.split(separator: 0x0A).compactMap { line -> [String: Any]? in
+                guard let saved = try JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else {
+                    throw CocoaError(.fileReadCorruptFile)
+                }
+                return saved["messageId"] as? String == messageID ? saved : nil
+            }
+            if let saved = matches.last,
+               saved["replyText"] as? String == row["replyText"] as? String,
+               saved["replyTruncated"] as? Bool == row["replyTruncated"] as? Bool {
+                return
+            }
         }
-        _ = try? enforceJSONLLineCap(at: file, maxLines: 500, trimWhenBytesExceed: 1_048_576)
+        try SwiftNativePersistenceCore.appendOwnedBytes(line, to: file, durable: true)
+        _ = try enforceJSONLRetention(at: file, maxLines: 500, trimWhenBytesExceed: 1_048_576)
     }
 
     /// The answer goes back to the chat that asked, from this who's own conversation.
@@ -1134,14 +963,15 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         let dataRoot = PersistenceCore.defaultDataRoot()
         let identity = AgentContactIdentity(dataRoot: dataRoot)
         let threadOwner = owner.hasPrefix("peer:") ? String(owner.dropFirst(5)) : owner
+        let answer = ChatResponse.answerOnly(response.output, workingCommentaryCharacters: response.workingCommentaryCharacters)
         guard let turnSession, turnSession == ContactThread.session(owner: threadOwner),
-              !response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !(response.attachments ?? []).isEmpty,
+              !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !(response.attachments ?? []).isEmpty,
               let row = try? AgentConversationStore(dataRoot: dataRoot).records().first(where: {
                   identity.canonical($0.agent) == owner && $0.readInput?["message_id"] == .string(messageID)
               }), row.scopeSessionID != turnSession else { return }
         let deliveryId = owner + "-reply:" + messageID
         let route = AgentBridgeCompletionRoute(asking: row, turnSessionId: turnSession)
-        let digest = SHA256.hash(data: Data(response.output.utf8)).map { String(format: "%02x", $0) }.joined()
+        let digest = SHA256.hash(data: Data(answer.utf8)).map { String(format: "%02x", $0) }.joined()
         let lifecycle = CodexCompletionLifecycle.shared
         // Once per answer: a resent reply never answers the asking chat twice.
         guard (try? await lifecycle.claim(deliveryId: deliveryId, requestDigest: digest, sessionId: turnSession,
@@ -1151,7 +981,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             return
         }
         let delivery = await AgentBridgeCompletionRouter.deliverAnswer(deliveryId: deliveryId, requestDigest: digest,
-            text: response.output, attachments: response.attachments ?? [],
+            text: answer, attachments: response.attachments ?? [],
             route: route, client: chatClient(),
             sender: port.completionSender(dataRoot: dataRoot), lifecycle: lifecycle, notifyRequestedResult: false)
         if delivery.status != "completed" {
@@ -1164,12 +994,11 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
             guard let response = row.response else { continue }
             let requestID = String(row.id.dropFirst("bridge-http.".count))
             let attachments = bridgeAttachmentPayload(response.attachments)
-            let status = codexCompletionReplyStatus(terminalState: response.terminalState,
-                hasReplyText: !response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                attachmentCount: attachments.count, completionDeliveryStatus: nil)
-            guard persistMessageReply(["at": ISO8601DateFormatter().string(from: Date()), "status": status,
+            let answer = ChatResponse.answerOnly(response.output, workingCommentaryCharacters: response.workingCommentaryCharacters)
+            let status = response.terminalState?.rawValue ?? "incomplete"
+            guard persistMessageReply(["at": NativeTimestampFormat.plainZulu(Date()), "status": status,
                 "sessionId": response.sessionId ?? "", "runId": response.runId, "model": response.model,
-                "reply": response.output, "attachments": attachments, "replyPersisted": true], requestID: requestID,
+                "reply": answer, "attachments": attachments, "replyPersisted": true], requestID: requestID,
                 principal: row.principal, logURL: logURL) else { throw CocoaError(.fileWriteUnknown) }
             try await lifecycle.recordDelivery(AgentBridgeCompletionDelivery(status: "completed", surface: "bridge-http",
                 delivery: "receipt", artifactCount: 1, attempts: 0, reason: nil), deliveryId: row.id, requestDigest: row.digest)
@@ -1189,71 +1018,44 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         let dir = file.deletingLastPathComponent()
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let lockFD = Darwin.open(file.path + ".lock", O_CREAT | O_WRONLY, 0o600)
-            guard lockFD >= 0 else {
-                throw NSError(
-                    domain: "ClaudeBridgeMessageReply",
-                    code: Int(errno),
-                    userInfo: [NSLocalizedDescriptionKey: "could not open receipt lock"]
-                )
-            }
-            defer {
-                _ = flock(lockFD, LOCK_UN)
-                Darwin.close(lockFD)
-            }
-            guard flock(lockFD, LOCK_EX) == 0 else {
-                throw NSError(
-                    domain: "ClaudeBridgeMessageReply",
-                    code: Int(errno),
-                    userInfo: [NSLocalizedDescriptionKey: "could not acquire receipt lock"]
-                )
-            }
-            guard JSONSerialization.isValidJSONObject(payload),
-                  let data = try? JSONSerialization.data(withJSONObject: payload) else {
-                nativeLog("[ClaudeBridge] message-reply persist skipped: payload not JSON-serializable")
-                return false
-            }
-            if FileManager.default.fileExists(atPath: file.path) {
-                let bytes = try Data(contentsOf: file)
-                guard bytes.isEmpty || bytes.last == 0x0A else { throw CocoaError(.fileReadCorruptFile) }
-                let matches = try bytes.split(separator: 0x0A).compactMap { line -> [String: Any]? in
-                    guard let row = try JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { throw CocoaError(.fileReadCorruptFile) }
-                    return row["requestId"] as? String == requestID ? row : nil
+            return try CredentialFileLock.withLock(file) {
+                guard JSONSerialization.isValidJSONObject(payload),
+                      let data = try? JSONSerialization.data(withJSONObject: payload) else {
+                    nativeLog("[ClaudeBridge] message-reply persist skipped: payload not JSON-serializable")
+                    return false
                 }
-                guard matches.count <= 1 else { throw CocoaError(.fileReadCorruptFile) }
-                if let existing = matches.first {
-                    guard existing["runId"] as? String == payload["runId"] as? String,
-                          existing["sessionId"] as? String == payload["sessionId"] as? String,
-                          existing["reply"] as? String == payload["reply"] as? String else { throw CocoaError(.fileReadCorruptFile) }
-                    return true
+                if FileManager.default.fileExists(atPath: file.path) {
+                    let bytes = try Data(contentsOf: file)
+                    guard bytes.isEmpty || bytes.last == 0x0A else { throw CocoaError(.fileReadCorruptFile) }
+                    let matches = try bytes.split(separator: 0x0A).compactMap { line -> [String: Any]? in
+                        guard let row = try JSONSerialization.jsonObject(with: Data(line)) as? [String: Any] else { throw CocoaError(.fileReadCorruptFile) }
+                        return row["requestId"] as? String == requestID ? row : nil
+                    }
+                    guard matches.count <= 1 else { throw CocoaError(.fileReadCorruptFile) }
+                    if let existing = matches.first {
+                        guard existing["runId"] as? String == payload["runId"] as? String,
+                              existing["sessionId"] as? String == payload["sessionId"] as? String,
+                              existing["reply"] as? String == payload["reply"] as? String else { throw CocoaError(.fileReadCorruptFile) }
+                        return true
+                    }
                 }
-            }
-            var line = data
-            line.append(Data("\n".utf8))
-            if !FileManager.default.fileExists(atPath: file.path) {
-                try line.write(to: file, options: [.atomic])
-            } else {
-                let handle = try FileHandle(forWritingTo: file)
-                try handle.seekToEnd()
-                try handle.write(contentsOf: line)
-                try handle.synchronize()
-                try handle.close()
-            }
-            // 2026-09-22: a byte cap, not a line cap. Rows are big (~2KB), so
-            // the file sat past the 8MiB trigger but under 5000 lines and was
-            // re-read whole on every append without ever trimming.
-            let dropped = try enforceJSONLByteCap(
-                at: file,
-                maxBytes: 8 << 20,
-                trimToBytes: 4 << 20
-            )
-            if dropped > 0 {
-                nativeLog(
-                    "[ClaudeBridge] message-replies cap dropped %d oldest row(s)",
-                    dropped
+                var line = data
+                line.append(Data("\n".utf8))
+                try SwiftNativePersistenceCore.appendOwnedBytes(line, to: file, durable: true)
+                // Retain the newest 4 MiB once the feed exceeds 8 MiB.
+                let dropped = try enforceJSONLRetention(
+                    at: file,
+                    maxBytes: 8 << 20,
+                    trimToBytes: 4 << 20
                 )
+                if dropped > 0 {
+                    nativeLog(
+                        "[ClaudeBridge] message-replies cap dropped %d oldest row(s)",
+                        dropped
+                    )
+                }
+                return true
             }
-            return true
         } catch {
             nativeLog("[ClaudeBridge] message-reply persist failed: %@", String(describing: error))
             return false
@@ -1269,7 +1071,7 @@ public final class ClaudeBridgeMessageRuntime: @unchecked Sendable {
         requestID: String,
         sessionID: String?,
         runID: String? = nil
-    ) -> ChatOrchestrationProgressHandler {
+    ) -> TurnEventSink {
         { [weak self] event in
             guard case .notice(let kind, let text) = event else { return }
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -1,20 +1,7 @@
 import SwiftUI
 import AppKit
-import CoreGraphics
-import ScreenCaptureKit
-import ScreenVision
-import Speech
-import AVFoundation
-import UniformTypeIdentifiers
 import NativeAgentShared
-import MemoryV2
 import PersistenceCore
-#if canImport(CoreSpotlight)
-import CoreSpotlight
-#endif
-#if canImport(CloudKit)
-import CloudKit
-#endif
 
 // Blueprint: | `WorkshopHubView.swift` | `DeskRootRoutePresentation` and `NewWorkshopTaskSheet`: root-navigation token and explicit task submission with retained draft/error state |
 
@@ -27,33 +14,12 @@ enum DeskRootRoutePresentation {
     }
 }
 
-enum NewDeskTaskPresentation {
-    static let successStatus = "Desk task created"
-    private static let failurePrefix = "Desk task creation failed:"
-
-    static func failureStatus(_ detail: String) -> String {
-        let trimmed = detail.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return failurePrefix }
-        return "\(failurePrefix) \(trimmed)"
-    }
-
-    static func inlineError(from statusText: String) -> String? {
-        guard statusText.hasPrefix(failurePrefix) else { return nil }
-        let detail = statusText.dropFirst(failurePrefix.count)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        // The sheet stays open on failure, so this line is the only thing the
-        // person sees. A bare backend detail ("connection lost") reads as a
-        // riddle without the sentence that says what it stopped.
-        return detail.isEmpty
-            ? "Couldn’t create this task. Try again."
-            : "Couldn’t create this task. \(detail)"
-    }
+enum NewDeskTaskOutcome {
+    case created
+    case failed(String)
 }
 
-// B2.3: the single unique control salvaged from the retired Command Center —
-// Title + Objective → AppModel.createWorkshopTask. The implementation keeps
-// its compatibility name, but the user-facing task belongs to the Desk. We
-// dismiss only when creation succeeded, never eating the user's text on failure.
+/// Retains the task draft until creation succeeds.
 struct NewWorkshopTaskSheet: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.dismiss) private var dismiss
@@ -111,14 +77,15 @@ struct NewWorkshopTaskSheet: View {
         errorMessage = nil
         submitting = true
         Task {
-            let succeeded = await appModel.createWorkshopTask(
+            let outcome = await appModel.createWorkshopTask(
                 title: nextTitle,
                 objective: nextObjective.isEmpty ? nextTitle : nextObjective
             )
             submitting = false
-            if !succeeded {
-                errorMessage = NewDeskTaskPresentation.inlineError(from: appModel.statusText)
-            } else {
+            switch outcome {
+            case .failed(let message):
+                errorMessage = message
+            case .created:
                 if appModel.editDraft(draftSubject, seed: submitted) == submitted { appModel.clearEditDraft(draftSubject) }
                 NotificationCenter.default.post(name: .deskTaskCreated, object: nil)
                 dismiss()

@@ -1,6 +1,7 @@
 import Foundation
 import os
 import PersistenceCore
+import NativeAgentShared
 // Blueprint: | `ChatGPTDotIPCTransport.swift` | `ChatGPTDotIPCTransport` enum; `listen`, `reconnect`, `stop`, `readiness`; retained socket observation and helper pipes close on the delegation runner's shutdown; generation guards reject old callbacks, accepted room deliveries retain their handles until exit |
 
 public enum ChatGPTDotIPCTransport {
@@ -68,6 +69,7 @@ public enum ChatGPTDotIPCTransport {
         var events: FileChangeEvents?
         var observation: Task<Void, Never>?
         var deliveries: [UUID: Task<Void, Never>] = [:]
+        var stopping = false
         var generation = UUID()
         var process: Process?
         var output: FileHandle?
@@ -85,7 +87,7 @@ public enum ChatGPTDotIPCTransport {
     /// Once, for the app's data root: follow Dot from now on.
     public static func listen(dataRoot: URL) {
         listener.withLock { state in
-            guard state.dataRoot == nil, !Task.isCancelled else { return }
+            guard state.dataRoot == nil, !state.stopping, !Task.isCancelled else { return }
             state.dataRoot = dataRoot
             let events = FileChangeEvents(paths: [socket], emitInitial: true)
             let generation = state.generation
@@ -105,12 +107,13 @@ public enum ChatGPTDotIPCTransport {
         }
     }
 
-    /// Stop passive ingress at once. Messages already accepted finish under
-    /// their retained delivery tasks; their actual exits release those handles.
-    public static func stop() {
+    /// Close ingress, cancel accepted work and join its actual settlement.
+    public static func stop() async {
         let retired = listener.withLock { state in
+            state.stopping = true
             state.generation = UUID()
-            let retired = (state.events, state.observation, state.process, state.lifeline, state.output)
+            let retired = (state.events, state.observation, state.process, state.lifeline, state.output,
+                           Array(state.deliveries.values), state.generation)
             state.dataRoot = nil
             state.state = unavailable("Dot messaging has not been checked yet.", status: "not_checked")
             state.events = nil; state.observation = nil
@@ -121,6 +124,12 @@ public enum ChatGPTDotIPCTransport {
         retired.4?.readabilityHandler = nil
         try? retired.3?.fileHandleForWriting.close()
         if retired.2?.isRunning == true { retired.2?.terminate() }
+        for task in retired.5 { task.cancel() }
+        await retired.1?.value
+        for task in retired.5 { await task.value }
+        listener.withLock { state in
+            if state.generation == retired.6 { state.stopping = false }
+        }
         NotificationCenter.default.post(name: didChange, object: nil)
     }
 
@@ -156,7 +165,7 @@ public enum ChatGPTDotIPCTransport {
                 return lines
             }
             listener.withLock { if $0.lifeline === lifeline { $0.lines += lines.count } }
-            lines.forEach { receive($0, root: root, generation: generation) }
+            lines.forEach { receive($0, generation: generation) }
             if chunk.isEmpty {
                 handle.readabilityHandler = nil
                 ended(lifeline, generation: generation)
@@ -177,21 +186,10 @@ public enum ChatGPTDotIPCTransport {
         }
     }
 
-    private static func receive(_ line: Data, root: URL, generation: UUID) {
+    private static func receive(_ line: Data, generation: UUID) {
         guard case .object(var fields)? = try? JSONDecoder().decode(JSONValue.self, from: line) else { return }
-        let room = fields.removeValue(forKey: "messages")
-        settle(.object(fields), generation: generation)
-        guard case .array(let messages)? = room else { return }
-        deliver(generation: generation) {
-            guard let peer = try? AgentPeerStore(dataRoot: root).list().first(where: owns) else { return }
-            do {
-                _ = try await conversation(root, peer, messages, nil)
-                // A wait on Dot looks again.
-                AgentConversationRunning.shared.changed()
-            } catch {
-                nativeLog("Dot's room could not be brought into her session: %@", error.localizedDescription)
-            }
-        }
+        let messages = fields.removeValue(forKey: "messages")?.arrayValue
+        settle(.object(fields), messages: messages, generation: generation)
     }
 
     /// The helper is gone. It said why in its last line; one that did not
@@ -219,26 +217,32 @@ public enum ChatGPTDotIPCTransport {
     }
 
     /// A new state is news at once: the contact rows and her contact health follow it.
-    private static func settle(_ state: JSONValue, generation: UUID) {
-        guard let root = listener.withLock({ value -> URL?? in
-            guard value.generation == generation, value.dataRoot != nil, value.state != state else { return nil }
+    private static func settle(_ state: JSONValue, messages: [JSONValue]? = nil, generation: UUID) {
+        guard let (root, changed) = listener.withLock({ value -> (URL, Bool)? in
+            guard value.generation == generation, let root = value.dataRoot else { return nil }
+            let changed = value.state != state
             value.state = state
-            return .some(value.dataRoot)
+            return (root, changed)
         }) else { return }
-        NotificationCenter.default.post(name: didChange, object: nil)
-        guard let root else { return }
+        if changed { NotificationCenter.default.post(name: didChange, object: nil) }
         // Inbound only has no send path to be unavailable: a mark an earlier refused send left is lifted here, once.
-        if inboundOnly, let peers = try? AgentPeerStore(dataRoot: root).list() {
+        if changed, inboundOnly, let peers = try? AgentPeerStore(dataRoot: root).list() {
             for peer in peers where owns(peer) && peer.unavailableAt != nil {
                 AgentPeerStore(dataRoot: root).clearUnavailable(peerID: peer.id, since: .distantPast)
             }
         }
+        guard changed || messages != nil else { return }
         deliver(generation: generation) {
-            await AgentContactHealth.shared.refresh(dataRoot: root)
-            // Room messages a failed ingestion kept are tried again.
+            if changed { await AgentContactHealth.shared.refresh(dataRoot: root) }
             guard listener.withLock({ $0.generation == generation && $0.dataRoot != nil }) else { return }
             guard let peer = try? AgentPeerStore(dataRoot: root).list().first(where: owns) else { return }
-            _ = try? await conversation(root, peer, [], nil)
+            do {
+                // This delivery also drains messages retained after a failed ingestion.
+                _ = try await conversation(root, peer, messages ?? [], nil)
+                if messages != nil { AgentConversationRunning.shared.changed() }
+            } catch {
+                nativeLog("Dot's room could not be brought into her session: %@", error.localizedDescription)
+            }
         }
     }
 

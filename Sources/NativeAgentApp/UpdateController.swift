@@ -5,58 +5,10 @@ import SystemOps
 
 // Blueprint: | `UpdateController.swift` | `UpdateController`: configured Sparkle lifecycle, version probes and explicit unavailable/update presentation |
 
-// RELEASE-2026-05-06: thin Sparkle 2.x wrapper — Task 4.3
-// Sparkle is enabled only for release bundles with a complete updater config.
-// Developer installs intentionally omit SUFeedURL/SUPublicEDKey; starting Sparkle
-// in that state shows a blocking "updater failed to start" modal on every launch.
-// @MainActor required for Swift 6 strict concurrency + Sparkle's ObjC bridge.
-//
-// A2.1 (2026-07-24): a syntactically-valid SUFeedURL is NOT evidence that a feed
-// exists. Every full release before today stamped a REQUIRED appcast URL that had
-// never been published, which enabled "Check for Updates…" and turned a user click
-// into a hopeful spinner that resolved into a 404. The updater now additionally
-// requires `NativeAgentUpdateFeedPublished`, which script/release.sh sets to true
-// only for a release that actually generated, signed, and published an appcast.
-// When it is false the updater is never started (no background 404s either) and
-// the menu tells the truth instead of pretending to check.
+// Sparkle runs on MainActor only for fully configured release bundles with NativeAgentUpdateFeedPublished.
 
-/// The modal model for builds where Sparkle cannot check. It owns both the
-/// release-page admission boundary and button-to-action mapping so the view
-/// never silently loses its only recovery path or routes an unrelated future
-/// button to the browser.
-struct UpdateUnavailableAlertPresentation: Equatable {
-    enum Action: Equatable {
-        case dismiss
-        case openReleases(URL)
-    }
-
-    struct Button: Equatable {
-        let title: String
-        let action: Action
-    }
-
-    let message: String
-    let informativeText: String
-    let buttons: [Button]
-
-    static func make(
-        reason: UpdateController.Unavailability,
-        info: [String: Any]
-    ) -> Self {
-        let rawVersion = (info["CFBundleShortVersionString"] as? String ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let version = rawVersion.isEmpty ? "this version" : rawVersion
-        var buttons = [Button(title: "OK", action: .dismiss)]
-        if let releaseURL = releasePageURL(in: info) {
-            buttons.append(Button(title: "Open Releases", action: .openReleases(releaseURL)))
-        }
-        return Self(
-            message: reason.message,
-            informativeText: "NativeAgent \(version)\n\n\(reason.detail)",
-            buttons: buttons
-        )
-    }
-
+@MainActor
+final class UpdateController: NSObject {
     /// A release page is a user-facing escape hatch, so only an absolute HTTPS
     /// URL with a host is admissible. Relative, scheme-less, and HTTP values
     /// never become an external-navigation action.
@@ -73,19 +25,6 @@ struct UpdateUnavailableAlertPresentation: Equatable {
         return url
     }
 
-    /// NSAlert returns a button ordinal. Resolve that ordinal through the
-    /// presentation's ordered button model instead of assuming the second
-    /// button always opens releases; a future inserted action stays dismissive
-    /// unless it is explicitly declared as `.openReleases`.
-    func action(for response: NSApplication.ModalResponse) -> Action {
-        let index = response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
-        guard buttons.indices.contains(index) else { return .dismiss }
-        return buttons[index].action
-    }
-}
-
-@MainActor
-final class UpdateController: NSObject {
     /// One updater owns the host app. The app menu and both Settings surfaces
     /// must not each start an independent Sparkle scheduler.
     static let shared = UpdateController()
@@ -118,11 +57,6 @@ final class UpdateController: NSObject {
     private let info: [String: Any]
     private let preferences: UserDefaults
 
-    typealias UpdaterFactory = @MainActor (
-        _ startingUpdater: Bool,
-        _ updaterDelegate: UpdateController
-    ) -> SPUStandardUpdaterController?
-
     override convenience init() {
         self.init(
             info: Bundle.main.infoDictionary ?? [:],
@@ -132,14 +66,7 @@ final class UpdateController: NSObject {
 
     init(
         info: [String: Any],
-        preferences: UserDefaults,
-        updaterFactory: UpdaterFactory = { startingUpdater, updaterDelegate in
-            SPUStandardUpdaterController(
-                startingUpdater: startingUpdater,
-                updaterDelegate: updaterDelegate,
-                userDriverDelegate: nil
-            )
-        }
+        preferences: UserDefaults
     ) {
         let unavailability = SoftwareUpdateState.resolveUnavailability(info: info)
         self.unavailability = unavailability
@@ -152,7 +79,11 @@ final class UpdateController: NSObject {
         // Created after super.init so the controller can carry `self` as the
         // updater delegate (found/not-found mirror into `status`).
         if unavailability == nil {
-            updaterController = updaterFactory(true, self)
+            updaterController = SPUStandardUpdaterController(
+                startingUpdater: true,
+                updaterDelegate: self,
+                userDriverDelegate: nil
+            )
             canCheckObservation = updaterController?.updater.observe(
                 \.canCheckForUpdates, options: [.initial, .new]
             ) { [weak self] _, _ in
@@ -265,15 +196,19 @@ final class UpdateController: NSObject {
 
     private func presentUnavailableExplanation() {
         let reason = unavailability ?? .notConfigured
-        let presentation = UpdateUnavailableAlertPresentation.make(reason: reason, info: info)
+        let rawVersion = (info["CFBundleShortVersionString"] as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let version = rawVersion.isEmpty ? "this version" : rawVersion
+        let releaseURL = Self.releasePageURL(in: info)
 
         let alert = NSAlert()
         alert.alertStyle = .informational
-        alert.messageText = presentation.message
-        alert.informativeText = presentation.informativeText
-        presentation.buttons.forEach { alert.addButton(withTitle: $0.title) }
+        alert.messageText = reason.message
+        alert.informativeText = "NativeAgent \(version)\n\n\(reason.detail)"
+        alert.addButton(withTitle: "OK")
+        if releaseURL != nil { alert.addButton(withTitle: "Open Releases") }
 
-        if case let .openReleases(releaseURL) = presentation.action(for: alert.runModal()) {
+        if alert.runModal() == .alertSecondButtonReturn, let releaseURL {
             NSWorkspace.shared.open(releaseURL)
         }
     }

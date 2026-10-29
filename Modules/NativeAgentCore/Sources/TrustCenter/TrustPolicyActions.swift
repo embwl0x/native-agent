@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `TrustPolicyActions.swift` | `TrustPolicyActions` struct; `developerModePatchBody`, `saveMemoryPolicy`, `saveAgentAccessMode`; `saveMacControlPolicy` patches edited fields and checks their baseline inside the policy lock |
@@ -16,32 +17,25 @@ public struct TrustPolicyActions: Sendable {
         try await TrustPolicyToolWriter.applyTrustPolicyPatch(body: body, dataRoot: dataRoot)
     }
 
-    public func saveWorkshopPolicyToggle(enabled: Bool? = nil, showTimeline: Bool? = nil) async throws -> TrustPolicy {
+    public func saveWorkshopPolicyToggle(enabled: Bool? = nil) async throws -> TrustPolicy {
         var patch: [String: Any] = [:]
         if let enabled { patch["enabled"] = enabled }
-        if let showTimeline { patch["showTimeline"] = showTimeline }
         return try await postTrustWrite(body: [WorkshopPolicyBlockVocabulary.wireKey: patch])
     }
 
     /// The Developer Mode toggle is an operator-facing, restart-applied policy
     /// change. Keep its persistence separate from changing Full Mac access.
     ///
-    /// The same patch also keeps the dependent destructive-action, shell, and
+    /// The same patch also keeps the dependent shell and
     /// system-control gates coherent on the next launch. Deep merge preserves
     /// all unrelated Trust Center policy and canonical normalization remains
     /// the final authority.
     public static func developerModePatchBody(enabled: Bool) -> [String: Any] {
         [
             "developerMode": enabled,
-            "filePolicy": [
-                "allowDestructiveActions": enabled,
-            ],
             "macControlPolicy": [
                 "shell_allowed": enabled,
                 "system_control_allowed": enabled,
-                "riskGatePolicy": [
-                    "critical": enabled ? "auto" : "deny",
-                ],
             ],
         ]
     }
@@ -78,10 +72,9 @@ public struct TrustPolicyActions: Sendable {
         ])
     }
 
-    public func saveMemoryPolicy(consolidationEnabled: Bool, crossSessionRecall: Bool) async throws -> TrustPolicy {
+    public func saveMemoryPolicy(crossSessionRecall: Bool) async throws -> TrustPolicy {
         try await postTrustWrite(body: [
             "memoryPolicy": [
-                "consolidation_enabled": consolidationEnabled,
                 "cross_session_recall": crossSessionRecall,
             ]
         ])
@@ -89,8 +82,7 @@ public struct TrustPolicyActions: Sendable {
 
     public func patchMemoryPolicy(
         knowledgeGraphEnabled: Bool? = nil,
-        adaptivePromotion: Bool? = nil,
-        hygieneEnabled: Bool? = nil
+        adaptivePromotion: Bool? = nil
     ) async throws -> TrustPolicy {
         var memoryPolicy: [String: Any] = [:]
         if let knowledgeGraphEnabled {
@@ -99,9 +91,6 @@ public struct TrustPolicyActions: Sendable {
         if let adaptivePromotion {
             memoryPolicy["adaptive_promotion"] = adaptivePromotion
         }
-        if let hygieneEnabled {
-            memoryPolicy["hygiene_enabled"] = hygieneEnabled
-        }
         return try await postTrustWrite(body: ["memoryPolicy": memoryPolicy])
     }
 
@@ -109,8 +98,8 @@ public struct TrustPolicyActions: Sendable {
     /// effective policy inside the canonical writer's lock; a conflicting edit
     /// leaves the policy untouched, and unrelated concurrent choices survive.
     public func saveMacControlPolicy(
-        _ policy: TrustMacControlPolicy,
-        comparedTo baseline: TrustMacControlPolicy,
+        _ policy: MacControlPolicyWireSnapshot,
+        comparedTo baseline: MacControlPolicyWireSnapshot,
         guardedByLockedPolicy: (@Sendable ([String: JSONValue]) throws -> Void)? = nil
     ) async throws -> TrustPolicy {
         let baselineValues = baseline.wireValue.mapValues { JSONValue(fromFoundation: $0) }
@@ -122,7 +111,7 @@ public struct TrustPolicyActions: Sendable {
             guardedByLockedPolicy: { locked in
                 try guardedByLockedPolicy?(locked)
                 let current = try TrustPolicy(policyObject: SwiftNativeTrustCenter.normalizeTrustPolicy(locked))
-                    .macControlPolicy ?? TrustMacControlPolicy()
+                    .macControlPolicy ?? MacControlPolicyWireSnapshot()
                 let currentValues = current.wireValue.mapValues { JSONValue(fromFoundation: $0) }
                 guard changedKeys.allSatisfy({ currentValues[$0] == baselineValues[$0] }) else {
                     throw TrustCenterError.policyConflict
@@ -137,34 +126,9 @@ public struct TrustPolicyActions: Sendable {
             return try await saveAgentAccessMode("full", currentPolicy: currentPolicy)
         }
 
-        let approvals = ["shell", "file_ops", "applescript", "jxa", "accessibility"]
-        let riskGate: [String: Any] = [
-            "low": "auto",
-            "medium": "approve_each",
-            "high": "approve_each",
-            "critical": "deny",
-        ]
-
         let filePolicy: [String: Any] = [
             "requireBackupBeforeWrite": true,
             "outsideWorkspaceDefault": "deny",
-            "allowDestructiveActions": false,
-        ]
-
-        let watchPolicy: [String: Any] = [
-            "enabled": true,
-            "applescript_allowed": false,
-            "jxa_allowed": false,
-            "shortcuts_allowed": true,
-            "accessibility_allowed": false,
-            "system_control_allowed": false,
-            "file_ops_allowed": false,
-            "shell_allowed": false,
-            "notifications_allowed": true,
-            "spotlight_allowed": true,
-            "remote_from_ios_allowed": true,
-            "approval_required_for": approvals,
-            "riskGatePolicy": riskGate,
         ]
 
         let body: [String: Any]
@@ -183,7 +147,7 @@ public struct TrustPolicyActions: Sendable {
                 "autonomyDefault": "supervised",
                 "developerMode": false,
                 "filePolicy": filePolicy,
-                "macControlPolicy": watchPolicy,
+                "macControlPolicy": MacControlPolicyWireSnapshot(enabled: true, remoteFromIosAllowed: true).wireValue,
             ]
         default:
             body = [
@@ -208,61 +172,22 @@ public struct TrustPolicyActions: Sendable {
         let requestedDeveloperMode = developerMode ?? (normalized == "full")
         let destructiveMode = normalized == "full" && requestedDeveloperMode
         let remoteFromIosAllowed = existingPolicy?.macControlPolicy?.remoteFromIosAllowed ?? false
-        var body: [String: Any] = [:]
-        switch normalized {
-        case "read_only":
-            body = [
-                "permissionLevel": "strict",
-                "autonomyDefault": "supervised",
-                "developerMode": false,
-                "filePolicy": [
-                    "requireBackupBeforeWrite": true,
-                    "outsideWorkspaceDefault": "deny",
-                    "allowDestructiveActions": false,
-                ],
-                "macControlPolicy": Self.macControlPolicyForAccessMode("read_only", remoteFromIosAllowed: false),
-            ]
-        case "workspace":
-            body = [
-                "permissionLevel": "balanced",
-                "autonomyDefault": "workspace_autonomous",
-                "developerMode": false,
-                "filePolicy": [
-                    "requireBackupBeforeWrite": true,
-                    "outsideWorkspaceDefault": "deny",
-                    "allowDestructiveActions": false,
-                ],
-                "macControlPolicy": Self.macControlPolicyForAccessMode("workspace", remoteFromIosAllowed: remoteFromIosAllowed),
-            ]
-        case "full":
-            body = [
-                "permissionLevel": "full_mac_os",
-                "autonomyDefault": "workspace_autonomous",
-                "developerMode": destructiveMode,
-                "filePolicy": [
-                    "requireBackupBeforeWrite": true,
-                    "outsideWorkspaceDefault": "allow",
-                    "allowDestructiveActions": destructiveMode,
-                ],
-                "macControlPolicy": Self.macControlPolicyForAccessMode(
-                    "full",
-                    remoteFromIosAllowed: true,
-                    developerMode: destructiveMode
-                ),
-            ]
-        default:
-            body = [
-                "permissionLevel": "balanced",
-                "autonomyDefault": "supervised",
-                "developerMode": false,
-                "filePolicy": [
-                    "requireBackupBeforeWrite": true,
-                    "outsideWorkspaceDefault": "deny",
-                    "allowDestructiveActions": false,
-                ],
-                "macControlPolicy": Self.macControlPolicyForAccessMode("read_only", remoteFromIosAllowed: false),
-            ]
-        }
+        let full = normalized == "full"
+        let workspace = normalized == "workspace"
+        let body: [String: Any] = [
+            "permissionLevel": full ? "full_mac_os" : normalized == "read_only" ? "strict" : "balanced",
+            "autonomyDefault": full || workspace ? "workspace_autonomous" : "supervised",
+            "developerMode": destructiveMode,
+            "filePolicy": [
+                "requireBackupBeforeWrite": true,
+                "outsideWorkspaceDefault": full ? "allow" : "deny",
+            ],
+            "macControlPolicy": Self.macControlPolicyForAccessMode(
+                normalized,
+                remoteFromIosAllowed: full || (workspace && remoteFromIosAllowed),
+                developerMode: destructiveMode
+            ),
+        ]
         return try await postTrustWrite(body: body)
     }
 

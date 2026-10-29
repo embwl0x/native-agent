@@ -1,9 +1,9 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `LLMClient+OpenAIResponsesDecoding.swift` | `OpenAIOAuthDirectAdapter`: `consumeResponsesStream`, `incompleteReasonText`, `incompleteNote` |
+// Blueprint: | `LLMClient+OpenAIResponsesDecoding.swift` | `ChatGPTTransport`: `consumeResponsesStream`, `incompleteReasonText`, `incompleteNote` |
 
-extension OpenAIOAuthDirectAdapter {
+extension ChatGPTTransport {
     /// Shared Responses SSE execution; authentication and HTTP retries stay with each lane.
     static func consumeResponsesStream(
         bytes: URLSession.AsyncBytes,
@@ -36,19 +36,10 @@ extension OpenAIOAuthDirectAdapter {
                 continuation.yield(.replyTextSettled(false))
             }
         }
-        // U1 step 1 — streaming telemetry: TTFT stamped at
-        // the FIRST meaningful output frame — text delta,
-        // function_call output_item.added, or first argument
-        // delta, whichever arrives first. Stamping only at
-        // output_item.done (after the whole argument stream)
-        // read materially too high for tool-call-first
-        // responses (gpt-5.5 review blocker, 2026-06-10).
-        // Usage rides on the terminal response.completed.
+        // TTFT starts at the first text, function-call or argument frame; usage comes from response.completed.
         var capturedUsage: LLMUsage?
         var ttftMs: Int?
-        // User, 2026-09-06: set by a terminal
-        // `response.incomplete` frame — see the buffered
-        // sibling. Same omission, same misclassification.
+        // response.incomplete supplies the terminal incomplete reason.
         var incompleteReason: String?
         var refusalTextByPart: [String: String] = [:]
         var runaway = RunawayOutputDetector()
@@ -81,13 +72,7 @@ extension OpenAIOAuthDirectAdapter {
             if payloadStr == "[DONE]" { return true }
             guard let pdata = payloadStr.data(using: .utf8),
                   let event = try? JSONSerialization.jsonObject(with: pdata) as? [String: Any] else {
-                // User, 2026-09-06: an unparseable frame used to
-                // vanish, so a corrupted transport mid-answer
-                // silently dropped a chunk of the reply (or of
-                // a function call's arguments) and the turn
-                // still finished "successfully". Once output
-                // has started, a frame we cannot read is a
-                // stream failure the ladder should re-ask on.
+                // An unreadable frame after output starts is a retryable stream failure.
                 guard emittedProviderOutput else { return false }
                 throw LLMError.transient(
                     message: "\(providerLabel): malformed stream frame after content")
@@ -147,16 +132,9 @@ extension OpenAIOAuthDirectAdapter {
                     // recognized `added` frame — stamp
                     // unconditionally.
                     stampTTFT()
-                    if pendingByItemId[id] != nil {
-                        pendingByItemId[id]!.args.append(delta)
-                    }
+                    pendingByItemId[id]?.args.append(delta)
                 }
-                // Liveness: tool-arg deltas are model output but are
-                // accumulated (not yielded as content), so emit
-                // `.keepAlive` to keep ProviderStreamGuard's idle
-                // clock alive through a long tool-argument stream —
-                // parity with the Anthropic input_json_delta path
-                // (pre-existing gap, gpt-5.5 review 2026-06-15).
+                // Tool-argument deltas emit keepAlive because accumulated output still proves liveness.
                 continuation.yield(.keepAlive)
             } else if etype == "response.output_item.done" {
                 if let item = event["item"] as? [String: Any],
@@ -176,7 +154,7 @@ extension OpenAIOAuthDirectAdapter {
                     pendingByItemId.removeValue(forKey: id)
                 }
             } else if etype == "response.completed" || etype == "response.done" {
-                // U1 step 1: usage rides on the terminal frame.
+                // Usage rides on the terminal frame.
                 let respObj = event["response"] as? [String: Any]
                 if let usageObj = respObj?["usage"] as? [String: Any] {
                     capturedUsage = LLMUsage.fromOpenAIResponses(usageObj)
@@ -224,22 +202,8 @@ extension OpenAIOAuthDirectAdapter {
             return false
         }
 
-        // R15: SSEEventStream owns framing (LF-only terminator
-        // with CR strip — audit #14 — multi-line `data:` joins,
-        // EOF flush of an unterminated trailing event);
-        // processPayload owns the Responses-API semantics.
-        //
-        // Mid-stream transport errors (resource timeout,
-        // connection lost, ...) thrown by the byte stream must
-        // route through the SAME transientNetworkError mapping
-        // the initial session.bytes(for:) connect uses —
-        // without this wrapper they fell through to the
-        // generic catch below and surfaced as raw URLErrors,
-        // so mid-stream URLError.timedOut never classified
-        // transient (Anthropic OAuth parity, gpt-5.5 review
-        // 2026-07-02). Intentional LLMErrors from
-        // processPayload (providerError, ...) and
-        // cancellation re-throw untouched.
+        // SSEEventStream owns line framing, multiline data and EOF flush; processPayload owns Responses semantics.
+        // Initial and mid-stream transport failures share the same mapper.
         var shouldStop = false
         do {
             for try await sse in SSEEventStream(bytes) {
@@ -273,12 +237,7 @@ extension OpenAIOAuthDirectAdapter {
             return
         }
         guard shouldStop else {
-            // Byte stream ended WITHOUT a terminal event
-            // ([DONE]/response.completed): a proxy/LB closing
-            // the response mid-reply otherwise rendered the
-            // partial as complete and persisted it. Every
-            // other adapter throws streamTruncated here —
-            // match the contract (audit 2026-06-09).
+            // A stream without a terminal event is truncated, never a complete reply.
             throw LLMError.streamTruncated(
                 message: "\(providerLabel) stream ended without terminal event"
             )
@@ -317,7 +276,7 @@ extension OpenAIOAuthDirectAdapter {
                 message: "\(providerLabel) stream produced no content (terminal event, empty)"
             )
         }
-        // U1 step 1: one llm.call row per successful stream.
+        // Each successful stream records one llm.call row.
         let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
         await telemetry.record(
             requestBody: req.httpBody,
@@ -347,30 +306,5 @@ extension OpenAIOAuthDirectAdapter {
         default:
             return "The model did not finish its response. Please try again."
         }
-    }
-
-    /// A whole reply from a Responses event stream: trimmed text, then each
-    /// tool call as the id-bearing marker ToolCallParser reads. The producers
-    /// finish cleanly only after the decoder saw its terminal event; the one
-    /// other clean end is this task's cancellation, which must not return the
-    /// partial as a whole reply.
-    static func collectResponsesReply(
-        _ events: AsyncThrowingStream<LLMMessageStreamEvent, Error>
-    ) async throws -> String {
-        var text = ""
-        var markers: [String] = []
-        for try await event in events {
-            switch event {
-            case .textDelta(let delta): text += delta
-            case .toolCall(let call):
-                let arguments = String(decoding: call.inputJSON, as: UTF8.self)
-                markers.append("<tool_use id=\"\(call.id)\" name=\"\(call.name)\">\(arguments)</tool_use>")
-            case .toolBoundary(.outputLimit): throw LLMError.outputLengthLimit(partial: text)
-            case .keepAlive, .replyTextSettled, .toolBoundary: break
-            }
-        }
-        try Task.checkCancellation()
-        return ([text.trimmingCharacters(in: .whitespacesAndNewlines)] + markers)
-            .filter { !$0.isEmpty }.joined(separator: "\n")
     }
 }

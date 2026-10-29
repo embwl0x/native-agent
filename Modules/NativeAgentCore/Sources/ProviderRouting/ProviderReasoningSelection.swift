@@ -1,10 +1,5 @@
 import Foundation
-// Blueprint: | `ProviderReasoningSelection.swift` | provider reasoning selection |
-
-public func reasoningOptions<Option>(available: [Option], supported: [String]?, id: (Option) -> String) -> [Option] {
-    guard let supported, !supported.isEmpty else { return available }
-    return available.filter { supported.contains(id($0)) }
-}
+// Blueprint: | `ProviderReasoningSelection.swift` | Normalizes reasoning selection; NativeAgentShared owns supported-choice filtering |
 
 public func normalizedReasoningEffort(options: [String], preferred: String?, selected: String) -> String {
     if options.contains(selected) { return selected }

@@ -1,5 +1,6 @@
 import ChatTurnRuntime
 import Foundation
+import NativeAgentShared
 import MacControl
 import ProviderRouting
 import Transcripts
@@ -8,12 +9,10 @@ import Transcripts
 
 extension NativeAgentEngine {
     public func replyToIntent(_ message: String) async throws -> String {
-        let snapshot: ProvidersFacade.SettingsSnapshot
-        switch await providers.refreshSettings(refreshCatalog: false, cause: { error, _ in error.localizedDescription }) {
-        case .loaded(let read): snapshot = read
-        case .failed(let detail): throw ProviderRoutingError.underlying(detail)
+        let snapshot = try await providers.routing.checkedProviderSnapshot()
+        guard let selection = snapshot.routing.preferences["chat"] else {
+            throw ProviderRoutingError.underlying("canonical routing snapshot is incomplete")
         }
-        let selection = try ProvidersFacade.modelRoutingConfig(from: snapshot.routing).current.chat
         let sessionID = try SwiftNativeChatOrchestrationClient.resolveSessionId(
             ConversationAnchor.currentSessionId() ?? UUID().uuidString
         )
@@ -36,7 +35,8 @@ extension NativeAgentEngine {
                     surface: "chat",
                     suppressUserAppend: false,
                     replacementAssistantMessageID: nil,
-                    serviceTier: selection.serviceTier
+                    serviceTier: selection.serviceTier,
+                    threadKind: .direct
                 ).chat(on: self.chatClient(profile: .mac))
             }
         }

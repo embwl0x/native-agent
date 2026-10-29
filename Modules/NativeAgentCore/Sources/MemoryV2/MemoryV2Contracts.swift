@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MemoryV2Contracts.swift` | Current recall/proposal contracts; `MemoryPatchContract` preserves untrusted sources through rewrites and duplicate collapse |
+// Blueprint: | `MemoryV2Contracts.swift` | Recall candidate offsets and counted/capped continuations, proposal contracts; `MemoryPatchContract` preserves untrusted sources through rewrites and duplicate collapse |
 
 // MARK: - Request / response types
 
@@ -11,19 +11,23 @@ public struct MemoryV2RecallRequest: Sendable, Codable, Equatable {
     public var persona: String?
     public var surface: String?
     public var requiresRelevance: Bool?
+    /// Ranked disclosed candidates already examined, copied from nextOffset.
+    public var offset: Int?
 
     public init(
         text: String,
         topK: Int = 10,
         persona: String? = nil,
         surface: String? = nil,
-        requiresRelevance: Bool? = nil
+        requiresRelevance: Bool? = nil,
+        offset: Int? = nil
     ) {
         self.text = text
         self.topK = topK
         self.persona = persona
         self.surface = surface
         self.requiresRelevance = requiresRelevance
+        self.offset = offset
     }
 }
 
@@ -40,6 +44,10 @@ public struct MemoryV2RecallResponse: Sendable, Equatable {
     public var hits: [MemoryRecallHit]
     public var scored: [ScoredMemoryRecord]
     public var total: Int
+    /// When true, total is only a lower bound; the remaining ranking is unjudged.
+    public var capped: Bool
+    public var hasMore: Bool
+    public var nextOffset: Int?
     public var disclosureFilteredCount: Int
     public var timings: [String: Double]
     public init(
@@ -47,13 +55,19 @@ public struct MemoryV2RecallResponse: Sendable, Equatable {
         scored: [ScoredMemoryRecord],
         total: Int,
         disclosureFilteredCount: Int = 0,
-        timings: [String: Double] = [:]
+        timings: [String: Double] = [:],
+        capped: Bool = false,
+        hasMore: Bool = false,
+        nextOffset: Int? = nil
     ) {
         self.hits = hits
         self.scored = scored
         self.total = total
         self.disclosureFilteredCount = disclosureFilteredCount
         self.timings = timings
+        self.capped = capped
+        self.hasMore = hasMore
+        self.nextOffset = nextOffset
     }
 }
 
@@ -67,9 +81,7 @@ public struct ProposalRecord: Sendable, Codable, Equatable, Identifiable {
     /// "pending" | "accepted" | "rejected".
     public var status: String
     public var createdAt: String
-    /// When the row left `pending`. Carried through the conversion so the launch
-    /// supersession-link recovery can anchor on the moment of retirement (Astra
-    /// comb 4, lane5 finding 2); nil for a row still pending.
+    /// When the row left `pending`, anchoring supersession-link recovery; nil while pending.
     public var resolvedAt: String?
     public var rejectionReason: String?
     /// Carries the extractor's per-fact signal (confidence, kind) from staging
@@ -107,16 +119,14 @@ public struct ProposalRecord: Sendable, Codable, Equatable, Identifiable {
 public enum MemoryPatchContract {
     /// Untyped keys that round-trip through metadata.
     ///
-    /// `pinned` — the Mac UI pin path (audit 2026-06-09; pin was a silent no-op).
+    /// `pinned` — the Mac UI pin path.
     /// `tags` / `importance` — surfaced back into typed slots by `toMemoryRecord`.
-    /// `recall_count` — `store()`'s duplicate guard bumps it (2026-07-24).
-    /// `source_history` / `duplicate_occurrences` — byte-identical collapse
-    /// provenance (2026-08-02).
-    /// `owner_restored` — stamped when the agent restores an archived row; the
-    /// hygiene duplicate pass leaves such a row alone (2026-10-01).
+    /// `recall_count` — `store()`'s duplicate guard bumps it.
+    /// `source_history` / `duplicate_occurrences` — byte-identical collapse provenance.
+    /// `owner_restored` — stamped when the agent restores an archived row.
     ///
     /// `kind` is deliberately ABSENT: it is semantics-owned (kind-scoped decay)
-    /// and no UI path patches it.
+    /// and the approval-gated kind backfill uses its dedicated typed writer.
     public static let untypedPassthroughKeys: Set<String> = [
         "pinned", "tags", "importance", "recall_count",
         "source_history", "duplicate_occurrences", "owner_restored", "untrusted_sources", "peer_data_sources", "peer_sources",
@@ -128,10 +138,7 @@ public enum MemoryPatchContract {
 /// fingerprint that row had when the proposal was staged.
 public struct SupersedingAcceptance: Sendable, Equatable {
     public let targetId: String
-    /// Always present: a supersession with no fingerprint to check is not a
-    /// supersession, it is an unrelated demotion waiting to happen. Legacy
-    /// proposals staged before the fingerprint existed are refused at
-    /// acceptance and left pending for re-review (2026-09-11 review item 1).
+    /// Acceptance requires a target fingerprint; proposals without one stay pending for re-review.
     public let expectedContentHash: String
     public let reason: String
     public init(targetId: String, expectedContentHash: String, reason: String) {

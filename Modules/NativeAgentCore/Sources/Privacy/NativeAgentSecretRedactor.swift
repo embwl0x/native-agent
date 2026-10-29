@@ -1,79 +1,19 @@
 import PersistenceCore
+import NativeAgentShared
 import CryptoKit
 import Foundation
 // Blueprint: | `NativeAgentSecretRedactor.swift` | Canonical credential text redaction and shared secret detection: exact script-input names, broader audit/card names, audit token/JWT scanning and recursive script-input paths |
 
 /// Canonical redaction contract for durable local receipts and activity feeds.
-///
-/// The pattern order and replacement format mirror the retired runtime's
-/// `redact_secret_text` / `redact_secret_value` behavior. Subsystems that need
-/// this exact eight-pattern, digest-bearing contract must reuse this owner
-/// instead of carrying private copies. More aggressive privacy boundaries
-/// (for example chat traces or public/app projections) may layer additional
-/// patterns without weakening this baseline.
+/// Shared credential recognition retains digest-bearing receipt replacements.
 public enum NativeAgentSecretRedactor {
-    private static let patterns: [(String, NSRegularExpression)] = {
-        let specs: [(String, String, NSRegularExpression.Options)] = [
-            (
-                "PRIVATE_KEY",
-                "-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
-                [.dotMatchesLineSeparators]
-            ),
-            (
-                "GITHUB_TOKEN",
-                "\\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{30,})\\b",
-                []
-            ),
-            ("OPENAI_KEY", "\\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\\b", []),
-            ("ANTHROPIC_KEY", "\\bsk-ant-[A-Za-z0-9_-]{20,}\\b", []),
-            ("STRIPE_KEY", "\\b(?:sk|rk)_live_[A-Za-z0-9]{16,}\\b", []),
-            ("SLACK_TOKEN", "\\bxox[baprs]-[A-Za-z0-9-]{20,}\\b", []),
-            ("GOOGLE_API_KEY", "\\bAIza[0-9A-Za-z_-]{25,}\\b", []),
-            (
-                "BEARER_TOKEN",
-                "\\bBearer\\s+[A-Za-z0-9._~+/=-]{24,}\\b",
-                [.caseInsensitive]
-            ),
-        ]
-        return specs.map { kind, pattern, options in
-            guard let expression = try? NSRegularExpression(
-                pattern: pattern,
-                options: options
-            ) else {
-                preconditionFailure("NativeAgentSecretRedactor pattern failed: \(kind)")
-            }
-            return (kind, expression)
-        }
-    }()
-
     public static func redactText(_ value: String) -> String {
-        redactText(value, patterns: patterns)
+        TurnSecretRedactor.redactText(value, patterns: TurnSecretRedactor.credentialPatterns, replacement: digestReplacement)
     }
 
     /// Boundaries may retain their replacement text while sharing recognition.
     public static func redactText(_ value: String, replacement: (String, String) -> String) -> String {
-        redactText(value, patterns: patterns, replacement: replacement)
-    }
-
-    static func redactText(_ value: String, patterns: [(String, NSRegularExpression)],
-                           replacement: (String, String) -> String = digestReplacement) -> String {
-        var text = value
-        for (kind, expression) in patterns {
-            let current = text as NSString
-            let matches = expression.matches(
-                in: text,
-                options: [],
-                range: NSRange(location: 0, length: current.length)
-            )
-            for match in matches.reversed() {
-                let matched = current.substring(with: match.range)
-                text = (text as NSString).replacingCharacters(
-                    in: match.range,
-                    with: replacement(kind, matched)
-                )
-            }
-        }
-        return text
+        TurnSecretRedactor.redactText(value, patterns: TurnSecretRedactor.credentialPatterns, replacement: replacement)
     }
 
     static func digestReplacement(_ kind: String, _ value: String) -> String {
@@ -114,6 +54,8 @@ public enum NativeAgentSecretRedactor {
     }
 
     public static func containsAuditSecret(_ value: String) -> Bool {
+        let range = NSRange(value.startIndex..<value.endIndex, in: value)
+        if TurnSecretRedactor.credentialPatterns.contains(where: { $0.1.firstMatch(in: value, range: range) != nil }) { return true }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.contains("-----BEGIN") && trimmed.contains("PRIVATE KEY") { return true }
         let lower = trimmed.lowercased()
@@ -128,12 +70,8 @@ public enum NativeAgentSecretRedactor {
         return false
     }
 
-    /// Detect a real JWT token inside arbitrary text. The former implementation
-    /// split the *entire input string* on "." and treated three long chunks as
-    /// a JWT. A shell command that mentioned `Package.swift` twice therefore
-    /// became three chunks and was blocked as secret egress. Candidate tokens
-    /// must now be bounded base64url triplets whose header and payload decode
-    /// as JSON objects; ordinary dotted paths and filenames cannot qualify.
+    /// Audit JWT candidates are bounded base64url triplets with JSON objects
+    /// for header and payload, so ordinary dotted paths cannot qualify.
     private static func containsValidJWT(in value: String) -> Bool {
         let pattern = #"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])"#
         guard let regex = try? NSRegularExpression(pattern: pattern) else { return false }

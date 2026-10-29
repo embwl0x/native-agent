@@ -2,6 +2,7 @@
 // Receipt summaries retain artifact paths; full captures stay on disk.
 
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `Browser.swift` | Browser status delegates run decoding to the operation owner and retains its existing malformed-feed error; operation/capture paths and status projection; WebKit owns website data, with no advertised data-root profile |
@@ -15,9 +16,6 @@ public struct SwiftNativeBrowserClient: Sendable {
     public let sourcesDir: URL
     /// Absolute path to `<dataRoot>/native_power/browser/screenshots`.
     public let screenshotsDir: URL
-    /// Absolute path to `<dataRoot>/trust/policy.json` (for approvedDomains).
-    public let trustPolicyPath: URL
-    let persistence: any PersistenceCoreProtocol
     let now: @Sendable () -> Date
 
     /// Shared NativeActionReceipt JSONL, capped through appendPathOwnedJSONL.
@@ -37,24 +35,19 @@ public struct SwiftNativeBrowserClient: Sendable {
         receiptsPath: URL,
         sourcesDir: URL,
         screenshotsDir: URL,
-        trustPolicyPath: URL,
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
         now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.runsPath = runsPath
         self.receiptsPath = receiptsPath
         self.sourcesDir = sourcesDir
         self.screenshotsDir = screenshotsDir
-        self.trustPolicyPath = trustPolicyPath
-        self.persistence = persistence
         self.now = now
     }
 
     /// Resolve the browser operation and capture files under the data root.
     /// WebKit owns its website data; this client has no profile directory.
     public static func defaultClient(
-        dataRoot: URL = PersistenceCore.defaultDataRoot(),
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
+        dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> SwiftNativeBrowserClient {
         let browser = dataRoot
             .appendingPathComponent("native_power", isDirectory: true)
@@ -63,23 +56,16 @@ public struct SwiftNativeBrowserClient: Sendable {
             runsPath: browser.appendingPathComponent("runs.json"),
             receiptsPath: browser.appendingPathComponent("receipts.jsonl"),
             sourcesDir: browser.appendingPathComponent("sources", isDirectory: true),
-            screenshotsDir: browser.appendingPathComponent("screenshots", isDirectory: true),
-            trustPolicyPath: dataRoot
-                .appendingPathComponent("trust", isDirectory: true)
-                .appendingPathComponent("policy.json"),
-            persistence: persistence
+            screenshotsDir: browser.appendingPathComponent("screenshots", isDirectory: true)
         )
     }
 
     public func browserStatus() async throws -> JSONValue {
         // Only a missing run feed is empty; malformed content is unavailable.
-        async let runsRead = Self.readCanonicalRuns(at: runsPath, using: persistence,
-            malformed: PersistenceCoreError.ioFailure("The browser run feed is malformed."))
-        async let receiptsRead = persistence.tailJSONLReadReceipt(receiptsPath, limit: 20, maxBytes: 1_048_576)
-        async let domainsRead = approvedBrowserDomains()
+        async let runsRead = Self.readCanonicalRuns(at: runsPath, malformed: PersistenceCoreError.ioFailure("The browser run feed is malformed."))
+        async let receiptsRead = SwiftNativePersistenceCore.tailJSONLReadReceipt(receiptsPath, limit: 20, maxBytes: 1_048_576)
         let runs = try await runsRead
 
-        // active = [run for run in runs if run.get("status") in {"running","waiting_approval"}]
         let activeRuns: [JSONValue] = runs.filter { run in
             guard case .object(let obj) = run, case .string(let s)? = obj["status"] else {
                 return false
@@ -106,17 +92,11 @@ public struct SwiftNativeBrowserClient: Sendable {
             })
         } ?? .null
 
-        let approved = try await domainsRead
-
-        // browser_status() emits createdAt = now_iso() (response timestamp).
+        // createdAt timestamps this status response.
         return .object([
             "status": .string("ready"),
             "sourcePath": .string(sourcesDir.path),
             "screenshotPath": .string(screenshotsDir.path),
-            "approvedDomains": .array(approved.map { .string($0) }),
-            // Compatibility key above is historical. It reduces approval risk;
-            // it is not a navigation allowlist and does not mint authority.
-            "domainPolicy": .string("approval_risk_tiering"),
             "activeRuns": .array(activeRuns),
             "receiptCount": .int(Int64(receipts.count)),
             "receiptPath": .string(receiptsPath.path),
@@ -125,68 +105,7 @@ public struct SwiftNativeBrowserClient: Sendable {
         ])
     }
 
-    /// Port of `NativeAgentRuntime.approved_browser_domains()` (the retired daemon
-    /// L16811): read trust policy, pull `browserPolicy.approvedDomains` (a list),
-    /// else the default list; lowercase + strip each; drop empties; return SORTED
-    /// (browser_status sorts the set with `sorted(...)`).
-    ///
-    /// We read `trust/policy.json` directly (not the full normalized trust
-    /// policy) because `approved_browser_domains` only consults the saved
-    /// `browserPolicy.approvedDomains` key with a fixed fallback list — it does
-    /// NOT depend on any normalization the daemon applies elsewhere.
-    func approvedBrowserDomains() async throws -> [String] {
-        let defaultDomains = ["example.com", "openai.com", "github.com", "linear.app", "localhost", "127.0.0.1"]
-        let raw = try await persistence.readJSON(trustPolicyPath, ifMissing: .object([:]))
-        var configured: [String]? = nil
-        if case .object(let policy) = raw,
-           case .object(let browserPolicy)? = policy["browserPolicy"],
-           case .array(let domainsRaw)? = browserPolicy["approvedDomains"] {
-            // configured is used iff browserPolicy.approvedDomains is a LIST
-            // (Python: `configured if isinstance(configured, list) else [...]`).
-            //
-            // R-W17 (gpt-5.5 review #2): Python does NOT filter to strings — it
-            // stringifies EVERY element with `str(domain).lower().strip()`
-            //. So a misconfigured `[123, " Foo "]`
-            // yields `["123", "foo"]` in Python, not `["foo"]`. Coerce each JSON
-            // scalar Python-`str()`-style (int -> "123", double -> Python float
-            // repr is not perfectly reproducible but domain lists never carry
-            // floats; bool -> "True"/"False"; null -> "None") so receiptCount/
-            // approvedDomains match the daemon. Container elements (object/array)
-            // are the ONLY case left dropped: Python would emit a dict/list repr,
-            // which is never a real domain and never matched by any consumer — so
-            // dropping them is strictly safer than emitting "{...}" and cannot
-            // affect a real allow-list decision.
-            configured = domainsRaw.compactMap { v -> String? in
-                switch v {
-                case .string(let s): return s
-                case .int(let n): return String(n)
-                case .double(let d): return String(d)
-                case .bool(let b): return b ? "True" : "False"
-                case .null: return "None"
-                case .object, .array: return nil
-                }
-            }
-        }
-        let source = configured ?? defaultDomains
-        // {str(domain).lower().strip() for domain in domains if str(domain).strip()}
-        // then sorted(...) at the call site (browser_status).
-        var deduped = Set<String>()
-        for d in source {
-            let stripped = d.trimmingCharacters(in: .whitespacesAndNewlines)
-            if stripped.isEmpty { continue }
-            // Python lowercases THEN the set dedups; .lower() then no second strip
-            // is needed (already stripped). Use lowercased() to match str.lower().
-            deduped.insert(stripped.lowercased())
-        }
-        return deduped.sorted()
-    }
-
-    /// Reproduce the daemon's `now_iso()` shape EXACTLY:
-    ///   `datetime.now(timezone.utc).isoformat()`
-    /// -> microseconds + `+00:00` offset (NOT `Z`), e.g.
-    /// "2026-06-01T17:08:42.123456+00:00". The `createdAt` envelope field is the
-    /// RESPONSE timestamp and is non-load-bearing (no consumer parses it), so we
-    /// always emit 6 fractional digits rather than special-casing zero-fraction.
+    /// ISO-8601 UTC with six fractional digits and a `+00:00` suffix.
     static func nowISO(_ date: Date) -> String {
         NativeTimestampFormat.sixDigitUTCOffset(date)
     }

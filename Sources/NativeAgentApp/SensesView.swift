@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 import Senses
 import EngineRuntime
-// Blueprint: | `SensesView.swift` | `SensesView`; engine Senses projection, lifecycle controls and native share picker |
+// Blueprint: | `SensesView.swift` | `SensesView`; engine Senses projection with scoped changes and actual live watches, lifecycle controls and native share picker |
 
 
 struct SensesView: View {
@@ -39,9 +39,15 @@ struct SensesView: View {
                         }
                     }
                 }
-                AdvancedSection(title: "Just changed", card: .single) {
+                AdvancedSection(title: "Live watches", card: .single) {
+                    if state.watches.isEmpty { Text("No live sense watches.") }
+                    ForEach(Array(state.watches.enumerated()), id: \.offset) { _, watch in
+                        Text("\(watch.address) → \(watch.senseID) v\(watch.version)")
+                    }
+                }
+                AdvancedSection(title: "Sense changes", card: .single) {
                     if state.news.isEmpty {
-                        Text("No recent changes.")
+                        Text("Senses: nothing changed recently.")
                     }
                     ForEach(Array(state.news.enumerated()), id: \.offset) { _, news in
                         VStack(alignment: .leading, spacing: 4) {

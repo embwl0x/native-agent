@@ -14,55 +14,18 @@ public struct CognitiveObservatoryDetail: Sendable {
     public var substrate: CognitiveSubstrateSnapshot
     public var workspace: CognitiveWorkspaceSnapshot
     public var associations: [CognitiveAssociationEdge]
-    var episodes: [CognitiveEpisodeReference]
     public var schemaProposals: [CognitiveSchemaProposal]
     public var developmentalTimeline: [CognitiveDevelopmentalTimelineEvent]
-    /// 2026-09-13: the seven-day readout — what changed this week and why —
-    /// projected from the timeline above and grouped by lesson or view. The
-    /// raw events remain below it: the readout is the answer, the events are
-    /// the receipts behind it.
+    /// Seven-day timeline projection grouped by lesson or view; raw events remain its receipts.
     public var growthWeek: CognitiveGrowthWeek
     public var reflections: [CognitiveReflectionReceipt]
-    /// Carries receipt-read availability through the runtime boundary.  The
-    /// compatibility `receipts` projection below remains for older consumers,
-    /// but the Observatory must render this state rather than infer from it.
+    /// Receipt evidence and its availability travel as one value.
     public var receiptRead: CognitiveReceiptRead
-    public var receipts: [CognitiveReceiptRecord]
-    public var facultyMeasurements: [CognitiveFacultyMeasurement]
-    public var experiments: [CognitiveExperimentResult]
-    public var welfareBounds: CognitiveWelfareBounds
     public var organism: OrganismSnapshot
-    public var lastResearchExportPath: String?
     public var capsulePreview: CognitiveCapsule?
     public var capsulePreviewInfo: CapsulePreviewInfo?
-    /// The aboutness under the felt words (U3, 2026-07-09) — a pure read of the same
-    /// signals the fingerprint is built from. nil when cognition/affect is off or no
-    /// mode is genuinely dominant. Read-only: it adds no capsule text and drives nothing.
+    /// Read-only fingerprint aboutness; nil when cognition/affect is off or no mode dominates.
     public var feltMode: CognitiveSubstrate.FeltMode?
-}
-
-/// The Observatory's complete projection plus the truthfulness of its
-/// receipt-evidence lane. An otherwise useful live snapshot is still partial
-/// when its durable loop receipts cannot be read; callers must carry that
-/// state rather than treat the compatibility `receipts` array as a quiet zero.
-public struct CognitiveObservatoryDetailRead: Sendable {
-    public enum EvidenceStatus: Sendable, Equatable {
-        case complete
-        case receiptEvidenceUnavailable(CognitiveReceiptReadUnavailability)
-    }
-
-    public let detail: CognitiveObservatoryDetail
-    public let evidenceStatus: EvidenceStatus
-
-    init(detail: CognitiveObservatoryDetail) {
-        self.detail = detail
-        switch detail.receiptRead {
-        case .available:
-            self.evidenceStatus = .complete
-        case .unavailable(let reason):
-            self.evidenceStatus = .receiptEvidenceUnavailable(reason)
-        }
-    }
 }
 
 /// Doctor's bounded, mutation-free read of mounted state; no Observatory refresh.
@@ -73,7 +36,6 @@ public struct CognitiveDoctorRead: Sendable {
     public let workspace: CognitiveWorkspaceSnapshot
     public let associations: [CognitiveAssociationEdge]
     public let receiptRead: CognitiveReceiptRead
-    public let welfareBounds: CognitiveWelfareBounds
     public let organism: OrganismSnapshot
     public let capsulePreviewInfo: CapsulePreviewInfo?
 }
@@ -105,37 +67,6 @@ public struct NativeCognitionRuntimeChange: Sendable, Equatable {
     public let revision: UInt64
     public let occurredAt: Date
     public let reason: String
-}
-
-/// The observable result of invoking every registered cognition evaluation
-/// sampler. A nil substrate result is an unavailable sampler, not an empty or
-/// successful evaluation run.
-public struct CognitiveEvaluationSamplerOutcome: Sendable, Equatable {
-    let recordedKinds: [CognitiveExperimentKind]
-    let unavailableKinds: [CognitiveExperimentKind]
-    public let failureDetail: String?
-
-    public var isFailed: Bool { failureDetail != nil }
-
-    public var isComplete: Bool {
-        !isFailed
-            && unavailableKinds.isEmpty
-            && recordedKinds.count == CognitiveExperimentKind.allCases.count
-    }
-
-    public var presentationText: String {
-        if let failureDetail {
-            return "Cognitive evaluation samplers failed: \(failureDetail)."
-        }
-        if isComplete {
-            return "Recorded \(recordedKinds.count) cognitive evaluation samples."
-        }
-        let unavailable = unavailableKinds.map(\.rawValue).joined(separator: ", ")
-        if recordedKinds.isEmpty {
-            return "Cognitive evaluation samplers unavailable: \(unavailable)."
-        }
-        return "Recorded \(recordedKinds.count) cognitive evaluation samples; unavailable: \(unavailable)."
-    }
 }
 
 public struct NativeSubconsciousRuntimeState: Sendable, Equatable {
@@ -205,18 +136,11 @@ public struct OrganismContinuityApplyOutcome: Sendable, Equatable {
     public var applied: Bool { status == .applied }
 }
 
-// internal for +Organism extension (move-only Wave C)
 struct OrganismDebugBodyOverride: Sendable {
     var scenario: OrganismDebugBodyScenario
     var expiresAt: Date
 }
 
-
-public enum CognitiveBackgroundRunOutcome: Sendable, Equatable {
-    case completed(String)
-    case skipped(String)
-    case failed(String)
-}
 
 /// Process-local counters for the event-driven dirty-settlement pilot. This is
 /// evidence only: it is not persisted into cognition, does not schedule work,

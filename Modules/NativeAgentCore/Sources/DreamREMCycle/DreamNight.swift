@@ -1,16 +1,14 @@
 import Foundation
 
-// Blueprint: | `DreamNight.swift` | `DreamNight` and `DreamDiaryWeeks`: shared diary section/title parsing and week grouping across all dream readers |
+// Blueprint: | `DreamNight.swift` | `DreamNight` and `DreamDiaryWeeks`: shared diary section/title/prose summary parsing and week grouping across all dream readers |
 
 /// One night of the diary, read the one way (`DreamCycleRunner` writes it):
 /// `# Dream — <date>`, then every later run of the same night as a
 /// `## Dreamt again — <yyyy-MM-dd HH:mm>` section. Each dream opens with
 /// `**<title>**`, then its summary, then `_Mood: <mood>_`.
+/// Other second-level headings also start a section in historical entries.
 ///
-/// Today, the Dreams page, `dream_diary_read` and provenance all read a night
-/// through here, so "the night's dream" is the same dream everywhere: the
-/// latest one (10-23: Today named the re-dream while the diary named the
-/// night's first dream).
+/// Readers and scheduler receipts name the latest dream through here.
 public struct DreamNight: Sendable, Equatable {
     public struct Dream: Sendable, Equatable {
         /// When a later run wrote it, as its heading names it; nil for the
@@ -21,6 +19,8 @@ public struct DreamNight: Sendable, Equatable {
         /// The first real line: the title as written, or the opening words
         /// of an entry without one.
         public var firstLine: String
+        /// First prose line, excluding headings, bold metadata, mood and lists.
+        public var summary: String = ""
     }
 
     public static let firstHeading = "# Dream — "
@@ -35,9 +35,10 @@ public struct DreamNight: Sendable, Equatable {
         var current: Dream?
         for rawLine in content.split(whereSeparator: \.isNewline) {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
-            if line.hasPrefix(Self.againHeading) {
+            if line.hasPrefix("## ") {
                 if let current { dreams.append(current) }
-                let stamp = line.dropFirst(Self.againHeading.count).trimmingCharacters(in: .whitespaces)
+                let stamp = line.hasPrefix(Self.againHeading)
+                    ? line.dropFirst(Self.againHeading.count).trimmingCharacters(in: .whitespaces) : ""
                 current = Dream(dreamtAgainAt: stamp.isEmpty ? nil : stamp, firstLine: "")
                 continue
             }
@@ -57,6 +58,10 @@ public struct DreamNight: Sendable, Equatable {
                 var value = String(line.dropFirst("_Mood:".count))
                 if value.hasSuffix("_") { value = String(value.dropLast()) }
                 dream.mood = value.trimmingCharacters(in: .whitespaces)
+            }
+            if dream.summary.isEmpty, !line.hasPrefix("**"),
+               !line.hasPrefix("_Mood:"), !line.hasPrefix("- ") {
+                dream.summary = line
             }
             current = dream
         }

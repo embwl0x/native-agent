@@ -1,6 +1,6 @@
 # Image generation
 
-Agent makes images through the always-on `app` tool. `AppActionRegistry.swift`
+Agent makes images through the always-on `app` tool. `AppActions+Declarations.swift`
 registers `image.generate` on the Chat page. Discover it with
 `app {"find":"image"}` or read `app {"page":"chat"}`.
 
@@ -27,9 +27,13 @@ no implicit shared image history. Reference order is preserved.
 The checked **Work** provider route selects the backend. In
 `FirstPartyModelCatalog.imageRoute(forProviderID:)`, OpenAI maps to `openai_api`;
 Codex and `openai_oauth_direct` map to `codex`. An unsupported Work route stops
-with a model-choice card. Request arguments cannot select a different provider
+with a model-choice card only after a successful routing read establishes its
+capability. A failed routing read returns its cause without asking for a model
+choice. Request arguments cannot select a different provider
 or image model; a conflicting `provider`, `backend`, or `model` is refused.
 `codex_cli` is accepted as an alias when Work resolves to Codex.
+Recovery cards retain that request's checked route and routing snapshot; a
+resumed request reads routing again and applies its one-request model choice.
 
 The Codex path runs `codex exec --enable image_generation --json` and requests
 the built-in `image_gen.imagegen` tool. It uses the app's resolved Codex auth
@@ -46,8 +50,9 @@ the edit/reference/background controls above are not implemented on that path.
 On the Codex route, quality, size/aspect, format and background are prompt
 preferences. The receipt reports `transport=codex_builtin`,
 `sourceTool=image_gen.imagegen`, and `codexThreadId`. It records image-model
-identity and quality fulfillment as unknown when the built-in result does not
-expose them. A controller model or requested quality is not image-model proof.
+identity and quality fulfillment as unknown: the built-in result exposes neither.
+A controller model or requested quality is not image-model proof. Aggregate
+control warnings reduce only the inspected per-image size and format evidence.
 
 NativeAgent decodes the returned raster and reports actual dimensions, format
 and alpha-channel presence. Alpha presence alone does not prove a transparent
@@ -55,12 +60,18 @@ background. Only files from that exact Codex thread's `generated_images`
 directory are collected; outputs and receipts are kept under
 `<dataRoot>/generated_images`.
 
-Trust admission precedes execution and reference reads. Codex accepts up to
-four local PNG/JPEG/WebP references, each at most 8 MiB and 40 megapixels,
-20 MiB total. `n` is clamped to 1–4; `timeout_seconds` to 30–1800, default 600.
-Masks, implicit prior-image references, compression and image reasoning-effort
-controls are refused.
+Successful results from either backend return `status: ok` and pass through
+`make-generated` to register their images in Make. Try again uses the same
+path with the existing Make reference, adding a version. A stopped result
+keeps `status: stopped` and its produced images without registering success.
 
-Implementation: `ChatToolRuntime/SwiftToolDispatcher+ImageGenerationTools.swift`
-and `ChatToolRuntime/CodexImageGenerationControls.swift` under
-`Modules/NativeAgentCore/Sources/`.
+Saved Trust authority gates routing, execution and reference reads; damaged
+policy fails with repair evidence. Codex accepts up to four local PNG/JPEG/WebP
+references, each at most 8 MiB and 40 megapixels, 20 MiB total. `n` is clamped
+to 1–4; `timeout_seconds` to 30–1800, default 600. Masks, implicit prior-image
+references, compression and image reasoning-effort controls are refused.
+
+Implementation under `Modules/NativeAgentCore/Sources/ChatToolRuntime/`: routing,
+display and receipts in `SwiftToolDispatcher+ImageGenerationTools.swift`; transports
+in `SwiftCodexImageGenerationClient.swift` and `SwiftOpenAIImageGenerationClient.swift`;
+reference admission and controls in `CodexImageGenerationControls.swift`.

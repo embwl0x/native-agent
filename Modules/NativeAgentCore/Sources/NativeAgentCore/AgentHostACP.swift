@@ -25,6 +25,22 @@ public struct AgentHostACP: Sendable, Equatable, Codable {
     public var supportsLoad: Bool? = nil
     public var supportsResume: Bool? = nil
 
+    package init(executable: String, arguments: [String], documentation: String,
+                 permissionMode: String, referenceVersion: String, environment: [String: String] = [:],
+                 protocolVersion: Int? = nil, modes: [String]? = nil,
+                 supportsLoad: Bool? = nil, supportsResume: Bool? = nil) {
+        self.executable = executable
+        self.arguments = arguments
+        self.documentation = documentation
+        self.permissionMode = permissionMode
+        self.referenceVersion = referenceVersion
+        self.environment = environment
+        self.protocolVersion = protocolVersion
+        self.modes = modes
+        self.supportsLoad = supportsLoad
+        self.supportsResume = supportsResume
+    }
+
     /// Exact installed version whose sandbox launcher was inspected. Do not
     /// infer compatibility for neighbouring releases or bypass its sandbox.
     /// https://github.com/google-gemini/gemini-cli/issues/23959
@@ -42,27 +58,4 @@ public struct AgentHostACP: Sendable, Equatable, Codable {
         return matches ? "Written against \(referenceVersion) (ACP registry pin); installed version matches."
             : "Untested version: installed \(reported); written against \(referenceVersion) (ACP registry pin)."
     }
-
-    /// The recipes' seed, by host id (`AgentHostDirectory.seed`).
-    public static let seed: [String: Self] = [
-        "gemini-cli": Self(executable: "gemini", arguments: ["--acp", "--approval-mode=plan", "--sandbox"],
-                       documentation: "https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/acp-mode.md",
-                       permissionMode: "plan", referenceVersion: "0.60.0", protocolVersion: 1),
-        "goose": Self(executable: "goose", arguments: ["acp"],
-                      documentation: "https://block-goose.mintlify.app/advanced/acp-protocol",
-                      permissionMode: "chat", referenceVersion: "1.51.0", environment: ["GOOSE_MODE": "chat"], protocolVersion: 1),
-        "cursor-cli": Self(executable: "cursor-agent", arguments: ["acp", "--mode=ask", "--sandbox=enabled"],
-                             documentation: "https://cursor.com/docs/cli/acp",
-                             permissionMode: "ask", referenceVersion: "2026.09.15", protocolVersion: 1),
-        // Read from the installed agent (0.21.3): `hermes acp` is its stdio entry
-        // point; its session modes are default ("Ask before edits"),
-        // accept_edits and dont_ask, and "default" is the asking one. It takes
-        // its own slash commands (/model, /help, /compress) as ordinary
-        // messages, so a model switch is just a message. 0.21.5's ACP adapter
-        // advertises the same three modes, session/load and session/resume.
-        "hermes": Self(executable: "hermes", arguments: ["acp"],
-                       documentation: "https://hermes-agent.nousresearch.com/docs/user-guide/features/acp",
-                       permissionMode: "default", referenceVersion: "0.21.3", protocolVersion: 1,
-                       modes: ["default", "accept_edits", "dont_ask"], supportsLoad: true, supportsResume: true)
-    ]
 }

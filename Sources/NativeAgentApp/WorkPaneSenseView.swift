@@ -29,8 +29,8 @@ private struct SealedSenseWebView: NSViewRepresentable {
     let presentation: SenseInteractiveView
     @Binding var error: String?
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator(presentation: presentation, report: { error = $0 })
+    func makeCoordinator() -> InteractiveSenseView {
+        InteractiveSenseView(presentation: presentation, report: { error = $0 })
     }
 
     func makeNSView(context: Context) -> WKWebView {
@@ -64,7 +64,7 @@ private struct SealedSenseWebView: NSViewRepresentable {
 
     func updateNSView(_ view: WKWebView, context: Context) {}
 
-    static func dismantleNSView(_ view: WKWebView, coordinator: Coordinator) {
+    static func dismantleNSView(_ view: WKWebView, coordinator: InteractiveSenseView) {
         coordinator.cancel()
         view.stopLoading()
         view.configuration.userContentController.removeScriptMessageHandler(forName: "senseEvent")
@@ -73,10 +73,10 @@ private struct SealedSenseWebView: NSViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject, WKURLSchemeHandler, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+    final class InteractiveSenseView: NSObject, WKURLSchemeHandler, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
         private let presentation: SenseInteractiveView
         private let report: (String?) -> Void
-        private let address = URL(string: "sense-view://sealed/view")!
+        private let address = URL(string: "sense-view://sealed/view")
         private var prepareTask: Task<Void, Never>?
         private var eventTask: Task<Void, Never>?
         private var cancelled = false
@@ -95,6 +95,10 @@ private struct SealedSenseWebView: NSViewRepresentable {
         }
 
         func prepare(_ view: WKWebView) {
+            guard let address else {
+                report("The sealed sense view address could not be constructed.")
+                return
+            }
             guard presentation.html.utf8.count <= 1_000_000 else {
                 report("This sense view is too large to open.")
                 return
@@ -124,17 +128,21 @@ private struct SealedSenseWebView: NSViewRepresentable {
         }
 
         func webView(_ webView: WKWebView, start task: any WKURLSchemeTask) {
-            guard !cancelled, task.request.url == address else {
+            guard !cancelled, let address, task.request.url == address else {
                 task.didFailWithError(URLError(.noPermissionsToReadFile))
                 return
             }
             // The response policy cannot be removed or relaxed by supplied HTML.
-            let response = HTTPURLResponse(url: address, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: [
+            guard let response = HTTPURLResponse(url: address, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: [
                 "Content-Type": "text/html; charset=utf-8",
                 "Content-Security-Policy": Self.policy,
                 "X-DNS-Prefetch-Control": "off",
                 "Permissions-Policy": "camera=(), microphone=(), geolocation=(), display-capture=()",
-            ])!
+            ]) else {
+                report("The sealed sense view response could not be constructed.")
+                task.didFailWithError(URLError(.badServerResponse))
+                return
+            }
             task.didReceive(response)
             task.didReceive(Data(("<!doctype html><meta http-equiv=\"Content-Security-Policy\" content=\""
                 + Self.policy + "\"><meta name=\"referrer\" content=\"no-referrer\">" + presentation.html).utf8))
@@ -144,7 +152,8 @@ private struct SealedSenseWebView: NSViewRepresentable {
         func webView(_ webView: WKWebView, stop task: any WKURLSchemeTask) {}
 
         func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction) async -> WKNavigationActionPolicy {
-            action.navigationType == .other && action.targetFrame?.isMainFrame == true
+            guard let address else { return .cancel }
+            return action.navigationType == .other && action.targetFrame?.isMainFrame == true
                 && action.request.url == address ? .allow : .cancel
         }
 
@@ -174,7 +183,7 @@ private struct SealedSenseWebView: NSViewRepresentable {
         }
 
         func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
-            guard !cancelled, message.name == "senseEvent", message.frameInfo.isMainFrame,
+            guard !cancelled, let address, message.name == "senseEvent", message.frameInfo.isMainFrame,
                   message.frameInfo.request.url == address else { return }
             guard eventTask == nil else {
                 report("This sense is still handling the previous event.")

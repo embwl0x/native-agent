@@ -4,12 +4,12 @@
 // owners can verify their outcomes.
 import SwiftUI
 import NativeAgentShared
-// Blueprint: | `SkillLifecycleView.swift` | Shared typed skill catalog, local filters/loading state, ID-resolved details with unavailable state |
+// Blueprint: | `SkillLifecycleView.swift` | Shared typed skill catalog renderer, local filters and ID-resolved details; SkillsToolsView owns catalog refresh/loading |
 
 // MARK: - Snapshot model
 
 /// Decoded from the skills snapshot — one entry per skill in the manifest.
-struct SkillManifestEntry: Codable, Identifiable, Hashable, Sendable {
+struct SkillManifestEntry: Decodable, Identifiable, Hashable, Sendable {
     var id: String
     var name: String
     var description: String?
@@ -36,19 +36,6 @@ struct SkillManifestEntry: Codable, Identifiable, Hashable, Sendable {
         let rawState = (try? c.decode(String.self, forKey: .state)) ?? (try? c.decode(String.self, forKey: .status))
         state = rawState
         version = try? c.decode(String.self, forKey: .version)
-    }
-
-    func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encode(id, forKey: .id)
-        try c.encode(name, forKey: .name)
-        try c.encodeIfPresent(description, forKey: .description)
-        try c.encodeIfPresent(source, forKey: .source)
-        try c.encodeIfPresent(kind, forKey: .kind)
-        try c.encodeIfPresent(triggers, forKey: .triggers)
-        try c.encodeIfPresent(use_count, forKey: .use_count)
-        try c.encodeIfPresent(state, forKey: .state)
-        try c.encodeIfPresent(version, forKey: .version)
     }
 }
 
@@ -114,92 +101,21 @@ enum SkillLifecyclePresentation {
         }
     }
 
-    static func stateColor(for skill: SkillManifestEntry) -> Color {
-        stateColor(for: canonicalState(for: skill))
-    }
 
-    static func stateColor(for state: CanonicalState) -> Color {
-        switch state {
-        case .on: return .green
-        case .draft: return .orange
-        case .archived, .off: return .gray
-        case .quarantined: return .red
-        case .unknown: return .secondary
-        }
-    }
 }
 
 enum SkillSourcePresentation {
-    enum Source: Equatable {
-        case persona, learned, registry
-        case unknown(String?)
-    }
-
-    static func source(for skill: SkillManifestEntry) -> Source {
+    static func label(for skill: SkillManifestEntry) -> String {
         switch skill.source?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "persona": return .persona
-        case "learned", "data": return .learned
-        case "registry": return .registry
-        default: return .unknown(skill.source)
-        }
-    }
-
-    static func label(for source: Source) -> String {
-        switch source {
-        case .persona: return "PERSONA"
-        case .learned: return "LEARNED"
-        case .registry: return "REGISTRY"
-        case .unknown(let raw):
-            let value = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        case "persona": return "PERSONA"
+        case "learned", "data": return "LEARNED"
+        case "registry": return "REGISTRY"
+        default:
+            let value = skill.source?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return value.isEmpty ? "UNKNOWN" : value.uppercased()
         }
     }
 
-    static func color(for source: Source) -> Color {
-        switch source {
-        case .persona: return .purple
-        case .learned: return .teal
-        case .registry: return .indigo
-        case .unknown: return .secondary
-        }
-    }
-}
-
-// MARK: - Store
-
-@MainActor
-final class SkillLifecycleStore: ObservableObject {
-    var skills: [SkillManifestEntry] { iCloudSyncEngine.shared.skills }
-    @Published var isLoading = false
-    @Published var bannerError: String?
-
-    // MARK: Fetch (iCloud snapshot)
-
-    func refresh(pairingStore: PairingStore, pollIncoming: Bool = true) async {
-        isLoading = true
-        defer { isLoading = false }
-
-        guard applyPairingGate(isPaired: pairingStore.isPaired) else { return }
-
-        let engine = iCloudSyncEngine.shared
-        if pollIncoming { await iCloudBridge.shared.pollIncomingNow() }
-        let refreshed = await engine.refreshCatalogSnapshot()
-        if !refreshed && skills.isEmpty {
-            bannerError = "No skills synced yet — Mac is publishing."
-        }
-    }
-
-    /// Pairing invalidation clears the shared catalog; this gate owns only
-    /// the screen's explanation while unpaired.
-    @discardableResult
-    func applyPairingGate(isPaired: Bool) -> Bool {
-        guard isPaired else {
-            bannerError = "Pair iPhone with the Mac to see skills."
-            return false
-        }
-        bannerError = nil
-        return true
-    }
 
 }
 
@@ -207,15 +123,16 @@ final class SkillLifecycleStore: ObservableObject {
 
 struct SkillLifecycleView: View {
     /// Rides under the page header (Skills & Tools puts its page switch here).
-    var accessory: AnyView = AnyView(EmptyView())
-    @EnvironmentObject private var pairingStore: PairingStore
-    @StateObject private var store = SkillLifecycleStore()
+    let accessory: AnyView
+    let isLoading: Bool
+    let error: String?
+    let refresh: () async -> Void
     private let sync = iCloudSyncEngine.shared
 
     @State private var filter: SkillFilter = .all
     @State private var selectedSkillID: String?
 
-    private var allSkills: [SkillManifestEntry] { MobileDesignSamples.rows(store.skills) }
+    private var allSkills: [SkillManifestEntry] { MobileDesignSamples.rows(sync.skills) }
 
     private var filtered: [SkillManifestEntry] {
         SkillLifecyclePresentation.filtered(
@@ -227,17 +144,17 @@ struct SkillLifecycleView: View {
     var body: some View {
         AlivePage(title: "Skills & Tools", line: "What I can do, and how.",
                  freshnessGroup: "skills_snapshot", accessory: accessory) {
-            if !store.skills.isEmpty, let err = store.bannerError {
+            if !sync.skills.isEmpty, let err = error {
                 AliveFootnote(err, systemImage: "wifi.slash")
                     .transition(.opacity)
             }
 
-            if store.isLoading && allSkills.isEmpty {
+            if isLoading && allSkills.isEmpty {
                 shimmerCard
-            } else if allSkills.isEmpty, let error = store.bannerError {
+            } else if allSkills.isEmpty, let error {
                 AliveCalmState(title: "Skills aren’t here yet", line: error,
                                actionTitle: "Try again") {
-                    Task { await store.refresh(pairingStore: pairingStore) }
+                    Task { await refresh() }
                 }
             } else if allSkills.isEmpty {
                 AliveCalmState(title: "No skills yet", line: emptyDescription)
@@ -257,17 +174,12 @@ struct SkillLifecycleView: View {
                 }
             }
         }
-        .animation(AppMotion.snappy, value: store.bannerError)
-        .refreshable {
-            await store.refresh(pairingStore: pairingStore)
-        }
-        .task(id: sync.groupTransportDeliveryAt["catalog"]) {
-            await store.refresh(pairingStore: pairingStore,
-                                pollIncoming: sync.groupTransportDeliveryAt["catalog"] == nil)
-            #if DEBUG
+        .animation(AppMotion.snappy, value: error)
+        #if DEBUG
+        .task {
             if ProcessInfo.processInfo.arguments.contains("-designDetail") { selectedSkillID = allSkills.first?.id }
-            #endif
         }
+        #endif
         .sheet(isPresented: Binding(get: { selectedSkillID != nil }, set: { if !$0 { selectedSkillID = nil } })) {
             if let skill = allSkills.first(where: { $0.id == selectedSkillID }) {
                 SkillLifecycleDetailSheet(skill: skill)
@@ -317,7 +229,7 @@ struct SkillLifecycleView: View {
         case .all:       return "No skills found. The Mac's skill manifest is empty or unreachable."
         case .draft:    return "No drafts. New skills and upgrades wait here until they are turned on."
         case .on:       return "No skills are on. Turn on a skill on the Mac to make it available."
-        case .archived: return "No archived skills. Unused skills are archived, kept and available to restore on the Mac."
+        case .archived: return "No archived skills. Archived records stay available to restore on the Mac."
         case .off:      return "No skills are off. Skills turned off on the Mac remain here."
         case .quarantined: return "No quarantined skills. Quarantined skills require Mac review before they can run again."
         case .unknown: return "No skills with unknown state. Their original Mac state is preserved when present."
@@ -329,7 +241,7 @@ struct SkillLifecycleView: View {
 private enum SkillLine {
     static func status(_ skill: SkillManifestEntry) -> String {
         var parts = [SkillLifecyclePresentation.stateLabel(for: skill)]
-        parts.append(SkillSourcePresentation.label(for: SkillSourcePresentation.source(for: skill)).lowercased())
+        parts.append(SkillSourcePresentation.label(for: skill).lowercased())
         if let count = skill.use_count { parts.append("used " + AliveWords.count(count, "time")) }
         return parts.joined(separator: " · ")
     }
@@ -390,11 +302,11 @@ struct SkillLifecycleDetailSheet: View {
                         .padding(.top, -12)
                 }
 
-                AliveSection("About", footer: "Skills move from draft to on to archived. Manage skills on the Mac; archived skills are kept and can be restored.") {
+                AliveSection("About", footer: "The Mac reports each skill's state. Manage skills and restore archived records there.") {
                     AliveRow("State") { value(SkillLifecyclePresentation.stateLabel(for: skill)) }
                     AliveDivider()
                     AliveRow("Source") {
-                        value(AliveWords.humanized(SkillSourcePresentation.label(for: SkillSourcePresentation.source(for: skill)).lowercased()))
+                        value(AliveWords.humanized(SkillSourcePresentation.label(for: skill).lowercased()))
                     }
                     if let kind = skill.kind, !kind.isEmpty {
                         AliveDivider()

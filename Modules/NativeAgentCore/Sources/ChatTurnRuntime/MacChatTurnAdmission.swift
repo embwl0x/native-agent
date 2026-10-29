@@ -85,15 +85,6 @@ public struct MacChatStartedTurn: Sendable {
     public let task: Task<Void, Never>?
 }
 
-/// Shared mutable back-channel between admission and the app's bubble body.
-/// Placeholder migration updates the effective session so cleanup targets the
-/// post-migration key. MainActor isolation keeps the existing ordering.
-@MainActor
-public final class MacChatTurnBodyContext {
-    public var effectiveSessionId: String
-    public init(initial: String) { effectiveSessionId = initial }
-}
-
 public extension MacChatTurnPresentationPort {
     func rejectMacChatTurn(_ message: String) -> MacChatTurnAcceptance {
         presentMacChatTurn(.status(message))
@@ -163,9 +154,7 @@ public extension MacChatTurnPresentationPort {
             : await captureMacWorkContinuation(text, taskReference: requestTurnID)
         let envelope = continuation.map { TurnEnvelope.current(surface: "chat").withMacContinuation($0) }
             ?? ChatToolSessionContext.envelope
-        // FIX 4: order a pending Stop's cancelled.flag write BEFORE this
-        // turn's flag-clear. Awaited ahead of the busy guards so the
-        // suspension can't open a guard→install re-entrancy window.
+        // Await Stop's flag write before the busy guards and this turn's flag-clear.
         await awaitPendingCancelFlagWrite(for: targetSessionId)
         let repairAvailable = await repairChatTurnLifecyclesIfNeeded(
             knownSessionIds: knownChatSessionIDs
@@ -197,9 +186,7 @@ public extension MacChatTurnPresentationPort {
             || (macChatTurns.busySessions.contains(targetSessionId) && reservation == nil)
         let queueDrainIsStarting = macChatTurns.drainingQueueSessions.contains(targetSessionId)
         let existingQueue = macChatTurns.queuedBySession[targetSessionId] ?? []
-        // 2026-09-18: the welcome's eligibility read precedes suspension.
-        // Recheck at admission so a competing turn cannot queue the greeting
-        // behind itself; its task would not prove the greeting's delivery.
+        // Recheck welcome eligibility after suspension so a competing turn cannot queue the greeting behind itself.
         if requireIdleAndEmpty && (reservation == nil || sessionIsRunning || queueDrainIsStarting
             || !existingQueue.isEmpty || chatHasConversationRows(sessionId: targetSessionId)) {
             return MacChatStartedTurn(
@@ -233,8 +220,7 @@ public extension MacChatTurnPresentationPort {
                 return MacChatStartedTurn(acceptance: rejectMacChatTurn("Send-next queue is full (20 messages)"), task: nil)
             }
             presentMacChatTurn(.status(existingQueue.isEmpty ? "Message queued to send next" : "Message added to queue"))
-            // User, 2026-10-18: a send while she works goes to her working turn,
-            // which takes it at its next step; until then it stays queued here.
+            // Offer sends to the working turn at its next step; keep them queued until taken.
             if sessionIsRunning, turn.canSteerRunningTurn {
                 steerQueuedChatTurn(turn.id, sessionId: targetSessionId)
             }
@@ -261,36 +247,19 @@ public extension MacChatTurnPresentationPort {
             sessionId: targetSessionId,
             turnId: requestTurnID
         )
-        _ = beginChatTurnLifecycle(
-            sessionId: activityIdentity.sessionId,
-            turnId: activityIdentity.turnId,
+        let lifecycle = await beginChatTurnLifecycle(
+            identity: activityIdentity,
+            generation: generation,
             at: Date()
         )
-        let lifecyclePersisted = await persistChatTurnLifecycleBegin(
-            identity: activityIdentity
-        )
-        let admissionStillCurrent = macChatTurns.lifecycle(for: targetSessionId)?.identity
-            == activityIdentity
-            && macChatTurns.lifecycle(for: targetSessionId)?.cancellationRequestedAt == nil
-            && macChatTurns.taskGenerations[targetSessionId] == generation
-            && !Task.isCancelled
-        guard lifecyclePersisted, admissionStillCurrent else {
-            _ = macChatTurns.finishRuntime(sessionId: targetSessionId, generation: generation)
-            await abandonChatTurnLifecycleBeforeAdmission(identity: activityIdentity)
+        guard lifecycle.persisted, lifecycle.isCurrent else {
+            await abandonChatTurnLifecycleBeforeAdmission(identity: activityIdentity, generation: generation)
             let rejection = rejectMacChatTurn(
                 "Chat could not start safely because its lifecycle receipt was not persisted"
             )
             await drainNextQueuedChatTurnIfPossible(sessionId: targetSessionId)
             return MacChatStartedTurn(acceptance: rejection, task: nil)
         }
-        // 2026-06-08 W0.3 fix-2 HIGH: the placeholder-id latch inside
-        // _sendChatBody may migrate per-session state from `targetSessionId`
-        // to a confirmed `sid`. The cleanup below has to find the task /
-        // generation / streamingSessions entry at its FINAL key, otherwise
-        // they leak forever under `sid` and block future sends. The shared
-        // context object is the back-channel _sendChatBody uses to report
-        // its final effective session id.
-        let bodyCtx = MacChatTurnBodyContext(initial: targetSessionId)
         let task = Task { @MainActor in
             if !Task.isCancelled, macChatTurns.taskGenerations[targetSessionId] == generation {
                 _ = applyChatTurnLifecycleInput(MacChatTurnLifecycleInput(
@@ -312,7 +281,6 @@ public extension MacChatTurnPresentationPort {
                                     attachments: attachments,
                                     sessionId: targetSessionId,
                                     generation: generation,
-                                    ctx: bodyCtx,
                                     hideUserBubble: hideUserBubble || enqueuedRunID != nil,
                                     activityIdentity: activityIdentity
                                 )
@@ -323,17 +291,16 @@ public extension MacChatTurnPresentationPort {
                     presentMacChatTurn(.status(error.localizedDescription))
                 }
             }
-            let cleanupId = bodyCtx.effectiveSessionId
             if let closed = closeChatTurnLifecycleIntake(
-                sessionId: cleanupId,
+                sessionId: targetSessionId,
                 turnId: activityIdentity.turnId,
                 at: Date()
             ) {
                 await persistChatTurnLifecycleUpdate(identity: closed.identity)
             }
-            _ = macChatTurns.finishRuntime(sessionId: cleanupId, generation: generation)
-            await macChatTurns.updateQueuedTurns { $0[cleanupId]?.removeAll { $0.startedTurnID == activityIdentity.turnId } }
-            await drainNextQueuedChatTurnIfPossible(sessionId: cleanupId)
+            _ = macChatTurns.finishRuntime(sessionId: targetSessionId, generation: generation)
+            await macChatTurns.updateQueuedTurns { $0[targetSessionId]?.removeAll { $0.startedTurnID == activityIdentity.turnId } }
+            await drainNextQueuedChatTurnIfPossible(sessionId: targetSessionId)
         }
         macChatTurns.tasks[targetSessionId] = task
         macChatTurns.streamingSessions.insert(targetSessionId)
@@ -540,11 +507,11 @@ public extension MacChatTurnPresentationPort {
         }
         if let runID = replayRunID {
             do {
-                let committed = try await SwiftNativeChatOrchestrationClient.steeringMessageCommitted(
+                let evidence = try await SwiftNativeChatOrchestrationClient.reconcileSteeringMessage(
                     message: candidate.text, sessionId: sessionId, runId: runID,
-                    dataRoot: macChatTurns.dataRoot, persistence: SwiftNativePersistenceCore()
+                    dataRoot: macChatTurns.dataRoot
                 )
-                if !committed { replayRunID = nil }
+                if !evidence.committed { replayRunID = nil }
             } catch {
                 // Preserve both the queue entry and its unresolved identity.
                 macChatTurns.pausedQueueSessions.insert(sessionId)
@@ -605,28 +572,11 @@ public extension MacChatTurnPresentationPort {
             queues[sessionId, default: []].insert(waiting, at: 0)
         }
         macChatTurns.pausedQueueSessions.insert(sessionId)
-        // 2026-09-06: carry the rejection's own words to the queue strip. A
-        // pause with no stated cause is indistinguishable from one the person
-        // asked for.
+        // Show the rejection's own reason in the queue strip.
         if case .rejected(let failureMessage) = acceptance {
             macChatTurns.queuePauseReasons[sessionId] = failureMessage
         } else {
             macChatTurns.queuePauseReasons.removeValue(forKey: sessionId)
-        }
-    }
-
-    @MainActor
-    func migrateQueuedChatTurns(from oldSessionId: String, to newSessionId: String) async {
-        await macChatTurns.updateQueuedTurns { queues in
-            if let old = queues.removeValue(forKey: oldSessionId), !old.isEmpty {
-                queues[newSessionId] = old + (queues[newSessionId] ?? [])
-            }
-        }
-        if macChatTurns.pausedQueueSessions.remove(oldSessionId) != nil {
-            macChatTurns.pausedQueueSessions.insert(newSessionId)
-        }
-        if let reason = macChatTurns.queuePauseReasons.removeValue(forKey: oldSessionId) {
-            macChatTurns.queuePauseReasons[newSessionId] = reason
         }
     }
 

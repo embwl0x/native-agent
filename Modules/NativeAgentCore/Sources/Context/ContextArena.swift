@@ -48,28 +48,21 @@ public enum ContextArenaEntryError: Error, Equatable, Sendable {
     case emptySourceFingerprint
     case negativeGeneration
     case negativeRetentionPriority
+    case negativeLogicalByteCount
     case logicalByteOverflow
 }
 
-/// A store-independent resident value. The fixed overhead and every payload
-/// component are accounted deterministically.
+/// A budget and eviction descriptor; content stays in the typed generation.
 public struct ContextArenaEntry: Sendable, Equatable {
     public let key: ContextArenaEntryKey
     public let tier: ContextArenaTier
-    public let text: String
-    public let summary: String?
-    public let metadata: Data
-    public let vector: [Float]
     public let retentionPriority: Int
     public let logicalByteCount: Int
 
     public init(
         key: ContextArenaEntryKey,
         tier: ContextArenaTier,
-        text: String = "",
-        summary: String? = nil,
-        metadata: Data = Data(),
-        vector: [Float] = [],
+        logicalByteCount: Int,
         retentionPriority: Int = 0
     ) throws {
         guard !key.namespace.isEmpty else { throw ContextArenaEntryError.emptyNamespace }
@@ -82,33 +75,14 @@ public struct ContextArenaEntry: Sendable, Equatable {
             throw ContextArenaEntryError.negativeRetentionPriority
         }
 
-        let vectorBytes = vector.count.multipliedReportingOverflow(by: MemoryLayout<Float>.stride)
-        guard !vectorBytes.overflow else { throw ContextArenaEntryError.logicalByteOverflow }
-        let components = [
-            96,
-            key.namespace.utf8.count,
-            key.id.utf8.count,
-            key.sourceFingerprint.utf8.count,
-            text.utf8.count,
-            summary?.utf8.count ?? 0,
-            metadata.count,
-            vectorBytes.partialValue,
-        ]
-        var total = 0
-        for component in components {
-            let addition = total.addingReportingOverflow(component)
-            guard !addition.overflow else { throw ContextArenaEntryError.logicalByteOverflow }
-            total = addition.partialValue
+        guard logicalByteCount >= 0 else {
+            throw ContextArenaEntryError.negativeLogicalByteCount
         }
 
         self.key = key
         self.tier = tier
-        self.text = text
-        self.summary = summary
-        self.metadata = metadata
-        self.vector = vector
         self.retentionPriority = retentionPriority
-        self.logicalByteCount = total
+        self.logicalByteCount = logicalByteCount
     }
 }
 
@@ -185,9 +159,9 @@ public struct ContextGenerationSnapshot: Sendable, Equatable {
             + sortedHot.map(\.logicalByteCount)
             + selectionIndex.values.map(\.logicalByteCount)
         let warmComponents = sortedWarm.map(\.logicalByteCount)
-        let hotBytes = try Self.checkedSum(hotComponents)
-        let warmBytes = try Self.checkedSum(warmComponents)
-        let totalBytes = try Self.checkedSum([hotBytes, warmBytes])
+        let hotBytes = try ContextLogicalByteAccounting.checkedSum(hotComponents, overflowError: ContextGenerationSnapshotError.logicalByteOverflow)
+        let warmBytes = try ContextLogicalByteAccounting.checkedSum(warmComponents, overflowError: ContextGenerationSnapshotError.logicalByteOverflow)
+        let totalBytes = try ContextLogicalByteAccounting.checkedSum([hotBytes, warmBytes], overflowError: ContextGenerationSnapshotError.logicalByteOverflow)
 
         self.generationID = generationID
         self.sourceFingerprint = sourceFingerprint
@@ -208,18 +182,6 @@ public struct ContextGenerationSnapshot: Sendable, Equatable {
             warmEntries: retained,
             selectionIndex: selectionIndex
         )
-    }
-
-    private static func checkedSum(_ values: [Int]) throws -> Int {
-        var total = 0
-        for value in values {
-            let addition = total.addingReportingOverflow(value)
-            guard !addition.overflow else {
-                throw ContextGenerationSnapshotError.logicalByteOverflow
-            }
-            total = addition.partialValue
-        }
-        return total
     }
 }
 

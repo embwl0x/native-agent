@@ -28,29 +28,12 @@ extension SwiftNativeChatOrchestrationClient {
         return out
     }
 
-    // MARK: - Trust ▸ Multimodal, at the point of use (2026-09-06)
+    // MARK: - Trust ▸ Multimodal, at the point of use
     //
-    // "Allow vision API calls" and "Allow PDF file ingestion" round-tripped to
-    // <dataRoot>/trust/policy.json and NOTHING read them: every attached image
-    // reached the provider with the switch off, and no PDF ever reached it with
-    // the switch on. These two readers close both halves.
-    //
-    // FRESH ON EVERY TURN, deliberately, the way MemoryPolicyGate reads the
-    // memory switches: no launch-time snapshot, so a flip in Trust lands on the
-    // next turn. The file is small and this runs once per turn.
+    // Read vision and PDF policy fresh each turn so Trust changes apply on the next turn.
 
-    /// One boolean out of `multimodalPolicy`. Missing file / missing key →
-    /// `fallback` (matching the shipped defaults in TrustCenter+Defaults, so
-    /// the gate and the switch can never disagree about "unset"). A file that
-    /// exists but cannot be read or parsed, a wrongly-typed `multimodalPolicy`
-    /// block, or a non-Bool value is policy TrustCenter itself rejects — those
-    /// fail CLOSED rather than quietly running the default.
-    ///
-    /// 2026-09-13: this used `fileExists`, which FOLLOWS a symlink — a dangling
-    /// policy link read as "no file" and handed back the default-on vision and
-    /// PDF flags — and it only inspected its own block, so damage elsewhere in
-    /// the policy left multimodal wide open. Both are now the shared
-    /// `SavedTrustPolicyAuthority` predicate's job (lstat, whole-policy shape).
+    /// Missing policy or keys use TrustCenter defaults; existing unreadable or malformed policy fails closed.
+    /// SavedTrustPolicyAuthority validates the whole policy and distinguishes dangling symlinks from absent files.
     nonisolated static func multimodalPolicyAllows(
         _ key: String,
         default fallback: Bool,
@@ -64,19 +47,10 @@ extension SwiftNativeChatOrchestrationClient {
         )
     }
 
-    /// Characters of extracted document text one attachment contributes to a
-    /// turn. A contract is worth reading; a 400-page appendix is not worth a
-    /// turn's whole context, and the note SAYS when the cut happened.
-    /// 2026-09-06: one cap for PDFs and plain text — an attached .md is as
-    /// capable of eating a turn's context as an attached .pdf.
+    /// Per-document character cap for PDFs and plain text; truncation is named to the model.
     static let documentIngestionCharacterCap = 40_000
 
-    /// Characters of extracted document text ALL of a turn's attachments may
-    /// contribute between them. 2026-09-06: the per-attachment cap was the only
-    /// bound, and both file pickers allow unlimited multiple selection — ten
-    /// documents were ten times 40k, and the turn's context went with them. The
-    /// budget is spent in attachment order; once it is gone the remaining
-    /// documents are skipped and the model is told how many and why.
+    /// Shared character budget spent in attachment order; exhausted documents are skipped with a count and reason.
     static let turnDocumentCharacterBudget = 120_000
 
     /// What the model gets for this turn's attachments: the image blocks it is
@@ -132,11 +106,7 @@ extension SwiftNativeChatOrchestrationClient {
             }
         }
 
-        // 2026-09-06: a .txt/.md attachment reached the model as nothing at all
-        // — it attaches as type "file", never became a content block, and no
-        // lane read it. Same road as the PDF text, no switch: nothing in Trust
-        // claims to govern plain text. PDFs and plain text share one pass so
-        // they also share one per-turn character budget.
+        // Plain text requires no Trust switch and shares one ingestion pass and per-turn budget with PDFs.
         notes.append(contentsOf: documentAttachmentNotes(
             attachments, dataRoot: dataRoot, query: queryMessage))
 
@@ -152,22 +122,9 @@ extension SwiftNativeChatOrchestrationClient {
         return TurnAttachmentInput(imageBlocks: imageBlocks, userMessage: composed, queryUserMessage: composedQuery)
     }
 
-    /// Every document attachment of a turn — PDFs under "Allow PDF file
-    /// ingestion", plain text under no switch (none claims to govern it) — read
-    /// in ONE pass, in attachment order, through the same extractors the `read`
-    /// organ uses. Anything skipped, cut, or unreadable is named to the model
-    /// rather than being left as a filename it can invent contents for.
-    ///
-    /// 2026-09-06: this was two passes with a 40k cap each and no ceiling on
-    /// how many attachments could claim one. One pass, one budget: each
-    /// document takes at most `documentIngestionCharacterCap`, and no more than
-    /// what is left of `turnDocumentCharacterBudget`; when the budget is spent
-    /// the rest are skipped and counted in a note that names the budget.
-    /// `query` is the turn's user message. It is used ONLY to choose which
-    /// passages of an over-long document are handed over (item 4 of the third
-    /// conversation pass); a document that fits its allowance is still given
-    /// whole, byte-for-byte as before, and an empty query falls back to the
-    /// original prefix.
+    /// Read documents in attachment order with the read organ's extractors; only PDFs require the ingestion switch.
+    /// Each document respects its cap and the remaining turn budget; skipped, cut and unreadable inputs are named to the model.
+    /// The user query selects overlong passages only; fitting documents stay whole, and an empty query selects the prefix.
     nonisolated static func documentAttachmentNotes(
         _ attachments: [MultimodalAttachment],
         dataRoot: URL,
@@ -190,9 +147,7 @@ extension SwiftNativeChatOrchestrationClient {
             let isPDF = isPDFAttachment(attachment)
             if isPDF, !pdfAllowed { continue }
             guard isPDF || isPlainTextAttachment(attachment) else { continue }
-            // 2026-09-07: budget admission comes before decoding and extraction,
-            // so a spent budget skips the work too and the "not read at all"
-            // note below stays true.
+            // Admit the budget before decoding or extraction so skipped documents remain unread.
             guard remainingBudget > 0 else {
                 skippedForBudget += 1
                 continue
@@ -205,12 +160,7 @@ extension SwiftNativeChatOrchestrationClient {
                     + "not be read, so it was skipped. Say so; do NOT guess at its contents.]")
                 continue
             }
-            // 2026-09-06: MacDocumentRead.decodeText rejects only a NUL in the
-            // first 4 KiB and then falls back to ISO-8859-1, which decodes ANY
-            // byte sequence — so a renamed binary with a .txt extension arrived
-            // as a page of mojibake presented as a document. The read organ
-            // keeps that latitude (a person named that file by path); a chat
-            // attachment named itself, so here the bytes must really be text.
+            // Plain-text attachments must contain text bytes; a filename extension alone cannot authorize binary decoding.
             if !isPDF, !attachmentBytesAreText(data) {
                 notes.append(
                     "[NOTE TO ASSISTANT: the \(label) \"\(name)\" was skipped — "

@@ -1,17 +1,16 @@
 import Foundation
 // Blueprint: | `StandingBotsModels.swift` | Helper definitions own name, optional personality, job, output and provider/budget settings; cadence, run and shelf values |
 
-/// Legacy URL strings remain decodable; new definitions may use explicit types.
-public enum BotSource: Codable, Equatable, Sendable, ExpressibleByStringLiteral {
+/// Historical source references fold into the live brief during decoding.
+private enum LegacyBotSource: Decodable {
     case http(String)
     case tool(String)
 
-    public init(stringLiteral value: String) { self = .http(value) }
-    public var reference: String {
+    var reference: String {
         switch self { case .http(let url): return url; case .tool(let name): return "tool:" + name }
     }
     private enum CodingKeys: String, CodingKey { case type, url, name }
-    public init(from decoder: Decoder) throws {
+    init(from decoder: Decoder) throws {
         if let url = try? decoder.singleValueContainer().decode(String.self) { self = .http(url); return }
         let c = try decoder.container(keyedBy: CodingKeys.self)
         switch try c.decode(String.self, forKey: .type) {
@@ -20,14 +19,7 @@ public enum BotSource: Codable, Equatable, Sendable, ExpressibleByStringLiteral 
         default: throw StandingBotsError.invalidValue("sources accept http {url} or tool {name}")
         }
     }
-    public func encode(to encoder: Encoder) throws {
-        switch self {
-        case .http(let url): var c = encoder.singleValueContainer(); try c.encode(url)
-        case .tool(let name):
-            var c = encoder.container(keyedBy: CodingKeys.self)
-            try c.encode("tool", forKey: .type); try c.encode(name, forKey: .name)
-        }
-    }
+
 }
 
 public enum BotRunLimits {
@@ -41,14 +33,10 @@ public enum BotRunLimits {
     }
     public static let maximumTokens = 32_000
     public static let maximumSeconds: TimeInterval = 120
-    /// Legacy daily allowance retained when decoding old definitions. New bots
-    /// choose their own ceiling. Run reservations are never refunded.
-    public static let dailyTokens = 256_000
 }
 
 /// BotRunnerScheduler schedules this cadence through StandingBotsDisk's shared calendar math.
-/// TIME (User 10-21): a cron runs on the Mac's local clock wherever the Mac is;
-/// no zone is stored (a saved `timeZone` from before is ignored on read).
+/// Cron runs on the Mac's local clock; historical saved timeZone values are ignored.
 public enum BotCadence: Codable, Equatable, Sendable {
     case manual
     case interval(seconds: TimeInterval)
@@ -74,11 +62,8 @@ public struct BotDefinition: Codable, Equatable, Sendable, Identifiable {
     public var brief: String
     public internal(set) var briefVersion: Int
     public var cadence: BotCadence
-    /// Set when the bot also wakes on an outside event (0.4.12). Absent on
-    /// every definition written before, which decodes as no trigger.
+    /// An optional outside event that wakes this helper.
     public var eventTrigger: BotEventTrigger? = nil
-    /// Decode-only compatibility for the production view awaiting its next stage.
-    public var sources: [BotSource]
     public var provider: String? = nil
     public var model: String? = nil
     /// Missing on legacy definitions; nil follows Providers.
@@ -89,6 +74,13 @@ public struct BotDefinition: Codable, Equatable, Sendable, Identifiable {
     public var notificationCondition: String? = nil
     public var deleted: Bool? = nil
     public var sessionID: String { "bot-" + id.uuidString.lowercased() }
+
+    /// Inverse of this owner's session locator. This identifies a particular
+    /// helper for routing, never whose conversation a session is.
+    public static func id(forSession sessionID: String?) -> UUID? {
+        guard let sessionID, sessionID.hasPrefix("bot-") else { return nil }
+        return UUID(uuidString: String(sessionID.dropFirst(4)))
+    }
     public var outputFormat: String?
     public var budget: BotBudget
     public var paused: Bool
@@ -99,7 +91,7 @@ public struct BotDefinition: Codable, Equatable, Sendable, Identifiable {
     public internal(set) var updatedAt: Date
 
     public init(id: UUID = UUID(), name: String, brief: String, cadence: BotCadence,
-                sources: [BotSource] = [], budget: BotBudget, paused: Bool = false,
+                budget: BotBudget, paused: Bool = false,
                 outputFormat: String? = nil,
                 createdAt: Date = Date()) {
         self.id = id
@@ -107,8 +99,6 @@ public struct BotDefinition: Codable, Equatable, Sendable, Identifiable {
         self.brief = brief
         self.briefVersion = 1
         self.cadence = cadence
-        self.sources = []
-        if !sources.isEmpty { self.brief += "\n\nSources: " + sources.map(\.reference).joined(separator: ", ") }
         self.outputFormat = outputFormat
         self.budget = budget
         self.paused = paused
@@ -118,8 +108,9 @@ public struct BotDefinition: Codable, Equatable, Sendable, Identifiable {
 }
 
 extension BotDefinition {
+    private enum LegacyCodingKeys: String, CodingKey { case sources }
     private enum CodingKeys: String, CodingKey {
-        case id, name, personality, brief, briefVersion, cadence, sources, outputFormat, budget, paused, createdAt, updatedAt
+        case id, name, personality, brief, briefVersion, cadence, outputFormat, budget, paused, createdAt, updatedAt
         case provider, model, modelPinned, reasoningEffort, fast, dailyTokenCeiling, notificationCondition, deleted
         case eventTrigger, offReason
     }
@@ -131,9 +122,9 @@ extension BotDefinition {
         brief = try c.decode(String.self, forKey: .brief)
         briefVersion = try c.decode(Int.self, forKey: .briefVersion)
         cadence = try c.decode(BotCadence.self, forKey: .cadence)
-        let oldSources = try c.decodeIfPresent([BotSource].self, forKey: .sources) ?? []
+        let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
+        let oldSources = try legacy.decodeIfPresent([LegacyBotSource].self, forKey: .sources) ?? []
         if !oldSources.isEmpty { brief += "\n\nSources: " + oldSources.map(\.reference).joined(separator: ", ") }
-        sources = []
         outputFormat = try c.decodeIfPresent(String.self, forKey: .outputFormat)
         budget = try c.decode(BotBudget.self, forKey: .budget)
         paused = try c.decode(Bool.self, forKey: .paused)
@@ -157,7 +148,7 @@ extension BotDefinition {
         }
     }
 
-    /// A bot that woke on a GitHub event (before 10-21) reads as switched off
+    /// A bot with a retired GitHub event trigger reads as switched off
     /// with no trigger, and the next save keeps it so; resuming it leaves it manual.
     public static let githubTriggerOff = "GitHub events are no longer built in; an ability of hers can signal this bot"
 }
@@ -165,10 +156,7 @@ extension BotDefinition {
 public enum BotRunStatus: String, Codable, Sendable {
     case completed, stopped, interrupted, failed
     case waitingForApproval = "waiting for approval"
-    /// The turn raised a card and stopped on a PERSON. Distinct from
-    /// `interrupted`, which says something went wrong: nothing went wrong here,
-    /// the run is simply waiting to be answered (Agent, 2026-09-13 — a bot
-    /// parked on a card read as "Interrupted" on the shelf).
+    /// The run awaits a person's answer to its card, without interruption or failure.
     case waitingOnPerson = "waiting on you"
 }
 
@@ -241,8 +229,7 @@ public struct ShelfEntry: Codable, Equatable, Sendable, Identifiable {
     /// waiting, so the shelf reads that record rather than freezing "Waiting for
     /// approval" until some later run replaces the entry.
     public var approvalID: String? = nil
-    /// True when this entry answered a message to the helper (bot_ask), not a
-    /// run of its brief. Nil on entries written before 2026-09-23.
+    /// True for a helper-message answer (bot_ask); nil means this field was not recorded.
     public var asked: Bool? = nil
     public var conditionMet: Bool? = nil
     public var conditionNotificationTitle: String? = nil
@@ -281,6 +268,7 @@ public struct ShelfReadPage: Equatable, Sendable {
     public let nextCursor: String?
     /// True when another matching row exists, or an index headline was shortened.
     public let truncated: Bool
+    public var nextOffset: Int? = nil
 }
 
 /// Sparse acknowledgements deliberately preserve holes: reading a later book cannot hide an earlier one.

@@ -7,8 +7,7 @@ import Vision
 
 // MARK: - ELEMENT LAYER (c): saliency
 //
-// `VNGenerateAttentionBasedSaliencyImageRequest` does two jobs here, in the
-// order the design gave them:
+// `VNGenerateAttentionBasedSaliencyImageRequest` ranks and adds pixel candidates:
 //   1. RANK: a colour region or text band the attention map also lights up is
 //      more likely to be a thing a human would reach for. It raises `target`
 //      confidence — never `role`, because saliency knows nothing about what a
@@ -16,9 +15,6 @@ import Vision
 //   2. ADD: salient boxes that neither colour nor text found become candidates
 //      in their own right, with LOW role confidence (AXUnknown) — this is the
 //      only layer that can see a non-text iconic control.
-//
-// It is emphatically NOT a detector. A CoreML UI-element detector stays out of
-// v0 by design; it must earn its way in with the MEASURED misses of (a)+(b).
 
 public enum VisionSaliencyLayer {
     /// A candidate overlapping a salient box by at least this IoU is "seen by

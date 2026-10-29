@@ -2,6 +2,7 @@ import Foundation
 import CoreServices
 import NativeAgentCore
 import PersistenceCore
+import NativeAgentShared
 // Blueprint: | `MacAppIndex.swift` | One in-process live Spotlight metadata query over local volumes; rows excluding bundles inside packages materialize only on gathering/update edges on its owning queue; cancellation removes async initial-gather waiters; startup failure retires query/tokens and completes gathering once; terminal `shutdown()` closes admission, stops query/tokens and finishes streams on that queue (engine caller integration remains required); sync/async reads and exact lookup share kept rows; newest-only edges emit when bundle id/version/path changes; actionable index failures propagate; `mac.apps` names its Spotlight source; Launch Services remains the launch fallback after an index miss |
 
 /// The Mac's app index, kept live by Spotlight. No app is opened or activated.
@@ -45,21 +46,6 @@ public final class MacAppIndex: @unchecked Sendable {
     static func shownName(_ url: URL) -> String {
         let shown = FileManager.default.displayName(atPath: url.path)
         return shown.hasSuffix(".app") ? String(shown.dropLast(4)) : shown
-    }
-
-    /// An ancestor that is a working tree: source lives there, so an app under it was built there.
-    static func insideWorkingTree(_ url: URL) -> Bool {
-        var parent = url.deletingLastPathComponent()
-        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
-        while parent.path != "/" && parent.standardizedFileURL.path != home {
-            if FileManager.default.fileExists(atPath: parent.appendingPathComponent(".git").path)
-                || FileManager.default.fileExists(atPath: parent.appendingPathComponent("Package.swift").path)
-                || ((try? FileManager.default.contentsOfDirectory(atPath: parent.path))?.contains { $0.hasSuffix(".xcodeproj") } ?? false) {
-                return true
-            }
-            parent.deleteLastPathComponent()
-        }
-        return false
     }
 
     /// What the Apps screen shows: the installed copy of each Mac app.
@@ -209,6 +195,23 @@ public final class MacAppIndex: @unchecked Sendable {
     private func materialize() -> Bool {
         MDQueryDisableUpdates(query)
         defer { MDQueryEnableUpdates(query) }
+        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
+        // Facts last one materialization; home stops source inheritance, not package exclusion.
+        var directories: [URL: (excluded: Bool, workingTree: Bool)] = [:]
+        func classify(_ parent: URL) -> (excluded: Bool, workingTree: Bool) {
+            guard parent.path != "/" else { return (false, false) }
+            if let facts = directories[parent] { return facts }
+            let above = classify(parent.deletingLastPathComponent())
+            let excluded = above.excluded || parent.lastPathComponent == "Library" || !parent.pathExtension.isEmpty
+                || (try? parent.resourceValues(forKeys: [.isPackageKey]))?.isPackage == true
+            let workingTree = !excluded && parent.standardizedFileURL.path != home && (above.workingTree
+                || FileManager.default.fileExists(atPath: parent.appendingPathComponent(".git").path)
+                || FileManager.default.fileExists(atPath: parent.appendingPathComponent("Package.swift").path)
+                || ((try? FileManager.default.contentsOfDirectory(atPath: parent.path))?.contains { $0.hasSuffix(".xcodeproj") } ?? false))
+            let facts = (excluded, workingTree)
+            directories[parent] = facts
+            return facts
+        }
         let next = (0..<MDQueryGetResultCount(query)).compactMap { index -> App? in
             let item = Unmanaged<MDItem>.fromOpaque(MDQueryGetResultAtIndex(query, index)).takeUnretainedValue()
             guard let path = MDItemCopyAttribute(item, kMDItemPath) as? String else { return nil }
@@ -218,12 +221,8 @@ public final class MacAppIndex: @unchecked Sendable {
             // a .service, an .xpc…), not a copy under a Library folder (an installer's
             // staging area, a tool's own versions, a cache).
             guard url.pathExtension.caseInsensitiveCompare("app") == .orderedSame else { return nil }
-            var parent = url.deletingLastPathComponent()
-            while parent.path != "/" {
-                if parent.lastPathComponent == "Library" || !parent.pathExtension.isEmpty
-                    || (try? parent.resourceValues(forKeys: [.isPackageKey]))?.isPackage == true { return nil }
-                parent.deleteLastPathComponent()
-            }
+            let ancestors = classify(url.deletingLastPathComponent())
+            guard !ancestors.excluded else { return nil }
             let info = CFBundleCopyInfoDictionaryInDirectory(url as CFURL) as NSDictionary?
             guard let bundleID = info?["CFBundleIdentifier"] as? String ?? MDItemCopyAttribute(item, kMDItemCFBundleIdentifier) as? String,
                   !bundleID.isEmpty else { return nil }
@@ -232,12 +231,12 @@ public final class MacAppIndex: @unchecked Sendable {
             // Build output is a copy whatever its bundle id: the folders build tools write
             // into, and anything built inside a working tree (a .git, a Package.swift, an
             // .xcodeproj above it). The Desktop and ~/Applications are not working trees.
-            let buildOutput = url.pathComponents.contains { Self.buildFolders.contains($0) } || Self.insideWorkingTree(url)
+            let buildOutput = url.pathComponents.contains { Self.buildFolders.contains($0) } || ancestors.workingTree
             // Installed: every bundle in the Mac's own app folders (what the Apps screen shows,
             // a beta beside its release included), and elsewhere the one copy Launch Services
             // opens for that bundle id. Build output is never installed.
             let preferred = LSCopyApplicationURLsForBundleIdentifier(bundleID as CFString, nil)?.takeRetainedValue() as? [URL]
-            let inAppFolder = Self.appFolders.contains { url.standardizedFileURL.path.hasPrefix($0 + "/") }
+            let inAppFolder = Self.appFolders.contains { NativeAgentWorkspaceRoot.relativePath(url.standardizedFileURL.path, under: $0)?.isEmpty == false }
             let kind = !buildOutput && (inAppFolder || (preferred?.first.map { $0.standardizedFileURL.path == url.standardizedFileURL.path } ?? true)) ? "installed" : "copy"
             return App(url: url, info: info,
                 // The name the Apps screen and Finder show: the Mac's own localized display name ("Find My").

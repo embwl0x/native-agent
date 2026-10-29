@@ -13,7 +13,7 @@ package enum MacAXAttributeRead {
             subrole: copyString(window, kAXSubroleAttribute),
             title: copyString(window, kAXTitleAttribute),
             frame: copyFrame(window)
-        )
+        ).retaining(window)
     }
 
     static func prepare(_ element: AXUIElement) -> Bool {
@@ -71,8 +71,8 @@ package enum MacAXAttributeRead {
     }
 
     /// Perception and action paths share the same visible-child ordering.
-    static func childAttribute(_ element: AXUIElement) -> String {
-        guard let role = copyString(element, kAXRoleAttribute),
+    static func childAttribute(_ element: AXUIElement, role: String? = nil) -> String {
+        guard let role = role ?? copyString(element, kAXRoleAttribute),
               ["AXList", "AXTable", "AXOutline"].contains(role) else { return kAXChildrenAttribute }
         guard prepare(element) else { return kAXVisibleChildrenAttribute }
         defer { if MacAXLimits.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(element, 0) } }
@@ -85,7 +85,7 @@ package enum MacAXAttributeRead {
 
     static func listSummary(_ element: AXUIElement, role: String) -> String? {
         guard ["AXList", "AXTable", "AXOutline"].contains(role) else { return nil }
-        let attribute = childAttribute(element)
+        let attribute = childAttribute(element, role: role)
         guard attribute != kAXChildrenAttribute, prepare(element) else { return nil }
         defer { if MacAXLimits.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(element, 0) } }
         var visible: CFIndex = 0, total: CFIndex = 0
@@ -100,68 +100,74 @@ package enum MacAXAttributeRead {
             + (total > visible ? " More \(kind) off screen." : "")
     }
 
-    package static func copyElementArray(_ element: AXUIElement, _ attribute: String) -> [AXUIElement] {
+    package static func copyElementArray(
+        _ element: AXUIElement, _ attribute: String, limit: Int? = nil, preservingIndices: Bool = false
+    ) -> [AXUIElement] {
         let attribute = attribute == kAXChildrenAttribute ? childAttribute(element) : attribute
-        if MacAXLimits.readDeadline != nil {
+        let array: [AnyObject]
+        if let limit = limit ?? (MacAXLimits.readDeadline != nil ? MacAXLimits.deepPageMaxNodes : nil) {
+            guard limit > 0 else { return [] }
             guard prepare(element) else { return [] }
-            defer { _ = AXUIElementSetMessagingTimeout(element, 0) }
+            defer { if MacAXLimits.readDeadline != nil { _ = AXUIElementSetMessagingTimeout(element, 0) } }
             var raw: CFArray?
             guard AXUIElementCopyAttributeValues(element, attribute as CFString, 0,
-                CFIndex(MacAXLimits.deepPageMaxNodes), &raw) == .success, let raw else { return [] }
-            return (raw as [AnyObject]).compactMap { candidate in
-                CFGetTypeID(candidate) == AXUIElementGetTypeID() ? (candidate as! AXUIElement) : nil
-            }
+                CFIndex(limit), &raw) == .success, let raw else { return [] }
+            array = raw as [AnyObject]
+        } else {
+            guard let raw = copyRaw(element, attribute), CFGetTypeID(raw) == CFArrayGetTypeID() else { return [] }
+            array = raw as! CFArray as [AnyObject]
         }
-        guard let raw = copyRaw(element, attribute), CFGetTypeID(raw) == CFArrayGetTypeID() else { return [] }
-        return (raw as! CFArray as [AnyObject]).compactMap { candidate in
+        let elements: [AXUIElement] = array.compactMap { candidate in
             guard CFGetTypeID(candidate) == AXUIElementGetTypeID() else { return nil }
             return (candidate as! AXUIElement)
         }
+        return preservingIndices && elements.count != array.count ? [] : elements
     }
 
-    /// Own title/description, else — for a field or popup named by a separate
-    /// label ("Save As:", Qt's "File Name") — that label's text: its
-    /// AXTitleUIElement, else the static text a person reads just before it,
-    /// beside or above it (`copyCaption`). Its value stays its value, and its
-    /// placeholder still answers as a second name.
-    /// The ONE identity rule for perception and the act-side drift check.
-    /// Display cleanup is opt-in; it must never remove a redaction caption.
+    /// Derive identity and help-cleaned display names from the same copies.
+    /// Captions and hints name otherwise unnamed controls; values stay separate.
     static func copyLabel(
         _ element: AXUIElement, role: String,
-        forDisplay: Bool = false,
         prepare: (AXUIElement) -> AXUIElement = { $0 }
-    ) -> String? {
+    ) -> (identity: String?, display: String?, subrole: String?, help: String?, placeholder: String?, frame: MacAXFrame?) {
+        let subrole = copyString(element, kAXSubroleAttribute)
+        let help = copyString(element, kAXHelpAttribute)
+        let placeholder = copyString(element, kAXPlaceholderValueAttribute)
+        let roleDescription = copyString(element, kAXRoleDescriptionAttribute)
+        let frame = copyFrame(element)
         func isName(_ text: String) -> Bool {
             text != role && text != MacScreenRender.kindName(role: role)
-                && text != copyString(element, kAXRoleDescriptionAttribute)
+                && text != roleDescription
         }
-        // Window furniture has an authoritative semantic subrole. Its help
-        // describes a gesture, not the control's name.
-        if role == kAXButtonRole,
-           let subrole = copyString(element, kAXSubroleAttribute),
+        var identity: String?, display: String?
+        if role == kAXButtonRole, let subrole,
            [kAXCloseButtonSubrole, kAXMinimizeButtonSubrole, kAXZoomButtonSubrole].contains(subrole) {
-            return MacScreenRender.kindName(role: String(subrole.dropLast("Button".count)))
-        }
-        for attribute in [kAXTitleAttribute, kAXDescriptionAttribute, "AXLabel"] {
-            if let own = copyString(element, attribute), isName(own),
-               (!forDisplay && attribute != kAXDescriptionAttribute)
-                || own != copyString(element, kAXHelpAttribute) {
-                return own
+            identity = MacScreenRender.kindName(role: String(subrole.dropLast("Button".count)))
+            display = identity
+        } else {
+            for attribute in [kAXTitleAttribute, kAXDescriptionAttribute, "AXLabel"] {
+                guard let own = copyString(element, attribute), isName(own) else { continue }
+                if identity == nil, attribute != kAXDescriptionAttribute || own != help { identity = own }
+                if display == nil, own != help { display = own }
+                if identity != nil, display != nil { break }
+            }
+            if identity == nil || display == nil {
+                let caption = copyCaption(element, role: role, frame: frame, prepare: prepare)
+                identity = identity ?? caption
+                display = display ?? caption
+            }
+            if hintNamedRoles.contains(role) {
+                for hint in [placeholder, help].compactMap({ $0 }) where isName(hint) {
+                    identity = identity ?? hint
+                    display = display ?? hint
+                }
             }
         }
-        let fallback = copyCaption(element, role: role, prepare: prepare)
-        guard fallback == nil, hintNamedRoles.contains(role) else { return fallback }
-        // Last resort for a control that names itself nowhere else: its
-        // placeholder ("Reply to Claude…"), else — an icon-only button — the
-        // tooltip a person reads on hover. Only when nothing else names it.
-        for attribute in [kAXPlaceholderValueAttribute, kAXHelpAttribute] {
-            if let hint = copyString(element, attribute), isName(hint) { return hint }
-        }
-        return nil
+        return (identity, display, subrole, help, placeholder, frame)
     }
 
-    static func valueState(_ element: AXUIElement, role: String) -> String? {
-        guard let raw = copyRaw(element, kAXValueAttribute) else { return nil }
+    static func valueState(_ raw: CFTypeRef?, role: String) -> String? {
+        guard let raw else { return nil }
         let checkable = role == "AXCheckBox" || role == "AXRadioButton" || role == "AXSwitch"
         let number: Int
         if CFGetTypeID(raw) == CFBooleanGetTypeID() {
@@ -186,7 +192,7 @@ package enum MacAXAttributeRead {
     ]
 
     private static func copyCaption(
-        _ element: AXUIElement, role: String, prepare: (AXUIElement) -> AXUIElement
+        _ element: AXUIElement, role: String, frame: MacAXFrame?, prepare: (AXUIElement) -> AXUIElement
     ) -> String? {
         if hintNamedRoles.contains(role), let caption = copyElement(element, kAXTitleUIElementAttribute) {
             let caption = prepare(caption)
@@ -197,9 +203,9 @@ package enum MacAXAttributeRead {
         guard MacPerceptionCompiler.captionedRoles.contains(role) else { return nil }
         // The label a person reads: among the field's own siblings, the nearest
         // static text before it with nothing else between, on its row to the
-        // left or directly above (`isLabel`), one line tall. Anything else and
+        // left or directly above, one line tall. Anything else and
         // the field has no label; its placeholder still names it.
-        guard let field = copyFrame(element),
+        guard let field = frame,
               let parent = copyElement(element, kAXParentAttribute).map(prepare) else { return nil }
         let siblings = copyElementArray(parent, kAXChildrenAttribute)
         guard let index = siblings.firstIndex(where: { CFEqual($0, element) }) else { return nil }
@@ -210,8 +216,8 @@ package enum MacAXAttributeRead {
                 copyString(sibling, kAXValueAttribute) ?? copyString(sibling, kAXTitleAttribute)
             ) else { continue }
             guard let frame = copyFrame(sibling), frame.h <= 2 * field.h,
-                  MacScreenViewTextRedaction.isLabel(frame, forValueAt: field,
-                      proximity: MacScreenViewTextRedaction.proximityPoints) else { return nil }
+                  MacScreenViewTextRedaction.labelDistance(frame, forValueAt: field,
+                      proximity: MacScreenViewTextRedaction.proximityPoints) != nil else { return nil }
             return text
         }
         return nil
@@ -237,7 +243,10 @@ package enum MacAXAttributeRead {
         if let raw = copyRaw(element, kAXSizeAttribute), CFGetTypeID(raw) == AXValueGetTypeID() {
             hasSize = AXValueGetValue((raw as! AXValue), .cgSize, &size)
         }
-        guard hasPoint && hasSize else { return nil }
+        guard hasPoint && hasSize,
+              point.x.isFinite, point.y.isFinite, size.width.isFinite, size.height.isFinite,
+              size.width >= 0, size.height >= 0,
+              (point.x + size.width).isFinite, (point.y + size.height).isFinite else { return nil }
         return MacAXFrame(x: Double(point.x), y: Double(point.y), w: Double(size.width), h: Double(size.height))
     }
 
@@ -254,7 +263,7 @@ package enum MacAXAttributeRead {
     /// separate from identity, including inside credential views.
     package static func label(_ element: AXUIElement) -> String {
         let role = text(element, kAXRoleAttribute)
-        return copyLabel(element, role: role)
+        return copyLabel(element, role: role).identity
             ?? (role == kAXStaticTextRole ? copyString(element, kAXValueAttribute) : nil) ?? ""
     }
 

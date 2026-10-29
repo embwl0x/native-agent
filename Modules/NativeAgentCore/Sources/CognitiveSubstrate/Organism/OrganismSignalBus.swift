@@ -29,7 +29,7 @@ public actor SomaticSignalBus {
         guard configuration.enabled else { return nil }
         let eventKey = event.deduplicationKey
         guard !deliveredEventKeys.contains(eventKey) else { return nil }
-        guard let signal = CognitiveSomaticSignalAdapter.signal(
+        guard let signal = CognitiveSomaticSignals.signal(
             from: event,
             id: UUID(),
             bounds: configuration.metadataBounds
@@ -40,7 +40,7 @@ public actor SomaticSignalBus {
         // delivered while the first observation is still being integrated.
         deliveredEventKeys.insert(eventKey)
         rememberDeliveredEventKey(eventKey)
-        await observer.ingest(signal, movesFeelings: CognitiveSomaticSignalAdapter.movesFeelings(signal.kind))
+        await observer.ingest(signal, movesFeelings: CognitiveSomaticSignals.movesFeelings(signal.kind))
         return signal
     }
 

@@ -1,4 +1,5 @@
 import EngineRuntime
+import Connectors
 import Foundation
 import SchedulerExecution
 import NativeAgentCore
@@ -10,19 +11,15 @@ import AttentionRouting
 /// TrustCenter's Mac control policy. The connector actions, the Mac
 /// integration bridge and the Mac control routes all gate through it.
 extension TrustCenterMacControlPolicyProvider {
-    /// One Mac control route run in-process behind this gate. Unimplemented
-    /// actions fail closed in Swift; there is no HTTP fallback. Only the
-    /// person's own workbench may carry Full Mac admission.
-    static func run(path: String, bodyData: Data, dataRoot: URL, localWorkbench: Bool) async throws -> MacControlRunResult {
+    /// Bridge requests carry no local-workbench admission.
+    static func run(path: String, bodyData: Data, dataRoot: URL) async throws -> JSONValue {
         try await MacControlActionRoutes.run(
-            path: path, bodyData: bodyData, dataRoot: dataRoot, localWorkbench: localWorkbench
-        ) { operatorOrigin, auditPath in
+            path: path, bodyData: bodyData, dataRoot: dataRoot
+        ) { auditPath in
             makeMacControl(
-                policyProvider: TrustCenterMacControlPolicyProvider(
-                    dataRoot: dataRoot, operatorOrigin: operatorOrigin
-                ),
+                policyProvider: TrustCenterMacControlPolicyProvider(dataRoot: dataRoot),
                 auditAppendPath: auditPath,
-                notificationCenterAdapter: NativeAgentMacControlNotificationAdapter()
+                notificationCenterAdapter: MacNotificationPosting()
             )
         }
     }
@@ -44,7 +41,7 @@ extension AppConnectorActionPlatform {
 extension MacIntegrationDeliveryActions {
     init() {
         self.init(
-            postMessage: { await NativeAgentNotifications.postMessage(title: $0, body: $1).deliveryFields() },
+            connectorActions: { ConnectorActions(platform: AppConnectorActionPlatform(engine: .live)) },
             router: { .shared },
             deviceSync: { NativeAgentEngine.liveDeviceSync },
             scheduler: { .shared }

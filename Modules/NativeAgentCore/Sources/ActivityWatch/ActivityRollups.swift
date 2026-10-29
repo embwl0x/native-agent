@@ -6,9 +6,7 @@ import Foundation
 
 /// One bucket of time in the ASKING timezone.
 ///
-/// `start`/`end` are epoch seconds, so the bucket carries no day string. That is
-/// deliberate: a stored "2026-08-14" can disagree with the timezone the question
-/// is asked in, and then no amount of care downstream recovers the truth.
+/// Epoch-second bounds avoid storing day strings that depend on a timezone.
 public struct ActivityBucket: Sendable, Equatable {
     public let start: Double
     public let end: Double
@@ -124,11 +122,14 @@ public struct ActivityAnswerBundle: Sendable, Equatable {
 public struct ActivityRollups: Sendable {
     public enum RollupError: Error, LocalizedError, Equatable {
         case sourceRowsExceeded(limit: Int)
+        case invalidEventCount(source: String)
 
         public var errorDescription: String? {
             switch self {
             case .sourceRowsExceeded(let limit):
                 return "More than \(limit) activity spans match this request. Ask for a shorter range or one bundle_id so NativeAgent does not return an incomplete answer."
+            case .invalidEventCount(let source):
+                return "Activity event counts are negative or exceed the supported integer range (\(source)); retained history was left unchanged."
             }
         }
     }
@@ -267,7 +268,7 @@ public struct ActivityRollups: Sendable {
 
     public static func topApps(
         spans: [ActivitySpan], from: Double, to: Double, limit: Int
-    ) -> ActivityTopN {
+    ) throws -> ActivityTopN {
         var seconds: [String: Double] = [:]
         var names: [String: String] = [:]
         var counts: [String: Int] = [:]
@@ -285,14 +286,14 @@ public struct ActivityRollups: Sendable {
             events[span.bundleId, default: 0] += Double(span.eventCount) * share
         }
 
-        let all = seconds
+        let all = try seconds
             .map { bundleId, secs in
                 ActivityAppTotal(
                     bundleId: bundleId,
                     appName: names[bundleId] ?? bundleId,
                     seconds: secs,
                     spanCount: counts[bundleId] ?? 0,
-                    eventCount: Int((events[bundleId] ?? 0).rounded())
+                    eventCount: try checkedEventCount(events[bundleId] ?? 0, source: "app \(bundleId)")
                 )
             }
             // Deterministic order: seconds desc, then bundle id — never
@@ -315,8 +316,8 @@ public struct ActivityRollups: Sendable {
     /// The longest spans in the window, after merging contiguous same-app spans.
     public static func exemplars(
         spans: [ActivitySpan], limit: Int
-    ) -> [ActivitySpan] {
-        let merged = merge(spans: spans)
+    ) throws -> [ActivitySpan] {
+        let merged = try merge(spans: spans)
         return Array(
             merged
                 .sorted { ($0.duration, $1.startedAt) > ($1.duration, $0.startedAt) }
@@ -327,7 +328,7 @@ public struct ActivityRollups: Sendable {
     /// Same app, same redacted title, no unobserved gap →
     /// one span. Keeps the first row's id so an exemplar still points at a real
     /// stored row.
-    public static func merge(spans: [ActivitySpan]) -> [ActivitySpan] {
+    public static func merge(spans: [ActivitySpan]) throws -> [ActivitySpan] {
         let ordered = spans.sorted { $0.startedAt < $1.startedAt }
         var out: [ActivitySpan] = []
         for span in ordered {
@@ -343,7 +344,12 @@ public struct ActivityRollups: Sendable {
                 continue
             }
             let spanEnd = span.endedAt ?? span.lastSeenAt
-            out[out.count - 1] = ActivitySpan(
+            let count = previous.eventCount.addingReportingOverflow(span.eventCount)
+            guard !count.overflow, previous.eventCount >= 0, span.eventCount >= 0 else {
+                throw RollupError.invalidEventCount(source: "spans \(previous.id), \(span.id)")
+            }
+            _ = out.popLast()
+            out.append(ActivitySpan(
                 id: previous.id,
                 startedAt: previous.startedAt,
                 endedAt: max(previousEnd, spanEnd),
@@ -351,12 +357,19 @@ public struct ActivityRollups: Sendable {
                 bundleId: previous.bundleId,
                 appName: previous.appName,
                 titleRedacted: previous.titleRedacted,
-                eventCount: previous.eventCount + span.eventCount,
+                eventCount: count.partialValue,
                 closeReason: span.closeReason,
                 tzOffsetMin: previous.tzOffsetMin
-            )
+            ))
         }
         return out
+    }
+
+    private static func checkedEventCount(_ value: Double, source: String) throws -> Int {
+        guard let count = Int(exactly: value.rounded()), count >= 0 else {
+            throw RollupError.invalidEventCount(source: source)
+        }
+        return count
     }
 
     // MARK: The single answer
@@ -394,7 +407,7 @@ public struct ActivityRollups: Sendable {
         let exemplarLimit = min(10, max(1, cap / 5))
         let bucketLimit = max(0, cap - topLimit - exemplarLimit)
 
-        let top = Self.topApps(spans: spans, from: from, to: to, limit: topLimit)
+        let top = try Self.topApps(spans: spans, from: from, to: to, limit: topLimit)
 
         // Detect the bucket-generation cap BEFORE bucketing, so a window too
         // large for the requested grain is reported rather than silently
@@ -415,7 +428,7 @@ public struct ActivityRollups: Sendable {
             .prefix(bucketLimit)
             .sorted { ($0.start, $0.seconds) < ($1.start, $1.seconds) }
 
-        let clipped = spans.compactMap { span -> ActivitySpan? in
+        let clipped = try spans.compactMap { span -> ActivitySpan? in
             let spanEnd = span.endedAt ?? span.lastSeenAt
             let start = max(span.startedAt, from)
             let end = min(spanEnd, to)
@@ -427,11 +440,11 @@ public struct ActivityRollups: Sendable {
                 endedAt: span.endedAt == nil ? nil : end, lastSeenAt: end,
                 bundleId: span.bundleId, appName: span.appName,
                 titleRedacted: span.titleRedacted,
-                eventCount: Int((Double(span.eventCount) * share).rounded()),
+                eventCount: try Self.checkedEventCount(Double(span.eventCount) * share, source: "span \(span.id)"),
                 closeReason: span.closeReason, tzOffsetMin: span.tzOffsetMin
             )
         }
-        let allExemplars = Self.exemplars(spans: clipped, limit: Int.max)
+        let allExemplars = try Self.exemplars(spans: clipped, limit: Int.max)
         let keptExemplars = Array(allExemplars.prefix(exemplarLimit))
 
         var truncated: [String] = []

@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 
@@ -8,8 +9,7 @@ import PersistenceCore
 // of authorization or transport supersedes success; proof decays without polling.
 
 public enum ConnectorHealthDecay {
-    /// A connector untouched for this long stops reading green. Seven days —
-    /// the sweep's stated window.
+    /// A connector untouched for seven days stops reading green.
     public static let provenWindow: TimeInterval = 7 * 24 * 60 * 60
 
     public enum Verification: String, Sendable, Equatable {
@@ -133,24 +133,28 @@ public enum ConnectorProofLedger {
         maxTailBytes: Int = maxTailBytes
     ) -> [String: (at: Date, succeeded: Bool, authorizationFailed: Bool)] {
         var newest: [String: (at: Date, succeeded: Bool, authorizationFailed: Bool)] = [:]
-        for line in tailLines(path: path, maxTailBytes: maxTailBytes) {
-            guard let data = line.data(using: .utf8),
+        guard let read = try? SwiftNativePersistenceCore.tailPhysicalLines(path, limit: .max, maxBytes: maxTailBytes) else { return newest }
+        let encoding: String.Encoding = read.lines.allSatisfy { String(data: $0, encoding: .utf8) != nil } ? .utf8 : .isoLatin1
+        // A truncated byte window conservatively discards its first row, even when whole.
+        for line in read.lines.dropFirst(read.truncatedToByteWindow ? 1 : 0) {
+            guard let text = String(data: line, encoding: encoding),
+                  let data = text.data(using: .utf8),
                   case .object(let row)? = try? JSONValue.parse(data) else { continue }
-            guard let connector = string(row["connectorId"]).map(canonicalID),
+            guard let connector = row["connectorId"]?.stringValue.map(canonicalID),
                   !connector.isEmpty else { continue }
             // A dry run proves nothing about the live integration.
             if case .bool(true)? = row["dryRun"] { continue }
-            guard let status = string(row["status"])?.lowercased(),
+            guard let status = row["status"]?.stringValue?.lowercased(),
                   successStatuses.contains(status) || status == "failed" else { continue }
             let rejection = connectionRejection(row["output"])
             if status == "failed", rejection == nil { continue }
             // Local status success proves no transport; a failed credential
             // check still invalidates an earlier successful call.
-            if let action = string(row["actionId"])?.lowercased(),
+            if let action = row["actionId"]?.stringValue?.lowercased(),
                status != "failed", action.hasSuffix(".status") {
                 continue
             }
-            guard let created = string(row["createdAt"]),
+            guard let created = row["createdAt"]?.stringValue,
                   let date = NativeTimestampFormat.parseISO8601FractionalFirst(created) else { continue }
             if let existing = newest[connector], existing.at > date { continue }
             newest[connector] = (date, successStatuses.contains(status), status == "failed" && rejection == true)
@@ -162,7 +166,7 @@ public enum ConnectorProofLedger {
     /// action/local failures that say nothing about the connection's health.
     private static func connectionRejection(_ output: JSONValue?) -> Bool? {
         guard case .object(let fields)? = output else { return nil }
-        let error = string(fields["error"])?.lowercased() ?? ""
+        let error = fields["error"]?.stringValue?.lowercased() ?? ""
         if error == "transport_failed" { return false }
         if ["invalid_auth", "not_authed", "token_revoked", "account_inactive",
             "invalid_token", "token_expired", "invalid_grant", "invalid_client",
@@ -179,33 +183,5 @@ public enum ConnectorProofLedger {
     /// Registry ids and receipt `connectorId`s compare as one key, trimmed and lowercased.
     public static func canonicalID(_ raw: String) -> String {
         ConnectorOAuthRegistry.normalizedConnectorID(raw)
-    }
-
-    private static func string(_ value: JSONValue?) -> String? {
-        guard case .string(let string)? = value else { return nil }
-        return string
-    }
-
-
-    /// Bounded tail read. The first (possibly partial) line of a seeked read is
-    /// dropped, matching the app-side `tailJSONL` idiom.
-    private static func tailLines(path: URL, maxTailBytes: Int) -> [String] {
-        guard maxTailBytes > 0,
-              let attrs = try? FileManager.default.attributesOfItem(atPath: path.path),
-              let sizeNumber = attrs[.size] as? NSNumber else { return [] }
-        let size = sizeNumber.uint64Value
-        guard size > 0 else { return [] }
-        let toRead = min(size, UInt64(maxTailBytes))
-        let seeked = size > toRead
-        guard let handle = try? FileHandle(forReadingFrom: path) else { return [] }
-        defer { try? handle.close() }
-        if seeked, (try? handle.seek(toOffset: size - toRead)) == nil { return [] }
-        guard let data = try? handle.read(upToCount: Int(toRead)), !data.isEmpty else { return [] }
-        let text = String(data: data, encoding: .utf8)
-            ?? String(data: data, encoding: .isoLatin1)
-            ?? ""
-        var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-        if seeked, !lines.isEmpty { lines.removeFirst() }
-        return lines.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
     }
 }

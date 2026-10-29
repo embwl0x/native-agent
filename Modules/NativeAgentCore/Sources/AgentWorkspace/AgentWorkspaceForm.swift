@@ -190,10 +190,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
         }
         var copy = self
         copy.draftValues.merge(supplied) { _, new in new }
-        guard copy.draftValues.values.reduce(0, { total, value in
-            if case .string(let text) = value { return total + text.utf8.count }
-            return total + ((try? value.serializedData(pretty: false).count) ?? 65_537)
-        }) <= 65_536 else {
+        guard Self.draftBytes(copy.draftValues) <= 65_536 else {
             throw Failure(message: "Form values are limited to 64 KiB. Your existing draft is still here; nothing was run.")
         }
         copy.focusedField = nil
@@ -202,31 +199,33 @@ struct AgentWorkspaceForm: Sendable, Equatable {
     }
 
     /// Workspace forms advertise workspace-relative paths. Freeze that meaning
-    /// before saving/submission so Full Mac's legacy repo cwd cannot redirect it.
+    /// before saving/submission so the source cwd cannot redirect it.
     /// Explicit selected/absolute targets retain their existing owner semantics.
     func resolvingWorkspacePath(root: URL) throws -> Self {
         guard ["write_file", "read_file", "list_dir"].contains(tool), bound["path"] == nil,
               case .string(let raw)? = draftValues["path"] else { return self }
-        let path = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let path = NativeAgentWorkspaceRoot.fileSpelling(raw)
         guard !path.isEmpty, !path.hasPrefix("/"), !path.hasPrefix("~") else { return self }
-        let alias = AgentWorkspacePorts.current.tools.normalizeWorkspaceAlias(path, workspaceRoot: root)
-        let resolved = (alias.hasPrefix("/") ? URL(fileURLWithPath: alias)
-            : root.appendingPathComponent(path)).standardizedFileURL.resolvingSymlinksInPath()
-        let base = root.standardizedFileURL.resolvingSymlinksInPath().path
-        guard resolved.path == base || resolved.path.hasPrefix(base + "/") else {
+        let resolved = NativeAgentWorkspaceRoot.canonicalFileURL(
+            NativeAgentWorkspaceRoot.fileCandidate(raw, relativeTo: root, workspaceRoot: root))
+        let base = NativeAgentWorkspaceRoot.canonicalFileURL(root).path
+        guard NativeAgentWorkspaceRoot.relativePath(resolved.path, under: base) != nil else {
             throw Failure(message: "A relative path must stay inside the workspace. Choose an explicit absolute path for another location; nothing was run.")
         }
         return try updating(fields: .array([.object(["field": .string("path"), "value": .string(resolved.path)])]), text: nil)
     }
 
-    private func selecting(_ value: JSONValue, field: String) -> Self {
-        var copy = self
-        copy.draftValues[field] = value
-        let bytes = copy.draftValues.values.reduce(0) { total, value in
+    private static func draftBytes(_ values: [String: JSONValue]) -> Int {
+        values.values.reduce(0) { total, value in
             if case .string(let text) = value { return total + text.utf8.count }
             return total + ((try? value.serializedData(pretty: false).count) ?? 65_537)
         }
-        guard bytes <= 65_536 else {
+    }
+
+    private func selecting(_ value: JSONValue, field: String) -> Self {
+        var copy = self
+        copy.draftValues[field] = value
+        guard Self.draftBytes(copy.draftValues) <= 65_536 else {
             return withNotice("That option exceeds the 64 KiB draft limit. Your existing draft is still here; nothing was run.")
         }
         copy.focusedField = nil
@@ -242,7 +241,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
     }
 
     private func fieldContent(_ name: String) -> JSONValue {
-        let spec = Self.object(properties[name])
+        let spec = properties[name]?.objectValue ?? [:]
         var field: [String: JSONValue] = ["field": .string(name),
             "label": .string(AgentWorkspaceEnvironment.title(name)), "required": .bool(required.contains(name)),
             "type": spec["type"] ?? (Self.types(properties[name]).isEmpty ? .string("structured") : .array(Self.types(properties[name]).sorted().map(JSONValue.string)))]
@@ -262,7 +261,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
     }
 
     private func choices(_ name: String) -> [JSONValue]? {
-        let spec = Self.object(properties[name])
+        let spec = properties[name]?.objectValue ?? [:]
         if case .array(let values)? = spec["enum"] { return values }
         let allowed = Self.types(properties[name])
         if allowed == ["boolean"] { return [.bool(true), .bool(false)] }
@@ -270,7 +269,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
         return nil
     }
 
-    var projection: AgentWorkspaceProjection {
+    var projection: WorkspacePage {
         if let name = focusedField, properties[name] != nil, let values = choices(name) {
             return .init(title: "Choose " + AgentWorkspaceEnvironment.title(name), content: fieldContent(name),
                 items: values.map { value in
@@ -411,10 +410,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
                   case .object(let root) = parameters, case .object(let properties)? = root["properties"],
                   properties.count <= 80, Set(bound.keys).isSubset(of: Set(properties.keys)),
                   try parameters.serializedData(pretty: false).count <= 131_072,
-                  values.values.reduce(0, { total, value in
-                      if case .string(let text) = value { return total + text.utf8.count }
-                      return total + ((try? value.serializedData(pretty: false).count) ?? 65_537)
-                  }) <= 65_536 else {
+                  AgentWorkspaceForm.draftBytes(values) <= 65_536 else {
                 throw Failure(message: "The saved draft is invalid. Its bytes were preserved.")
             }
             let form = AgentWorkspaceForm(stored: self)
@@ -432,17 +428,13 @@ struct AgentWorkspaceForm: Sendable, Equatable {
         notice = "Restored draft inputs. The current owner schema and permissions are checked before submission; nothing was resumed."
     }
 
-    private static func object(_ value: JSONValue?) -> [String: JSONValue] {
-        if case .object(let row)? = value { return row }; return [:]
-    }
-
     private static func isString(_ value: JSONValue) -> Bool {
         if case .string = value { return true }; return false
     }
 
     private static func types(_ value: JSONValue?, depth: Int = 0) -> Set<String> {
         guard depth < 8 else { return [] }
-        let row = object(value)
+        let row = value?.objectValue ?? [:]
         var direct: Set<String> = []
         if case .string(let type)? = row["type"] { direct = [type] }
         if case .array(let entries)? = row["type"] { direct = Set(entries.compactMap { if case .string(let type) = $0 { return type }; return nil }) }
@@ -459,7 +451,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
 
     private static func permitsNull(_ schema: JSONValue?, depth: Int = 0) -> Bool {
         guard depth < 8 else { return false }
-        let row = object(schema)
+        let row = schema?.objectValue ?? [:]
         if let type = row["type"] {
             guard types(.object(["type": type])).contains("null") else { return false }
         }
@@ -475,7 +467,7 @@ struct AgentWorkspaceForm: Sendable, Equatable {
     }
 
     private static func convert(_ rawValue: JSONValue, schema: JSONValue?, name: String) throws -> JSONValue {
-        let row = object(schema), allowed = types(schema)
+        let row = schema?.objectValue ?? [:], allowed = types(schema)
         if rawValue == .null {
             guard allowed.contains("null"), permitsNull(schema) else {
                 throw Failure(message: "\(name) does not allow an explicit null. Nothing was run.")

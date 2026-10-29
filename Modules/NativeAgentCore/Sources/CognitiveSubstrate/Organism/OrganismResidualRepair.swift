@@ -1,75 +1,49 @@
 import Foundation
-import CryptoKit
 // Blueprint: | `OrganismResidualRepair.swift` | `OrganismResidualRepair` enum; `combinedPressure`, `opportunity` |
 
 public struct OrganismResidualRepairOpportunity: Sendable, Equatable {
     public var generatedAt: Date
-    /// Preregistered five-residual product used by Dream/recalibration lanes.
+    /// Five-residual product used by Dream/recalibration lanes.
     public var pressure: Double
-    /// Existing bounded field-repair signal. Kept distinct because the
-    /// preregistered product can contribute at most 0.15 from field charge and
-    /// therefore cannot, by itself, reach the proven 0.30 local repair gate.
+    /// Bounded field-repair signal, distinct because the product contributes
+    /// at most 0.15 from field charge and cannot reach the 0.30 local repair gate.
     public var localRepairPressure: Double
-    public var predictionResidual: Double
-    public var transitionSurpriseResidual: Double
-    public var contradictionResidual: Double
-    public var fieldChargeResidual: Double
+    public var components: OrganismSleepPressureComponents
     public var fieldUncertaintyResidual: Double
-    public var calibrationResidual: Double
     public var evidenceCount: Int
-    public var evidenceGeneration: String
-    public var evidence: [OrganismSleepEvidenceReference]
     public var chargedNodeIDs: [String]
     public var noisyEdgeIDs: [String]
     public var quietUntil: Date?
     public var nextRepairAt: Date?
     public var nextWakeAt: Date?
     public var ready: Bool
-    public var resourceInhibited: Bool
-    public var lanes: [OrganismSleepLaneOpportunity]
 
     public init(
         generatedAt: Date,
         pressure: Double = 0,
         localRepairPressure: Double? = nil,
-        predictionResidual: Double = 0,
-        transitionSurpriseResidual: Double = 0,
-        contradictionResidual: Double = 0,
-        fieldChargeResidual: Double = 0,
+        components: OrganismSleepPressureComponents = .init(),
         fieldUncertaintyResidual: Double = 0,
-        calibrationResidual: Double = 0,
         evidenceCount: Int = 0,
-        evidenceGeneration: String = "none",
-        evidence: [OrganismSleepEvidenceReference] = [],
         chargedNodeIDs: [String] = [],
         noisyEdgeIDs: [String] = [],
         quietUntil: Date? = nil,
         nextRepairAt: Date? = nil,
         nextWakeAt: Date? = nil,
-        ready: Bool = false,
-        resourceInhibited: Bool = false,
-        lanes: [OrganismSleepLaneOpportunity] = []
+        ready: Bool = false
     ) {
         self.generatedAt = generatedAt
         self.pressure = Self.clamp(pressure)
         self.localRepairPressure = Self.clamp(localRepairPressure ?? pressure)
-        self.predictionResidual = Self.clamp(predictionResidual)
-        self.transitionSurpriseResidual = Self.clamp(transitionSurpriseResidual)
-        self.contradictionResidual = Self.clamp(contradictionResidual)
-        self.fieldChargeResidual = Self.clamp(fieldChargeResidual)
+        self.components = components
         self.fieldUncertaintyResidual = Self.clamp(fieldUncertaintyResidual)
-        self.calibrationResidual = Self.clamp(calibrationResidual)
         self.evidenceCount = max(0, evidenceCount)
-        self.evidenceGeneration = String(evidenceGeneration.prefix(80))
-        self.evidence = Array(evidence.prefix(32))
         self.chargedNodeIDs = Array(chargedNodeIDs.prefix(4))
         self.noisyEdgeIDs = Array(noisyEdgeIDs.prefix(4))
         self.quietUntil = quietUntil
         self.nextRepairAt = nextRepairAt
         self.nextWakeAt = nextWakeAt
         self.ready = ready
-        self.resourceInhibited = resourceInhibited
-        self.lanes = Array(lanes.prefix(OrganismSleepLane.allCases.count))
     }
 
     public static func empty(at date: Date) -> Self { Self(generatedAt: date) }
@@ -135,14 +109,12 @@ public enum OrganismResidualRepair {
         // Inspect current tissue directly instead of comparing untrusted source
         // timestamps with a local repair receipt. This makes delayed events
         // visible while the exact IDs causally bind the later operation.
-        let charged = hasUnrepairedFieldMutation ? Array(field.nodes.values.filter { $0.charge >= 0.12 }
+        let charged = hasUnrepairedFieldMutation ? Array(field.nodes.values.filter(OrganismDreamRepair.hasRepairableCharge)
             .sorted {
                 if $0.charge != $1.charge { return $0.charge > $1.charge }
                 return $0.id < $1.id
             }.prefix(4)) : []
-        let noisy = hasUnrepairedFieldMutation ? Array(field.edges.values.filter {
-            $0.uncertainty >= 0.18 || ($0.eligibility >= 0.45 && $0.weight >= 0.12)
-        }.sorted {
+        let noisy = hasUnrepairedFieldMutation ? Array(field.edges.values.filter(OrganismDreamRepair.hasRepairableNoise).sorted {
             if $0.uncertainty != $1.uncertainty { return $0.uncertainty > $1.uncertainty }
             return $0.id < $1.id
         }.prefix(4)) : []
@@ -208,54 +180,11 @@ public enum OrganismResidualRepair {
             ? max(minimumPressure, measuredLocalRepairPressure)
             : measuredLocalRepairPressure
         let pressure = measuredPressure
-        var provenance = unresolvedPredictions.map { prediction in
-            OrganismSleepEvidenceReference(
-                id: opaqueEvidenceID("prediction|\(prediction.id)|\(prediction.status.rawValue)"),
-                kind: .prediction,
-                evidenceClass: .exactRuntime,
-                observedAt: prediction.lastUpdatedAt,
-                expiresAt: prediction.dueAt
-            )
-        }
-        if let correctionNode {
-            provenance.append(OrganismSleepEvidenceReference(
-                id: opaqueEvidenceID("contradiction|correction|\(field.mutationGeneration)"),
-                kind: .contradiction,
-                evidenceClass: .exactRuntime,
-                observedAt: correctionNode.lastActivatedAt
-            ))
-        }
-        if let memoryCorrectionNode {
-            provenance.append(OrganismSleepEvidenceReference(
-                id: opaqueEvidenceID("contradiction|memory|\(field.mutationGeneration)"),
-                kind: .contradiction,
-                evidenceClass: .exactRuntime,
-                observedAt: memoryCorrectionNode.lastActivatedAt
-            ))
-        }
-        if hasUnrepairedFieldMutation, !charged.isEmpty || !noisy.isEmpty {
-            provenance.append(OrganismSleepEvidenceReference(
-                id: opaqueEvidenceID("field|\(field.mutationGeneration)"),
-                kind: .fieldCharge,
-                evidenceClass: .exactRuntime,
-                observedAt: field.lastUpdatedAt ?? now
-            ))
-        }
-        if derivedCalibration > 0, let updated = ledger.lastUpdatedAt {
-            provenance.append(OrganismSleepEvidenceReference(
-                id: opaqueEvidenceID("calibration|\(Int(updated.timeIntervalSince1970))|\(ledger.violatedCount)|\(ledger.expiredCount)"),
-                kind: .calibration,
-                evidenceClass: .exactRuntime,
-                observedAt: updated
-            ))
-        }
-        provenance = Array(Dictionary(grouping: provenance, by: \.id).compactMap { $0.value.first }
-            .sorted { $0.id < $1.id }.prefix(32))
-        let evidenceGeneration = generationFingerprint(
-            evidence: provenance,
-            fieldGeneration: field.mutationGeneration
-        )
-        let evidenceCount = provenance.count
+        let evidenceCount = min(32, unresolvedPredictions.count
+            + (correctionNode == nil ? 0 : 1)
+            + (memoryCorrectionNode == nil ? 0 : 1)
+            + (hasUnrepairedFieldMutation && (!charged.isEmpty || !noisy.isEmpty) ? 1 : 0)
+            + (derivedCalibration > 0 && ledger.lastUpdatedAt != nil ? 1 : 0))
         let repairableFieldEvidenceCount = charged.count + noisy.count
 
         // Scheduling follows the trusted ingestion anchor. Source event and
@@ -277,18 +206,6 @@ public enum OrganismResidualRepair {
         let localReady = localEligible && now >= localQuietUntil
         let localNext = localEligible ? max(now, localQuietUntil) : nil
 
-        let lanes = [
-            OrganismSleepLaneOpportunity(
-                lane: .quietLocalRepair,
-                threshold: minimumPressure,
-                quietInterval: quietInterval,
-                disposition: localEligible
-                    ? (localReady ? .ready : .waitingForQuiet)
-                    : .inactive,
-                nextEligibleAt: localNext
-            ),
-        ]
-
         let pendingPredictionDue = ledger.predictions.values
             .filter { $0.status == .pending && $0.dueAt > now }
             .map(\.dueAt)
@@ -298,43 +215,22 @@ public enum OrganismResidualRepair {
             .filter { $0 > now }
         // Below threshold, monotonic residual decay cannot create a crossing;
         // only exact pending prediction expiries are worth scheduling.
-        //
-        // She is always on (User 10-24): heat never disarms her repair.
+        // Heat never disarms repair.
         let nextWake = candidateDeadlines.min()
         return OrganismResidualRepairOpportunity(
             generatedAt: now,
             pressure: pressure,
             localRepairPressure: localRepairPressure,
-            predictionResidual: components.predictionResidual,
-            transitionSurpriseResidual: components.transitionSurprise,
-            contradictionResidual: components.contradictionResidual,
-            fieldChargeResidual: components.fieldChargeResidual,
+            components: components,
             fieldUncertaintyResidual: fieldUncertainty,
-            calibrationResidual: components.calibrationResidual,
             evidenceCount: evidenceCount,
-            evidenceGeneration: evidenceGeneration,
-            evidence: provenance,
             chargedNodeIDs: charged.map(\.id),
             noisyEdgeIDs: noisy.map(\.id),
             quietUntil: localEligible ? localQuietUntil : nil,
             nextRepairAt: localNext,
             nextWakeAt: nextWake,
-            ready: localReady,
-            lanes: lanes
+            ready: localReady
         )
     }
 
-    private static func opaqueEvidenceID(_ source: String) -> String {
-        SHA256.hash(data: Data(source.utf8)).map { String(format: "%02x", $0) }.joined()
-    }
-
-    private static func generationFingerprint(
-        evidence: [OrganismSleepEvidenceReference],
-        fieldGeneration: UInt64
-    ) -> String {
-        let source = (["field:\(fieldGeneration)"] + evidence.map {
-            "\($0.id)|\($0.kind.rawValue)|\($0.evidenceClass.rawValue)|\(Int($0.observedAt.timeIntervalSince1970))"
-        }).joined(separator: "\n")
-        return opaqueEvidenceID(source)
-    }
 }

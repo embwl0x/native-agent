@@ -2,40 +2,20 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
-// Blueprint: | `ChatSessionAgingConsolidation.swift` | `ChatSessionAgingConsolidation` struct; `scheduleTranscriptAgingIfNeeded`, `runTranscriptAging`; coordinator retains bodies and 300-second cancellation deadlines, releases claims only at body exit, closes admission at engine termination |
+import TurnTrace
+// Blueprint: | `ChatSessionAgingConsolidation.swift` | Append-triggered aging at 85% keeps ~55% raw history and distills proportional consecutive chunks concurrently before one ordered commit; coordinator retains bodies and 300-second cancellation deadlines, releases claims only at body exit, closes admission and joins admitted bodies and deadlines at engine termination |
 
-// Continuous consolidation — NORTHSTAR clause 4, sweep item 45 (2026-09-01).
-//
-// Compaction used to be a stop-the-world event on User's critical path: between
-// persisting his message and building context, the turn measured the
-// transcript, and at 200k tokens (or 40% of the model window) it backed up,
-// distilled, replaced and — on any failure — ABORTED the turn. A threshold with
-// a backup and a watchdog is the machinery clause 4 names.
-//
-// The inversion: older turns decay into recollection AS THEY AGE, off the
-// critical path. The append that crosses the aging boundary schedules one
-// background pass (no timer, no schedule, no budget — the signal reached it);
-// by the time a session could approach the old threshold, its older turns are
-// already recollection and the synchronous check finds nothing to do. The
-// threshold stays exactly where it was, as a rare BACKSTOP, and every receipt
-// now names which lane ran (`lane: aging` vs `lane: backstop`).
-//
-// What does NOT change: the aging pass runs the SAME `ChatSessionAutocompactor`
-// selection and replacement, with the same verified pre-compaction backup, the
-// same transcript validator, and the same durable write. What DOES change is
-// where a failure goes — a background pass may never take a turn down with it,
-// so failure is loud in the receipt and on stderr instead — and when the model
-// works: aging distills BEFORE it replaces, with the transcript unlocked, so
-// no turn ever waits on a background recollection (2026-10-19: a 114 s aging
-// distill held User's next message, because the pass wrote its row pending
-// first and the turn waited for it).
+// Appends trigger background recollection at 85% of the threshold, keeping ~55%
+// raw history through proportional concurrent distillation and one ordered commit.
+// Foreground compaction waits on its own recollection; stale aging prefixes cannot
+// replace it. Background failures are recorded without taking down a turn.
 
 /// One aging pass per session at a time. Three lanes (text-compat, structured,
 /// structured-stream) and rapid consecutive turns all reach the same transcript;
 /// without this, two passes would queue on the file lock and the second would
 /// re-consolidate what the first just wrote.
-actor ChatTranscriptAgingCoordinator {
-    static let shared = ChatTranscriptAgingCoordinator()
+actor TranscriptConsolidationFlights {
+    static let shared = TranscriptConsolidationFlights()
 
     private struct Flight {
         let body: Task<Void, Never>
@@ -44,11 +24,18 @@ actor ChatTranscriptAgingCoordinator {
     private var inFlight: [String: Flight] = [:]
     private var stopped = false
 
-    func stop() {
+    func stop() async {
         stopped = true
-        for flight in inFlight.values {
+        let admitted = Array(inFlight.values)
+        for flight in admitted {
             flight.body.cancel()
             flight.deadline.cancel()
+        }
+        await settle {
+            for flight in admitted {
+                await flight.body.value
+                await flight.deadline.value
+            }
         }
     }
 
@@ -73,15 +60,11 @@ actor ChatTranscriptAgingCoordinator {
     private func release(_ sessionId: String) {
         inFlight.removeValue(forKey: sessionId)?.deadline.cancel()
     }
-
-    func isInFlight(_ sessionId: String) -> Bool {
-        inFlight[sessionId] != nil
-    }
 }
 
 public struct ChatSessionAgingConsolidation: Sendable {
     public static func stop() async {
-        await ChatTranscriptAgingCoordinator.shared.stop()
+        await TranscriptConsolidationFlights.shared.stop()
     }
     let dataRoot: URL
     let autocompactionConfig: ChatSessionAutocompactionConfig
@@ -135,14 +118,14 @@ public struct ChatSessionAgingConsolidation: Sendable {
         // at the aging boundary. Below it, this append changed nothing that
         // matters and the turn moves on without spawning anything.
         guard Self.transcriptBytes(messagesPath)
-            >= Int64(Double(boundaryTokens) * Self.agingTokenDivisor(forModel: model))
+            >= Int64(Double(boundaryTokens) * ContextBudgetPolicy.transcriptCharactersPerToken)
         else { return }
 
         let dataRoot = self.dataRoot
         let clock = self.clock
         let llm = self.llm
         Task.detached(priority: .background) {
-            await ChatTranscriptAgingCoordinator.shared.start(safeSessionId) {
+            await TranscriptConsolidationFlights.shared.start(safeSessionId) {
                 await Self.runTranscriptAging(
                     sessionId: safeSessionId,
                     model: model,
@@ -173,10 +156,6 @@ public struct ChatSessionAgingConsolidation: Sendable {
         llm: any LLMClient,
         now: @escaping @Sendable () -> Date
     ) async {
-        let coordinator = ChatTranscriptAgingCoordinator.shared
-        guard !Task.isCancelled else { return }
-        // No power or budget gate (User 10-24): this work happens anyway, and a
-        // deferral only moved it onto her turn as the backstop.
         guard !Task.isCancelled else { return }
 
         let compactor = ChatSessionAutocompactor(dataRoot: dataRoot, config: config, now: now)
@@ -215,7 +194,7 @@ public struct ChatSessionAgingConsolidation: Sendable {
                 sessionId: sessionId,
                 summaryRowId: summaryRowId,
                 backupPath: backupPath,
-                messagesReplaced: outcome.messagesReplaced,
+                rows: outcome.recollectionSource,
                 turnModel: model,
                 surface: surface,
                 runId: runId
@@ -226,33 +205,31 @@ public struct ChatSessionAgingConsolidation: Sendable {
             // history as it is and waits on nothing. Only the finished
             // recollection takes the lock, for a replacement that first
             // checks the prefix is still exactly what was distilled.
-            let committed = await distiller.distillAhead(
+            _ = await distiller.distillAhead(
                 sessionId: sessionId,
                 rows: fold.source,
                 turnModel: model,
                 surface: surface,
                 runId: runId,
                 stillCurrent: { try await compactor.agingFoldIsCurrent(fold) },
-                commit: { text, distillModel in
-                    try Task.checkCancellation()
-                    return try await compactor.commitAging(
+                commit: { blocks, distillModel in
+                    let committed = try await compactor.commitAging(
                         fold,
-                        recollection: text,
+                        recollection: blocks,
                         distillModel: distillModel,
                         model: model,
                         surface: surface,
                         runId: runId,
                         trigger: Self.agingTrigger
                     ).compacted
+                    if committed {
+                        await ChatCompactionDistiller.publishTranscriptChange(
+                            sessionId: sessionId, dataRoot: dataRoot
+                        )
+                    }
+                    return committed
                 }
             )
-            // A landed commit must invalidate readers even if cancellation
-            // arrived with its result. No new consolidation is admitted here.
-            if committed {
-                await ChatCompactionDistiller.publishTranscriptChange(
-                    sessionId: sessionId, dataRoot: dataRoot, persistence: compactor.persistence
-                )
-            }
         }
     }
 
@@ -291,25 +268,16 @@ public struct ChatSessionAgingConsolidation: Sendable {
     ) -> ChatCompactionDistiller {
         ChatCompactionDistiller(
             dataRoot: dataRoot,
-            summaryModelResolver: { surface in
-                try? await SwiftNativeProviderRouting(
-                    dataRoot: dataRoot,
-                    surfacesPathOverride: dataRoot
-                        .appendingPathComponent("providers", isDirectory: true)
-                        .appendingPathComponent("surfaces.json"),
-                    activeProviderPathOverride: dataRoot
-                        .appendingPathComponent("providers", isDirectory: true)
-                        .appendingPathComponent("active.json")
-                ).modelForSurface(surface).model
+            summaryRouteResolver: { surface in
+                let snapshot = try await SwiftNativeProviderRouting(dataRoot: dataRoot).checkedRoutingSnapshot()
+                let route = try snapshot.routeAdmission(for: surface, choice: nil, inheritChat: false)
+                guard route.providerId?.isEmpty == false else {
+                    throw ProviderRoutingError.configurationFailed(
+                        snapshot.unusablePickNotice(for: surface) ?? "Choose a model and account for Memory and mind in Providers.")
+                }
+                return route
             },
-            llmComplete: { model, prompt in
-                try await llm.complete(
-                    prompt: prompt,
-                    system: ChatCompactionDistiller.distillSystem,
-                    model: model,
-                    surface: ChatCompactionDistiller.distillSurface, purpose: "compaction"
-                )
-            },
+            llm: llm,
             now: now
         )
     }
@@ -318,10 +286,6 @@ public struct ChatSessionAgingConsolidation: Sendable {
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: path.path),
               let size = attrs[.size] as? NSNumber else { return 0 }
         return size.int64Value
-    }
-
-    private static func agingTokenDivisor(forModel model: String) -> Double {
-        model.lowercased().contains("claude") ? 3.5 : 4.0
     }
 
     /// Deferrals and failures of the background lane land on the SAME trace
@@ -339,9 +303,6 @@ public struct ChatSessionAgingConsolidation: Sendable {
         dataRoot: URL,
         now: @escaping @Sendable () -> Date
     ) async {
-        let tracesPath = dataRoot
-            .appendingPathComponent("traces", isDirectory: true)
-            .appendingPathComponent("events.jsonl")
         var payload: [String: JSONValue] = [
             "schema": .string("context.compact.v1"),
             "sessionId": .string(sessionId),
@@ -355,25 +316,8 @@ public struct ChatSessionAgingConsolidation: Sendable {
         if let runId, !runId.isEmpty {
             payload["runId"] = .string(runId)
         }
-        let row: JSONValue = .object([
-            "id": .string(UUID().uuidString.lowercased()),
-            "kind": .string("context.compact"),
-            "title": .string(sessionId),
-            "status": .string(status),
-            "payload": .object(payload),
-            "createdAt": .string(ISO8601DateFormatter().string(from: now())),
-        ])
-        do {
-            try await appendPathOwnedJSONL(
-                row,
-                to: tracesPath,
-                using: SwiftNativePersistenceCore(),
-                logLabel: "ChatSessionAging"
-            )
-        } catch {
-            FileHandle.standardError.write(
-                Data("ChatSessionAging: trace append failed for \(sessionId): \(error)\n".utf8)
-            )
-        }
+        await TurnTracePersistLane(dataRootOverride: dataRoot).append(
+            TurnTraceEvent(kind: "context.compact", title: sessionId, status: status,
+                payload: .object(payload), createdAt: ISO8601DateFormatter().string(from: now())))
     }
 }

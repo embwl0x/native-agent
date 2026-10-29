@@ -4,21 +4,10 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `SwiftToolDispatcher+MemoryCurationTools.swift` | `MemoryCuration`: `listMemories`, `rewriteMemory` retain provenance on readback (a read steers nothing); `rewriteTarget` shares read-only preview validation; `SwiftToolDispatcher`: `impl_forget_memory`, `impl_rebuild_knowledge_graph` |
 
-// User, 2026-09-05: "make it so she can do it." The agent's memory tools were
-// recall, commit and moment review; there was no way to walk the whole store,
-// rewrite a row to what it means, or drop one, short of the Memories page's
-// buttons. These three ride the same owner calls that page uses
-// (SwiftNativeMemoryV2.updateMemory re-embeds when the text changes and gates
-// against tombstones; deleteMemoryIfPresent tombstones and republishes the
-// derived state). They touch only the agent's own store.
-//
-// User, 2026-10-01: Agent's ruling, anything a merge or correction replaces
-// must stay recoverable. A merge or a newer fact ARCHIVES the old row (status
-// archived, with duplicate_of / superseded_by in its metadata); a correction
-// DEMOTES it (lifecycle corrected, corrected_by). `memory.list status:
-// archived` shows both and `memory.rewrite restore` brings one back through
-// the same updateMemory, so a bad merge or correction undoes in one call.
-// `memory.rewrite pinned` is the page's pin (MemoryFacade.setPinned's patch).
+// Curation shares the Memories page's owner calls and touches only the agent's own store.
+// Merges archive rows with duplicate_of/superseded_by; corrections demote with corrected_by.
+// memory.list status:archived exposes both; memory.rewrite restore restores through updateMemory.
+// memory.rewrite pinned uses MemoryFacade.setPinned's patch.
 
 /// What the app door's memory.list and memory.rewrite run, in process, over
 /// one store.
@@ -48,9 +37,7 @@ public struct MemoryCuration: Sendable {
         switch input[key] {
         case .int(let i)?: return Int(i)
         case .double(let d)?:
-            // Int(d) traps on NaN, infinity and anything past Int's range
-            // (Codex review 2026-09-05: an offset of 1e100 crashed
-            // the app instead of refusing).
+            // Int(d) traps on NaN, infinity and values outside Int's range.
             guard d.isFinite, abs(d) < 1e15 else { return nil }
             return Int(d)
         default: return nil
@@ -76,7 +63,8 @@ public struct MemoryCuration: Sendable {
     }
 
     func curationRefusal(_ reason: String) -> JSONValue {
-        .object(["status": .string("refused"), "reason": .string(reason)])
+        .object(["status": .string("refused"), "reason": .string(reason),
+            "execution": .string("not_run"), "effects": .string("none")])
     }
 
     /// Every active memory, newest first by default, in pages. The walk
@@ -154,6 +142,7 @@ public struct MemoryCuration: Sendable {
             "memories": .array(rows),
             "count": .int(Int64(rows.count)),
             "total": .int(Int64(listing.total)),
+            "has_more": .bool(next < listing.total),
             "next_offset": .int(Int64(next)),
             "remaining": .int(Int64(max(0, listing.total - next))),
         ]
@@ -233,7 +222,12 @@ public struct MemoryCuration: Sendable {
     public func rewriteMemory(input: [String: JSONValue], surface: String, persona: String?) async throws -> JSONValue {
         let row: MemoryRecord
         do { row = try await rewriteTarget(input: input, surface: surface, persona: persona) }
-        catch { return SwiftToolDispatcher.memoryFailure(error) }
+        catch {
+            guard case .object(var failure) = SwiftToolDispatcher.memoryFailure(error) else { throw error }
+            failure["execution"] = .string("not_run")
+            failure["effects"] = .string("none")
+            return .object(failure)
+        }
         let text = curationString(input, "text")
         let pinned = curationBool(input, "pinned")
         let restore = curationBool(input, "restore") == true

@@ -46,7 +46,7 @@ extension PhoneTurnActivity {
             let workID = activity.attributes.workID
             enqueueWork(workID) { await Self.endWork(workID, content: nil) }
         }
-        for id in Array(work.keys) where !ids.contains(id) && work[id]!.staleDate.addingTimeInterval(10 * 60) <= Date() {
+        for (id, row) in Array(work) where !ids.contains(id) && row.staleDate.addingTimeInterval(10 * 60) <= Date() {
             work.removeValue(forKey: id)
             workExpirations.removeValue(forKey: id)?.cancel()
             enqueueWork(id) { await Self.endWork(id, content: nil) }
@@ -178,7 +178,7 @@ extension PhoneTurnActivity {
             await previous?.value
             guard activityPairing == expectedPairing, isEnabled == enabled,
                   tokenPairing == nil || tokenPairing == activityPushPairing,
-                  let environment = NativeAgentAPNSEnvironmentResolver.current()?.environment.rawValue,
+                  let environment = NativeAgentAPNSEnvironmentResolver.current()?.rawValue,
                   let bundleID = Bundle.main.bundleIdentifier,
                   let deviceID = UIDevice.current.identifierForVendor?.uuidString else { return }
             var payload = ["deviceId": deviceID, "enabled": enabled ? "true" : "false",

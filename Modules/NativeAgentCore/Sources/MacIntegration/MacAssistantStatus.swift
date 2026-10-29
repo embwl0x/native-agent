@@ -1,23 +1,10 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-import TrustCenter
-// Blueprint: | `MacAssistantStatus.swift` | assistant status client, result, lightweight serialization of an existing full result, Mail readiness projection and native watch access evidence; typed catalog data and UI words come from `Resources/abilities/mac-watch-catalog.js`, never creating jobs; missing/disabled/invalid catalog is unavailable, never an empty catalog |
+// Blueprint: | `MacAssistantStatus.swift` | assistant status composition from evidence snapshots, client contract, result, lightweight serialization, Mail readiness projection and native watch access evidence; typed catalog data and UI words come from `Resources/abilities/mac-watch-catalog.js`, never creating jobs; missing/disabled/invalid catalog is unavailable, never an empty catalog |
 
-// MARK: - Subsystem #17 wave 11 (2026-05-31) — MacAssistantStatus Swift port
-//
-// PORTED-PARTIAL: composition runs against SwiftNativeTrustCenter for
-// macControlPolicy reads. Three sub-queries are still conservative Swift
-// defaults until their backing proof/probe subsystems expose richer native
-// state:
-//
-//   - connector_proof_status(provider)  -> ConnectorProofProvider
-//   - mobile_push_status()              -> MobilePushStatusProvider
-//   - _dispatcher_tool_available(name)  -> DispatcherToolAvailabilityProvider
-//
-// Each provider has a protocol + conservative Swift-native impl + static test
-// impl. The status renderer never contacts a daemon and never creates watcher
-// jobs; it emits manifest/setup state only.
+// Status rendering reads readiness evidence and never creates watch jobs.
 
 // MARK: - Result types
 
@@ -179,7 +166,7 @@ public struct MacAssistantStatusResult: Sendable, Equatable {
             guard lightweight else { return rows }
             return rows.map { row in
                 guard case .object(let object) = row else { return row }
-                return .object(object.filter { keys.contains($0.key) && Self.isTruthy($0.value) })
+                return .object(object.filter { keys.contains($0.key) && $0.value.isTruthy })
             }
         }
         return .object([
@@ -197,95 +184,21 @@ public struct MacAssistantStatusResult: Sendable, Equatable {
     }
 }
 
-// MARK: - Cross-system provider protocols
-
-public protocol ConnectorProofProvider: Sendable {
-    /// Returns the connector proof dict for `provider`. Expected keys:
-    /// `"verified"` (bool), `"nextStep"` (string, optional).
-    func proofStatus(provider: String) async -> [String: JSONValue]
-}
-
-public protocol MobilePushStatusProvider: Sendable {
-    /// Expected keys: `"status"`, `"tokenConfigured"`, `"nextStep"` (all
-    /// optional).
-    func pushStatus() async -> [String: JSONValue]
-}
-
-public protocol DispatcherToolAvailabilityProvider: Sendable {
-    func isAvailable(toolName: String) async -> Bool
-}
-
-public protocol LocalPIMStatusProvider: Sendable {
-    /// Expected keys: `"status"` plus optional `"nextStep"` and `"detail"`.
-    /// Status values should use the same vocabulary as access rows:
-    /// ready, probe_needed, needs_permission, needs_setup, failed.
-    func localStatuses() async -> [String: [String: JSONValue]]
-}
-
-public struct StaticDispatcherToolAvailabilityProvider: DispatcherToolAvailabilityProvider {
-    public let availableTools: Set<String>
-    public init(availableTools: Set<String> = []) {
-        self.availableTools = availableTools
-    }
-    public func isAvailable(toolName: String) async -> Bool {
-        availableTools.contains(toolName)
-    }
-}
-
 // MARK: - Client protocol
 
 public protocol MacAssistantStatusClient: Sendable {
     func macAssistantStatus(lightweight: Bool) async throws -> MacAssistantStatusResult
 }
 
-// MARK: - SwiftNative impl
-
-public actor SwiftNativeMacAssistantStatusClient: MacAssistantStatusClient {
-    private let loadTrustPolicy: @Sendable () async -> [String: JSONValue]
-    private let proofs: ConnectorProofProvider
-    private let push: MobilePushStatusProvider
-    private let dispatcherTools: DispatcherToolAvailabilityProvider
-    private let localPIM: LocalPIMStatusProvider
-    private let watchCatalog: @Sendable () async throws -> [MacAssistantWatchRecipe]
-
-    public init(
-        loadTrustPolicy: @escaping @Sendable () async -> [String: JSONValue],
-        proofs: ConnectorProofProvider,
-        push: MobilePushStatusProvider,
-        dispatcherTools: DispatcherToolAvailabilityProvider,
-        localPIM: LocalPIMStatusProvider,
-        watchCatalog: @escaping @Sendable () async throws -> [MacAssistantWatchRecipe]
-    ) {
-        self.loadTrustPolicy = loadTrustPolicy
-        self.proofs = proofs
-        self.push = push
-        self.dispatcherTools = dispatcherTools
-        self.localPIM = localPIM
-        self.watchCatalog = watchCatalog
-    }
-
-    public func macAssistantStatus(lightweight: Bool) async throws -> MacAssistantStatusResult {
-        let trust = await loadTrustPolicy()
-        var macEnabled = false
-        var notificationsAllowedRaw: Bool = true
-        var notificationsKeyPresent = false
-        if case .object(let macPolicy)? = trust["macControlPolicy"] {
-            if case .bool(let b)? = macPolicy["enabled"] {
-                macEnabled = b
-            }
-            if let v = macPolicy["notifications_allowed"] {
-                notificationsKeyPresent = true
-                if case .bool(let b) = v { notificationsAllowedRaw = b } else { notificationsAllowedRaw = false }
-            }
-        }
-        let notificationsAllowed = notificationsKeyPresent ? notificationsAllowedRaw : true
-
-        let pushStatus = await push.pushStatus()
-        // Ready means proven: a successful Mac action receipt in the proof
-        // window. A switch that is on is only waiting for that proof.
-        let macProven = await proofs.proofStatus(provider: "mac")["verified"] == .bool(true)
+extension MacAssistantStatusResult {
+    public static func compose(
+        macEnabled: Bool, macProven: Bool, notifications: (status: String, nextStep: String),
+        pushStatus: [String: JSONValue],
+        availableTools: Set<String>, localStatuses: [String: [String: JSONValue]],
+        watchCatalog: @Sendable () async throws -> [MacAssistantWatchRecipe]
+    ) async throws -> MacAssistantStatusResult {
+        // Ready requires a successful action receipt within the proof window.
         let macState = !macEnabled ? "needs_policy" : macProven ? "ready" : "probe_needed"
-        let macNotificationsState = !(macEnabled && notificationsAllowed) ? "needs_policy" : "probe_needed"
 
         let pushState: String
         switch (pushStatus["status"].flatMap { if case .string(let s) = $0 { s.lowercased() } else { nil } }) {
@@ -297,8 +210,7 @@ public actor SwiftNativeMacAssistantStatusClient: MacAssistantStatusClient {
         var pushNextStep = ""
         if case .string(let s)? = pushStatus["nextStep"] { pushNextStep = s }
 
-        let localStatuses = await localPIM.localStatuses()
-        func localAccessState(id: String, toolName: String) async -> (status: String, detail: String?, nextStep: String?) {
+        func localAccessState(id: String, toolName: String) -> (status: String, detail: String?, nextStep: String?) {
             let local = localStatuses[id] ?? [:]
             let localStatus: String? = {
                 if case .string(let s)? = local["status"] {
@@ -318,13 +230,13 @@ public actor SwiftNativeMacAssistantStatusClient: MacAssistantStatusClient {
             if let localStatus {
                 return (localStatus, detail, nextStep)
             }
-            let available = await dispatcherTools.isAvailable(toolName: toolName)
+            let available = availableTools.contains(toolName)
             return (available ? "probe_needed" : "needs_setup", detail, nextStep)
         }
 
-        let mailAccess = await localAccessState(id: "local_mail", toolName: "mail_list_recent")
-        let calAccess = await localAccessState(id: "local_calendar", toolName: "calendar_list_upcoming")
-        let remAccess = await localAccessState(id: "local_reminders", toolName: "reminders_list_due_today")
+        let mailAccess = localAccessState(id: "local_mail", toolName: "mail_list_recent")
+        let calAccess = localAccessState(id: "local_calendar", toolName: "calendar_list_upcoming")
+        let remAccess = localAccessState(id: "local_reminders", toolName: "reminders_list_due_today")
         let mailState = mailAccess.status
         let calState = calAccess.status
         let remState = remAccess.status
@@ -332,29 +244,29 @@ public actor SwiftNativeMacAssistantStatusClient: MacAssistantStatusClient {
         let access: [MacAssistantAccessItem] = [
             MacAssistantAccessItem(
                 id: "mac_control",
-                title: "Mac Control Bridge",
+                title: "Mac control",
                 status: macState,
-                detail: "App-owned local control bridge for shortcuts, notifications, file reads, and Apple Events.",
+                detail: "Lets me run shortcuts, post notifications, read files and script apps on this Mac.",
                 setupRoute: "sidebar:trust",
                 requiredFor: ["local_mail", "local_calendar", "local_reminders", "mac_notifications"],
-                nextStep: !macEnabled ? "Enable Mac Control in Trust Center." : macProven ? "" : "Run mac.self_test once to prove the bridge.",
+                nextStep: !macEnabled ? "Turn on Mac control above." : macProven ? "" : "Run mac.self_test once to prove the bridge.",
                 actionIds: ["mac.self_test"]
             ),
             MacAssistantAccessItem(
                 id: "mac_notifications",
-                title: "Mac Notifications",
-                status: macNotificationsState,
-                detail: "Posts local macOS notifications through the app-owned bridge.",
+                title: "Mac notifications",
+                status: notifications.status,
+                detail: "I post notifications on this Mac. Readiness uses policy, macOS authorization and a delivered notification retained by Notification Center.",
                 setupRoute: "sidebar:trust",
                 requiredFor: ["watch_receipts"],
-                nextStep: "Enable Mac Control notifications and send a test notification.",
+                nextStep: notifications.nextStep,
                 actionIds: ["mac.notify"]
             ),
             MacAssistantAccessItem(
                 id: "iphone_push",
-                title: "iPhone Push",
+                title: "iPhone notifications",
                 status: pushState,
-                detail: "APNS path for watch receipts and activity opens on iOS.",
+                detail: "I send what a watch found to your iPhone through APNS, with activity opens on iOS.",
                 setupRoute: "sidebar:settings",
                 requiredFor: ["remote_watch_receipts"],
                 nextStep: pushNextStep,
@@ -362,34 +274,40 @@ public actor SwiftNativeMacAssistantStatusClient: MacAssistantStatusClient {
             ),
             MacAssistantAccessItem(
                 id: "local_mail",
-                title: "Local Mail.app",
+                title: "Mac Mail",
                 status: mailState,
-                detail: mailAccess.detail ?? "Read-only Mail.app inbox scan via Apple Events. First real run may trigger macOS privacy approval.",
+                detail: "I read your Mail inbox (read only), through Apple Events."
+                    + (mailState == "ready" ? "" : " The first check shows the macOS permission prompt.")
+                    + (mailAccess.detail.map { " \($0)" } ?? ""),
                 setupRoute: "sidebar:trust",
                 requiredFor: ["local_mail_watch"],
-                nextStep: mailAccess.nextStep ?? (mailState == "ready" ? "" : "Run mac.mail_list_recent once from the app to prove Mail.app access."),
+                nextStep: mailAccess.nextStep ?? (mailState == "ready" ? "" : "Use Check Mail so macOS can ask for access."),
                 actionIds: ["mac.mail_list_recent"],
                 toolNames: ["mail_list_recent", "mail_search"]
             ),
             MacAssistantAccessItem(
                 id: "local_calendar",
-                title: "Local Calendar.app",
+                title: "Mac Calendar",
                 status: calState,
-                detail: calAccess.detail ?? "Read-only Calendar access through EventKit. The first probe opens the macOS Calendar permission prompt.",
+                detail: "I read Calendar (read only), through EventKit."
+                    + (calState == "ready" ? "" : " The first check shows the macOS permission prompt.")
+                    + (calAccess.detail.map { " \($0)" } ?? ""),
                 setupRoute: "sidebar:trust",
                 requiredFor: ["local_calendar_watch"],
-                nextStep: calAccess.nextStep ?? (calState == "ready" ? "" : "Run mac.calendar_list_upcoming once from the app to prove Calendar access."),
+                nextStep: calAccess.nextStep ?? (calState == "ready" ? "" : "Use Check Calendar and Reminders above so macOS can ask for access."),
                 actionIds: ["mac.calendar_list_upcoming"],
                 toolNames: ["calendar_list_upcoming"]
             ),
             MacAssistantAccessItem(
                 id: "local_reminders",
-                title: "Local Reminders.app",
+                title: "Mac Reminders",
                 status: remState,
-                detail: remAccess.detail ?? "Read-only Reminders access through EventKit. The first probe opens the macOS Reminders permission prompt.",
+                detail: "I read Reminders (read only), through EventKit."
+                    + (remState == "ready" ? "" : " The first check shows the macOS permission prompt.")
+                    + (remAccess.detail.map { " \($0)" } ?? ""),
                 setupRoute: "sidebar:trust",
                 requiredFor: ["local_reminders_watch"],
-                nextStep: remAccess.nextStep ?? (remState == "ready" ? "" : "Run mac.reminders_list_due_today once from the app to prove Reminders access."),
+                nextStep: remAccess.nextStep ?? (remState == "ready" ? "" : "Use Check Calendar and Reminders above so macOS can ask for access."),
                 actionIds: ["mac.reminders_list_due_today"],
                 toolNames: ["reminders_list_due_today"]
             ),
@@ -433,48 +351,8 @@ public actor SwiftNativeMacAssistantStatusClient: MacAssistantStatusClient {
             schedulerActions: ["scheduler.schedule_job", "scheduler.create_job", "scheduler.list_jobs", "scheduler.cancel_job"],
             lazyContract: lazyContract,
             createdAt: createdAt
-        ).projected(lightweight: lightweight)
+        )
     }
-}
-
-extension MacAssistantStatusResult {
-    /// Mirrors Python's `... and value` truthiness used in the lightweight
-    /// dict comprehension: empty string / empty array / empty object / null /
-    /// `false` / `0` all drop out.
-    static func isTruthy(_ v: JSONValue) -> Bool {
-        switch v {
-        case .null: return false
-        case .bool(let b): return b
-        case .int(let i): return i != 0
-        case .double(let d): return d != 0
-        case .string(let s): return !s.isEmpty
-        case .array(let a): return !a.isEmpty
-        case .object(let o): return !o.isEmpty
-        }
-    }
-}
-
-// MARK: - Factory
-
-public func makeMacAssistantStatusClient(
-    loadTrustPolicy: (@Sendable () async -> [String: JSONValue])? = nil,
-    proofs: ConnectorProofProvider,
-    push: MobilePushStatusProvider,
-    dispatcherTools: DispatcherToolAvailabilityProvider,
-    localPIM: LocalPIMStatusProvider,
-    watchCatalog: @escaping @Sendable () async throws -> [MacAssistantWatchRecipe]
-) -> any MacAssistantStatusClient {
-    let loader: @Sendable () async -> [String: JSONValue] = loadTrustPolicy ?? {
-        await SwiftNativeTrustCenter().loadTrustPolicy()
-    }
-    return SwiftNativeMacAssistantStatusClient(
-        loadTrustPolicy: loader,
-        proofs: proofs,
-        push: push,
-        dispatcherTools: dispatcherTools,
-        localPIM: localPIM,
-        watchCatalog: watchCatalog
-    )
 }
 
 extension MacAssistantStatusResult {

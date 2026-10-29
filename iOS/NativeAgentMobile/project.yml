@@ -1,5 +1,5 @@
 name: NativeAgentMobile
-# PATCH-2026-05-06: ios-companion xcodegen spec for iOS companion app
+# XcodeGen spec for the iOS companion app.
 # Generate: xcodegen --spec iOS/NativeAgentMobile/project.yml
 # from repo root (NativeAgent/).
 

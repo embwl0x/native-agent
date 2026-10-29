@@ -99,9 +99,10 @@ nativeagent-link reply --contact <UUID>
 It supplies `{"message_id":"…","text":"…"}` on stdin. The helper reads its
 credential from Keychain and sends the contact bearer over loopback. The saved
 pending record chooses the destination, not the reply body.
-Grok's credential authorizes only correlated replies to pending messages through
-`POST /agent/grok-reply`. It cannot use MCP, general messaging, or HTTP/gRPC A2A;
-the HTTP and gRPC authentication boundaries enforce this restriction.
+Grok's credential authorizes correlated replies through `POST /agent/grok-reply`
+and conversations through `/agent/mcp`, with verified peer authorship under
+peer Trust, including Trust → Connected agents. Control routes, direct tool
+access and HTTP/gRPC A2A remain excluded.
 
 `GrokInboundReply` claims the request, saves the answer and settles the exact
 conversation exchange. If Agent's waiting turn already took the answer, it

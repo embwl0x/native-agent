@@ -1,9 +1,9 @@
 import Foundation
 import NativeAgentCore
 
-// Blueprint: | `ChatCompletionsStreamDecoder.swift` | `ChatCompletionsStreamDecoder`: shared SSE content/reasoning/tool fragments, usage and root errors; terminal/tool alignment validation preserves provider failures |
+// Blueprint: | `ChatCompletionsStreamDecoder.swift` | `ChatCompletionsStreamDecoder`: shared buffered terminal decoding/receipts and SSE content/reasoning/tool fragments, usage and root errors; terminal/tool alignment validation preserves provider failures |
 
-/// Shared decoder for OpenAI-compatible Chat Completions SSE streams.
+/// Shared decoder for buffered and streamed OpenAI-compatible Chat Completions.
 ///
 /// Consumes `choices[0].delta` content, reasoning, and indexed tool fragments;
 /// captures root-level usage wherever it appears; and surfaces root error
@@ -11,7 +11,7 @@ import NativeAgentCore
 ///
 /// Tool calls accumulate in first-seen order. Finalization checks the DONE
 /// sentinel, retained finish reason, complete tool batch, and nonempty output.
-/// Adapters own authentication, requests, yield cadence, and telemetry timing.
+/// Adapters own authentication and request bodies; consumption owns stream events and receipts.
 public struct ChatCompletionsStreamDecoder {
     /// Human-facing provider name used to prefix a mid-stream error message
     /// (e.g. "Moonshot: quota exceeded for kimi-k3").
@@ -48,13 +48,12 @@ public struct ChatCompletionsStreamDecoder {
     /// telemetry shape. `nil` when the stream sent no usage frame — the recorder
     /// omits nil keys, so the row simply carries no token fields.
     public private(set) var usage: LLMUsage?
-    /// True once this stream has produced model output of any kind — a content
-    /// delta, reasoning, or a tool-call fragment. User, 2026-09-06: gates the
-    /// malformed-frame rule in `consume`.
+    /// Any text, reasoning or tool fragment activates the malformed-frame failure rule in consume.
     private var sawSemanticOutput = false
     public private(set) var reachedLengthLimit = false
     private var terminalBoundaryReason: LLMToolBoundaryReason?
     private var streamError: Error?
+    private var refusalText = ""
     var errorDetail: String? { streamError.map(ProviderFailure.diagnosticDescription) }
     private var runaway = RunawayOutputDetector()
     public var toolBoundaryReason: LLMToolBoundaryReason? {
@@ -66,17 +65,38 @@ public struct ChatCompletionsStreamDecoder {
         self.retainReasoning = retainReasoning
     }
 
+
     /// Read failures share EOF's finalizer; cancellation and provider verdicts
     /// remain errors rather than permission to execute retained calls.
     mutating func consume<Events: AsyncSequence>(
-        _ events: Events, onFrame: (DecodedFrame) -> Void
+        _ events: Events, continuation: AsyncThrowingStream<LLMMessageStreamEvent, Error>.Continuation,
+        request: URLRequest, providerID: String, model: String, idPrefix: String,
+        started: UInt64, telemetry: LLMCallTraceRecorder,
+        onCalls: ([LLMStreamToolCall], String) async -> Void = { _, _ in }
     ) async throws where Events.Element == SSEEvent {
+        var ttftMs: Int?
+        var sawContent = false
         do {
             for try await event in events {
                 try Task.checkCancellation()
                 let frame = try consume(payload: event.data)
                 if frame.isDone { break }
-                onFrame(frame)
+                if ttftMs == nil, frame.content != nil || frame.toolCallDeltaCount > 0 {
+                    ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- started) / 1_000_000)
+                }
+                if frame.reasoning != nil { continuation.yield(.keepAlive) }
+                if providerID == "xai_oauth_direct" {
+                    for _ in 0..<frame.toolCallDeltaCount { continuation.yield(.keepAlive) }
+                }
+                if let content = frame.content {
+                    sawContent = true
+                    continuation.yield(.textDelta(content))
+                }
+                if providerID != "xai_oauth_direct" {
+                    for _ in 0..<frame.toolCallDeltaCount { continuation.yield(.keepAlive) }
+                } else if frame.finishReason == "tool_calls" || frame.finishReason == "stop" {
+                    continuation.yield(.keepAlive)
+                }
                 if toolBoundaryReason != nil { break }
             }
         } catch {
@@ -87,6 +107,20 @@ public struct ChatCompletionsStreamDecoder {
             terminalBoundaryReason = .interrupted
         }
         try Task.checkCancellation()
+        let terminal = Result {
+            try finalizedToolCalls(idPrefix: idPrefix, providerID: providerID, sawContent: sawContent)
+        }
+        await telemetry.record(
+            requestBody: request.httpBody, provider: providerID, model: model, streaming: true,
+            usage: usage, ttftMs: ttftMs,
+            durationMs: Int((DispatchTime.now().uptimeNanoseconds &- started) / 1_000_000),
+            status: toolBoundaryReason != nil ? "incomplete" : (try terminal.chatCompletionsTerminalStatus()),
+            stopReason: toolBoundaryReason?.rawValue, errorDetail: errorDetail
+        )
+        let completed = try terminal.get()
+        for call in completed { continuation.yield(.toolCall(call)) }
+        await onCalls(completed, reasoning)
+        if let reason = toolBoundaryReason { continuation.yield(.toolBoundary(reason)) }
     }
 
     /// One decoded frame's surface-relevant content. Every field is
@@ -121,25 +155,18 @@ public struct ChatCompletionsStreamDecoder {
         if payload.isEmpty { return frame }
         if payload == "[DONE]" {
             sawDone = true
+            if !refusalText.isEmpty { terminalBoundaryReason = .refusal }
             frame.isDone = true
             return frame
         }
         guard let data = payload.data(using: .utf8),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            // User, 2026-09-06: an unparseable frame used to vanish, so a
-            // corrupted transport mid-answer silently dropped a chunk of the
-            // reply (or of a tool call's arguments) and the turn still finished
-            // "successfully". Once the stream has started producing output,
-            // a frame we cannot read is a stream failure — transient, so the
-            // reconnect ladder re-asks — not silence. Before any output it is
-            // still skipped: a provider preamble is not a corrupted answer.
+            // Unreadable frames are skipped before output starts and fail the stream transiently afterward.
             guard sawSemanticOutput else { return frame }
             throw LLMError.transient(
                 message: "\(providerLabel): malformed stream frame after content")
         }
-        // Root error frame FIRST: it carries no `choices`, so a bare delta
-        // guard swallows it (the B2 bug). Throw the provider's own message,
-        // loud, before anything else touches the frame.
+        // Root error frames carry no choices; surface them before reading deltas.
         try throwIfChatCompletionsProviderError(root)
         // Usage rides either the dedicated final empty-choices frame or the
         // last delta frame itself — capture it wherever it appears.
@@ -153,6 +180,7 @@ public struct ChatCompletionsStreamDecoder {
         try throwIfChatCompletionsProviderError(choice)
         frame.finishReason = choice["finish_reason"] as? String
         if frame.finishReason == "length" { reachedLengthLimit = true }
+        if frame.finishReason == "content_filter" { terminalBoundaryReason = .refusal }
         guard let delta = choice["delta"] as? [String: Any] else {
             return frame
         }
@@ -167,13 +195,19 @@ public struct ChatCompletionsStreamDecoder {
             frame.content = kept.isEmpty ? nil : kept
             sawSemanticOutput = true
         }
+        if let refusal = delta["refusal"] as? String, !refusal.isEmpty {
+            refusalText += refusal
+            frame.content = (frame.content ?? "") + refusal
+            sawSemanticOutput = true
+        }
+        if frame.finishReason != nil, !refusalText.isEmpty { terminalBoundaryReason = .refusal }
         if let calls = delta["tool_calls"] as? [[String: Any]] {
             frame.toolCallDeltaCount = calls.count
             sawSemanticOutput = true
             var touched: [Int] = []
             frameAligned = true
             for (position, raw) in calls.enumerated() {
-                let index = slot(for: raw, position: position)
+                let index = try slot(for: raw, position: position)
                 if toolAccum[index] == nil {
                     toolAccum[index] = Accum()
                     toolOrder.append(index)
@@ -181,10 +215,10 @@ public struct ChatCompletionsStreamDecoder {
                 currentToolIndex = index
                 touched.append(index)
                 // Mutate in place so each fragment does not copy the growing arguments.
-                if let id = raw["id"] as? String, !id.isEmpty { toolAccum[index]!.id = id }
+                if let id = raw["id"] as? String, !id.isEmpty { toolAccum[index, default: Accum()].id = id }
                 if let function = raw["function"] as? [String: Any] {
-                    if let name = function["name"] as? String, !name.isEmpty { toolAccum[index]!.name = name }
-                    if let args = function["arguments"] as? String { toolAccum[index]!.arguments += args }
+                    if let name = function["name"] as? String, !name.isEmpty { toolAccum[index, default: Accum()].name = name }
+                    if let args = function["arguments"] as? String { toolAccum[index, default: Accum()].arguments += args }
                 }
             }
             previousFrameSlots = touched
@@ -200,8 +234,11 @@ public struct ChatCompletionsStreamDecoder {
     /// Once frame alignment breaks, an unnamed fragment continues the current
     /// slot. A new ID or a conflicting function name opens a new slot rather
     /// than corrupting an existing call. Explicit indexes remain authoritative.
-    private mutating func slot(for raw: [String: Any], position: Int) -> Int {
-        if let explicit = raw["index"] as? Int {
+    private mutating func slot(for raw: [String: Any], position: Int) throws -> Int {
+        if let value = raw["index"] {
+            guard let explicit = value as? Int, explicit >= 0 else {
+                throw LLMError.providerError(message: "\(providerLabel): invalid tool index")
+            }
             noteAlignment(of: explicit, at: position)
             return explicit
         }
@@ -224,7 +261,11 @@ public struct ChatCompletionsStreamDecoder {
         // first fragment of the stream: allocate a slot that cannot collide
         // with an explicit index seen so far.
         frameAligned = false
-        return (toolAccum.keys.max() ?? -1) + 1
+        let (next, overflow) = (toolAccum.keys.max() ?? -1).addingReportingOverflow(1)
+        guard !overflow else {
+            throw LLMError.providerError(message: "\(providerLabel): tool index space exhausted")
+        }
+        return next
     }
 
     /// An id- or index-addressed entry that does NOT land where the previous
@@ -255,7 +296,15 @@ public struct ChatCompletionsStreamDecoder {
         idPrefix: String,
         providerID: String,
         sawContent: Bool
-    ) throws -> [ChatCompletionsToolCall] {
+    ) throws -> [LLMStreamToolCall] {
+        if !refusalText.isEmpty { terminalBoundaryReason = .refusal }
+        if terminalBoundaryReason == .refusal {
+            guard sawContent else {
+                throw ProviderFailure.Diagnostic(cause: .refused,
+                    detail: refusalText.isEmpty ? "\(providerID): content_filter" : refusalText)
+            }
+            return []
+        }
         if reachedLengthLimit {
             RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit")
         }
@@ -263,7 +312,7 @@ public struct ChatCompletionsStreamDecoder {
             terminalBoundaryReason = .interrupted
             streamError = LLMError.streamTruncated(message: "\(providerID) stream ended without [DONE]")
         }
-        var completed: [ChatCompletionsToolCall] = []
+        var completed: [LLMStreamToolCall] = []
         for index in toolOrder {
             guard let call = toolAccum[index] else { continue }
             let name = call.name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -274,7 +323,7 @@ public struct ChatCompletionsStreamDecoder {
                 if toolBoundaryReason == nil { terminalBoundaryReason = .incompleteCall }
                 continue
             }
-            completed.append(ChatCompletionsToolCall(id: id, name: call.name, arguments: arguments))
+            completed.append(LLMStreamToolCall(id: id, name: call.name, inputJSON: Data(arguments.utf8)))
         }
         if completed.isEmpty, let streamError { throw streamError }
         if !sawContent && completed.isEmpty && toolBoundaryReason == nil {
@@ -286,21 +335,7 @@ public struct ChatCompletionsStreamDecoder {
     }
 }
 
-/// A finalized Chat-Completions tool call. Decoder-internal shape; the adapter
-/// maps it to `LLMStreamToolCall` (with `inputJSON` bytes) when it yields.
-public struct ChatCompletionsToolCall: Sendable, Equatable {
-    public let id: String
-    public let name: String
-    public let arguments: String
-
-    public init(id: String, name: String, arguments: String) {
-        self.id = id
-        self.name = name
-        self.arguments = arguments
-    }
-}
-
-// MARK: - Shared adapter helpers (C10)
+// MARK: - Shared adapter helpers
 
 extension Result where Failure == Error {
     /// Length terminals retain their usage receipt without claiming success.
@@ -330,110 +365,9 @@ private func throwIfChatCompletionsProviderError(_ object: [String: Any]) throws
     }
 }
 
-/// Shared non-streaming envelope validation. A length terminal never exposes
-/// the associated tool batch, even when its fragments happen to parse.
-func chatCompletionsMessage(_ root: [String: Any], status: Int) throws -> [String: Any] {
-    try throwIfChatCompletionsProviderError(root)
-    guard let choices = root["choices"] as? [[String: Any]],
-          let first = choices.first else {
-        throw LLMError.invalidResponse(status: status)
-    }
-    try throwIfChatCompletionsProviderError(first)
-    guard let message = first["message"] as? [String: Any] else {
-        throw LLMError.invalidResponse(status: status)
-    }
-    if first["finish_reason"] as? String == "length" {
-        throw LLMError.outputLengthLimit(partial: (message["content"] as? String) ?? "")
-    }
-    return message
-}
 
-func chatCompletionsReply(
-    content: String, toolCalls: [ChatCompletionsToolCall], incompleteNote: String?, provider: String
-) throws -> String {
-    var pieces = content.isEmpty ? [] : [content]
-    if let incompleteNote {
-        pieces.append(incompleteNote)
-    } else {
-        pieces.append(contentsOf: toolCalls.map(chatCompletionsToolUseMarker))
-    }
-    guard !pieces.isEmpty else {
-        throw LLMError.streamTruncated(message: "\(provider) returned no content (empty reply)")
-    }
-    return pieces.joined(separator: "\n")
-}
 
-/// A non-streaming Chat-Completions `tool_calls` array, finalized.
-struct ChatCompletionsToolCallSet {
-    /// The calls to execute. EMPTY when the set was dropped.
-    var calls: [ChatCompletionsToolCall]
-    /// Set when the whole set was dropped; the adapter appends it to the reply
-    /// text so the turn says what it discarded instead of going quiet.
-    var incompleteNote: String?
-}
 
-/// User, 2026-09-06: the non-streaming lanes `compactMap`ped their `tool_calls`,
-/// so an entry the adapter could not execute (no `function` object, or no
-/// name) was silently dropped and its siblings ran anyway — half of a plan the
-/// model wrote as one decision, chosen by which entry happened to be
-/// well-formed. The rule is now the streaming lanes': all-or-nothing, with the
-/// note that names what was lost.
-func finalizeChatCompletionsToolCalls(
-    _ raw: [[String: Any]],
-    idPrefix: String
-) -> ChatCompletionsToolCallSet {
-    guard !raw.isEmpty else { return ChatCompletionsToolCallSet(calls: [], incompleteNote: nil) }
-    var calls: [ChatCompletionsToolCall] = []
-    var malformed = 0
-    for (index, entry) in raw.enumerated() {
-        guard let function = entry["function"] as? [String: Any],
-              let rawName = function["name"] as? String,
-              case let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines),
-              !name.isEmpty
-        else {
-            malformed += 1
-            continue
-        }
-        // User, 2026-09-06: any nonempty `arguments` string used to be accepted
-        // verbatim. Downstream, the tool loop's marker parse falls back to an
-        // EMPTY input object when the body is not parseable JSON
-        // (ChatOrchestration+ToolLoop.swift), so a truncated or corrupt
-        // arguments payload ran the tool with no arguments at all — a
-        // different action than the model asked for, executed silently. An
-        // unparseable arguments string is malformed, and the set goes with it.
-        let rawArguments = (function["arguments"] as? String) ?? ""
-        let trimmedArguments = rawArguments.trimmingCharacters(in: .whitespacesAndNewlines)
-        let arguments: String
-        if trimmedArguments.isEmpty {
-            // A genuinely no-argument call: the wire form is "" or "{}".
-            arguments = "{}"
-        } else if let data = trimmedArguments.data(using: .utf8),
-                  (try? JSONSerialization.jsonObject(with: data)) is [String: Any] {
-            arguments = rawArguments
-        } else {
-            malformed += 1
-            continue
-        }
-        let id = (entry["id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-            ?? "\(idPrefix)_\(index)_\(name)"
-        calls.append(ChatCompletionsToolCall(id: id, name: name, arguments: arguments))
-    }
-    guard malformed == 0 else {
-        return ChatCompletionsToolCallSet(
-            calls: [],
-            incompleteNote: OpenAIOAuthDirectAdapter.incompleteNote(
-                "\(malformed) of \(raw.count) tool call(s) were unusable"
-            )
-        )
-    }
-    return ChatCompletionsToolCallSet(calls: calls, incompleteNote: nil)
-}
-
-/// The `<tool_use …>` marker shape every Chat-Completions-family adapter
-/// returns from its non-streaming path for the tool loop.
-func chatCompletionsToolUseMarker(_ call: ChatCompletionsToolCall) -> String {
-    "<tool_use id=\"\(call.id)\" name=\"\(call.name)\">\(call.arguments)</tool_use>"
-}
 
 /// Apply the three streaming Chat-Completions content headers shared by every
 /// chat-completions adapter's SSE request. `Authorization` is provider-specific
@@ -444,18 +378,8 @@ func applyStreamingLLMHeaders(to request: inout URLRequest) {
     request.setValue("NativeAgent (Darwin)", forHTTPHeaderField: "User-Agent")
 }
 
-/// Map a URLSession transport error to the error the adapter should surface
-/// (R-M2). Cancellation — either a Swift `CancellationError` or URLSession's
-/// `NSURLErrorDomain` + `NSURLErrorCancelled` — becomes `CancellationError` so
-/// structured-concurrency callers (e.g. the workshop runner) can distinguish a
-/// cancelled request from a real network failure. Every other transport
-/// failure becomes `fallback`, evaluated lazily so the per-provider message /
-/// error shape stays with the caller. This was hand-rolled ~30× across 8
-/// adapters (Moonshot had already extracted it as `rethrowNetwork`); this owns
-/// the cancellation-detection prologue once.
-///
-/// Usage at a throwing site: `throw mapTransportError(error, fallback: …)`.
-/// At a continuation site: `continuation.finish(throwing: mapTransportError(error, fallback: …)); return`.
+/// Cancellation, wrapped failures and transport classification have one boundary.
+/// Only otherwise unclassified errors use the caller's bounded contextual detail.
 func mapTransportError(_ error: Error, fallback: @autoclosure () -> LLMError) -> Error {
     if error is CancellationError { return CancellationError() }
     let nsError = error as NSError
@@ -473,8 +397,7 @@ func mapTransportError(_ error: Error, fallback: @autoclosure () -> LLMError) ->
     return ProviderFailure.normalize(fallback())
 }
 
-/// 2026-09-18 WHY: preserve status and Retry-After as data instead of encoding
-/// them in adapter-specific prose that each surface has to rediscover.
+/// HTTP status and Retry-After remain structured data across adapters and surfaces.
 func throwIfChatCompletionsError(
     status: Int,
     data: Data,
@@ -489,10 +412,7 @@ func throwIfChatCompletionsError(
     ), detail: "HTTP \(status): \(detail)")
 }
 
-/// Parse an HTTP `Retry-After` header into whole seconds (A3.4). Accepts the
-/// two RFC 7231 forms — delta-seconds ("30") and an HTTP-date — and clamps the
-/// result to `[0, LLMError.retryAfterMaxSeconds]`. Returns nil when the header
-/// is absent or unparseable.
+/// Retry-After accepts RFC 7231 seconds/date forms, clamps to 0...retryAfterMaxSeconds, or returns nil.
 func parseRetryAfterSeconds(from response: URLResponse?, now: Date = Date()) -> Int? {
     guard let http = response as? HTTPURLResponse else { return nil }
     guard
@@ -513,10 +433,7 @@ func parseRetryAfterSeconds(from response: URLResponse?, now: Date = Date()) -> 
     return nil
 }
 
-/// Best-effort extraction of a provider error-body message for `.authRejected`
-/// detail (A3.1). Handles the shapes every Chat-Completions-family provider
-/// uses: `{"error":{"message":"..."}}`, `{"error":"..."}`, `{"message":"..."}`.
-/// Falls back to a bounded raw-body slice so nothing is silently dropped.
+/// Auth rejection detail uses error.message, error or message, otherwise a bounded raw-body slice.
 func providerErrorDetail(_ data: Data, maxBytes: Int = 400) -> String? {
     if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
         if let err = obj["error"] as? [String: Any], let m = err["message"] as? String, !m.isEmpty {
@@ -528,32 +445,4 @@ func providerErrorDetail(_ data: Data, maxBytes: Int = 400) -> String? {
     let raw = String(decoding: data.prefix(maxBytes), as: UTF8.self)
         .trimmingCharacters(in: .whitespacesAndNewlines)
     return raw.isEmpty ? nil : raw
-}
-
-// Text-only callers share the structured stream's activity and cancellation.
-extension AsyncThrowingStream where Element == LLMMessageStreamEvent, Failure == Error {
-    func textDeltas(omittingEmpty: Bool) -> AsyncThrowingStream<String, Error> {
-        AsyncThrowingStream<String, Error> { continuation in
-            let task = Task {
-                do {
-                    for try await event in self {
-                        switch event {
-                        case .textDelta(let text):
-                            if !omittingEmpty || !text.isEmpty { continuation.yield(text) }
-                        case .keepAlive:
-                            // String streams use an empty delta for activity without
-                            // reply text, so the outer idle guard stays informed.
-                            continuation.yield("")
-                        case .toolCall, .replyTextSettled, .toolBoundary:
-                            continue
-                        }
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
-    }
 }

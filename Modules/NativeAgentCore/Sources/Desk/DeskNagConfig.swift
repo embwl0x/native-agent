@@ -301,30 +301,6 @@ public struct DeskNagConfig: Sendable, Equatable {
         if !observed.isEmpty { obj["observed"] = .object(observed.mapValues { $0.toJSON() }) }
         return .object(obj)
     }
-
-    /// Tolerant value decoder. The store validates saved settings first so
-    /// malformed preferences cannot be silently replaced by these defaults.
-    public static func fromJSON(_ value: JSONValue) -> DeskNagConfig {
-        guard case .object(let obj) = value else { return DeskNagConfig() }
-        var cfg = DeskNagConfig()
-        if case .bool(let b)? = obj["enabled"] { cfg.enabled = b }
-        if case .int(let i)? = obj["windowId"] { cfg.windowId = max(1, Int(i)) }
-        if case .array(let rows)? = obj["scopes"] {
-            cfg.scopes = rows.compactMap { DeskNagScope.fromJSON($0) }
-        }
-        if case .string(let m)? = obj["mutedUntil"], !m.isEmpty { cfg.mutedUntil = m }
-        if case .object(let led)? = obj["ledger"] {
-            for (k, v) in led {
-                if case .int(let i) = v { cfg.ledger[k] = Int(i) }
-            }
-        }
-        if case .object(let seen)? = obj["observed"] {
-            for (k, v) in seen {
-                if let o = DeskNagObservation.fromJSON(v) { cfg.observed[k] = o }
-            }
-        }
-        return cfg
-    }
 }
 
 // MARK: - Store
@@ -342,11 +318,9 @@ public struct DeskNagConfig: Sendable, Equatable {
 /// off-disk backup includes it; PrivacyMap lists desk/.
 public struct DeskNagConfigStore: Sendable {
     public let dataRoot: URL
-    public let persistence: any PersistenceCoreProtocol
 
-    public init(dataRoot: URL, persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()) {
+    public init(dataRoot: URL) {
         self.dataRoot = dataRoot
-        self.persistence = persistence
     }
 
     public var configPath: URL {
@@ -361,7 +335,7 @@ public struct DeskNagConfigStore: Sendable {
     }
 
     public func loadChecked() async throws -> DeskNagConfig {
-        let raw = try await persistence.readJSON(configPath, ifMissing: .null)
+        let raw = try await SwiftNativePersistenceCore.readJSON(configPath, ifMissing: .null)
         if raw == .null, !FileManager.default.fileExists(atPath: configPath.path) {
             return DeskNagConfig()
         }
@@ -370,42 +344,49 @@ public struct DeskNagConfigStore: Sendable {
               DeskNagConfigSchema.unexpectedKeys(in: raw).isEmpty else {
             throw UnavailableSettings()
         }
+        var config = DeskNagConfig()
         for (key, value) in object {
             switch (key, value) {
-            case ("version", .int), ("enabled", .bool), ("windowId", .int),
-                 ("mutedUntil", .string), ("scopes", .array):
-                break
+            case ("version", .int): break
+            case ("enabled", .bool(let enabled)): config.enabled = enabled
+            case ("windowId", .int(let window)): config.windowId = max(1, Int(window))
+            case ("mutedUntil", .string(let stamp)): config.mutedUntil = stamp.isEmpty ? nil : stamp
+            case ("scopes", .array(let rows)):
+                for row in rows {
+                    guard let scope = DeskNagScope.fromJSON(row) else { throw UnavailableSettings() }
+                    config.scopes.append(scope)
+                }
             case ("ledger", .object(let rows)):
-                guard rows.values.allSatisfy({ if case .int = $0 { return true }; return false }) else {
-                    throw UnavailableSettings()
+                for (handle, value) in rows {
+                    guard case .int(let window) = value else { throw UnavailableSettings() }
+                    config.ledger[handle] = Int(window)
                 }
             case ("observed", .object(let rows)):
-                guard rows.values.allSatisfy({ DeskNagObservation.fromJSON($0) != nil }) else {
-                    throw UnavailableSettings()
+                for (handle, value) in rows {
+                    guard let observation = DeskNagObservation.fromJSON(value) else { throw UnavailableSettings() }
+                    config.observed[handle] = observation
                 }
             default:
                 throw UnavailableSettings()
             }
         }
-        if let scopes = object["scopes"] {
-            guard case .array(let rows) = scopes,
-                  rows.allSatisfy({ DeskNagScope.fromJSON($0) != nil }) else {
-                throw UnavailableSettings()
-            }
+        try Self.checkWindow(config)
+        return config
+    }
+
+    private static func checkWindow(_ config: DeskNagConfig) throws {
+        guard config.windowId < Int.max else { throw WindowExhausted() }
+    }
+
+    private struct WindowExhausted: LocalizedError {
+        var errorDescription: String? {
+            "The reminder window counter is exhausted. Saved reminder settings were left unchanged."
         }
-        return DeskNagConfig.fromJSON(raw)
     }
 
     private struct UnavailableSettings: LocalizedError {
         var errorDescription: String? {
             "I couldn’t read your reminder settings. I’ve left them unchanged. Try opening them with the app version that last saved them."
-        }
-    }
-
-    public func save(_ config: DeskNagConfig) async throws {
-        try await persistence.withFileLock(configPath) {
-            _ = try await loadChecked()
-            try await persistence.writeJSON(config.toJSON(), to: configPath)
         }
     }
 
@@ -424,14 +405,13 @@ public struct DeskNagConfigStore: Sendable {
     public func updating<T: Sendable>(
         _ transform: @Sendable (DeskNagConfig) throws -> (DeskNagConfig, T)
     ) async throws -> (config: DeskNagConfig, value: T) {
-        try await persistence.withFileLock(configPath) {
+        try await SwiftNativePersistenceCore.withFileLock(configPath) {
             let current = try await loadChecked()
             let (next, value) = try transform(current)
-            // An unchanged config is not rewritten: the desk loop watches this
-            // file, and rewriting identical bytes every pass woke it again
-            // every ~2s, forever (perf sweep 2026-10-05).
+            try Self.checkWindow(next)
+            // Unchanged config is not rewritten, so the file watcher stays quiet.
             if next != current {
-                try await persistence.writeJSON(next.toJSON(), to: configPath)
+                try await SwiftNativePersistenceCore.writeJSON(next.toJSON(), to: configPath)
             }
             return (next, value)
         }

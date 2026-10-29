@@ -23,8 +23,8 @@ public protocol QuietSettingsHost: AnyObject {
 
     func saveChatBrainDefaultsFailure() async -> String?
     func saveMacControlPolicy(
-        _ policy: TrustMacControlPolicy,
-        comparedTo baseline: TrustMacControlPolicy,
+        _ policy: MacControlPolicyWireSnapshot,
+        comparedTo baseline: MacControlPolicyWireSnapshot,
         guardedByLockedPolicy: (@Sendable ([String: JSONValue]) throws -> Void)?
     ) async throws -> TrustPolicy
     func applySavedTrustPolicy(_ policy: TrustPolicy, status: String)
@@ -35,7 +35,7 @@ public protocol QuietSettingsHost: AnyObject {
     func listQuietProviderAccounts() async throws -> [QuietProviderAccount]
     func agentAccessMode(from policy: TrustPolicy) -> String
     func applyTrustPreset(
-        _ preset: TrustPolicyPreset,
+        _ preset: MobileTrustAction.Preset,
         guardedByLockedPolicy: (@Sendable ([String: JSONValue]) throws -> Void)?
     ) async -> QuietTrustPresetOutcome
     func saveMultimodalPolicy(
@@ -46,8 +46,8 @@ public protocol QuietSettingsHost: AnyObject {
     func setDreamCycleEnabled(_ enabled: Bool) async -> Bool
     func setRemCycleEnabled(_ enabled: Bool) async -> Bool
     func savePersonalityChecked(_ profile: PersonalityProfile) async throws
-    func patchMemoryPolicy(knowledgeGraphEnabled: Bool?, adaptivePromotion: Bool?, hygieneEnabled: Bool?) async -> Bool
-    func saveMemoryPolicy(consolidationEnabled: Bool, crossSessionRecall: Bool) async
+    func patchMemoryPolicy(knowledgeGraphEnabled: Bool?, adaptivePromotion: Bool?) async -> Bool
+    func saveMemoryPolicy(crossSessionRecall: Bool) async
 
     // The Settings page's live switches. Each stores its key AND tells the
     // running app, which is what the page's own control does; a bare write to

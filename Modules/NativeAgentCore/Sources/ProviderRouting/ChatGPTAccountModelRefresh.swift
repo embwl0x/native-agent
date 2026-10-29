@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
 
@@ -27,11 +28,11 @@ public actor ChatGPTAccountModelRefresh {
     @discardableResult
     public func refresh(dataRoot: URL, force: Bool = false) async throws -> Bool {
         let root = dataRoot.standardizedFileURL
-        let authPath = OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: root)
+        let authPath = ChatGPTTransport.preferredAuthPath(dataRoot: root)
         // This maintenance operation writes only the app-owned account cache;
         // do not discover an inactive sign-in when runtime selected another one.
         guard authPath.standardizedFileURL == NativeOAuthFlow.openAIAppOwnedAuthPath(dataRoot: root).standardizedFileURL else { return false }
-        guard let token = OpenAIOAuthDirectAdapter.storedAccessToken(at: authPath) else { return false }
+        guard let token = ChatGPTTransport.storedAccessToken(at: authPath) else { return false }
         var key = CredentialKey(root: root, accessToken: token)
         if !force {
             if let failure = failedAt[key], Date().timeIntervalSince(failure) < 300 { return false }
@@ -42,7 +43,7 @@ public actor ChatGPTAccountModelRefresh {
         config.timeoutIntervalForResource = 45
         let session = URLSession(configuration: config)
         defer { session.invalidateAndCancel() }
-        let adapter = OpenAIOAuthDirectAdapter(session: session, authPathOverride: authPath)
+        let adapter = ChatGPTTransport(session: session, authPathOverride: authPath)
         let context: CodexOAuthAccessContext
         do {
             try Self.validateCachePath(dataRoot: root, authPath: authPath)
@@ -80,15 +81,11 @@ public actor ChatGPTAccountModelRefresh {
               let cache = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
               let stamp = cache["fetched_at"] as? String,
               let account = cache["nativeagent_account_id"] as? String,
-              let token = OpenAIOAuthDirectAdapter.storedAccessToken(at: authPath),
-              account == (try? OpenAIOAuthDirectAdapter(authPathOverride: authPath)
+              let token = ChatGPTTransport.storedAccessToken(at: authPath),
+              account == (try? ChatGPTTransport(authPathOverride: authPath)
                 .currentAccountID(accessToken: token)),
               let models = cache["models"] as? [[String: Any]], !models.isEmpty else { return false }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let fractional = formatter.date(from: stamp)
-        formatter.formatOptions = [.withInternetDateTime]
-        guard let fetched = fractional ?? formatter.date(from: stamp) else { return false }
+        guard let fetched = NativeTimestampFormat.parseISO8601FractionalFirst(stamp) else { return false }
         let age = Date().timeIntervalSince(fetched)
         return age >= 0 && age < 86_400
     }
@@ -101,9 +98,9 @@ public actor ChatGPTAccountModelRefresh {
               authPath.resolvingSymlinksInPath() == parent.appendingPathComponent("auth.json"),
               cacheURL(dataRoot: dataRoot).resolvingSymlinksInPath()
                 == parent.appendingPathComponent("models_cache.json"),
-              !parent.resolvingSymlinksInPath().path.hasPrefix(
-                OpenAIOAuthDirectAdapter.defaultUserCodexHome().path + "/"
-              ), parent != OpenAIOAuthDirectAdapter.defaultUserCodexHome() else {
+              NativeAgentWorkspaceRoot.relativePath(parent.resolvingSymlinksInPath().path,
+                under: ChatGPTTransport.defaultUserCodexHome().path)?.isEmpty != false,
+              parent != ChatGPTTransport.defaultUserCodexHome() else {
             throw failure("The app-owned model cache path is unavailable.")
         }
     }
@@ -111,13 +108,13 @@ public actor ChatGPTAccountModelRefresh {
     private static func fetch(
         dataRoot: URL, authPath: URL, context: CodexOAuthAccessContext, session: URLSession
     ) async throws -> Bool {
-        let parent = cacheURL(dataRoot: dataRoot).deletingLastPathComponent()
-        var request = URLRequest(url: URL(string:
-            "https://chatgpt.com/backend-api/codex/models?client_version=\(clientVersion)")!)
+        guard let endpoint = URL(string:
+            "https://chatgpt.com/backend-api/codex/models?client_version=\(clientVersion)") else { throw URLError(.badURL) }
+        var request = URLRequest(url: endpoint)
         request.setValue("Bearer \(context.accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue(context.accountID, forHTTPHeaderField: "ChatGPT-Account-Id")
-        request.setValue(OpenAIOAuthDirectAdapter.codexBackendOriginator, forHTTPHeaderField: "originator")
-        request.setValue(OpenAIOAuthDirectAdapter.codexBackendUserAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue(ChatGPTTransport.codexBackendOriginator, forHTTPHeaderField: "originator")
+        request.setValue(ChatGPTTransport.codexBackendUserAgent, forHTTPHeaderField: "User-Agent")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         let (bytes, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
@@ -130,17 +127,16 @@ public actor ChatGPTAccountModelRefresh {
                 && $0["supported_reasoning_levels"] is [[String: Any]] }) else {
             throw failure("ChatGPT returned an invalid account model catalog.")
         }
-        cache["fetched_at"] = ISO8601DateFormatter().string(from: Date())
+        cache["fetched_at"] = NativeTimestampFormat.plainZulu(Date())
         cache["client_version"] = clientVersion
         cache["etag"] = http.value(forHTTPHeaderField: "ETag")
         cache["nativeagent_account_id"] = context.accountID
         let saved = try JSONSerialization.data(withJSONObject: cache, options: [.sortedKeys])
         try CredentialFileLock.withLock(authPath) {
-            guard OpenAIOAuthDirectAdapter.storedAccessToken(at: authPath) == context.accessToken else {
+            guard ChatGPTTransport.storedAccessToken(at: authPath) == context.accessToken else {
                 throw OAuthRequestAccount.changed("openai_oauth_direct")
             }
-            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-            try saved.write(to: cacheURL(dataRoot: dataRoot), options: [.atomic])
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(saved, to: cacheURL(dataRoot: dataRoot))
         }
         NotificationCenter.default.post(name: didRefresh, object: dataRoot)
         return true

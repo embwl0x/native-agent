@@ -38,14 +38,13 @@ let package = Package(
             path: "Sources/NativeAgentSenseHost",
             resources: [.copy("../../Resources/Senses")]
         ),
-        .executableTarget(name: "NativeAgentLink", dependencies: [.product(name: "GrokLink", package: "NativeAgentCore"), .product(name: "PersistenceCore", package: "NativeAgentCore")], path: "Sources/NativeAgentLink"),
+        .executableTarget(name: "NativeAgentLink", dependencies: [.product(name: "PersistenceCore", package: "NativeAgentCore"), .product(name: "NativeAgentCore", package: "NativeAgentCore")], path: "Sources/NativeAgentLink"),
         .executableTarget(
             name: "NativeAgentChromeRelay",
             dependencies: [
                 .product(name: "NativeAgentChromeRelayCore", package: "NativeAgentCore"),
                 .product(name: "PersistenceCore", package: "NativeAgentCore"),
                 .product(name: "Privacy", package: "NativeAgentCore"),
-                .product(name: "GrokLink", package: "NativeAgentCore"),
             ],
             path: "Sources/NativeAgentChromeRelay"
         ),
@@ -70,7 +69,6 @@ let package = Package(
                 .product(name: "TrustPersistence", package: "NativeAgentCore"),
                 .product(name: "PersistenceCore", package: "NativeAgentCore"),
                 .product(name: "Privacy", package: "NativeAgentCore"),
-                .product(name: "GrokLink", package: "NativeAgentCore"),
                 .product(name: "Desk", package: "NativeAgentCore"),
                 .product(name: "Studio", package: "NativeAgentCore"),
                 .product(name: "Senses", package: "NativeAgentCore"),
@@ -95,7 +93,6 @@ let package = Package(
                 .product(name: "ScreenVision", package: "NativeAgentCore"),
                 .product(name: "Onboarding", package: "NativeAgentCore"),
                 .product(name: "CognitiveSubstrate", package: "NativeAgentCore"),
-                .product(name: "WorkflowOrchestration", package: "NativeAgentCore"),
                 .product(name: "Connectors", package: "NativeAgentCore"),
                 .product(name: "TelegramBot", package: "NativeAgentCore"),
                 .product(name: "SlackBot", package: "NativeAgentCore"),

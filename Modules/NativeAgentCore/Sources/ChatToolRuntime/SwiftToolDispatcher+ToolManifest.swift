@@ -18,22 +18,20 @@ import WorkshopExecution
 
 extension SwiftToolDispatcher {
     /// What the Tools page and the slash-command menu read: the tools a chat
-    /// request carries (only `app` since one-door phase 2 step 7), each with
+    /// request carries (only `app`), each with
     /// its schema when detail is full, and what Trust lets the folded Mac,
     /// file and builder actions reach. Not a tool: she finds actions with
     /// `app {find}`, and nothing is loaded.
     public func toolManifest(detail: String? = nil, surface: String = "chat") async throws -> JSONValue {
         let fullDetail = detail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "full"
-        let access = await fullMacToolAccess(surface: surface)
-        let catalog = await catalogSnapshot(includeSchemas: false)
-        let names = catalog.names.filter { !Self.isModelHidden($0) }.sorted()
+        let catalog = await catalogSnapshot(includeSchemas: fullDetail, surface: surface)
+        let access = catalog.access
         let trustedRoots = await trustedWorkspaceRoots()
-        let modelNameSet = Self.modelVisibleCatalogToolNames(Set(names))
-        let schemas = fullDetail ? try await listAvailableToolSchemas(named: modelNameSet).sorted { $0.name < $1.name } : []
+        let modelNameSet = Self.modelVisibleCatalogToolNames(Set(catalog.names))
         let currentlyLoaded = Self.alwaysOnCoreNames.intersection(modelNameSet).sorted()
         let loadedSet = Set(currentlyLoaded)
         let contributedBuckets = Dictionary((appTools?.descriptors ?? []).map { ($0.name, $0.bucket) }) { first, _ in first }
-        let rows: [JSONValue] = schemas.filter { modelNameSet.contains($0.name) }.map { schema in
+        let rows: [JSONValue] = catalog.schemas.filter { modelNameSet.contains($0.name) }.sorted { $0.name < $1.name }.map { schema in
             var row: [String: JSONValue] = [
                 "name": .string(schema.name),
                 "description": .string(schema.description),
@@ -107,12 +105,10 @@ extension SwiftToolDispatcher {
                 ? "Trust Center Full Mac file access is active. app's files.*, git.*, shell.run/shell.bash, files.patch, swift.build/swift.test and app.install/app.restart actions are all available (autonomy-gated)."
                 : "app files.write is available only inside Trust Center workspace roots; broader file, git and shell actions are locked until Trust Center Full Mac mode with file_ops_allowed is active."),
             "trusted_workspace_roots": .array(trustedRoots.map { .string($0.path) }),
-            // W1b — read-only AX perception, listed separately from app control
-            // so the discovery surface does not label reads "app control".
+            // Read-only AX perception is listed separately from app control.
             "mac_accessibility_read_available_tools": .array(availableAXReadTools.map { .string($0) }),
             "mac_accessibility_read_policy_locked_tools": .array(lockedAXReadTools.map { .string($0) }),
-            // W2/W3 — listed apart from BOTH the reads and app control, so the
-            // discovery surface never lets an injection tool look like a read.
+            // Activity and injection remain distinct from reads and app control.
             "activity_available_tools": .array(availableActivityTools.map { .string($0) }),
             "activity_policy_locked_tools": .array(lockedActivityTools.map { .string($0) }),
             "mac_accessibility_act_available_tools": .array(availableAXActTools.map { .string($0) }),

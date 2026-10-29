@@ -1,13 +1,12 @@
 import CryptoKit
 import Foundation
 import Darwin
-import NativeAgentCore
-// Blueprint: | `JSONValue.swift` | `JSONValue` enum; `ToolSchema` shared object/string/boolean/integer/enum/parameter constructors; shared schema checker for app arguments, Workshop and owned-code model replies (whole-tree preflight of enforced keywords, unknown keywords ignored, caller-owned error formatting); `fromEncodable`, `mapStrings`, `decodedExactly` (a store's one shape check, naming the field), `digest`, `differences`; `JSONRow` checked row reads for typed owner records |
+// Blueprint: | `JSONValue.swift` | `JSONValue` ADT and wire codec; nonfinite-token parsing, Python-compatible ordered/sorted serialization, Codable conversion; `decodeCompletion`, `fromEncodable`, `mapStrings`, `decodedExactly` (strict stored-document shape), `digest`, `differences` |
 
 // MARK: - JSONValue
 
-/// Sendable, Equatable JSON ADT used at the persistence boundary.
-public enum JSONValue: Sendable, Equatable {
+/// Sendable, Hashable JSON ADT used at the persistence boundary.
+public enum JSONValue: Sendable, Hashable {
     case null
     case bool(Bool)
     case int(Int64)
@@ -18,149 +17,76 @@ public enum JSONValue: Sendable, Equatable {
 }
 
 extension JSONValue {
-    public struct SchemaProblem: Sendable {
-        public let path: String
-        public let keyword: String
-        public let expected: String
+    /// Sorted object leaves and indexed array leaves; empty containers are leaves.
+    /// False means the collected prefix is incomplete at the caller's bounds.
+    @discardableResult
+    package func leaves(prefix: String = "", into out: inout [(path: String, value: JSONValue)],
+                        limit: Int, depthLimit: Int = .max, depth: Int = 0) -> Bool {
+        guard out.count < limit, depth < depthLimit else { return false }
+        switch self {
+        case .object(let fields) where !fields.isEmpty:
+            for (key, child) in fields.sorted(by: { $0.key < $1.key }) {
+                guard child.leaves(prefix: prefix + "/" + Self.escapedPointerComponent(key), into: &out,
+                                   limit: limit, depthLimit: depthLimit, depth: depth + 1) else { return false }
+            }
+        case .array(let values) where !values.isEmpty:
+            for (index, child) in values.enumerated() {
+                guard child.leaves(prefix: prefix + "/" + String(index), into: &out,
+                                   limit: limit, depthLimit: depthLimit, depth: depth + 1) else { return false }
+            }
+        default: out.append((path: prefix, value: self))
+        }
+        return true
     }
 
-    public func validate(schema: JSONValue) throws {
-        if let problem = schemaProblem(schema: schema) {
-            throw PersistenceCoreError.ioFailure("JSON schema: \(problem.path.isEmpty ? "value" : problem.path) must be \(problem.expected)")
+    package static func escapedPointerComponent(_ key: String) -> String {
+        key.replacingOccurrences(of: "~", with: "~0").replacingOccurrences(of: "/", with: "~1")
+    }
+
+    package static func pointerComponents(_ path: String) -> [String] {
+        path.split(separator: "/", omittingEmptySubsequences: false).dropFirst()
+            .map { $0.replacingOccurrences(of: "~1", with: "/").replacingOccurrences(of: "~0", with: "~") }
+    }
+
+    package func value(atPointer path: String) -> JSONValue? {
+        var current = self
+        for part in Self.pointerComponents(path) {
+            switch current {
+            case .object(let fields): guard let next = fields[part] else { return nil }; current = next
+            case .array(let items): guard let index = Int(part), items.indices.contains(index) else { return nil }; current = items[index]
+            default: return nil
+            }
+        }
+        return current
+    }
+
+    package func replacing(at path: ArraySlice<String>, with leaf: JSONValue) -> JSONValue? {
+        guard let head = path.first else { return leaf }
+        switch self {
+        case .object(var fields):
+            guard let child = fields[head], let next = child.replacing(at: path.dropFirst(), with: leaf) else { return nil }
+            fields[head] = next
+            return .object(fields)
+        case .array(var values):
+            guard let index = Int(head), values.indices.contains(index),
+                  let next = values[index].replacing(at: path.dropFirst(), with: leaf) else { return nil }
+            values[index] = next
+            return .array(values)
+        default: return nil
         }
     }
 
-    /// Check the entire schema before matching values, including unused branches.
-    /// Callers own error wording. Unknown keywords are ignored; enforced rules must be valid.
-    public func schemaProblem(schema: JSONValue, path: String = "") -> SchemaProblem? {
-        func number(_ value: JSONValue?) -> Double? {
-            switch value { case .int(let n)?: Double(n); case .double(let n)?: n; default: nil }
+    /// Null, zero, false and empty strings or containers are false; all other values are true.
+    public var isTruthy: Bool {
+        switch self {
+        case .null: return false
+        case .bool(let value): return value
+        case .int(let value): return value != 0
+        case .double(let value): return value != 0
+        case .string(let value): return !value.isEmpty
+        case .array(let value): return !value.isEmpty
+        case .object(let value): return !value.isEmpty
         }
-        func list(_ value: JSONValue) -> [JSONValue] { if case .array(let values) = value { values } else { [value] } }
-        func schemaError(_ schema: JSONValue, _ at: String) -> SchemaProblem? {
-            func bad(_ expected: String) -> SchemaProblem { .init(path: at, keyword: "schema", expected: expected) }
-            if case .bool = schema { return nil }
-            guard case .object(let rules) = schema else { return bad("an object or boolean schema") }
-            for key in rules.keys.sorted() {
-                let rule = rules[key]!
-                switch key {
-                case "type":
-                    let types = list(rule)
-                    guard !types.isEmpty, types.allSatisfy({
-                        if case .string(let type) = $0 { return ["string", "boolean", "integer", "number", "object", "array", "null"].contains(type) }
-                        return false
-                    }) else { return bad("a known type or nonempty type array") }
-                case "required", "enum", "allOf", "anyOf", "oneOf":
-                    guard case .array(let values) = rule else { return bad("an array for \(key)") }
-                    if key == "required", !values.allSatisfy({ if case .string = $0 { true } else { false } }) { return bad("string required names") }
-                    if ["allOf", "anyOf", "oneOf"].contains(key) {
-                        guard !values.isEmpty else { return bad("nonempty \(key)") }
-                        for (index, child) in values.enumerated() {
-                            if let error = schemaError(child, "\(at).\(key)[\(index)]") { return error }
-                        }
-                    }
-                case "properties":
-                    guard case .object(let properties) = rule else { return bad("an object for properties") }
-                    for name in properties.keys.sorted() {
-                        if let error = schemaError(properties[name]!, at + ".properties." + name) { return error }
-                    }
-                case "items", "additionalProperties", "not":
-                    // Draft-07 tuple form: items is a list of schemas, one per position.
-                    if key == "items", case .array(let positions) = rule {
-                        for (index, child) in positions.enumerated() {
-                            if let error = schemaError(child, "\(at).items[\(index)]") { return error }
-                        }
-                    } else if let error = schemaError(rule, at + "." + key) { return error }
-                case "minItems", "maxItems", "minLength", "maxLength", "minProperties", "maxProperties":
-                    guard let n = number(rule), n.isFinite, n >= 0, n.rounded() == n else { return bad("a nonnegative integer for \(key)") }
-                case "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf":
-                    guard let n = number(rule), n.isFinite, key != "multipleOf" || n > 0 else { return bad("a valid numeric \(key)") }
-                case "uniqueItems":
-                    guard case .bool = rule else { return bad("a boolean for uniqueItems") }
-                case "pattern":
-                    guard case .string(let pattern) = rule, (try? NSRegularExpression(pattern: pattern)) != nil else { return bad("a valid regular expression") }
-                default: break
-                }
-            }
-            return nil
-        }
-        func check(_ value: JSONValue, _ schema: JSONValue, _ at: String) -> SchemaProblem? {
-            func bad(_ key: String, _ expected: String, at child: String? = nil) -> SchemaProblem {
-                .init(path: child ?? at, keyword: key, expected: expected)
-            }
-            func childPath(_ key: String) -> String { at.isEmpty ? key : at + "." + key }
-            if case .bool(let allowed) = schema { return allowed ? nil : bad("false", "allowed by the schema") }
-            guard case .object(let rules) = schema else { return nil } // Checked above.
-            if case .array(let choices)? = rules["allOf"] {
-                for choice in choices { if let problem = check(value, choice, at) { return problem } }
-            }
-            for key in ["anyOf", "oneOf"] {
-                if case .array(let choices)? = rules[key] {
-                    let problems = choices.compactMap { check(value, $0, at) }
-                    if problems.count == choices.count { return bad(key, problems.map(\.expected).joined(separator: " or ")) }
-                    if key == "oneOf", choices.count - problems.count != 1 { return bad(key, "exactly one accepted alternative") }
-                }
-            }
-            if let child = rules["not"], check(value, child, at) == nil { return bad("not", "outside the forbidden combination") }
-            if let fixed = rules["const"], fixed != value { return bad("const", "\(fixed)") }
-            if case .array(let options)? = rules["enum"], !options.contains(value) {
-                return bad("enum", options.map { if case .string(let text) = $0 { text } else { String(describing: $0) } }.joined(separator: " or "))
-            }
-            if let declared = rules["type"] {
-                let types = list(declared)
-                let matches = types.contains { type in
-                    switch (type, value) {
-                    case (.string("string"), .string), (.string("boolean"), .bool), (.string("integer"), .int),
-                         (.string("number"), .int), (.string("number"), .double), (.string("object"), .object),
-                         (.string("array"), .array), (.string("null"), .null): return true
-                    case (.string("integer"), .double(let n)): return n.isFinite && n.rounded() == n
-                    default: return false
-                    }
-                }
-                if !matches { return bad("type", types.compactMap { if case .string(let text) = $0 { text } else { nil } }.joined(separator: " or ")) }
-            }
-            func bounds(_ count: Int, _ minimum: String, _ maximum: String, _ unit: String) -> SchemaProblem? {
-                if let n = number(rules[minimum]), Double(count) < n { return bad(minimum, "at least \(Int64(exactly: n).map(String.init) ?? String(n)) \(unit)") }
-                if let n = number(rules[maximum]), Double(count) > n { return bad(maximum, "at most \(Int64(exactly: n).map(String.init) ?? String(n)) \(unit)") }
-                return nil
-            }
-            switch value {
-            case .object(let object):
-                if let problem = bounds(object.count, "minProperties", "maxProperties", "properties") { return problem }
-                if case .array(let required)? = rules["required"] {
-                    for case .string(let key) in required where object[key] == nil { return bad("required", "present", at: childPath(key)) }
-                }
-                let properties: [String: JSONValue] = if case .object(let fields)? = rules["properties"] { fields } else { [:] }
-                for key in object.keys.sorted() {
-                    if properties[key] == nil, rules["additionalProperties"] == .bool(false) { return bad("additionalProperties", "an accepted argument", at: childPath(key)) }
-                    if let rule = properties[key] ?? rules["additionalProperties"], let problem = check(object[key]!, rule, childPath(key)) { return problem }
-                }
-            case .array(let items):
-                if let problem = bounds(items.count, "minItems", "maxItems", "items") { return problem }
-                if rules["uniqueItems"] == .bool(true), items.indices.contains(where: { items.prefix($0).contains(items[$0]) }) { return bad("uniqueItems", "unique items") }
-                if case .array(let positions)? = rules["items"] {
-                    for (index, item) in items.enumerated() where index < positions.count {
-                        if let problem = check(item, positions[index], "\(at)[\(index)]") { return problem }
-                    }
-                } else if let rule = rules["items"] {
-                    for (index, item) in items.enumerated() { if let problem = check(item, rule, "\(at)[\(index)]") { return problem } }
-                }
-            case .string(let text):
-                if let problem = bounds(text.unicodeScalars.count, "minLength", "maxLength", "characters") { return problem }
-                if case .string(let pattern)? = rules["pattern"], let regex = try? NSRegularExpression(pattern: pattern),
-                   regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) == nil { return bad("pattern", "matching \(pattern)") }
-            case .int, .double:
-                let n = number(value)!
-                for (key, failed) in [("minimum", n < (number(rules["minimum"]) ?? -.infinity)),
-                    ("maximum", n > (number(rules["maximum"]) ?? .infinity)),
-                    ("exclusiveMinimum", n <= (number(rules["exclusiveMinimum"]) ?? -.infinity)),
-                    ("exclusiveMaximum", n >= (number(rules["exclusiveMaximum"]) ?? .infinity))] where failed { return bad(key, "within \(key)") }
-                if let step = number(rules["multipleOf"]), abs(n / step - (n / step).rounded()) > 1e-10 { return bad("multipleOf", "a multiple of \(step)") }
-            default: break
-            }
-            return nil
-        }
-        return schemaError(schema, path) ?? check(self, schema, path)
     }
 
     /// An object's string fields by key; empty for anything that isn't an object.
@@ -191,6 +117,41 @@ extension JSONValue {
         }
     }
 
+    /// Decode the first balanced object/array candidate matching this job's type.
+    /// Candidates may nest inside the other container kind, never their own.
+    /// Quoted brackets and escapes are data.
+    public static func decodeCompletion<T: Decodable>(_ text: String, as type: T.Type) throws -> T {
+        var stack: [(start: String.Index, close: Character)] = []
+        var spans: [Range<String.Index>] = []
+        var inString = false
+        var escaped = false
+        for i in text.indices {
+            let c = text[i]
+            if inString {
+                if escaped { escaped = false }
+                else if c == "\\" { escaped = true }
+                else if c == "\"" { inString = false }
+            } else if c == "\"", !stack.isEmpty {
+                inString = true
+            } else if c == "[" || c == "{" {
+                stack.append((i, c == "[" ? "]" : "}"))
+            } else if c == "]" || c == "}" {
+                if let open = stack.last, open.close == c {
+                    if !stack.dropLast().contains(where: { $0.close == c }) {
+                        spans.append(open.start..<text.index(after: i))
+                    }
+                    stack.removeLast()
+                } else { stack.removeAll() }
+            }
+        }
+        var failure: Error = CocoaError(.coderInvalidValue)
+        for span in spans.sorted(by: { $0.lowerBound < $1.lowerBound }) {
+            do { return try JSONDecoder().decode(type, from: Data(text[span].utf8)) }
+            catch { failure = error }
+        }
+        throw failure
+    }
+
     /// Parse JSON bytes into a JSONValue. Distinguishes Int vs Double by
     /// inspecting the underlying CFNumber type (NSNumber from JSONSerialization).
     ///
@@ -201,9 +162,7 @@ extension JSONValue {
     /// literals) and replace them with `null` before parsing. So
     /// `Python NaN → Swift JSONValue.null` on read.
     public static func parse(_ data: Data) throws -> JSONValue {
-        // JSONSerialization's tree is autoreleased, and a busy cooperative
-        // thread may not drain its pool for seconds: at launch every parsed
-        // feed and transcript stayed alive at once. Release it per parse.
+        // Release JSONSerialization's autoreleased tree after each parse.
         try autoreleasepool {
             let sanitized = stripNonFiniteTokens(data)
             let raw = try JSONSerialization.jsonObject(
@@ -223,6 +182,19 @@ extension JSONValue {
     /// the persona normalize/write path losslessly.
     public init(fromFoundation any: Any) {
         self = JSONValue.convert(any)
+    }
+
+    /// The in-memory Foundation tree for JSON serialization and transport boundaries.
+    public var foundationObject: Any {
+        switch self {
+        case .null: return NSNull()
+        case .bool(let value): return NSNumber(value: value)
+        case .int(let value): return NSNumber(value: value)
+        case .double(let value): return NSNumber(value: value)
+        case .string(let value): return value
+        case .array(let values): return values.map { $0.foundationObject }
+        case .object(let values): return values.mapValues { $0.foundationObject }
+        }
     }
 
     /// Walk JSON bytes with a tiny string-aware lexer and replace bare
@@ -329,27 +301,10 @@ extension JSONValue {
         try Data(serialize(pretty: pretty).utf8)
     }
 
-    /// Serialize an object whose keys MUST be emitted in the given order (NOT
-    /// sorted), byte-for-byte matching Python's `json.dumps(d)` with its DEFAULT
-    /// arguments (`sort_keys=False`, `ensure_ascii=True`, compact separators
-    /// `(', ', ': ')`). The plain `serialize`/`encode` path always sort_keys —
-    /// correct for the `indent=2, sort_keys=True` writers (registry.json, persona
-    /// docs, replay captures) but WRONG for any file the daemon writes with a
-    /// bare `json.dumps(...)`, which preserves Python dict insertion order.
-    ///
-    /// The audit log (`mac_control_audit.jsonl`) is exactly that case: the
-    /// daemon's `MacControl._append_audit` does `fh.write(json.dumps(receipt))`
-    /// with NO sort_keys, so a row's keys land in `make_receipt(...)` insertion
-    /// order. To be byte-equivalent the Swift mirror must reproduce that order,
-    /// not the alphabetical sort. (Closes wave-32 W03's functional-but-not-
-    /// byte-equivalent gap — CUTOVER §6.96.)
-    ///
-    /// Values are escaped identically to `serialize` (same `encodeString` ⇒ same
-    /// `\uXXXX` / control-escape rules ⇒ same `ensure_ascii=True` output). Nested
-    /// objects/arrays inside a value still go through the sort_keys `encode`
-    /// path; pass only flat, pre-ordered top-level objects (the audit receipt is
-    /// flat, so this is exact). The boolean/int/null/string atoms used by the
-    /// receipt are reproduced exactly.
+    /// Emit top-level keys in the supplied order, matching Python's default
+    /// `json.dumps(d)` (`sort_keys=False`, `ensure_ascii=True`, separators
+    /// `(', ', ': ')`), including `mac_control_audit.jsonl` receipt order.
+    /// String escaping matches `serialize`; nested objects still sort keys.
     public static func serializeOrderedObjectPython(_ pairs: [(String, JSONValue)]) throws -> String {
         if pairs.isEmpty { return "{}" }
         var out = "{"
@@ -380,25 +335,15 @@ extension JSONValue {
             JSONValue.encodeString(s, into: &out)
         case .array(let arr):
             if arr.isEmpty { out += "[]"; return }
-            if pretty {
-                let inner = String(repeating: " ", count: (indentLevel + 1) * 2)
-                let close = String(repeating: " ", count: indentLevel * 2)
-                out += "[\n"
-                for (idx, v) in arr.enumerated() {
-                    out += inner
-                    try v.encode(into: &out, pretty: true, indentLevel: indentLevel + 1, path: "\(path)[\(idx)]")
-                    if idx < arr.count - 1 { out += "," }
-                    out += "\n"
-                }
-                out += close + "]"
-            } else {
-                out += "["
-                for (idx, v) in arr.enumerated() {
-                    if idx > 0 { out += ", " }
-                    try v.encode(into: &out, pretty: false, indentLevel: 0, path: "\(path)[\(idx)]")
-                }
-                out += "]"
+            let inner = pretty ? String(repeating: " ", count: (indentLevel + 1) * 2) : ""
+            out += pretty ? "[\n" : "["
+            for (idx, v) in arr.enumerated() {
+                if idx > 0 { out += pretty ? ",\n" : ", " }
+                out += inner
+                try v.encode(into: &out, pretty: pretty, indentLevel: pretty ? indentLevel + 1 : 0, path: "\(path)[\(idx)]")
             }
+            if pretty { out += "\n" + String(repeating: " ", count: indentLevel * 2) }
+            out += "]"
         case .object(let dict):
             if dict.isEmpty { out += "{}"; return }
             // Sort keys by UTF-8 byte order to match Python's json.dumps(sort_keys=True)
@@ -408,31 +353,18 @@ extension JSONValue {
             let keys = dict.keys.sorted { lhs, rhs in
                 lhs.utf8.lexicographicallyPrecedes(rhs.utf8)
             }
-            if pretty {
-                let inner = String(repeating: " ", count: (indentLevel + 1) * 2)
-                let close = String(repeating: " ", count: indentLevel * 2)
-                out += "{\n"
-                for (idx, k) in keys.enumerated() {
-                    out += inner
-                    JSONValue.encodeString(k, into: &out)
-                    out += ": "
-                    let childPath = path.isEmpty ? k : "\(path).\(k)"
-                    try dict[k]!.encode(into: &out, pretty: true, indentLevel: indentLevel + 1, path: childPath)
-                    if idx < keys.count - 1 { out += "," }
-                    out += "\n"
-                }
-                out += close + "}"
-            } else {
-                out += "{"
-                for (idx, k) in keys.enumerated() {
-                    if idx > 0 { out += ", " }
-                    JSONValue.encodeString(k, into: &out)
-                    out += ": "
-                    let childPath = path.isEmpty ? k : "\(path).\(k)"
-                    try dict[k]!.encode(into: &out, pretty: false, indentLevel: 0, path: childPath)
-                }
-                out += "}"
+            let inner = pretty ? String(repeating: " ", count: (indentLevel + 1) * 2) : ""
+            out += pretty ? "{\n" : "{"
+            for (idx, k) in keys.enumerated() {
+                if idx > 0 { out += pretty ? ",\n" : ", " }
+                out += inner
+                JSONValue.encodeString(k, into: &out)
+                out += ": "
+                let childPath = path.isEmpty ? k : "\(path).\(k)"
+                try dict[k]!.encode(into: &out, pretty: pretty, indentLevel: pretty ? indentLevel + 1 : 0, path: childPath)
             }
+            if pretty { out += "\n" + String(repeating: " ", count: indentLevel * 2) }
+            out += "}"
         }
     }
 
@@ -518,76 +450,6 @@ extension JSONValue: Codable {
     }
 }
 
-/// Checked reads of one stored JSON object row, for owners that hand out
-/// typed records without a byte round trip: a required field must be present
-/// with its type, an optional one may be absent or null, and a present field
-/// of the wrong type makes the row malformed.
-public struct JSONRow {
-    public enum Malformed: Error, LocalizedError {
-        case notAnObject
-        case field(String)
-
-        public var errorDescription: String? {
-            switch self {
-            case .notAnObject: return "row is not a JSON object"
-            case .field(let key): return "row has no valid \(key)"
-            }
-        }
-    }
-
-    public let fields: [String: JSONValue]
-
-    public init(_ value: JSONValue) throws {
-        guard case .object(let fields) = value else { throw Malformed.notAnObject }
-        self.fields = fields
-    }
-
-    public func string(_ key: String) throws -> String { try required(key, Self.string) }
-    public func optionalString(_ key: String) throws -> String? { try optional(key, Self.string) }
-    public func strings(_ key: String) throws -> [String] { try required(key, Self.strings) }
-    public func array(_ key: String) throws -> [JSONValue] {
-        try required(key) { if case .array(let values) = $0 { return values }; return nil }
-    }
-    public func optionalBool(_ key: String) throws -> Bool? {
-        try optional(key) { if case .bool(let value) = $0 { return value }; return nil }
-    }
-    public func optionalInt(_ key: String) throws -> Int? {
-        try optional(key) {
-            switch $0 {
-            case .int(let value): return Int(exactly: value)
-            case .double(let value): return Int(exactly: value)
-            default: return nil
-            }
-        }
-    }
-    /// Any value but null.
-    public func optionalValue(_ key: String) -> JSONValue? {
-        fields[key].flatMap { $0 == .null ? nil : $0 }
-    }
-
-    public func optional<T>(_ key: String, _ read: (JSONValue) -> T?) throws -> T? {
-        guard let raw = fields[key], raw != .null else { return nil }
-        guard let value = read(raw) else { throw Malformed.field(key) }
-        return value
-    }
-
-    private func required<T>(_ key: String, _ read: (JSONValue) -> T?) throws -> T {
-        guard let value = try optional(key, read) else { throw Malformed.field(key) }
-        return value
-    }
-
-    private static func string(_ value: JSONValue) -> String? {
-        if case .string(let string) = value { return string }
-        return nil
-    }
-
-    private static func strings(_ value: JSONValue) -> [String]? {
-        guard case .array(let values) = value else { return nil }
-        let strings = values.compactMap(string)
-        return strings.count == values.count ? strings : nil
-    }
-}
-
 // MARK: - A store's document
 
 extension JSONValue {
@@ -618,8 +480,14 @@ extension JSONValue {
         switch (given, decoded) {
         case (.object(let fields), _):
             let known: [String: JSONValue] = if case .object(let known) = decoded { known } else { [:] }
+            let members: [String: Any] = unwrapped(value).map { value in
+                if let entries = value as? [String: Any] { return entries }
+                return Dictionary(Mirror(reflecting: value).children.compactMap { child in
+                    child.label.map { ($0, child.value) }
+                }, uniquingKeysWith: { first, _ in first })
+            } ?? [:]
             for (key, field) in fields.sorted(by: { $0.key < $1.key }) {
-                let property = member(value, key)
+                let property = members[key]
                 guard let match = known[key] ?? (field == .null && isNilOptional(property) ? .null : nil) else { return path + key }
                 if let stray = unknownField(field, match, property, path: path + key + ".") { return stray }
             }
@@ -632,13 +500,6 @@ extension JSONValue {
         default: break
         }
         return nil
-    }
-
-    /// A decoded value's `key`: a dictionary's entry or a stored property, through any Optional.
-    private static func member(_ value: Any?, _ key: String) -> Any? {
-        guard let value = unwrapped(value) else { return nil }
-        if let entries = value as? [String: Any] { return entries[key] }
-        return Mirror(reflecting: value).children.first { $0.label == key }?.value
     }
 
     private static func unwrapped(_ value: Any?) -> Any? {
@@ -677,62 +538,5 @@ extension JSONValue {
     public static func differences(_ old: JSONValue, _ new: JSONValue, path: String = "") -> [String] {
         guard case .object(let before) = old, case .object(let after) = new else { return old == new ? [] : [String(path.dropLast())] }
         return Set(before.keys).union(after.keys).sorted().flatMap { differences(before[$0] ?? .null, after[$0] ?? .null, path: path + $0 + ".") }
-    }
-}
-
-/// Shared JSON-schema constructors; each tool owner still supplies its own schema.
-package enum ToolSchema {
-    package static func obj(_ pairs: [(String, JSONValue)]) -> JSONValue {
-        var d: [String: JSONValue] = [:]
-        for (k, v) in pairs { d[k] = v }
-        return .object(d)
-    }
-    package static func strSchema(_ desc: String? = nil) -> JSONValue {
-        var props: [(String, JSONValue)] = [("type", .string("string"))]
-        if let desc { props.append(("description", .string(desc))) }
-        return obj(props)
-    }
-    package static func enumStringSchema(_ values: [String], _ desc: String? = nil) -> JSONValue {
-        var props: [(String, JSONValue)] = [
-            ("type", .string("string")),
-            ("enum", .array(values.map(JSONValue.string))),
-        ]
-        if let desc { props.append(("description", .string(desc))) }
-        return obj(props)
-    }
-    package static func intSchema(
-        _ desc: String? = nil,
-        minimum: Int? = nil,
-        maximum: Int? = nil
-    ) -> JSONValue {
-        var props: [(String, JSONValue)] = [("type", .string("integer"))]
-        if let minimum { props.append(("minimum", .int(Int64(minimum)))) }
-        if let maximum { props.append(("maximum", .int(Int64(maximum)))) }
-        if let desc { props.append(("description", .string(desc))) }
-        return obj(props)
-    }
-    package static func boolSchema(_ desc: String? = nil) -> JSONValue {
-        var props: [(String, JSONValue)] = [("type", .string("boolean"))]
-        if let desc { props.append(("description", .string(desc))) }
-        return obj(props)
-    }
-    package static func params(properties: [(String, JSONValue)], required: [String]) -> Data {
-        let v = obj([
-            ("type", .string("object")),
-            ("properties", obj(properties)),
-            ("required", .array(required.map { .string($0) })),
-        ])
-        // serializedData throws only on un-serializable JSONValue payloads;
-        // ours are plain string/array/object literals, so this never throws
-        // in practice. Fail-soft to `{}` to avoid crashing the chat turn.
-        return (try? v.serializedData(pretty: false)) ?? Data("{}".utf8)
-    }
-}
-
-extension DataRootLife {
-    /// The life a stored JSON stamp names; no stamp is her first life.
-    public static func life(of stamp: JSONValue?) -> String {
-        if case .string(let id)? = stamp { return id }
-        return first
     }
 }

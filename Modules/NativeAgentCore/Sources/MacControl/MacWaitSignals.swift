@@ -1,33 +1,3 @@
-// MacWaitSignals.swift — WAITING BECAUSE THE SIGNAL REACHED YOU (fable51 item 31).
-//
-// NORTHSTAR clause 4: "A polling loop made faster is still a polling loop. The
-// clause-4 move is the loop DISSOLVING into a flow — a signal that propagates
-// when something happens." `wait` was the loop. It called `sight()` every
-// 500 ms for up to 60 s, and every sight is a full AX walk plus a
-// ScreenCaptureKit capture plus (conditionally) OCR: up to 120 captures to
-// answer "has the page finished loading yet".
-//
-// The machinery to do it properly was already in the building. `MacActClosedLoop`
-// has subscribed to a real `AXObserver` since the closed loop landed, and ends
-// its wait the MOMENT the notification arrives. This file lets `wait` subscribe
-// to the same thing, plus the one signal an AX observer structurally cannot
-// carry: an app SWITCH, which happens in a process the observer is not
-// installed on.
-//
-// WHAT CHANGED, AND WHAT DID NOT:
-//   • `wait` renders to identify the app, then reconciles the baseline after
-//     subscribing. Later it renders once per change EPISODE, with another
-//     reconciliation after an app switch. A burst of notifications is one wake.
-//   • Silence prompts the settling read. The observer sits on the application
-//     element, which misses many in-window changes, so after `settleQuietSeconds`
-//     of quiet `wait` reads once more and settles only when that read matches.
-//   • The coarse fallback re-render is the SAFETY NET, and it is honest about
-//     what it is for: when no observer could be installed at all, silence
-//     proves nothing, so `wait` degrades to a slow poll (every
-//     `fallbackPollSeconds`) rather than reporting a settle it cannot see.
-//   • The vocabulary and the result shape are untouched: matched / settled /
-//     timeout, `seconds`, and the final render.
-
 import Foundation
 import PersistenceCore
 
@@ -68,7 +38,7 @@ public struct SystemMacAppActivationObserverSource: MacAppActivationObserverSour
 }
 
 /// Removes the workspace observer exactly once, from wherever control leaves
-/// the wait — the same contract `MacAXEffectObserverGuard` holds for the AX
+/// the wait — the same contract each observation holds for the AX
 /// side.
 final class MacWorkspaceActivationObservation: MacAXEffectObservation, @unchecked Sendable {
     private let center: NotificationCenter
@@ -108,22 +78,15 @@ public func defaultMacAppActivationObserverSource() -> any MacAppActivationObser
     #endif
 }
 
-/// Both subscriptions, and the one question the wait asks of them: "has
-/// anything happened since I last looked?"
-///
-/// `consume()` DRAINS. A real UI change fires a burst — Calculator emits
-/// `AXValueChanged` then `AXTitleChanged` within milliseconds — and rendering
-/// once per notification would put the poll straight back, with extra steps.
-/// One episode, one render.
+/// Coalesces AX changes and app activation until the consumer drains them.
 public final class MacWaitSignals: @unchecked Sendable {
     private let collector = MacAXEffectCollector()
-    private let effectGuard: MacAXEffectObserverGuard
+    private let effects: (any MacAXEffectObservation)?
     private let activation: (any MacAXEffectObservation)?
     private let lock = NSLock()
     private var stopped = false
 
-    /// App activation alone says nothing about changes inside a window.
-    /// Without its AX observer, use fresh renders to decide settlement.
+    /// Whether AX observation is installed; activation alone cannot observe in-window changes.
     public let isObserving: Bool
 
     public init(
@@ -139,7 +102,7 @@ public final class MacWaitSignals: @unchecked Sendable {
                 onNotification: { sink.record($0) }
             )
         }
-        self.effectGuard = MacAXEffectObserverGuard(installedEffects)
+        self.effects = installedEffects
         self.activation = activationSource.install(onActivation: { sink.signal() })
         self.isObserving = installedEffects != nil
     }
@@ -153,26 +116,13 @@ public final class MacWaitSignals: @unchecked Sendable {
         await collector.waitForSignal(seconds: seconds)
     }
 
-    /// The notification kinds seen so far, for the wait's structured detail.
-    /// Diagnostics only — never a claim about what the screen now says.
-    public func kinds() -> [String] {
-        var seen: [String] = []
-        for notification in collector.snapshot() where !seen.contains(notification.kind) {
-            seen.append(notification.kind)
-            if seen.count >= MacActClosedLoop.maxReportedNotifications { break }
-        }
-        return seen
-    }
-
-    /// Removes BOTH observers, exactly once, from wherever control leaves the
-    /// wait: the matched return, the settle, the timeout, a blind re-look, or a
-    /// cancellation that unwinds past every `defer`.
+    /// Removes both observers and releases pending signal waits exactly once.
     public func stop() {
         lock.lock()
         guard !stopped else { lock.unlock(); return }
         stopped = true
         lock.unlock()
-        effectGuard.stop()
+        effects?.stop()
         activation?.stop()
         collector.finishWaiting()
     }

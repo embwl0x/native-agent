@@ -67,7 +67,6 @@ private struct MobileWorkOverviewDetail: View {
     let capturedAt: String
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var pairingStore: PairingStore
-    @EnvironmentObject private var bridgeClient: MacBridgeClient
     private let sync = iCloudSyncEngine.shared
     @StateObject private var approvals = ApprovalsStore()
     @StateObject private var workshop = WorkshopStore()
@@ -97,10 +96,10 @@ private struct MobileWorkOverviewDetail: View {
                 NavigationStack {
                     ScrollView {
                         if let approval = approvals.approvals.first(where: { $0.id == row.reference.id }) {
-                            if approval.status.lowercased() == "pending" {
+                            if approval.outcome == .pending {
                                 ApprovalCard(approval: approval, isDeciding: approvals.decidingApprovalIDs.contains(approval.id)) { decision in
                                     Task { await approvals.decide(id: approval.id, decision: decision,
-                                        client: bridgeClient, pairingStore: pairingStore) }
+                                        pairingStore: pairingStore) }
                                 }
                                 .padding()
                             } else {
@@ -118,7 +117,7 @@ private struct MobileWorkOverviewDetail: View {
                         ScrollView {
                             InboxCardRow(item: item, onAction: { action in
                                 Task { await inbox.performAction(id: item.id, actionID: action,
-                                    client: bridgeClient, pairingStore: pairingStore) }
+                                    pairingStore: pairingStore) }
                             }, onView: { inboxDetailID = item.id })
                             .padding()
                             if let error = inbox.bannerError { Text(error).foregroundStyle(.red).padding() }
@@ -169,11 +168,11 @@ private struct MobileWorkOverviewDetail: View {
         }
         .task {
             if row.reference.kind == .approval { await sync.refreshApprovalsSnapshot() }
-            approvals.applySyncedApprovalsFromSnapshot(animated: false, notifyNewPending: false)
-            inbox.applySyncedInboxFromSnapshot(animated: false, notifyNewArrivals: false)
+            approvals.applySyncedApprovalsFromSnapshot(notifyNewPending: false)
+            inbox.applySyncedInboxFromSnapshot(notifyNewArrivals: false)
         }
-        .onChange(of: sync.approvals) { approvals.applySyncedApprovalsFromSnapshot(animated: false, notifyNewPending: false) }
-        .onChange(of: sync.inboxItems) { inbox.applySyncedInboxFromSnapshot(animated: false, notifyNewArrivals: false) }
+        .onChange(of: sync.approvals) { approvals.applySyncedApprovalsFromSnapshot(notifyNewPending: false) }
+        .onChange(of: sync.inboxItems) { inbox.applySyncedInboxFromSnapshot(notifyNewArrivals: false) }
     }
 
     private func unavailable(_ text: String) -> some View {

@@ -17,18 +17,14 @@ public struct BrowserRuntimeStatus: Codable, Hashable {
     public var status: String
     public var sourcePath: String?
     public var screenshotPath: String?
-    public var approvedDomains: [String]?
-    public var domainPolicy: String?
     public var activeRuns: [BrowserRun]?
     public var receiptCount: Int?
     public var latestReceipt: BrowserRun?
     public var createdAt: String?
-    public init(status: String, sourcePath: String? = nil, screenshotPath: String? = nil, approvedDomains: [String]? = nil, domainPolicy: String? = nil, activeRuns: [BrowserRun]? = nil, receiptCount: Int? = nil, latestReceipt: BrowserRun? = nil, createdAt: String? = nil) {
+    public init(status: String, sourcePath: String? = nil, screenshotPath: String? = nil, activeRuns: [BrowserRun]? = nil, receiptCount: Int? = nil, latestReceipt: BrowserRun? = nil, createdAt: String? = nil) {
         self.status = status
         self.sourcePath = sourcePath
         self.screenshotPath = screenshotPath
-        self.approvedDomains = approvedDomains
-        self.domainPolicy = domainPolicy
         self.activeRuns = activeRuns
         self.receiptCount = receiptCount
         self.latestReceipt = latestReceipt

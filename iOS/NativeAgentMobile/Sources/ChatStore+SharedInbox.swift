@@ -27,7 +27,7 @@ extension ChatStore {
                         if !queuedSends.contains(where: { $0.id == item.id }) {
                             guard enqueueSend(QueuedChatSend(id: item.id, sessionID: selectedSessionID,
                                 text: item.text, controls: controls, attachments: item.attachments,
-                                createdAt: item.createdAt)) else { return }
+                                createdAt: item.createdAt, pairingFingerprint: item.pairingFingerprint)) else { return }
                         }
                         receipts.insert(item.id.uuidString)
                         let savedReceipts = Array(receipts)

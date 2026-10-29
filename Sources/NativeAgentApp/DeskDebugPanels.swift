@@ -1,3 +1,4 @@
+import NativeAgentShared
 // Diagnostics renders the engine’s retained Desk revision.
 
 import SwiftUI
@@ -14,7 +15,7 @@ struct DeskDebugPanels: View {
     @State private var showAllItems = false
 
     var body: some View {
-        NativePanel(title: "Desk (debug)", systemImage: "tablecells", tint: .gray) {
+        NativePanel(title: "Desk (debug)") {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
                 Text("The Desk, as raw state — the compact projection the agent reads in-context and the underlying records with their aliases and handles.")
                     .font(.caption2)

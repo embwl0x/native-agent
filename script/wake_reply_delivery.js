@@ -197,14 +197,7 @@ function postBridgeMessage(text, sessionId, config, metadata = {}) {
 // .claim() is keyed on (deliveryId, requestDigest) and answers .cached /
 // .inProgress / .outcomeUnknown for anything already started.
 //
-// Deliberately NOT retryable:
-//   - 409 (outcome_unknown / conflict): terminal in the lifecycle. Once a state
-//     file reaches .outcomeUnknown, claim() returns .outcomeUnknown forever
-//     (CodexCompletionLifecycle.swift:198-199) and nothing transitions out of
-//     it. Retrying can only burn attempts.
-//   - 504 work_timeout: the app is mid-turn under its own 600s work deadline.
-//     A resend inside a short backoff window can only draw 202/409.
-//   - missing/empty bridge token: a config fault, not a transient one.
+// Ambiguous lifecycle outcomes, active work and missing credentials are not retryable.
 function bridgeDeliveryRetryable(bridge) {
   if (!bridge || bridge.status !== "failed") return false;
   const httpStatus = Number(bridge.httpStatus);
@@ -272,7 +265,7 @@ function replyJobDisposition(bridge) {
   if (!bridge) return "retain";
   if (bridge.replyPersisted === true || bridge.status === "delivered" || bridge.status === "dry_run") return "unlink";
   if (!isTerminalBridgeReply(bridge)) return "retain";
-  return bridge.replyStatus === "outcome_unknown" || bridge.replyStatus === "conflict"
+  return bridge.completionDelivery?.status === "outcome_unknown" || bridge.replyStatus === "outcome_unknown" || bridge.replyStatus === "conflict"
     ? "preserve"
     : "unlink";
 }
@@ -379,16 +372,10 @@ function finalizeReplyJobFile(jobPath, bridge) {
 }
 
 function isTerminalBridgeReply(bridge) {
-  // These states cannot improve by replaying the same durable, cached the agent
-  // response. `outcome_unknown` and `conflict` must not resend; `no_reply`
-  // would otherwise leave an orphan job that relaunches forever.
-  return Boolean(bridge && [
-    "outcome_unknown",
-    "conflict",
-    "no_reply",
-    "delivery_rejected",
-    "completion_already_settled",
-  ].includes(bridge.replyStatus));
+  // Replaying a cached response cannot repair a terminal refusal or missing reply.
+  return Boolean(bridge && ((bridge.execution_terminal && !bridge.hasReply)
+    || ["rejected", "outcome_unknown"].includes(bridge.completionDelivery?.status)
+    || ["outcome_unknown", "conflict", "completion_already_settled"].includes(bridge.replyStatus)));
 }
 
 return {

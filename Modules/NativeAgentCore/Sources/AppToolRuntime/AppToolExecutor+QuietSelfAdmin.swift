@@ -9,7 +9,7 @@ import PersistenceCore
 import ProviderRouting
 import Privacy
 import TrustCenter
-// Blueprint: | `AppToolExecutor+QuietSelfAdmin.swift` | `AppToolExecutor`: `performMacSelfAppRoute` propagates self-window look outcomes; only independently verified navigation retains its success with a supplementary observation; `quietPosture`, `freshQuietPosture` |
+// Blueprint: | `AppToolExecutor+QuietSelfAdmin.swift` | `AppToolExecutor`: `performMacSelfAppRoute` propagates self-window look outcomes, carrying `behind` (the person's app behind their own window) onto the read; only independently verified navigation retains its success with a supplementary observation; `quietPosture`, `freshQuietPosture` |
 
 /// The `app` door's posture, page read and setting set.
 ///
@@ -44,6 +44,8 @@ extension AppToolExecutor {
         }
         guard case .object(var response) = outcome else { return outcome }
         response["ok"] = .bool(response["status"] == .string("ok"))
+        // A look at her own app, in front: the read carries who is behind her.
+        if case .string(let behind)? = detail["behind"] { response["behind"] = .string(behind) }
         return .object(response)
     }
 
@@ -54,7 +56,7 @@ extension AppToolExecutor {
     /// `permissionLevel` alone cannot tell Work from Builder: the two presets
     /// write the SAME level ("balanced") and differ by how files outside the
     /// workspace are treated ("deny" vs "ask"), so that is the axis that
-    /// decides (TrustCenterView.TrustPolicyPreset.plan).
+    /// decides through the shared preset plan.
     ///
     /// `changesAllowed` is about THIS APP's own settings, not about the Mac.
     /// The agent administers the app under every posture but Safe: a knowledge
@@ -70,8 +72,7 @@ extension AppToolExecutor {
         let changesAllowed: Bool
     }
 
-    /// The one mode that is wide open (User, 2026-09-13). Named once so the
-    /// catalog's `writable` and the set's refusal cannot drift apart.
+    /// One Full Mac name keeps catalog writability and write refusals aligned.
     public static let fullMacModeName = "Full Mac"
 
     /// The saved posture, as `PermissionLaw.posture` reads it for every gate,
@@ -243,21 +244,12 @@ extension AppToolExecutor {
         let fullMac = posture?.name == Self.fullMacModeName
         var settingRows: [JSONValue] = []
         for setting in QuietSettings.settings(forPage: page.id, host: quietHost()) {
-            var row: [String: JSONValue] = [
-                "id": .string(setting.id),
-                "label": .string(setting.label),
-                "value": await setting.read(appModel),
-                "writable": .bool(setting.writable(fullMac: fullMac)),
-            ]
-            if setting.ownerOnly { row["owner_only"] = .bool(true) }
-            if setting.fullMacOnly {
-                row["full_mac_only"] = .bool(true)
-                if !fullMac { row["refusal"] = .string(QuietSettings.belowFullMacRefusal) }
-            }
             if case .object(let listed) = await setting.catalogRow(fullMac: fullMac, host: { self.quietHost() }) {
-                for key in ["type", "choices", "note"] { row[key] = listed[key] }
+                var row = listed.filter { ["id", "label", "type", "choices", "note", "writable", "owner_only", "full_mac_only"].contains($0.key) }
+                row["value"] = await setting.read(appModel)
+                if setting.fullMacOnly && !fullMac { row["refusal"] = listed["refusal"] }
+                settingRows.append(.object(row))
             }
-            settingRows.append(.object(row))
         }
 
         return Self.pageReadResult(page: page.id, fields: [
@@ -525,7 +517,7 @@ extension AppToolExecutor {
         let after = await setting.read(appModel)
         if raise {
             HarnessDecidedRow.post(requester: "Full Mac", tool: "setting.set \(setting.id)",
-                                   sessionID: Self.inputString(input["__session_id"]),
+                                   sessionID: input["__session_id"]?.scalarText,
                                    dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot())
         }
 

@@ -17,56 +17,30 @@ enum ChatRuntimeControlPresentation {
         fastMode ? "Fast" : "Normal"
     }
 
-    /// Runs the model-menu refresh and surfaces every unsuccessful outcome to
-    /// the person who explicitly asked for it. Background refresh callers can
-    /// still ignore the returned outcome without producing unsolicited toast.
-    @MainActor
-    static func refreshModels(
-        refresh: () async -> ProviderControlsRefreshOutcome,
-        presentError: (String) -> Void
-    ) async {
-        if let message = (await refresh()).feedbackMessage {
-            presentError(message)
-        }
-    }
-
     static func normalizedFileAccessID(_ id: String) -> String {
         ICloudChatFileAccessPolicy.normalized(id)
     }
 }
 
-enum ChatFollowPresentation {
-    static func userScrolledAway() -> (autoFollow: Bool, showsLatest: Bool) { (false, true) }
-    static func followLatest() -> (autoFollow: Bool, showsLatest: Bool) { (true, false) }
-}
 
-/// One pending callback is enough for a streaming burst. Each later ordinary
-/// mutation replaces its target rather than scheduling another scroll, while a
-/// forced/animated request supersedes the prior callback through a new serial.
+/// Ordinary scroll bursts coalesce; forced or animated requests supersede the pending callback.
 struct ChatScrollScheduler: Equatable {
     private(set) var serial = 0
     private(set) var isScheduled = false
-    private var pendingTargetID: String?
 
-    mutating func schedule(targetID: String, animated: Bool, force: Bool) -> Int? {
+    mutating func schedule(animated: Bool, force: Bool) -> Int? {
         if isScheduled && !animated && !force {
-            pendingTargetID = targetID
             return nil
         }
         serial &+= 1
         isScheduled = true
-        pendingTargetID = targetID
         return serial
     }
 
-    mutating func complete(serial: Int, messagesAreAvailable: Bool) -> String? {
-        guard serial == self.serial else { return nil }
-        defer {
-            isScheduled = false
-            pendingTargetID = nil
-        }
-        guard messagesAreAvailable else { return nil }
-        return pendingTargetID
+    mutating func complete(serial: Int, messagesAreAvailable: Bool) -> Bool {
+        guard serial == self.serial else { return false }
+        isScheduled = false
+        return messagesAreAvailable
     }
 }
 
@@ -92,23 +66,6 @@ actor ChatAttachmentPresentation {
             if recency.count > 128 { entries.removeValue(forKey: recency.removeFirst()) }
             return image.map { (attachment, $0) }
         }
-    }
-}
-
-enum PendingPhotoPresentation {
-    struct Removal {
-        var photos: [PendingPhotoAttachment]
-        var clearsPicker: Bool
-        var suppressesNextEmptySelection: Bool
-    }
-
-    static func removing(_ id: String, from photos: [PendingPhotoAttachment]) -> Removal {
-        let remaining = photos.filter { $0.id != id }
-        return Removal(
-            photos: remaining,
-            clearsPicker: true,
-            suppressesNextEmptySelection: !remaining.isEmpty
-        )
     }
 }
 

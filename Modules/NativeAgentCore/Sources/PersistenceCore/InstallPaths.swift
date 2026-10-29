@@ -1,9 +1,9 @@
 import Foundation
+import NativeAgentShared
+import NativeAgentCore
 // Blueprint: | `InstallPaths.swift` | Install-owned paths, public release preparation and login-item location admission |
 
-/// 2026-09-18: one owner for install-owned paths outside the data root. The
-/// shipped installs keep their established rendezvous; only other bundle ids
-/// namespace tokens, sockets, caches and entries in another app.
+/// Owns paths outside the data root, preserving shipped rendezvous names and namespacing other bundle ids.
 public struct InstallPaths: Sendable {
     public static let privateBundleIdentifier = "com.example.nativeagent.mac"
     public static let current: InstallPaths = {
@@ -30,18 +30,11 @@ public struct InstallPaths: Sendable {
     }
     public var bridgeConfigRelativePath: String { usesLegacyPaths ? ".config" : ".config/" + bundleIdentifier }
     public var bridgeConfigRoot: URL { home.appendingPathComponent(bridgeConfigRelativePath, isDirectory: true) }
-    /// 2026-09-26: per bundle for the shipped installs too. Both shared one
-    /// socket and token, so the second to launch unlinked the first's listener.
-    /// The relay derives this from its own bundle; Chrome's one host name
-    /// picks the relay via the manifest's owner.
+    /// Every bundle owns its Chrome socket; the manifest's owner selects the relay.
     public var chromeSocket: URL {
         home.appendingPathComponent(".config/" + bundleIdentifier + "/chrome.sock")
     }
-    /// 2026-09-26: each install's own FIXED loopback ports, like its Chrome
-    /// socket. The primary install keeps 8771 (bridge) and
-    /// 8766 (browser IPC); another bundle, or an install marked secondary,
-    /// gets its own set from its bundle id, so two installs never contend.
-    /// A taken port fails loudly; nothing hops. Clients read the descriptor.
+    /// Install ports are fixed; a collision fails without hopping, and clients read the descriptor.
     public struct LoopbackPorts: Sendable, Equatable {
         public let bridge: UInt16
         public let browserIPC: UInt16
@@ -120,7 +113,7 @@ public struct InstallPaths: Sendable {
         let path = URL(fileURLWithPath: bundlePath).standardizedFileURL.path
         let userApplications = URL(fileURLWithPath: homeDirectory, isDirectory: true)
             .appendingPathComponent("Applications", isDirectory: true).standardizedFileURL.path
-        return path.hasPrefix("/Applications/") || path.hasPrefix(userApplications + "/")
+        return ["/Applications", userApplications].contains { NativeAgentWorkspaceRoot.relativePath(path, under: $0)?.isEmpty == false }
     }
 
     public enum PublicReleaseDataRootPreparationResult: Sendable {
@@ -153,7 +146,7 @@ public struct InstallPaths: Sendable {
             var payload: [String: Any] = [
                 "markerVersion": 1,
                 "channel": "public-release",
-                "createdAt": ISO8601DateFormatter().string(from: Date()),
+                "createdAt": NativeTimestampFormat.plainZulu(Date()),
                 "reason": "public_release_marker_written_in_place",
                 "bundleIdentifier": Bundle.main.bundleIdentifier ?? "",
                 "bundleVersion": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "",

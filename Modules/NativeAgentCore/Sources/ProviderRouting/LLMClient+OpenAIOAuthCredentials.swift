@@ -2,9 +2,9 @@ import Foundation
 import Darwin
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `LLMClient+OpenAIOAuthCredentials.swift` | `OpenAIOAuthDirectAdapter.preferredAuthPath`: the single ChatGPT/Codex credential-path resolver for readiness, all adapters, maintenance, child execution and explicit CLI inspection; app-owned writes and root-consented CLI adoption share this owner; child homes derive from an already-selected credential; hasAccessToken checks presence only, not execution readiness |
+// Blueprint: | `LLMClient+OpenAIOAuthCredentials.swift` | `ChatGPTTransport.preferredAuthPath`: the single ChatGPT/Codex credential-path resolver for readiness, all adapters, maintenance, child execution and explicit CLI inspection; app-owned writes and root-consented CLI adoption share this owner; child homes derive from an already-selected credential; hasAccessToken checks presence only, not execution readiness |
 
-extension OpenAIOAuthDirectAdapter {
+extension ChatGPTTransport {
     /// Inspection of the independently signed-in Codex program is distinct
     /// from permission for NativeAgent providers to use that account.
     public enum AuthPathSource {
@@ -32,14 +32,12 @@ extension OpenAIOAuthDirectAdapter {
     ) -> URL {
         if let authPathOverride { return authPathOverride }
         let shared = userCodexHome.appendingPathComponent("auth.json")
+        let commandCLI = environment["CODEX_HOME"].flatMap { home in
+            home.isEmpty ? nil : URL(fileURLWithPath: (home as NSString).expandingTildeInPath).appendingPathComponent("auth.json")
+        }
         switch source {
         case .sharedCLI: return shared
-        case .commandCLI:
-            if let codexHome = environment["CODEX_HOME"], !codexHome.isEmpty {
-                return URL(fileURLWithPath: (codexHome as NSString).expandingTildeInPath)
-                    .appendingPathComponent("auth.json")
-            }
-            return shared
+        case .commandCLI: return commandCLI ?? shared
         case .runtime: break
         }
         func ownedPath(_ root: URL) -> URL {
@@ -49,7 +47,7 @@ extension OpenAIOAuthDirectAdapter {
         }
         func boundRootPath(_ root: URL) -> URL {
             let owned = ownedPath(root)
-            if !hasAccessToken(at: owned), cliAdoptionConsent(dataRoot: root) == .allowed,
+            if !credentialFileExists(at: owned), cliAdoptionConsent(dataRoot: root) == .allowed,
                hasAccessToken(at: shared) { return shared }
             return owned
         }
@@ -60,13 +58,9 @@ extension OpenAIOAuthDirectAdapter {
            dataRoot.standardizedFileURL != defaultRoot.standardizedFileURL {
             return boundRootPath(dataRoot)
         }
-        if let codexHome = environment["CODEX_HOME"], !codexHome.isEmpty {
-            return URL(fileURLWithPath: (codexHome as NSString).expandingTildeInPath)
-                .appendingPathComponent("auth.json")
-        }
-        if let dataRoot = environment["NATIVE_AGENT_DATA_ROOT"], !dataRoot.isEmpty {
-            let root = URL(fileURLWithPath: (dataRoot as NSString).expandingTildeInPath)
-            return boundRootPath(root)
+        if let commandCLI { return commandCLI }
+        if !(environment["NATIVE_AGENT_DATA_ROOT"] ?? "").isEmpty {
+            return boundRootPath(PersistenceCore.defaultDataRoot(environment: environment))
         }
         let repoRoot = URL(fileURLWithPath: currentDirectoryPath).appendingPathComponent("data", isDirectory: true)
         var candidates = [ownedPath(repoRoot), ownedPath(appSupportRoot)]
@@ -75,18 +69,24 @@ extension OpenAIOAuthDirectAdapter {
         // All app-owned sign-ins outrank an adopted CLI session. Process
         // overrides above are exact, and alternate roots never scan this list.
         if cliAdoptionConsent(dataRoot: dataRoot) == .allowed { candidates.append(shared) }
-        // Only honor the repo path when the FILE exists AND it carries real
-        // tokens. Mere presence of `data/` (or worse, root-relative `/data/`)
-        // shouldn't shadow the app-support candidate.
-        for candidate in candidates where Self.hasAccessToken(at: candidate) {
+        // Existing credentials own this route even when unreadable or malformed.
+        // Let the adapter report that damage; never select another account.
+        for candidate in candidates where Self.credentialFileExists(at: candidate) {
             return candidate
         }
         return ownedPath(appSupportRoot)
     }
 
+    private static func credentialFileExists(at url: URL) -> Bool {
+        var info = stat()
+        if lstat(url.path, &info) == 0 { return true }
+        // Only an absent path admits discovery/adoption. Inaccessible paths
+        // and dangling credential symlinks must reach the checked reader.
+        return errno != ENOENT
+    }
+
     /// True iff the file at `url` parses and has a non-empty
-    /// tokens.access_token. Used by `preferredAuthPath` to decide between the
-    /// repo dev path and the production AppSupport path.
+    /// tokens.access_token. This is a presence projection, not path selection.
     public static func hasAccessToken(at url: URL) -> Bool {
         guard let data = try? Data(contentsOf: url),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -106,12 +106,10 @@ extension OpenAIOAuthDirectAdapter {
     /// Shared CLI credentials stay read-only, including explicit overrides
     /// and app-owned paths that resolve through a symlink into ~/.codex.
     static func isUserCodexPath(_ path: URL) -> Bool {
-        let lexicalHome = defaultUserCodexHome().standardizedFileURL.path
-        let lexicalPath = path.standardizedFileURL.path
-        if lexicalPath == lexicalHome || lexicalPath.hasPrefix(lexicalHome + "/") { return true }
-        let home = defaultUserCodexHome().resolvingSymlinksInPath().standardizedFileURL.path
-        let resolved = path.resolvingSymlinksInPath().standardizedFileURL.path
-        return resolved == home || resolved.hasPrefix(home + "/")
+        let home = defaultUserCodexHome()
+        return NativeAgentWorkspaceRoot.relativePath(path.standardizedFileURL.path, under: home.standardizedFileURL.path) != nil
+            || NativeAgentWorkspaceRoot.relativePath(path.resolvingSymlinksInPath().standardizedFileURL.path,
+                under: home.resolvingSymlinksInPath().standardizedFileURL.path) != nil
     }
 
     // MARK: - Shared CLI session adoption consent
@@ -179,11 +177,7 @@ extension OpenAIOAuthDirectAdapter {
         return decision == .allowed ? .allowed : .declined
     }
 
-    /// Persist an explicit user decision. `source` names the UI moment that
-    /// captured it (for the receipt, not for authority). An existing record
-    /// that does not parse to a known decision is corrupt authority: it is
-    /// byte-preserved and this write fails loud rather than papering over it
-    /// (standard corrupt-authority contract; gpt-5.5 review 2026-08-06).
+    /// Persist explicit consent with a receipt source; corrupt authority stays byte-preserved and fails the write.
     public static func recordCLIAdoptionConsent(
         _ decision: CLISessionAdoptionConsent,
         source: String,
@@ -248,10 +242,7 @@ extension OpenAIOAuthDirectAdapter {
         Self.loadAuthBlob(at: resolveAuthPath())
     }
 
-    /// Read the blob at ONE already-resolved path. User, 2026-09-06: candidate
-    /// resolution probes the filesystem, so any code that resolved a path and
-    /// then called `loadAuthBlob()` could be handed a different file's bytes
-    /// — a sign-out mid-refresh moves the answer to the shared Codex CLI file.
+    /// Read only the already-resolved path so a concurrent sign-out cannot switch credential sources.
     static func loadAuthBlob(at path: URL) -> [String: Any]? {
         guard let data = try? Data(contentsOf: path) else { return nil }
         return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -279,13 +270,7 @@ extension OpenAIOAuthDirectAdapter {
 
     // MARK: - Codex child home
 
-    /// CODEX_HOME for every Codex child the app runs on its own ChatGPT sign-in
-    /// (the `codex` chat provider, swarm workers, the workshop planner, image
-    /// generation). It holds an access-only copy of `<root>/codex_home/auth.json`,
-    /// so the app stays the only refresher. 2026-10-07: the Codex CLI rewrites
-    /// auth.json from a typed struct when it refreshes, which drops the refresh
-    /// binding (the 10-06 17 h outage class), and it rotates the single-use
-    /// refresh token behind the app's back.
+    /// App-authenticated Codex children use an access-only CODEX_HOME so the app owns token refresh.
     public static func codexChildHome(dataRoot: URL) -> URL {
         // Credential/session copy: excluded from backup/export/phone sync;
         // PrivacyMap: codex_child_home. Codex owns its internal file schemas.
@@ -392,9 +377,7 @@ extension OpenAIOAuthDirectAdapter {
         return nil
     }
 
-    /// Extract chatgpt_account_id from a JWT payload's
-    /// `https://api.openai.com/auth` claim. Mirrors the lookup chain in
-    /// `_account_id()` at L751-L764 + the persistence path at L678-L684.
+    /// Extract chatgpt_account_id from the JWT's https://api.openai.com/auth claim.
     static func extractAccountIDFromJWT(_ token: String) -> String? {
         guard let payload = jwtPayload(token, omittingEmptySubsequences: false) else { return nil }
         guard let authClaim = payload["https://api.openai.com/auth"] as? [String: Any] else {

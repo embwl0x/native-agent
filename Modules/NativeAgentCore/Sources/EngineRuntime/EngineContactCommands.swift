@@ -1,11 +1,11 @@
 import ChatTurnRuntime
+import ApprovalTransactions
 import ChatTurnContracts
 import AgentConversations
 import Foundation
 import Agents
 import Cognition
 import ContextFlow
-import GrokLink
 import PersonaEngine
 import PersistenceCore
 // Blueprint: | `EngineContactCommands.swift` | Person-initiated sends, verified-session stop commands and held-message withdrawal through engine dispatch; Contact sends/stops and core bridge/A2A construction over the injected engine |
@@ -98,7 +98,7 @@ private struct EngineClaudeBridgePort: ClaudeBridgeRuntimePort {
     var grpcPort: UInt16? { readGRPCPort() }
     var preferredPersona: String? { PersonaSelection.current() }
     var preferredSessionID: String? { UserDefaults.standard.string(forKey: "activeChatSessionId") }
-    func chatClient() -> any ChatOrchestrationClient { engine().chatClient(profile: .bridge) }
+    func chatClient() -> SwiftNativeChatOrchestrationClient { engine().chatClient(profile: .bridge) }
     func toolClient(verifiedSessionID: String?) -> any ToolDispatchClient {
         let engine = engine()
         return engine.bridgeToolDispatchClient(approvalFiler: NativeAgentChatApprovalFiler(dataRoot: engine.dataRoot),

@@ -1,5 +1,4 @@
-// Move-only extraction (tightness Wave C) from CognitionObservatoryView.swift
-
+import NativeAgentShared
 import Cognition
 import SwiftUI
 import CognitiveSubstrate
@@ -109,52 +108,6 @@ extension CognitionObservatoryView {
                 Divider()
             }
         }
-    }
-
-    func researchHarness(_ detail: CognitiveObservatoryDetail) -> some View {
-            VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
-                HStack {
-                    Text("Welfare bounds")
-                        .font(.caption.weight(.semibold))
-                    Spacer()
-                    Text(detail.welfareBounds.withinBounds ? "bounded" : "attention")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                Text("max affect \(String(format: "%.2f", detail.welfareBounds.maxAffectValue)), reflection pressure \(String(format: "%.2f", detail.welfareBounds.reflectionBudgetPressure))")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                if let path = detail.lastResearchExportPath {
-                    Text(path)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                }
-                Divider()
-                ForEach(Array(detail.facultyMeasurements.prefix(6)), id: \.id) { measurement in
-                    HStack {
-                        Text(measurement.faculty)
-                            .font(.caption)
-                        Spacer()
-                        Text(String(format: "%.2f", measurement.score))
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                if !detail.experiments.isEmpty {
-                    Divider()
-                    ForEach(Array(detail.experiments.prefix(4)), id: \.id) { experiment in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("\(experiment.kind.rawValue): \(String(format: "%.2f", experiment.score))")
-                                .font(.caption.weight(.semibold))
-                            Text(experiment.reproducibilityKey)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .textSelection(.enabled)
-                        }
-                    }
-                }
-            }
     }
 
     @ViewBuilder

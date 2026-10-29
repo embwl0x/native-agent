@@ -1,31 +1,12 @@
 import Foundation
+import NativeAgentShared
 import CryptoKit
 import NativeAgentCore
 import PersistenceCore
 
 // Blueprint: | `ApprovalReplayAuthorizer.swift` | `ApprovalInboxApprovedReplayVerifier`: verifies replay authority against canonical inbox state and effect identity before approved dispatch |
 
-// MARK: - 2026-09-06 — the NON-injection replay exemption is checked too
-
-/// Why this exists.
-///
-/// `ApprovedChatToolReplay` is a public value type with a public init, and its
-/// `matches` only asks whether the caller's fields equal the caller's call plus
-/// a NONEMPTY id. Injection tools were already fenced by
-/// `InjectionApprovalVerifying`; every OTHER tool was not, so any in-process
-/// caller could hand `makeGatedToolDispatchClient` a fabricated replay and skip
-/// the SecurityCenter `.ask` (external_send — mail_send / messages_send /
-/// mail_reply) for a call nobody ever approved, as many times as it liked.
-///
-/// The approval record is the authority here as well: the id must resolve to a
-/// real record that is resolved-approved, names THIS tool (compared
-/// canonically — the record persists the spelling the caller used, which the
-/// outer canonicalizer has since rewritten), carries THIS body, and has been
-/// spent by the executor moments ago. The executor spends BEFORE it
-/// re-dispatches (`applyResolvedChatToolApproval`), so "already spent, just
-/// now" is exactly what an honest replay looks like and "no spend marker" is
-/// what a forgery looks like. The durable dispatch marker then makes the exemption
-/// single-use: a second dispatch presenting the same id is refused.
+/// Approved replay requires a matching grant, a fresh executor spend and single-use dispatch.
 public enum ApprovedReplayVerification: String, Sendable, Equatable {
     case verified
     case recordNotFound = "approval_record_not_found"
@@ -41,23 +22,9 @@ public enum ApprovedReplayVerification: String, Sendable, Equatable {
     /// call. The dispatcher only ever sees a replay that the executor spent
     /// immediately before dispatching it.
     case notSpentByExecutor = "approval_not_spent_for_this_dispatch"
-    /// No verifier wired. Fail-closed: an unverifiable exemption is no
-    /// exemption.
-    case noVerifier = "approval_verifier_unavailable"
 }
 
-public protocol ApprovedReplayVerifying: Sendable {
-    /// Consumes the exemption on success: `.verified` is returned at most once
-    /// per approval record.
-    func verifyApprovedReplay(
-        approvalID: String,
-        tool: String,
-        surface: String,
-        input: [String: JSONValue]
-    ) async -> ApprovedReplayVerification
-}
-
-public struct ApprovalInboxApprovedReplayVerifier: ApprovedReplayVerifying {
+public struct ApprovalInboxApprovedReplayVerifier: Sendable {
     /// How long after the executor's durable spend a replay still counts as
     /// that executor's dispatch. The spend is written immediately before
     /// `dispatch`, so this only has to cover the gate chain in front of it.
@@ -93,18 +60,7 @@ public struct ApprovalInboxApprovedReplayVerifier: ApprovedReplayVerifying {
               record.decision?.lowercased() == "approved" else {
             return .notApproved
         }
-        // An executed record is a finished record; nothing replays it again.
-        //
-        // 2026-09-06: a FAILED replay stamp is not an execution. The executor
-        // writes `{op: chat_tool_approval_replay, status: failed}` when the
-        // dispatch never ran (no filer on a noninteractive surface), and the
-        // reconciler's one sanctioned heal re-runs exactly that record — which
-        // this check then refused as already consumed, so the approved
-        // persona note was never filed. Nothing ran, so nothing was spent.
-        if let executed = record.executedAction, executed != .null,
-           !Self.isFailedReplayStamp(executed) {
-            return .alreadyConsumed
-        }
+        if record.executedAction != nil { return .alreadyConsumed }
         guard case .object(let payload) = record.payload else { return .malformedRecord }
 
         let recordTool = Self.string(payload["toolName"])
@@ -122,45 +78,21 @@ public struct ApprovalInboxApprovedReplayVerifier: ApprovedReplayVerifying {
 
         // The executor's durable spend, which it writes immediately before it
         // re-dispatches. An id nobody spent is an id nobody executed.
-        let spend: JSONValue?
-        do { spend = try await inbox.approvedEffectSpend(id: id) }
-        catch { return .spendUnavailable }
-        guard case .object(let marker)? = spend else {
-            return .notSpentByExecutor
-        }
-        guard let spentAction = Self.string(marker["action"]),
-              sameTool(spentAction, tool),
-              let spentSurface = Self.string(marker["surface"]),
-              Self.normalized(spentSurface) == Self.normalized(surface),
-              let spentAt = Self.string(marker["spentAt"]),
-              let spentDate = NativeTimestampFormat.parseISO8601(spentAt) else {
-            return .notSpentByExecutor
-        }
-        // 2026-09-06: the marker also carries the executor's digest of the
-        // record body it was about to run, and nothing checked it — so a spend
-        // written for one body vouched for a dispatch of a record whose payload
-        // had since been rewritten. Bind the marker to the body it was minted
-        // from, exactly as the executor computes it.
-        guard let spentDigest = Self.string(marker["digest"]),
-              Self.normalized(spentDigest) == Self.effectDigest(record.payload) else {
-            return .notSpentByExecutor
-        }
-        let age = now().timeIntervalSince(spentDate)
-        guard age >= -60, age <= Self.spendFreshnessSeconds else {
-            return .notSpentByExecutor
-        }
-
         do {
-            return try await inbox.consumeApprovedReplayDispatch(id: id)
+            return try await inbox.consumeApprovedReplayDispatch(id: id) { marker in
+                guard let spentAction = Self.string(marker["action"]),
+                      sameTool(spentAction, tool),
+                      let spentSurface = Self.string(marker["surface"]),
+                      Self.normalized(spentSurface) == Self.normalized(surface),
+                      let spentAt = Self.string(marker["spentAt"]),
+                      let spentDate = NativeTimestampFormat.parseISO8601(spentAt) else { return false }
+                // The executor's spend digest must match the approval payload.
+                guard let spentDigest = Self.string(marker["digest"]),
+                      Self.normalized(spentDigest) == Self.effectDigest(record.payload) else { return false }
+                let age = now().timeIntervalSince(spentDate)
+                return age >= -60 && age <= Self.spendFreshnessSeconds
+            }
         } catch { return .spendUnavailable }
-    }
-
-    /// The executor's own "nothing ran" annotation: a replay op that failed
-    /// before dispatch. Any other executed value is a spent record.
-    private static func isFailedReplayStamp(_ executed: JSONValue) -> Bool {
-        guard case .object(let stamp) = executed else { return false }
-        return stamp["op"] == .string("chat_tool_approval_replay")
-            && stamp["status"] == .string("failed")
     }
 
     private func sameTool(_ lhs: String, _ rhs: String) -> Bool {

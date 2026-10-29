@@ -1,8 +1,4 @@
 // BridgeMessage.swift — shared wire format for iCloud chat channel
-// Phase 14e-iCloud: HMAC-SHA256 signing.
-// Moved from Mac Sources/NativeAgentApp/iCloudBridge.swift and
-// iOS iOS/NativeAgentMobile/Sources/iCloudBridge.swift — both sides
-// were byte-identical in logic (comments only differed).
 import Foundation
 import CryptoKit
 
@@ -25,9 +21,9 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
     /// iCloud message into a general-purpose config blob.
     public let metadata: [String: String]?
     /// Optional multimodal attachments for the chat turn. Used by the iOS
-    /// companion to send camera-roll images through iCloud to the Mac daemon.
+    /// companion to send camera-roll images through iCloud to the Mac.
     public let attachments: [MultimodalAttachment]?
-    /// Phase 14e-iCloud: HMAC-SHA256 (lowercase hex) over canonical JSON body
+    /// HMAC-SHA256 (lowercase hex) over canonical JSON body
     /// (keys sorted, "signature" key excluded). Optional for backward-compat
     /// with older builds; receivers may reject unsigned messages once both sides
     /// are upgraded.
@@ -108,23 +104,26 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
         return diff == 0
     }
 
+    /// Preserve every inner action field except signature, including unknown fields.
+    public static func innerActionCanonicalBody(_ data: Data) throws -> Data {
+        guard var body = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw DeviceSyncError.underlying(message: "inner action envelope must be a JSON object")
+        }
+        body.removeValue(forKey: "signature")
+        return try JSONSerialization.data(withJSONObject: body, options: [.sortedKeys])
+    }
+
     /// The inner action envelope signs sorted JSON with its signature removed.
     /// Its case-insensitive hex rule is distinct from the outer message's wire rule.
     public static func innerActionSignatureError(data: Data, signature sig: String, secret: () throws -> Data) -> String? {
-        // S.11: reject obviously wrong-format signatures before computing HMAC.
+        // Reject wrong-format signatures before computing HMAC.
         let hexChars = CharacterSet(charactersIn: "0123456789abcdefABCDEF")
         if sig.count != 64 || sig.unicodeScalars.contains(where: { !hexChars.contains($0) }) {
             return "signature wrong format (expected 64 hex chars, got \(sig.count) chars)"
         }
 
-        // Reconstruct canonical body: re-encode with sorted keys, signature excluded.
-        guard let original = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return "cannot re-parse JSON for HMAC"
-        }
-        var withoutSig = original
-        withoutSig.removeValue(forKey: "signature")
-        guard let canonical = try? JSONSerialization.data(withJSONObject: withoutSig, options: [.sortedKeys]) else {
-            return "cannot re-serialize for HMAC"
+        guard let canonical = try? innerActionCanonicalBody(data) else {
+            return "cannot canonicalize JSON for HMAC"
         }
         let expected: String
         do {
@@ -166,10 +165,6 @@ public struct BridgeMessage: Codable, Identifiable, Sendable {
     /// It is a pairing wake-up, never a command: the receiver may refresh the
     /// separately authenticated KVS material, but cannot infer an action,
     /// session, attachment, or arbitrary metadata from this envelope.
-    public var isUnsignedResyncHint: Bool {
-        unsignedResyncHintFailure == nil
-    }
-
     /// Field names only: diagnostics must never print pairing material or payloads.
     public var unsignedResyncHintFailure: String? {
         let requiredKeys: Set<String> = [
@@ -209,12 +204,7 @@ public struct ICloudTransactionRecord: Codable, Identifiable, Sendable {
     public var attempts: Int
     public var lastError: String?
     public var response: [String: String]?
-    /// 2026-09-06: `id` here is the phone-supplied TRANSACTION id, which is only
-    /// defaulted to the message id — two unrelated actions can collide on it.
-    /// These two fields bind the row to the exact envelope that reserved it, so
-    /// a redelivery can tell "my action, already run" from "someone else's
-    /// action wearing my id". Optional: rows written before this field existed
-    /// decode with nil and are treated as unbound.
+    /// Bind the phone's potentially colliding transaction ID to its exact envelope; nil fields mean unbound.
     public var msgId: String?
     /// SHA-256 over the action envelope's canonical body (sorted keys, the
     /// `signature` key removed) — the same bytes the inner HMAC covers.

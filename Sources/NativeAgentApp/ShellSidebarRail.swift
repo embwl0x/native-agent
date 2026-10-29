@@ -1,15 +1,8 @@
+import NativeAgentShared
 import AppToolRuntime
 import SwiftUI
 
 // Blueprint: | `ShellSidebarRail.swift` | `ShellSidebarRail`: canonical rail item presentation, selection and focus-ring rendering |
-
-// ui-simplify 2026-09-02 (Lane A): the rail.
-//
-// Seventeen destinations became five places. Refinement pass, same day: the
-// glyphs went. Four words at one left edge carry the column; a 2pt bar marks
-// the place. A pill turned the rail into a segmented control, and the SF
-// Symbols were the borrowed part (Agent's read, User's "looks like a template").
-// Every route is untouched — only the furniture changed.
 
 /// One word in the rail, with the bar when it is the place you are.
 struct ShellRailItem: View {
@@ -34,17 +27,7 @@ struct ShellRailItem: View {
                     .font(ShellType.rail)
                     .foregroundStyle(isSelected ? NativeAgentShell.text
                         : (hovering ? NativeAgentShell.text.opacity(0.75) : NativeAgentShell.secondary))
-                    // The hover fade belongs to the word and nothing else. It
-                    // used to sit on the whole Button, one modifier outside the
-                    // overlay that hosts the selection bar — and an
-                    // `.animation(_:value:)` is a scope, not an addition: for
-                    // everything under it the transaction's animation becomes
-                    // this one when `value` changed and NOTHING when it did
-                    // not. On a click `hovering` does not change, so the rail's
-                    // `.snappy` selection transaction was replaced with nil
-                    // before it reached the bar, the matchedGeometryEffect
-                    // source was removed and re-inserted un-animated, and the
-                    // bar cut from one row to the next instead of travelling.
+                    // Scope hover animation to the word so selection-bar travel keeps the rail's transaction.
                     .animation(
                         NativeAgentMotion.respecting(NativeAgentMotion.quick, reduceMotion: reduceMotion),
                         value: hovering
@@ -150,30 +133,12 @@ struct ShellSidebarRail: View {
             NativeAgentMotion.respecting(NativeAgentMotion.standard, reduceMotion: reduceMotion),
             value: selection
         )
-        // The shell baseline: "Chat", "Conversations" and the room header
-        // share one first-text baseline at window y 72 (the 28pt title strip
-        // plus 44 — the 24pt unit's nearest whole beat). At 13pt medium
-        // centred in a 44pt row the word's baseline sits 27.3 below the top
-        // of the stack, so 14 lands it on 72 — now 10 of that outside the
-        // plate and 4 inside it. Settings keeps its 14 from the bottom the
-        // same way.
+        // Rail words share the shell header's baseline at window y 72; Settings keeps the same bottom inset.
         .padding(.top, 14 - NativeAgentShellLayout.railPlateInset)
         .padding(.bottom, 14 - NativeAgentShellLayout.railPlateInset)
         .frame(width: NativeAgentShellLayout.railWidth)
         .frame(maxHeight: .infinity)
-        // User, 2026-09-23 ("alive glass"): the rail alone floats — a rounded
-        // plate of glass inset from the window's top (below the traffic
-        // lights), bottom and leading edges. This changes the 2026-09-03 "one
-        // sheet, not three plates" rule for the rail only: the list column and
-        // every page stay transparent over the window's one sheet
-        // (ShellFrame). Agent, same day: the plate must read as that same
-        // sheet, just shaped — no seam, no brightness jump — so it wears
-        // `.clear` glass (the edge and the lensing, none of `.regular`'s frost
-        // over a room that is already coated) and no drawn border; the
-        // trailing hairline is gone because the plate's edge is the boundary.
-        // Reduce transparency: `.identity`, the flat rail over the opaque room.
-        // While she thinks before replying, a shimmer drifts through it
-        // (ThinkingGlow, a leaf).
+        // Only the rail floats on clear glass; reduced transparency leaves it flat over the opaque room.
         .background {
             ThinkingGlow(kind: .shimmer, cornerRadius: NativeAgentShellLayout.railPlateRadius)
         }
@@ -183,16 +148,10 @@ struct ShellSidebarRail: View {
         )
         .padding([.top, .bottom, .leading], NativeAgentShellLayout.railPlateInset)
         .padding(.trailing, 6)
-        // Agent, 2026-09-02: the 1px light hairline that used to sit on the
-        // rail's top edge is gone. With the title bar transparent the rail now
-        // reaches the window's own edge, so that line drew itself across the
-        // traffic-light row — a strip, which is the thing the shell does not
-        // paint on glass.
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Places")
     }
 
-    /// A page, or (nil) the hairline between the rail's groups.
     @ViewBuilder
     private func row(item: SidebarItem?) -> some View {
         if let item {

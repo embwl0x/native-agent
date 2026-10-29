@@ -1,46 +1,10 @@
-// Astra audit 2026-09-11 finding 5 — the legacy correction budget.
-//
-// The former `CorrectionScopeAtIntake` (2026-09-11) scoped arriving corrections,
-// never atoms already in the store. It is retired; intake now uses explicit
-// context_topics only (docs/MEMORY_SYSTEM_MAP.md).
-// That left the thing the audit actually measured untouched. The live Context
-// store holds 31 current correction atoms, 13 of them with no `context_topic`
-// entity, and `ContextCorrectionScope.applies` is fail-open — no scoping entity
-// means MANDATORY on every turn. 14 corrections were injected ahead of the
-// ordinary memories in the first fresh prompt of the day, among them an
-// image-decode-cache diagnosis, a git stash/reflog lesson and a
-// shell-versus-connectors distinction, on turns about none of those things.
-// They are real lessons. They are not every turn's business, and they were
-// spending the relevance budget ordinary memories needed.
-//
-// WHY THIS PATCHES MEMORY ROWS AND NOT context.sqlite. A correction atom is a
-// PROJECTION of its memory row (`NativeMemoryContextProjection`), and the
-// projection's change detector compares a `sourceHash` computed FROM that row —
-// `context_topics` included. Hand-writing `context_atom_versions` would be
-// silently reverted by the next reconcile, which would recompute the hash from
-// the untouched memory row and republish the atom without the entities. So the
-// scope goes where scope comes from: `metadata.context_topics` on the record,
-// exactly the key `commit_memory` writes, after which the ordinary projection
-// mints the `context_topic` entities itself (same atom id, new version).
-//
-// WHY A HARD-CODED TABLE AND NOT A CLASSIFIER. The former intake
-// deliberately refused to guess without dispatch evidence from the turn that
-// produced the correction, and for a legacy row that evidence is gone. The
-// audit asked for a legacy scope REVIEW, so this is the review: thirteen
-// decisions, made once, by hand, listed here. Seven get a topic. Six stay
-// global — every interpersonal one and every one that speaks about what she may
-// do, because a boundary that only holds on turns about its own subject is not
-// a boundary. The six are named in `keptGlobal` below so the judgment is on the
-// record rather than implied by absence.
-//
-// Idempotence is the house pattern: a version-stamped `.done` marker under
-// <dataRoot>/memory/migrations/, written ONLY after the pass completes, so a
-// crash re-runs it; plus a per-row guard that skips any record which already
-// carries topics from any source. Receipt JSON lands beside the marker.
+// Reviewed scopes update canonical metadata so Context projects them normally.
+// Existing topics are preserved; the completion marker admits retries until settled.
 
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import NativeAgentShared
 // Blueprint: | `LegacyCorrectionScopeMigration.swift` | Reviewed scope application and its consumed completion marker; no dated write-only audit copies; `runIfNeeded`, `migrationsDir` |
 
 /// Completion marker: local backup/export and memory PrivacyMap, no phone sync.
@@ -60,10 +24,8 @@ public enum LegacyCorrectionScopeMigration {
     /// would be stricter still and unreadable here; the uniqueness requirement
     /// buys the same safety while keeping the table reviewable.
     struct Entry: Sendable {
-        let atomPrefix: String
         let phrase: String
         let topics: [String]
-        let why: String
     }
 
     /// The seven task-specific corrections. Topics are plain words a later turn
@@ -72,49 +34,32 @@ public enum LegacyCorrectionScopeMigration {
     /// stemming — a label nobody types is a correction nobody gets.
     static let entries: [Entry] = [
         Entry(
-            atomPrefix: "atom:861474c3b72d",
             phrase: "Callable tool names come from the live catalog",
-            topics: ["tool", "tools", "tool name", "tool catalog", "capability"],
-            why: "how tools are named and found; no boundary in it"
+            topics: ["tool", "tools", "tool name", "tool catalog", "capability"]
         ),
         Entry(
-            atomPrefix: "atom:a2c29c30ad51",
             phrase: "An isolated transcript bar soaking clean",
-            topics: ["hang", "freeze", "soak", "transcript", "performance"],
-            why: "what proves a hang diagnosis; a performance-turn lesson"
+            topics: ["hang", "freeze", "soak", "transcript", "performance"]
         ),
         Entry(
-            atomPrefix: "atom:98a30e202c58",
             phrase: "A shell network restriction does not prove",
-            topics: ["sandbox", "network", "shell", "connector", "connectors"],
-            why: "epistemic — it warns against ASSUMING a restriction, so scoping "
-                + "it cannot remove a boundary; the audit named this one"
+            topics: ["sandbox", "network", "shell", "connector", "connectors"]
         ),
         Entry(
-            atomPrefix: "atom:035df08cf0ee",
             phrase: "Delegate one coherent unit at a time",
-            topics: ["delegation", "delegate", "worker", "workers", "subagent"],
-            why: "how to hand work to a worker; 'before sending' is about "
-                + "delegating, not about contacting anyone"
+            topics: ["delegation", "delegate", "worker", "workers", "subagent"]
         ),
         Entry(
-            atomPrefix: "atom:9a6f42a30a06",
             phrase: "I mistook a provider outage for a broken bridge",
-            topics: ["bridge", "provider", "outage", "delegate", "claude"],
-            why: "one diagnosis of one failure mode on the bridge"
+            topics: ["bridge", "provider", "outage", "delegate", "claude"]
         ),
         Entry(
-            atomPrefix: "atom:6aea2c427db3",
             phrase: "Image working-set thrash, not transcript length",
-            topics: ["image", "images", "cache", "decode", "thrash"],
-            why: "the image-decode-cache diagnosis the audit quoted"
+            topics: ["image", "images", "cache", "decode", "thrash"]
         ),
         Entry(
-            atomPrefix: "atom:2c2367d8bb48",
             phrase: "When shared-tree changes disappear",
-            topics: ["git", "stash", "reflog", "worktree", "commit"],
-            why: "a git-command lesson; scoping it puts it on exactly the turns "
-                + "that can hit it"
+            topics: ["git", "stash", "reflog", "worktree", "commit"]
         ),
     ]
 
@@ -147,45 +92,24 @@ public enum LegacyCorrectionScopeMigration {
         }
 
         let corrections = rows.filter { metadataString($0.metadata, "kind") == "correction" }
-        var applied: [JSONValue] = []
-        var skipped: [JSONValue] = []
-        // SATISFIED IS NOT SKIPPED (Astra comb 3, lane1 finding 5, 2026-09-12).
-        // A row that already carries a scope needs nothing from this migration
-        // ever again — whether this pass wrote it, a hand edit did, or intake
-        // derived it. Counting those as unresolved made a retry unfinishable:
-        // after a run that scoped some rows and died before its marker, the next
-        // run correctly preserved the scopes, classified all seven as
-        // "already scoped", and therefore never wrote the marker — so every
-        // subsequent launch repeated the pass and added another receipt. The
-        // seven rows of receipt `correction_scope_review_v1_2026-09-11T21-16-29
-        // .992Z.json` (memory rowids 163, 165, 167, 281, 290, 343, 359, all
-        // `context_topics_origin=legacy_scope_review_v1`) are exactly the rows
-        // that would have deadlocked it.
-        var satisfied: [JSONValue] = []
+        var applied = 0
+        var skipped = 0
+        // Existing scopes are satisfied, so retries can complete after partial writes.
+        var satisfied = 0
         var anyMatched = false
 
         for entry in entries {
             let matches = corrections.filter { $0.content.contains(entry.phrase) }
             anyMatched = anyMatched || !matches.isEmpty
             guard matches.count == 1, let row = matches.first else {
-                // Not the row the review read. Say which and move on — a guess
-                // here would scope the wrong correction.
-                skipped.append(.object([
-                    "atom_prefix": .string(entry.atomPrefix),
-                    "reason": .string("matched \(matches.count) active corrections, expected 1"),
-                ]))
+                skipped += 1
                 continue
             }
             // Any topics at all — hand-supplied, intake-derived, or a previous
             // run of this migration — mean the scope is already someone's
             // decision. Never overwrite it.
             if case .array(let existing)? = metadataValue(row.metadata, "context_topics"), !existing.isEmpty {
-                satisfied.append(.object([
-                    "atom_prefix": .string(entry.atomPrefix),
-                    "memory_id": .string(row.id),
-                    "reason": .string("already scoped"),
-                    "origin": .string(metadataString(row.metadata, "context_topics_origin") ?? "unknown"),
-                ]))
+                satisfied += 1
                 continue
             }
             let patch = MemoryPatch(metadataMerge: [
@@ -204,11 +128,7 @@ public enum LegacyCorrectionScopeMigration {
                         return true
                     }
                 ) != nil else {
-                    skipped.append(.object([
-                        "atom_prefix": .string(entry.atomPrefix),
-                        "memory_id": .string(row.id),
-                        "reason": .string("row changed or already scoped"),
-                    ]))
+                    skipped += 1
                     continue
                 }
             } catch {
@@ -216,17 +136,12 @@ public enum LegacyCorrectionScopeMigration {
                 nativeLog("[correctionScope] write failed for \(row.id); migration deferred: \(String(describing: error))")
                 return
             }
-            applied.append(.object([
-                "atom_prefix": .string(entry.atomPrefix),
-                "memory_id": .string(row.id),
-                "topics": .array(entry.topics.map { .string($0) }),
-                "why": .string(entry.why),
-            ]))
+            applied += 1
         }
 
         // The atoms only change once the projection recompiles the memory
         // sources whose `sourceHash` just moved.
-        if !applied.isEmpty {
+        if applied > 0 {
             await DerivedStateInvalidationCenter.shared.publish(DerivedSourceChange(
                 namespace: "memory-v2",
                 stableID: "correction_scope_review_v\(version)",
@@ -235,17 +150,17 @@ public enum LegacyCorrectionScopeMigration {
             ))
         }
 
-        if skipped.isEmpty || !anyMatched {
+        if skipped == 0 || !anyMatched {
             do {
                 let marker = markerPath(dataRoot: dataRoot)
                 try FileManager.default.createDirectory(at: marker.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try await SwiftNativePersistenceCore().writeDataAtomicDurable(
+                try await SwiftNativePersistenceCore.writeDataAtomicDurableAsync(
                     Data(MemoryStorage.nowISO8601().utf8), to: marker)
             } catch {
                 nativeLog("[correctionScope] completion marker write failed: %@", String(describing: error))
             }
         }
-        nativeLog("[correctionScope] legacy scope review: scoped=\(applied.count) already_scoped=\(satisfied.count) skipped=\(skipped.count) kept_global=\(keptGlobal.count)")
+        nativeLog("[correctionScope] legacy scope review: scoped=\(applied) already_scoped=\(satisfied) skipped=\(skipped) kept_global=\(keptGlobal.count)")
     }
 
     // MARK: - Paths

@@ -4,31 +4,7 @@ import ProviderRouting
 import os
 // Blueprint: | `ContextBudgetPolicy.swift` | Shared model-input budgets for every door; `compactionHistoryCharacters`, `floors`; derived budget reuse by exact effective window after current model/catalog resolution |
 
-/// SINGLE SOURCE OF TRUTH for every prompt-assembly character budget.
-///
-/// Sweep R4 lane-A finding #2: every context budget in the assembler was a
-/// hardcoded literal — history 22k chars, memory 5 rows × 1,200, capsule 4k,
-/// ranked packet 6k/24k — while the provider catalog
-/// already knew the real window (kimi-k3 = 1,048,576 tokens) and had NO
-/// prompt-assembly caller. Net effect: under 1% window utilization on a
-/// million-token model.
-///
-/// This type turns those literals into a FUNCTION of the model's window.
-/// Two hard rules govern it:
-///
-///  1. **The literals are the FLOOR.** No resolved budget is ever smaller than
-///     what shipped before this policy existed. Scaling can only add room.
-///  2. **Small windows are byte-identical.** A window at or below
-///     `floorWindowTokens` — and any turn where the model is unknown or not
-///     resolved at all — short-circuits to the floor table with NO arithmetic,
-///     so speed-must-be-free holds for small-window models: their assembled
-///     prompt is unchanged, byte for byte. `ContextBudgetPolicyTests` pins it.
-///
-/// There is NO post-assembly provider input clamp on the adapter paths —
-/// safety comes from the ceiling-sum invariant above the tuning constants:
-/// the worst-case derived ask provably fits the smallest catalog-gated
-/// window. This policy decides how much we ASK for, and its ceilings are
-/// sized so the ask can never exceed what any gate-passing model accepts.
+/// Prompt-assembly budgets scale with the effective context window and never undercut floors.
 public enum ContextBudgetPolicy {
 
     // MARK: - Tuning constants (every number in this file, nowhere else)
@@ -39,10 +15,12 @@ public enum ContextBudgetPolicy {
     /// direction to be wrong in.
     package static let charactersPerToken = 3.2
 
-    /// Share of the window that history + memory + capsule may claim between
-    /// them. The remaining ~75% covers the persona/system blocks, tool schemas,
-    /// the ranked packet, the user message, and — the reason this is not 50% —
-    /// the model's own reply plus reasoning tokens.
+    /// Transcript-size approximation when no tokenizer counts are available.
+    /// Shared by transcript status, aging and compaction; model spelling is not tokenizer evidence.
+    /// The 3.2 prompt-budget factor above is a separate, tighter safety margin.
+    package static let transcriptCharactersPerToken = 3.5
+
+    /// Window fraction used to scale the derived block budgets.
     static let combinedUtilizationFraction = 0.25
 
     /// At or below this window, budgets are EXACTLY the pre-policy literals.
@@ -52,50 +30,20 @@ public enum ContextBudgetPolicy {
     /// model's prompt.
     static let floorWindowTokens = 32_768
 
-    /// The shared floor total as RENDERED: history 22,000 + memory
-    /// 5×(1,200 + per-row markup) + capsule 4,000. Used as the denominator that
-    /// turns "characters this window can afford" into a scale factor.
-    ///
-    /// The markup term is not cosmetic: `memoryBlockChars` bounds rendered
-    /// rows, so leaving it out of the denominator makes the scale factor
-    /// slightly too generous and the governed total overshoots the allowance
-    /// on mid-size windows.
+    /// Rendered history + memory (including row markup) + capsule floors:
+    /// the denominator for the derived character allowance's scale factor.
     static let referenceFloorTotalCharacters =
         22_000 + (5 * (1_200 + memoryRowOverheadChars)) + 4_000
 
-    /// Absolute ceilings. Past these, more context stops buying attention and
-    /// — the binding constraint — their SUM must provably fit the SMALLEST
-    /// window any catalog-gated model can actually have. The derive regime is
-    /// only reachable through FirstPartyModelCatalog membership, whose
-    /// smallest window is 128k tokens; a stale or over-optimistic catalog row
-    /// claiming 1M for what is really a 128k account limit must still produce
-    /// a prompt the provider accepts, because NO post-assembly input clamp
-    /// exists on the adapter paths (gpt-5.5 review 2026-08-06, blocking).
-    /// Invariant, enforced by worstCaseDerivedFitsCatalogMinimum test:
-    ///   (history + memory + relevant + capsule + packetExpanded ceilings +
-    ///    per-row slack) / 3.2 chars-per-token + output reserve
-    ///   ≤ 60% of the 128k catalog minimum.
-    /// starts buying latency and cost.
+    /// Ceiling of the scaled-history term; the separate history rule can raise the final budget.
     static let maximumHistoryCharacters = 96_000
 
-    /// Everything in one request that is NOT history, at its maximum, in
-    /// tokens at 3.2 chars/token: persona + tool schemas (~126k chars measured
-    /// 2026-09-24 → 39.4k), the other block ceilings (memory 24k + relevant 24k
-    /// + capsule 8k + expanded packet 48k + continuity/user ~16k chars → 37.5k),
-    /// one tool round plus a working note (~52k chars → 16.3k), and 32,768
-    /// output tokens. ≈126k, rounded up.
+    /// Reserve tokens for persona, tools, other context, one tool round, a working note and output.
     static let requestReserveTokens = 128_000
-    /// The whole request, output included, stays inside this share of the
-    /// model's own window (User: never error her out on a 272k GPT).
+    /// The whole request, including output, stays inside this share of the model window.
     static let requestWindowFraction = 0.90
 
-    /// User 2026-09-23: history follows her compaction point. `windowTokens` is
-    /// already her effective window (see `windowTokens(forModel:)`), where the
-    /// session compacts — but on a small model replaying ALL of it plus the
-    /// reserve above could overrun the model. Her window is at most 60% of the
-    /// model's, so the model holds at least window ÷ 0.6; history gets what is
-    /// left of 90% of that after the reserve. Binds only below a ~256k window
-    /// (a 272k GPT: 116.8k of 163.2k); 1M at 300k replays the whole 300k.
+    /// Separate history rule: effective-window room limited by the model's request share after reserve.
     static func compactionHistoryCharacters(windowTokens: Int) -> Int {
         let modelFloor = Double(windowTokens) / ChatSessionAutocompactionConfig.maximumContextWindowFraction
         let room = Int(modelFloor * requestWindowFraction) - requestReserveTokens
@@ -116,36 +64,17 @@ public enum ContextBudgetPolicy {
     /// row from eating the block.
     static let maximumRowScale = 4.0
 
-    /// Recall breadth. Widens once the window is genuinely large — 120k counts
-    /// (see `resolve`), so the models we actually route to get the wide limit
-    /// rather than only the 1M tier.
-    /// Non-content characters a rendered memory row carries: the `- ` bullet,
-    /// the newline, and the `[2026-07-14, preference]` provenance marker. The
-    /// per-row content cap is sized net of this so `rowLimit` FULL rows
-    /// actually fit inside `maximumMemoryBlockCharacters` — without it the last
-    /// row is dropped by the aggregate bound and the doubled recall breadth
-    /// quietly buys 9 rows instead of 10.
+    /// Per-row content leaves room for the bullet, newline and provenance marker inside the block cap.
     static let memoryRowOverheadChars = 64
 
     static let baseRecallRowLimit = 5
     package static let wideRecallRowLimit = 12
-    /// In HER-window terms (2026-09-24): 60% of the 200k models that always
-    /// qualified, so every model that got wide recall from its raw window
-    /// still gets it — a 272k GPT's 163k window keeps 12 rows, not 5.
+    /// Wide recall starts at 60% of a 200k-token model window.
     static let wideRecallWindowTokens = 120_000
 
     // MARK: - Packet atom rendering (NORTHSTAR clause 6: reach, not weight)
 
-    /// Above this body length a packet atom is rendered as a LEAD plus a
-    /// `context_expand` pointer instead of its full body. Measured 2026-09-01:
-    /// atoms rendered uncapped (`- [kind] <full body>`), corrections averaging
-    /// 830 chars and reaching 2 KB, memories 470. 400 keeps the ordinary atom
-    /// whole (it is the rule, and the rule is short) while a story-length one
-    /// becomes one pull away rather than permanent prompt mass.
-    ///
-    /// Window-independent on purpose: this is not a budget that a bigger model
-    /// should spend harder, it is the shape of what an atom SAYS. The packet's
-    /// aggregate character budget (`packetChars`) is the window-scaled knob.
+    /// Long atoms become leads with expansion pointers; this threshold is window-independent.
     package static let packetAtomExpandThresholdChars = 400
 
     // MARK: - Floors (today's literals, verbatim)
@@ -158,7 +87,6 @@ public enum ContextBudgetPolicy {
         public let userCap: Int
         public let systemCap: Int
         public let compactionSummaryCap: Int
-        public let toolCap: Int
         public let relevantChars: Int
         public let relevantItemCap: Int
     }
@@ -169,16 +97,18 @@ public enum ContextBudgetPolicy {
         userCap: 1_800,
         systemCap: 1_200,
         compactionSummaryCap: ChatCompactionDistiller.maxSummaryChars,
-        toolCap: 320,
         relevantChars: 2_400,
         relevantItemCap: 650
     )
 
     /// Surface-independent floors (memory recall, capsule, ranked packet).
     /// These were literals at their own call sites, not in the history table.
+    // Their product is also the person picture's bound
+    // (`UserMDAutogenMarkers.promptByteCap`, a base target that cannot read
+    // these): change them together.
     static let floorMemoryRowChars = 1_200          // TurnEngine.recalledMemoryRowCharCap
     static let floorRecallRowLimit = 5              // TurnEngine.recalledMemoryRowLimit / recall(k:)
-    static let floorCapsuleChars = 4_000            // cognitiveTurnProjectionRequest
+    static let floorCapsuleChars = 4_000            // Cognitive capsule request
     static let floorPacketChars = 6_000             // ContextTurnRequest.characterBudget
     static let floorPacketExpandedChars = 24_000    // ContextTurnRequest.maximumCharacterBudget
     static let floorPacketPostMandatoryReserve = 4_000
@@ -194,7 +124,6 @@ public enum ContextBudgetPolicy {
         public let userCap: Int
         public let systemCap: Int
         public let compactionSummaryCap: Int
-        public let toolCap: Int
         public let relevantChars: Int
         public let relevantItemCap: Int
 
@@ -216,18 +145,12 @@ public enum ContextBudgetPolicy {
         public let isDerived: Bool
     }
 
-    /// Characters the utilization fraction allows for a given window. Exposed
-    /// so the eval harness can assert the bound rather than restate the math.
+    /// Scaling input for derived budgets, not a cap on their sum.
     public static func derivedCharacterAllowance(windowTokens: Int) -> Int {
         Int(Double(windowTokens) * charactersPerToken * combinedUtilizationFraction)
     }
 
-    /// HER window for a model id — `ChatSessionAutocompactionConfig
-    /// .effectiveWindowTokens`, never the model's raw window (User 2026-09-24:
-    /// sizing from a 1M window burns tokens for nothing). nil when the id is
-    /// blank or no catalog row on its route states a window
-    /// (`ProviderRouting.verifiedContextLength`), so an unknown id lands in
-    /// the floor regime rather than be scaled against a guess.
+    /// Use the effective window; unresolved model or route windows return nil and use floor budgets.
     public static func windowTokens(
         forModel modelID: String?,
         providerID: String? = nil,
@@ -268,10 +191,7 @@ public enum ContextBudgetPolicy {
         let scale = max(1.0, Double(allowance) / Double(referenceFloorTotalCharacters))
         let rowScale = min(scale, maximumRowScale)
 
-        // At/above, not above: the live catalog's most-routed models sit EXACTLY
-        // at 200k (19 entries, the Claude models included), so a strict `>` left
-        // wide recall reachable only by the 1M tier — the band it was written
-        // for never qualified.
+        // Wide recall includes the threshold itself.
         let recallRowLimit = windowTokens >= wideRecallWindowTokens
             ? wideRecallRowLimit
             : baseRecallRowLimit
@@ -286,6 +206,7 @@ public enum ContextBudgetPolicy {
         )
 
         return Resolved(
+            // Final history takes the larger of scaled history and the effective-window/request-reserve rule.
             historyChars: max(
                 min(maximumHistoryCharacters, grow(floors.historyChars, scale)),
                 compactionHistoryCharacters(windowTokens: windowTokens)
@@ -296,7 +217,6 @@ public enum ContextBudgetPolicy {
             // room than that buys literally nothing.
             // The whole recollection renders; per-surface floors would cut it.
             compactionSummaryCap: ChatCompactionDistiller.maxSummaryChars,
-            toolCap: grow(floors.toolCap, rowScale),
             relevantChars: min(maximumRelevantCharacters, grow(floors.relevantChars, scale)),
             relevantItemCap: grow(floors.relevantItemCap, rowScale),
             recallRowLimit: recallRowLimit,
@@ -347,7 +267,6 @@ public enum ContextBudgetPolicy {
             userCap: floors.userCap,
             systemCap: floors.systemCap,
             compactionSummaryCap: floors.compactionSummaryCap,
-            toolCap: floors.toolCap,
             relevantChars: floors.relevantChars,
             relevantItemCap: floors.relevantItemCap,
             recallRowLimit: floorRecallRowLimit,
@@ -362,10 +281,7 @@ public enum ContextBudgetPolicy {
         )
     }
 
-    /// TRUNCATING scale — never rounds up. Guarantees the summed derived
-    /// budgets stay at or under `derivedCharacterAllowance` (the eval harness
-    /// asserts exactly that), and guarantees `grow(x, 1.0) == x` for the
-    /// byte-identical floor case.
+    /// Truncate scaled values without undercutting the floor; grow(x, 1.0) == x.
     private static func grow(_ value: Int, _ scale: Double) -> Int {
         max(value, Int(Double(value) * scale))
     }

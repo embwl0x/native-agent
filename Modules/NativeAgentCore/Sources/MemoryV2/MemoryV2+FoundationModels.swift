@@ -5,19 +5,9 @@ import NativeAgentCore
 import FoundationModels
 #endif
 
-// Blueprint: | `MemoryV2+FoundationModels.swift` | `AppleFoundationModelsAdapter.classify`: on-device kind labels for existing memory rows; no fact extraction |
+// Blueprint: | `MemoryV2+FoundationModels.swift` | `OnDeviceClassification`: shared category prompt and exact reply parser for on-device and remote kind labels |
 
-// MARK: - Apple Foundation Models adapter (on-device classification)
-//
-// What is LEFT of this adapter, 2026-09-11: `classify`, which the memory kind
-// backfill and the kind-repair approval executor use to label an EXISTING row.
-//
-// The on-device FACT EXTRACTION that used to live here is gone, with
-// `ExtractedFact`, the regex fallback extractor, the `MemoryFactQuality` prefix
-// cleaning, and `SemanticAdaptiveFactExtractor`. Those minted the junk User saw
-// on the Memories page, and every fix to them was one more regex. The memory
-// manager (MemoryV2+MemoryManager.swift) asks the agent's real model once, with
-// the memories already kept in view.
+// MARK: - On-device classification of existing memory rows
 
 public enum FoundationModelsError: Error, Sendable, Equatable {
     case unavailable
@@ -29,7 +19,7 @@ public enum FoundationModelsError: Error, Sendable, Equatable {
     case classificationNoMatch(String)
 }
 
-public enum AppleFoundationModelsAdapter {
+public enum OnDeviceClassification {
 
     /// True only on macOS 26+ with Apple Intelligence enabled and the
     /// `FoundationModels` framework present at compile time.
@@ -44,20 +34,14 @@ public enum AppleFoundationModelsAdapter {
         #endif
     }
 
-    /// Single-label classification helper. Returns the chosen category
-    /// verbatim from `categories`. Throws `.classificationNoMatch` when the
-    /// model's reply matches none of them — a reply that can't be trusted
-    /// must be dropped by the caller, never coerced. (The old behavior
-    /// fell back to `categories.first`, which for the kind-backfill taxonomy
-    /// was "identity" — malformed FM output became an approved-looking card
-    /// row; gpt-5.5 U3w2 fix-round finding 1.)
+    /// Return exactly one declared category; never repair a nonmember reply.
     public static func classify(content: String, into categories: [String]) async throws -> String {
         guard !categories.isEmpty else {
             throw FoundationModelsError.generationFailed("empty categories")
         }
         #if canImport(FoundationModels)
         if #available(macOS 26, *), SystemLanguageModel.default.isAvailable {
-            let prompt = classifyPrompt(content: content, categories: categories)
+            let prompt = try classifyPrompt(content: content, categories: categories)
             do {
                 let session = LanguageModelSession()
                 let response = try await session.respond(to: prompt)
@@ -75,7 +59,7 @@ public enum AppleFoundationModelsAdapter {
     }
 
     /// Accept only a declared category; unparseable replies drop the row.
-    static func matchCategory(reply: String, categories: [String]) throws -> String {
+    public static func matchCategory(reply: String, categories: [String]) throws -> String {
         guard categories.contains(reply) else {
             throw FoundationModelsError.classificationNoMatch(reply)
         }
@@ -84,17 +68,11 @@ public enum AppleFoundationModelsAdapter {
 
     // MARK: prompts
 
-    static func classifyPrompt(content: String, categories: [String]) -> String {
-        """
-        Choose exactly one category for the content. Respond with only the \
-        category label, nothing else.
-
-        Categories: \(categories.joined(separator: ", "))
-
-        Content: \(content)
-
-        Category:
-        """
+    public static func classifyPrompt(content: String, categories: [String]) throws -> String {
+        try completionPolicy("kind-classification", section: "prompt", arguments: [
+            categories.joined(separator: ", "),
+            content
+        ])
     }
 
 }

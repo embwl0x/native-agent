@@ -1,3 +1,4 @@
+import NativeAgentShared
 import SwiftUI
 import WidgetKit
 

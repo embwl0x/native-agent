@@ -11,5 +11,6 @@ OUT="$ROOT/Modules/NativeAgentCore/Sources/AgentLinkTransport/Generated"
 mkdir -p "$OUT"
 protoc -I "$PROTO" \
   --swift_out="Visibility=Public:$OUT" \
-  --grpc-swift-2_out="Visibility=Public:$OUT" \
+  --grpc-swift-2_out="Visibility=Public,Client=false:$OUT" \
   "$PROTO/a2a.proto"
+ruby "$ROOT/script/trim_a2a_grpc.rb" "$OUT/a2a.grpc.swift"

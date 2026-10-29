@@ -10,6 +10,9 @@ package final class ProcessPipeDrain: @unchecked Sendable {
     private let queue = DispatchQueue(label: "NativeAgent.process.pipe")
     private let source: DispatchSourceRead
     private let completion = DispatchGroup()
+    private var readFailed = false
+
+    package var captureReadFailed: Bool { queue.sync { readFailed } }
 
     package init(handle: FileHandle, onData: @escaping @Sendable (Data) -> Void) throws {
         self.handle = handle
@@ -42,7 +45,10 @@ package final class ProcessPipeDrain: @unchecked Sendable {
                 source.cancel()
                 return
             } else if errno != EINTR {
-                if errno != EAGAIN && errno != EWOULDBLOCK { source.cancel() }
+                if errno != EAGAIN && errno != EWOULDBLOCK {
+                    readFailed = true
+                    source.cancel()
+                }
                 return
             }
         }
@@ -59,6 +65,10 @@ package final class ProcessPipeDrain: @unchecked Sendable {
     package func stopAndWait() {
         stop()
         completion.wait()
+    }
+
+    package func wait(until deadline: DispatchTime) -> Bool {
+        completion.wait(timeout: deadline) == .success
     }
 
     package func wait() async {

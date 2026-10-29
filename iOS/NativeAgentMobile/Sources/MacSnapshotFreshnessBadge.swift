@@ -3,9 +3,7 @@
 import SwiftUI
 import NativeAgentShared
 
-/// Sweep 2026-09-01 item 2: a snapshot age is not the only way a screen lies.
-/// The Mac publishes the groups it could NOT rebuild, and a screen whose group
-/// is named there is showing old rows no matter how recently the phone synced.
+/// A Mac-reported group rebuild failure marks its rows stale regardless of sync age.
 enum MacSnapshotGroupStaleness {
     /// The Mac's reason for this screen's group, or nil when the group built.
     static func reason(in markers: [String: String], group: String?) -> String? {
@@ -19,7 +17,7 @@ enum MacSnapshotGroupStaleness {
 enum MacSnapshotPageFreshness {
     /// "12 minutes", "2 hours", "3 days".
     static func spokenAge(_ interval: TimeInterval) -> String {
-        let seconds = max(0, Int(interval))
+        guard interval.isFinite, let seconds = Int(exactly: max(0, interval).rounded(.towardZero)) else { return "an unknown interval" }
         if seconds < 60 { return AliveWords.count(seconds, "second") }
         if seconds < 3_600 { return AliveWords.count(seconds / 60, "minute") }
         if seconds < 86_400 { return AliveWords.count(seconds / 3_600, "hour") }

@@ -2,12 +2,8 @@
 
 import SwiftUI
 import UIKit
+import NativeAgentShared
 // Blueprint: | `NativeAgentDesign.swift` | `View`: `appShimmer` |
-
-/// The app's animated ground stays outside the extension's shared glass tokens.
-struct MobileRoomBackground: View {
-    var body: some View { AliveRoom() }
-}
 
 enum NativeAgentPalette {
     static let agentAccent = Color(hex: 0x06B6D4)
@@ -48,26 +44,17 @@ enum NativeAgentAppearance: String, CaseIterable, Identifiable {
 // MARK: - Typography tokens
 
 enum AppFont {
-    static let display = Font.system(.largeTitle, design: .rounded, weight: .heavy)
-    static let title   = Font.system(.title2,     design: .rounded, weight: .heavy)
-    static let section = Font.system(.headline,   design: .rounded, weight: .bold)
     static let body    = Font.system(.body,       design: .rounded)
     static let label   = Font.system(.caption,    design: .rounded, weight: .semibold)
     static let tag     = Font.system(.caption2,   design: .rounded, weight: .bold)
-    static let mono    = Font.system(.caption,    design: .monospaced)
 }
 
 // MARK: - Motion tokens
 
 enum AppMotion {
     static let snappy = Animation.spring(response: 0.32, dampingFraction: 0.82)
-    static let gentle = Animation.spring(response: 0.55, dampingFraction: 0.88)
-    static let drift  = Animation.easeInOut(duration: 8).repeatForever(autoreverses: true)
     static let pulse  = Animation.easeInOut(duration: 1.6).repeatForever(autoreverses: true)
-    // chat-smoothness phase 6: subtle entrance for newly-inserted chat bubbles.
-    // Triggered ONLY by withAnimation at the append seam (ChatStore.send) —
-    // never by a list-level .animation key (gpt-5.5 r1 blocker: an id-list key
-    // also animates wholesale replaces like the snapshot merge).
+    // Animate appended bubbles at the mutation seam; list animation must not animate snapshot replacement.
     static let entrance = Animation.easeOut(duration: 0.22)
 
     /// Reduce-motion-aware entrance for MODEL-layer mutation sites
@@ -77,9 +64,7 @@ enum AppMotion {
         UIAccessibility.isReduceMotionEnabled ? nil : entrance
     }
 
-    /// chat-smoothness phase 6: reduce-motion gate. Returns nil (the change is
-    /// applied instantly with no movement) when the system Reduce Motion
-    /// accessibility setting is on; otherwise the given animation.
+    /// Return nil when Reduce Motion is enabled; otherwise preserve the given animation.
     static func respecting(_ animation: Animation?, reduceMotion: Bool) -> Animation? {
         reduceMotion ? nil : animation
     }

@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Foundation
 import CryptoKit
 import NativeAgentCore
@@ -83,7 +84,6 @@ public enum NativeAgentScheduledProactiveScan {
     public static func evaluate(
         dataRoot: URL,
         payload: [String: JSONValue],
-        persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore(),
         now: Date = Date()
     ) async throws -> Result {
         let limit = max(1, min(int(payload["limit"], default: 10), 50))
@@ -103,9 +103,9 @@ public enum NativeAgentScheduledProactiveScan {
             .appendingPathComponent("approvals", isDirectory: true)
             .appendingPathComponent("requests.json")
 
-        let inboxRows = (try? await persistence.readJSONL(inboxPath)) ?? []
-        let schedulerRaw = try await persistence.readJSON(schedulerPath, ifMissing: .array([]))
-        let approvalsRaw = try await persistence.readJSON(approvalsPath, ifMissing: .array([]))
+        let inboxRows = (try? await SwiftNativePersistenceCore.readJSONL(inboxPath)) ?? []
+        let schedulerRaw = try await SwiftNativePersistenceCore.readJSON(schedulerPath, ifMissing: .array([]))
+        let approvalsRaw = try await SwiftNativePersistenceCore.readJSON(approvalsPath, ifMissing: .array([]))
 
         let deskStaleDays = max(1, int(payload["staleDays"] ?? payload["stale_days"], default: defaultDeskStaleDays))
         let deskItems = (try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState().items) ?? []

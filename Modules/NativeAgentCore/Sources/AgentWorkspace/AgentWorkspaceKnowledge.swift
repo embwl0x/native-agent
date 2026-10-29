@@ -1,5 +1,6 @@
 import Foundation
 import PersistenceCore
+import ChatToolParsing
 // Blueprint: | `AgentWorkspaceKnowledge.swift` | `AgentWorkspaceKnowledge` enum; `project`, `memoryTitle` |
 
 /// Presents the existing memory and research owners without retaining
@@ -17,7 +18,7 @@ enum AgentWorkspaceKnowledge {
 
     static let readTools: Set<String> = ["recall_memory", "recall_search", "read_page", webSearchTool]
 
-    static func project(tool: String, input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection? {
+    static func project(tool: String, input: [String: JSONValue], result: JSONValue) -> WorkspacePage? {
         switch tool {
         case webSearchTool: return webSearch(input: input, result: result)
         case "recall_memory", "recall_search": return memory(input: input, result: result)
@@ -40,19 +41,18 @@ enum AgentWorkspaceKnowledge {
 
     /// Search results as rows: each one reads privately (read_page) or,
     /// only when she picks it, opens in her Chrome tab.
-    private static func webSearch(input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection {
-        var content = object(result)
-        var inner = object(content.removeValue(forKey: "result") ?? .null)
+    private static func webSearch(input: [String: JSONValue], result: JSONValue) -> WorkspacePage {
+        var content = result.objectValue ?? [:]
+        var inner = (content.removeValue(forKey: "result") ?? .null).objectValue ?? [:]
         let rows: [JSONValue] = if case .array(let list)? = inner.removeValue(forKey: "results") ?? content.removeValue(forKey: "results") { list } else { [] }
         content.merge(inner) { old, _ in old }
         let items = rows.compactMap { value -> AgentWorkspaceItem? in
-            let row = object(value)
+            let row = value.objectValue ?? [:]
             guard let url = validWebURL(row["url"]) else { return nil }
-            let title = text(row["title"]).flatMap { $0.isEmpty ? nil : $0 } ?? url
-            // A row reads as title · site · snippet (desk walk 4 got raw JSON);
-            // Bing's "…Read more" tail says nothing.
+            let title = row["title"]?.stringValue.flatMap { $0.isEmpty ? nil : $0 } ?? url
+            // A row reads as title · site · snippet; Bing's "…Read more" tail says nothing.
             let site = URL(string: url)?.host?.replacingOccurrences(of: #"^www\."#, with: "", options: .regularExpression) ?? url
-            let snippet = text(row["snippet"])?.replacingOccurrences(of: #"\s*(…|\.\.\.)?\s*Read more$"#, with: "…", options: .regularExpression)
+            let snippet = row["snippet"]?.stringValue?.replacingOccurrences(of: #"\s*(…|\.\.\.)?\s*Read more$"#, with: "…", options: .regularExpression)
             return .init(title: String(title.prefix(200)), content: .object(["site": .string(site), "snippet": snippet.map(JSONValue.string) ?? .null]), actions: [
                 .init(label: "Read this page", action: .open(.record(tool: "read_page", input: ["url": .string(url)], title: String(title.prefix(100))))),
                 // Navigation reuses this conversation's tab or opens one in her group.
@@ -61,19 +61,19 @@ enum AgentWorkspaceKnowledge {
             ])
         }
         // A failed search reads as its error, never as "no results".
-        let failed = content["ok"] == .bool(false) || content["error"] != nil
+        let failed = ChatToolOutcome.carriesFailureEvidence(result)
         if !failed, content["status"] == nil || content["status"] == .string("ok") {
             content["status"] = .string("ok")
             if items.isEmpty { content["message"] = .string("No results. Try other words.") }
-            if let query = text(input["query"]) { content["about"] = .string("Private search for \"\(query.prefix(80))\"; no browser tab was opened.") }
+            if let query = input["query"]?.stringValue { content["about"] = .string("Private search for \"\(query.prefix(80))\"; no browser tab was opened.") }
         }
         return .init(title: "Web search", content: .object(content), items: items, actions: [
             .init(label: "Search again", action: .perform(tool: webSearchTool, input: [:], title: "Web search", textField: "query", isEffect: false), needsText: true),
         ])
     }
 
-    private static func memory(input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection {
-        var content = object(result)
+    private static func memory(input: [String: JSONValue], result: JSONValue) -> WorkspacePage {
+        var content = result.objectValue ?? [:]
         var items: [AgentWorkspaceItem] = []
         var actions: [AgentWorkspaceButton] = [
             .init(label: "Recall something else", action: .perform(tool: "recall_memory", input: [:], title: "Memory", textField: "query", isEffect: false), needsText: true),
@@ -81,16 +81,24 @@ enum AgentWorkspaceKnowledge {
         ]
         if case .array(let hits)? = content.removeValue(forKey: "hits") {
             items = hits.map { hit in
-                let row = object(hit)
+                let row = hit.objectValue ?? [:]
                 var buttons: [AgentWorkspaceButton] = []
                 // IDs come only from the canonical hit, never its text/evidence.
                 if let id = identifier(row["id"]) {
                     buttons.append(.init(label: "Read memory and evidence", action: .open(.record(
                         tool: "recall_memory", input: ["memory_id": .string(id), "offset": .int(0), "max_characters": .int(2000)], title: memoryTitle(row)))))
                 }
-                return .init(title: String((text(row["preview"]) ?? text(row["content"]) ?? "Memory").prefix(100)), content: hit, actions: buttons)
+                return .init(title: String((row["preview"]?.stringValue ?? row["content"]?.stringValue ?? "Memory").prefix(100)), content: hit, actions: buttons)
             }
             content["returned_memories"] = .int(Int64(hits.count))
+            if content["has_more"] == .bool(true), let query = input["query"]?.stringValue,
+               case .int(let offset)? = content["next_offset"], offset > 0 {
+                var next = input
+                next["query"] = .string(query)
+                next["offset"] = .int(offset)
+                actions.insert(.init(label: "More memories", action: .open(.record(
+                    tool: "recall_memory", input: next, title: "Memory"))), at: 0)
+            }
         }
         if let id = identifier(input["memory_id"]), content["id"] == .string(id) {
             if let continuation = memoryContinuation(content["read_more"], id: id, page: content) {
@@ -103,7 +111,7 @@ enum AgentWorkspaceKnowledge {
     }
 
     static func memoryTitle(_ row: [String: JSONValue]) -> String {
-        let excerpt = text(row["preview"]) ?? text(row["content"]) ?? ""
+        let excerpt = row["preview"]?.stringValue ?? row["content"]?.stringValue ?? ""
         let label = excerpt.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
         return label.isEmpty ? "Memory evidence" : "Memory: " + String(label.prefix(100))
     }
@@ -116,26 +124,20 @@ enum AgentWorkspaceKnowledge {
               case .int(let offset)? = next["offset"], offset > 0,
               next["offset"] == page["next_offset"],
               case .int(let size)? = next["max_characters"], size > 0, size <= 2000,
-              let hash = text(next["expected_content_sha256"]), hash.count == 64,
+              let hash = next["expected_content_sha256"]?.stringValue, hash.count == 64,
               hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }),
               page["content_sha256"] == .string(hash) else { return nil }
         return next
     }
 
 
-    private static func object(_ value: JSONValue) -> [String: JSONValue] {
-        guard case .object(let row) = value else { return [:] }; return row
-    }
-    private static func text(_ value: JSONValue?) -> String? {
-        guard case .string(let value)? = value else { return nil }; return value
-    }
     private static func identifier(_ value: JSONValue?) -> String? {
-        guard let value = text(value), !value.isEmpty, value.count <= 500,
+        guard let value = value?.stringValue, !value.isEmpty, value.count <= 500,
               !value.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else { return nil }
         return value
     }
     private static func validWebURL(_ value: JSONValue?) -> String? {
-        guard let value = text(value), value.count <= 8192, let url = URL(string: value),
+        guard let value = value?.stringValue, value.count <= 8192, let url = URL(string: value),
               ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
               url.host?.isEmpty == false, url.user == nil, url.password == nil else { return nil }
         return value

@@ -1,5 +1,6 @@
 import SwiftUI
-// Blueprint: | `SkillsToolsView.swift` | Shared tool catalog presentation and local page/search/loading state |
+import NativeAgentShared
+// Blueprint: | `SkillsToolsView.swift` | Combined catalog refresh/loading/error owner; tool renderer reads shared sync catalog and retains local search state |
 
 enum ToolCatalogPresentation {
     enum ContentState: Equatable {
@@ -8,16 +9,6 @@ enum ToolCatalogPresentation {
         case unpublished
         case noMatches
         case content
-    }
-    enum Status: Equatable {
-        case known(String)
-        case unknown
-    }
-
-    enum Automaticity: Equatable {
-        case automatic
-        case manual
-        case unknown
     }
 
     static func contentState(isLoading: Bool, error: String?, toolCount: Int, visibleCount: Int) -> ContentState {
@@ -28,20 +19,6 @@ enum ToolCatalogPresentation {
         return .content
     }
 
-    static func status(for tool: ToolRecord) -> Status {
-        guard let raw = tool.status?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
-            return .unknown
-        }
-        return .known(raw.replacingOccurrences(of: "_", with: " ").capitalized)
-    }
-
-    static func automaticity(for tool: ToolRecord) -> Automaticity {
-        switch tool.autoRun {
-        case true: return .automatic
-        case false: return .manual
-        case nil: return .unknown
-        }
-    }
 }
 
 // MARK: - Skills & Tools
@@ -54,15 +31,14 @@ private enum MobileSkillsToolsSection: String, CaseIterable, Identifiable {
 }
 
 /// One combined destination matching the Mac app. Both pages read the shared
-/// sync catalog; this wrapper owns only the visible page selection and
-/// can either host its own navigation stack or live inside More's stack.
+/// sync catalog; this destination owns their one refresh and visible page
+/// selection, inside its caller's navigation stack.
 struct SkillsToolsView: View {
     @AppStorage("NativeAgentMobile.skillsToolsSection") private var selectedRawValue = MobileSkillsToolsSection.skills.rawValue
-    private let embedInNavigationStack: Bool
-
-    init(embedInNavigationStack: Bool = true) {
-        self.embedInNavigationStack = embedInNavigationStack
-    }
+    @EnvironmentObject private var pairingStore: PairingStore
+    @State private var isLoading = false
+    @State private var error: String?
+    private let sync = iCloudSyncEngine.shared
 
     private var selection: Binding<MobileSkillsToolsSection> {
         Binding(
@@ -71,16 +47,7 @@ struct SkillsToolsView: View {
         )
     }
 
-    var body: some View {
-        if embedInNavigationStack {
-            NavigationStack { content }
-        } else {
-            content
-        }
-    }
-
-    /// The page switch sits under the header; each page owns its own scroll,
-    /// pull-to-refresh and search.
+    /// The page switch sits under the header; each page owns its scroll and filters.
     private var picker: some View {
         AliveSegmentedPicker(selection: selection, options: MobileSkillsToolsSection.allCases) { $0.rawValue }
             .accessibilityElement(children: .contain)
@@ -88,33 +55,26 @@ struct SkillsToolsView: View {
             .accessibilityIdentifier("skills-tools-section-picker")
     }
 
-    private var content: some View {
-        Group {
+    var body: some View {
+        VStack(spacing: 0) {
             switch selection.wrappedValue {
             case .skills:
-                SkillLifecycleView(accessory: AnyView(picker))
+                SkillLifecycleView(accessory: AnyView(picker), isLoading: isLoading, error: error, refresh: { await refresh() })
             case .tools:
-                MobileToolCatalogView(accessory: AnyView(picker))
+                MobileToolCatalogView(accessory: AnyView(picker), isLoading: isLoading, error: error, refresh: { await refresh() })
             }
         }
         .macSyncErrorBanner()
+        .refreshable { await refresh() }
+        .task(id: sync.groupTransportDeliveryAt["catalog"]) {
+            await refresh(pollIncoming: sync.groupTransportDeliveryAt["catalog"] == nil)
+        }
     }
-}
 
-@MainActor
-private final class MobileToolCatalogStore: ObservableObject {
-    var tools: [ToolRecord] {
-        #if DEBUG
-        if MobileDesignSamples.screen != nil { return MobileToolDesignSample.tools }
-        #endif
-        return iCloudSyncEngine.shared.tools.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
-    }
-    @Published var isLoading = false
-    @Published var error: String?
-
-    func refresh(pairingStore: PairingStore, pollIncoming: Bool = true) async {
+    private func refresh(pollIncoming: Bool = true) async {
+        guard !isLoading else { return }
         guard pairingStore.isPaired else {
-            error = "Pair iPhone with the Mac to see tools."
+            error = "Pair iPhone with the Mac to see skills and tools."
             return
         }
         isLoading = true
@@ -122,19 +82,18 @@ private final class MobileToolCatalogStore: ObservableObject {
         defer { isLoading = false }
 
         if pollIncoming { await iCloudBridge.shared.pollIncomingNow() }
-        let refreshed = await iCloudSyncEngine.shared.refreshCatalogSnapshot()
-        if !refreshed && tools.isEmpty {
-            error = "No tool catalog has synced yet — Mac is publishing."
+        if !(await sync.refreshCatalogSnapshot()) {
+            error = "Some of the skill and tool catalog is still downloading from iCloud."
         }
     }
 }
 
 #if DEBUG
 private enum MobileToolDesignSample {
-    static let tools: [ToolRecord] = [
-        ToolRecord(id: "t2", name: "web_search", kind: "builtin", status: "available",
+    static let tools: [MobileToolCatalogRecord] = [
+        MobileToolCatalogRecord(id: "t2", name: "web_search", kind: "builtin", status: "available",
                    description: "Search the web and read the pages that answer the question.", autoRun: true),
-        ToolRecord(id: "t3", name: "shell_exec", kind: "builtin", status: "policy_locked",
+        MobileToolCatalogRecord(id: "t3", name: "shell_exec", kind: "builtin", status: "policy_locked",
                    description: "Run a command in Terminal on the Mac.", autoRun: false),
     ]
 }
@@ -142,15 +101,23 @@ private enum MobileToolDesignSample {
 
 private struct MobileToolCatalogView: View {
     let accessory: AnyView
-    @EnvironmentObject private var pairingStore: PairingStore
-    @StateObject private var store = MobileToolCatalogStore()
+    let isLoading: Bool
+    let error: String?
+    let refresh: () async -> Void
     private let sync = iCloudSyncEngine.shared
     @State private var searchText = ""
-    @State private var searchIndex = MobileSearchIndex<ToolRecord>()
-    @State private var searchResults: [ToolRecord] = []
+    @State private var searchIndex = MobileSearchIndex<MobileToolCatalogRecord>()
+    @State private var searchResults: [MobileToolCatalogRecord] = []
 
-    private var visibleTools: [ToolRecord] {
-        searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? store.tools : searchResults
+    private var tools: [MobileToolCatalogRecord] {
+        #if DEBUG
+        if MobileDesignSamples.screen != nil { return MobileToolDesignSample.tools }
+        #endif
+        return sync.tools.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private var visibleTools: [MobileToolCatalogRecord] {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? tools : searchResults
     }
 
     var body: some View {
@@ -158,9 +125,9 @@ private struct MobileToolCatalogView: View {
         return AlivePage(title: "Skills & Tools", line: "What I can do, and how.",
                  freshnessGroup: "tools_snapshot", accessory: accessory) {
             switch ToolCatalogPresentation.contentState(
-                isLoading: store.isLoading,
-                error: store.error,
-                toolCount: store.tools.count,
+                isLoading: isLoading,
+                error: error,
+                toolCount: tools.count,
                 visibleCount: visibleTools.count
             ) {
             case .loading:
@@ -190,49 +157,42 @@ private struct MobileToolCatalogView: View {
         // The search floats over the list, like Memories.
         .safeAreaInset(edge: .bottom, spacing: 0) {
             // Nothing to search until the Mac has published tools.
-            if !store.tools.isEmpty || !searchText.isEmpty {
+            if !tools.isEmpty || !searchText.isEmpty {
                 AliveSearchField(prompt: "Search tools", text: $searchText)
                     .padding(.horizontal, AliveMetrics.pageInset)
                     .padding(.top, 6)
                     .padding(.bottom, 8)
             }
         }
-        .task(id: MobileSearchInput(rows: store.tools, query: searchText)) {
-            let input = MobileSearchInput(rows: store.tools, query: searchText.trimmingCharacters(in: .whitespacesAndNewlines))
+        .task(id: MobileSearchInput(rows: tools, query: searchText)) {
+            let input = MobileSearchInput(rows: tools, query: searchText.trimmingCharacters(in: .whitespacesAndNewlines))
             let result = await searchIndex.search(input, maximum: input.rows.count,
                 fields: { [$0.name, $0.description ?? "", $0.kind ?? ""] },
                 matches: { $0.localizedCaseInsensitiveContains($1) })
             guard !Task.isCancelled else { return }
             searchResults = result
         }
-        .refreshable {
-            await store.refresh(pairingStore: pairingStore)
-        }
-        .task(id: sync.groupTransportDeliveryAt["catalog"]) {
-            await store.refresh(pairingStore: pairingStore,
-                                pollIncoming: sync.groupTransportDeliveryAt["catalog"] == nil)
-        }
     }
 
     private func retry() {
-        Task { await store.refresh(pairingStore: pairingStore) }
+        Task { await refresh() }
     }
 }
 
 private struct ToolCatalogRow: View {
-    let tool: ToolRecord
+    let tool: MobileToolCatalogRecord
 
     /// Status, how it runs and its kind, folded into one secondary line.
     private var statusLine: String {
         var parts: [String] = []
-        switch ToolCatalogPresentation.status(for: tool) {
-        case .known(let value): parts.append(value.prefix(1).uppercased() + value.dropFirst().lowercased())
-        case .unknown: parts.append("Status unknown")
+        if let raw = tool.status?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+            let value = raw.replacingOccurrences(of: "_", with: " ").capitalized
+            parts.append(value.prefix(1).uppercased() + value.dropFirst().lowercased())
+        } else {
+            parts.append("Status unknown")
         }
-        switch ToolCatalogPresentation.automaticity(for: tool) {
-        case .automatic: parts.append("runs on its own")
-        case .manual: parts.append("asks first")
-        case .unknown: break
+        if let autoRun = tool.autoRun {
+            parts.append(autoRun ? "runs on its own" : "asks first")
         }
         if let kind = tool.kind, !kind.isEmpty {
             parts.append(kind.lowercased() == "builtin" ? "built in" : AliveWords.humanized(kind).lowercased())

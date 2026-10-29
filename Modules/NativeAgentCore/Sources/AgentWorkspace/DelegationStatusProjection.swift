@@ -1,392 +1,17 @@
 import ChatSessionWork
 import Foundation
+import NativeAgentShared
 import PersistenceCore
 import NativeAgentCore
-// Blueprint: | `DelegationStatusProjection.swift` | `DelegationDeliveryCache` class; `read`; consumes lifecycle decisions with their known principal and source; resumable work obeys the originating DataRootLife, reads stopped/restored across lives and resumes fresh only on explicit request |
+import Darwin
+// Blueprint: | `DelegationStatusProjection.swift` | Delegation source inventory and read snapshots; retained facts preserve originating DataRootLife and unknown delivery |
 
-/// Process-local read acceleration only. The ledger remains authoritative.
-/// One lock covers stamp validation, append reads and publication across tool
-/// observations and the outcome loop. Terminal projections have no clock input.
-final class DelegationDeliveryCache: @unchecked Sendable {
-    struct Snapshot {
-        var byID: [String: DelegationJobProjection] = [:]
-        var ordered: [DelegationJobProjection] = []
-        var deliveredIDs: Set<String> = []
-        var availability = DelegationSourceAvailability(source: "codex_deliveries", agent: "codex")
-    }
-    private struct Stamp: Equatable {
-        let inode: UInt64
-        let device: UInt64
-        let modified: Date
-        let created: Date
-        let size: UInt64
-        let permissions: UInt16
-
-        init(_ url: URL) throws {
-            let a = try FileManager.default.attributesOfItem(atPath: url.resolvingSymlinksInPath().path)
-            guard a[.type] as? FileAttributeType == .typeRegular,
-                  let inode = a[.systemFileNumber] as? NSNumber,
-                  let device = a[.systemNumber] as? NSNumber,
-                  let modified = a[.modificationDate] as? Date,
-                  let created = a[.creationDate] as? Date,
-                  let size = a[.size] as? NSNumber else { throw CocoaError(.fileReadUnknown) }
-            self.inode = inode.uint64Value; self.device = device.uint64Value
-            self.modified = modified; self.created = created; self.size = size.uint64Value
-            self.permissions = (a[.posixPermissions] as? NSNumber)?.uint16Value ?? 0
-        }
-
-        func sameFile(as other: Stamp) -> Bool {
-            inode == other.inode && device == other.device && created == other.created
-        }
-    }
-    private struct Entry {
-        var stamp: Stamp
-        var offset: UInt64 = 0
-        var committed = Snapshot()
-        var visible = Snapshot()
-    }
-    private let lock = NSLock()
-    private var entries: [String: Entry] = [:]
-
-    func read(_ url: URL) -> Snapshot {
-        lock.lock()
-        defer { lock.unlock() }
-        let key = url.standardizedFileURL.path
-        do {
-            let stamp = try Stamp(url)
-            if let entry = entries[key], entry.stamp == stamp { return entry.visible }
-            var entry: Entry
-            if let previous = entries[key], stamp.sameFile(as: previous.stamp), stamp.size > previous.stamp.size {
-                entry = previous
-            } else {
-                entry = Entry(stamp: stamp)
-            }
-            let file = try FileHandle(forReadingFrom: url)
-            defer { try? file.close() }
-            try file.seek(toOffset: entry.offset)
-            let data = try file.readToEnd() ?? Data()
-            // A moving/replaced file is unavailable for this observation. Never
-            // publish a mixed generation or advance its cursor.
-            guard try Stamp(url) == stamp, UInt64(data.count) == stamp.size - entry.offset else {
-                throw CocoaError(.fileReadUnknown)
-            }
-            let completeEnd = data.lastIndex(of: 0x0A).map { $0 + 1 } ?? data.startIndex
-            for line in data[..<completeEnd].split(separator: 0x0A) {
-                consume(Data(line), into: &entry.committed)
-            }
-            entry.offset += UInt64(completeEnd - data.startIndex)
-            entry.visible = entry.committed
-            // Preserve legacy files with a final JSON object but no newline.
-            // This suffix is provisional: a later append re-reads it from the
-            // last complete-line offset, without double-counting malformed rows.
-            if completeEnd < data.endIndex { consume(Data(data[completeEnd...]), into: &entry.visible) }
-            entry.visible.ordered = entry.visible.byID.values.sorted(by: DelegationStatusProjector.newestFirst)
-            if entry.visible.availability.malformedRecords > 0 { entry.visible.availability.status = "partial" }
-            entry.stamp = stamp
-            entries[key] = entry
-            return entry.visible
-        } catch {
-            entries.removeValue(forKey: key)
-            var result = Snapshot()
-            let error = error as NSError
-            let absent = error.domain == NSCocoaErrorDomain && [NSFileReadNoSuchFileError, NSFileNoSuchFileError].contains(error.code)
-            result.availability.status = absent ? "absent" : "unavailable"
-            result.availability.unreadableFiles = absent ? 0 : 1
-            return result
-        }
-    }
-
-    private func consume(_ line: Data, into snapshot: inout Snapshot) {
-        guard !line.allSatisfy({ [0x20, 0x09, 0x0D].contains($0) }) else { return }
-        guard let parsed = try? JSONValue.parse(line), case .object(let object) = parsed,
-              case .array(let ids)? = object["messageIds"], ids.contains(where: {
-                  if case .string(let id) = $0 { return !id.isEmpty }; return false
-              }) else {
-            snapshot.availability.malformedRecords += 1
-            return
-        }
-        snapshot.availability.readableRecords += 1
-        for row in DelegationStatusProjector.projectCodexDeliveries(now: .distantPast, objects: [object]) {
-            if let previous = snapshot.byID[row.id], previous.deliveryOutcome == "delivered",
-               previous.recordedThreadID == row.recordedThreadID,
-               previous.recordedTurnID == row.recordedTurnID, row.deliveryOutcome != "delivered",
-               object["settlement"] == nil { continue }
-            snapshot.byID[row.id] = row
-            if row.deliveryOutcome == "delivered" { snapshot.deliveredIDs.insert(row.id) }
-            else if object["settlement"] != nil { snapshot.deliveredIDs.remove(row.id) }
-        }
-    }
-}
-
-/// Process-local parse reuse for job files and inbox tails: a file whose
-/// inode, size and modification time are unchanged is not read or parsed
-/// again. Projection (which depends on `now`) still runs on every read.
-final class DelegationFileCache: @unchecked Sendable {
-    private let lock = NSLock()
-    private var jobs: [String: [String: (stamp: String, object: [String: JSONValue])]] = [:]
-    private var tails: [String: (stamp: String, found: [String: [String: String]])] = [:]
-
-    static func stamp(_ url: URL) -> String? {
-        guard let a = try? FileManager.default.attributesOfItem(atPath: url.resolvingSymlinksInPath().path),
-              let inode = a[.systemFileNumber] as? NSNumber, let size = a[.size] as? NSNumber,
-              let modified = a[.modificationDate] as? Date else { return nil }
-        return "\(inode) \(size) \(modified.timeIntervalSinceReferenceDate) \((a[.posixPermissions] as? NSNumber)?.intValue ?? -1)"
-    }
-
-    func jobSnapshot(_ directory: String) -> [String: (stamp: String, object: [String: JSONValue])] {
-        lock.withLock { jobs[directory] ?? [:] }
-    }
-    func putJobs(_ directory: String, _ files: [String: (stamp: String, object: [String: JSONValue])]) {
-        lock.withLock { jobs[directory] = files }
-    }
-    func tail(_ key: String, stamp: String) -> [String: [String: String]]? {
-        lock.withLock { tails[key].flatMap { $0.stamp == stamp ? $0.found : nil } }
-    }
-    func putTail(_ key: String, stamp: String, _ found: [String: [String: String]]) {
-        lock.withLock { tails[key] = (stamp, found) }
-    }
-}
-
-// MARK: - Delegation status projection
-// The bridge writers own their distinct record shapes; this reader joins job
-// state, accepted-message identities and durable delivery receipts. Runner
-// heartbeat proves watcher activity, never child progress. Cross-life work is
-// stopped; terminal delivery evidence remains retained.
-
-/// One job's projected lifecycle, normalized across the bridge stores.
-/// Every timestamp is the RAW string from the record (already ISO-8601 from
-/// both writers) — we never reformat, so a malformed legacy value round-trips
-/// visibly instead of silently becoming `null`.
-public struct DelegationJobProjection: Sendable, Equatable {
-    public var replyOwed: Bool { ["owed", "sent_unconfirmed"].contains(deliveryOutcome ?? "") }
-
-    public enum StallBasis: String, Sendable {
-        /// `now` is past the runner's own recorded `deadlineAt`.
-        case deadline
-        /// Liveness went quiet for longer than the record's `stallSeconds`.
-        case stallSeconds = "stall_seconds"
-        /// Terminal record — a settled job cannot be stalled.
-        case terminal
-        /// The record carries neither a deadline nor a stall threshold.
-        /// `stalled` is reported false but that is ABSENCE OF EVIDENCE.
-        case none
-        /// 2026-09-06: the run ended (`state: delivering`) and no settlement
-        /// followed within the delivery grace. The runner writes `delivering`
-        /// BEFORE it awaits the bridge POST, so a worker that dies there leaves
-        /// a record that says the run is over and never settles.
-        case deliveryStall = "delivery_stall"
-        case rolloutIdle = "rollout_idle"
-        case recordedStall = "recorded_stall"
-    }
-
-    public var id: String
-    /// Exact identity returned to the dispatching turn and therefore used by
-    /// the shared motor lifecycle. Codex has a separate internal reply-job id;
-    /// keeping both prevents its terminal projection from closing a different
-    /// action than the one dispatch opened.
-    public var motorOwnerID: String? = nil
-    package var completionDeliveryID: String? = nil
-    /// A batched Codex reply retains every accepted action for settlement.
-    public internal(set) var acceptedMessageIDs: Set<String> = []
-    package var recordedThreadID: String? = nil
-    package var recordedTurnID: String? = nil
-    /// Claude's `claude:<topic>` handle, joined from the inbox row.
-    var conversationID: String? = nil
-    /// Her side of the exchange: the inbox message this reply answered.
-    var requestTextHead: String? = nil
-    /// Retained executor text, distinct from Agent's delivery assessment.
-    public var agentReplyTextHead: String? = nil
-    /// Bounded original executor words, separate from delivery diagnostics.
-    var agentReplyText: String? = nil
-    var agentReplyTruncated: Bool = false
-    /// Which bridge store this row came from: "claude" | "codex" | "omp".
-    public var source: String
-    /// The agent that runs the job. Currently 1:1 with `source`, kept separate
-    /// because the claude store is also where a future third runner would land.
-    public var agent: String
-    public var topicSlug: String?
-    /// Exact stable Desk item bound at dispatch, never inferred from prose.
-    public var deskHandle: String?
-    public var state: String?
-    public var status: String?
-    public var runStatus: String?
-    public var createdAt: String?
-    public var claimedAt: String?
-    public var startedAt: String?
-    /// max(heartbeatAt, progressAt) for claude; measured rollout write for codex.
-    public var lastLiveness: String?
-    public var watcherObservedAt: String? = nil
-    public var toolActivityCount: Int? = nil
-    public var noWorkObserved: Bool? = nil
-    public var recoveryStatus: String? = nil
-    public var completedAt: String?
-    /// Wall-clock seconds from the earliest known start (startedAt ?? claimedAt
-    /// ?? createdAt) to completedAt, or to `now` while the job is still open.
-    /// nil when no start timestamp exists at all (legacy record).
-    public var elapsedSeconds: Int?
-    public var stalled: Bool
-    public var stallBasis: StallBasis
-    /// Only set when the record ITSELF asserts it (claude's `deliveryLost`
-    /// field). Never inferred — see `deliveryOutcome`.
-    public var deliveryLost: Bool?
-    /// Receipt or reconciled settlement; retained files alone never prove loss.
-    public var deliveryOutcome: String?
-    /// Allowlisted machine reason only; never raw helper errors or prose.
-    public var deliveryReason: String? = nil
-    public var onwardDelivery: JSONValue? = nil
-    /// First 200 characters of the completion text, when the record carries it.
-    ///
-    /// Absent on most claude rows BY DESIGN: the runner nulls completionText
-    /// once delivery succeeds (claude_thread_wakeup.js L1551) and only retains
-    /// it when the text still needs replaying. Its absence means "delivered",
-    /// not "missing".
-    public var completionTextHead: String?
-    /// Read-only recovery evidence. A later receipt is not an automatic replay
-    /// authorization or proof that a different completion was consumed.
-    public var recoveryNote: String? = nil
-    /// Bounded, redacted terminal execution evidence, independent of delivery.
-    public var executionError: String? = nil
-    /// Identifies the evidence being projected, not another execution.
-    public var recordKind: String? = nil
-    public var deliveryReceiptVersion: String? = nil
-    /// Contract/build identity stamped by the NativeAgent runtime that
-    /// originated this wake. Absence means a legacy/unversioned producer.
-    public var producerSchemaVersion: Int? = nil
-    public var producerSourceRevision: String? = nil
-
-    /// Newest-first ordering key: the most recent timestamp the record proves.
-    var recencyKey: Date?
-    /// Exact future crossing at which this open record's existing liveness
-    /// rule becomes stalled. Drawing and scheduling evidence only; the public
-    /// JSON continues to expose the verdict and basis, not another workflow
-    /// field.
-    var stallDeadline: Date?
-
-    func stalled(at now: Date) -> Bool {
-        stallBasis == .recordedStall || (stallDeadline.map { now >= $0 } ?? stalled)
-    }
-
-    public func toJSON(includeReplyText: Bool = false) -> JSONValue {
-        var obj: [String: JSONValue] = [
-            "id": .string(id),
-            "source": .string(source),
-            "agent": .string(agent),
-            "stalled": .bool(stalled),
-            "stall_basis": .string(stallBasis.rawValue),
-        ]
-        // Absent fields are OMITTED, not emitted as null: an older record that
-        // predates a field should read as "this record doesn't say", and an
-        // explicit null in the envelope invites the model to narrate it as a
-        // finding.
-        func put(_ key: String, _ value: String?) {
-            if let value, !value.isEmpty { obj[key] = .string(value) }
-        }
-        put("topic_slug", topicSlug)
-        put("motor_owner_id", motorOwnerID)
-        put("desk_handle", deskHandle)
-        put("state", state)
-        put("status", status)
-        put("run_status", runStatus)
-        put("created_at", createdAt)
-        put("claimed_at", claimedAt)
-        put("started_at", startedAt)
-        put("last_liveness", lastLiveness)
-        put("watcher_observed_at", watcherObservedAt)
-        put("recovery_status", recoveryStatus)
-        if let toolActivityCount { obj["tool_activity_count"] = .int(Int64(toolActivityCount)) }
-        if let noWorkObserved { obj["no_work_observed"] = .bool(noWorkObserved) }
-        put("completed_at", completedAt)
-        put("completion_text_head", completionTextHead)
-        put("request_text_head", requestTextHead)
-        put("agent_reply_text_head", agentReplyTextHead)
-        if includeReplyText {
-            put("agent_reply_text", agentReplyText)
-            if agentReplyText != nil { obj["agent_reply_truncated"] = .bool(agentReplyTruncated) }
-        }
-        put("execution_error", executionError)
-        put("record_kind", recordKind)
-        put("recovery_note", recoveryNote)
-        put("thread_id", recordedThreadID)
-        put("turn_id", recordedTurnID)
-        put("conversation_id", conversationID)
-        obj["accepted_message_ids"] = .array(acceptedMessageIDs.sorted().map(JSONValue.string))
-        put("delivery_outcome", deliveryOutcome)
-        put("delivery_reason", deliveryReason)
-        if let onwardDelivery { obj["onward_delivery"] = onwardDelivery }
-        put("producer_source_revision", producerSourceRevision)
-        if let producerSchemaVersion {
-            obj["producer_schema_version"] = .int(Int64(producerSchemaVersion))
-        }
-        if let elapsedSeconds { obj["elapsed_seconds"] = .int(Int64(elapsedSeconds)) }
-        if let deliveryLost { obj["delivery_lost"] = .bool(deliveryLost) }
-        return .object(obj)
-    }
-
-    /// Provider-facing status row for ordinary progress checks. Lifecycle
-    /// truth stays intact while low-value duplicate provenance/timestamps are
-    /// reserved for `detail=full`.
-    public func toCompactJSON() -> JSONValue {
-        var obj: [String: JSONValue] = [
-            "id": .string(id),
-            "agent": .string(agent),
-            "stalled": .bool(stalled),
-            "stall_basis": .string(stallBasis.rawValue),
-        ]
-        func put(_ key: String, _ value: String?) {
-            if let value, !value.isEmpty { obj[key] = .string(value) }
-        }
-        put("topic_slug", topicSlug)
-        put("motor_owner_id", motorOwnerID)
-        put("desk_handle", deskHandle)
-        put("state", state)
-        put("status", status)
-        put("run_status", runStatus)
-        put("last_liveness", lastLiveness)
-        put("recovery_status", recoveryStatus)
-        if let toolActivityCount { obj["tool_activity_count"] = .int(Int64(toolActivityCount)) }
-        if let noWorkObserved { obj["no_work_observed"] = .bool(noWorkObserved) }
-        put("completed_at", completedAt)
-        put("completion_text_head", completionTextHead)
-        put("execution_error", executionError)
-        put("record_kind", recordKind)
-        put("conversation_id", conversationID)
-        put("delivery_outcome", deliveryOutcome)
-        put("delivery_reason", deliveryReason)
-        if let elapsedSeconds { obj["elapsed_seconds"] = .int(Int64(elapsedSeconds)) }
-        return .object(obj)
-    }
-}
-
-package struct DelegationSourceAvailability: Sendable {
-    package let source: String
-    package let agent: String
-    package var status = "available"
-    package var readableRecords = 0
-    package var malformedRecords = 0
-    package var unreadableFiles = 0
-
-    package var json: JSONValue {
-        .object(["source": .string(source), "agent": .string(agent), "status": .string(status),
-                 "readable_records": .int(Int64(readableRecords)), "malformed_records": .int(Int64(malformedRecords)),
-                 "unreadable_files": .int(Int64(unreadableFiles))])
-    }
-}
-
-package struct DelegationStatusReadSnapshot: Sendable {
-    package let jobs: [DelegationJobProjection]
-    package let sources: [DelegationSourceAvailability]
-    package let matchedCount: Int
-}
-
-/// Pure, injectable reader over the three wake-job stores.
 public struct DelegationStatusProjector: Sendable {
     /// Default: `~/.config/claude-bridge/wake-jobs`.
     public var claudeJobsDirectory: URL
     /// Default: `~/.config/codex-nativeagent-bridge/reply-jobs`.
     public var codexJobsDirectory: URL
-    /// Default: `~/.config/codex-nativeagent-bridge/reply-deliveries.jsonl`.
-    /// This is the terminal half of the Codex lifecycle after successful jobs
-    /// leave `reply-jobs/`.
+    /// Default: `~/.config/codex-nativeagent-bridge/reply-deliveries.jsonl`. This is the terminal half of the Codex lifecycle after successful jobs leave `reply-jobs/`.
     public var codexDeliveriesFile: URL
     /// Default: `~/.config/omp-bridge/wake-jobs`.
     public var ompJobsDirectory: URL
@@ -399,7 +24,7 @@ public struct DelegationStatusProjector: Sendable {
     /// Every source read by the projection, including existing jobs updated in place.
     package var watchedPaths: [URL] {
         let directories = [claudeJobsDirectory, codexJobsDirectory, codexJobsDirectory.appendingPathComponent("undelivered"), ompJobsDirectory]
-            + CodexCompletionLifecycleProjection.directories(
+            + CodexCompletionReadout.directories(
                 configRoot: claudeJobsDirectory.deletingLastPathComponent().deletingLastPathComponent(), dataRoot: dataRoot)
         return directories.flatMap { directory in
             [directory] + ((try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []).sorted { $0.path < $1.path }
@@ -407,8 +32,7 @@ public struct DelegationStatusProjector: Sendable {
             + ["claude-inbox.jsonl", "claude-replies.jsonl"].map { claudeJobsDirectory.deletingLastPathComponent().appendingPathComponent($0) }
     }
 
-    /// `configRoot` mirrors `SwiftToolDispatcher.agentBridgeConfigRoot`: the
-    /// stand-in for `~/.config`, which is what makes the tests hermetic.
+    /// `configRoot` mirrors `SwiftToolDispatcher.agentBridgeConfigRoot`: the stand-in for `~/.config`, which is what makes the tests hermetic.
     public init(configRoot: URL? = nil, dataRoot: URL = PersistenceCore.defaultDataRoot()) {
         self.dataRoot = dataRoot
         let root = configRoot ?? InstallPaths.current.bridgeConfigRoot
@@ -444,35 +68,18 @@ public struct DelegationStatusProjector: Sendable {
             .appendingPathComponent("omp-bridge/wake-jobs", isDirectory: true)
     }
 
-    /// Read all supported stores and return the newest `limit` jobs, newest first.
-    /// Unreadable/absent directories contribute zero rows rather than failing
-    /// the whole call — a machine with only one bridge configured still gets a
-    /// useful answer.
-    public func recentJobs(now: Date, limit: Int = DelegationStatusProjector.defaultLimit) -> [DelegationJobProjection] {
+    /// Read all supported stores and return the newest `limit` jobs, newest first. Unreadable/absent directories contribute zero rows rather than failing the whole call — a machine with only one bridge configured still gets a useful
+    /// answer.
+    public func recentJobs(now: Date, limit: Int = DelegationStatusProjector.defaultLimit) -> [DelegationReadout] {
         let bounded = max(1, min(limit, Self.maxLimit))
         return readSnapshot(now: now, limit: bounded).jobs
     }
 
-    /// Item 5 (2026-09-02): the jobs AND whether every configured store
-    /// actually answered, from ONE read of disk.
-    ///
-    /// `recentJobs` cannot express this. It swallows absent and unreadable
-    /// stores alike so that "a machine with only one bridge configured still
-    /// gets a useful answer" — which is right for a display, and wrong for any
-    /// caller that reads an EMPTY result as a fact about the world. The horizon
-    /// register is such a caller: a peer disappearing from the pending set means
-    /// "they wrote back", so a bridge directory that briefly could not be read
-    /// would otherwise mint relief for a reply that never came.
-    ///
-    /// `allStoresReadable` is true when every source is either `available` or
-    /// `absent`. Absent is deliberately fine: a bridge that is not configured on
-    /// this machine is not a failed read, it is a peer she does not have. Only
-    /// `unavailable` (present but unreadable) and `partial` (some records
-    /// unreadable or malformed) make the answer untrustworthy.
+    /// One disk read reports jobs and availability; only absent or fully readable stores count as readable.
     public func recentJobsWithAvailability(
         now: Date,
         limit: Int = DelegationStatusProjector.defaultLimit
-    ) -> (jobs: [DelegationJobProjection], allStoresReadable: Bool) {
+    ) -> (jobs: [DelegationReadout], allStoresReadable: Bool) {
         let bounded = max(1, min(limit, Self.maxLimit))
         let snapshot = readSnapshot(now: now, limit: bounded)
         return (
@@ -481,23 +88,16 @@ public struct DelegationStatusProjector: Sendable {
         )
     }
 
-    /// Complete ordered projection for reconciliation owners. This is
-    /// deliberately separate from `recentJobs`: the latter is a model-visible
-    /// display budget, while a durable outcome cursor must never skip an older
-    /// record merely because more than 100 newer jobs arrived in one burst.
-    public func allJobs(now: Date) -> [DelegationJobProjection] {
+    /// Complete ordered projection for reconciliation owners. This is deliberately separate from `recentJobs`: the latter is a model-visible display budget, while a durable outcome cursor must never skip an older record merely because more
+    /// than 100 newer jobs arrived in one burst.
+    public func allJobs(now: Date) -> [DelegationReadout] {
         readSnapshot(now: now).jobs
     }
 
-    /// 2026-09-06: `allJobs` for a cursor owner, PLUS whether the read was
-    /// complete. An unreadable job file simply vanishes from the array, and a
-    /// cursor that advances its `last_seen` past that job while a newer sibling
-    /// settles rejects it forever once it becomes readable again. The
-    /// reconciliation owner needs the same availability half `delegation_status`
-    /// already gets from `recentJobsWithAvailability`, from ONE read of disk.
+    /// One disk read reports all jobs and availability so cursors never advance past unreadable records.
     public func allJobsWithAvailability(
         now: Date
-    ) -> (jobs: [DelegationJobProjection], allStoresReadable: Bool) {
+    ) -> (jobs: [DelegationReadout], allStoresReadable: Bool) {
         let snapshot = readSnapshot(now: now)
         return (
             snapshot.jobs,
@@ -505,35 +105,32 @@ public struct DelegationStatusProjector: Sendable {
         )
     }
 
-    /// Read each source once. Availability describes this same observation,
-    /// while the historical array APIs still return every readable job.
+    /// Read each source once. Availability describes this same observation, while the historical array APIs still return every readable job.
     package func readSnapshot(now: Date, limit: Int? = nil, offset: Int = 0,
                       agent: String? = nil, messageID: String? = nil) -> DelegationStatusReadSnapshot {
         let life: String
         do { life = try DataRootLife.current(in: dataRoot) }
         catch { return .init(jobs: [], sources: [.init(source: "life-id", agent: "self", status: "unavailable")], matchedCount: 0) }
-        func inLife(_ original: DelegationJobProjection, _ job: [String: JSONValue]) -> DelegationJobProjection {
+        func inLife(_ original: DelegationReadout, _ job: [String: JSONValue]) -> DelegationReadout {
             guard DataRootLife.life(of: Self.string(job, "lifeID")) != life, original.deliveryOutcome != "delivered" else { return original }
             var row = original
             row.state = "stopped"; row.status = "stopped"; row.deliveryOutcome = "stopped"
             row.deliveryReason = DataRootLife.stoppedReason; row.stalled = false; row.stallBasis = .terminal; row.stallDeadline = nil
             return row
         }
-        var rows: [DelegationJobProjection] = []
+        var rows: [DelegationReadout] = []
         var sources: [DelegationSourceAvailability] = []
         let claude = Self.readDirectory(claudeJobsDirectory, source: "claude_jobs", agent: "claude")
         sources.append(claude.availability)
         for (url, object) in claude.objects {
             if let row = Self.projectClaude(url: url, now: now, object: object) { rows.append(inLife(row, object)) }
         }
-        // A live-session reply has a linked receipt, but no wake job. Exact
-        // reads must include that receipt without inventing a runner.
+        // A live-session reply has a linked receipt, but no wake job. Exact reads must include that receipt without inventing a runner.
         if let messageID, agent == nil || agent == "claude",
            !rows.contains(where: { $0.acceptedMessageIDs.contains(messageID) }) {
-            let replies = claudeJobsDirectory.deletingLastPathComponent().appendingPathComponent("claude-replies.jsonl")
             if let reply = liveReplies([messageID])[messageID] {
-                let stamp = Self.requestTexts(inbox: replies, ids: [messageID], field: "createdAt", window: .max)[messageID]
-                var row = DelegationJobProjection(id: messageID, acceptedMessageIDs: [messageID],
+                let stamp = reply.createdAt
+                var row = DelegationReadout(id: messageID, acceptedMessageIDs: [messageID],
                     source: "claude", agent: "claude", topicSlug: nil,
                     deskHandle: nil, state: "replied", status: "replied", runStatus: nil, createdAt: nil,
                     claimedAt: nil, startedAt: nil, lastLiveness: nil, completedAt: stamp, elapsedSeconds: nil,
@@ -545,7 +142,7 @@ public struct DelegationStatusProjector: Sendable {
                 sources.append(DelegationSourceAvailability(source: "claude_replies", agent: "claude", readableRecords: 1))
             }
         }
-        var codexRows: [String: DelegationJobProjection] = [:]
+        var codexRows: [String: DelegationReadout] = [:]
         for (directory, source, undelivered) in [
             (codexJobsDirectory, "codex_jobs", false),
             (codexJobsDirectory.appendingPathComponent("undelivered", isDirectory: true), "codex_undelivered", true),
@@ -558,10 +155,8 @@ public struct DelegationStatusProjector: Sendable {
                 }
             }
         }
-        // Successful delivery removes the reply-job file. The durable ledger
-        // is therefore not optional history: it is the canonical terminal half
-        // of the same lifecycle. A proven delivered receipt outranks a stale
-        // in-flight projection for the same originating message id.
+        // Successful delivery removes the reply-job file. The durable ledger is therefore not optional history: it is the canonical terminal half of the same lifecycle. A proven delivered receipt outranks a stale in-flight projection for
+        // the same originating message id.
         let deliveries = Self.deliveryCache.read(codexDeliveriesFile)
         sources.append(deliveries.availability)
         for key in Array(codexRows.keys) {
@@ -592,34 +187,30 @@ public struct DelegationStatusProjector: Sendable {
         for (url, object) in omp.objects {
             if let row = Self.projectOMP(url: url, now: now, object: object) { rows.append(inLife(row, object)) }
         }
-        func matches(_ row: DelegationJobProjection) -> Bool {
+        func matches(_ row: DelegationReadout) -> Bool {
             (agent == nil || row.agent == agent) && (messageID == nil || row.acceptedMessageIDs.contains(messageID!))
         }
         rows = rows.filter(matches)
-        var matchedCount = rows.count
-        // Cached terminal rows are already ordered. Only retain enough candidates
-        // for this page; full reconciliation deliberately retains every receipt.
+        // Cached terminal rows are already ordered. Only retain enough candidates for this page; full reconciliation deliberately retains every receipt.
         if agent == nil || agent == "codex" {
             if let messageID {
                 if let row = deliveries.byID[messageID], matches(row) {
-                    matchedCount += 1
                     rows.append(row)
                 }
             } else {
-                matchedCount += deliveries.byID.count
                 for row in deliveries.ordered {
                     rows.append(row)
                 }
             }
         }
-        var states: [String: (state: CodexCompletionLifecycleProjection, path: URL)] = [:]
+        var states: [String: (state: CodexCompletionReadout, path: URL)] = [:]
         let matchedLifecycles = Set(rows.compactMap(\.completionDeliveryID))
-        for directory in CodexCompletionLifecycleProjection.directories(
+        for directory in CodexCompletionReadout.directories(
             configRoot: claudeJobsDirectory.deletingLastPathComponent().deletingLastPathComponent(), dataRoot: dataRoot) {
             var lifecycles = Self.readDirectory(directory, source: "completion_lifecycle", agent: "self")
             for (url, fields) in lifecycles.objects {
-                guard let state = try? JSONDecoder().decode(CodexCompletionLifecycleProjection.self,
-                    from: JSONValue.object(fields).serializedData(pretty: false)).reading(in: dataRoot) else {
+                guard let state = try? JSONDecoder().decode(CodexCompletionReadout.self,
+                    from: JSONValue.object(fields).serializedData(pretty: false)).reading(life: life) else {
                     lifecycles.availability.status = "unreadable"
                     continue
                 }
@@ -629,7 +220,7 @@ public struct DelegationStatusProjector: Sendable {
                 guard !matchedLifecycles.contains(id) else { continue }
                 let principal = (try? state.knownPrincipal(dataRoot: dataRoot)) ?? "unattributed"
                 let terminal = status != "owed"
-                var row = DelegationJobProjection(id: id, source: state.source ?? principal, agent: principal,
+                var row = DelegationReadout(id: id, source: state.source ?? principal, agent: principal,
                     topicSlug: nil, deskHandle: nil, state: status, status: nil, runStatus: nil,
                     createdAt: nil, claimedAt: nil, startedAt: nil, lastLiveness: nil,
                     completedAt: terminal ? state.updatedAt : nil, elapsedSeconds: nil, stalled: false,
@@ -661,7 +252,7 @@ public struct DelegationStatusProjector: Sendable {
             }
             rows[index].deliveryLost = nil
         }
-        var answers: [String: DelegationJobProjection] = [:]
+        var answers: [String: DelegationReadout] = [:]
         rows = rows.sorted { $0.id < $1.id }.filter { row in
             guard let id = row.completionDeliveryID,
                   states[id] != nil || ["delivered", "owed", "failed_before_answer", "legacy_before_receipts", "let_go"].contains(row.deliveryOutcome ?? "") else { return true }
@@ -679,30 +270,27 @@ public struct DelegationStatusProjector: Sendable {
             rows[index].deliveryReceiptVersion = (rows[index].deliveryReceiptVersion ?? "")
                 + "|" + rows[index].acceptedMessageIDs.sorted().joined(separator: ",")
         }
-        matchedCount = rows.count
+        let matchedCount = rows.count
         rows.sort(by: Self.newestFirst)
         var page = Array(rows.dropFirst(min(offset, rows.count)).prefix(limit ?? rows.count))
-        // A thread reads as ask and answer. Only the returned page is joined,
-        // from the tail of the inbox, so this stays a bounded read.
+        // A thread reads as ask and answer. Only the returned page is joined, from the tail of the inbox, so this stays a bounded read.
         let wanted = Set(page.flatMap { $0.acceptedMessageIDs })
         if !wanted.isEmpty {
-            let asks = Self.requestTexts(inbox: codexDeliveriesFile.deletingLastPathComponent()
+            let asks = Self.requestRecords(inbox: codexDeliveriesFile.deletingLastPathComponent()
                 .appendingPathComponent("codex-inbox.jsonl"), ids: wanted)
             for index in page.indices where page[index].requestTextHead == nil {
-                page[index].requestTextHead = page[index].acceptedMessageIDs.sorted().lazy.compactMap { asks[$0] }.first.flatMap(Self.head)
+                page[index].requestTextHead = page[index].acceptedMessageIDs.sorted().lazy.compactMap { asks[$0]?["text"] }.first.flatMap(Self.head)
             }
         }
-        // 2026-09-22: Claude jobs don't record their conversation handle;
-        // its inbox row does, so every Claude row lacked one to reply with.
+        // Conversation handles come from the bridge inbox.
         let claudeIDs = Set(page.filter { $0.agent == "claude" }.flatMap { $0.acceptedMessageIDs })
         if !claudeIDs.isEmpty {
-            let handles = Self.requestTexts(inbox: claudeJobsDirectory.deletingLastPathComponent()
-                .appendingPathComponent("claude-inbox.jsonl"), ids: claudeIDs, field: "conversationId")
-            // 2026-09-22: a live Claude answers in a bridge chat, not the
-            // job; the bridge records a reply that names her message here.
+            let handles = Self.requestRecords(inbox: claudeJobsDirectory.deletingLastPathComponent()
+                .appendingPathComponent("claude-inbox.jsonl"), ids: claudeIDs)
+            // Live replies join by accepted message ID from the bridge chat.
             let replies = liveReplies(claudeIDs)
             for index in page.indices where page[index].agent == "claude" {
-                page[index].conversationID = page[index].acceptedMessageIDs.sorted().lazy.compactMap { handles[$0] }.first
+                page[index].conversationID = page[index].acceptedMessageIDs.sorted().lazy.compactMap { handles[$0]?["conversationId"] }.first
                 if page[index].agentReplyTextHead == nil,
                    let reply = page[index].acceptedMessageIDs.sorted().lazy.compactMap({ replies[$0] }).first {
                     Self.retainReply(reply.text, truncated: reply.truncated, in: &page[index])
@@ -712,23 +300,19 @@ public struct DelegationStatusProjector: Sendable {
         return DelegationStatusReadSnapshot(jobs: page, sources: sources, matchedCount: matchedCount)
     }
 
-    /// Inbox `field` for the given message ids, read from the file's last 512 KiB.
-    /// The live-session answers recorded for these messages. Rows written
-    /// before the bridge kept the answer whole carry only a 400-character head.
-    private func liveReplies(_ ids: Set<String>) -> [String: (text: String, truncated: Bool)] {
+    /// Live-session answers retain full text or a 400-character head.
+    private func liveReplies(_ ids: Set<String>) -> [String: (text: String, truncated: Bool, createdAt: String?)] {
         let url = claudeJobsDirectory.deletingLastPathComponent().appendingPathComponent("claude-replies.jsonl")
-        // Read whole: the bridge's own retention (500 answers) bounds this file, and a
-        // tail window would drop older answers it still keeps.
-        let whole = Self.requestTexts(inbox: url, ids: ids, field: "replyText", window: .max)
-        let cut = Set(Self.requestTexts(inbox: url, ids: ids, field: "replyTruncated", window: .max).filter { $0.value == "true" }.keys)
-        return Self.requestTexts(inbox: url, ids: ids, field: "replyTextHead", window: .max)
-            .mapValues { ($0, $0.hasSuffix("…")) }
-            .merging(whole.map { ($0.key, ($0.value, cut.contains($0.key))) }) { _, whole in whole }
+        // Read whole: the bridge's own retention (500 answers) bounds this file, and a tail window would drop older answers it still keeps.
+        return Self.requestRecords(inbox: url, ids: ids, window: .max).compactMapValues { record in
+            guard let text = record["replyText"] ?? record["replyTextHead"] else { return nil }
+            return (text, record["replyText"] != nil ? record["replyTruncated"] == "true" : text.hasSuffix("…"), record["createdAt"])
+        }
     }
 
-    public static func requestTexts(inbox url: URL, ids: Set<String>, field: String = "text", window: Int = 524_288) -> [String: String] {
+    public static func requestRecords(inbox url: URL, ids: Set<String>, window: Int = 524_288) -> [String: [String: String]] {
         let key = url.standardizedFileURL.path + "#" + String(window)
-        let stamp = DelegationFileCache.stamp(url)
+        let stamp = try? DelegationFileCache.stamp(url)
         let all: [String: [String: String]]
         if let stamp, let cached = fileCache.tail(key, stamp: stamp) {
             all = cached
@@ -736,17 +320,13 @@ public struct DelegationStatusProjector: Sendable {
             all = tailTexts(inbox: url, window: window)
             if let stamp { fileCache.putTail(key, stamp: stamp, all) }
         }
-        return all.filter { ids.contains($0.key) }.compactMapValues { $0[field] }
+        return all.filter { ids.contains($0.key) }
     }
 
     private static func tailTexts(inbox url: URL, window: Int) -> [String: [String: String]] {
-        guard let file = try? FileHandle(forReadingFrom: url) else { return [:] }
-        defer { try? file.close() }
-        let size = (try? file.seekToEnd()) ?? 0
-        let start = size > UInt64(window) ? size - UInt64(window) : 0
-        guard (try? file.seek(toOffset: start)) != nil, let data = try? file.readToEnd() else { return [:] }
-        var lines = data.split(separator: 0x0A)
-        if start > 0, !lines.isEmpty { lines.removeFirst() }
+        guard let read = try? SwiftNativePersistenceCore.tailPhysicalLines(url, limit: .max, maxBytes: window) else { return [:] }
+        var lines = read.lines.filter { !$0.isEmpty }
+        if read.truncatedToByteWindow, !lines.isEmpty { lines.removeFirst() }
         var found: [String: [String: String]] = [:]
         for line in lines {
             // A true flag (the inbox's `read`) reads as "true"; false is absent.
@@ -762,7 +342,7 @@ public struct DelegationStatusProjector: Sendable {
         return found
     }
 
-    fileprivate static func newestFirst(_ lhs: DelegationJobProjection, _ rhs: DelegationJobProjection) -> Bool {
+    static func newestFirst(_ lhs: DelegationReadout, _ rhs: DelegationReadout) -> Bool {
         switch (lhs.recencyKey, rhs.recencyKey) {
         case let (l?, r?) where l != r: return l > r
         case (nil, .some): return false
@@ -774,10 +354,8 @@ public struct DelegationStatusProjector: Sendable {
     private static let deliveryCache = DelegationDeliveryCache()
     private static let fileCache = DelegationFileCache()
 
-    /// Earliest future crossing of the same deadline/stall-seconds rules used
-    /// by `stalled`. File events trigger immediate rereads while work moves;
-    /// this exact deadline is what makes a writer that goes quiet observable
-    /// without adding a polling heartbeat.
+    /// Earliest future crossing of the same deadline/stall-seconds rules used by `stalled`. File events trigger immediate rereads while work moves; this exact deadline is what makes a writer that goes quiet observable without adding a
+    /// polling heartbeat.
     public func nextStallDeadline(after now: Date) -> Date? {
         allJobs(now: now)
             .compactMap(\.stallDeadline)
@@ -787,12 +365,10 @@ public struct DelegationStatusProjector: Sendable {
 
     // MARK: - Directory scanning
 
-    /// Only an initial missing-path error means absent. A later read failure
-    /// or a wrong file kind is unavailable, never an empty healthy source.
+    /// Only an initial missing-path error means absent. A later read failure or a wrong file kind is unavailable, never an empty healthy source.
     private static func sourceStatus(_ url: URL, expected: FileAttributeType) -> String {
         do {
-            // Existing reads follow configured symlinks; availability is not
-            // a new path/authority restriction on those readable sources.
+            // Existing reads follow configured symlinks; availability is not a new path/authority restriction on those readable sources.
             let attributes = try FileManager.default.attributesOfItem(atPath: url.resolvingSymlinksInPath().path)
             return attributes[.type] as? FileAttributeType == expected ? "available" : "unavailable"
         } catch {
@@ -812,15 +388,16 @@ public struct DelegationStatusProjector: Sendable {
         catch { availability.status = "unavailable"; return ([], availability) }
         var objects: [(URL, [String: JSONValue])] = []
         let previous = fileCache.jobSnapshot(directory.path)
-        var parsedFiles: [String: (stamp: String, object: [String: JSONValue])] = [:]
+        var parsedFiles: [String: (stamp: SnapshotTailOpLog.FileStamp, object: [String: JSONValue])] = [:]
         for name in names.filter({ $0.hasSuffix(".json") && !$0.hasPrefix(".") }).sorted() {
             let url = directory.appendingPathComponent(name)
-            guard sourceStatus(url, expected: .typeRegular) == "available" else {
+            let stamp: SnapshotTailOpLog.FileStamp?
+            do { stamp = try DelegationFileCache.stamp(url) }
+            catch {
                 availability.unreadableFiles += 1
                 continue
             }
             // Unchanged since the last read: reuse its parse.
-            let stamp = DelegationFileCache.stamp(url)
             if let stamp, let cached = previous[name], cached.stamp == stamp {
                 parsedFiles[name] = cached
                 availability.readableRecords += 1
@@ -844,626 +421,8 @@ public struct DelegationStatusProjector: Sendable {
         return (objects, availability)
     }
 
-    // MARK: - Claude projection
-
-    static func projectClaude(url: URL, now: Date, object job: [String: JSONValue]) -> DelegationJobProjection? {
-        // messageId is the claude record's identity (it is also the filename
-        // stem). Fall back to the stem so a record that lost the field still
-        // shows up addressable rather than being dropped.
-        let id = string(job, "messageId") ?? url.deletingPathExtension().lastPathComponent
-        let createdAt = string(job, "createdAt")
-        let claimedAt = string(job, "claimedAt")
-        let startedAt = string(job, "startedAt")
-        let completedAt = string(job, "completedAt")
-        // heartbeatAt proves the RUNNER is alive; progressAt proves the CHILD
-        // is. Either one is liveness, so the projection takes the later.
-        let liveness = laterISO(string(job, "heartbeatAt"), string(job, "progressAt"))
-
-        let start = firstDate(startedAt, claimedAt, createdAt)
-        let end = date(completedAt) ?? now
-        let elapsed = start.map { Int(max(0, end.timeIntervalSince($0)).rounded()) }
-
-        // A stall verdict is about a RUN that stopped making progress. The run
-        // is over the moment the runner stamps runStatus — `delivering`
-        // (L1457) and `spawn_failed` (L2222) both sit past that point with no
-        // completedAt yet, and both carry a deadlineAt that will eventually
-        // pass, so neither may be judged against the RUN's deadline: a job that
-        // finished an hour ago and is merely waiting on bridge delivery would
-        // read as STALLED, the exact false stuck-job report this tool exists to
-        // prevent. `spawn_failed` is terminal outright; `delivering` keeps a
-        // stall clock of its own, below.
-        let state = string(job, "state")
-        // 2026-09-06: `delivering` is no longer counted as terminal. The run IS
-        // over there, but the answer is still in flight, and the runner writes
-        // that state before it awaits the bridge POST — so a worker that dies
-        // in the POST leaves a record excluded from stall detection forever.
-        // Its clock is the delivery stamp (`runEndedAt`), never the run's own
-        // `deadlineAt`, which a long run has usually passed already: an
-        // ordinary delivery of a few seconds cannot trip it, and one that never
-        // lands does.
-        let delivering = completedAt == nil && state == "delivering"
-        let terminal = !delivering && (completedAt != nil
-            || string(job, "runStatus") != nil
-            || ["settled", "spawn_failed"].contains(state ?? ""))
-        let stalled: Bool
-        let basis: DelegationJobProjection.StallBasis
-        let stallDeadline: Date?
-        if delivering {
-            let clock = firstDate(string(job, "runEndedAt"), liveness, startedAt, claimedAt, createdAt)
-            let deadline = clock?.addingTimeInterval(deliveryStallSeconds)
-            stalled = deadline.map { now >= $0 } ?? false
-            basis = deadline == nil ? .none : .deliveryStall
-            stallDeadline = deadline
-        } else {
-            (stalled, basis, stallDeadline) = stallVerdict(
-                terminal: terminal,
-                deadlineAt: string(job, "deadlineAt"),
-                stallSeconds: number(job, "stallSeconds"),
-                lastLiveness: liveness ?? startedAt ?? claimedAt ?? createdAt,
-                now: now
-            )
-        }
-
-        var row = DelegationJobProjection(
-            id: id,
-            motorOwnerID: id,
-            source: "claude",
-            agent: "claude",
-            topicSlug: string(job, "topicSlug"),
-            deskHandle: nestedString(job, objectKey: "payload", field: "deskHandle"),
-            state: state,
-            status: string(job, "status"),
-            runStatus: string(job, "runStatus"),
-            createdAt: createdAt,
-            claimedAt: claimedAt,
-            startedAt: startedAt,
-            lastLiveness: liveness,
-            completedAt: completedAt,
-            elapsedSeconds: elapsed,
-            stalled: stalled,
-            stallBasis: basis,
-            deliveryLost: bool(job, "deliveryLost"),
-            deliveryOutcome: claudeDeliveryOutcome(job),
-            completionTextHead: head(string(job, "completionText")),
-            producerSchemaVersion: nestedInt(job, objectKey: "payload", field: "producerSchemaVersion"),
-            producerSourceRevision: nestedString(job, objectKey: "payload", field: "producerSourceRevision"),
-            stallDeadline: stallDeadline
-        )
-        row.recencyKey = firstDate(completedAt, liveness, startedAt, claimedAt, createdAt)
-        Self.retainReply(string(job, "agentReplyText"), truncated: bool(job, "agentReplyTruncated") ?? true, in: &row)
-        row.acceptedMessageIDs = Set([Self.recordedLookupID(job["messageId"])].compactMap { $0 })
-        if row.deliveryOutcome == "blocked", string(job, "bridgeReason") == "missing_origin_session" {
-            row.deliveryReason = "missing_origin_session"
-        }
-        if case .object(let payload)? = job["payload"] { row.requestTextHead = head(string(payload, "text")) }
-        return row
-    }
-
-    // MARK: - Codex projection
-
-    static func projectCodex(url: URL, undelivered: Bool, now: Date, object job: [String: JSONValue]) -> DelegationJobProjection? {
-        let id = string(job, "id") ?? url.deletingPathExtension().lastPathComponent
-        let createdAt = string(job, "createdAt")
-        // boundAt is when the watcher bound this job to a live turn — the
-        // closest analogue the codex record has to claude's claimedAt.
-        let claimedAt = string(job, "boundAt")
-
-        var turnResult: [String: JSONValue] = [:]
-        if case .object(let exec)? = job["completedExecution"], case .object(let tr)? = exec["turnResult"] {
-            turnResult = tr
-        }
-        let completedAt = string(turnResult, "completedAt")
-        let runStatus = string(turnResult, "status")
-
-        var probe: [String: JSONValue] = [:]
-        if case .object(let value)? = job["stallProbe"] { probe = value }
-        var watcherObservedAt: String?
-        if case .object(let wait)? = job["lastWait"] { watcherObservedAt = string(wait, "observedAt") }
-        var liveness: String?
-        if case .object(let snapshot)? = probe["rolloutSnapshot"],
-           let mtime = number(snapshot, "mtimeMs"), mtime.isFinite {
-            liveness = NativeTimestampFormat.fractionalZulu(Date(timeIntervalSince1970: mtime / 1000))
-        }
-
-        let start = firstDate(claimedAt, createdAt)
-        let end = date(completedAt) ?? now
-        let elapsed = start.map { Int(max(0, end.timeIntervalSince($0)).rounded()) }
-
-        let terminal = completedAt != nil || !turnResult.isEmpty
-        let (idleStalled, idleBasis, stallDeadline) = stallVerdict(
-            terminal: terminal, deadlineAt: nil,
-            stallSeconds: number(probe, "idleThresholdMs").map { $0 / 1000 },
-            lastLiveness: liveness, now: now
-        )
-        let recordedStall = runStatus == "stalled" || runStatus == "failed_hung"
-        let stalled = recordedStall || idleStalled
-        let basis: DelegationJobProjection.StallBasis = recordedStall ? .recordedStall
-            : idleBasis == .stallSeconds ? .rolloutIdle : idleBasis
-        var recordedDeliveryStatus: String?
-        var recordedDeliveryOutcome: String?
-        if case .object(let delivery)? = job["delivery"] {
-            recordedDeliveryStatus = string(delivery, "status")
-            recordedDeliveryOutcome = string(delivery, "outcome")
-        }
-        let deliveryOutcome = recordedDeliveryOutcome ?? (undelivered ? "unknown" : nil)
-        let recordedPhase = string(job, "phase")
-        let effectiveState: String? = {
-            guard terminal else { return recordedPhase }
-            switch deliveryOutcome {
-            case "delivered": return "settled"
-            case "unknown": return "delivery_unknown"
-            default:
-                // Old records predate the explicit execution/delivery split.
-                // Their completedExecution is canonical terminal evidence, so
-                // never repeat the stale pre-terminal `watching_turn` label.
-                return recordedPhase == "watching_turn" ? "execution_completed" : recordedPhase
-            }
-        }()
-
-        var row = DelegationJobProjection(
-            id: id,
-            motorOwnerID: codexSoleMessageID(job),
-            source: "codex",
-            agent: "codex",
-            topicSlug: codexTopicSlug(job),
-            deskHandle: codexDeskHandle(job),
-            state: effectiveState,
-            status: recordedDeliveryStatus,
-            runStatus: runStatus,
-            createdAt: createdAt,
-            claimedAt: claimedAt,
-            startedAt: nil,  // codex records no runner start; boundAt is the closest
-            lastLiveness: liveness,
-            completedAt: completedAt,
-            elapsedSeconds: elapsed,
-            stalled: stalled,
-            stallBasis: basis,
-            // The codex record has NO deliveryLost field, and living under
-            // undelivered/ does not prove loss — it proves the bridge could
-            // not confirm the outcome. So `deliveryLost` stays nil and the
-            // disposition is reported as "unknown" instead.
-            deliveryLost: nil,
-            deliveryOutcome: deliveryOutcome,
-            completionTextHead: head(string(turnResult, "message") ?? string(turnResult, "lastAgentMessage")),
-            producerSchemaVersion: codexProducerSchemaVersion(job),
-            producerSourceRevision: codexProducerSourceRevision(job),
-            stallDeadline: stallDeadline
-        )
-        row.recencyKey = firstDate(completedAt, watcherObservedAt, liveness, claimedAt, createdAt)
-        row.watcherObservedAt = watcherObservedAt
-        let evidence = terminal ? turnResult : probe
-        row.toolActivityCount = int(evidence, "toolActivityCount")
-        row.noWorkObserved = bool(evidence, "noWorkObserved")
-        if case .object(let recovery)? = turnResult["hangRecovery"] { row.recoveryStatus = string(recovery, "status") }
-        row.executionError = Self.codexExecutionError(turnResult)
-        row.recordKind = undelivered ? "retained_reply_job" : "reply_job"
-        row.completionDeliveryID = id
-        Self.retainReply(string(turnResult, "message") ?? string(turnResult, "lastAgentMessage"), truncated: false, in: &row)
-        row.acceptedMessageIDs = Set(Self.codexPayloadValues(job, field: "messageId").compactMap { Self.recordedLookupID($0) })
-        // A completed execution may belong to a later recovery turn. Keep its
-        // recorded pair together instead of mixing it with initial job IDs.
-        let identity: [String: JSONValue]
-        if case .object(let execution)? = job["completedExecution"] { identity = execution }
-        else { identity = job }
-        row.recordedThreadID = Self.recordedLookupID(identity["threadId"])
-        row.recordedTurnID = Self.recordedLookupID(identity["turnId"])
-        return row
-    }
-
-    /// Project the durable completion receipt that survives after a successful
-    /// Codex reply job is unlinked. One delivery may batch several originating
-    /// messages, so each message id receives the same proven terminal result;
-    /// this preserves the exact identity emitted at dispatch time.
-    static func projectCodexDeliveries(
-        now: Date,
-        objects: [[String: JSONValue]]
-    ) -> [DelegationJobProjection] {
-        objects.flatMap { delivery -> [DelegationJobProjection] in
-            guard case .array(let rawIDs)? = delivery["messageIds"] else { return [] }
-            let ids = rawIDs.compactMap { value -> String? in
-                guard case .string(let id) = value, !id.isEmpty else { return nil }
-                return id
-            }
-            guard !ids.isEmpty else { return [] }
-
-            var turnResult: [String: JSONValue] = [:]
-            if case .object(let value)? = delivery["turnResult"] { turnResult = value }
-            var bridge: [String: JSONValue] = [:]
-            if case .object(let value)? = delivery["bridge"] { bridge = value }
-            let runStatus = string(turnResult, "status")
-            let completedAt = string(turnResult, "completedAt") ?? string(delivery, "createdAt") ?? string(delivery, "settledAt")
-            let bridgeStatus = string(bridge, "status")
-            let replyStatus = string(bridge, "replyStatus")
-            // Older receipts have no explicit persistence flag, but retain
-            // the chat return and its separate notification settlement.
-            var completionDelivery: [String: JSONValue] = [:]
-            if case .object(let value)? = bridge["completionDelivery"] { completionDelivery = value }
-            let persisted = bool(bridge, "replyPersisted") == true
-                || (string(bridge, "nativeAgentReplyPreview")?.isEmpty == false
-                    && string(bridge, "nativeAgentSessionId") != nil
-                    && string(bridge, "nativeAgentSessionId") == string(delivery, "sessionId")
-                    && string(completionDelivery, "surface") != nil
-                    && string(completionDelivery, "surface") != "caller-result")
-            let outcome: String? = string(delivery, "settlement") ?? { switch (persisted, bridgeStatus, replyStatus) {
-            case (true, _, _), (_, "delivered", _), (_, _, "ok"): "delivered"
-            // A failed POST or notification proves neither transcript absence
-            // nor a delivery deadline. Keep uncertainty instead of minting loss.
-            case (_, .some, _), (_, _, .some): "unknown"
-            default: nil
-            } }()
-            let effectiveState: String = switch outcome {
-            case "delivered": "settled"
-            case "unknown": "delivery_unknown"
-            default: outcome ?? "execution_completed"
-            }
-            let completion = string(bridge, "nativeAgentReplyPreview")
-                ?? string(turnResult, "messagePreview") ?? string(turnResult, "message") ?? string(turnResult, "lastAgentMessage")
-            return ids.map { id in
-                var row = DelegationJobProjection(
-                    id: id,
-                    motorOwnerID: id,
-                    source: "codex",
-                    agent: "codex",
-                    topicSlug: nil,
-                    deskHandle: nil,
-                    state: effectiveState,
-                    status: bridgeStatus ?? replyStatus,
-                    runStatus: runStatus,
-                    createdAt: nil,
-                    claimedAt: nil,
-                    startedAt: nil,
-                    lastLiveness: nil,
-                    completedAt: completedAt,
-                    elapsedSeconds: nil,
-                    stalled: runStatus == "stalled" || runStatus == "failed_hung",
-                    stallBasis: runStatus == "stalled" || runStatus == "failed_hung" ? .recordedStall : .terminal,
-                    deliveryLost: nil,
-                    deliveryOutcome: outcome,
-                    completionTextHead: head(completion),
-                    producerSchemaVersion: nil,
-                    producerSourceRevision: nil,
-                    stallDeadline: nil
-                )
-                row.recencyKey = date(completedAt)
-                row.executionError = Self.codexExecutionError(turnResult)
-                row.toolActivityCount = int(turnResult, "toolActivityCount")
-                row.noWorkObserved = bool(turnResult, "noWorkObserved")
-                if case .object(let recovery)? = turnResult["hangRecovery"] { row.recoveryStatus = string(recovery, "status") }
-                row.recordKind = "delivery_receipt"
-                row.completionDeliveryID = string(delivery, "jobId")
-                row.deliveryReceiptVersion = [string(delivery, "createdAt"),
-                    string(delivery, "threadId"), string(delivery, "turnId"),
-                    bridgeStatus, replyStatus, string(delivery, "settlement")].map { $0 ?? "" }.joined(separator: "|")
-                if persisted, bridgeStatus != "delivered", replyStatus != "ok" {
-                    row.deliveryReceiptVersion = (row.deliveryReceiptVersion ?? "") + "|reply_persisted"
-                }
-                row.agentReplyTextHead = head(string(turnResult, "messagePreview"))
-                Self.retainReply(string(turnResult, "agentReplyText") ?? string(turnResult, "message")
-                    ?? string(turnResult, "lastAgentMessage") ?? string(turnResult, "messagePreview"),
-                    truncated: bool(turnResult, "agentReplyTruncated") ?? (string(turnResult, "message") == nil && string(turnResult, "lastAgentMessage") == nil), in: &row)
-                row.acceptedMessageIDs = Set([Self.recordedLookupID(.string(id))].compactMap { $0 })
-                row.recordedThreadID = Self.recordedLookupID(delivery["threadId"])
-                row.recordedTurnID = Self.recordedLookupID(delivery["turnId"])
-                return row
-            }
-        }
-    }
-
-    // MARK: - OMP projection
-
-    /// OMP keeps settled job records, like Claude, but writes the delivery
-    /// result as a nested `bridge.status` and the topic inside `payload`.
-    static func projectOMP(url: URL, now: Date, object job: [String: JSONValue]) -> DelegationJobProjection? {
-        let id = string(job, "messageId") ?? url.deletingPathExtension().lastPathComponent
-        let createdAt = string(job, "createdAt")
-        let startedAt = string(job, "startedAt")
-        let completedAt = string(job, "completedAt")
-        let liveness = laterISO(string(job, "lastActivityAt"), string(job, "updatedAt"))
-        let start = firstDate(startedAt, createdAt)
-        let end = date(completedAt) ?? now
-        let elapsed = start.map { Int(max(0, end.timeIntervalSince($0)).rounded()) }
-        let state = string(job, "state")
-        let status = string(job, "status")
-        let terminal = completedAt != nil || state == "settled"
-        let (stalled, basis, stallDeadline) = stallVerdict(
-            terminal: terminal,
-            deadlineAt: nil,
-            stallSeconds: number(job, "idleSeconds"),
-            lastLiveness: liveness ?? startedAt ?? createdAt,
-            now: now
-        )
-        var payload: [String: JSONValue] = [:]
-        if case .object(let value)? = job["payload"] { payload = value }
-        var bridge: [String: JSONValue] = [:]
-        if case .object(let value)? = job["bridge"] { bridge = value }
-        let bridgeStatus = string(bridge, "status")
-        // These statuses follow Agent's completed turn; they describe her
-        // answer's onward delivery, not receipt of the agent's completion.
-        let received = int(bridge, "httpStatus") == 200 && string(payload, "sessionId") != nil
-            && string(bridge, "nativeAgentSessionId") == string(payload, "sessionId")
-            && ["ok", "delivery_failed_pre_dispatch", "delivery_rejected", "delivery_lifecycle_unavailable",
-                "delivery_in_progress", "outcome_unknown", "completion_already_settled"].contains(string(bridge, "replyStatus") ?? "")
-        let delivery: String? = switch (received, bridgeStatus) {
-        case (true, _), (_, "delivered"), (_, "dry_run"): "delivered"
-        case (_, "failed"): "lost"
-        case (_, "unknown"): "unknown"
-        case (_, "blocked"): "blocked"
-        default: nil
-        }
-        let retained = string(job, "completionText")
-            ?? string(job, "reply")
-            ?? string(job, "stderrTail")
-        var row = DelegationJobProjection(
-            id: id,
-            motorOwnerID: id,
-            source: "omp",
-            agent: "omp",
-            topicSlug: string(payload, "topic").map(slug),
-            deskHandle: string(payload, "deskHandle"),
-            state: state,
-            status: status,
-            runStatus: status,
-            createdAt: createdAt,
-            claimedAt: nil,
-            startedAt: startedAt,
-            lastLiveness: liveness,
-            completedAt: completedAt,
-            elapsedSeconds: elapsed,
-            stalled: stalled,
-            stallBasis: basis,
-            deliveryLost: delivery == "lost" ? true : nil,
-            deliveryOutcome: delivery,
-            completionTextHead: head(retained),
-            producerSchemaVersion: int(payload, "producerSchemaVersion"),
-            producerSourceRevision: string(payload, "producerSourceRevision"),
-            stallDeadline: stallDeadline
-        )
-        row.recencyKey = firstDate(completedAt, liveness, startedAt, createdAt)
-        row.completionDeliveryID = string(job, "deliveryId")
-        if case .object(let onward)? = bridge["completionDelivery"] {
-            row.onwardDelivery = .object(onward.filter { ["status", "reason", "surface", "delivery"].contains($0.key) })
-        }
-        Self.retainReply(string(job, "reply"), truncated: false, in: &row)
-        row.acceptedMessageIDs = Set([Self.recordedLookupID(job["messageId"])].compactMap { $0 })
-        // What was sent, and why a failed run failed (a provider's error, else the runner's reason).
-        row.requestTextHead = head(string(payload, "text"))
-        if status == "failed" { row.executionError = head(string(job, "assistantError") ?? string(job, "reason")) }
-        if delivery == "blocked", string(bridge, "reason") == "missing_origin_session" {
-            row.deliveryReason = "missing_origin_session"
-        }
-        return row
-    }
-
-    /// Claude's runner records BOTH an explicit `deliveryLost` boolean and a
-    /// `bridgeStatus`. Only those two are consulted — the disposition is never
-    /// guessed from the presence or absence of other fields.
-    static func claudeDeliveryOutcome(_ job: [String: JSONValue]) -> String? {
-        if bool(job, "deliveryLost") == true { return "lost" }
-        switch string(job, "bridgeStatus") {
-        case "delivered": return "delivered"
-        case "unknown": return "unknown"
-        case "blocked": return "blocked"
-        case .some(let other) where !other.isEmpty: return "unknown"
-        default: return nil
-        }
-    }
-
-    /// Mirrors `topicSlug()` in claude_thread_wakeup.js (L165-172) so a topic
-    /// slugs identically on both sides. Returns nil — never the JS writer's
-    /// "general" default — when the record carries no topic, because inventing
-    /// a topic the record does not contain is fabrication.
-    static func codexTopicSlug(_ job: [String: JSONValue]) -> String? {
-        guard case .array(let entries)? = job["entries"] else { return nil }
-        for entry in entries {
-            guard case .object(let e) = entry,
-                  case .object(let payload)? = e["payload"],
-                  let topic = string(payload, "topic") else { continue }
-            let trimmed = slug(topic)
-            if !trimmed.isEmpty { return trimmed }
-        }
-        return nil
-    }
-
-    /// A reply job can batch entries. One exact originating id is safe to bind
-    /// into a single motor projection; a mixed batch remains explicitly
-    /// unbound until it is split by the terminal delivery ledger, which lists
-    /// every message id separately.
-    static func codexSoleMessageID(_ job: [String: JSONValue]) -> String? {
-        let ids = Set(codexPayloadValues(job, field: "messageId").compactMap { value -> String? in
-            guard case .string(let raw) = value, !raw.isEmpty else { return nil }
-            return raw
-        })
-        return ids.count == 1 ? ids.first : nil
-    }
-
-    /// Preserve exact opaque IDs or omit them. Never clip one into a different
-    /// handle, infer one from a filename/topic, or serialize the whole batch.
-    private static func recordedLookupID(_ value: JSONValue?) -> String? {
-        guard case .string(let id)? = value, !id.isEmpty, id.count <= 160 else { return nil }
-        return id
-    }
-
-    /// A Codex reply job can batch several inbox entries. Bind it to a Desk
-    /// item only when every bound entry names the same exact stable handle;
-    /// mixed ownership is ambiguous and therefore stays unbound.
-    static func codexDeskHandle(_ job: [String: JSONValue]) -> String? {
-        guard case .array(let entries)? = job["entries"] else { return nil }
-        let handles = Set(entries.compactMap { entry -> String? in
-            guard case .object(let object) = entry,
-                  case .object(let payload)? = object["payload"] else { return nil }
-            return string(payload, "deskHandle")
-        })
-        return handles.count == 1 ? handles.first : nil
-    }
-
-    static func codexProducerSchemaVersion(_ job: [String: JSONValue]) -> Int? {
-        codexPayloadValues(job, field: "producerSchemaVersion").compactMap { value in
-            switch value {
-            case .int(let raw): return Int(raw)
-            case .double(let raw): return Int(exactly: raw.rounded(.towardZero))
-            case .string(let raw): return Int(raw)
-            default: return nil
-            }
-        }.max()
-    }
-
-    static func codexProducerSourceRevision(_ job: [String: JSONValue]) -> String? {
-        let revisions: Set<String> = Set(codexPayloadValues(job, field: "producerSourceRevision").compactMap { value -> String? in
-            guard case .string(let raw) = value, !raw.isEmpty else { return nil }
-            return raw.lowercased()
-        })
-        return revisions.count == 1 ? revisions.first : nil
-    }
-
-    static func codexPayloadValues(_ job: [String: JSONValue], field: String) -> [JSONValue] {
-        guard case .array(let entries)? = job["entries"] else { return [] }
-        return entries.compactMap { entry in
-            guard case .object(let object) = entry,
-                  case .object(let payload)? = object["payload"] else { return nil }
-            return payload[field]
-        }
-    }
-
-    static func slug(_ topic: String) -> String {
-        let value = String(topic.lowercased().map { $0.isLetter || $0.isNumber ? $0 : "-" })
-            .split(separator: "-", omittingEmptySubsequences: true).joined(separator: "-")
-        return String(value.prefix(64))
-    }
-
     // MARK: - Shared helpers
 
-    /// How long a finished run may sit in `delivering` before the delivery
-    /// itself is the stuck step. The POST is a localhost call with an ack, so
-    /// minutes here mean the worker died between the stamp and the settlement.
-    ///
-    /// 2026-09-06: must stay ABOVE the bridge POST's own ceiling. The helper
-    /// allows a delivery 600s (NATIVE_AGENT_CLAUDE_WAKE_BRIDGE_TIMEOUT_MS in
-    /// script/claude_thread_wakeup.js), so at 300s this clock called a
-    /// supported, still-running delivery stalled. 660s leaves the helper its
-    /// full window plus a minute to settle.
+    /// Delivery grace stays above the bridge POST ceiling to allow settlement.
     static let deliveryStallSeconds: TimeInterval = 660
-
-    /// The single place a stall verdict is made, for every store.
-    static func stallVerdict(
-        terminal: Bool,
-        deadlineAt: String?,
-        stallSeconds: Double?,
-        lastLiveness: String?,
-        now: Date
-    ) -> (Bool, DelegationJobProjection.StallBasis, Date?) {
-        if terminal { return (false, .terminal, nil) }
-        if let deadline = date(deadlineAt) {
-            return (now >= deadline, .deadline, deadline)
-        }
-        if let stallSeconds, stallSeconds > 0, let last = date(lastLiveness) {
-            let deadline = last.addingTimeInterval(stallSeconds)
-            return (now >= deadline, .stallSeconds, deadline)
-        }
-        return (false, .none, nil)
-    }
-
-    /// The helper retains provider failures even when no final reply exists.
-    /// Surface only that terminal error, never the surrounding diagnostics or
-    /// an inferred retry instruction. Absence remains absence of evidence.
-    static func codexExecutionError(_ result: [String: JSONValue]) -> String? {
-        guard let status = string(result, "status"),
-              ["failed", "error", "timed_out", "timeout"].contains(status.lowercased()) else { return nil }
-        let nested: String? = {
-            guard case .object(let error)? = result["error"] else { return nil }
-            return string(error, "message")
-        }()
-        guard let raw = string(result, "errorMessage") ?? string(result, "error") ?? nested else { return nil }
-        return head(ChatSecretRedactor.redactText(raw))
-    }
-
-    static func head(_ text: String?) -> String? {
-        guard let text, !text.isEmpty else { return nil }
-        guard longer(text, than: completionTextHeadLimit) else { return text }
-        // 2026-09-22: a cut head ends on a word and carries "…", which is how
-        // readers tell a cut reply from a short one.
-        var cut = text.prefix(completionTextHeadLimit - 1)
-        if !text[cut.endIndex].isWhitespace, let space = cut.lastIndex(where: \.isWhitespace) {
-            cut = cut[..<space]
-        }
-        return String(cut).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
-    }
-
-    /// `text.count > limit` without counting a whole long reply's characters:
-    /// every delivery row asks, and replies run to many kilobytes.
-    static func longer(_ text: String, than limit: Int) -> Bool {
-        text.index(text.startIndex, offsetBy: limit, limitedBy: text.endIndex).map { $0 < text.endIndex } ?? false
-    }
-
-    static func string(_ obj: [String: JSONValue], _ key: String) -> String? {
-        if case .string(let s)? = obj[key] { return s.isEmpty ? nil : s }
-        return nil
-    }
-
-    static func nestedString(
-        _ obj: [String: JSONValue], objectKey: String, field: String
-    ) -> String? {
-        guard case .object(let nested)? = obj[objectKey] else { return nil }
-        return string(nested, field)
-    }
-
-    static func nestedInt(
-        _ obj: [String: JSONValue], objectKey: String, field: String
-    ) -> Int? {
-        guard case .object(let nested)? = obj[objectKey] else { return nil }
-        return int(nested, field)
-    }
-
-    static func int(_ obj: [String: JSONValue], _ key: String) -> Int? {
-        switch obj[key] {
-        case .some(.int(let value)): return Int(value)
-        case .some(.double(let value)): return Int(exactly: value.rounded(.towardZero))
-        case .some(.string(let value)): return Int(value)
-        default: return nil
-        }
-    }
-
-    static func bool(_ obj: [String: JSONValue], _ key: String) -> Bool? {
-        if case .bool(let b)? = obj[key] { return b }
-        return nil
-    }
-
-    static func number(_ obj: [String: JSONValue], _ key: String) -> Double? {
-        switch obj[key] {
-        case .some(.int(let i)): return Double(i)
-        case .some(.double(let d)): return d
-        case .some(.string(let s)): return Double(s)
-        default: return nil
-        }
-    }
-
-    /// Both writers emit `new Date().toISOString()` — fractional-second UTC.
-    /// The no-fractional variant is the fallback so a hand-edited or older
-    /// record still parses.
-    static func date(_ iso: String?) -> Date? {
-        guard let iso, !iso.isEmpty else { return nil }
-        return NativeTimestampFormat.parseISO8601FractionalFirst(iso)
-    }
-
-    static func laterISO(_ a: String?, _ b: String?) -> String? {
-        switch (date(a), date(b)) {
-        case let (x?, y?): return x >= y ? a : b
-        case (_?, nil): return a
-        case (nil, _?): return b
-        case (nil, nil): return a ?? b
-        }
-    }
-
-    private static func retainReply(_ text: String?, truncated: Bool, in row: inout DelegationJobProjection) {
-        guard let text, !text.isEmpty else { return }
-        row.agentReplyText = String(text.prefix(6000))
-        row.agentReplyTextHead = head(text)
-        row.agentReplyTruncated = truncated || longer(text, than: 6000)
-    }
-
-    static func firstDate(_ candidates: String?...) -> Date? {
-        for candidate in candidates {
-            if let d = date(candidate) { return d }
-        }
-        return nil
-    }
 }

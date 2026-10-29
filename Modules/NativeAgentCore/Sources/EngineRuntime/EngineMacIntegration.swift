@@ -6,17 +6,19 @@ import Foundation
 import MacControl
 import MacIntegration
 import NativeAgentCore
+import NativeAgentShared
 import Observation
 import PersistenceCore
 import TrustCenter
+import UserNotifications
 // Blueprint: | `EngineMacIntegration.swift` | `MacIntegrationFacade`: root-specific checked permissions, nonprompting OS grants and watch readiness publish through `LatestRead`; explicit Mail evidence shares the same owner and invalidation; Setup, Mac Integration, connector actions and quiet pages share these reads; permission-file and root-specific notifications invalidate the same owner; phone serialization uses its own returned checked permission result |
 
 /// One root's checked Mac permissions, nonprompting OS grants and watch readiness.
 @MainActor @Observable
-public final class MacIntegrationFacade: LocalPIMStatusProvider, MacAssistantStatusClient {
+public final class MacIntegrationFacade: MacAssistantStatusClient {
     public nonisolated let dataRoot: URL
     private nonisolated let deviceSync: DeviceSync?
-    private nonisolated let platform: any ConnectorStatusPlatform
+    private nonisolated let platform: AppConnectorStatusPlatform
     public var permissions: [String: MacIntegrationPermission] {
         if case .success(let snapshot)? = checkedPermissions { return snapshot.permissions }
         return [:]
@@ -38,7 +40,7 @@ public final class MacIntegrationFacade: LocalPIMStatusProvider, MacAssistantSta
     @ObservationIgnored private var permissionWatcher: FileChangeWatcher?
     private var mailCheck: (status: String, word: String, next: String?)?
 
-    public nonisolated init(dataRoot: URL, deviceSync: DeviceSync?, platform: any ConnectorStatusPlatform) {
+    public nonisolated init(dataRoot: URL, deviceSync: DeviceSync?, platform: AppConnectorStatusPlatform) {
         self.dataRoot = dataRoot
         self.deviceSync = deviceSync
         self.platform = platform
@@ -81,8 +83,8 @@ public final class MacIntegrationFacade: LocalPIMStatusProvider, MacAssistantSta
                  "fullDiskAccess": SystemPermissionPreflight.status(.fullDiskAccess).rawValue]
             }.value
             var grants = statuses
-            for app in SystemAppleScriptAdapter.automationTargetApps {
-                grants["apple_events_\(app.lowercased())"] = await SystemAppleScriptAdapter.automationStatus(app: app, ask: false)
+            for app in AppleScriptExecution.automationTargetApps {
+                grants[AppleScriptExecution.automationStatusKey(app: app)] = await AppleScriptExecution.automationStatus(app: app, ask: false)
             }
             return (result, grants)
         } publish: { result, grants in
@@ -143,14 +145,40 @@ public final class MacIntegrationFacade: LocalPIMStatusProvider, MacAssistantSta
             if refreshPermissions { await refresh(refreshWatches: false) }
             do {
                 guard let deviceSync else { throw CocoaError(.featureUnsupported) }
-                let client = makeMacAssistantStatusClient(
-                    loadTrustPolicy: { [dataRoot] in await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicy() },
-                    proofs: NativeAppConnectorProofProvider(root: dataRoot, platform: platform),
-                    push: NativeAppMobilePushStatusProvider(deviceSync: deviceSync),
-                    dispatcherTools: StaticDispatcherToolAvailabilityProvider(availableTools: SwiftToolDispatcher.catalogRegisteredToolNames),
-                    localPIM: self,
+                let availableTools = SwiftToolDispatcher.catalogRegisteredToolNames
+                let trust = await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicy()
+                let macPolicy = trust["macControlPolicy"]?.objectValue ?? [:]
+                let macEnabled = macPolicy["enabled"] == .bool(true)
+                let notificationsAllowed = macPolicy["notifications_allowed"].map { $0 == .bool(true) } ?? true
+                let push = await ConnectorReadiness.mobilePushStatus(deviceSync: deviceSync)
+                let macProven = await ConnectorReadiness.isProven(id: "mac", root: dataRoot, platform: platform)
+                let macNotificationsState: String
+                let notificationsNextStep: String
+                if !(macEnabled && notificationsAllowed) {
+                    macNotificationsState = "needs_policy"
+                    notificationsNextStep = "Turn on Notifications under Advanced Mac control, then send a test notification."
+                } else {
+                    let center = UNUserNotificationCenter.current()
+                    let settings = await center.notificationSettings()
+                    switch settings.authorizationStatus {
+                    case .authorized, .provisional:
+                        let delivered = await center.deliveredNotifications()
+                        macNotificationsState = delivered.isEmpty ? "probe_needed" : "ready"
+                        notificationsNextStep = delivered.isEmpty ? "Send a notification to prove delivery; no delivered notification is currently retained." : ""
+                    case .denied, .notDetermined:
+                        macNotificationsState = "needs_permission"
+                        notificationsNextStep = "Allow NativeAgent notifications in macOS notification settings."
+                    default:
+                        macNotificationsState = "unavailable"
+                        notificationsNextStep = "macOS notification authorization evidence is unavailable."
+                    }
+                }
+                let response = try await MacAssistantStatusResult.compose(
+                    macEnabled: macEnabled, macProven: macProven,
+                    notifications: (macNotificationsState, notificationsNextStep), pushStatus: push,
+                    availableTools: availableTools,
+                    localStatuses: localStatusProjection(),
                     watchCatalog: { [dataRoot] in try await MacAssistantParts.watchCatalog(dataRoot: dataRoot) })
-                let response = try await client.macAssistantStatus(lightweight: false)
                 return Result<MacAssistantStatusResult, Error>.success(response)
             } catch {
                 return .failure(error)
@@ -176,10 +204,6 @@ public final class MacIntegrationFacade: LocalPIMStatusProvider, MacAssistantSta
         await refresh(refreshWatches: false)
         permissionRead.write { mailCheck = evidence }
         await refreshWatches(refreshPermissions: false)
-    }
-
-    public nonisolated func localStatuses() async -> [String: [String: JSONValue]] {
-        await localStatusProjection()
     }
 
     private func localStatusProjection() -> [String: [String: JSONValue]] {

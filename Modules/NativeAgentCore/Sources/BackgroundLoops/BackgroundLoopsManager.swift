@@ -1,381 +1,18 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `BackgroundLoopsManager.swift` | Core background-loop registration, execution and status; retains the engine's single resident observation body, cancels its effect on stop and joins its settlement before returning or replacement |
+// Blueprint: | `BackgroundLoopsManager.swift` | BackgroundLoopLifetimes registration, execution, status, resident observation and lifecycle settlement |
 
-// MARK: - BackgroundLoopsManager
-//
-// Process-wide owner for Swift background-loop registration, execution, and
-// status. Concrete loop assembly stays in NativeAgentApp and is injected via
-// `start(loops:)`, keeping this module dependency-light.
+// EngineRuntime composes registrations; this owner holds their lifecycle,
+// execution and status.
 
-/// Liveness of ONE event-driven loop's stream listener (sweep R4 item 3).
-///
-/// An `EventDeadlineLoopRunner` is invalidated by its event stream, not by a
-/// timer. When that stream ends — a file watcher invalidated, an upstream
-/// continuation finished — the `for await` returns and the listener task exits
-/// normally. Before this type existed nothing recorded that exit, so a loop
-/// with a dead listener still reported `running: true` and simply stopped
-/// firing. `nil` on `LoopStatus` means "this loop has no event listener", which
-/// is a different statement from "its listener is down".
-public struct LoopEventListenerHealth: Sendable, Equatable {
-    /// A listener task is currently consuming the stream.
-    public var active: Bool
-    /// When the stream last ended on its own (nil = it never has).
-    public var lastEndedAt: Date?
-    /// How many times this loop's listener has been restarted since
-    /// registration. Monotonic; a healthy loop stays at 0.
-    public var restartCount: Int
-    /// Ends since the last event actually arrived. Reset by a delivered event,
-    /// which is the only proof the replacement listener is really working — a
-    /// stream that ends immediately on every restart keeps climbing.
-    public var consecutiveEnds: Int
-    /// Human-readable last termination, carried into Doctor.
-    public var lastError: String?
-
-    public init(
-        active: Bool = true,
-        lastEndedAt: Date? = nil,
-        restartCount: Int = 0,
-        consecutiveEnds: Int = 0,
-        lastError: String? = nil
-    ) {
-        self.active = active
-        self.lastEndedAt = lastEndedAt
-        self.restartCount = restartCount
-        self.consecutiveEnds = consecutiveEnds
-        self.lastError = lastError
-    }
-}
-
-public struct LoopStatus: Sendable, Equatable {
-    public let name: String
-    public let interval: TimeInterval
-    public let lastRun: Date?
-    public let nextRun: Date?
-    public let runCount: Int
-    public let lastError: String?
-    public let running: Bool
-    public let disabledReason: String?
-    /// A loop body is executing right now. This differs from `running`, which
-    /// only means the manager owns an active scheduler registration.
-    public let executing: Bool
-    public let executionStartedAt: Date?
-    /// Watchdog budget for the active tick.
-    public let executionTimeout: TimeInterval
-    /// nil for loops that are not event-driven at all.
-    public let eventListener: LoopEventListenerHealth?
-    /// Outcome text of the most recent tick ("completed", "skipped: …",
-    /// "failed"). C8 surfaces it so a dormancy verdict can name the reason the
-    /// lane is doing nothing instead of just reporting that it is.
-    public let lastResult: String?
-    /// When this loop last COMPLETED real work. Durable across relaunch; nil
-    /// means it has never completed a tick. Distinct from `lastRun`, which
-    /// advances on failures and skips too (C8).
-    public let lastSuccessfulWorkAt: Date?
-    /// When this loop was first registered on this machine (durable). Dormancy
-    /// is measured from max(firstSeen, lastSuccessfulWork).
-    public let firstSeenAt: Date?
-
-    public init(
-        name: String,
-        interval: TimeInterval = 300,
-        lastRun: Date?,
-        nextRun: Date?,
-        runCount: Int,
-        lastError: String?,
-        running: Bool = false,
-        disabledReason: String? = nil,
-        executing: Bool = false,
-        executionStartedAt: Date? = nil,
-        executionTimeout: TimeInterval = 300,
-        eventListener: LoopEventListenerHealth? = nil,
-        lastResult: String? = nil,
-        lastSuccessfulWorkAt: Date? = nil,
-        firstSeenAt: Date? = nil
-    ) {
-        self.name = name
-        self.interval = interval
-        self.lastRun = lastRun
-        self.nextRun = nextRun
-        self.runCount = runCount
-        self.lastError = lastError
-        self.running = running
-        self.disabledReason = disabledReason
-        self.executing = executing
-        self.executionStartedAt = executionStartedAt
-        self.executionTimeout = executionTimeout
-        self.eventListener = eventListener
-        self.lastResult = lastResult
-        self.lastSuccessfulWorkAt = lastSuccessfulWorkAt
-        self.firstSeenAt = firstSeenAt
-    }
-}
-
-/// Serializes every execution request for one loop registration. A request
-/// arriving during an active tick waits for that tick and then returns without
-/// invoking the underlying loop again.
-
-/// One parked idle-waiter registration. All mutation is confined to the gate
-/// actor; `@unchecked Sendable` only so the cancellation handler can hop back
-/// onto the actor carrying it.
-private final class IdleWait: @unchecked Sendable {
-    var continuation: CheckedContinuation<Void, Never>?
-    var cancelled = false
-}
-
-private actor LoopExecutionGate {
-    struct Snapshot: Sendable {
-        let executing: Bool
-        let executionStartedAt: Date?
-    }
-
-    private var active = false
-    private var activeSince: Date?
-    private var idleWaiters: [IdleWait] = []
-    /// `finish` only releases the execution that owns this token.
-    private var generation: UInt64 = 0
-
-    /// Returns the ownership token to the request that owns this execution.
-    /// Coalesced callers wait for that owner and receive nil.
-    func acquireOrJoin(startedAt: Date) async -> UInt64? {
-        guard active else {
-            active = true
-            activeSince = startedAt
-            generation &+= 1
-            return generation
-        }
-        await waitForIdle()
-        return nil
-    }
-
-    /// Releases exactly one acquire after its body and accounting settle.
-    func finish(token: UInt64) {
-        guard active, token == generation else { return }
-        active = false
-        activeSince = nil
-        let waiters = idleWaiters
-        idleWaiters.removeAll()
-        for waiter in waiters {
-            waiter.continuation?.resume()
-        }
-    }
-
-    /// Cancellation retires the replacement, never the physical execution.
-    /// Its old registration keeps this gate until the body actually exits.
-    func waitUntilIdleForReplacement() async -> Bool {
-        if active { await waitForIdle() }
-        return !Task.isCancelled && !active
-    }
-
-    /// Drops a parked waiter whose Task was cancelled. 2026-07-21 audit (MED):
-    /// a loop wedged ignoring cancellation used to leak the joining Task and
-    /// its continuation in `idleWaiters` forever — one per interval.
-    private func cancelIdleWait(_ wait: IdleWait) {
-        wait.cancelled = true
-        guard let idx = idleWaiters.firstIndex(where: { $0 === wait }) else { return }
-        idleWaiters.remove(at: idx)
-        wait.continuation?.resume()
-    }
-
-    /// Parks the caller until the active tick finishes, resuming early when
-    /// its Task is cancelled so a wedged tick can never leak the waiter.
-    private func waitForIdle() async {
-        let wait = IdleWait()
-        await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                // A cancellation that raced registration must never park.
-                if wait.cancelled {
-                    continuation.resume()
-                } else {
-                    wait.continuation = continuation
-                    idleWaiters.append(wait)
-                }
-            }
-        } onCancel: {
-            Task { await self.cancelIdleWait(wait) }
-        }
-    }
-
-    func snapshot() -> Snapshot {
-        Snapshot(
-            executing: active,
-            executionStartedAt: activeSince
-        )
-    }
-}
-
-/// One-shot latch resolving the race between "the underlying tick returned"
-/// and "our own Task was cancelled". Exactly one resolution wins; a LATE
-/// completion from a wedged tick is dropped as stale.
-private actor ManagedTickRace {
-    enum Result: Sendable {
-        case finished(LoopTickOutcome)
-        case cancelled
-    }
-
-    private var result: Result?
-    private var waiters: [CheckedContinuation<Result, Never>] = []
-
-    /// Returns true only to the first resolver. A cancelled manager-facing
-    /// wait can therefore leave lifecycle cleanup to the still-running child:
-    /// when that child eventually exits, its rejected `.finished` resolution
-    /// is the proof that it is finally safe to release the execution gate.
-    @discardableResult
-    func resolve(_ value: Result) -> Bool {
-        guard result == nil else { return false }
-        result = value
-        let parked = waiters
-        waiters.removeAll()
-        for waiter in parked { waiter.resume(returning: value) }
-        return true
-    }
-
-    func wait() async -> Result {
-        if let result { return result }
-        return await withCheckedContinuation { continuation in
-            if let result {
-                continuation.resume(returning: result)
-            } else {
-                waiters.append(continuation)
-            }
-        }
-    }
-}
-
-private struct ManagedLoopRunner: LoopRunner {
-    let underlying: any LoopRunner
-    let gate: LoopExecutionGate
-    let clock: @Sendable () -> Date
-    let onFinished: @Sendable () async -> Void
-
-    var loopId: String { underlying.loopId }
-    var interval: TimeInterval { underlying.interval }
-    var tickTimeoutOverride: TimeInterval? { underlying.tickTimeoutOverride }
-
-    /// Single-release discipline: exactly one `finish` per `acquireOrJoin`,
-    /// carrying the acquire's token. The underlying tick runs in an
-    /// unstructured child so the manager-facing timeout stays bounded even
-    /// when a buggy body ignores cooperative cancellation. Crucially, that
-    /// timeout no longer releases the gate: the registration stays
-    /// quarantined/busy until the actual child exits. Releasing early allowed
-    /// a replacement effecting tick to overlap a timed-out body whose external
-    /// effects were still in flight.
-    func tickOutcome() async -> LoopTickOutcome {
-        await tickOutcome(ifDue: nil)
-    }
-
-    func shutdown() async {
-        await underlying.shutdown()
-    }
-
-    /// Due-aware entry used by opportunistic OS wakes. Gate ownership comes
-    /// first; the durable due check comes second. That order closes the race in
-    /// which a periodic tick could settle after an early due read but before
-    /// this request entered the single-flight owner.
-    func tickOutcomeIfDue(
-        _ isDue: @escaping @Sendable () async -> Bool
-    ) async -> LoopTickOutcome {
-        await tickOutcome(ifDue: isDue)
-    }
-
-    private func tickOutcome(
-        ifDue isDue: (@Sendable () async -> Bool)?
-    ) async -> LoopTickOutcome {
-        guard let accounting = LoopTickAccounting.current else {
-            return .failed(error: "Background work could not start because result tracking is unavailable.")
-        }
-        guard let token = await gate.acquireOrJoin(startedAt: clock()) else {
-            return .skipped(reason: LoopTickOutcome.coalescedSkipReason)
-        }
-        if let isDue, !(await isDue()) {
-            await gate.finish(token: token)
-            await onFinished()
-            return .skipped(
-                reason: LoopTickOutcome.notDueSkipReason,
-                healthNeutral: true
-            )
-        }
-        let race = ManagedTickRace()
-        let loop = underlying
-        let child = Task {
-            let outcome = await loop.tickOutcome()
-            let delivered = await race.resolve(.finished(outcome))
-            if !delivered {
-                // Cancellation/timeout already won the caller-facing race.
-                // This return is nevertheless the first authoritative proof
-                // that the old effecting body is gone, so only now may a new
-                // execution acquire the registration.
-                await finishAfterRecording(token: token, accounting: accounting)
-            }
-        }
-        let result = await withTaskCancellationHandler {
-            await race.wait()
-        } onCancel: {
-            child.cancel()
-            Task { await race.resolve(.cancelled) }
-        }
-
-        switch result {
-        case .finished(let outcome):
-            // C6: the tick body has returned, so whatever it wrote is on disk.
-            // Stamp the watched paths' generation NOW — every watcher event
-            // that still observes this generation is this loop's own echo.
-            // A health-neutral skip never ran the body, so it must not stamp:
-            // doing so would swallow a foreign write that arrived while the
-            // loop was coalescing or backing off.
-            if !outcome.isHealthNeutralSkip {
-                PhysiologySelfWriteRegistry.shared.stampAfterTick(loopId: loopId)
-            }
-            await finishAfterRecording(token: token, accounting: accounting)
-            return outcome
-        case .cancelled:
-            // The caller receives a bounded failure, but the gate deliberately
-            // remains active. The child above releases it only after its real
-            // exit, preventing a replacement effecting tick from overlapping
-            // this quarantined execution.
-            return .failed(error: "cancelled before tick completed")
-        }
-    }
-
-    private func finishAfterRecording(
-        token: UInt64, accounting: LoopTickAccounting
-    ) async {
-        let release: @Sendable () async -> Void = {
-            await gate.finish(token: token)
-            await onFinished()
-        }
-        await accounting.releaseAfterRecording(release)
-    }
-}
-
-/// Adapts the managed runner's gate-then-due entry back to `LoopRunner` so the
-/// existing timeout and outcome-accounting path stays singular.
-private struct DueAwareManagedLoopRunner: LoopRunner {
-    let base: ManagedLoopRunner
-    let isDue: @Sendable () async -> Bool
-
-    var loopId: String { base.loopId }
-    var interval: TimeInterval { base.interval }
-    var tickTimeoutOverride: TimeInterval? { base.tickTimeoutOverride }
-
-    func tickOutcome() async -> LoopTickOutcome {
-        await base.tickOutcomeIfDue(isDue)
-    }
-
-    func shutdown() async {
-        await base.shutdown()
-    }
-}
-
-public actor BackgroundLoopsManager {
+public actor BackgroundLoopLifetimes {
     public static let systemBackgroundActivities: [(loopId: String, interval: TimeInterval)] = [
-        ("memory_consolidation", 7 * 24 * 60 * 60),
         ("self_improvement_sweep", 7 * 24 * 60 * 60),
     ]
     public static let retiredSystemBackgroundActivities = ["dream_cycle", "rem_cycle"]
 
-    public static let shared = BackgroundLoopsManager(
+    public static let shared = BackgroundLoopLifetimes(
         scheduler: SwiftNativeLoopScheduler(
             failureReceiptsPath: PersistenceCore.defaultDataRoot()
                 .appendingPathComponent("logs", isDirectory: true)
@@ -383,19 +20,19 @@ public actor BackgroundLoopsManager {
         )
     )
 
-    private let scheduler: SwiftNativeLoopScheduler
-    private let clock: @Sendable () -> Date
-    private var started = false
+    internal let scheduler: SwiftNativeLoopScheduler
+    internal let clock: @Sendable () -> Date
+    internal var started = false
     private var starting = false
     private var stopped = false
     private var startedAt: Date?
-    private var lifecycleGeneration: UInt64 = 0
+    internal var lifecycleGeneration: UInt64 = 0
     // One engine-assembled observation body shares this owner's start/stop.
     // Retain a cancelled predecessor through exit before admitting its successor.
     private var residentObservation: (@Sendable () async -> Void)?
     private var residentObservationTask: Task<Void, Never>?
     private var residentObservationID: UUID?
-    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var startTransition = ScopedWaiter()
     private var registrations: [String: LoopRegistration] = [:]
     // Expected configuration survives the live registration's retirement drain.
     private var configuredLoopIntervals: [String: TimeInterval] = [:]
@@ -403,34 +40,31 @@ public actor BackgroundLoopsManager {
     /// Event/deadline physiology stays owned by the same manager as periodic
     /// integrity sweeps. Per-loop generations make replacement fail closed:
     /// a stale stream/deadline can never execute a newly registered runner.
-    private var physiologyRunners: [String: any EventDeadlineLoopRunner] = [:]
-    private var physiologyGenerations: [String: UUID] = [:]
-    /// Owns the one-shot startup/restart reconciliation separately from the
-    /// long-lived event listener. Keeping a completion handle makes the
-    /// lifecycle guarantee observable without relying on a wall-clock poll,
-    /// while `start()` remains non-blocking for lanes whose reconciliation may
-    /// legitimately perform long-running work.
-    private var physiologyStartupTasks: [String: Task<Void, Never>] = [:]
-    private var physiologyEventTasks: [String: Task<Void, Never>] = [:]
-    private var physiologyDebounceTasks: [String: Task<Void, Never>] = [:]
-    private var physiologyDebounceTokens: [String: UUID] = [:]
+    internal var physiologyRunners: [String: any EventDeadlineLoopRunner] = [:]
+    internal var physiologyGenerations: [String: UUID] = [:]
+    /// Retain startup/restart reconciliation independently of listener lifetime;
+    /// `start()` remains non-blocking while lifecycle settlement can join it.
+    internal var physiologyStartupTasks: [String: Task<Void, Never>] = [:]
+    internal var physiologyEventTasks: [String: Task<Void, Never>] = [:]
+    internal var physiologyDebounceTasks: [String: Task<Void, Never>] = [:]
+    internal var physiologyDebounceTokens: [String: UUID] = [:]
     /// A firing wake transfers its handle here before executing. Arrivals may
     /// replace a pending debounce, but only stop/replacement cancels execution.
-    private var physiologyExecutionTasks: [String: [UUID: Task<Void, Never>]] = [:]
-    private var physiologyPendingEvents: Set<String> = []
-    private var physiologyDeadlineTasks: [String: Task<Void, Never>] = [:]
-    private var physiologyDeadlines: [String: Date] = [:]
+    internal var physiologyExecutionTasks: [String: [UUID: Task<Void, Never>]] = [:]
+    internal var physiologyPendingEvents: Set<String> = []
+    internal var physiologyDeadlineTasks: [String: Task<Void, Never>] = [:]
+    internal var physiologyDeadlines: [String: Date] = [:]
     /// Only the latest projection may arm or fire a deadline for this loop.
-    private var physiologyDeadlineTokens: [String: UUID] = [:]
-    private var wallClockObservers: [NSObjectProtocol] = []
-    /// Sweep R4 item 3: per-loop listener liveness + the pending restart task.
-    private var physiologyListenerHealth: [String: LoopEventListenerHealth] = [:]
-    private var physiologyListenerRestartTasks: [String: Task<Void, Never>] = [:]
+    internal var physiologyDeadlineTokens: [String: UUID] = [:]
+    internal var wallClockObservers: [NSObjectProtocol] = []
+    /// Per-loop listener liveness and the pending restart task.
+    internal var physiologyListenerHealth: [String: LoopEventListenerHealth] = [:]
+    internal var physiologyListenerRestartTasks: [String: Task<Void, Never>] = [:]
     /// Bounded restart backoff for an event listener whose stream ended. The
     /// last entry is the ceiling: a permanently dead source retries every 30s
     /// forever rather than spinning, and its climbing `consecutiveEnds` is what
     /// surfaces the problem in `status()` instead of a respawn loop hiding it.
-    private let eventListenerRestartBackoff: [TimeInterval] = [1, 5, 30]
+    internal let eventListenerRestartBackoff: [TimeInterval] = [1, 5, 30]
 
     public init(
         scheduler: SwiftNativeLoopScheduler = SwiftNativeLoopScheduler(),
@@ -476,7 +110,7 @@ public actor BackgroundLoopsManager {
                       residentObservation: (@Sendable () async -> Void)? = nil) async -> Bool {
         guard !stopped else { return false }
         if starting {
-            await waitForStartTransition()
+            await startTransition.park()
             guard started, !stopped else { return false }
         }
         if started {
@@ -488,6 +122,7 @@ public actor BackgroundLoopsManager {
         }
         if let residentObservation { self.residentObservation = residentObservation }
         starting = true
+        startTransition = ScopedWaiter()
         lifecycleGeneration &+= 1
         let generation = lifecycleGeneration
         // Stop retains registrations, including gates held by cancelled work
@@ -497,6 +132,9 @@ public actor BackgroundLoopsManager {
         }
         guard starting, !stopped, lifecycleGeneration == generation else { return false }
 
+        for registration in Array(registrations.values) {
+            if let runner = registration.runner as? ManagedLoopRunner { await runner.gate.reopen() }
+        }
         await scheduler.start()
         guard starting, !stopped, lifecycleGeneration == generation else {
             await scheduler.stop()
@@ -541,11 +179,19 @@ public actor BackgroundLoopsManager {
             finishStartTransition()
         }
         cancelAllPhysiologyTasks()
-        for tail in restartTails.values { tail.task.cancel() }
+        let replacements = restartTails.values.map(\.task)
+        for task in replacements { task.cancel() }
         for observer in wallClockObservers { NotificationCenter.default.removeObserver(observer) }
         wallClockObservers.removeAll()
         await scheduler.stop()
-        await settle { await observation?.value }
+        await settle {
+            await observation?.value
+            for task in replacements { await task.value }
+        }
+        while !retiringTasks.isEmpty {
+            let retiring = Array(retiringTasks.values)
+            await settle { for task in retiring { await task.value } }
+        }
     }
 
     public func status() async -> [LoopStatus] {
@@ -571,11 +217,7 @@ public actor BackgroundLoopsManager {
                 executing: snapshot.executing,
                 executionStartedAt: snapshot.executionStartedAt,
                 executionTimeout: runner.tickTimeoutOverride ?? 300,
-                // Sweep R4 item 3: liveness of the EVENT lane, reported
-                // separately from `running` (which only proves the manager
-                // started and the loop is registered). A loop can be running
-                // with a dead listener; that is precisely the state that used
-                // to be invisible.
+                // Listener liveness is separate from registration and manager uptime.
                 eventListener: physiologyRunners[state.loopId] == nil
                     ? nil
                     : (physiologyListenerHealth[state.loopId] ?? LoopEventListenerHealth()),
@@ -615,7 +257,7 @@ public actor BackgroundLoopsManager {
 
     public func loopRunner(loopId: String) -> (any LoopRunner)? { managedRunner(loopId: loopId)?.underlying }
 
-    private func managedRunner(loopId: String) -> ManagedLoopRunner? {
+    internal func managedRunner(loopId: String) -> ManagedLoopRunner? {
         registrations[loopId]?.runner as? ManagedLoopRunner
     }
 
@@ -631,7 +273,7 @@ public actor BackgroundLoopsManager {
     /// that execution instead of overlapping it.
     @discardableResult
     public func runTickOnce(loopId: String) async -> LoopTickOutcome {
-        if starting { await waitForStartTransition() }
+        if starting { await startTransition.park() }
         if !started { _ = await start() }
         guard started else {
             return .failed(error: "background loop manager unavailable")
@@ -646,96 +288,63 @@ public actor BackgroundLoopsManager {
         )
     }
 
-    /// OUT-OF-BAND OUTCOME REPORT for a lane whose real work happens off its own
-    /// loop tick. `cognition_maintenance`, `cognition_replay` and
-    /// `cognition_reflection` all run from the organism's event/deadline paths;
-    /// with nothing reported, their daily integrity sweep was the only thing the
-    /// scheduler ever saw and it always landed on `.skipped`, so the durable
-    /// completion stamps never advanced and Doctor's dormancy read could not tell
-    /// a working lane from a dead one.
-    ///
-    /// Identical accounting to `executeAndRecord`: only a completion advances the
-    /// durable stamp, a health-neutral skip is recorded as nothing, and a failure
-    /// goes through the failure path so the streak is real.
-    public func recordOutOfBandOutcome(loopId: String, outcome: LoopTickOutcome) async {
+    /// Record work performed outside the loop's own tick through shared accounting:
+    /// only completion advances the durable stamp; health-neutral skips do not
+    /// record health, and failures advance the failure streak.
+    public func recordOutOfBandOutcome(loopId: String, outcome: LoopTickOutcome, startedAt: Date? = nil) async {
         switch outcome {
         case .completed(let result):
-            await scheduler.recordResult(loopId: loopId, result: result ?? "completed")
+            await scheduler.recordResult(loopId: loopId, result: result ?? "completed", startedAt: startedAt)
         case .skipped(let reason, _):
             guard !outcome.isHealthNeutralSkip else { return }
             await scheduler.recordResult(
                 loopId: loopId,
                 result: "skipped: \(reason)",
-                completedWork: false
+                completedWork: false, startedAt: startedAt
             )
         case .failed(let error):
             await scheduler.recordFailure(loopId: loopId, error: error)
         }
     }
 
-    private func executeAndRecord(
-        loopId: String,
-        runner: any LoopRunner,
-        gate: LoopExecutionGate,
-        automaticLifecycle: UInt64?
-    ) async -> LoopTickOutcome {
-        let accounting = LoopTickAccounting()
-        let outcome = await LoopTickAccounting.$current.withValue(accounting) {
-            await executeAndRecordOutcome(
-                loopId: loopId, runner: runner, gate: gate, automaticLifecycle: automaticLifecycle
-            )
-        }
-        await accounting.didRecord()
-        return outcome
-    }
-
     private func executeAndRecordOutcome(
         loopId: String,
-        runner: any LoopRunner,
+        runner: ManagedLoopRunner,
         gate: LoopExecutionGate,
-        automaticLifecycle: UInt64?
+        automaticLifecycle: UInt64?,
+        isDue: @escaping @Sendable () async -> Bool
     ) async -> LoopTickOutcome {
+        let result: Result<LoopTickOutcome, Error>
         do {
-            let outcome = try await tickWithTimeoutOutcome(
-                runner,
+            result = .success(try await tickWithTimeoutOutcome(
+                { await runner.tickOutcome(ifDue: isDue) },
                 timeout: runner.tickTimeoutOverride ?? 300
-            )
-            guard registrationIsCurrent(loopId: loopId, gate: gate, lifecycle: automaticLifecycle) else {
-                return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
-            }
-            await recordOutOfBandOutcome(loopId: loopId, outcome: outcome)
+            ))
+        } catch { result = .failure(error) }
+        let execution = await gate.snapshot()
+        guard registrationIsCurrent(loopId: loopId, gate: gate, lifecycle: automaticLifecycle) else {
+            return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
+        }
+        switch result {
+        case .success(let outcome):
+            await recordOutOfBandOutcome(loopId: loopId, outcome: outcome, startedAt: execution.executionStartedAt)
             return outcome
-        } catch is CancellationError {
-            guard registrationIsCurrent(loopId: loopId, gate: gate, lifecycle: automaticLifecycle) else {
-                return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
+        case .failure(let error):
+            let outcome: LoopTickOutcome
+            if error is CancellationError {
+                outcome = .skipped(reason: "cancelled")
+            } else if error is TickTimeoutError {
+                let detail = "timeout after \(formatTimeout(runner.tickTimeoutOverride ?? 300))"
+                // A timeout does not advance the durable successful-run clock.
+                await scheduler.recordFailure(loopId: loopId, error: detail, advanceDurableRun: false)
+                outcome = .failed(error: detail)
+            } else {
+                let detail = String(describing: error)
+                await scheduler.recordFailure(loopId: loopId, error: detail)
+                outcome = .failed(error: detail)
             }
             await reschedulePhysiologyDeadline(loopId: loopId)
-            return .skipped(reason: "cancelled")
-        } catch is TickTimeoutError {
-            guard registrationIsCurrent(loopId: loopId, gate: gate, lifecycle: automaticLifecycle) else {
-                return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
-            }
-            let error = "timeout after \(formatTimeout(runner.tickTimeoutOverride ?? 300))"
-            // A TIMED-OUT tick did not complete its body, so it must NOT book a
-            // fresh durable last-run stamp. Without this a
-            // wedged weekly loop timing out through the manual/background-task
-            // path persisted `lastRun = now`, and restart catch-up slept another
-            // week instead of treating it as overdue (gpt-5.5 BLOCKING).
-            await scheduler.recordFailure(
-                loopId: loopId,
-                error: error,
-                advanceDurableRun: false
-            )
-            await reschedulePhysiologyDeadline(loopId: loopId)
-            return .failed(error: error)
-        } catch {
-            guard registrationIsCurrent(loopId: loopId, gate: gate, lifecycle: automaticLifecycle) else {
-                return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
-            }
-            let detail = String(describing: error)
-            await scheduler.recordFailure(loopId: loopId, error: detail)
-            await reschedulePhysiologyDeadline(loopId: loopId)
-            return .failed(error: detail)
+            return outcome
         }
     }
 
@@ -751,7 +360,7 @@ public actor BackgroundLoopsManager {
     @discardableResult
     public func runTickIfDue(loopId: String) async -> LoopTickOutcome {
         let lifecycle = lifecycleGeneration
-        if starting { await waitForStartTransition() }
+        if starting { await startTransition.park() }
         guard automaticLifecycleIsCurrent(lifecycle) else {
             return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
         }
@@ -773,7 +382,7 @@ public actor BackgroundLoopsManager {
 
     /// Validate registration after suspension and inside the execution gate.
     /// Automatic wakes also carry the lifecycle that admitted them.
-    private func executeRegisteredTick(
+    internal func executeRegisteredTick(
         loopId: String,
         runner: ManagedLoopRunner,
         lifecycle: UInt64?,
@@ -782,22 +391,21 @@ public actor BackgroundLoopsManager {
         guard registrationIsCurrent(loopId: loopId, gate: runner.gate, lifecycle: lifecycle) else {
             return .skipped(reason: LoopTickOutcome.notDueSkipReason, healthNeutral: true)
         }
-        let dueRunner = DueAwareManagedLoopRunner(
-            base: runner,
-            isDue: { [weak self, scheduler, gate = runner.gate] in
-                guard let self else { return false }
-                if requiresDue, await scheduler.isDue(loopId: loopId) != true { return false }
-                return await self.registrationIsCurrent(
-                    loopId: loopId, gate: gate, lifecycle: lifecycle
-                )
-            }
-        )
-        return await executeAndRecord(
-            loopId: loopId, runner: dueRunner, gate: runner.gate, automaticLifecycle: lifecycle
-        )
+        let isDue: @Sendable () async -> Bool = { [weak self, scheduler, gate = runner.gate] in
+            guard let self else { return false }
+            if requiresDue, await scheduler.isDue(loopId: loopId) != true { return false }
+            return await self.registrationIsCurrent(loopId: loopId, gate: gate, lifecycle: lifecycle)
+        }
+        let accounting = LoopTickAccounting()
+        let outcome = await LoopTickAccounting.$current.withValue(accounting) {
+            await executeAndRecordOutcome(loopId: loopId, runner: runner, gate: runner.gate,
+                automaticLifecycle: lifecycle, isDue: isDue)
+        }
+        await accounting.didRecord()
+        return outcome
     }
 
-    private func automaticLifecycleIsCurrent(_ lifecycle: UInt64?) -> Bool {
+    internal func automaticLifecycleIsCurrent(_ lifecycle: UInt64?) -> Bool {
         guard let lifecycle else { return true } // Explicit manual execution.
         return !Task.isCancelled && started && lifecycleGeneration == lifecycle
     }
@@ -849,12 +457,7 @@ public actor BackgroundLoopsManager {
         replacingLoopIds.insert(id)
         defer { replacingLoopIds.remove(id) }
         cancelPhysiologyTasks(loopId: id)
-        let previous = managedRunner(loopId: id)
         await scheduler.stopWorkForReplacement(loopId: id)
-        guard replacementIsCurrent(lifecycle) else { return }
-        // Keep the old registration and gate while draining. Stop can retire
-        // this waiter immediately without ever releasing the body's exclusion.
-        if let previous, !(await previous.gate.waitUntilIdleForReplacement()) { return }
         guard replacementIsCurrent(lifecycle) else { return }
         cancelPhysiology(loopId: id)
         registrations.removeValue(forKey: id)
@@ -905,331 +508,16 @@ public actor BackgroundLoopsManager {
         }
     }
 
-    // MARK: Event/deadline physiology
-
-    private func observeWallClock(lifecycle: UInt64) {
-        guard wallClockObservers.isEmpty else { return }
-        wallClockObservers = [Notification.Name.NSSystemClockDidChange, .NSSystemTimeZoneDidChange].map { name in
-            NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil) { [weak self] _ in
-                Task { await self?.wallClockChanged(lifecycle: lifecycle) }
-            }
-        }
-    }
-
-    private func wallClockChanged(lifecycle: UInt64) {
-        guard automaticLifecycleIsCurrent(lifecycle) else { return }
-        for id in physiologyRunners.keys.sorted() {
-            if let generation = physiologyGenerations[id] {
-                physiologyEventArrived(loopId: id, generation: generation)
-            }
-        }
-    }
-
-    private func activateAllPhysiology() {
-        for id in physiologyRunners.keys.sorted() {
-            activatePhysiology(loopId: id)
-        }
-    }
-
-    private func activatePhysiology(loopId: String, reconcile: Bool = true) {
-        guard started,
-              let runner = physiologyRunners[loopId],
-              let generation = physiologyGenerations[loopId]
-        else { return }
-        physiologyStartupTasks.removeValue(forKey: loopId)?.cancel()
-        physiologyEventTasks[loopId]?.cancel()
-        physiologyListenerRestartTasks.removeValue(forKey: loopId)?.cancel()
-        var health = physiologyListenerHealth[loopId] ?? LoopEventListenerHealth()
-        health.active = true
-        physiologyListenerHealth[loopId] = health
-        let stream = runner.physiologyEvents()
-        physiologyEventTasks[loopId] = Task { [weak self] in
-            for await _ in stream {
-                guard !Task.isCancelled else { return }
-                await self?.physiologyEventArrived(loopId: loopId, generation: generation)
-            }
-            // The stream ENDED. Before sweep R4 item 3 this task simply
-            // returned and nothing anywhere knew: `status()` still reported the
-            // loop running, and a purely event-driven loop stopped firing until
-            // the process restarted. Cancellation is the legitimate exit
-            // (stop/restart/replacement) and stays silent.
-            guard !Task.isCancelled else { return }
-            await self?.physiologyEventStreamEnded(loopId: loopId, generation: generation)
-        }
-        // Startup/restart reconciliation closes the missed-event window
-        // without waiting for the slow integrity sweep. It is deliberately a
-        // separately owned one-shot task: coupling it to the infinite stream
-        // consumer made completion depend on when that listener happened to
-        // receive executor time under whole-suite or host saturation.
-        //
-        // `reconcile: false` is the PERMANENTLY-DEAD-SOURCE case (sweep R4
-        // item 3). Reconciling on every listener restart is right while the
-        // source might come back, but a source that is simply gone retries at
-        // the 30s ceiling forever — and reconciling each time would turn a dead
-        // watcher into a forced tick every 30s for the life of the process.
-        // After the third consecutive end we keep rebuilding the listener and
-        // keep reporting the failure, without the tick.
-        guard reconcile else { return }
-        physiologyStartupTasks[loopId] = Task { [weak self] in
-            await self?.reschedulePhysiologyDeadline(loopId: loopId)
-            await self?.firePhysiology(loopId: loopId, generation: generation)
-        }
-    }
-
-    /// A listener's stream finished on its own. Record it, then rebuild the
-    /// listener after a bounded backoff. The rebuild goes through
-    /// `activatePhysiology`, which ALSO re-runs the startup reconciliation —
-    /// deliberately: the window in which no listener existed is a window in
-    /// which events were missed, and reconciliation is the existing mechanism
-    /// for closing exactly that gap.
-    private func physiologyEventStreamEnded(loopId: String, generation: UUID) async {
-        guard started, physiologyGenerations[loopId] == generation else { return }
-        var health = physiologyListenerHealth[loopId] ?? LoopEventListenerHealth()
-        health.active = false
-        health.lastEndedAt = clock()
-        health.consecutiveEnds += 1
-        let delay = backoffDelay(forEndCount: health.consecutiveEnds)
-        health.lastError = "event stream ended (\(health.consecutiveEnds) consecutive); restarting in \(formatTimeout(delay))"
-        physiologyListenerHealth[loopId] = health
-
-        physiologyListenerRestartTasks.removeValue(forKey: loopId)?.cancel()
-        physiologyListenerRestartTasks[loopId] = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(delay))
-            guard !Task.isCancelled else { return }
-            await self?.restartPhysiologyListener(loopId: loopId, generation: generation)
-        }
-    }
-
-    private func restartPhysiologyListener(loopId: String, generation: UUID) {
-        physiologyListenerRestartTasks.removeValue(forKey: loopId)
-        guard started, physiologyGenerations[loopId] == generation else { return }
-        physiologyListenerHealth[loopId]?.restartCount += 1
-        let ends = physiologyListenerHealth[loopId]?.consecutiveEnds ?? 0
-        activatePhysiology(loopId: loopId, reconcile: ends <= 2)
-    }
-
-    private func backoffDelay(forEndCount count: Int) -> TimeInterval {
-        let index = min(max(count, 1) - 1, eventListenerRestartBackoff.count - 1)
-        return eventListenerRestartBackoff[index]
-    }
-
-    private func physiologyEventArrived(loopId: String, generation: UUID) {
-        guard !Task.isCancelled, started,
-              physiologyGenerations[loopId] == generation,
-              let runner = physiologyRunners[loopId]
-        else { return }
-        // A delivered event is the ONLY proof a restarted listener actually
-        // works; a stream that ends immediately every time never gets here, so
-        // its consecutive-end count keeps climbing into Doctor.
-        if var health = physiologyListenerHealth[loopId], health.consecutiveEnds != 0 || !health.active {
-            health.consecutiveEnds = 0
-            health.active = true
-            health.lastError = nil
-            physiologyListenerHealth[loopId] = health
-        }
-        physiologyDeadlineTasks.removeValue(forKey: loopId)?.cancel()
-        physiologyDeadlines.removeValue(forKey: loopId)
-        physiologyDeadlineTokens.removeValue(forKey: loopId)
-        physiologyDebounceTasks.removeValue(forKey: loopId)?.cancel()
-        physiologyDebounceTokens.removeValue(forKey: loopId)
-        if physiologyExecutionTasks[loopId] != nil {
-            physiologyPendingEvents.insert(loopId)
-            return
-        }
-        let delay = max(0, min(runner.eventCoalescingDelay, 60))
-        let token = UUID()
-        physiologyDebounceTokens[loopId] = token
-        physiologyDebounceTasks[loopId] = Task { [weak self] in
-            if delay > 0 {
-                try? await Task.sleep(for: .seconds(delay))
-            }
-            guard !Task.isCancelled else { return }
-            await self?.fireDebouncedPhysiology(loopId: loopId, generation: generation, token: token)
-        }
-    }
-
-    private func fireDebouncedPhysiology(loopId: String, generation: UUID, token: UUID) async {
-        guard physiologyDebounceTokens[loopId] == token,
-              let task = physiologyDebounceTasks.removeValue(forKey: loopId) else { return }
-        physiologyDebounceTokens.removeValue(forKey: loopId)
-        physiologyExecutionTasks[loopId, default: [:]][token] = task
-        defer { retirePhysiologyExecution(loopId: loopId, generation: generation, token: token) }
-        await firePhysiology(loopId: loopId, generation: generation)
-    }
-
-    private func retirePhysiologyExecution(loopId: String, generation: UUID, token: UUID) {
-        guard physiologyExecutionTasks[loopId]?.removeValue(forKey: token) != nil,
-              physiologyExecutionTasks[loopId]?.isEmpty == true else { return }
-        physiologyExecutionTasks.removeValue(forKey: loopId)
-        if physiologyGenerations[loopId] == generation,
-           physiologyPendingEvents.remove(loopId) != nil {
-            physiologyEventArrived(loopId: loopId, generation: generation)
-        }
-    }
-
-    private func firePhysiology(loopId: String, generation: UUID) async {
-        let lifecycle = lifecycleGeneration
-        guard automaticLifecycleIsCurrent(lifecycle), physiologyGenerations[loopId] == generation else { return }
-        guard await waitUntilPhysiologyEligible(loopId: loopId, generation: generation, lifecycle: lifecycle),
-              physiologyGenerations[loopId] == generation,
-              let runner = managedRunner(loopId: loopId) else { return }
-        let outcome = await executeRegisteredTick(
-            loopId: loopId, runner: runner, lifecycle: lifecycle, requiresDue: false
-        )
-        // A wake arriving during work joins its physical exit. Preserve one
-        // reconciliation afterwards: the active pass may have left a capped
-        // remainder, or read before this event or deadline crossing.
-        if outcome.isCoalescedSkip,
-           automaticLifecycleIsCurrent(lifecycle), physiologyGenerations[loopId] == generation {
-            physiologyEventArrived(loopId: loopId, generation: generation)
-        }
-    }
-
-    private func reschedulePhysiologyDeadline(loopId: String) async {
-        let lifecycle = lifecycleGeneration
-        physiologyDeadlineTasks.removeValue(forKey: loopId)?.cancel()
-        physiologyDeadlines.removeValue(forKey: loopId)
-        guard started,
-              let runner = physiologyRunners[loopId],
-              let generation = physiologyGenerations[loopId]
-        else { return }
-        let token = UUID()
-        physiologyDeadlineTokens[loopId] = token
-        let current = clock()
-        guard let deadline = await runner.nextMeaningfulDeadline(after: current),
-              started, lifecycleGeneration == lifecycle,
-              physiologyGenerations[loopId] == generation,
-              physiologyDeadlineTokens[loopId] == token,
-              deadline.timeIntervalSince(current).isFinite,
-              deadline > current
-        else { return }
-        physiologyDeadlines[loopId] = deadline
-        let delay = min(deadline.timeIntervalSince(current), 365 * 24 * 60 * 60)
-        physiologyDeadlineTasks[loopId] = Task { [weak self] in
-            // Clock and zone changes invalidate this one sleep through the
-            // manager's lifecycle-owned observers, then project a new deadline.
-            try? await Task.sleep(for: .seconds(delay))
-            guard !Task.isCancelled else { return }
-            await self?.firePhysiologyDeadline(
-                loopId: loopId,
-                generation: generation,
-                token: token,
-                deadline: deadline
-            )
-        }
-    }
-
-    private func firePhysiologyDeadline(
-        loopId: String,
-        generation: UUID,
-        token: UUID,
-        deadline: Date
-    ) async {
-        let lifecycle = lifecycleGeneration
-        guard automaticLifecycleIsCurrent(lifecycle),
-              physiologyGenerations[loopId] == generation,
-              physiologyDeadlineTokens[loopId] == token,
-              physiologyDeadlines[loopId] == deadline,
-              let task = physiologyDeadlineTasks.removeValue(forKey: loopId)
-        else { return }
-        physiologyDeadlines.removeValue(forKey: loopId)
-        physiologyDeadlineTokens.removeValue(forKey: loopId)
-        // This wake is executing now, not a replaceable sleep. Completion can
-        // rearm its successor without cancelling the task doing the projection.
-        physiologyExecutionTasks[loopId, default: [:]][token] = task
-        defer { retirePhysiologyExecution(loopId: loopId, generation: generation, token: token) }
-        await firePhysiology(loopId: loopId, generation: generation)
-    }
-
-    private func waitUntilPhysiologyEligible(loopId: String, generation: UUID, lifecycle: UInt64) async -> Bool {
-        while automaticLifecycleIsCurrent(lifecycle), physiologyGenerations[loopId] == generation {
-            guard let eligibleAt = await scheduler.nextPhysiologyEligibleAt(
-                loopId: loopId,
-                at: clock()
-            ), automaticLifecycleIsCurrent(lifecycle),
-               physiologyGenerations[loopId] == generation else { return false }
-            let delay = max(0, eligibleAt.timeIntervalSince(clock()))
-            guard delay > 0 else { return true }
-            do {
-                try await Task.sleep(for: .seconds(delay))
-            } catch {
-                return false
-            }
-        }
-        return false
-    }
-
-    private func cancelPhysiologyTasks(loopId: String) {
-        physiologyStartupTasks.removeValue(forKey: loopId)?.cancel()
-        physiologyEventTasks.removeValue(forKey: loopId)?.cancel()
-        physiologyListenerRestartTasks.removeValue(forKey: loopId)?.cancel()
-        physiologyListenerHealth[loopId]?.active = false
-        physiologyDebounceTasks.removeValue(forKey: loopId)?.cancel()
-        physiologyDebounceTokens.removeValue(forKey: loopId)
-        if let tasks = physiologyExecutionTasks.removeValue(forKey: loopId) {
-            for task in tasks.values { task.cancel() }
-        }
-        physiologyPendingEvents.remove(loopId)
-        physiologyDeadlineTasks.removeValue(forKey: loopId)?.cancel()
-        physiologyDeadlines.removeValue(forKey: loopId)
-        physiologyDeadlineTokens.removeValue(forKey: loopId)
-    }
-
-    private func cancelPhysiology(loopId: String) {
-        cancelPhysiologyTasks(loopId: loopId)
-        // Health belongs to a registration, not the process.
-        physiologyListenerHealth.removeValue(forKey: loopId)
-        physiologyGenerations.removeValue(forKey: loopId)
-        physiologyRunners.removeValue(forKey: loopId)
-        // C6: suppression state belongs to a REGISTRATION. A replacement runner
-        // must not inherit the retired one's stamp.
-        PhysiologySelfWriteRegistry.shared.clear(loopId: loopId)
-    }
-
-    private func cancelAllPhysiologyTasks() {
-        for task in physiologyStartupTasks.values { task.cancel() }
-        for task in physiologyEventTasks.values { task.cancel() }
-        for task in physiologyDebounceTasks.values { task.cancel() }
-        for tasks in physiologyExecutionTasks.values {
-            for task in tasks.values { task.cancel() }
-        }
-        for task in physiologyDeadlineTasks.values { task.cancel() }
-        for task in physiologyListenerRestartTasks.values { task.cancel() }
-        physiologyStartupTasks.removeAll()
-        physiologyEventTasks.removeAll()
-        physiologyDebounceTasks.removeAll()
-        physiologyDebounceTokens.removeAll()
-        physiologyExecutionTasks.removeAll()
-        physiologyPendingEvents.removeAll()
-        physiologyDeadlineTasks.removeAll()
-        physiologyListenerRestartTasks.removeAll()
-        physiologyDeadlines.removeAll()
-        physiologyDeadlineTokens.removeAll()
-        // A stopped manager has no listeners by definition. Marking them
-        // inactive (rather than dropping the history) keeps a subsequent
-        // status() honest without inventing a fresh healthy record.
-        for id in physiologyListenerHealth.keys {
-            physiologyListenerHealth[id]?.active = false
-        }
-    }
-
-    private func waitForStartTransition() async {
-        guard starting else { return }
-        await withCheckedContinuation { continuation in
-            startWaiters.append(continuation)
-        }
-    }
+    /// A replaced task stays owned through its exit, even after its active
+    /// slot is reused. These tasks only join settlement; they admit no work.
+    internal var retiringTasks: [UUID: Task<Void, Never>] = [:]
 
     private func finishStartTransition() {
         starting = false
-        let waiters = startWaiters
-        startWaiters.removeAll()
-        for waiter in waiters {
-            waiter.resume()
-        }
+        startTransition.resume()
     }
 
-    private nonisolated func formatTimeout(_ seconds: TimeInterval) -> String {
+    internal nonisolated func formatTimeout(_ seconds: TimeInterval) -> String {
         if seconds.rounded() == seconds {
             return "\(Int(seconds))s"
         }

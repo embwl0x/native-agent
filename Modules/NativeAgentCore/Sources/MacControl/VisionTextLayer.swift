@@ -5,32 +5,16 @@ import Vision
 // Blueprint: | `VisionTextLayer.swift` | `VisionTextLayerResult`, `VisionTextLayer`, `VisionKitTextRecognizer` |
 #endif
 
-// MARK: - The TEXT layer
-//
-// Spike v0/v1 (docs/build_plans/native-look.md) settled this half already:
-//   • whole-frame `VNRecognizeTextRequest(.accurate)` recovers ~99% of normal
-//     UI text up to at least 2560p — 142/144 strings on a dense 13pt grid — in
-//     ~30–65 ms warm (~250 ms cold, one-time Vision model load);
-//   • a 3×3 overlapped TILING pass on the same frame returned 145/144 (dedup
-//     noise, +1–2 real strings) for ~1.7× the latency.
-//
-// So tiling is a CONDITIONAL tool for genuinely tiny text, not a stage. v0's
-// "1/9 at 2560" was a scene artifact (that scene's text was proportionally
-// tiny), not a general OCR ceiling. Building the tiling pipeline as a default
-// would buy ~nothing and cost latency on every look — the measurement is the
-// reason this code has a `shouldTile` predicate instead of a tiling stage.
+// Whole-frame recognition refines only genuinely tiny or sparse text.
 
-/// The result of a text pass, including WHETHER tiling fired — a caller (and a
-/// latency budget) must be able to tell a 40 ms look from a 700 ms one.
+/// Text boxes and whether conditional OCR refinement ran.
 public struct VisionTextLayerResult: Sendable, Equatable {
     public let boxes: [VisionTextBox]
     public let tiled: Bool
     /// Why tiling did or did not fire, in one phrase. Stated rather than
     /// inferred: "no tiny text (median 18.0px)" vs "tiny text (median 7.0px)".
     public let tilingReason: String
-    /// Tile OCR passes that threw. A failed tile silently dropping text made
-    /// tiny-text recovery non-deterministic and unreportable (gpt-5.5 review);
-    /// the failure count rides out so the compiler can say so.
+    /// Count thrown tile OCR passes so the compiler can report incomplete text recovery.
     public let tileFailures: Int
 
     public init(boxes: [VisionTextBox], tiled: Bool, tilingReason: String, tileFailures: Int = 0) {
@@ -42,14 +26,12 @@ public struct VisionTextLayerResult: Sendable, Equatable {
 }
 
 public enum VisionTextLayer {
-    /// Median text height BELOW this fraction of the frame height triggers the
-    /// conditional tiling pass. 0.9% of a 1440-tall frame ≈ 13 px — right at
-    /// the point where the v1 measurement stops being reassuring.
+    /// Relative frame-height threshold for median text height to trigger tiling.
     private static let tinyTextHeightFraction: Double = 0.009
     /// …and an absolute floor, because a small window full of ordinary 13 px
     /// text is not tiny text; it is a small window.
     private static let tinyTextHeightPixels: Double = 12
-    /// Tiles per axis for the conditional pass (v1 measured 3×3 overlapped).
+    /// Tiles per axis for conditional OCR refinement.
     private static let tileGrid: Int = 3
     /// Fractional overlap between adjacent tiles, so a string straddling a
     /// tile seam is whole in at least one tile.
@@ -58,11 +40,7 @@ public enum VisionTextLayer {
     /// twice by two tiles.
     private static let dedupeIoU: Double = 0.5
 
-    /// The conditional-tiling decision, isolated so it can be pinned without
-    /// running Vision at all.
-    ///
-    /// Returns nil when tiling should NOT fire. The whole point of the v1
-    /// measurement is that this returns nil for typical UI.
+    /// Tiles only recognized text whose median height is below the tiny-text threshold.
     public static func tilingDecision(
         boxes: [VisionTextBox],
         imageHeight: Double
@@ -164,22 +142,8 @@ public enum VisionTextLayer {
             }
             if !duplicate { kept.append(box) }
         }
-        // Reading order: top-to-bottom, then left-to-right. Deterministic
-        // output is a contract — the same frame must compile to the same
-        // handles in the same order, in this launch and the next.
-        // A tolerance inside a pairwise comparator is not transitive: nearby
-        // A/B and B/C can each tie while A/C do not. Anchor each 1px group to
-        // its first coordinate after strict sorting instead, then order groups.
-        let rows = toleranceGroups(kept.sorted(by: geometryPrecedes), coordinate: { $0.rect.y })
-        return rows.flatMap { row in
-            let byX = row.sorted {
-                $0.rect.x == $1.rect.x ? geometryPrecedes($0, $1) : $0.rect.x < $1.rect.x
-            }
-            return toleranceGroups(byX, coordinate: { $0.rect.x }).flatMap { column in
-                column.sorted {
-                    $0.text == $1.text ? geometryPrecedes($0, $1) : $0.text < $1.text
-                }
-            }
+        return VisionRect.readingOrder(kept, rect: \.rect, tolerance: 1, geometryPrecedes: geometryPrecedes) {
+            $0.text == $1.text ? geometryPrecedes($0, $1) : $0.text < $1.text
         }
     }
 
@@ -190,21 +154,6 @@ public enum VisionTextLayer {
         if lhs.rect.h != rhs.rect.h { return lhs.rect.h < rhs.rect.h }
         if lhs.text != rhs.text { return lhs.text < rhs.text }
         return lhs.source < rhs.source
-    }
-
-    private static func toleranceGroups(
-        _ boxes: [VisionTextBox],
-        coordinate: (VisionTextBox) -> Double
-    ) -> [[VisionTextBox]] {
-        var groups: [[VisionTextBox]] = []
-        for box in boxes {
-            if let anchor = groups.last?.first, coordinate(box) - coordinate(anchor) <= 1 {
-                groups[groups.count - 1].append(box)
-            } else {
-                groups.append([box])
-            }
-        }
-        return groups
     }
 
     /// Whole-frame pass, plus a tiling pass ONLY when the text is genuinely
@@ -272,20 +221,33 @@ public enum VisionTextLayer {
 // MARK: - The real engine
 
 #if canImport(Vision)
-/// `VNRecognizeTextRequest(.accurate)` — the measured path.
+/// Native request execution and normalized-to-pixel observation conversion.
 public struct VisionKitTextRecognizer: Sendable {
     public init() {}
 
+    func recognizeText(in image: CGImage, request: VNRecognizeTextRequest,
+        select: ([VNRecognizedTextObservation]) -> [VNRecognizedTextObservation] = { $0 }
+    ) throws -> [VisionTextBox] {
+        try Task.checkCancellation()
+        try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+        try Task.checkCancellation()
+        return select(request.results ?? []).compactMap { observation in
+            guard let candidate = observation.topCandidates(1).first else { return nil }
+            let box = observation.boundingBox
+            return VisionTextBox(text: candidate.string,
+                rect: VisionRect(x: box.minX * Double(image.width),
+                    y: (1 - box.maxY) * Double(image.height),
+                    w: box.width * Double(image.width), h: box.height * Double(image.height)),
+                confidence: Double(candidate.confidence))
+        }
+    }
+
     public func recognizeText(in image: CGImage, region: VisionRect?) throws -> [VisionTextBox] {
-        let width = Double(image.width)
-        let height = Double(image.height)
         // A tile is cropped rather than passed as a regionOfInterest so the
         // recognizer sees the sub-image at full resolution — which is the
         // entire point of tiling for tiny text.
         var offset = (x: 0.0, y: 0.0)
         var target = image
-        var targetWidth = width
-        var targetHeight = height
         if let region {
             let rect = CGRect(
                 x: region.x.rounded(.down),
@@ -298,34 +260,20 @@ public struct VisionKitTextRecognizer: Sendable {
             }
             target = cropped
             offset = (Double(rect.origin.x), Double(rect.origin.y))
-            targetWidth = Double(cropped.width)
-            targetHeight = Double(cropped.height)
         }
 
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         // UI labels must not be rewritten as prose.
         request.usesLanguageCorrection = false
-        let handler = VNImageRequestHandler(cgImage: target, options: [:])
-        try handler.perform([request])
-
         let source = region == nil ? "whole_frame" : "tile"
-        return (request.results ?? []).compactMap { observation -> VisionTextBox? in
-            guard let candidate = observation.topCandidates(1).first else { return nil }
-            let confidence = Double(candidate.confidence)
-            guard confidence >= 0.3 else { return nil }
-            let text = candidate.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        return try recognizeText(in: target, request: request).compactMap { box in
+            guard box.confidence >= 0.3 else { return nil }
+            let text = box.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return nil }
-            // Vision boxes are normalized with a BOTTOM-LEFT origin; every
-            // rect in this module is top-left image pixels. Convert once, here.
-            let box = observation.boundingBox
-            let rect = VisionRect(
-                x: offset.x + Double(box.minX) * targetWidth,
-                y: offset.y + (1 - Double(box.maxY)) * targetHeight,
-                w: Double(box.width) * targetWidth,
-                h: Double(box.height) * targetHeight
-            )
-            return VisionTextBox(text: text, rect: rect, confidence: confidence, source: source)
+            return VisionTextBox(text: text,
+                rect: VisionRect(x: offset.x + box.rect.x, y: offset.y + box.rect.y, w: box.rect.w, h: box.rect.h),
+                confidence: box.confidence, source: source)
         }
     }
 }

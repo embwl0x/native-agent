@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 // Blueprint: | `TrustAccessModeCapabilityCatalog.swift` | `TrustAccessModeCapabilityCatalog` enum; `normalizedMode`, `macControlPolicy` and Mac integration preset recognition |
 
 /// Canonical Mac-control policy templates used by the access-mode writer.
@@ -15,10 +16,10 @@ public enum TrustAccessModeCapabilityCatalog {
         for rawMode: String,
         remoteFromIosAllowed: Bool = false,
         developerMode: Bool = false
-    ) -> TrustMacControlPolicy {
+    ) -> MacControlPolicyWireSnapshot {
         switch normalizedMode(rawMode) {
         case "workspace":
-            return TrustMacControlPolicy(
+            return MacControlPolicyWireSnapshot(
                 enabled: true,
                 shortcutsAllowed: true,
                 fileOpsAllowed: true,
@@ -27,7 +28,7 @@ public enum TrustAccessModeCapabilityCatalog {
                 remoteFromIosAllowed: remoteFromIosAllowed
             )
         case "full":
-            return TrustMacControlPolicy(
+            return MacControlPolicyWireSnapshot(
                 enabled: true,
                 applesScriptAllowed: true,
                 jxaAllowed: true,
@@ -42,7 +43,7 @@ public enum TrustAccessModeCapabilityCatalog {
                 remoteFromIosAllowed: true
             )
         default:
-            return TrustMacControlPolicy(
+            return MacControlPolicyWireSnapshot(
                 enabled: false,
                 applesScriptAllowed: false,
                 jxaAllowed: false,
@@ -63,28 +64,11 @@ public enum TrustAccessModeCapabilityCatalog {
         remoteFromIosAllowed: Bool = false,
         developerMode: Bool = false
     ) -> [String: Any] {
-        let policy = macControlPolicy(
+        macControlPolicy(
             for: rawMode,
             remoteFromIosAllowed: remoteFromIosAllowed,
             developerMode: developerMode
-        )
-        let defaultRiskGate: [String: Any] = [
-            "low": "auto",
-            "medium": "approve_each",
-            "high": "approve_each",
-            "critical": "deny",
-        ]
-        let riskGate: [String: Any] = normalizedMode(rawMode) == "full"
-            ? [
-                "low": "auto",
-                "medium": "auto",
-                "high": "auto",
-                "critical": developerMode ? "auto" : "deny",
-            ]
-            : defaultRiskGate
-        var value = policy.wireValue
-        value["riskGatePolicy"] = riskGate
-        return value
+        ).wireValue
     }
 }
 
@@ -99,7 +83,7 @@ public enum MacIntegrationPreset: String, Identifiable {
 }
 
 extension TrustAccessModeCapabilityCatalog {
-    public static func macIntegrationPreset(for policy: TrustMacControlPolicy) -> MacIntegrationPreset {
+    public static func macIntegrationPreset(for policy: MacControlPolicyWireSnapshot) -> MacIntegrationPreset {
         if policy.enabled == false {
             return .off
         }

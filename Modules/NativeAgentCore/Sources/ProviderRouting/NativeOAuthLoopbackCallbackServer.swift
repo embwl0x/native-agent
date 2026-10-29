@@ -3,7 +3,7 @@ import Darwin
 import Foundation
 // Blueprint: | `NativeOAuthLoopbackCallbackServer.swift` | shared ChatGPT/xAI loopback callback socket lifecycle; one admitted wait (concurrent waits reject before installing cancellation or timeout), bounded blocking clients on Dispatch, protocol-specific response shape, state validation and exactly-once completion; browser opening stays in the owning session |
 
-public final class NativeOAuthLoopbackCallbackServer: OAuthLoopbackSession, @unchecked Sendable {
+public final class NativeOAuthLoopbackCallbackServer: @unchecked Sendable {
     public let redirectURI: URL
 
     private let fd: Int32
@@ -107,6 +107,10 @@ public final class NativeOAuthLoopbackCallbackServer: OAuthLoopbackSession, @unc
     }
 
     public func wait(timeoutSeconds: TimeInterval, expectedState: String) async throws -> URL {
+        guard timeoutSeconds.isFinite, timeoutSeconds >= 0,
+              let nanoseconds = UInt64(exactly: (max(timeoutSeconds, 1) * 1_000_000_000).rounded(.up)) else {
+            throw OAuthLoopbackCallbackError.invalidTimeout
+        }
         // Claim the whole wait, including its timeout/cancellation handler.
         // A rejected second caller must not finish the first caller's listener.
         // An already-canceled first caller still installs that handler so it
@@ -120,8 +124,7 @@ public final class NativeOAuthLoopbackCallbackServer: OAuthLoopbackSession, @unc
             try await withThrowingTaskGroup(of: URL.self) { group in
                 group.addTask { try await self.acceptOnce(expectedState: expectedState) }
                 group.addTask {
-                    let seconds = max(timeoutSeconds, 1)
-                    try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                    try await Task.sleep(nanoseconds: nanoseconds)
                     self.finish(.failure(OAuthLoopbackCallbackError.timedOut))
                     throw OAuthLoopbackCallbackError.timedOut
                 }
@@ -242,15 +245,9 @@ public final class NativeOAuthLoopbackCallbackServer: OAuthLoopbackSession, @unc
             return nil
         }
         let target = String(parts[1])
-        let callback: URL?
-        if openAIFlow {
-            callback = NativeOAuthFlow.callbackTarget(from: firstLine)
-                .flatMap { URL(string: "http://localhost:\(port)\($0)") }
-                .flatMap { NativeOAuthFlow.callbackHasResult($0) ? $0 : nil }
-        } else {
-            callback = OAuthLoopbackCallbackPolicy.validCallbackURL(target: target, path: path, port: port)
-        }
-        guard let url = callback,
+        let callback = OAuthLoopbackCallbackPolicy.validCallbackURL(target: target, path: path, port: port)
+        let url = openAIFlow ? callback.flatMap { _ in URL(string: "http://localhost:\(port)\(target)") } : callback
+        guard let url,
               OAuthLoopbackCallbackPolicy.callbackMatchesState(url, expectedState: expectedState) else {
             writeHTTPResponse(client, accepted: nil)
             return nil

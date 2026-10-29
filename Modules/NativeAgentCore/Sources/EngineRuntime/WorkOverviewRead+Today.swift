@@ -15,7 +15,9 @@ import AuthoredCapabilities
 import AppToolRuntime
 import ToolExecution
 import Senses
-// Blueprint: | `WorkOverviewRead+Today.swift` | `TodayProjection` freezes checked sources and provenance, feeds the pure `today-readout.js` faces through L0's version/epoch cache, binds source IDs to native dates and note links, and publishes through `LatestRead`; waiting counts share a pure face too. `TodayDreamDigest` reads the latest dream through `DreamNight`; native input supplies its title, mood and timestamp, never diary Markdown for JS to parse. Narration, grouping, due words and ordering live in the part. Unbound rows are omitted individually with native reasons; other activity, Ahead, earlier notes and note links remain. Native unavailable evidence, localization and live clock gutters remain. Mac and quiet reads consume the same prepared rows |
+import AgentConversations
+import TrustCenter
+// Blueprint: | `WorkOverviewRead+Today.swift` | `TodayReadout` freezes checked sources and provenance, feeds the pure `today-readout.js` faces through L0's version/epoch cache, binds source IDs to native dates and note links, and publishes through `LatestRead`; waiting counts share a pure face too. `TodayDreamDigest` reads the latest dream through `DreamNight`; native input supplies its title, mood and timestamp, never diary Markdown for JS to parse. Narration, grouping, due words and ordering live in the part. Unbound rows are omitted individually with native reasons; other activity, Ahead, earlier notes and note links remain. Native unavailable evidence, localization and live clock gutters remain. Mac and quiet reads consume the same prepared rows |
 
 /// One line of her day. Payload-free by construction: a title, one plain
 /// sentence, and when it happened (or is due). `details` is non-empty only on
@@ -126,8 +128,7 @@ public enum TodayWords {
             }
             // Inline emphasis and code spans. `_` is deliberately left alone:
             // it lives inside identifiers far more often than around emphasis.
-            // A backslash is never something to read: a stray one in a quote
-            // rendered "exax\ctly" on Memories (2026-09-23).
+            // Backslashes are not display text.
             line.removeAll { $0 == "*" || $0 == "`" || $0 == "\\" }
             return line.trimmingCharacters(in: .whitespaces)
         }
@@ -199,8 +200,14 @@ public enum TodayWords {
         return (start..<end).formatted(style)
     }
 
-    public static func weekday(_ date: Date, calendar: Calendar = Calendar.autoupdatingCurrent) -> String {
-        date.formatted(Date.FormatStyle(calendar: calendar, timeZone: calendar.timeZone).weekday(.abbreviated))
+    /// A weekday names a day within the week either side; further out it is
+    /// the date (with the year when it is not this one), so a run a year away
+    /// never reads as this Thursday.
+    public static func weekday(_ date: Date, now: Date = Date(), calendar: Calendar = Calendar.autoupdatingCurrent) -> String {
+        let style = Date.FormatStyle(calendar: calendar, timeZone: calendar.timeZone)
+        guard abs(date.timeIntervalSince(now)) >= 6.5 * 86_400 else { return date.formatted(style.weekday(.abbreviated)) }
+        let sameYear = calendar.component(.year, from: date) == calendar.component(.year, from: now)
+        return date.formatted(sameYear ? style.month(.abbreviated).day() : style.month(.abbreviated).day().year())
     }
 
     /// "Today", "Tonight", "Tomorrow" or the weekday — from the real date and
@@ -341,14 +348,15 @@ extension WorkOverviewRead {
     }
 
     @MainActor
-    public static func conversationSurfaces(_ sessions: [NativeAgentShared.ChatSession]) -> [String: String] {
+    public static func conversationSurfaces(_ sessions: [NativeAgentShared.ChatSession],
+                                            openingLines: ChatShellOpeningLine) -> [String: String] {
         let now = Date()
         let calendar = Calendar.autoupdatingCurrent
         return Dictionary(sessions.filter {
             guard ($0.messageCount ?? 0) > 0,
                   let at = TodayWords.parseTimestamp($0.updatedAt ?? $0.createdAt),
                   calendar.isDate(at, inSameDayAs: now) else { return false }
-            return !ChatShellConversationRow.isWorking($0) && !ChatShellConversationRow.isHerOwn($0)
+            return !ChatShellConversationRow.isWorking($0) && !ChatShellConversationRow.isHerOwn($0, openingLines: openingLines)
         }
             .map { ($0.id, ChatShellConversationRow.surface(for: $0)) }, uniquingKeysWith: { first, _ in first })
     }
@@ -443,7 +451,7 @@ private struct TodaySource: Sendable {
         var sessionState = "available"
         do {
             let path = engine.dataRoot.appendingPathComponent("chat/sessions.json")
-            sessions = try await SwiftNativePersistenceCore().withFileLock(path) {
+            sessions = try await SwiftNativePersistenceCore.withFileLock(path) {
                 try ChatSessionIndexFile.loadObjectRowsForMutation(at: path).map(NativeAgentShared.ChatSession.init(row:))
             }
             sessionState = sessions.isEmpty ? "empty" : "available"
@@ -466,7 +474,7 @@ private struct TodaySource: Sendable {
             let kept = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: engine.dataRoot).listMemory(kind: MemoryMoments.kind)
             for record in kept {
                 if let at = TodayWords.parseTimestamp(record.createdAt), today(at) {
-                    let quote = TodayWords.plain(MemoryMoments.metadataString(record.extras, "quote") ?? "")
+                    let quote = TodayWords.plain(record.extras?.objectValue?["quote"]?.stringValue ?? "")
                     let body = quote.isEmpty ? TodayWords.plain(record.text) : quote
                     if !body.isEmpty {
                         let key = "moment:" + record.id
@@ -552,7 +560,7 @@ private struct TodaySource: Sendable {
         }
         // The open thread's live persisted rows belong to the same canonical owner.
         if !activeSessionID.isEmpty { loaded[activeSessionID] = engine.transcripts.messages(for: activeSessionID) }
-        let surfaces = WorkOverviewRead.conversationSurfaces(sessions)
+        let surfaces = WorkOverviewRead.conversationSurfaces(sessions, openingLines: engine.transcripts.openingLines)
         var conversations: [JSONValue] = []
         for session in sessions {
             if let end = TodayWords.parseTimestamp(session.updatedAt ?? session.createdAt), today(end),
@@ -578,18 +586,28 @@ private struct TodaySource: Sendable {
             }
         }
         // Provenance is admission evidence, never inferred from titles or prose.
+        let contacts: [AgentPeerContact]?
+        do { contacts = try AgentPeerStore(dataRoot: engine.dataRoot).list() }
+        catch {
+            contacts = nil
+            source.unavailable.append("Collaboration names unavailable: " + error.localizedDescription)
+        }
         for (sessionID, messages) in loaded {
             for message in messages {
                 if (message.sessionId == nil || message.sessionId == sessionID), message.role == "user",
                    !message.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                    let origin = message.metadata?.origin,
-                   let agent = origin.agent?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-                   ["claude","codex"].contains(agent),
-                   origin.surface?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == agent + "-bridge",
+                   let surface = origin.surface, PeerTurnEffectPolicy.isPeerBridge(surface: surface),
+                   let agent = origin.agent?.trimmingCharacters(in: .whitespacesAndNewlines), !agent.isEmpty,
+                   let contacts,
                    let at = TodayWords.parseTimestamp(message.createdAt), at <= now, today(at) {
+                    let peerID = message.metadata?.envelope?.verifiedUserId
+                        ?? (agent.hasPrefix("peer:") ? String(agent.dropFirst(5)) : nil)
+                    let name = peerID.flatMap { id in contacts.first { $0.id == id }?.name }
+                    let display = name ?? (peerID == nil && agent != "agent" ? agent : "another agent")
                     let key = "builder:" + sessionID + ":" + message.id
                     source.facts[key] = .init(at: at)
-                    builders.append(.object(["key": .string(key), "session": .string(sessionID), "agent": .string(agent),"at":.double(at.timeIntervalSince1970)]))
+                    builders.append(.object(["key": .string(key), "session": .string(sessionID), "agent": .string(TodayWords.line(display, limit: 80)),"at":.double(at.timeIntervalSince1970)]))
                 }
             }
         }
@@ -640,8 +658,10 @@ private struct TodaySource: Sendable {
             if let fact = facts[key] { return fact }
             throw PartCallError(code: "unbound_source", message: "Today row names an unknown source: " + key)
         }
-        if sources.isEmpty { throw PartCallError(code: "unbound_source", message: "Today row has no source.") }
-        let first = sources.map(\.at).min()!, end = sources.map { $0.end ?? $0.at }.max()!
+        guard let firstSource = sources.first, let first = sources.map(\.at).min(),
+              let end = sources.map({ $0.end ?? $0.at }).max() else {
+            throw PartCallError(code: "unbound_source", message: "Today row has no source.")
+        }
         var at = first, gutter: String?, span: TodayRow.Span?
         if decision.id == "talked" {
             let start = sources.compactMap(\.start).min()
@@ -651,13 +671,13 @@ private struct TodaySource: Sendable {
             gutter = TodayWords.clockSpan(first,end)
         }
         return TodayRow(id: decision.id, title: decision.title, line: decision.line, at: at,
-            isHorizon: sources[0].horizon, details: decision.details, gutter: gutter, dreamDate: sources[0].dreamDate,liveSpan:span)
+            isHorizon: firstSource.horizon, details: decision.details, gutter: gutter, dreamDate: firstSource.dreamDate,liveSpan:span)
     }
 }
 
 @MainActor
 @Observable
-public final class TodayProjection {
+public final class TodayReadout {
     public private(set) var snapshot = TodaySnapshot.empty
     public private(set) var didRows: [TodayRow] = []
     public private(set) var earlierNotes: [TodayEarlierNote] = []
@@ -683,16 +703,15 @@ public final class TodayProjection {
     public func prepareWaiting(_ engine: NativeAgentEngine, count: Int, split: (items: Int, notes: Int)?) async -> String {
         let input=WorkOverviewRead.waitingDeskInput(count:count,split:split)
         if waitingInput != input { waitingInput=input; waitingEpoch += 1 }
-        if waitingFaces == nil {
-            let root=engine.dataRoot
-            waitingFaces=PartFaces(dataRoot:root) { id,input,version in
-                let host=AppToolExecutor.authoredProgramHost(dataRoot:root) { _,_ in nil }
-                return await OwnedProgramInvocation.$host.withValue(host) {
-                    await Parts(root:root).face(id:id,input:input,version:version)
-                }
+        let faces: PartFaces
+        if let existing = waitingFaces { faces = existing } else {
+            let root=engine.dataRoot, cognition=engine.ports.cognitionHost
+            faces=PartFaces(dataRoot:root) { id,input,version in
+                await cognition.readoutFace(id:id,input:input,version:version,dataRoot:root)
             }
+            waitingFaces = faces
         }
-        return waitingWords(await waitingFaces!.sourceChanged(id:"today-readout",epoch:waitingEpoch,input:input))
+        return waitingWords(await faces.sourceChanged(id:"today-readout",epoch:waitingEpoch,input:input))
     }
     public var dreamUnavailable = false
     private var readCount = 0
@@ -751,21 +770,20 @@ public final class TodayProjection {
             do {
                 let input = JSONValue.object(source.input)
                 if dayInput != input { dayInput=input; dayEpoch += 1 }
-                if dayFaces == nil {
-                    let root=engine.dataRoot
-                    dayFaces=PartFaces(dataRoot:root) { id,input,version in
-                        let host=AppToolExecutor.authoredProgramHost(dataRoot:root) { _,_ in nil }
-                        return await OwnedProgramInvocation.$host.withValue(host) {
-                            await Parts(root:root).face(id:id,input:input,version:version)
-                        }
+                let faces: PartFaces
+                if let existing = dayFaces { faces = existing } else {
+                    let root=engine.dataRoot, cognition=engine.ports.cognitionHost
+                    faces=PartFaces(dataRoot:root) { id,input,version in
+                        await cognition.readoutFace(id:id,input:input,version:version,dataRoot:root)
                     }
+                    dayFaces = faces
                 }
-                let projected=await dayFaces!.sourceChanged(id:"today-readout",epoch:dayEpoch,input:input)
+                let projected=await faces.sourceChanged(id:"today-readout",epoch:dayEpoch,input:input)
                 if projected.status != .ready {
                     throw projected.error ?? PartCallError(code:projected.status.rawValue,message:"The Today projection is unavailable.")
                 }
-                if projected.face == nil { throw PartCallError(code:"bad_face",message:"The Today projection returned no face.") }
-                let decision=TodayDecision(face:projected.face!)
+                guard let face = projected.face else { throw PartCallError(code:"bad_face",message:"The Today projection returned no face.") }
+                let decision=TodayDecision(face:face)
                 var unavailable = source.unavailable + decision.omissions
                 func bindRows(_ rows: [TodayDecision.Row]) -> [TodayRow] {
                     rows.compactMap { row in
@@ -790,10 +808,12 @@ public final class TodayProjection {
                             if let fact = source.facts[key], let note = fact.note { return (note,fact.at) }
                             throw PartCallError(code: "unbound_source", message: "Earlier note names an unknown source: " + key)
                         }.sorted { $0.1 > $1.1 }
-                        if notes.isEmpty { throw PartCallError(code: "unbound_source", message: "Earlier note has no source.") }
+                        guard let newest = notes.first, let oldest = notes.last else {
+                            throw PartCallError(code: "unbound_source", message: "Earlier note has no source.")
+                        }
                         return TodayEarlierNote(id: group.sources.joined(separator: "|"), title: group.title,
-                            isFailure: group.failure, count: group.count, at: notes[0].1,
-                            oldest: notes.last!.1, newest: notes[0].0)
+                            isFailure: group.failure, count: group.count, at: newest.1,
+                            oldest: oldest.1, newest: newest.0)
                     } catch {
                         unavailable.append("Earlier note \(group.sources.joined(separator: "|")) omitted: " + error.localizedDescription)
                         return nil

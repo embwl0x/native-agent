@@ -13,10 +13,10 @@ import DeviceSync
 import TrustCenter
 // Blueprint: | `EngineApprovals.swift` | `ApprovalsFacade`: one checked records/loading/error publication for health, sidebar, views, actions and phone overview; failed reads retain checked rows and mark them unavailable; shared inline settlement, single-flight resolution and outcome/preflight checks; shared summary/failure wording; Approval reads return their own result; LatestRead orders records/failure publication and committed decisions use write(). |
 
-/// `NativeAgentEngine.approvals` (S10): the ApprovalInbox for one data root, in
+/// `NativeAgentEngine.approvals`: the ApprovalInbox for one data root, in
 /// core types. Every read publishes `records` and its load state for all surfaces.
 /// Decisions run
-/// through the approval executors (`ApprovalTransactionCoordinator`).
+/// through the approval executors (`ApprovalExecution`).
 @MainActor
 @Observable
 public final class ApprovalsFacade {
@@ -52,7 +52,7 @@ public final class ApprovalsFacade {
     }
 
     @ObservationIgnored public var recordsDidChange: (@MainActor () -> Void)?
-    @ObservationIgnored private var resolutionTasks: [String: Task<ApprovalRecord, Error>] = [:]
+    private var resolutionTasks: [String: Task<ApprovalRecord, Error>] = [:]
     @ObservationIgnored private var resolutionDecisions: [String: String] = [:]
 
     public nonisolated init(dataRoot: URL) {
@@ -116,13 +116,11 @@ public final class ApprovalsFacade {
     }
 
     public func settleInlineCard(
-        id: String, decision: String, coordinator: ApprovalTransactionCoordinator,
-        resolutionChanged: @MainActor (String, Bool) -> Void,
+        id: String, decision: String, coordinator: ApprovalExecution,
         refreshHealth: @MainActor () async -> Void
     ) async throws {
         do {
-            _ = try await resolveApproval(id: id, decision: decision, coordinator: coordinator,
-                                          resolutionChanged: resolutionChanged)
+            _ = try await resolveApproval(id: id, decision: decision, coordinator: coordinator)
             await refreshHealth()
         } catch ApprovalInboxError.alreadyResolved {
             _ = try await list()
@@ -134,8 +132,7 @@ public final class ApprovalsFacade {
     }
 
     public func resolveApproval(
-        id: String, decision: String, coordinator: ApprovalTransactionCoordinator,
-        resolutionChanged: @MainActor (String, Bool) -> Void
+        id: String, decision: String, coordinator: ApprovalExecution
     ) async throws -> ApprovalRecord {
         let trimmedID = id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedID.isEmpty else {
@@ -167,11 +164,9 @@ public final class ApprovalsFacade {
         }
         resolutionTasks[trimmedID] = task
         resolutionDecisions[trimmedID] = normalizedDecision
-        resolutionChanged(trimmedID, true)
         defer {
             resolutionTasks.removeValue(forKey: trimmedID)
             resolutionDecisions.removeValue(forKey: trimmedID)
-            resolutionChanged(trimmedID, false)
         }
         return try await task.value
     }
@@ -308,19 +303,15 @@ extension NativeAgentEngine {
         // replaying with authority it can no longer prove.
         InlineInteractionSignatureWitness.install(
             mint: { canonical in
-                guard let secret = try? PairingSecretManager.loadOrGenerateSecret()
+                guard let secret = try? PairingSecret.loadOrGenerateSecret()
                 else { return nil }
                 return BridgeMessage.hmacHex(of: Data(canonical.utf8), secret: secret)
             },
             verify: { canonical, receipt in
-                guard let secret = try? PairingSecretManager.loadOrGenerateSecret()
+                guard let secret = try? PairingSecret.loadOrGenerateSecret()
                 else { return false }
                 let expected = BridgeMessage.hmacHex(of: Data(canonical.utf8), secret: secret)
-                let a = Array(receipt.utf8), b = Array(expected.utf8)
-                guard a.count == b.count else { return false }
-                var diff: UInt8 = 0
-                for i in 0..<a.count { diff |= a[i] ^ b[i] }
-                return diff == 0
+                return BridgeMessage.constantTimeEqual(receipt, expected)
             }
         )
 

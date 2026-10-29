@@ -1,10 +1,4 @@
 import StandingBots
-
-// Blueprint: | `DeskPageView.swift` | `DeskPageView`: canonical work overview, bounded folds/detail actions and separate store/execution/schedule failure presentation |
-// DeskPageView.swift
-// The primary Desk: canonical work in plain words, with item actions in place.
-// Store, execution and schedule lanes retain their own failure states.
-
 import SwiftUI
 import AppKit
 import PersistenceCore
@@ -18,24 +12,12 @@ import NativeAgentShared
 import ApprovalInbox
 import NotificationInbox
 
-// MARK: - Metrics
-
-enum DeskPageMetrics {
-    // On the shell's one ramp (ShellType): a row's title is the 16 step, its
-    // sentence and its meta line the 13 step. 11 is not on the scale.
-    static let titleSize: CGFloat = ShellType.bodySize
-    static let lineSize: CGFloat = ShellType.labelSize
-    static let metaSize: CGFloat = ShellType.labelSize
-    /// How many rows a fold shows before it says how many more there are.
-    static let foldRowCap = 60
-}
-
-// MARK: - The page
+// Blueprint: | `DeskPageView.swift` | `DeskPageView`: canonical work page, state, navigation and actions; store/execution failures stay distinct |
 
 struct DeskPageView: View {
     @Environment(AppModel.self) private var appModel
     @Environment(\.quietOffscreenRead) private var quietOffscreenRead
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceMotion) var reduceMotion
     @AppStorage(StudioWanderLane.enabledDefaultsKey) private var studioWanderEnabled = false
     @AppStorage("cognitiveSubstrateEnabled") private var cognitiveSubstrateEnabled = true
 
@@ -45,14 +27,14 @@ struct DeskPageView: View {
         self.rootRouteVersion = rootRouteVersion
     }
 
-    @State private var overviewSelection: WorkOverviewRow?
+    @State var overviewSelection: WorkOverviewRow?
     private var desk: DeskFacade { appModel.engine.desk }
-    private var snapshot: DeskPageSnapshot { desk.page }
+    var snapshot: DeskPageSnapshot { desk.page }
     private var readCount: Int { desk.readCount }
-    private var now: Date { snapshot.now }
-    @State private var openFolds: Set<String> = []
+    var now: Date { snapshot.now }
+    @State var openFolds: Set<String> = []
     private var projectRows: [DeskPageContent.ProjectRow] { snapshot.rows.projects }
-    @State private var sheet: DeskPageSheet?
+    @State var sheet: DeskPageSheet?
     @State private var actionNotice: DeskActionNotice?
     @State private var actionInFlight: String?
     @State private var selectedHandle: String?
@@ -60,27 +42,20 @@ struct DeskPageView: View {
     @State private var showingPalette = false
     @State private var showingNags = false
     private var nagConfig: DeskNagConfig { snapshot.nagConfig }
-    @State private var revealCounts: [String: Int] = [:]
+    @State var revealCounts: [String: Int] = [:]
     private var herHour: DeskHerHourPresentation.State { snapshot.herHour }
     private var liveUpdateError: String? { desk.liveUpdateError }
-    @State private var vetoHandler = WorkshopObservatoryVetoHandler(
-        dataRoot: PersistenceCore.defaultDataRoot())
-    private var items: [DeskItem] { snapshot.boardItems }
+    var items: [DeskItem] { snapshot.boardItems }
     private var selectedItem: DeskItem? { items.first { $0.handle == selectedHandle } }
     private var paletteRows: [DeskPaletteRow] {
         DeskPageContent.active(items).map(DeskPaletteRow.init(item:))
-    }
-    private var liveActivity: DeskLiveActivityPresentation.State {
-        DeskLiveActivityPresentation.make(deskItems: laneOfItems, executions: snapshot.executions,
-                                          generatedTs: snapshot.generatedTs, now: now)
     }
 
     var body: some View {
         ScrollViewReader { scroller in
         ScrollView {
             LazyVStack(alignment: .leading, spacing: AliveMetrics.sectionSpacing) {
-                // Looking something up is an action, not a count: a quiet
-                // button on the header's baseline, not an item in the line.
+                // Lookup actions share the header baseline.
                 HStack(alignment: .firstTextBaseline) {
                     AlivePageHeader(title: "Desk", line: headerLine)
                     Spacer(minLength: 12)
@@ -107,8 +82,7 @@ struct DeskPageView: View {
                                       selectedTitle: selectedItem?.title, perform: { perform($0) },
                                       config: nagConfig, isBusy: actionInFlight != nil)
                     }
-                    // ContentView owns the New Task sheet (a sheet attached
-                    // here presents only once on macOS); the page posts.
+                    // ContentView owns the New Task sheet; the page requests presentation.
                     Button {
                         NotificationCenter.default.post(name: .newWorkshopTaskRequest, object: nil)
                     } label: {
@@ -256,23 +230,14 @@ struct DeskPageView: View {
         }
         .onChange(of: studioWanderEnabled) { signalLiveUpdate() }
         .onChange(of: cognitiveSubstrateEnabled) { signalLiveUpdate() }
-        // A route to the Desk is a route to its ROOT: the folds close, the
-        // stores are re-read.
-        // This is also first paint — one task, owned by the view, instead of a
-        // detached `Task {}` from onChange that outlived it.
+        // Root navigation closes folds and reloads in the view-owned task.
         .quietReadTask(id: rootRouteVersion) {
             openFolds.removeAll()
             revealCounts.removeAll()
             selectedHandle = nil
             inspectorMode = nil
             let published = await reload()
-            // First paint has rows now: a notification click that arrived
-            // before this page existed opens its item here. This is also the
-            // one place that may give up on a handle — the reload the route
-            // asked for has finished, so an item still missing is not coming.
-            //
-            // Only a completed engine refresh may give up. A cancelled route
-            // proves nothing about the pending handle it would clear.
+            // Only a published, uncancelled root refresh may discard a missing reminder target.
             guard published, !Task.isCancelled else { return }
             openPendingDeskItem(scroller, giveUpIfMissing: true)
         }
@@ -294,16 +259,12 @@ struct DeskPageView: View {
         }
         // A click on a Desk reminder banner while this page is already up.
         .onChange(of: appModel.pendingDeskHandle) { openPendingDeskItem(scroller) }
-        // ...and every load that lands after it. The handle may have been set
-        // against a snapshot that did not have the item yet.
+        // A later snapshot may contain the pending reminder target.
         .onChange(of: snapshot.id) { openPendingDeskItem(scroller) }
         }
     }
 
     // MARK: waiting on you
-
-    private var ownerItems: [DeskItem] { snapshot.rows.owner }
-
     private var headerLine: String? { snapshot.overview?.headline }
 
     @ViewBuilder
@@ -357,7 +318,6 @@ struct DeskPageView: View {
     }
 
     // MARK: projects
-
     private func projectRow(_ row: DeskPageContent.ProjectRow) -> some View {
         DeskProjectRow(
             title: row.title,
@@ -370,281 +330,8 @@ struct DeskPageView: View {
             .contextMenu { Button("Details and actions") { inspect(row.id) } }
     }
 
-    /// The ordinary projects, each with its next step and — when something is
-    /// actually executing for it — that execution's progress on the SAME row.
-    /// The project and the run it spawned were on two different surfaces (and
-    /// the run under a second, Workshop-named item); joined by `deskHandle`,
-    /// they read as one piece of work again.
-    /// The families projection wants the lane state, not the bare array, so a
-    /// failed desk read contributes no families rather than a false calm.
-    private var laneOfItems: DeskLaneState<DeskItem> {
-        if let reason = snapshot.deskUnavailable { return .unavailable(reason) }
-        return .rows(items)
-    }
-
-    // MARK: the board — everything else, folded
-
-    private enum Fold {
-        static let blocked = "blocked"
-        static let watching = "watching"
-        static let schedule = "schedule"
-        static let parked = "parked"
-        static let stale = "stale"
-        static let other = "other"
-        static let history = "history"
-    }
-
-    private var blockedItems: [DeskItem] { snapshot.rows.blocked }
-    private var watchItems: [DeskItem] { snapshot.rows.watches }
-    private var staleItems: [DeskItem] { snapshot.rows.stale }
-    private var otherItems: [DeskItem] { snapshot.rows.other }
-    private var historyItems: [DeskItem] { snapshot.rows.history }
-    private var historyExecutions: [WorkshopExecution.WorkshopExecutionRecord] { snapshot.rows.executions }
-
-    private var boardIsEmpty: Bool {
-        blockedItems.isEmpty && watchItems.isEmpty && otherItems.isEmpty
-            && snapshot.jobs.isEmpty
-    }
-
-    // MARK: finished work
-
-    /// The execution's own result, never a re-description of it. An execution
-    /// that finished without writing one says so instead of borrowing the
-    /// objective and reading as a result.
-    private static func resultText(_ execution: WorkshopExecution.WorkshopExecutionRecord) -> String {
-        switch execution.result {
-        case .string(let value) where !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
-            return value.trimmingCharacters(in: .whitespacesAndNewlines)
-        case .null:
-            return "It finished without writing down a result."
-        default:
-            do { return try execution.result.serialize(pretty: true) }
-            catch { return UserFacingError.message(error, action: "show the result") }
-        }
-    }
-
-    // MARK: the rest of the board — one quiet line of counts
-
-    private struct FoldCount: Identifiable {
-        let id: String
-        /// The short count on the line.
-        let label: String
-        /// The fold's own sentence: its header when open, and its spoken name.
-        let title: String
-    }
-
-    /// Every fold the page keeps, as one count each: only the ones with
-    /// something in them, except the timer fold, which stays reachable on an
-    /// empty board. Numerals on this line: it is scanned, not read.
-    private var foldCounts: [FoldCount] {
-        var out: [FoldCount] = []
-        if !otherItems.isEmpty {
-            out.append(FoldCount(id: Fold.other, label: "\(otherItems.count) other items",
-                                 title: "Other work and pursuits"))
-        }
-        let history = historyItems.count + historyExecutions.count
-        if history > 0 {
-            out.append(FoldCount(id: Fold.history, label: "\(history) in history", title: "Finished history"))
-        }
-        if !blockedItems.isEmpty {
-            let count = blockedItems.count
-            out.append(FoldCount(
-                id: Fold.blocked,
-                label: "\(count) blocked",
-                title: "\(DeskPageWords.spelled(count)) \(DeskPageWords.plural(count, "thing is", "things are")) blocked"))
-        }
-        if !watchItems.isEmpty {
-            let count = watchItems.count
-            out.append(FoldCount(
-                id: Fold.watching,
-                label: "\(count) on watch",
-                title: "I'm keeping an eye on \(DeskPageWords.spelledLower(count)) \(DeskPageWords.plural(count, "thing", "things"))"))
-        }
-        let jobs = snapshot.jobs
-        let running = jobs.filter(\.enabled).count + timedBots.count
-        var timer = running == 0 ? "nothing on a timer" : "\(running) on a timer"
-        if !missedBots.isEmpty {
-            timer += ", \(missedBots.count) \(DeskPageWords.plural(missedBots.count, "missed run", "missed runs"))"
-        }
-        out.append(FoldCount(
-            id: Fold.schedule,
-            label: timer,
-            title: DeskPageContent.scheduleHeadline(jobs, missed: missedBots.count, bots: timedBots.count)))
-        let stale = staleItems.count
-        if stale > 0 {
-            // Quiet for a while, and quiet on its own: these rows have already
-            // left "on watch", and one update puts them back there. Nothing to
-            // clear, so nothing asks him to clear it.
-            out.append(FoldCount(
-                id: Fold.stale,
-                label: "\(stale) quiet for a week",
-                title: "\(DeskPageWords.spelled(stale)) \(DeskPageWords.plural(stale, "item hasn't", "items haven't")) moved in a week"))
-        }
-        return out
-    }
-
-    @ViewBuilder
-    private var foldsSection: some View {
-        let counts = foldCounts
-        VStack(alignment: .leading, spacing: 12) {
-            // Each count its own item in the flow, spaced apart rather than
-            // joined with "·", so a wrapped line never starts on a separator.
-            AliveFlow(spacing: 18, lineSpacing: 6) {
-                ForEach(Array(counts.enumerated()), id: \.element.id) { index, count in
-                    foldCountButton(count, first: index == 0)
-                }
-            }
-            // Each open fold opens under the line, in the line's order.
-            ForEach(counts.filter { openFolds.contains($0.id) }) { count in
-                openFold(count)
-            }
-        }
-    }
-
-    private func foldCountButton(_ count: FoldCount, first: Bool) -> some View {
-        let isOpen = openFolds.contains(count.id)
-        return Button { toggleFold(count.id) } label: {
-            Text(first ? TodayWords.capitalizedFirst(count.label) : count.label)
-                .foregroundStyle(isOpen ? NativeAgentShell.text : NativeAgentShell.secondary)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(count.title)
-        .accessibilityValue(isOpen ? "Open" : "Folded")
-        .accessibilityIdentifier(foldIdentifier(count.id))
-        .font(.system(size: 13))
-    }
-
-    private func foldIdentifier(_ key: String) -> String {
-        switch key {
-        case Fold.stale: "desk.stale-line"
-        default: "desk.fold.\(key)"
-        }
-    }
-
-    private func toggleFold(_ key: String) {
-        withAnimation(NativeAgentMotion.respecting(NativeAgentMotion.arrive, reduceMotion: reduceMotion)) {
-            if openFolds.contains(key) { openFolds.remove(key) } else { openFolds.insert(key) }
-        }
-    }
-
-    /// An open fold: its own sentence as a header that folds it again, then
-    /// exactly the rows the fold always held.
-    private func openFold(_ count: FoldCount) -> some View {
-        AliveGroupCard {
-            Button { toggleFold(count.id) } label: {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(count.title)
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(NativeAgentShell.text)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 8)
-                    Image(systemName: "chevron.down")
-                        .font(ShellType.captionSemibold)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .accessibilityHidden(true)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityHint("Folds this away")
-            .accessibilityIdentifier("desk.fold")
-            foldContent(count.id)
-        }
-        .transition(NativeAgentMotion.arrivalFade)
-    }
-
-    @ViewBuilder
-    private func foldContent(_ key: String) -> some View {
-        switch key {
-        case Fold.other:
-            ForEach(cap(otherItems, key: key), id: \.handle) { item in itemDetailRow(item) }
-            overflowLine(otherItems.count, key: key)
-        case Fold.history:
-            ForEach(cap(historyItems, key: key), id: \.handle) { item in itemDetailRow(item) }
-            overflowLine(historyItems.count, key: key)
-            ForEach(cap(historyExecutions, key: "execution-history"), id: \.id) { execution in
-                let meta = execution.verification.map(DeskExecutionPresentation.verificationLabel)
-                    ?? DeskExecutionPresentation.pill(for: execution.status).label
-                // Opens the canonical record, which shows the whole result.
-                Button {
-                    overviewSelection = WorkOverviewRead.row(for: execution, now: now)
-                } label: {
-                    DeskPageDetailRow(title: execution.title, line: Self.resultText(execution), meta: meta)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-            }
-            overflowLine(historyExecutions.count, key: "execution-history")
-        case Fold.blocked:
-            ForEach(cap(blockedItems, key: key), id: \.handle) { item in
-                DeskPageDetailRow(
-                    title: DeskPageContent.title(item),
-                    line: DeskPageContent.itemDetail(item, in: items),
-                    meta: DeskRelativeTimePresentation.text(forISO: item.updatedAt, now: now))
-                    .id("desk:\(item.handle)")
-                    .contextMenu { Button("Details and actions") { inspect(item.handle) } }
-            }
-            overflowLine(blockedItems.count, key: key)
-        case Fold.watching:
-            ForEach(cap(watchItems, key: key), id: \.handle) { item in
-                DeskPageDetailRow(
-                    title: DeskPageContent.title(item),
-                    line: TodayWords.line(item.summary ?? item.project, limit: 96),
-                    meta: DeskRelativeTimePresentation.text(forISO: item.updatedAt, now: now))
-                    .id("desk:\(item.handle)")
-                    .contextMenu { Button("Details and actions") { inspect(item.handle) } }
-            }
-            overflowLine(watchItems.count, key: key)
-        case Fold.schedule:
-            scheduleContent
-        case Fold.stale:
-            ForEach(cap(staleItems, key: key), id: \.handle) { item in
-                DeskPageDetailRow(
-                    title: DeskPageContent.title(item),
-                    line: TodayWords.line(item.summary ?? item.project, limit: 96),
-                    meta: DeskRelativeTimePresentation.text(forISO: item.updatedAt, now: now))
-                    .id("desk:\(item.handle)")
-                    .contextMenu { Button("Details and actions") { inspect(item.handle) } }
-            }
-            overflowLine(staleItems.count, key: key)
-        default:
-            EmptyView()
-        }
-    }
-
-    @ViewBuilder
-    private var scheduleContent: some View {
-        ForEach(timedBots) { bot in
-            DeskPageDetailRow(
-                title: TodayWords.line(bot.name, limit: 110),
-                line: bot.line,
-                meta: bot.nextRun.map { DeskRelativeTimePresentation.text(for: $0, now: now) } ?? "")
-        }
-        ForEach(missedBots) { bot in
-            DeskPageDetailRow(
-                title: TodayWords.line(bot.name, limit: 110),
-                line: bot.line,
-                meta: BotsShelfRecord.shortDate(bot.dueAt))
-        }
-        ForEach(snapshot.jobs) { job in
-            DeskPageDetailRow(
-                title: TodayWords.line(job.name, limit: 110),
-                line: DeskPageContent.scheduleLine(job),
-                meta: job.nextRunAt.map {
-                    DeskRelativeTimePresentation.text(forISO: $0, now: now)
-                } ?? "")
-        }
-        Button("Open the schedule") { sheet = .schedule }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .accessibilityIdentifier("desk.open-schedule")
-    }
-
     // MARK: lane honesty
-
-    /// One plain sentence per unreadable lane. A lane that failed must never
-    /// render as an empty, calm board.
+    /// An unreadable lane says so rather than rendering as an empty board.
     private var laneTrouble: [String] {
         var out: [String] = []
         if let liveUpdateError { out.append(liveUpdateError) }
@@ -657,41 +344,10 @@ struct DeskPageView: View {
         return out
     }
 
-    // MARK: pieces
-
-    private func cap<T>(_ rows: [T], key: String) -> [T] {
-        Array(rows.prefix(revealCounts[key] ?? DeskPageMetrics.foldRowCap))
-    }
-
-    @ViewBuilder
-    private func overflowLine(_ total: Int, key: String) -> some View {
-        let visible = revealCounts[key] ?? DeskPageMetrics.foldRowCap
-        if total > visible {
-            Button("Show \(min(total - visible, DeskPageMetrics.foldRowCap)) more") {
-                revealCounts[key] = visible + DeskPageMetrics.foldRowCap
-            }
-                .buttonStyle(.plain)
-                .font(.system(size: DeskPageMetrics.metaSize))
-                .foregroundStyle(.tertiary)
-                .accessibilityIdentifier("desk.show-more.\(key)")
-        }
-    }
-
     // MARK: actions
-
-    private func itemDetailRow(_ item: DeskItem) -> some View {
-        Button { inspect(item.handle) } label: {
-            DeskPageDetailRow(title: DeskPageContent.title(item),
-                              line: DeskPageContent.itemDetail(item, in: items),
-                              meta: "\(item.status.displayLabel) · \(item.project)")
-        }
-        .buttonStyle(.plain)
-        .id("desk:\(item.handle)")
-    }
-
     @ViewBuilder
     private var liveActivityContent: some View {
-        switch liveActivity {
+        switch snapshot.rows.activity {
         case .quiet:
             EmptyView()
         case .unavailable(let reason):
@@ -718,7 +374,7 @@ struct DeskPageView: View {
         }
     }
 
-    private func inspect(_ handle: String) {
+    func inspect(_ handle: String) {
         inspectorMode = nil
         selectedHandle = handle
     }
@@ -745,7 +401,7 @@ struct DeskPageView: View {
         default: actionInFlight = "desk-action"
         }
         actionNotice = nil
-        let router = DeskToolDispatchRouter(dataRoot: PersistenceCore.defaultDataRoot())
+        let router = DeskToolDispatchRouter(dataRoot: appModel.engine.dataRoot)
         Task { @MainActor in
             let outcome = await router.perform(action)
             actionNotice = DeskActionNotice(text: outcome.message, isError: !outcome.ok)
@@ -758,7 +414,7 @@ struct DeskPageView: View {
     private func veto(_ handle: String) {
         guard actionInFlight == nil else { return }
         actionInFlight = handle
-        let handler = vetoHandler
+        let handler = desk.vetoHandler
         Task { @MainActor in
             let outcome = await handler.veto(handle)
             actionNotice = DeskPursuitVetoNotice.receipt(for: outcome)
@@ -767,36 +423,20 @@ struct DeskPageView: View {
         }
     }
 
-    /// The canonical mutation seam — one
-    /// `desk_close` through `DeskToolDispatchRouter`, same ledger, same gate.
+    /// Close through the canonical Desk router, ledger and gate.
     private func close(_ item: DeskItem) {
         perform(.close(
             handle: item.handle,
             outcome: DeskQuickAction.deskCloseOutcome))
     }
 
-    /// The one seam between this page and the conversation: a row hands Chat a
-    /// draft that carries the item's own handle, so her next turn acts on the
-    /// SAME durable item instead of a retold version of it. Every row on this
-    /// page that opens something uses it — waiting, projects, finished work.
+    /// Every row opens Chat with a draft carrying the same durable item's handle.
     @MainActor
     private func askAbout(_ draft: String) {
         NotificationCenter.default.post(name: .openChatDraftRequest, object: draft)
     }
 
-    /// A click on a Desk reminder banner names an item; bringing THAT item into
-    /// view is all this does. It waits for rows — a `scrollTo` before the load
-    /// lands is a no-op — and clears the handle so the click opens once.
-    ///
-    /// Sol P1, 2026-09-13: a click while the Desk was ALREADY mounted lost the
-    /// item. The route bumps `rootRouteVersion` and the handle is set after it,
-    /// so `onChange` ran against the PREVIOUS snapshot — already `loaded`, and
-    /// without the item — consumed the handle and scrolled nowhere, and the
-    /// reload that followed published the row to a page no longer looking for
-    /// it. So the handle is held until the item is actually on the board:
-    /// every published revision re-checks, and only the reload that
-    /// followed the route gives up (`giveUpIfMissing`) when the item is not
-    /// there at all.
+    /// Hold the reminder target until it appears; only the post-route reload may discard a missing target.
     @MainActor
     private func openPendingDeskItem(_ scroller: ScrollViewProxy, giveUpIfMissing: Bool = false) {
         guard !quietOffscreenRead, let handle = appModel.pendingDeskHandle else { return }
@@ -807,8 +447,7 @@ struct DeskPageView: View {
         appModel.pendingDeskHandle = nil
         selectedHandle = handle
         inspectorMode = nil
-        // A row inside a closed fold cannot be scrolled to; open the fold it
-        // lives in first.
+        // Open the target's fold before scrolling to its row.
         if blockedItems.contains(where: { $0.handle == handle }) { openFolds.insert(Fold.blocked) }
         if watchItems.contains(where: { $0.handle == handle }) { openFolds.insert(Fold.watching) }
         if projectRows.contains(where: { $0.parked && $0.id == handle }) { openFolds.insert(Fold.parked) }
@@ -826,211 +465,4 @@ struct DeskPageView: View {
         return await desk.refresh()
     }
 
-    private var missedBots: [DeskMissedBot] { snapshot.missedBots }
-    private var timedBots: [DeskTimedBot] { snapshot.timedBots }
-
-}
-
-// MARK: - Sheets
-
-/// The focused surfaces the page opens without duplicating their controls.
-enum DeskPageSheet: String, Identifiable {
-    case schedule
-    case research
-
-    var id: String { rawValue }
-}
-
-private struct DeskPageSheetHost: View {
-    let sheet: DeskPageSheet
-    let onDone: () -> Void
-
-    private var title: String {
-        switch sheet {
-        case .schedule: "What runs on a timer"
-        case .research: "Look something up"
-        }
-    }
-
-    var body: some View {
-        PageSheetHost(title: title, onDone: onDone) {
-            switch sheet {
-            case .schedule: SchedulerView()
-            case .research: ResearchView()
-            }
-        }
-    }
-}
-
-/// A full surface a page folds to but does not re-implement, in a sheet: its
-/// title and Done, then the surface itself. The Desk and Today both open
-/// theirs this way.
-struct PageSheetHost<Content: View>: View {
-    let title: String?
-    let onDone: () -> Void
-    @ViewBuilder let content: () -> Content
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
-                if let title { Text(title).font(ShellType.bodySemibold) }
-                Spacer(minLength: 0)
-                Button("Done", action: onDone)
-                    .keyboardShortcut(.cancelAction)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-            Divider()
-            content()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-        .frame(minWidth: 720, idealWidth: 900, minHeight: 520, idealHeight: 700)
-    }
-}
-
-// MARK: - Row furniture
-
-/// One project inside the Projects card: the name (the way into Chat about
-/// it), its next step, and a bar when the board counts its parts.
-struct DeskProjectRow: View {
-    let title: String
-    let line: String
-    let meta: String
-    var done: Int? = nil
-    var total: Int? = nil
-    /// The title is how he says something about this piece of work: it opens
-    /// Chat with the item's handle attached. The name of the thing IS the way in.
-    let onOpenTitle: () -> Void
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 16) {
-            VStack(alignment: .leading, spacing: 3) {
-                Button(action: onOpenTitle) {
-                    Text(TodayWords.bounded(title, limit: 64))
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(NativeAgentShell.text)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("desk.row.open")
-                if !line.isEmpty {
-                    Text(TodayWords.bounded(line, limit: 90))
-                        .font(.system(size: 12))
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                }
-            }
-            .frame(height: line.isEmpty ? TodayMetrics.rowContentHeightSingle : 34, alignment: .leading)
-            Spacer(minLength: 12)
-            if let done, let total, total > 0 {
-                AliveProgressBar(done: done, total: total)
-            } else if !meta.isEmpty {
-                Text(meta)
-                    .font(.system(size: 12))
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .lineLimit(1)
-            }
-        }
-        .accessibilityIdentifier("desk.row")
-    }
-}
-
-/// A row inside an open fold. Same type sizes, no card — the fold itself is the
-/// card, so twenty-one of these read as one block instead of twenty-one boxes.
-struct DeskPageDetailRow: View {
-    let title: String
-    let line: String
-    let meta: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title)
-                .font(.system(size: DeskPageMetrics.titleSize, weight: .semibold))
-                .foregroundStyle(NativeAgentShell.text)
-                .lineLimit(1)
-                .truncationMode(.tail)
-            if !line.isEmpty {
-                Text(line)
-                    .font(.system(size: DeskPageMetrics.lineSize, weight: .medium))
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
-            if !meta.isEmpty {
-                Text(meta)
-                    .font(.system(size: DeskPageMetrics.metaSize))
-                    .foregroundStyle(NativeAgentShell.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityIdentifier("desk.detail-row")
-    }
-}
-
-struct DeskActionNotice: Equatable {
-    let text: String
-    let isError: Bool
-}
-
-/// What the Desk says after a veto settles. Every outcome gets a line — a
-/// refused write must never look like a completed one.
-enum DeskPursuitVetoNotice {
-    static func receipt(for outcome: WorkshopObservatoryVetoHandler.Outcome) -> DeskActionNotice {
-        switch outcome {
-        case .completed:
-            return DeskActionNotice(text: "Pursuit vetoed and closed.", isError: false)
-        case .alreadyVetoed:
-            return DeskActionNotice(text: "Pursuit was already vetoed.", isError: false)
-        case .inFlight:
-            return DeskActionNotice(text: "That veto is still being written.", isError: false)
-        case .failed(let detail):
-            return DeskActionNotice(text: "Veto failed: \(detail)", isError: true)
-        }
-    }
-}
-
-extension DeskExecutionPresentation {
-    struct Pill: Sendable, Equatable {
-        let label: String
-        let tone: DeskPresentationTone
-    }
-
-    static func pill(for status: String) -> Pill {
-        switch status {
-        case "running": return Pill(label: "running", tone: .info)
-        case "queued": return Pill(label: "queued", tone: .neutral)
-        case "blocked_on_approval": return Pill(label: "needs approval", tone: .warning)
-        case "completed": return Pill(label: "done", tone: .success)
-        case "failed": return Pill(label: "failed", tone: .danger)
-        case "cancelled": return Pill(label: "cancelled", tone: .neutral)
-        default:
-            let human = status.replacingOccurrences(of: "_", with: " ")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            return Pill(label: human.isEmpty ? "unknown status" : "unknown: \(human)", tone: .neutral)
-        }
-    }
-
-    static func verificationLabel(_ verification: WorkshopVerificationRecord) -> String {
-        switch verification.status {
-        case .satisfied:
-            let methods = verification.methods.map { method in
-                switch method {
-                case "exact_output": return "exact output"
-                case "file_bytes": return "file bytes"
-                default: return method.replacingOccurrences(of: "_", with: " ")
-                }
-            }.filter { !$0.isEmpty }.joined(separator: " + ")
-            return methods.isEmpty ? "verified" : "verified: \(methods)"
-        case .failed:
-            return "verification failed"
-        case .unverified:
-            return "completed; outcome not independently verified"
-        }
-    }
 }

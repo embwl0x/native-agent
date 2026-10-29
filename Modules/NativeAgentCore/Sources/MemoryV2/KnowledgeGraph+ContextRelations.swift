@@ -8,16 +8,9 @@
 // the projection a bounded, ordered list and stops.
 //
 // ── WHY ENTITY→ENTITY ONLY ───────────────────────────────────────────────────
-// `indexActiveFact` writes three shapes of edge:
-//   1. user --<typed>--> memory-fact node   (prefers / decided / wants / …)
-//   2. user --mentions--> entity, fact --mentions--> entity  (structural)
-//   3. entity --<typed>--> entity           (works_on / owns / knows / …)
-// Only (3) says something the memory lane cannot already say. A memory-fact
-// node's NAME is a rendering of the memory's own text, so projecting (1) would
-// duplicate a memory atom's body into a second atom competing for the same
-// packet slot; (2) is the indexer's own plumbing, present on essentially every
-// entity pair, and carries no meaning to select on. Both are excluded here
-// rather than downstream so the caps below bound real triples.
+// `indexActiveFact` writes user-to-fact and structural mentions edges, excluded
+// here so memory text is not projected twice. Typed entity-to-entity claims
+// from Studio or imported graph data remain selectable under the same caps.
 //
 // ── PRIVACY ──────────────────────────────────────────────────────────────────
 // Entity NAMES only — never a memory body, never a fact node. The projection
@@ -46,11 +39,7 @@ public struct KnowledgeGraphContextRelation: Sendable, Equatable {
     /// Journal entry ids asserting this edge, from
     /// `metadata_json.studio_entry_ids`. Empty for every non-studio edge.
     ///
-    /// Studio edges are selectable exactly like the other 94 — same reader,
-    /// same caps, same endpoint scoping. What they carry EXTRA is the entry
-    /// that made the claim, so "this work deepens that one" can be traced back
-    /// to the judgment she actually wrote instead of standing as an unsourced
-    /// assertion in the graph.
+    /// Studio claims retain their journal evidence under the same reader, caps and endpoint scoping.
     public let journalEntryIDs: [String]
     /// The memory that last asserted this edge (`last_memory_id`); nil for an
     /// edge no memory wrote. The projection checks its disclosure and tracks it.
@@ -119,7 +108,7 @@ extension SwiftNativeKnowledgeGraphIndexer {
         let prefix = Self.memoryFactIDPrefix
         // Read a bounded superset so the per-subject cap has something to
         // choose from without ever streaming the whole edge table.
-        let readLimit = min(4_096, total * 8)
+        let readLimit = min(4_096, min(4_096, total) * 8)
         // Keep GRDB rows on the database executor; return only Sendable values.
         return try await dbPool.read { db in
             let rows = try Row.fetchAll(db, sql: """

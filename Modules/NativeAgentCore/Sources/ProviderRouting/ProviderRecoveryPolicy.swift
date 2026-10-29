@@ -17,8 +17,7 @@ public enum ProviderRecoveryPolicy {
         }
     }
 
-    /// 2026-09-18 WHY: one typed verdict for every adapter and surface.
-    /// Model fallback is deliberately absent: the person's selection is binding.
+    /// One typed recovery verdict serves every adapter and surface while preserving the selected model.
     public static func isRecoverable(_ error: Error) -> Bool {
         if let wrapped = error as? any ProviderFailureWrapping {
             return isRecoverable(wrapped.providerFailureCause)

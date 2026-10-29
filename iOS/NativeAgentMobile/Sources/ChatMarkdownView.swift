@@ -1,16 +1,8 @@
 import SwiftUI
 import NativeAgentShared
 
-// iPhone markdown for settled replies (fluid-glass plan, 2026-10-04).
-//
-// Fences split first through the Mac's shared `ChatRichContentParser`, so code
-// stays literal. Prose is read line by line: headings and list rows get their
-// own shape, everything else groups into paragraphs, and each piece parses
-// with `.inlineOnlyPreservingWhitespace` (bold, italic, links, inline code).
-// Links pass the shared `ChatLinkPolicy` allowlist.
-//
-// Streaming text never comes here; a reply parses once when it settles. Its
-// paragraphs do take `inline`, so the live reply is never raw markdown.
+// Settled blocks retain literal code and native prose layout; streaming uses
+// the same sanitized inline parse without caching growing text.
 
 enum ChatMarkdownBlock: Sendable {
     case paragraph(AttributedString)
@@ -21,16 +13,12 @@ enum ChatMarkdownBlock: Sendable {
 
 actor MobileChatMarkdown {
     static let shared = MobileChatMarkdown()
-    private var entries: [UUID: (content: String, blocks: [ChatMarkdownBlock])] = [:]
-    private var recency: [UUID] = []
+    private let cache = ChatContentCache<[ChatMarkdownBlock]>()
 
-    func blocks(id: UUID, content: String) -> [ChatMarkdownBlock] {
-        recency.removeAll { $0 == id }
-        recency.append(id)
-        if let hit = entries[id], hit.content == content { return hit.blocks }
+    func blocks(content: String) -> [ChatMarkdownBlock] {
+        if let hit = cache.lookup(content) { return hit }
         let parsed = Self.parse(content)
-        entries[id] = (content, parsed)
-        if recency.count > 300 { entries.removeValue(forKey: recency.removeFirst()) }
+        cache.insertIfAbsent(parsed, for: content)
         return parsed
     }
 
@@ -90,13 +78,9 @@ actor MobileChatMarkdown {
 
     /// Also the live reply's parse, so it streams in the settled look.
     nonisolated static func inline(_ text: String) -> AttributedString {
-        guard let parsed = try? AttributedString(
-            markdown: text,
-            options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-        ) else { return AttributedString(text) }
+        guard var out = ChatRichContentParser.inline(text) else { return AttributedString(text) }
         // The reply's text colour wins over link tint, so underline live
         // links to keep them visible (teal stays for "needs you").
-        var out = ChatLinkPolicy.sanitized(parsed)
         let links = out.runs.compactMap { $0.link == nil ? nil : $0.range }
         for range in links { out[range].underlineStyle = Text.LineStyle(pattern: .solid) }
         return out
@@ -104,14 +88,13 @@ actor MobileChatMarkdown {
 }
 
 struct PreparedChatMarkdownView: View {
-    let id: UUID
     let content: String
     @State private var blocks: [ChatMarkdownBlock] = []
 
     var body: some View {
         ChatMarkdownView(blocks: blocks)
             .task(id: content) {
-                let prepared = await MobileChatMarkdown.shared.blocks(id: id, content: content)
+                let prepared = await MobileChatMarkdown.shared.blocks(content: content)
                 guard !Task.isCancelled else { return }
                 blocks = prepared
             }

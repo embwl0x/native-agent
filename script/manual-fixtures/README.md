@@ -3,6 +3,22 @@
 These pages are opened deliberately during installed-runtime computer-use
 development. Nothing in the build or test suite runs them automatically.
 
+- `readpage-{hn-front,hn-comments,article,forecast}.html` are small authored,
+  saved HTML examples for the dfix-readpage extraction change. They preserve
+  representative nested HN layout tables, omitted closing tags, inline prose,
+  relative links, cookie chrome and forecast rows without storing a live site's
+  changing content. `node script/readpage_samples.js` deliberately prints the
+  actual pre-change and current extractor output on these files using the Swift
+  interpreter. It builds no app or test target and makes no network requests;
+  it is sample evidence, not installed-app proof. Compilation, installation and
+  resident verification belong to the release lead.
+  `readpage-saved-hn-front.html` and `readpage-saved-hn-comments.html` are also
+  actual saved public HN HTML, fetched once on 2026-10-28 from
+  `https://news.ycombinator.com/` and
+  `https://news.ycombinator.com/item?id=50271640`. The sample printer shows the
+  first 12 extracted lines and full line counts for these larger documents.
+  Trailing spaces in the saved comment HTML are normalized for repository hygiene.
+
 - `visual-navigation-check.html` is a local, pixel-only input surface. Actual
   right-button drag pans its grid, left drag moves the orange circle, held
   WASD keys pan, vertical wheel changes zoom, and horizontal wheel pans.

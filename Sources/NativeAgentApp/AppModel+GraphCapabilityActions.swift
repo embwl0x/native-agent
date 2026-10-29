@@ -1,41 +1,18 @@
-import EngineRuntime
 import Foundation
-import Observation
-import Darwin
-import AppKit
-@preconcurrency import EventKit
-import SwiftUI
 import NativeAgentShared
-import PersistenceCore
 import NativeAgentCore
+import EngineRuntime
 import MemoryV2
-import ToolRegistry
-import ProviderRouting
-import BackgroundLoops
-import ApprovalInbox
 import ToolExecution
-import PersonaEngine
-import ChatToolParsing
 import TrustCenter
-import DreamREMCycle
-import DoctorChecks
+import ChatToolParsing
 import Research
-import MultimodalTTS
-import TriggerScheduler
-import WorkshopExecution
-import NotificationInbox
 import SystemOps
-import ScreenVision
-import TelegramBot
-import Dispatcher
 import MacControl
-import Onboarding
-import MacIntegration
-import WorkflowOrchestration
-import Connectors
+import TrustPersistence
+import DoctorChecks
 import Browser
 import AppToolRuntime
-import AuthoredCapabilities
 import Senses
 // Blueprint: | `AppModel+GraphCapabilityActions.swift` | `AppModel`: `searchGraph`, `refreshGraph`, `runResearchLab`; Lab's frozen evidence calls the editable `research-lab` part through `Parts.call` and the canonical admission-only gate; native Research commits the accepted proposal |
 
@@ -182,27 +159,6 @@ extension AppModel {
     }
 
     @MainActor
-    func checkCapabilityUpdates() async {
-        _ = await capabilityUpdatesRead.read({ () async -> Result<CapabilityUpdateCheck, Error> in
-            do {
-                let checked = try await engine.trust.checkCapabilityUpdates()
-                try? await engine.trust.refreshCatalogSources()
-                return Result.success(checked)
-            }
-            catch { return .failure(error) }
-        }, publish: { result in
-        do {
-            latestCapabilityUpdateCheck = try result.get()
-            statusText = latestCapabilityUpdateCheck?.status == "unavailable"
-                ? "Capability update checking is unavailable; source versions are not compared."
-                : "Capability updates checked"
-        } catch {
-            setFailureStatus(error, action: "check for updates")
-        }
-        })
-    }
-
-    @MainActor
     func evaluateCapabilityTrust(_ capability: CapabilityRecord) async {
         _ = await capabilityEvaluationRead.read({ () async -> Result<CapabilityTrustEvaluation, Error> in
             do {
@@ -225,8 +181,7 @@ extension AppModel {
     func runNativeAction(_ action: NativeActionRecord, dryRun: Bool = true) async {
         do {
             _ = try await NativeActionRoutes.runNativeAction(
-                id: action.id, dryRun: dryRun, input: [:], dataRoot: dataRootOverride, browser: .app
-            )
+                id: action.id, dryRun: dryRun, input: [:], dataRoot: nil, browser: .app)
             _ = await engine.tools.refreshNativePower()
             await engine.approvals.refresh()
             statusText = "Native action recorded"
@@ -234,34 +189,6 @@ extension AppModel {
             setFailureStatus(error, action: "run that action")
         }
     }
-
-    @MainActor
-    @discardableResult
-    func runNextGenAction(id: String, dryRun: Bool = true) async -> Bool {
-        guard !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
-        guard !isRunningNextGenAction else { return false }
-
-        isRunningNextGenAction = true
-        defer { isRunningNextGenAction = false }
-
-        do {
-            let receipt = try await nextGenActionReceipt(id: id, dryRun: dryRun)
-            _ = await decodeLogged("nextgen snapshot") { try await engine.nextGen.snapshot() }
-            let label = dryRun ? "Next-gen dry run" : "Next-gen action"
-            statusText = "\(label): \(receipt.displayStatus)"
-            return true
-        } catch {
-            setFailureStatus(error, action: "run the next-gen probe")
-            return false
-        }
-    }
-
-    @MainActor
-    @discardableResult
-    func runNextGenAction(_ action: NextGenAction, dryRun: Bool = true) async -> Bool {
-        await runNextGenAction(id: action.id, dryRun: dryRun)
-    }
-
 
     @MainActor
     func runBrowserDryRun(url: String = "https://example.com") async {
@@ -316,29 +243,6 @@ extension AppModel {
         }
     }
 
-    @MainActor
-    func installDemoCapabilityPack() async {
-        guard !isInstallingDemoCapabilityPack else { return }
-        isInstallingDemoCapabilityPack = true
-        defer { isInstallingDemoCapabilityPack = false }
-        do {
-            let receipt = try await NativeSkillRegistryActions.installDemoCapabilityPack(dataRoot: engine.dataRoot)
-            disabledFeature = nil
-            let name = receipt.name ?? receipt.packId
-            capabilityCatalogInstallOutcome = .installed(name: name)
-            statusText = "Installed signed pack \(name)"
-            await refreshAll()
-        } catch let err as NSError where AppModel.isNotImplemented(err) {
-            disabledFeature = AppModel.disabledBadge(for: "Demo capability pack install", error: err)
-            capabilityCatalogInstallOutcome = .refused(
-                message: disabledFeature ?? "Demo capability pack install is disabled."
-            )
-            statusText = capabilityCatalogInstallOutcome?.message ?? "Pack install refused"
-        } catch {
-            capabilityCatalogInstallOutcome = .refused(message: UserFacingError.cause(error, action: "install the pack"))
-            statusText = capabilityCatalogInstallOutcome?.message ?? "Pack install refused"
-        }
-    }
 
     @MainActor
     func rollbackCapabilityPack(_ install: CapabilityPackInstall) async {
@@ -358,13 +262,13 @@ extension AppModel {
         do {
             let export = support
                 ? try await ProductionExport.createSupportBundle(
-                    dataRoot: root, host: .app, runProcess: SystemProcessAdapter.runBounded,
-                    diagnostics: { @Sendable in try await SupportDiagnostics.read(reusingChecks: nil) },
+                    dataRoot: root, runProcess: ProcessExecution.runBounded,
+                    diagnostics: { @Sendable in await SupportDiagnostics.read(reusingChecks: nil) },
                     health: { @Sendable in DoctorFacade(dataRoot: root).readHealth() }
                 )
                 : try await ProductionExport.createArchive(
-                    dataRoot: root, host: .app, runProcess: SystemProcessAdapter.runBounded
-                ) { @Sendable in try await DoctorStatusProjection.getProductionHardening(dataRoot: root) }
+                    dataRoot: root, runProcess: ProcessExecution.runBounded
+                ) { @Sendable in try await DoctorReadout.getProductionHardening(dataRoot: root) }
             let verification = try await export.verifyRegistry(dataRoot: root)
             if let detail = verification.failure {
                 statusText = "\(label) failed verification: \(detail)"

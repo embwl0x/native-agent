@@ -6,13 +6,6 @@ import PersistenceCore
 import ProviderRouting
 // Blueprint: | `AgentACPClient.swift` | `AgentACPClient` actor; `startupTimeoutReceipt`, `turn` (recipe-driven; no message is a dry run), `learned`; `Mismatch`: nothing sent |
 
-private extension JSONValue {
-    var objectValue: [String: JSONValue]? {
-        if case .object(let value) = self { return value }
-        return nil
-    }
-}
-
 /// One owned stdio connection. EOF is never a prompt response. No prompt retries,
 /// shell, optional filesystem/terminal service, or automatic permission grants.
 public actor AgentACPClient {
@@ -23,7 +16,6 @@ public actor AgentACPClient {
         package let text: String
         package let stopReason: String
         package let continued: Bool
-        package let detail: String?
         package var completed: Bool { stopReason == "end_turn" }
     }
     public enum Failure: String, Error, LocalizedError {
@@ -123,7 +115,7 @@ public actor AgentACPClient {
               line: AgentHostACP,
               conversationID: String? = nil,
               approvedExecutable: AgentACPExecutable? = nil,
-              keepAlive: Bool = false, requireVerifiedRestore: Bool = false,
+              requireVerifiedRestore: Bool = false,
               timeout: Duration = .seconds(300), permission: @escaping Permission,
               update: @escaping Update = { _ in }) async throws -> Reply {
         guard !active else { throw Failure.busy }
@@ -152,10 +144,9 @@ public actor AgentACPClient {
                 let method = requireVerifiedRestore && capabilities?["loadSession"] == .bool(true) ? "session/load"
                     : capabilities?["sessionCapabilities"]?.objectValue?["resume"]?.objectValue != nil
                     ? "session/resume" : capabilities?["loadSession"] == .bool(true) ? "session/load" : nil
-                // The recipe's downgrade: an agent learned to reopen nothing gets a new session.
-                if method == nil, line.supportsLoad != false || line.supportsResume != false {
-                    throw Mismatch(method: "session/resume", code: nil, detail: "it no longer advertises session/load or session/resume")
-                }
+                // A saved conversation can only continue through restoration.
+                // A fresh session requires an explicit send without its id.
+                guard method != nil else { throw Failure.sessionUnavailable }
                 if let method {
                     opened = method
                     // History can arrive before the load/resume response, including from Hermes resume.
@@ -223,7 +214,7 @@ public actor AgentACPClient {
                 _ = try await request("session/set_mode", ["sessionId": .string(id), "modeId": .string(line.permissionMode)])
             }
             guard let message else {
-                return Reply(sessionID: id, text: "", stopReason: "dry_run", continued: continued, detail: nil)
+                return Reply(sessionID: id, text: "", stopReason: "dry_run", continued: continued)
             }
             // Conservative boundary: any attempted prompt write makes delivery uncertain.
             prompting = true; delivered = true
@@ -234,11 +225,10 @@ public actor AgentACPClient {
                   permissions.isEmpty else { throw Failure.invalidResponse }
             try Task.checkCancellation()
             return Reply(sessionID: id, text: text, stopReason: deniedPermission ? "permission_denied" : reason,
-                continued: continued, detail: nil)
+                continued: continued)
         } onCancel: { Task { await self.cancel(error: CancellationError()) } }
         deadlineGeneration += 1
         deadline?.cancel(); deadline = nil
-        if !keepAlive { await close() }
         return reply
         } catch {
             let reportedError: any Error = (error as? Failure == .timedOut && !prompting) ? startupTimeout : error
@@ -250,12 +240,11 @@ public actor AgentACPClient {
         }
     }
 
-    /// The start every exchange shares: the approved program checked, started
-    /// once, and initialize sent and held to its answer (JSON-RPC 2.0, its own
-    /// id, ACP 1), under a handshake deadline of its own.
+    /// Spawn verifies a fresh program; retained connections verify before each exchange.
+    /// Initialize must answer with JSON-RPC 2.0, its request id and ACP 1 before the handshake deadline.
     private func handshake(executable: String, arguments: [String], directory: URL, environment: [String: String],
                            approvedExecutable: AgentACPExecutable?, timeout: Duration) async throws -> JSONValue {
-        if let approvedExecutable {
+        if started, let approvedExecutable {
             do { try approvedExecutable.verify() } catch { throw Failure.executableChanged }
         }
         if !started {
@@ -299,8 +288,7 @@ public actor AgentACPClient {
                 } catch { await self?.fail(error) }
             }
         }
-        // 2026-09-22 WHY: one 300s deadline covered the handshake too, so a
-        // CLI stuck initializing burned the whole reply window.
+        // Cap initialization at 30s under its own deadline, separate from the reply window.
         arm(min(timeout, .seconds(30)))
         if initialized == nil { initialized = try await request("initialize", [
             "protocolVersion": .int(1), "clientCapabilities": .object([:]),
@@ -531,17 +519,21 @@ public actor AgentACPClient {
     /// answered cancelled. The agent ends the prompt with stopReason
     /// "cancelled" and the session stays open for the next message.
     func requestCancel() -> Bool {
-        guard prompting, failure == nil, !closing, let sessionID else { return false }
-        do {
-            try write(.object(["jsonrpc": .string("2.0"), "method": .string("session/cancel"),
-                               "params": .object(["sessionId": .string(sessionID)])]))
-        } catch { return false }
+        guard prompting, failure == nil, !closing, sessionID != nil else { return false }
+        do { try cancelSession(notify: write) } catch { return false }
+        return true
+    }
+
+    private func cancelSession(notify: (JSONValue) throws -> Void) rethrows {
+        if let sessionID {
+            try notify(.object(["jsonrpc": .string("2.0"), "method": .string("session/cancel"),
+                                "params": .object(["sessionId": .string(sessionID)])]))
+        }
         for (_, (id, task)) in permissions {
             task.cancel()
             try? respondPermission(id: id, selection: nil)
         }
         permissions.removeAll()
-        return true
     }
 
     /// A timer whose sleep finished just as its phase answered must not kill
@@ -553,15 +545,7 @@ public actor AgentACPClient {
 
     private func cancel(error: any Error) {
         guard failure == nil else { return }
-        if let sessionID {
-            try? write(.object(["jsonrpc": .string("2.0"), "method": .string("session/cancel"),
-                               "params": .object(["sessionId": .string(sessionID)])]))
-        }
-        for (_, (id, task)) in permissions {
-            task.cancel()
-            try? respondPermission(id: id, selection: nil)
-        }
-        permissions.removeAll()
+        cancelSession { try? write($0) }
         fail(error)
     }
 

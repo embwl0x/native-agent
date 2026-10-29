@@ -6,30 +6,10 @@ import TrustCenter
 
 // Blueprint: | `ActivityCapturePermissionsView.swift` | `ActivityCapturePermissionsView`: Trust Center consent/title/exclusion controls and honest capture privacy/issue presentation |
 
-/// W8 — the Trust Center surface for the ambient activity watcher.
-///
-/// The copy here is the feature's actual privacy contract, so it is written to
-/// the honest limit rather than the flattering one. Three rules it follows,
-/// each of which the build plan's review round forced:
-///
-///  1. **Never imply titles are sanitised.** `MacScreenViewTextRedaction`
-///     catches SHAPED secrets — tokens, keys, one-time codes. It does nothing
-///     for "Re: Q3 layoffs — Mail" or "patient-notes.pdf — Preview". Saying
-///     "titles are redacted" without saying what redaction does not do would
-///     be the single most misleading sentence in the app.
-///  2. **Never claim private browsing is excluded.** Private-browsing state is
-///     not reliably detectable through AX across Safari/Chrome versions. A
-///     browser update would turn that claim into a lie without anyone editing
-///     a line of code, so the claim is not made.
-///  3. **Say what an action does before it does it.** Adding an app to the
-///     exclusion list deletes its existing rows. That is the right behaviour
-///     and it is destructive, so it is stated in a confirmation, with the
-///     count reported afterwards.
-///
-/// Alive glass (2026-09-23): an eyebrow over one group card per part, switches
-/// instead of checkboxes, and no per-row "applies now" pill — every change on
-/// this surface applies at once, said once in the footnote. The master switch
-/// says whether recording is on; no pill repeats it.
+/// Redaction catches shaped secrets; titles may still reveal sensitive information.
+/// Private browsing is not reliably detectable through Accessibility.
+/// Excluding an app confirms deletion of existing rows and reports the count.
+/// Permission changes apply immediately.
 struct ActivityCapturePermissionsView: View {
     @Environment(AppModel.self) private var appModel
     private var controller: ActivityWatchController { appModel.engine.activityWatch }
@@ -95,32 +75,6 @@ struct ActivityCapturePermissionsView: View {
         }
     }
 
-    /// A switch row: the words on the left, the switch on the right.
-    private func switchRow(
-        _ title: String,
-        detail: String? = nil,
-        isOn: Binding<Bool>
-    ) -> some View {
-        HStack(alignment: .center, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title)
-                    .font(ShellType.rowTitle)
-                    .foregroundStyle(NativeAgentShell.text)
-                if let detail {
-                    Text(detail)
-                        .font(ShellType.rowDetail)
-                        .foregroundStyle(NativeAgentShell.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            Spacer(minLength: 12)
-            Toggle(title, isOn: isOn)
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .hazeTinted()
-        }
-    }
-
     private func issueColor(_ severity: ActivityCaptureIssue.Severity) -> Color {
         switch severity {
         case .notice: NativeAgentShell.secondary
@@ -131,22 +85,13 @@ struct ActivityCapturePermissionsView: View {
     // MARK: - Master toggle
 
     private var masterToggle: some View {
-        HStack(alignment: .center, spacing: 12) {
-            Text("Record which apps you use")
-                .font(ShellType.rowTitle)
-                .foregroundStyle(NativeAgentShell.text)
-            Spacer(minLength: 12)
-            Toggle(
-                "Record which apps you use",
-                isOn: Binding(
-                    get: { controller.policy.captureEnabled },
-                    set: { value in Task { await controller.setCaptureEnabled(value) } }
-                )
+        FeatureSwitchRow(
+            title: "Record which apps you use",
+            isOn: Binding(
+                get: { controller.policy.captureEnabled },
+                set: { value in Task { await controller.setCaptureEnabled(value) } }
             )
-            .labelsHidden()
-            .toggleStyle(.switch)
-            .hazeTinted()
-        }
+        )
         .help("Off by default. Nothing is recorded until you turn this on, and nothing was recorded before you did.")
     }
 
@@ -206,7 +151,7 @@ struct ActivityCapturePermissionsView: View {
     }
 
     // Full Mac admits `activity_query` on trusted chats whatever the saved
-    // switch says (ActivityQueryService.run, fullMacAdmitted), so under Full
+    // switch says (ActivityQueries.run, fullMacAdmitted), so under Full
     // Mac there is no switch: a switch reading off would be false.
     @ViewBuilder
     private var modelAccessControl: some View {
@@ -230,8 +175,8 @@ struct ActivityCapturePermissionsView: View {
                     .help("Full Mac lets me answer from your recorded activity in trusted chats. In narrower modes this is a switch. Recording must still be on.")
             }
         } else {
-            switchRow(
-                title,
+            FeatureSwitchRow(
+                title: title,
                 detail: detail,
                 isOn: Binding(
                     get: { controller.policy.allowModelAccess },

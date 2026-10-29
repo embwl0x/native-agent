@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 // Blueprint: | `OrganismBodySchema.swift` | `ProviderPathEvidenceOutcome` enum |
 
@@ -36,13 +35,8 @@ public struct ProviderPathEvidence: Codable, Sendable, Equatable {
         outcome: ProviderPathEvidenceOutcome,
         sourceReliability: Double = 1
     ) {
-        let cleanID = evidenceID.trimmingCharacters(in: .whitespacesAndNewlines)
-        let digestSource = cleanID.isEmpty ? "anonymous" : String(cleanID.prefix(512))
-        let digest = SHA256.hash(data: Data(digestSource.utf8))
-            .map { String(format: "%02x", $0) }
-            .joined()
         self.init(
-            canonicalEvidenceID: digest,
+            canonicalEvidenceID: BodyEvidenceReference.digest(evidenceID),
             observedAt: observedAt,
             outcome: outcome,
             sourceReliability: sourceReliability
@@ -59,18 +53,8 @@ public struct ProviderPathEvidence: Codable, Sendable, Equatable {
         let observedAt = try container.decode(Date.self, forKey: .observedAt)
         let outcome = try container.decode(ProviderPathEvidenceOutcome.self, forKey: .outcome)
         let reliability = try container.decode(Double.self, forKey: .sourceReliability)
-        let canonicalID: String
-        if Self.isCanonicalDigest(rawID) {
-            canonicalID = rawID
-        } else {
-            let cleanID = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
-            let source = cleanID.isEmpty ? "anonymous" : String(cleanID.prefix(512))
-            canonicalID = SHA256.hash(data: Data(source.utf8))
-                .map { String(format: "%02x", $0) }
-                .joined()
-        }
         self.init(
-            canonicalEvidenceID: canonicalID,
+            canonicalEvidenceID: Self.isCanonicalDigest(rawID) ? rawID : BodyEvidenceReference.digest(rawID),
             observedAt: observedAt,
             outcome: outcome,
             sourceReliability: reliability
@@ -113,7 +97,7 @@ public enum ProviderPathBeliefState: String, Codable, Sendable, Equatable {
 /// lifecycle events remain owned by their provider/trace stores. Consumers may
 /// use estimate, freshness and uncertainty for posture; the optional Boolean
 /// is only the legacy `BodySchema` compatibility view.
-public struct ProviderPathBeliefProjection: Codable, Sendable, Equatable {
+public struct ProviderPathEstimate: Codable, Sendable, Equatable {
     public let generatedAt: Date
     public let estimate: Double
     public let freshness: Double
@@ -129,9 +113,7 @@ public struct ProviderPathBeliefProjection: Codable, Sendable, Equatable {
         freshness: Double,
         uncertainty: Double,
         evidenceCount: Int,
-        newestEvidenceAt: Date?,
-        state: ProviderPathBeliefState,
-        bodySchemaProvidersHealthy: Bool?
+        newestEvidenceAt: Date?
     ) {
         self.generatedAt = generatedAt
         self.estimate = Self.clampFinite(estimate, fallback: 0.5)
@@ -145,9 +127,7 @@ public struct ProviderPathBeliefProjection: Codable, Sendable, Equatable {
             uncertainty: self.uncertainty,
             evidenceCount: self.evidenceCount
         )
-        // Category/compatibility are projections of the bounded numerics, not
-        // independently trusted truth. The parameters remain source-compatible
-        // for older callers/decoders but cannot create a contradictory value.
+        // Category and compatibility derive only from bounded numeric evidence.
         self.state = derived.state
         self.bodySchemaProvidersHealthy = derived.compatibility
     }
@@ -165,10 +145,10 @@ public struct ProviderPathBeliefProjection: Codable, Sendable, Equatable {
             freshness: try container.decode(Double.self, forKey: .freshness),
             uncertainty: try container.decode(Double.self, forKey: .uncertainty),
             evidenceCount: try container.decode(Int.self, forKey: .evidenceCount),
-            newestEvidenceAt: try container.decodeIfPresent(Date.self, forKey: .newestEvidenceAt),
-            state: try container.decode(ProviderPathBeliefState.self, forKey: .state),
-            bodySchemaProvidersHealthy: try container.decodeIfPresent(Bool.self, forKey: .bodySchemaProvidersHealthy)
+            newestEvidenceAt: try container.decodeIfPresent(Date.self, forKey: .newestEvidenceAt)
         )
+        _ = try container.decode(ProviderPathBeliefState.self, forKey: .state)
+        _ = try container.decodeIfPresent(Bool.self, forKey: .bodySchemaProvidersHealthy)
     }
 
     private static func clampFinite(_ value: Double, fallback: Double) -> Double {
@@ -203,7 +183,7 @@ public enum ProviderPathBeliefProjector {
         halfLife: TimeInterval = 2 * 60 * 60,
         staleAfter: TimeInterval = 6 * 60 * 60,
         maximumEvidence: Int = 32
-    ) -> ProviderPathBeliefProjection {
+    ) -> ProviderPathEstimate {
         let boundedHalfLife = halfLife.isFinite ? max(1, halfLife) : 2 * 60 * 60
         let boundedStaleAfter = staleAfter.isFinite
             ? max(boundedHalfLife, staleAfter)
@@ -225,15 +205,13 @@ public enum ProviderPathBeliefProjector {
         }
 
         guard let newest = bounded.first?.observedAt else {
-            return ProviderPathBeliefProjection(
+            return ProviderPathEstimate(
                 generatedAt: now,
                 estimate: 0.5,
                 freshness: 0,
                 uncertainty: 1,
                 evidenceCount: 0,
-                newestEvidenceAt: nil,
-                state: .unobserved,
-                bodySchemaProvidersHealthy: nil
+                newestEvidenceAt: nil
             )
         }
 
@@ -254,15 +232,13 @@ public enum ProviderPathBeliefProjector {
             ? exp(-log(2) * newestAge / boundedHalfLife)
             : 0
         guard totalWeight > 0, freshness > 0 else {
-            return ProviderPathBeliefProjection(
+            return ProviderPathEstimate(
                 generatedAt: now,
                 estimate: 0.5,
                 freshness: freshness,
                 uncertainty: 1,
                 evidenceCount: bounded.count,
-                newestEvidenceAt: newest,
-                state: freshness > 0 ? .uncertain : .stale,
-                bodySchemaProvidersHealthy: nil
+                newestEvidenceAt: newest
             )
         }
 
@@ -273,44 +249,24 @@ public enum ProviderPathBeliefProjector {
         let lowSupport = 1 / sqrt(totalWeight + 1)
         let disagreement = 4 * estimate * (1 - estimate)
         let uncertainty = max(lowSupport, disagreement).clamped01()
-        let state: ProviderPathBeliefState
-        let compatibility: Bool?
-        if freshness < 0.05 {
-            state = .stale
-            compatibility = nil
-        } else if uncertainty > 0.55 || (0.35...0.65).contains(estimate) {
-            state = .uncertain
-            compatibility = nil
-        } else if estimate > 0.65 {
-            state = .healthy
-            compatibility = true
-        } else {
-            state = .brittle
-            compatibility = false
-        }
-        return ProviderPathBeliefProjection(
+        return ProviderPathEstimate(
             generatedAt: now,
             estimate: estimate,
             freshness: freshness,
             uncertainty: uncertainty,
             evidenceCount: bounded.count,
-            newestEvidenceAt: newest,
-            state: state,
-            bodySchemaProvidersHealthy: compatibility
+            newestEvidenceAt: newest
         )
     }
 }
 
 public struct OrganismBodyRead: Sendable, Equatable {
     public var macAwake: Bool?
-    public var iPhoneReachable: Bool?
-    public var iPhoneLastSeenAt: Date?
     public var iPhoneStaleAfter: TimeInterval
-    public var providersHealthy: Bool?
     /// Exact configuration/credential availability. This is not path health:
     /// a configured provider can still be stale, failing, or unobserved.
     public var providersAvailable: Bool?
-    public var providerPathBelief: ProviderPathBeliefProjection?
+    public var providerPathBelief: ProviderPathEstimate?
     public var peerPresenceBelief: PeerPresenceBelief?
     public var notificationDeliveryBelief: NotificationDeliveryBelief?
     public var memoryIntegrityReading: MemoryIntegrityReading?
@@ -318,40 +274,22 @@ public struct OrganismBodyRead: Sendable, Equatable {
     public var toolCapabilityReading: ToolCapabilityReading?
     public var approvalPathReading: ApprovalPathReading?
     public var resourcePressureReading: ResourcePressureReading?
-    public var memoryHealthy: Bool?
-    public var dreamHealthy: Bool?
-    public var toolHandsAvailable: Bool?
-    public var approvalChannelsOpen: Bool?
-    public var notificationPathHealthy: Bool?
-    public var resourcePressure: OrganismResourcePressure?
 
     public init(
         macAwake: Bool? = nil,
-        iPhoneReachable: Bool? = nil,
-        iPhoneLastSeenAt: Date? = nil,
         iPhoneStaleAfter: TimeInterval = 60 * 60 * 36,
-        providersHealthy: Bool? = nil,
         providersAvailable: Bool? = nil,
-        providerPathBelief: ProviderPathBeliefProjection? = nil,
+        providerPathBelief: ProviderPathEstimate? = nil,
         peerPresenceBelief: PeerPresenceBelief? = nil,
         notificationDeliveryBelief: NotificationDeliveryBelief? = nil,
         memoryIntegrityReading: MemoryIntegrityReading? = nil,
         dreamIntegrityReading: DreamIntegrityReading? = nil,
         toolCapabilityReading: ToolCapabilityReading? = nil,
         approvalPathReading: ApprovalPathReading? = nil,
-        resourcePressureReading: ResourcePressureReading? = nil,
-        memoryHealthy: Bool? = nil,
-        dreamHealthy: Bool? = nil,
-        toolHandsAvailable: Bool? = nil,
-        approvalChannelsOpen: Bool? = nil,
-        notificationPathHealthy: Bool? = nil,
-        resourcePressure: OrganismResourcePressure? = nil
+        resourcePressureReading: ResourcePressureReading? = nil
     ) {
         self.macAwake = macAwake
-        self.iPhoneReachable = iPhoneReachable
-        self.iPhoneLastSeenAt = iPhoneLastSeenAt
         self.iPhoneStaleAfter = max(0, iPhoneStaleAfter)
-        self.providersHealthy = providersHealthy
         self.providersAvailable = providersAvailable
         self.providerPathBelief = providerPathBelief
         self.peerPresenceBelief = peerPresenceBelief
@@ -361,12 +299,6 @@ public struct OrganismBodyRead: Sendable, Equatable {
         self.toolCapabilityReading = toolCapabilityReading
         self.approvalPathReading = approvalPathReading
         self.resourcePressureReading = resourcePressureReading
-        self.memoryHealthy = memoryHealthy
-        self.dreamHealthy = dreamHealthy
-        self.toolHandsAvailable = toolHandsAvailable
-        self.approvalChannelsOpen = approvalChannelsOpen
-        self.notificationPathHealthy = notificationPathHealthy
-        self.resourcePressure = resourcePressure
     }
 }
 
@@ -383,15 +315,11 @@ public enum OrganismBodySchemaSampler {
         if let peerPresenceBelief = read.peerPresenceBelief {
             body.peerPresenceBelief = peerPresenceBelief
             body.iPhoneReachable = peerPresenceBelief.compatibilityReachable
-        } else if let iPhoneReachable = read.iPhoneReachable {
-            body.iPhoneReachable = iPhoneReachable
-        }
-        if read.peerPresenceBelief == nil, let lastSeen = read.iPhoneLastSeenAt {
-            body.iPhoneReachable = now.timeIntervalSince(lastSeen) <= read.iPhoneStaleAfter
         }
         if let providersAvailable = read.providersAvailable {
             body.providersAvailable = providersAvailable
             if !providersAvailable {
+                body.providerPathBelief = nil
                 body.providersHealthy = false
             }
         }
@@ -405,47 +333,36 @@ public enum OrganismBodySchemaSampler {
                 // mere configuration to health.
                 body.providersHealthy = false
             }
-        } else if let providersHealthy = read.providersHealthy {
-            body.providerPathBelief = nil
-            body.providersHealthy = providersHealthy
         }
         if let memoryIntegrityReading = read.memoryIntegrityReading {
             body.memoryIntegrityReading = memoryIntegrityReading
             if let healthy = memoryIntegrityReading.compatibilityHealthy {
                 body.memoryHealthy = healthy
             }
-        } else if let memoryHealthy = read.memoryHealthy {
-            body.memoryHealthy = memoryHealthy
         }
         if let dreamIntegrityReading = read.dreamIntegrityReading {
             body.dreamIntegrityReading = dreamIntegrityReading
             if let healthy = dreamIntegrityReading.compatibilityHealthy {
                 body.dreamHealthy = healthy
             }
-        } else if let dreamHealthy = read.dreamHealthy {
-            body.dreamHealthy = dreamHealthy
         }
         if let toolCapabilityReading = read.toolCapabilityReading {
             body.toolCapabilityReading = toolCapabilityReading
             if let available = toolCapabilityReading.compatibilityAvailable {
                 body.toolHandsAvailable = available
             }
-        } else if let toolHandsAvailable = read.toolHandsAvailable {
-            body.toolHandsAvailable = toolHandsAvailable
         }
         if let approvalPathReading = read.approvalPathReading {
             body.approvalPathReading = approvalPathReading
             if let open = approvalPathReading.compatibilityOpen {
                 body.approvalChannelsOpen = open
             }
-        } else if let approvalChannelsOpen = read.approvalChannelsOpen {
-            body.approvalChannelsOpen = approvalChannelsOpen
         }
         if let notificationDeliveryBelief = read.notificationDeliveryBelief {
             body.notificationDeliveryBelief = notificationDeliveryBelief
             // Delivery freshness can describe a transport failure, not the device receipt.
             if notificationDeliveryBelief.deviceReceived,
-               notificationDeliveryBelief.evidence.contains(where: {
+               notificationDeliveryBelief.metrics.evidence.contains(where: {
                    $0.evidenceClass == .deviceProcessReceipt
                        && $0.receivedAt.timeIntervalSince(now) <= 5
                        && now.timeIntervalSince($0.receivedAt) <= read.iPhoneStaleAfter
@@ -460,17 +377,10 @@ public enum OrganismBodySchemaSampler {
                 // contact can still establish that the peripheral path is live.
                 body.notificationPathHealthy = body.iPhoneReachable
             }
-        } else if let notificationPathHealthy = read.notificationPathHealthy {
-            body.notificationPathHealthy = notificationPathHealthy
-        } else if (read.iPhoneReachable != nil || read.iPhoneLastSeenAt != nil),
-                  body.iPhoneReachable == false {
-            body.notificationPathHealthy = false
         }
         if let resourcePressureReading = read.resourcePressureReading {
             body.resourcePressureReading = resourcePressureReading
             body.resourcePressure = resourcePressureReading.category
-        } else if let resourcePressure = read.resourcePressure {
-            body.resourcePressure = resourcePressure
         }
         return body
     }

@@ -1,9 +1,3 @@
-// PATCH-2026-05-07: ios-sync MacSyncEngine — SnapshotWriter + InboxWatcher (Mac side)
-// SnapshotWriter: source mutations write app-owned Swift runtime state to iCloud Drive `snapshots/`.
-//   Touches KVS key `snapshot_updated` so iOS observes immediately.
-// InboxWatcher: NSMetadataQuery on `inbox/`. When iOS drops an action JSON, dispatch to
-//   the in-process Swift runtime, write response to `responses/<msg_id>.json`, touch KVS `inbox_response_<msg_id>`.
-
 import CommonCrypto
 import CryptoKit
 import AppKit
@@ -108,10 +102,7 @@ extension MacSyncEngine {
     }
 
     private func settleInboxAction(_ action: InboxAction, transactionId: String, response: [String: String], directory: URL) async {
-        let status = (response["status"] ?? "").lowercased()
-        let state = status == "error" || status == "failed" || response["ok"] == "false"
-            ? "failed" : (status == "pending_approval" ? "pending_approval" : "completed")
-        await writeTransaction(id: transactionId, action: action.action, state: state,
+        await writeTransaction(id: transactionId, action: action.action, state: InboxAction.responseTransactionState(response),
                                attempts: 1, error: response["message"], response: response, directory: directory)
     }
 
@@ -143,13 +134,11 @@ extension MacSyncEngine {
     }
 
     func authenticateInboxFile(data: Data, action: InboxAction, fileURL: URL, inboxDir: URL) async -> Bool {
-        // The legacy validator writes upgrade responses for unsigned input;
-        // an unauthenticated message must not claim that response path.
         let error: String?
-        if action.signature == nil {
-            error = "missing signature"
+        if let signature = action.signature {
+            error = BridgeMessage.innerActionSignatureError(data: data, signature: signature, secret: pairingSecret)
         } else {
-            error = await validateInboxAction(data: data, action: action)
+            error = "missing signature"
         }
         guard let error else { return true }
         await quarantineUnauthenticatedInboxFile(data: data, fileURL: fileURL, inboxDir: inboxDir, reason: error)
@@ -158,9 +147,7 @@ extension MacSyncEngine {
 
     // MARK: - KVS ping handler
 
-    // 2026-05-09: nonisolated — KVS callbacks fire on com.apple.kvs.client.callback,
-    // not main.  Body is a no-op (NSMetadataQuery does the real work) so we just
-    // observe and return without touching @MainActor state.
+    // KVS callbacks hop to MainActor before requesting inbox processing.
     @objc nonisolated func kvsDidChange(_ note: Notification) {
         let keys = note.userInfo?[NSUbiquitousKeyValueStoreChangedKeysKey] as? [String] ?? []
         guard keys.contains(KVSKey.inboxPending) || keys.contains(where: { $0.hasPrefix("inbox_pending") }) else { return }
@@ -175,10 +162,7 @@ extension MacSyncEngine {
     func startInboxQuery(docsURL: URL) {
         guard let inboxDir else { return }
         let q = NSMetadataQuery()
-        // PATCH-2026-05-08: review-fix-r8 Predicate also excludes archive
-        // names so the query never re-fires on previously-processed files.
-        // The directory-level filter still catches them, but excluding at
-        // the query layer avoids spurious wake-ups on every iCloud sync.
+        // Exclude archived and pending files at the query boundary to avoid spurious wake-ups.
         q.predicate = NSPredicate(
             format: "%K BEGINSWITH %@ AND NOT (%K CONTAINS '/_rejected/') AND NOT (%K BEGINSWITH 'processed_') AND NOT (%K BEGINSWITH 'rejected_') AND NOT (%K BEGINSWITH 'pending_') AND %K ENDSWITH '.json'",
             NSMetadataItemPathKey,
@@ -208,8 +192,7 @@ extension MacSyncEngine {
         q.start()
     }
 
-    // 2026-05-09: nonisolated + MainActor hop — NSMetadataQuery posts on its
-    // private worker queue; touching @MainActor state from there fatal-traps.
+    // NSMetadataQuery callbacks hop from its worker queue to MainActor before accessing state.
     @objc private nonisolated func inboxQueryUpdated(_ note: Notification) {
         let queryID = note.object.map { ObjectIdentifier($0 as AnyObject) }
         Task { @MainActor in
@@ -246,12 +229,6 @@ extension MacSyncEngine {
         validationError: String
     ) async {
         syncError = "Rejected inbox message \(action.msgId): \(validationError)"
-        if validationError.contains("pairing secret unavailable") {
-            // Local authority is unavailable, so this is not evidence
-            // that the peer sent a bad action. Leave it untouched for
-            // exact retry after deliberate local repair.
-            return
-        }
         switch await readTransaction(id: transactionId) {
         case .absent:
             break
@@ -273,8 +250,7 @@ extension MacSyncEngine {
         }
         // Retain the signed rejection and archive this exact stale envelope,
         // without reserving its message or transaction identity.
-        // PATCH-2026-05-08: fix-A.3 Use .done suffix so the file is no longer
-        // matched by the `.json` filter on next query update or restart.
+        // The .done suffix excludes this archive from subsequent .json queries.
         let archiveURL = inboxDir.appendingPathComponent("rejected_\(fileURL.lastPathComponent).done")
         await Task.detached(priority: .utility) { [fileURL, archiveURL] in
             try? FileManager.default.moveItem(at: fileURL, to: archiveURL)
@@ -325,11 +301,7 @@ extension MacSyncEngine {
 
         guard isActive, generation == snapshotLifecycleGeneration else { return }
 
-        // PATCH-2026-05-08: fix-A.3 Exclude already-processed/rejected archives so
-        // restarts don't re-decode and re-dispatch them.  Archives use a `.done`
-        // suffix (e.g. `processed_foo.json.done`) added below.  As belt-and-suspenders,
-        // also skip any filename starting with "processed_" or "rejected_" even if the
-        // suffix isn't .done (e.g. legacy `.json` archives from a previous build).
+        // Exclude .done archives and processed_/rejected_ names, including .json archives, from dispatch.
         let now = Date()
         for pendingURL in files where pendingURL.lastPathComponent.hasPrefix("pending_") && pendingURL.pathExtension == "json" {
             guard isActive, generation == snapshotLifecycleGeneration else { return }
@@ -383,12 +355,7 @@ extension MacSyncEngine {
                     syncError = "Pairing secret unavailable; stale command \(staleAction.msgId) remains pending."
                     continue
                 }
-                // M3 (2026-07-09): the encode+write used to be stacked `try?` and
-                // the pending file was archived regardless — an encode or iCloud
-                // write failure silently consumed the command and the phone waited
-                // forever for a response that no longer had a writer. Verify the
-                // response actually landed (retry once), and only then consume the
-                // pending file; otherwise leave it for the next sweep.
+                // Consume the pending file only after its response passes durable readback.
                 let responseWritten = await writeInboxResponse(response, to: responseURL)
                 guard responseWritten else {
                     syncError = "Could not write iCloud response for stale command \(staleAction.msgId); left pending for retry."
@@ -472,14 +439,7 @@ extension MacSyncEngine {
             let transactionId = ids.transactionID
             let actionDigest = Self.inboxActionDigest(envelope: data)
 
-            // C.1: Validate the HMAC signature before dispatching.
-            // 2026-09-06: freshness NO LONGER runs here. Authenticity has to
-            // come first — anything on the account can drop a file in this
-            // folder — but an action whose response was lost and which arrives
-            // again beyond the ±5-minute window is a REDELIVERY, and rejecting
-            // it here meant its completed ledger row was never consulted and
-            // the phone was told the command failed when it had run. Freshness
-            // moves below the ledger, where it gates new work only.
+            // Authenticate before consulting the ledger; freshness gates only new work.
             guard await authenticateInboxFile(
                 data: data,
                 action: action,
@@ -662,14 +622,6 @@ extension MacSyncEngine {
             }
 
             await settleInboxAction(action, transactionId: transactionId, response: response, directory: transactionDir)
-            // Sweep R4 item 1: the action has now RUN and its response has
-            // landed, so from here on the only correct outcome is "never
-            // dispatch this again". Both bookkeeping steps used to be `try?`:
-            // a disk-full or permission failure after execution left the
-            // pending file in place with no processed id, and the next sweep
-            // (or the next launch) re-ran the remote Mac action. Both steps are
-            // now CHECKED, and if either fails we write a durable local marker
-            // that restoreState reads back as "already processed".
             recordProcessed(action.msgId)
             let processedSaved = await saveProcessedIds()
             let archiveURL = inboxDir.appendingPathComponent("processed_\(fileURL.lastPathComponent).done")
@@ -718,12 +670,7 @@ extension MacSyncEngine {
     }
 
 
-    /// Encode + coordinated-write one inbox response, verifying it actually
-    /// landed on disk and retrying once. Returns false when the response is NOT
-    /// present afterwards — the caller must then leave the pending command in
-    /// place for a later sweep rather than consuming it, because a phone that
-    /// never sees a response waits forever (M3, honesty sweep 2026-07-09).
-    /// Never silent: every failed attempt is logged.
+    /// Verify response readback with one retry, log failures, and return false to keep the command pending.
     func writeInboxResponse(_ response: [String: String], to responseURL: URL) async -> Bool {
         let responseData: Data
         do {
@@ -734,14 +681,9 @@ extension MacSyncEngine {
             return false
         }
         for attempt in 1...2 {
-            // 2026-09-06: check the write, then READ THE FILE BACK AND DECODE
-            // it. `fileExists` passed for a zero-length or half-written file —
-            // a phone that reads one of those gets a decode failure and waits
-            // forever, which is exactly the outcome this function exists to
-            // prevent. Only a response that decodes back into the same keys is
-            // a landed response.
+            // A landed response decodes from disk to exactly the values written.
             let landed = await Task.detached(priority: .utility) { [responseURL, responseData] () -> Bool in
-                guard Self.coordinatedWrite(data: responseData, to: responseURL) else { return false }
+                guard Self.coordinatedWriteReturningError(data: responseData, to: responseURL) == nil else { return false }
                 guard let readBack = Self.coordinatedRead(at: responseURL),
                       let decoded = try? JSONDecoder().decode([String: String].self, from: readBack)
                 else { return false }
@@ -778,12 +720,11 @@ extension MacSyncEngine {
             return true
         }
         // Authenticate the inner envelope before consulting any ID-owned state.
-        // Missing signatures must bypass the legacy upgrade-response writer.
         let authenticationError: String?
-        if action.signature == nil {
-            authenticationError = "missing signature"
+        if let signature = action.signature {
+            authenticationError = BridgeMessage.innerActionSignatureError(data: data, signature: signature, secret: pairingSecret)
         } else {
-            authenticationError = await validateInboxAction(data: data, action: action)
+            authenticationError = "missing signature"
         }
         guard isActive, generation == snapshotLifecycleGeneration else { return false }
         if let authenticationError {
@@ -816,7 +757,7 @@ extension MacSyncEngine {
         if processedMsgIds.contains(action.msgId), alreadyExecuted {
             guard let response = try? replayInboxResponse(action, record: priorTransaction, refusal: nil) else { return false }
             do {
-                try await sendCloudKitActionResponse(response, correlationID: action.msgId)
+                try await sync.bridge.sendCloudKitActionResponse(response, correlationID: action.msgId)
                 return true
             } catch {
                 syncError = "Could not resend CloudKit action response \(action.msgId): \(error.localizedDescription)"
@@ -833,7 +774,7 @@ extension MacSyncEngine {
             // either path belongs to the run we could not read, or to the other
             // action holding this id, and must not be clobbered.
             do {
-                try await sendCloudKitActionResponse(signed, correlationID: action.msgId)
+                try await sync.bridge.sendCloudKitActionResponse(signed, correlationID: action.msgId)
                 return true
             } catch {
                 syncError = "Could not send CloudKit action refusal \(action.msgId): \(error.localizedDescription)"
@@ -867,10 +808,6 @@ extension MacSyncEngine {
             }
         } else if let validationError = freshnessError {
             inboundActionVerified = false
-            if validationError.contains("pairing secret unavailable") {
-                syncError = "Pairing secret unavailable; CloudKit action \(action.msgId) remains unacknowledged."
-                return false
-            }
             guard let signed = try? signedResponse([
                 "status": "error",
                 "ok": "false",
@@ -886,7 +823,7 @@ extension MacSyncEngine {
             // A stale envelope has not executed. Return its authenticated
             // refusal without claiming either identity or a response-file slot.
             do {
-                try await sendCloudKitActionResponse(signed, correlationID: action.msgId)
+                try await sync.bridge.sendCloudKitActionResponse(signed, correlationID: action.msgId)
                 return true
             } catch {
                 syncError = "Could not send stale CloudKit action refusal \(action.msgId): \(error.localizedDescription)"
@@ -941,10 +878,6 @@ extension MacSyncEngine {
                 dataRoot: actionStateRoot
             )
         }
-        // Sweep R4 item 1 (CloudKit lane, same hazard as the Drive lane above):
-        // the action has already executed. If the id window cannot be persisted
-        // the in-process guard at the top of this function still holds, but a
-        // restart would lose it — so leave the durable marker instead.
         recordProcessed(action.msgId)
         let processedSaved = await saveProcessedIds()
         let commit = await sync.storage.perform {
@@ -955,7 +888,7 @@ extension MacSyncEngine {
 
         guard isActive, generation == snapshotLifecycleGeneration else { return false }
         do {
-            try await sendCloudKitActionResponse(response, correlationID: action.msgId)
+            try await sync.bridge.sendCloudKitActionResponse(response, correlationID: action.msgId)
             guard isActive, generation == snapshotLifecycleGeneration else { return false }
             lastInboxAt = Date()
             await writeSnapshots(forceHeavy: true)
@@ -966,20 +899,6 @@ extension MacSyncEngine {
             guard isActive, generation == snapshotLifecycleGeneration else { return false }
             syncError = "CloudKit action completed but its response is waiting to resend: \(error.localizedDescription)"
             return false
-        }
-    }
-
-    private func sendCloudKitActionResponse(
-        _ response: [String: String],
-        correlationID: String
-    ) async throws {
-        if let cloudKitActionResponseSender {
-            try await cloudKitActionResponseSender(response, correlationID)
-        } else {
-            try await sync.bridge.sendCloudKitActionResponse(
-                response,
-                correlationID: correlationID
-            )
         }
     }
 

@@ -22,28 +22,16 @@ enum AppScriptRunner {
     static let actionLimit = OwnedProgramRunner.actionLimit
     typealias Perform = @Sendable ([String: JSONValue]) async -> JSONValue
     typealias ScriptError = OwnedProgramRunner.ScriptError
-    typealias Replay = OwnedProgramRunner.Replay
 
-    static func run(source: String, preview: Bool, dataRoot: URL = PersistenceCore.defaultDataRoot(), perform: @escaping Perform) async -> JSONValue {
+    static func run(source: String, preview: Bool, dataRoot: URL, perform: @escaping Perform) async -> JSONValue {
         guard source.utf8.count <= sourceLimit else {
             return AppToolExecutor.doorRefusal("script_too_long",
                 "The script is \(source.utf8.count) bytes; the limit is \(sourceLimit). Nothing ran.",
                 remedy: "shorten", "Split it, or read first and act in a shorter script.")
         }
         let program = OwnedProgram(kind: .script, id: "app-script", version: "1", source: source, entry: .functionBody)
-        return await runner(dataRoot: dataRoot).run(program, input: nil, preview: preview, replay: nil, host: Host(call: perform, dataRoot: dataRoot))
+        return await OwnedProgramRunner(dataRoot: dataRoot).run(program, input: nil, preview: preview, replay: nil, host: Host(call: perform, dataRoot: dataRoot))
     }
-
-    static func runner(dataRoot root: URL) -> OwnedProgramRunner {
-        let helper = SenseHostLocator.helperURL
-        return OwnedProgramRunner(helperURL: helper, dataRoot: root) { scratch in
-            try SenseSandboxProfile.build(reach: SenseReach(), helperURL: helper, scratch: scratch,
-                dataRoot: root, personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: root))
-        }
-    }
-
-    static func ownVersions(_ journal: [JSONValue]) -> [String] { OwnedProgramRunner.ownVersions(journal) }
-    static func versionScope(_ version: String) -> String { OwnedProgramRunner.versionScope(version) }
 
     /// Door args from a script call: one object is the args by name (a second
     /// object carries expected_version or preview); anything else is
@@ -102,7 +90,7 @@ enum AppScriptRunner {
         let call: Perform
         var reach = Host.unwiredReach
         var validation: (@Sendable ([String: JSONValue], OwnedProgramFixtures) async -> JSONValue)?
-        var dataRoot = PersistenceCore.defaultDataRoot()
+        var dataRoot: URL
         var admit: @Sendable (String, [String: JSONValue]) async -> JSONValue? = { _, _ in
             AppToolExecutor.failure("door_unavailable", "Authored execution requires the originating Trust gate.")
         }
@@ -137,15 +125,16 @@ enum AppScriptRunner {
         func evidence(_ receipt: JSONValue) -> OwnedProgramReceiptEvidence {
             let fields: [String: JSONValue] = if case .object(let fields) = receipt { fields } else { [:] }
             let mac = MacControlReceiptOutcome.projecting(envelope: receipt)
+            let verdict = ChatToolOutcome.exactResultClass(receipt)
             return OwnedProgramReceiptEvidence(
-                successful: ChatToolOutcome.outputLooksSuccessful(receipt),
-                waiting: ChatToolOutcome.isWaitingOnPerson(receipt),
-                resultClass: ChatToolOutcome.exactResultClass(receipt).rawValue,
+                successful: ChatToolOutcome.outputLooksSuccessful(receipt, verdict: verdict),
+                waiting: ChatToolOutcome.isWaitingOnPerson(receipt, verdict: verdict),
+                resultClass: verdict.rawValue,
                 pending: ChatToolOutcome.pendingStatuses.contains(AppToolExecutor.doorText(fields["status"]).lowercased()),
                 effectUnconfirmed: mac == .running || mac == .effectUnconfirmed)
         }
         func receiptField(_ key: String, in receipt: JSONValue) -> JSONValue? {
-            SessionHistoryPromptRenderer.receiptField(key, in: receipt)
+            ChatTranscriptEvidenceRendering.receiptField(key, in: receipt)
         }
         /// One shape: a door receipt's object result comes up to the top, and
         /// what the door writes for the model (guide, remedy, next_call,

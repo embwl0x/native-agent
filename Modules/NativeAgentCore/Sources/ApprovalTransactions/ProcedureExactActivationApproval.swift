@@ -4,9 +4,9 @@ import NativeAgentCore
 import PersistenceCore
 import Procedures
 import WorkshopExecution
-// Blueprint: | `ProcedureExactActivationApproval.swift` | `ApprovalTransactionCoordinator`: `applyResolvedProcedureExactActivation` |
+// Blueprint: | `ProcedureExactActivationApproval.swift` | `ApprovalExecution`: `applyResolvedProcedureExactActivation` |
 
-extension ApprovalTransactionCoordinator {
+extension ApprovalExecution {
     /// Idempotent executor for the local-only exact-procedure activation card.
     /// Approval persists first; this executor installs an immutable manifest
     /// and one replaceable pointer. Launch reconciliation heals the crash gap.
@@ -43,24 +43,17 @@ extension ApprovalTransactionCoordinator {
             return
         }
         do {
-            let manifest = try await ProcedureExactActivationExecutor.activate(
-                proposal: proposal,
-                dataRoot: dataRoot,
-                evidenceMatches: { artifact in
-                    await WorkshopProcedureExactActivationQualifier
-                        .proposalStillMatchesCanonicalEvidence(
-                            proposal,
-                            dataRoot: dataRoot,
-                            artifact: artifact
-                        )
-                },
-                reviewerDecision: {
-                    let inbox = SwiftNativeApprovalInbox(root: dataRoot)
-                    return try await inbox.approvedProcedureExactActivationDecision(
-                        approvalID: record.id,
-                        proposal: proposal
-                    )
-                }
+            let store = ProcedureArtifactStore(dataRoot: dataRoot)
+            let artifact = try await store.load(proposal.artifactID)
+            guard await WorkshopProcedureExactActivationQualifier.proposalStillMatchesCanonicalEvidence(
+                proposal, dataRoot: dataRoot, artifact: artifact
+            ) else {
+                throw ProcedureExactActivationError.activationBindingMismatch
+            }
+            let decision = try await SwiftNativeApprovalInbox(root: dataRoot)
+                .approvedProcedureExactActivationDecision(approvalID: record.id, proposal: proposal)
+            let manifest = try await store.installAndActivateExact(
+                proposal: proposal, reviewerDecision: decision
             )
             try await SwiftNativeApprovalInbox(root: dataRoot).annotateExecution(
                 record.id,

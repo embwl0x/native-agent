@@ -3,7 +3,7 @@ import PersistenceCore
 import ChatSessionWork
 // Blueprint: | `HerScreenRooms+Life.swift` | Native Music target bindings, status/unavailable evidence and rendering; playback narration, track/playlist curation and action labels are removed to `workspace-readout.js`; `lifeRoom` presents a failed nested Music readback with its full cause while retaining the original control receipt on its separate DONE line; `lifePulse`, `opening`; `HerItemPages` caches text without read-side peer lists |
 
-/// Her life rooms (2026-09-24): music opens by name like any place (`music`).
+/// Music opens by name like any place (`music`).
 /// Each is its owner's own read laid out by the shared text room; opening
 /// one runs that read on demand, home never does. Calendar and reminders were
 /// already places; their changes now come back as the same text room.
@@ -25,7 +25,7 @@ enum AgentWorkspaceLife {
         return tool.hasPrefix("music_") ? "music" : nil
     }
 
-    static func project(tool: String, input: [String: JSONValue], result: JSONValue, dataRoot: URL) async -> AgentWorkspaceProjection {
+    static func project(tool: String, input: [String: JSONValue], result: JSONValue, dataRoot: URL) async -> WorkspacePage {
         let row = object(result)
         var native: [String: JSONValue] = ["status": row["status"] ?? (row["ok"] == .bool(false) ? .string("failed") : .string("ok"))]
         for key in ["connected", "detail", "fix", "reason", "failure_code", "error_code", "effects", "remedy", "hint", "next_call", "tap"] { native[key] = row[key] }
@@ -70,7 +70,7 @@ enum AgentWorkspaceLife {
                 actions[key+":play"] = effect("play",tool:"music_control",input:["action":.string("play"),"playlist":.string(name)])
             }
         }
-        for verb in ["play","pause","next","previous"] { actions[verb] = effect(verb,tool:"music_control",input:["action":.string(verb)]) }
+        for verb in ["play","pause","stop","next","previous"] { actions[verb] = effect(verb,tool:"music_control",input:["action":.string(verb)]) }
         actions["playlist"] = typed("playlist",tool:"music_control",input:["action":.string("play")],field:"playlist",effect:true)
         actions["track"] = typed("track",tool:"music_control",input:["action":.string("play")],field:"track",effect:true)
         actions["find"] = typed("find",tool:"music_search_library",field:"query")
@@ -82,9 +82,7 @@ enum AgentWorkspaceLife {
 
     /// The one sentence that says why a read or change did not work.
     static func problem(_ row: [String: JSONValue]) -> String? {
-        let failed = row["not_run_status"] != nil || row["ok"] == .bool(false) || ["failed", "error", "denied", "refused", "rejected", "blocked", "unavailable", "needs_setup", "needs_authentication", "outcome_unknown", "cancelled", "canceled", "timeout", "timed_out"].contains(text(row["status"]) ?? "")
-            || row["needs"] != nil
-        guard failed else { return nil }
+        guard !ChatToolOutcome.hasReadEvidence(.object(row)) else { return nil }
         return HerScreen.failureFace(.object(row))
     }
 
@@ -107,14 +105,23 @@ enum AgentWorkspaceLife {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
-    private static func int(_ value: JSONValue?) -> Int? { number(value).map { Int($0) } }
-    private static func number(_ value: JSONValue?) -> Double? { value?.numberValue(coercingStrings: true, finiteOnly: false) }
 }
 
 extension HerScreen {
+    /// Passes the owner read through while retaining its same-day badge.
+    package static func notedLifeRead(_ name: String, _ result: JSONValue, dataRoot: URL) -> JSONValue {
+        let row = AgentWorkspaceLife.object(result)
+        guard row["status"] == .string("completed"), case .int(let count)? = row["count"] else { return result }
+        if name == "calendar", row["day"] == .string("today") { HerReadBadges.shared.note(name, "\(count) today", dataRoot: dataRoot) }
+        if name == "reminders", row["includeCompleted"] == .bool(false), case .string(let summary)? = row["summary"] {
+            HerReadBadges.shared.note(name, summary, dataRoot: dataRoot)
+        }
+        return result
+    }
+
     /// A read or a change in a life room as that room's text, with what the
-    /// change did on the line under the header. Nil keeps the old frame.
-    static func lifeRoom(_ place: AgentWorkspaceLocation, projection: AgentWorkspaceProjection, frame: JSONValue, dataRoot: URL) async -> String? {
+    /// change did on the line under the header. Nil leaves the frame to the caller.
+    static func lifeRoom(_ place: AgentWorkspaceLocation, projection: WorkspacePage, status: JSONValue, dataRoot: URL, scope: String) async -> String? {
         let tool: String, receipt: JSONValue?
         var shown = projection
         switch place {
@@ -125,20 +132,15 @@ extension HerScreen {
             tool = name; receipt = value
             if AgentWorkspaceLife.room(for: name) == "music" { shown = await AgentWorkspaceLife.project(tool: name, input: [:], result: value, dataRoot: dataRoot) }
         case .page(let inner, _):
-            return await lifeRoom(inner, projection: projection, frame: frame, dataRoot: dataRoot)
+            return await lifeRoom(inner, projection: projection, status: status, dataRoot: dataRoot, scope: scope)
         default: return nil
         }
         guard let room = AgentWorkspaceLife.room(for: tool) else { return nil }
-        // A calendar or reminder change keeps its old receipt frame unless
+        // A calendar or reminder change keeps its receipt frame unless
         // its list was read back (the record carries the receipt).
         if case .receipt = place, tool.hasPrefix("mac_") { return nil }
-        var readFrame = frame
-        if tool == "music_control", case .object(var fields) = readFrame,
-           let status = AgentWorkspaceLife.object(shown.content)["status"] {
-            fields["status"] = status
-            readFrame = .object(fields)
-        }
-        var lines = textRoom(room, place: place, projection: shown, frame: readFrame, dataRoot: dataRoot).components(separatedBy: "\n")
+        let readStatus = tool == "music_control" ? (AgentWorkspaceLife.object(shown.content)["status"] ?? status) : status
+        var lines = textRoom(room, place: place, projection: shown, status: readStatus, dataRoot: dataRoot, scope: scope).components(separatedBy: "\n")
         if let receipt {
             let row = AgentWorkspaceLife.object(receipt)
             let what = ["title", "action_performed", "playlist", "track"].lazy.compactMap { key -> String? in
@@ -167,8 +169,8 @@ extension HerScreen {
     }
 
     /// "calendar: 2 today · 3h" from the latest read today, else the bare name.
-    static func lifePulse(_ name: String, now: Date = Date()) -> String {
-        guard let seen = HerLifePulse.shared.latest(name), Calendar.current.isDate(seen.at, inSameDayAs: now) else { return name }
+    static func lifePulse(_ name: String, dataRoot: URL, now: Date = Date()) -> String {
+        guard let seen = HerReadBadges.shared.latest(name, dataRoot: dataRoot), Calendar.current.isDate(seen.at, inSameDayAs: now) else { return name }
         return name + ": " + seen.words + " · " + age(now.timeIntervalSince(seen.at))
     }
 }
@@ -207,33 +209,4 @@ final class HerItemPages: @unchecked Sendable {
     }
 
     func removeSession(_ key: String) { cache.removeSession(key) }
-}
-
-/// The latest calendar-today and reminders-due counts, noted as those reads
-/// pass through the dispatcher, for home to show without reading. Memory only.
-package final class HerLifePulse: @unchecked Sendable {
-    package static let shared = HerLifePulse()
-    private let lock = NSLock()
-    private var rows: [String: (words: String, at: Date)] = [:]
-
-    /// Passes the read's result through untouched.
-    package static func noted(_ name: String, _ result: JSONValue) -> JSONValue {
-        let row = AgentWorkspaceLife.object(result)
-        guard row["status"] == .string("completed"), case .int(let count)? = row["count"] else { return result }
-        if name == "calendar", row["day"] == .string("today") { shared.set(name, "\(count) today") }
-        if name == "reminders", row["includeCompleted"] == .bool(false), case .array(let due)? = row["reminders"] {
-            // Overdue apart from due today: "6 overdue", "1 due · 5 overdue".
-            let today = Calendar.current.startOfDay(for: Date())
-            let overdue = due.filter { value in
-                guard case .string(let at)? = AgentWorkspaceLife.object(value)["dueAt"], let date = ISO8601DateFormatter().date(from: at) else { return false }
-                return date < today
-            }.count
-            let words = [count - Int64(overdue) > 0 ? "\(count - Int64(overdue)) due" : nil, overdue > 0 ? "\(overdue) overdue" : nil].compactMap { $0 }
-            shared.set(name, words.isEmpty ? "none due" : words.joined(separator: " · "))
-        }
-        return result
-    }
-
-    private func set(_ name: String, _ words: String) { lock.withLock { rows[name] = (words, Date()) } }
-    func latest(_ name: String) -> (words: String, at: Date)? { lock.withLock { rows[name] } }
 }

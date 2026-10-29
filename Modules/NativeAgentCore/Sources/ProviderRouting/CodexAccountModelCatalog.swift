@@ -2,7 +2,7 @@ import NativeAgentShared
 import Foundation
 import PersistenceCore
 import Experiences
-// Blueprint: | `CodexAccountModelCatalog.swift` | `CodexAccountModelCatalog` enum; `load`, `signedCacheLists`; one decoded catalog for account matching and separate Codex/OAuth projections, invalidated by file attributes with auth identity checked on selection; a cache read fault owes repair under `codex.model_catalog:<file path>` with the file as owner; a later successful read settles it |
+// Blueprint: | `CodexAccountModelCatalog.swift` | `CodexAccountModelCatalog` enum; `load`, `matchingModels`; one decoded catalog for account matching and separate Codex/OAuth projections, invalidated by file attributes with auth identity checked on selection; a cache read fault owes repair under `codex.model_catalog:<file path>` with the file as owner; a later successful read settles it |
 
 /// Reads the signed, account-scoped Codex model catalog instead of advertising
 /// preview models to users whose ChatGPT/Codex account cannot select them.
@@ -111,7 +111,7 @@ public enum CodexAccountModelCatalog {
         if let failure {
             RepairOwed.owe(dataRoot, id: "codex-model-catalog:" + UUID().uuidString,
                            kind: .act, operation: "codex.model_catalog:" + url.path, owner: url.path,
-                           words: "\(url.path) could not be read (\(failure)); the shipped model rows are offered until the Codex CLI rewrites it")
+                           words: "\(url.path) could not be read (\(failure)); its models and windows are unknown until the catalog is repaired")
         } else {
             RepairOwed.settle(dataRoot, operation: "codex.model_catalog:" + url.path,
                               evidence: .init(source: "providers", id: url.path))
@@ -157,12 +157,16 @@ public enum CodexAccountModelCatalog {
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> [Model] {
         let url = cacheURL ?? (useDefaultCacheWhenNil ? cacheCandidate() : nil)
-        return models(providerID: providerID, cache: url.flatMap { readCache(at: $0, dataRoot: dataRoot) })
+        let cache = url.flatMap { readCache(at: $0, dataRoot: dataRoot) }
+        if let url, modelCatalogFault(at: url, read: cache != nil, owner: "this ChatGPT account") != nil { return [] }
+        return models(providerID: providerID, cache: cache)
     }
 
     private static func models(providerID: String, cache: Cache?) -> [Model] {
         var byID: [String: Model] = [:]
-        for (index, descriptor) in FirstPartyModelCatalog.chatGPTAccountFallbackModels.enumerated() {
+        // Only an absent catalog can use the shipped discovery rows. A read
+        // account list owns both its membership and stated windows.
+        for (index, descriptor) in (cache == nil ? FirstPartyModelCatalog.chatGPTAccountFallbackModels : []).enumerated() {
             byID[descriptor.id] = Model(
                 id: descriptor.id,
                 displayName: descriptor.name,
@@ -180,7 +184,10 @@ public enum CodexAccountModelCatalog {
             for record in cache.models {
                 let id = record.slug.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 guard record.visibility == nil || record.visibility == "list",
-                      !directOAuth || record.supportedInAPI != false else { continue }
+                      !directOAuth || record.supportedInAPI != false else {
+                    byID.removeValue(forKey: id)
+                    continue
+                }
                 let efforts = record.supportedReasoningLevels?.map(\.effort).filter { !$0.isEmpty } ?? []
                 guard !efforts.isEmpty else { continue }
                 let hasFastTier = record.additionalSpeedTiers?.contains("fast") == true
@@ -193,27 +200,14 @@ public enum CodexAccountModelCatalog {
                     supportedReasoningEfforts: efforts,
                     supportsFast: hasFastTier,
                     priority: record.priority ?? 1_000,
-                    // The record's window, else the shipped row's for this id, else unknown (0).
-                    contextWindow: record.contextWindow ?? byID[id]?.contextWindow ?? 0
+                    // A read catalog owns its windows; an absent value is unknown (0).
+                    contextWindow: record.contextWindow ?? 0
                 )
             }
         }
         return byID.values.sorted {
             if $0.priority != $1.priority { return $0.priority < $1.priority }
             return $0.id < $1.id
-        }
-    }
-
-    /// 2026-09-22: `load` always carries every fallback row, so only the signed
-    /// cache itself says this account can run a model. No cache = cannot.
-    public static func signedCacheLists(_ modelID: String, providerID: String, cacheURL: URL?, dataRoot: URL = PersistenceCore.defaultDataRoot()) -> Bool {
-        guard let cacheURL, let cache = readCache(at: cacheURL, dataRoot: dataRoot) else { return false }
-        let directOAuth = providerID.trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased() == "openai_oauth_direct"
-        return cache.models.contains {
-            $0.slug.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == modelID.lowercased()
-                && ($0.visibility == nil || $0.visibility == "list")
-                && (!directOAuth || $0.supportedInAPI != false)
         }
     }
 
@@ -243,6 +237,9 @@ public enum CodexAccountModelCatalog {
         dataRoot: URL,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> [String: [Model]] {
+        if cacheFault(dataRoot: dataRoot, environment: environment) != nil {
+            return ["codex": [], "openai_oauth_direct": []]
+        }
         let cache = chatGPTOAuthCache(dataRoot: dataRoot, environment: environment)?.cache
         return Dictionary(uniqueKeysWithValues: ["codex", "openai_oauth_direct"].map {
             ($0, models(providerID: $0, cache: cache))
@@ -264,7 +261,7 @@ public enum CodexAccountModelCatalog {
 
     private static func authPath(dataRoot: URL, environment: [String: String]) -> (url: URL, canonical: Bool) {
         let canonical = dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL
-        return (OpenAIOAuthDirectAdapter.preferredAuthPath(dataRoot: dataRoot, environment: environment), canonical)
+        return (ChatGPTTransport.preferredAuthPath(dataRoot: dataRoot, environment: environment), canonical)
     }
 
     private static func chatGPTOAuthCache(
@@ -284,21 +281,16 @@ public enum CodexAccountModelCatalog {
         )
     }
 
-    public static func matchingCacheCandidate(
-        oauthAuthURL: URL,
-        fallbackCacheURL: URL,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
-    ) -> URL? {
-        matchingCache(oauthAuthURL: oauthAuthURL, fallbackCacheURL: fallbackCacheURL, dataRoot: dataRoot)?.url
-    }
-
     static func matchingModels(
         providerID: String,
         oauthAuthURL: URL,
         fallbackCacheURL: URL,
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) -> [Model] {
-        models(providerID: providerID, cache: matchingCache(
+        let sibling = oauthAuthURL.deletingLastPathComponent().appendingPathComponent("models_cache.json")
+        let source = FileManager.default.fileExists(atPath: sibling.path) ? sibling : fallbackCacheURL
+        if modelCatalogFault(at: source, read: readCache(at: source, dataRoot: dataRoot) != nil, owner: "this ChatGPT account") != nil { return [] }
+        return models(providerID: providerID, cache: matchingCache(
             oauthAuthURL: oauthAuthURL, fallbackCacheURL: fallbackCacheURL, dataRoot: dataRoot
         )?.cache)
     }
@@ -313,10 +305,12 @@ public enum CodexAccountModelCatalog {
         if let cache = readCache(at: sibling, dataRoot: dataRoot), cacheMatchesAccount(cache, authURL: oauthAuthURL) {
             return (sibling, cache)
         }
+        // An existing account-owned catalog never borrows another source.
+        guard !FileManager.default.fileExists(atPath: sibling.path) else { return nil }
         guard let cache = readCache(at: fallbackCacheURL, dataRoot: dataRoot), cacheMatchesAccount(cache, authURL: oauthAuthURL),
               let oauthAccount = persistedAccountID(at: oauthAuthURL),
               let cacheAccount = persistedAccountID(
-                at: OpenAIOAuthDirectAdapter.preferredAuthPath(
+                at: ChatGPTTransport.preferredAuthPath(
                     environment: ["CODEX_HOME": fallbackCacheURL.deletingLastPathComponent().path],
                     source: .commandCLI
                 )
@@ -357,17 +351,9 @@ public enum CodexAccountModelCatalog {
         environment: [String: String] = ProcessInfo.processInfo.environment,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
     ) -> URL {
-        // CodexAdapter inherits this process environment. An explicit
-        // CODEX_HOME is authoritative even when its cache is absent; falling
-        // through to another account would advertise models the active CLI
-        // cannot use. Without the override, the CLI's exact home is ~/.codex.
-        if let codexHome = environment["CODEX_HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !codexHome.isEmpty {
-            return URL(fileURLWithPath: (codexHome as NSString).expandingTildeInPath)
-                .appendingPathComponent("models_cache.json")
-        }
-        return homeDirectory
-            .appendingPathComponent(".codex", isDirectory: true)
+        ChatGPTTransport.preferredAuthPath(environment: environment,
+            userCodexHome: homeDirectory.appendingPathComponent(".codex", isDirectory: true), source: .commandCLI)
+            .deletingLastPathComponent()
             .appendingPathComponent("models_cache.json")
     }
 }

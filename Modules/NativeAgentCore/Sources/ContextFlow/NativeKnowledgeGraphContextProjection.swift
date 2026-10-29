@@ -3,8 +3,9 @@ import Foundation
 import MemoryV2
 import NativeAgentCore
 import PersistenceCore
+import NativeAgentShared
 
-// Blueprint: | `NativeKnowledgeGraphContextProjection.swift` | `NativeKnowledgeGraphContextProjection`: rebuildable graph atoms, support and triggers with canonical-source verification |
+// Blueprint: | `NativeKnowledgeGraphContextProjection.swift` | `KnowledgeGraphContext`: rebuildable graph atoms, support and triggers with canonical-source verification |
 
 /// The knowledge graph, made REACHABLE instead of dark.
 ///
@@ -33,7 +34,7 @@ import PersistenceCore
 /// relations (no changes, no removals) and says so in the log — a garnish must
 /// never be able to fail the whole context generation that also carries
 /// persona, memory and resident work.
-struct NativeKnowledgeGraphContextProjection: ContextCompiledProjectionProvider, Sendable {
+struct KnowledgeGraphContext: ContextCompiledProjectionProvider, Sendable {
     static let owner = "nativeagent.knowledge-graph"
     static let schemaVersion = "knowledge-graph-context-projection-v1"
     static let maximumRelations = 192
@@ -82,14 +83,14 @@ struct NativeKnowledgeGraphContextProjection: ContextCompiledProjectionProvider,
             guard let support = atom.draft.entities.first(where: { $0.kind == Self.supportKind }),
                   support.id != "none", let at = support.id.lastIndex(of: "@") else { return nil }
             return (atom, String(support.id[..<at]),
-                    NativeMemoryContextProjection.parseDate(String(support.id[support.id.index(after: at)...])) ?? .distantPast)
+                    MemoryContext.parseDate(String(support.id[support.id.index(after: at)...])) ?? .distantPast)
         }
         guard !supported.isEmpty else { return exclusion }
         do {
             let records = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).memoryRecords(ids: supported.map(\.1))
             let byID = Dictionary(records.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
             exclusion.atomIDs.formUnion(supported.lazy.filter { _, id, compiled in
-                !NativeMemoryContextProjection.speakable(byID[id], compiledAt: compiled, on: surface)
+                !MemoryContext.speakable(byID[id], compiledAt: compiled, on: surface)
             }.map(\.0.draft.id))
         } catch {
             exclusion.atomIDs.formUnion(supported.map(\.0.draft.id))
@@ -109,10 +110,7 @@ struct NativeKnowledgeGraphContextProjection: ContextCompiledProjectionProvider,
     ) async throws -> ContextCompiledProjectionResult {
         guard MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot) else {
             return ContextCompiledProjectionResult(
-                changedSources: [],
-                removedSourceIDs: Set(previousSources.values.lazy
-                    .filter { $0.descriptor.owner == Self.owner }
-                    .map(\.descriptor.id))
+                owner: Self.owner, currentSources: [], previousSources: previousSources
             )
         }
         let relations: [KnowledgeGraphContextRelation]
@@ -130,35 +128,17 @@ struct NativeKnowledgeGraphContextProjection: ContextCompiledProjectionProvider,
             return ContextCompiledProjectionResult(changedSources: [], removedSourceIDs: [])
         }
 
-        let prepared = Self.prepare(relations)
-        let selectedIDs = Set(prepared.map(\.sourceID))
-        let previousOwnedIDs = Set(previousSources.values.lazy
-            .filter { $0.descriptor.owner == Self.owner }
-            .map(\.descriptor.id))
-        let changed = prepared.compactMap { item -> ContextCompiledSource? in
-            guard previousSources[item.sourceID]?.sourceHash != item.sourceHash else {
-                return nil
-            }
-            return item.compiledSource
-        }
         return ContextCompiledProjectionResult(
-            changedSources: changed,
-            removedSourceIDs: previousOwnedIDs.subtracting(selectedIDs)
+            owner: Self.owner, currentSources: Self.prepare(relations), previousSources: previousSources
         )
     }
 }
 
-extension NativeKnowledgeGraphContextProjection {
-    struct Prepared: Sendable {
-        let sourceID: ContextSourceID
-        let sourceHash: String
-        let compiledSource: ContextCompiledSource
-    }
-
+extension KnowledgeGraphContext {
     /// One source per subject entity, one atom per edge. Grouping this way lets
     /// the selector's existing `maximumAtomsPerSource` bound keep a single
     /// entity from owning the whole relationship budget of one packet.
-    static func prepare(_ relations: [KnowledgeGraphContextRelation]) -> [Prepared] {
+    static func prepare(_ relations: [KnowledgeGraphContextRelation]) -> [ContextCompiledSource] {
         let usable = relations.filter { relation in
             let body = self.body(relation)
             return !body.isEmpty
@@ -167,7 +147,7 @@ extension NativeKnowledgeGraphContextProjection {
                 && !ContextSecretContentPolicy.containsSecretLikeContent(body)
         }
         let grouped = Dictionary(grouping: usable, by: \.subjectID)
-        return grouped.keys.sorted().compactMap { subjectID -> Prepared? in
+        return grouped.keys.sorted().compactMap { subjectID -> ContextCompiledSource? in
             guard let edges = grouped[subjectID], !edges.isEmpty else { return nil }
             let locatorDigest = ContextStableID.digest(parts: [subjectID])
             let locator = "knowledge-graph/entities/\(locatorDigest)"
@@ -194,14 +174,10 @@ extension NativeKnowledgeGraphContextProjection {
             let atoms = ordered.map { relation in
                 atom(relation, sourceID: sourceID, sourceHash: sourceHash)
             }
-            return Prepared(
-                sourceID: sourceID,
+            return ContextCompiledSource(
+                descriptor: descriptor,
                 sourceHash: sourceHash,
-                compiledSource: ContextCompiledSource(
-                    descriptor: descriptor,
-                    sourceHash: sourceHash,
-                    atoms: atoms
-                )
+                atoms: atoms
             )
         }
     }
@@ -260,7 +236,7 @@ extension NativeKnowledgeGraphContextProjection {
             body: body,
             authority: .inferred,
             confidence: min(1, max(0, relation.weight)),
-            freshness: ContextFreshness(updatedAt: NativeMemoryContextProjection.parseDate(relation.lastSeen) ?? .distantPast),
+            freshness: ContextFreshness(updatedAt: MemoryContext.parseDate(relation.lastSeen) ?? .distantPast),
             privacy: .localPrivate,
             permittedSurfaces: surfaces,
             injectionPolicy: .adaptive,

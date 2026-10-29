@@ -3,7 +3,8 @@ import Foundation
 import Experiences
 import Observation
 import PersistenceCore
-// Blueprint: | `ActivityWatchController.swift` | `ActivityWatchController`, `ActivityCaptureIssue`; capture lifecycle, serialized off-main policy reads/writes and capture-ordered exclusion purges, exact policy-file invalidation and one retention schedule using the runner's completed-run stamp and effective clamped capture policy; issues join their Experience receipts, with injected platform error and notification presentation; Mac permissions, quiet controls and the menu indicator reach this same lifecycle/policy owner through engine.activityWatch |
+import NativeAgentCore
+// Blueprint: | `ActivityWatchController.swift` | `ActivityWatchController`, `ActivityCaptureIssue`; capture lifecycle and retained termination join of startup, policy, event, retention and watcher bodies; serialized off-main policy reads/writes and capture-ordered exclusion purges, exact policy-file invalidation and one retention schedule using the runner's completed-run stamp and effective clamped capture policy; issues join their Experience receipts, with injected platform error and notification presentation; Mac permissions, quiet controls and the menu indicator reach this same lifecycle/policy owner through engine.activityWatch |
 
 public struct ActivityCaptureIssue: Identifiable, Equatable, Sendable {
     public enum Severity: Int, Comparable, Equatable, Sendable {
@@ -88,6 +89,7 @@ public final class ActivityWatchController {
     private var startupTask: Task<Void, Never>?
     private var policyEventsTask: Task<Void, Never>?
     private var retentionTask: Task<Void, Never>?
+    @ObservationIgnored private var terminationDrain: Task<Void, Never>?
 
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -166,13 +168,7 @@ public final class ActivityWatchController {
     }
 
     public func shutdown() async {
-        shuttingDown = true
-        startupTask?.cancel()
-        policyEventsTask?.cancel()
-        policyEventsTask = nil
-        retentionTask?.cancel()
-        retentionTask = nil
-        await watcher?.stop()
+        await makeTerminationDrain().value
         refreshCapturingFlag()
     }
 
@@ -185,16 +181,28 @@ public final class ActivityWatchController {
     /// stop run independently; UI state no longer matters once termination has
     /// begun.
     public func makeTerminationDrain() -> Task<Void, Never> {
+        if let terminationDrain { return terminationDrain }
         shuttingDown = true
-        startupTask?.cancel()
-        policyEventsTask?.cancel()
-        policyEventsTask = nil
-        retentionTask?.cancel()
-        retentionTask = nil
+        let startup = startupTask
+        let events = policyEventsTask
+        let retention = retentionTask
+        let policy = policyTask
+        startup?.cancel()
+        events?.cancel()
+        retention?.cancel()
+        policy?.cancel()
         let watcher = watcher
-        return Task.detached(priority: .utility) {
-            await watcher?.stop()
+        let drain = Task.detached(priority: .utility) {
+            await settle {
+                await watcher?.stop()
+                await startup?.value
+                await events?.value
+                await retention?.value
+                _ = await policy?.value
+            }
         }
+        terminationDrain = drain
+        return drain
     }
 
     private func ensureWatcher() async -> ActivityWatcher? {
@@ -215,8 +223,7 @@ public final class ActivityWatchController {
                             await self?.recordIssue("Activity capture is unavailable. Its shutdown has not been confirmed.", severity: .critical)
                         }
                     }
-                },
-                presenceTransitionURL: ActivityWatchPaths.presenceTransitionURL(dataRoot: dataRoot)
+                }
             )
             spanStore = store
             watcher = created
@@ -288,6 +295,7 @@ public final class ActivityWatchController {
     /// direction.
     @discardableResult
     public func apply(_ change: @escaping @MainActor (inout ActivityPolicy) -> Void) async -> Bool {
+        guard !shuttingDown else { return false }
         let previous = policyTask
         let task = Task { [self] in
             _ = await previous?.value
@@ -346,6 +354,7 @@ public final class ActivityWatchController {
     /// are not deleted, they are hidden. The policy slot covers the purge too;
     /// the watcher orders it after applying the exclusion and older writes.
     public func addExclusion(bundleID: String) async {
+        guard !shuttingDown else { return }
         lastPurgedRowCount = nil
         let trimmed = bundleID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -394,7 +403,12 @@ public final class ActivityWatchController {
     public func wipeAll() async -> DeletionResult {
         lastPurgedRowCount = nil
         do {
-            let removed = try await existingStore()?.wipeAll() ?? 0
+            let removed: Int
+            if let watcher {
+                removed = try await watcher.wipeAll()
+            } else {
+                removed = try await existingStore()?.wipeAll() ?? 0
+            }
             lastPurgedRowCount = removed
             return .deleted(rows: removed)
         } catch {
@@ -405,6 +419,7 @@ public final class ActivityWatchController {
     }
 
     private func scheduleRetention() {
+        guard !shuttingDown else { return }
         let previous = retentionTask
         previous?.cancel()
         retentionTask = Task { @MainActor [weak self] in

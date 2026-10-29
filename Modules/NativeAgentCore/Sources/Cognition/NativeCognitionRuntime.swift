@@ -1,7 +1,5 @@
 import Foundation
 import ApprovalInbox
-import BackgroundLoops
-import ChatTurnRuntime
 import ChatToolRuntime
 import AgentConversations
 import CognitiveSubstrate
@@ -13,165 +11,152 @@ import PersonaEngine
 import PersistenceCore
 import Desk
 import Experiences
-import DreamREMCycle
-import ProviderRouting
 import AuthoredCapabilities
 import NativeAgentShared
 import Studio
-// Blueprint: | `NativeCognitionRuntime.swift` | `NativeCognitionRuntime` actor; `rememberNonLiveTurnKind`; Desk candidates/approval context publish together with the read's Desk revision, checked at turn and wake admission; generation orders refreshes; observes Experiences for carried wait settlement, caching only its last read to ignore unchanged replay events; settled live turns trigger one held-memory drain at idle; `GrowthWeekProjection` binds frozen growth facts to L0's version/source cache through the native host |
+import Transcripts
+import BackgroundLoops
+import ChatTurnRuntime
+import DreamREMCycle
+import ProviderRouting
+// Blueprint: | `NativeCognitionRuntime.swift` | `NativeCognitionRuntime` actor composition, retained state and sensory admission; run-scoped turn classification and live-turn latches |
 
-public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureProviding {
+public actor NativeCognitionRuntime: CognitiveRuntimeProviding {
     public let dataRoot: URL
     /// The app-owned pieces this mind reaches (see CognitionHost).
     let host: any CognitionHost
     /// The engine root's ContextFlow, reloaded from the live body.
     let contextFlow: NativeContextFlowRuntime
-    public var usesLiveAppBody: Bool {  // internal for actor extensions (move-only Wave C)
+    public var usesLiveAppBody: Bool {
         dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL
     }
-    public let now: @Sendable () -> Date  // internal for actor extensions (move-only Wave C)
+    public let now: @Sendable () -> Date
     /// Monotonic timing for duration evidence. Wall time remains the semantic
     /// event clock, but NTP/manual clock corrections cannot alter latency.
-    private let monotonicNowNanoseconds: @Sendable () -> UInt64
+    let monotonicNowNanoseconds: @Sendable () -> UInt64
     let preferenceDefaults = UserDefaults.standard
-    private let configurationEnvironment: [String: String]
-    private let cognitiveStore: CognitiveSQLiteStore?
-    public let substrate: CognitiveSubstrate  // internal for actor extensions (move-only Wave C)
-    public let organismKernel: OrganismKernel  // internal for actor extensions (move-only Wave C)
-    private let somaticSignalBus: SomaticSignalBus  // G-M3: private — no external refs
-    /// INTEROCEPTION (prerelease campaign): passive per-provider vitals sensor.
-    /// Fed from `observeProviderCall` — the SAME lifecycle seam — with zero new
-    /// provider calls and zero turn-path disk I/O. Band transitions become
-    /// graded somatic signals; sustained degradation stages ONE approval card.
-    let providerVitalsSensor = ProviderVitalsSensor()  // internal for actor extensions
-    /// Single-flight latch for the background vitals card sweep (gpt-5.5
-    /// review: proposal-store I/O must never be awaited on the turn path;
-    /// card↔provider association is derived from the store via the evidence
-    /// marker, never remembered in memory — restart-safe by construction).
+    let configurationEnvironment: [String: String]
+    let cognitiveStore: CognitiveSQLiteStore?  // internal: the door (+Door) records moments in it
+    public let substrate: CognitiveSubstrate
+    public let organismKernel: OrganismKernel
+    let somaticSignalBus: SomaticSignalBus
+    /// Existing provider-call observations feed passive vitals and graded somatic signals.
+    /// Adds no provider calls or turn-path disk I/O.
+    let providerVitalsSensor = ProviderVitalsSensor()
     /// Published by the canonical owners after mutation; ordinary turns read
     /// this without entering the runtime, substrate, or organism actors.
-    nonisolated let attentionProjection: CognitiveAttentionResidentProjection  // internal for actor extensions (move-only Wave C)
-    /// Audit C4 (2026-07-09): bootstrap is memoized as a Task so REENTRANT callers
-    /// (the two racing detached launch tasks: AppDelegate bootstrap + the background
-    /// loops' first microcycle) share ONE execution instead of coin-flipping into a
-    /// full second bootstrap (double restorePersistentState, double appWake into
-    /// substrate + somatic bus, double persistOrganismContinuity). Actors are
-    /// reentrant at await — a bool set at the END of an 8-await function is a gate
-    /// with the door open.
-    var bootstrapTask: Task<Void, Never>?  // internal for actor extensions (move-only Wave C)
-    var bootstrapFailure: String?  // internal for actor extensions (move-only Wave C)
+    nonisolated let attentionProjection: ResidentAttention
+    /// Reentrant launch callers join one bootstrap task.
+    var bootstrapTask: Task<Void, Never>?
+    var bootstrapChoresTask: Task<Void, Never>?
+    var recentLifeTask: Task<Void, Never>?
+    var bootstrapFailure: String?
     /// One process-local subscription to the canonical ApprovalInbox owner.
     /// It turns durable request/resolution edges into correlated body evidence.
     var approvalLifecycleObservationTask: Task<Void, Never>?
     /// Provider picker authority can fail independently of cognitive-state
     /// restore. It closes only the provider-backed reflection lane and is
     /// cleared after a later checked routing refresh succeeds.
-    var providerRoutingFailure: String?  // internal for actor extensions (move-only Wave C)
-    private var lastResearchExportPath: String?
-    /// The capsule from Agent's most recent live chat injection, mirrored so the
-    /// Observatory shows what she actually received (timestamped) rather than a
-    /// synthetic constant-message compile. Display-only — never affects injection.
-    private var lastInjectedCapsule: (capsule: CognitiveCapsule, userMessage: String)?
-    var organismDebugBodyOverride: OrganismDebugBodyOverride?  // internal for actor extensions (move-only Wave C)
+    var providerRoutingFailure: String?
+    /// The last live injection, mirrored for display without affecting injection.
+    var lastInjectedCapsule: (capsule: CognitiveCapsule, userMessage: String)?
+    var organismDebugBodyOverride: OrganismDebugBodyOverride?
     /// Suppress-when-unchanged for the felt body line: the last line actually
     /// injected into a prompt, and when. A held-steady line goes quiet until it
     /// changes or the refresh window elapses, so she doesn't re-narrate the same
     /// mood every turn for hours. Observatory/snapshot paths are unaffected.
-    var lastInjectedBodyLine: String?  // internal for actor extensions (move-only Wave C)
-    var lastInjectedBodyLineAt: Date?  // internal for actor extensions (move-only Wave C)
+    var lastInjectedBodyLine: String?
+    var lastInjectedBodyLineAt: Date?
     /// Event-coalesced owner for the fast dirty microcycle. A burst of sensory
     /// events becomes one settle pass; quiet time creates no wake at all.
-    private var microcycleTimer = StoreReloadDebouncer.Timer()
-    private var microcycleTelemetry: CognitiveMicrocycleTelemetry
+    var microcycleTimer = StoreReloadDebouncer.Timer()
+    var microcycleTelemetry: CognitiveMicrocycleTelemetry
     static let microcycleCoalescingDelay: TimeInterval = 0.25
-    private var replayReconciliationPending = false
-    private var replayRetryTask: Task<Void, Never>?
+    var replayReconciliationPending = false
+    var replayRetryTask: Task<Void, Never>?
     static let replayFailureRetryDelay: TimeInterval = 30
-    /// A4.6: reflection rides the same dream/REM somatic commit signal replay
+    /// Reflection rides the same dream/REM somatic commit signal replay
     /// does (clause 4 — no bare-interval LLM heartbeat). Single-flight; the
     /// substrate's budget/reservation gates stay the authority inside
     /// `runReflectionIfDue`.
-    var reflectionEventTask: Task<Void, Never>?  // internal for actor extensions
+    var reflectionEventTask: Task<Void, Never>?
     /// Studio canon tending: single-flight, throttled. See
     /// NativeCognitionRuntime+StudioCanon.swift.
-    var studioCanonTask: Task<Void, Never>?  // internal for actor extensions
+    var studioCanonTask: Task<Void, Never>?
+    /// The hour, including admission, terminal settlement and claim release.
+    var studioWanderTask: Task<Void, Never>?
     var horizonRefreshTask: Task<Void, Never>?
     var reachTask: Task<Void, Never>?
     var sourceWakes = CognitiveSourceWakes()
-    var lastStudioCanonTendingAt: Date?  // internal for actor extensions
-    var lastStudioRelationAuditVerdict: String?  // internal for actor extensions
+    var lastStudioCanonTendingAt: Date?
+    var lastStudioRelationAuditVerdict: String?
     public static let eventDrivenReplayDeadlineSeconds: TimeInterval = 10
-    private func deadlineLogger(_ message: String) {
+    func deadlineLogger(_ message: String) {
         FileHandle.standardError.write(Data("[NativeCognitionRuntime] \(message)\n".utf8))
     }
     /// One exact quiet-window deadline derived from prediction/field residuals.
     /// New sensory evidence cancels and re-arms it; an empty/low-pressure body
-    /// owns no task and therefore creates no idle heartbeat. (C6: state +
-    /// mechanics live in `CoalescingDeadline`; the projection/fire body stays
-    /// below. This site never reads `scheduledAt`.)
-    var residualDeadline = CoalescingDeadline()  // internal for actor extensions (move-only Wave C)
+    /// owns no task and therefore creates no idle heartbeat. State and
+    /// mechanics and projection live in +Deadlines; this site never reads `scheduledAt`.
+    var residualDeadline = CoalescingDeadline()
     /// One exact deadline derived from cognition's real discrete lifecycle
     /// boundaries. Continuous affect and node decay stay
-    /// analytic at read time and therefore owns no periodic wake. (C6: shares
+    /// analytic at read time and therefore owns no periodic wake. Shares
     /// the `CoalescingDeadline` mechanics; the force/notBefore/short-circuit
-    /// projection stays in `rescheduleCognitionMaintenanceDeadline`.)
-    var cognitionDeadline = CoalescingDeadline()  // internal for actor extensions (move-only Wave C)
-    /// Review round 2 (LOW): set by `flushForTermination`; blocks the wake
+    /// projection stays in `rescheduleCognitionMaintenanceDeadline`.
+    var cognitionDeadline = CoalescingDeadline()
+    /// Set by `sleep`; blocks the wake
     /// re-anchor from resurrecting deadline timers during app teardown.
-    public internal(set) var isFlushedForTermination = false  // internal for actor extensions (move-only Wave C)
-    private static let cognitionMaintenanceRetryDelay: TimeInterval = 60 * 60
-    /// Review round 2 (HIGH): when a DUE maintenance is excluded by the
-    /// microcycle's commit window (R-F2), the natural next deadline is
-    /// effectively "now" — a plain reschedule would arm a zero-delay task and
-    /// hot-loop against a slow SQLite commit. Retry on a short bounded delay
-    /// instead; the hour-scale retry above is for gate/error skips, not
-    /// momentary commit contention.
-    private static let cognitionMaintenanceContentionRetryDelay: TimeInterval = 30
+    public internal(set) var isFlushedForTermination = false
     /// Owner-emitted invalidations for visible cognition projections. Views
     /// subscribe while mounted instead of rereading the whole mind every five
     /// seconds. Buffering-newest coalesces bursts; the runtime state remains
     /// canonical and the notification carries no cognitive payload.
-    private var changeRevision: UInt64 = 0
-    private var changeContinuations: [UUID: AsyncStream<NativeCognitionRuntimeChange>.Continuation] = [:]
+    var changeRevision: UInt64 = 0
+    var changeContinuations: [UUID: AsyncStream<NativeCognitionRuntimeChange>.Continuation] = [:]
 
-    /// C2 (2026-07-11), tightened 2026-07-14: her active WORKSHOP pursuit
+    /// Her active Workshop pursuit
     /// colors context selection without making a turn replay Desk's uncapped
     /// canonical op feed. Exact-path owner/file invalidations rebuild this
     /// bounded advisory projection off the cognition actor; the hot read only
     /// re-scores the resident candidates for the supplied time.
-    var pursuitCandidates: [DeskItem] = []  // internal for actor extensions (move-only Wave C)
+    var pursuitCandidates: [DeskItem] = []
     var pursuitCarriedContext: MyQueue.Context?
-    var pursuitProjectionGeneration: UInt64 = 0  // internal for actor extensions (move-only Wave C)
+    let pursuitRead = LatestRead()
     var pursuitReadRevision: UInt64?
     var pursuitCompletedRefreshRevision = SwiftNativeDeskStore.currentRevision
-    var pursuitRefreshInFlight = false  // internal for actor extensions (move-only Wave C)
-    var pursuitRefreshQueued = false  // internal for actor extensions (move-only Wave C)
-    var pursuitObservationTask: Task<Void, Never>?  // internal for actor extensions (move-only Wave C)
+    var pursuitRefreshInFlight = false
+    var pursuitRefreshQueued = false
+    var pursuitObservationTask: Task<Void, Never>?
     var carriedExperienceObservationTask: Task<Void, Never>?
     var carriedReleaseRunning = false
     var carriedReleaseAgain = false
     var pursuitRefreshTask: Task<Void, Never>?
-    private static let bodyLineRefreshInterval: TimeInterval = 20 * 60
-    var organismContinuityRestored = false  // internal for actor extensions (move-only Wave C)
-    /// Audit C1: set when the organism continuity decode threw; freezes persistOrganismContinuity.
-    var organismRestoreFailedHard = false  // internal for actor extensions (move-only Wave C)
+    var organismContinuityRestored = false
+    /// True once the body's restore has FINISHED (decoded, absent, or failed
+    /// and frozen). Persistence refuses until then.
+    var organismContinuityReadable = false
+    /// The one sleep settlement every quit path joins.
+    var sleepTask: Task<NativeCognitionSleepOutcome, Never>?
+    /// THE DOOR: one fold at a time, exclusive with Clear, Reset Body and
+    /// restore (`enterDoor` / `leaveDoor`, +Door).
+    var doorHeld = false
+    var doorWaiters: [CheckedContinuation<Void, Never>] = []
+    /// A failed organism decode freezes continuity persistence.
+    var organismRestoreFailedHard = false
     /// Organism continuity writes are serialized through one coalescing drain.
     /// Ordinary sensory acceptance only advances `requestedGeneration`; it never
     /// exports, encodes, or writes state inline. A burst therefore owns one task
     /// and at most one follow-up snapshot while the current write is in flight.
-    var organismPersistenceRequestedGeneration: UInt64 = 0  // internal for actor extensions (move-only Wave C)
-    var organismPersistenceCompletedGeneration: UInt64 = 0  // internal for actor extensions (move-only Wave C)
-    var organismPersistenceLatestReason = "bootstrap"  // internal for actor extensions (move-only Wave C)
-    var organismPersistenceDrainTask: Task<Void, Never>?  // internal for actor extensions (move-only Wave C)
-    var organismPersistenceWaiters: [UInt64: [CheckedContinuation<Bool, Never>]] = [:]  // internal for actor extensions (move-only Wave C)
-    var organismPersistenceLastResult = true  // internal for actor extensions (move-only Wave C)
-    var organismPersistenceLastWriteAt: ContinuousClock.Instant?  // internal for actor extensions
-    var organismPersistenceDebounceTask: Task<Void, Never>?  // internal for actor extensions
-    /// Non-live user turns must carry their classification through every event
-    /// in the same tool/provider run. ChatOrchestration emits user, tool, and
-    /// assistant events independently; without this run-scoped inheritance a
-    /// bridge probe entered as `.debug` but Agent's ordinary-language reply was
-    /// re-inferred as `.live` and could tint affect/organism continuity.
+    var organismPersistenceRequestedGeneration: UInt64 = 0
+    var organismPersistenceCompletedGeneration: UInt64 = 0
+    var organismPersistenceLatestReason = "bootstrap"
+    var organismPersistenceDrainTask: Task<Void, Never>?
+    var organismPersistenceWaiters: [UInt64: [CheckedContinuation<Bool, Never>]] = [:]
+    var organismPersistenceLastResult = true
+    var organismPersistenceLastWriteAt: ContinuousClock.Instant?
+    var organismPersistenceDebounceTask: Task<Void, Never>?
+    /// Non-live classification follows every user, tool and assistant event in its run.
     var nonLiveTurnKindByRunId: [String: CognitiveTurnKind] = [:]
     private var nonLiveTurnKindRunOrder: [String] = []
     static let maximumNonLiveTurnKindRuns = 256
@@ -196,22 +181,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         nonLiveTurnKindRunOrder.removeAll { $0 == runId }
     }
 
-    /// Real chat-turn lifecycle latch (review 2026-09-01, HIGH).
-    ///
-    /// The coalesced microcycle generation is NOT a turn. `runScheduledMicrocycle`
-    /// consumes `microcycleTimer` the moment the settlement it owns
-    /// starts, while the user's turn — provider stream, tool loop, reply
-    /// persistence — keeps running for minutes afterwards. A residual deadline
-    /// landing in that window read "no turn in flight" and could start a
-    /// pressure dream (or a studio encounter) on top of a live turn.
-    ///
-    /// No new app-side hook is needed: the runtime is already handed BOTH edges
-    /// of every chat turn through `observe`. ChatOrchestration stamps a `runId`
-    /// on the admitted `userMessageReceived` row and on that run's terminal
-    /// `assistantTurnCompleted` / `providerFailure` (the same correlation
-    /// `inheritNonLiveTurnKind` already reads). Keying the latch by runId counts
-    /// nested and concurrent turns for free and is idempotent under exact replay.
-    var liveTurnStartedAtByRunId: [String: Date] = [:]  // internal for actor extensions
+    /// Unique admitted runs in admission order, independent of microcycles.
     private var liveTurnRunOrder: [String] = []
     static let maximumLiveTurnRuns = 64
     /// Admission edge. The user's message row is persisted and observed BEFORE
@@ -220,13 +190,11 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     func noteTurnStarted(runId: String) {
         let key = runId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else { return }
-        let startedAt = now()
-        if liveTurnStartedAtByRunId.updateValue(startedAt, forKey: key) == nil {
+        if !liveTurnRunOrder.contains(key) {
             liveTurnRunOrder.append(key)
         }
         while liveTurnRunOrder.count > Self.maximumLiveTurnRuns {
-            let stale = liveTurnRunOrder.removeFirst()
-            liveTurnStartedAtByRunId.removeValue(forKey: stale)
+            liveTurnRunOrder.removeFirst()
         }
     }
 
@@ -236,7 +204,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     func noteTurnFinished(runId: String) {
         let key = runId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else { return }
-        guard liveTurnStartedAtByRunId.removeValue(forKey: key) != nil else { return }
         liveTurnRunOrder.removeAll { $0 == key }
     }
 
@@ -248,7 +215,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     }
 
     /// Turns admitted and not yet terminal, including long-running work.
-    func liveTurnLatchCount() -> Int { liveTurnStartedAtByRunId.count }
+    func liveTurnLatchCount() -> Int { liveTurnRunOrder.count }
 
     public init(
         dataRoot: URL = PersistenceCore.defaultDataRoot(),
@@ -279,7 +246,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         )
         let store = try? CognitiveSQLiteStore(dataRoot: dataRoot)
         self.cognitiveStore = store
-        let attentionProjection = CognitiveAttentionResidentProjection()
+        let attentionProjection = ResidentAttention()
         self.attentionProjection = attentionProjection
         // Resolve the user's configured name live so the capsule/reflection cues
         // address whoever the install belongs to (never a hardcoded "User"). The
@@ -295,7 +262,7 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
                 }
             )
         )
-        let growthProjection = GrowthWeekProjection(dataRoot: root, host: host)
+        let growthProjection = GrowthWeekFace(dataRoot: root, host: host)
         self.substrate = CognitiveSubstrate(
             configuration: store == nil
                 ? Self.configurationWithoutPersistence(configuration)
@@ -303,28 +270,15 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             dependencies: CognitiveSubstrateDependencies(
                 now: now,
                 userName: { NativeCognitionRuntime.resolveUserName(dataRoot: root) },
-                attentionProjectionSink: { signals, publishedAt in
-                    attentionProjection.replaceSubstrate(
-                        signals,
-                        publishedAt: publishedAt
-                    )
+                attentionProjectionSink: { signals in
+                    attentionProjection.replaceSubstrate(signals)
                 },
                 // Resolve traits once per calculation so edits take effect on its next read.
                 dynamics: {
                     let traits = PersonaCompiler.loadProfile(dataRoot: root).traits
                     return .derived(warmth: traits.warmth, humor: traits.humor)
                 },
-                // UNBIDDEN RECALL (2026-09-02). The substrate asks with the
-                // words of its own felt line and gets back felt MOMENTS. Local
-                // SQLite + the already-warm embedder — no provider call — and
-                // unreadable sources carry explicit cue-read evidence.
-                // Rooted at THIS runtime's data root and filtered by the turn's
-                // own surface; both are correctness, not hygiene (see below).
-                recallMoments: { feltLine, k, surface in
-                    await NativeCognitionRuntime.recallMoments(
-                        feltLine: feltLine, limit: k, surface: surface, dataRoot: root)
-                },
-                // Phase 5 B: last night's dream residue and what happened in a
+                // Last night's dream residue and what happened in a
                 // gap — local reads and the already-warm embedder, nothing else.
                 dreamThemes: { message, spent in
                     let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: root)
@@ -336,9 +290,11 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
                             return runtime.effectiveBackend != ManagedEmbeddingProvider.failClosedBackend
                                 && runtime.coreMLLoaded
                         },
-                        embed: { try await memory.embedForDerivedContext($0) })
+                        embeddingEpoch: { await memory.embeddingEpoch() },
+                        embed: { try await memory.embedForDerivedContextWithEpoch($0) },
+                        embedQuery: { try await memory.embedQueriesWithEpoch($0) })
                 },
-                // Phase 5 D1: warm only. `mind.reflect` can run this inside a
+                // Warm only. `mind.reflect` can run this inside a
                 // live turn, so it never loads the model or takes its load
                 // lock; cold means the lexical match alone.
                 embedTexts: { texts in
@@ -351,9 +307,6 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
                 },
                 sinceGap: { from, to, surface in
                     await NativeCognitionRuntime.sinceGapItems(from: from, to: to, surface: surface, dataRoot: root)
-                },
-                feltCause: { curiosity, coherence in
-                    await kernel.admitHumanCause(curiosity: curiosity, coherence: coherence)
                 },
                 decisions: {
                     do {
@@ -384,519 +337,22 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         organismPersistenceDrainTask?.cancel()
     }
 
-    /// Read the configured user name from `<dataRoot>/memory/profile.json`
-    /// (`userName`, written at onboarding). Tolerant of a missing/malformed file.
-    public nonisolated static func resolveUserName(dataRoot: URL) -> String {
-        let path = dataRoot
-            .appendingPathComponent("memory", isDirectory: true)
-            .appendingPathComponent("profile.json")
-        return SwiftNativeKnowledgeGraphIndexer.profileNames(profileURL: path).user ?? ""
-    }
-
-    // MARK: - Unbidden recall (2026-09-02)
-
-    /// Memory kinds that count as a MOMENT — something that HAPPENED and left a
-    /// feeling, as opposed to a fact she knows. `moment` is the lane's own kind;
-    /// the other three are what episodic rows were called before it, so an
-    /// install whose store predates the lane still has something to be reminded
-    /// of. Everything else (facts, preferences, identity) is excluded: being
-    /// "reminded of" a stored preference is not a memory arriving sideways.
-    nonisolated static let momentMemoryKinds: Set<String> = [
-        "moment", "experience", "episodic", "event",
-    ]
-
-    /// One local recall, mapped into the substrate's vocabulary. Never throws:
-    /// a cold store contributes no cue; unavailable reads carry unreadable
-    /// evidence into frozen capsule preparation.
-    ///
-    /// TWO THINGS HERE ARE LOAD-BEARING, and the first cut had neither:
-    ///
-    /// * **The surface**, which is the disclosure boundary. `recall` applies
-    ///   `MemoryRecordDisclosurePolicy` against it; with no surface every record
-    ///   classifies through, so a memory restricted to one surface could arrive
-    ///   unbidden on another. Unbidden is the *worst* place for that leak,
-    ///   because nobody asked and nobody is checking.
-    /// * **The data root.** `SwiftNativeMemoryV2.shared` is the production
-    ///   store; a runtime built on an alternate or test root must never read it.
-    ///   `resolvedOwner(dataRoot:)` is the same rule the chat recall factory
-    ///   uses (`makeChatMemoryRecaller`): the singleton for the default root, a
-    ///   private hermetic actor otherwise.
-    ///
-    /// Persona is deliberately `nil` — the exact value the ordinary chat recall
-    /// passes. `memoryRecallPersonaFilter` returns nil for the resident slot
-    /// and, by policy, for custom slots too: the mask changes the voice, not the
-    /// store. Anything else here would make unbidden recall stricter than the
-    /// recall the same turn already did.
-    nonisolated static func recallMoments(
-        feltLine: String,
-        limit: Int,
-        surface: String,
-        dataRoot: URL
-    ) async -> CognitiveCueRead<[CognitiveRecalledMoment]> {
-        let query = feltLine.trimmingCharacters(in: .whitespacesAndNewlines)
-        let surface = surface.trimmingCharacters(in: .whitespacesAndNewlines)
-        // No surface means no disclosure boundary to check against, and an
-        // unchecked recall is precisely what this must never do.
-        guard !query.isEmpty, !surface.isEmpty, limit > 0 else { return CognitiveCueRead([]) }
-        do {
-            let response = try await SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot).recall(
-                MemoryV2RecallRequest(
-                    text: query, topK: limit, persona: nil, surface: surface))
-            return CognitiveCueRead(response.scored.compactMap { moment(from: $0.record, score: $0.score) })
-        } catch {
-            return CognitiveCueRead([], unreadable: ["your saved moments (\(error.localizedDescription))"])
-        }
-    }
-
-    /// The one mapper, shared by the recall lane and the served-moment lane, so
-    /// "what counts as a moment" cannot come to mean two things.
-    nonisolated static func moment(
-        from record: MemoryV2.MemoryRecord,
-        score: Double
-    ) -> CognitiveRecalledMoment? {
-        guard (record.status ?? "active") == "active" else { return nil }
-        guard let kind = record.memoryKind?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-              momentMemoryKinds.contains(kind) else { return nil }
-        // The lane stores the felt weight beside the text; `extras` is the
-        // record's metadata bag verbatim (see `toMemoryRecord`).
-        let text = metadataString(record.extras, "quote") ?? record.text
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        return CognitiveRecalledMoment(
-            id: record.id,
-            text: text,
-            valence: metadataDouble(record.extras, "valence") ?? 0,
-            salience: metadataDouble(record.extras, "salience")
-                ?? record.importance
-                ?? 0.5,
-            occurredAt: isoDate(record.observedAt)
-                ?? isoDate(record.createdAt)
-                ?? Date(),
-            score: score)
-    }
-
-    /// How many served ids one turn may look up. The re-feel spends at most
-    /// `refeelNodesPerTurn` of them, so a whole 32-id serve is never worth
-    /// reading; this keeps the lane a few point reads, not a scan.
-    nonisolated static let servedMomentLookupLimit = 8
-
-    /// GIVE THE SERVED MOMENTS THEIR FEELING BEFORE THE EVENT IS INGESTED.
-    ///
-    /// The re-feel runs inside `ingest`, reading `memoryRecordIds` off the
-    /// event. It can only re-feel a moment whose weight the substrate already
-    /// holds, and nothing else fills that ledger for the ORDINARY recall lane —
-    /// so without this hop an ordinary served moment arrived as a bare id and
-    /// was re-felt neutrally, which is the exact complaint this wave answers.
-    ///
-    /// Disclosure: `readMemoryRecord` re-applies the policy against this event's
-    /// own surface. Belt and braces — these ids are what the turn already
-    /// served, and that path filtered them — but the check is local and cheap,
-    /// and a lookup by id with no surface would be a bypass.
-    func noteServedMoments(for event: CognitiveEvent) async {
-        let ids = CognitiveSubstrate.memoryRecordIDs(fromEventMetadata: event.metadata)
-        guard !ids.isEmpty else { return }
-        guard case .string(let rawSurface)? = event.metadata["surface"] else { return }
-        let surface = rawSurface.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !surface.isEmpty else { return }
-        // Only ids whose feeling is not already known — a moment surfaced by the
-        // reminded-of lane this same turn is already in the ledger.
-        let unknown = await substrate.momentIDsMissingFeeling(ids)
-            .prefix(Self.servedMomentLookupLimit)
-        guard !unknown.isEmpty else { return }
-        let memory = SwiftNativeMemoryV2.resolvedOwner(dataRoot: dataRoot)
-        var moments: [CognitiveRecalledMoment] = []
-        for id in unknown {
-            guard let record = try? await memory.readMemoryRecord(
-                id: id, persona: nil, surface: surface) else { continue }
-            // Served rows are not scored here; the score gates the reminded-of
-            // LINE, and this lane never renders anything.
-            if let moment = Self.moment(from: record, score: 1) { moments.append(moment) }
-        }
-        guard !moments.isEmpty else { return }
-        await substrate.noteServedMoments(moments)
-    }
-
-    private nonisolated static func metadataString(_ value: JSONValue?, _ key: String) -> String? {
-        guard case .object(let object)? = value,
-              case .string(let string)? = object[key] else { return nil }
-        return string
-    }
-
-    private nonisolated static func metadataDouble(_ value: JSONValue?, _ key: String) -> Double? {
-        guard case .object(let object)? = value else { return nil }
-        switch object[key] {
-        case .double(let number): return number
-        case .int(let number): return Double(number)
-        default: return nil
-        }
-    }
-
-    private nonisolated static func isoDate(_ raw: String?) -> Date? {
-        guard let raw, !raw.isEmpty else { return nil }
-        return NativeTimestampFormat.parseISO8601FractionalFirst(raw)
-    }
-
-    public func bootstrap() async {
-        if bootstrapTask == nil {
-            bootstrapTask = Task { await self.bootstrapBody() }
-        }
-        await bootstrapTask?.value
-    }
-
-    private func bootstrapBody() async {
-        // Desk 903 phase 2 — the ONE seam between a filed journal entry and the
-        // cognitive bus. The tool lane that writes the journal holds no
-        // cognition reference by design; whoever owns the live substrate
-        // installs the sink once, and this is that owner. Until this line runs
-        // the bus is inert and says so out loud.
-        //
-        // ROOT-GUARDED. The bus is process-global and a second install REPLACES
-        // the first, so every runtime bootstrapped on an alternate data root —
-        // a test harness, a workshop profile, a second window pointed elsewhere
-        // — used to silently take over the resident mind's sink and feed her
-        // journal entries into a substrate that is not hers. There is one
-        // resident mind, and it is the one on the canonical root; a runtime on
-        // any other root installs nothing and stays out of the way.
-        if dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL {
-            await StudioJournalCognitiveBus.install { [substrate] entry in
-                await substrate.ingestStudioJournalEntry(entry)
-            }
-        }
-        startPursuitObservationIfNeeded()
-        await ensureReflectionSurfaceSeed()
-        await refreshConfiguration()
-        do {
-            try await substrate.restorePersistentState()
-        } catch {
-            bootstrapFailure = "cognitive restore failed: \(error.localizedDescription)"
-            await substrate.recordReceipt(
-                kind: "lifecycle.restore_failed",
-                payload: .object(["error": .string(String(describing: error))])
-            )
-        }
-        await restoreOrganismContinuityIfAvailable()
-        await restoreProviderVitalsSnapshot()
-        await startApprovalLifecycleObservationIfNeeded()
-        let wakeAt = now()
-        let wakeEvent = CognitiveEvent(
-            id: "app-wake:\(Int(wakeAt.timeIntervalSince1970))",
-            kind: .appWake,
-            subject: CognitiveSubjectReference(type: "app", id: "NativeAgent", label: "NativeAgent"),
-            sourceClass: .observed,
-            occurredAt: wakeAt,
-            summary: "NativeAgent app launched or resumed",
-            importance: 0.35
-        )
-        await substrate.observe(wakeEvent)
-        await somaticSignalBus.observe(wakeEvent)
-        scheduleDirtyMicrocycle(reason: "app_wake_reconciliation")
-        // Bootstrap is her restored state, which every reader joins. The
-        // launch chores publish into that state on their own; no turn waits
-        // for a Desk replay, an inbox sweep or a trace read.
-        Task { await self.bootstrapChores() }
-        // (memoized via bootstrapTask — audit C4)
-    }
-
-    private func bootstrapChores() async {
-        await reconcilePendingApprovalExpectationsAtBootstrap()
-        await restoreProviderLifecycleEvidence()
-        await retireProviderVitalsNotices()
-        await host.archiveSupersededMorningBriefs(dataRoot: dataRoot)
-        await startPursuitRefresh()
-        await refreshOrganismBodySchema(reason: "bootstrap")
-        await persistOrganismContinuity(reason: "bootstrap")
-        await rescheduleResidualRepairDeadline()
-        await rescheduleCognitionMaintenanceDeadline()
-        publishRuntimeChange(reason: "bootstrap")
-        await readRecentLifeIntoCaresIfOwed()
-    }
-
-    /// Once, after the cares migration: her last 72 hours of lived
-    /// conversation, one cares-only call per (conversation, local day) holding
-    /// at least two exchanges, so an existing agent wakes with cares from what
-    /// she lived. One group's failure is logged with its cause and the rest
-    /// continue; groups already read are never read again.
-    private func readRecentLifeIntoCaresIfOwed() async {
-        guard dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL,
-              let (alreadyRead, generation) = await substrate.careLifeReadingOwed() else { return }
-        let lines: [ChatHistoryIndex.LivedLine]
-        do {
-            lines = try ChatHistoryIndex.shared(dataRoot: dataRoot).livedLines(since: now().addingTimeInterval(-72 * 3_600))
-        } catch {
-            nativeLog("cares: her recent life was not read, chat history unreadable: %@", error.localizedDescription)
-            return
-        }
-        let day = DateFormatter()
-        day.dateFormat = "yyyy-MM-dd"
-        let owner = Self.resolveUserName(dataRoot: dataRoot)
-        func name(_ speaker: String) -> String {
-            speaker == CognitiveCare.ownerKey ? (owner.isEmpty ? "the person" : owner) : "agent \(speaker)"
-        }
-        // One group per (conversation, local day, speaker): that speaker's
-        // lines and her replies to them. Her wake prompts and a helper's own
-        // runs are not conversations she lived; a row its writer marked
-        // machinery, or a debug/verification exchange, is not lived talk, and
-        // neither is her reply to one. A reply joins the message with its run
-        // id; a row with none joins the message before it.
-        struct Group { var speaker: String; var parts: [String] = []; var exchanges = 0; var last: ChatHistoryIndex.LivedLine }
-        var groups: [String: Group] = [:]
-        let conversations = Dictionary(grouping: lines.filter {
-            $0.conversation != "resident-wake" && !$0.conversation.hasPrefix("bot-")
-        }, by: \.conversation)
-        for (conversation, rows) in conversations {
-            var current: String?
-            var asked = false
-            var runs: [String: String?] = [:]
-            var answeredRuns: Set<String> = []
-            for line in rows.sorted(by: { $0.at < $1.at }) {
-                let lived = !line.mechanical
-                    && CognitiveTurnKind.inferred(fromSignals: [line.words]).contributesToLivedState
-                if line.role == "user" {
-                    guard lived, line.author != "self" else {
-                        current = nil
-                        if let run = line.runId { runs[run] = .some(nil) }
-                        continue
-                    }
-                    let speaker = CognitiveCareProvenance.personKey(line.peer ?? CognitiveCare.ownerKey)
-                    let key = "\(conversation)|\(day.string(from: line.at))|\(speaker)"
-                    groups[key, default: Group(speaker: speaker, last: line)].parts.append("\(name(speaker)): \(line.words)")
-                    groups[key]?.last = line
-                    current = key
-                    asked = true
-                    if let run = line.runId { runs[run] = key }
-                } else if lived {
-                    let key: String
-                    if let run = line.runId {
-                        guard let paired = runs[run] ?? nil else { continue }
-                        key = paired
-                        if answeredRuns.insert(run).inserted { groups[key]?.exchanges += 1 }
-                    } else {
-                        guard let adjacent = current else { continue }
-                        key = adjacent
-                        if asked { groups[key]?.exchanges += 1 }
-                    }
-                    asked = false
-                    groups[key]?.parts.append("Her reply: \(line.words)")
-                    groups[key]?.last = line
-                }
-            }
-        }
-        let manager = MindMemoryManager(makeLLMClient: { [host, dataRoot, weak self] in
-            host.backgroundLLMClient(dataRoot: dataRoot, cognition: self)
-        })
-        var passFailed = false
-        for (key, group) in groups.sorted(by: { $0.key < $1.key })
-        where !alreadyRead.contains(key) && group.exchanges >= 2 {
-            let trusted = group.speaker == CognitiveCare.ownerKey || PeerTrust.ownerTrusts(group.speaker, dataRoot: dataRoot)
-            let conversation = String(group.parts.joined(separator: "\n").suffix(12_000))
-            let shown = await substrate.caresShown(for: conversation)
-            do {
-                let judgments = try await LLMCallContext.$purpose.withValue("memory_interpret") {
-                    try await manager.appraiseCares(conversation: conversation, speaker: name(group.speaker), shown: shown)
-                }
-                try await substrate.applyCares(judgments, provenance: CognitiveCareProvenance(
-                    speaker: group.speaker, trusted: trusted, appAuthored: false,
-                    source: "exchange:\(group.last.conversation)/\(group.last.messageId ?? "")", at: group.last.at),
-                    generation: generation)
-                await substrate.noteCareLifeReadingGroup(key, failure: nil, generation: generation)
-            } catch {
-                let why = (error as? AfterTurnMemoryFailure)?.detail ?? String(describing: error)
-                passFailed = true
-                nativeLog("cares: reading %@ into her cares failed: %@", key, why)
-                await substrate.noteCareLifeReadingGroup(key, failure: why, generation: generation)
-            }
-        }
-        await substrate.finishCareLifeReading(passFailed: passFailed, generation: generation)
-    }
-
-    public func changes() -> AsyncStream<NativeCognitionRuntimeChange> {
-        let id = UUID()
-        let pair = AsyncStream<NativeCognitionRuntimeChange>.makeStream(
-            bufferingPolicy: .bufferingNewest(1)
-        )
-        changeContinuations[id] = pair.continuation
-        pair.continuation.onTermination = { [weak self] _ in
-            Task { await self?.removeChangeContinuation(id) }
-        }
-        return pair.stream
-    }
-
-    private func removeChangeContinuation(_ id: UUID) {
-        changeContinuations.removeValue(forKey: id)
-    }
-
-    public func publishRuntimeChange(reason: String) {  // internal for actor extensions (move-only Wave C)
-        changeRevision &+= 1
-        let change = NativeCognitionRuntimeChange(
-            revision: changeRevision,
-            occurredAt: now(),
-            reason: String(reason.prefix(96))
-        )
-        for continuation in changeContinuations.values {
-            continuation.yield(change)
-        }
-    }
-
-    var reachEnabled: Bool {
-        let configuration = Self.loadConfiguration(
-            defaults: preferenceDefaults, environment: configurationEnvironment)
-        return !isFlushedForTermination && configuration.enabled && configuration.backgroundMicrocyclesEnabled
-    }
-
-    public func refreshConfiguration() async {
-        sourceWakes.canonDirty = true
-        sourceWakes.horizonDirty = true
-        sourceWakes.reachDirty = true
-        withdrawReachIfDisabled()
-        if NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot),
-           preferenceDefaults.object(forKey: Self.enabledKey) == nil {
-            let routing = SwiftNativeProviderRouting(dataRoot: dataRoot)
-            if let snapshot = try? await routing.checkedRoutingSnapshot(),
-               let providerID = snapshot.activeProviders["chat"],
-               let provider = try? await routing.getProvider(id: providerID),
-               provider.configured == true {
-                Self.initializeMissingInnerLifePreferences(
-                    dataRoot: dataRoot, providerReady: true, defaults: preferenceDefaults
-                )
-                if usesLiveAppBody {
-                    await contextFlow.reloadConfiguration()
-                }
-            }
-        }
-        var configuration = Self.loadConfiguration(
-            defaults: preferenceDefaults,
-            environment: configurationEnvironment
-        )
-        do {
-            let routing = SwiftNativeProviderRouting(dataRoot: dataRoot)
-            let routingSnapshot = try await routing.checkedRoutingSnapshot()
-            if let reflection = routingSnapshot.preferences[configuration.reflectionSurface] {
-                configuration.reflectionModel = reflection.model
-                configuration.reflectionReasoningEffort = reflection.reasoningEffort
-                configuration.reflectionProvider = routingSnapshot.activeProviders[configuration.reflectionSurface] ?? ""
-            }
-            providerRoutingFailure = nil
-        } catch {
-            // Provider files are authoritative for reflection. Corruption closes
-            // only the provider-using lane instead of silently reviving a stale
-            // UserDefaults route.
-            configuration.reflectiveCallsEnabled = false
-            providerRoutingFailure = "cognitive provider state unavailable: \(error.localizedDescription)"
-        }
-        await substrate.configure(configuration)
-        // The caring appraisal's model seam (2026-09-11). Installed here for
-        // the same reason the configuration is: this is the one place that
-        // knows both the substrate and the app's provider routing. Without it
-        // the substrate never appraises and nothing ever doses, which is what a
-        // headless tool or a test should get.
-        // Phase 5A: Dream/REM read the pinned USER core, gated like reflection.
-        DreamUserCore.provider = { root in
-            MemoryPolicyGate.crossSessionRecallEnabled(dataRoot: root)
-                ? await SwiftNativeMemoryV2.userCoreForBackground(dataRoot: root)
-                : []
-        }
-        await AdaptiveMemoryPromoter.shared.configureInterpretation(
-            prepare: { [substrate] origin, reply in
-                await substrate.afterTurnContext(origin: origin, reply: reply)
-            },
-            isIdle: { [weak self, dataRoot] in
-                guard let self,
-                      dataRoot.standardizedFileURL == PersistenceCore.defaultDataRoot().standardizedFileURL
-                else { return false }
-                return await self.liveTurnLatchCount() == 0
-            },
-            finish: { [weak self, substrate] context, interpretation, noveltySkipped in
-                // A novelty-gated turn never asked, so it leaves no caring
-                // receipt (it would read as a failed call); the trace has it.
-                if let request = context.caring, !noveltySkipped {
-                    await MindCaringAppraiser.receipt(request, model: interpretation?.model,
-                        surface: interpretation?.surface ?? "unavailable",
-                        raw: interpretation == nil ? nil : "{}", verdict: interpretation?.caring)
-                }
-                let reaction = await substrate.finishAfterTurn(context, appraisal: interpretation?.affect,
-                                                               caring: interpretation?.caring)
-                if let interpretation {
-                    await substrate.applyCares(interpretation.cares, context: context,
-                                               appAuthored: interpretation.appAuthored)
-                }
-                await self?.caresSourceChanged()
-                // Phase 5 E3: a correction from the person she took in (kept as
-                // a standing correction) is her own outcome: a little more sure.
-                if let self, context.event.sourceClass != .imported,
-                   interpretation?.memories.contains(where: {
-                       $0.kind == "correction" && $0.action != .skip
-                           && $0.confidence >= MemoryManagerLane.confidenceFloor
-                   }) == true {
-                    await self.organismKernel.admitHumanCause(confidence: 0.03)
-                }
-                guard let self, let reaction else { return }
-                await self.finishAfterTurnReaction(context.event, metadata: reaction)
-            }
-        )
-        // And the door the verdict goes in by (2026-09-11, fourth pass). The
-        // appraisal owner calls this the moment its model call returns, carrying
-        // the originating turn's own timestamp; the kernel takes the fixed dose.
-        // It used to ride out on the next somatic signal's metadata, which
-        // scaled the dose by that signal's intensity and lost the verdict when no
-        // further signal came.
-        await substrate.setCaringEventSink { [weak self] reading, window in
-            guard let self else { return .refused }
-            return await self.admitCaringEventIntoBody(reading, window: window)
-        }
-        // And the receipt's other half (2026-09-11, review c4 item 4): a verdict
-        // the substrate turns away never reaches the sink, so it amends its own
-        // appraisal row from here instead, with the same fields the sink writes.
-        await substrate.setCaringRefusalRecorder { [weak self] session, turn, why in
-            guard let self else { return }
-            await MindCaringAppraiser.amendReceiptRefused(
-                session: session,
-                turn: turn,
-                why: why,
-                tendernessAfter: await self.organismKernel.snapshot().chemicalState.tenderness
-            )
-        }
-        let organismConfiguration = Self.loadOrganismConfiguration(
-            dataRoot: dataRoot,
-            defaults: preferenceDefaults
-        )
-        await organismKernel.configure(organismConfiguration)
-        // Configuration replaces the pushed clock. Invalidate after that await
-        // so a concurrent body read cannot consume the invalidation too early.
-        sourceWakes.clockDirty = true
-        await somaticSignalBus.configure(organismConfiguration)
-    }
-
-
     public func observe(_ event: CognitiveEvent) async {
         await bootstrap()
         let inherited = inheritNonLiveTurnKind(for: event)
         // Chat-turn lifecycle latch opens at admission, BEFORE the provider
         // call this event's run is about to make (see `noteTurnStarted`).
         noteChatTurnAdmission(inherited.event)
-        // BEFORE ingest, because the re-feel happens inside it: a served moment
-        // with no recorded feeling is re-felt neutrally, which is the thing
-        // being fixed. No-op for the overwhelming majority of events (they carry
-        // no `memoryRecordIds` at all).
-        await noteServedMoments(for: inherited.event)
-        let substrateAccepted = await substrate.ingestResident(inherited.event)
-        // Semantic expectations use the same cares as event appraisal; the
-        // substrate names a touched care and scopes the completion it answers.
-        // The organism reads only metadata. Read after ingest so its reaction
-        // refers to the completion the turn actually answered.
+        let admission = await substrate.ingestResident(inherited.event)
+        // Semantic consequences arrive with the admission that produced them.
         var enriched = inherited.event
-        for (key, value) in await substrate.semanticExpectationMetadata(for: inherited.event) {
+        for (key, value) in admission.semanticMetadata {
             enriched.metadata[key] = value
         }
-        // Tenderness's caring appraisal (2026-09-11) is LAUNCHED on the same hop
-        // and crosses on no hop at all. Only the appraisal owner can say a turn
-        // was an act of care, and only the body can feel it — so the owner calls
-        // the body directly when its model call returns (`setCaringEventSink`
-        // above). Nothing is stamped on the signal and nothing blocks here.
-        await substrate.noteCaringTurn(for: inherited.event)
         let somaticAccepted = await somaticSignalBus.observe(enriched) != nil
-        // Phase 5 E3: the signal itself is transport and moved no feeling;
+        // The signal itself is transport and moved no feeling;
         // when it is her own work landing (or failing), that is felt here.
-        if somaticAccepted, let dose = CognitiveSomaticSignalAdapter.ownOutcomeDose(enriched) {
+        if somaticAccepted, let dose = CognitiveSomaticSignals.ownOutcomeDose(enriched) {
             await organismKernel.admitHumanCause(agency: dose.agency, confidence: dose.confidence)
         }
         if let completedRunId = inherited.completedRunId {
@@ -904,8 +360,8 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             noteTurnFinished(runId: completedRunId)
         }
         // Exact replay is inert across both resident owners. It must not create
-        // settlement work, persistence, invalidations, or telemetry.
-        guard substrateAccepted || somaticAccepted else { return }
+        // settlement work, invalidations, or telemetry.
+        guard admission.accepted || somaticAccepted else { return }
         // The completion slot and live-turn timing are in-memory sources.
         if inherited.event.kind == .userMessageReceived || inherited.event.kind == .assistantTurnCompleted || inherited.event.kind == .providerFailure {
             sourceWakes.horizonDirty = true
@@ -913,17 +369,11 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         }
         if somaticAccepted {
             cachedBodyRead = nil
-            // Round 3 Wave A2 (review 3360e532dd3b, High): the MAIN event
-            // path reaches the kernel through the somatic bus — without a
-            // drain here, felt resolutions from ordinary tool events sat in
-            // the memory-only buffer (rate stamp persisted, feeling lost on
-            // shutdown). Both kernel-feed paths drain through the one door.
+            // Both kernel-feed paths drain felt resolutions into the substrate.
             await drainFeltResolutionsIntoSubstrate()
         }
-        if substrateAccepted {
-            scheduleDirtyMicrocycle(
-                reason: "event:\(inherited.event.kind.rawValue)"
-            )
+        if admission.accepted {
+            scheduleDirtyMicrocycle(reason: "event:\(inherited.event.kind.rawValue)")
         }
         if somaticAccepted { await rescheduleResidualRepairDeadline() }
         publishRuntimeChange(reason: "event:\(inherited.event.kind.rawValue)")
@@ -939,6 +389,8 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     /// Existing cognition persistence owns this payload-free replay guard; it
     /// is not another action authority or memory system.
     func admitMotorConsequenceForResident(_ model: MotorActionReadModel, at: Date) async -> Bool {
+        // The replay guard is part of her saved mind: admitted only after the opening.
+        await bootstrap()
         guard let cognitiveStore else {
             deadlineLogger("motor consequence replay guard unavailable; resident observation skipped")
             return false
@@ -951,667 +403,8 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         }
     }
 
-
-    func handleEventDrivenReplayOutcome(  // internal for +Organism extension (move-only Wave C)
-        _ outcome: CognitiveBackgroundRunOutcome,
-        reason: String,
-        allowRetry: Bool
-    ) async {
-        switch outcome {
-        case .completed:
-            replayReconciliationPending = false
-            replayRetryTask?.cancel()
-            replayRetryTask = nil
-        case .skipped(let detail) where detail == "no new replay evidence":
-            replayReconciliationPending = false
-            replayRetryTask?.cancel()
-            replayRetryTask = nil
-        case .skipped(let detail), .failed(let detail):
-            replayReconciliationPending = true
-            await substrate.recordReceipt(
-                kind: "replay.reconciliation_pending",
-                payload: .object([
-                    "reason": .string(reason),
-                    "outcome": .string(String(detail.prefix(300))),
-                    "retryScheduled": .bool(allowRetry),
-                ])
-            )
-            guard allowRetry, replayRetryTask == nil else { return }
-            replayRetryTask = Task { [weak self] in
-                let nanos = UInt64(Self.replayFailureRetryDelay * 1_000_000_000)
-                try? await Task.sleep(nanoseconds: nanos)
-                guard !Task.isCancelled else { return }
-                await self?.retryPendingReplayReconciliation()
-            }
-        }
-    }
-
-    private func retryPendingReplayReconciliation() async {
-        // G-L1: hold `replayRetryTask` non-nil across the replay await. The
-        // arm site guards on `replayRetryTask == nil`, so clearing it before
-        // awaiting would let a concurrent dream signal observe "no retry armed"
-        // and double-run replay. Reconciliation stays idempotent; the task
-        // self-clears only after this body completes.
-        guard replayReconciliationPending, !isFlushedForTermination else {
-            replayRetryTask = nil
-            return
-        }
-        let reason = "replay_event_retry"
-        let outcome = await runEventDrivenReplayWithDeadline(reason: reason)
-        await handleEventDrivenReplayOutcome(outcome, reason: reason, allowRetry: false)
-        replayRetryTask = nil
-    }
-
-    /// Dream/REM signals are background tissue today, but this seam must remain
-    /// safe if a foreground caller ever emits one. The unstructured race returns
-    /// on the deadline without structurally awaiting a cancellation-insensitive
-    /// replay body; reconciliation remains durable and gets one bounded retry.
-    func runEventDrivenReplayWithDeadline(  // internal for +Organism extension (move-only Wave C)
-        reason: String
-    ) async -> CognitiveBackgroundRunOutcome {
-        let outcome = await raceAgainstTimeout(seconds: Self.eventDrivenReplayDeadlineSeconds) { [weak self] in
-            guard let self else {
-                return CognitiveBackgroundRunOutcome.failed("cognitive runtime released before event-driven replay")
-            }
-            return await self.runReplay(reason: reason)
-        }
-        switch outcome {
-        case .value(let result):
-            return result
-        case .failure(let detail):
-            return .failed("event-driven replay race failed: \(detail)")
-        case .timedOut:
-            let detail = "event-driven replay '\(reason)' exceeded "
-                + "\(Self.eventDrivenReplayDeadlineSeconds)s deadline; task cancelled and reconciliation retained"
-            deadlineLogger("TIMEOUT: \(detail)")
-            return .failed(detail)
-        case .cancelled:
-            let detail = "event-driven replay '\(reason)' cancelled; reconciliation retained"
-            deadlineLogger("CANCELLED: \(detail)")
-            return .failed(detail)
-        }
-    }
-
-
-    public func substrateForIntegration() async -> CognitiveSubstrate {
-        await bootstrap()
-        return substrate
-    }
-
-    /// The live turn seam is an actor-free read of the projection already
-    /// published by CognitiveSubstrate, OrganismKernel, and the Desk pursuit
-    /// projection. Bootstrap and owner I/O happen off this path; an early cold
-    /// turn may receive nil, but can never wait for those owners.
-    public nonisolated func attentionSignals(at date: Date) async -> CognitiveAttentionSignals? {
-        let trace = CognitiveAttentionTraceContext.recorder
-        trace?.recordAdmission()
-        guard !Task.isCancelled else {
-            trace?.markCancellationObserved()
-            return nil
-        }
-        let stageStarted = DispatchTime.now().uptimeNanoseconds
-        let signals = attentionProjection.read(at: date)
-        trace?.recordElapsed("resident", since: stageStarted)
-        return signals
-    }
-
-
-    /// Ordinary chat reads cognition and organism at one fixed time after one
-    /// body refresh. It does not consume the surfaced-state window; the caller
-    /// commits that only after the value is actually appended to provider input.
-    public func prepareTurnProjection(_ request: CognitiveCapsuleRequest) async -> CognitiveTurnProjection {
-        await bootstrap()
-        let fixedAt = now()
-        let bodySample = await organismBodySample(at: fixedAt)
-        let canonicalAffect = await substrate.canonicalAffectProjection(at: fixedAt)
-        let organism = await organismKernel.refreshBodySchemaAndFrozenRead(
-            bodySample,
-            integratesChemistry: false,
-            canonicalAffect: canonicalAffect,
-            fixedAt: fixedAt
-        )
-        let capsuleRequest = requestWithOrganismProjection(
-            request,
-            projection: organism.projection,
-            toward: await towardRead(),
-            at: fixedAt
-        )
-        let preparedCapsule = await substrate.prepareFrozenCapsulePresentation(
-            capsuleRequest,
-            at: fixedAt
-        )
-        return CognitiveTurnProjection(
-            fixedAt: fixedAt,
-            capsule: preparedCapsule?.nonEmptyCapsule,
-            posture: organism.posture,
-            capsulePresentationCommit: preparedCapsule?.presentationCommit,
-            why: preparedCapsule?.why
-        )
-    }
-
-    public func commitTurnProjection(
-        _ projection: CognitiveTurnProjection,
-        request: CognitiveCapsuleRequest
-    ) async {
-        guard let capsule = projection.capsule else {
-            // Phase 5A: "none" is a normal capsule. Nothing was injected, but
-            // the turn still happened, so the presentation clock moves.
-            if request.resolvedTurnKind == .live, request.mode == .inject,
-               let presentationCommit = projection.capsulePresentationCommit {
-                _ = await substrate.applyCapsulePresentationCommit(presentationCommit)
-                await substrate.flushCommittedCapsulePresentation(at: projection.fixedAt)
-            }
-            return
-        }
-        // Mirror the real injection so the Observatory's Capsule Preview reflects
-        // what Agent actually received this turn, not a synthetic constant. Only a
-        // successful (.live, non-empty) injection updates the cache. Trusted
-        // teammate bridges may receive a read-only non-live projection, but it
-        // never replaces the last real capsule or consumes the Body-line window.
-        let requestTurnKind = request.resolvedTurnKind
-        if requestTurnKind == .live {
-            lastInjectedCapsule = (capsule, request.userMessage)
-            // Mark the body line as surfaced only after a real (.inject) capsule
-            // actually built with it — so observatory previews and nil builds don't
-            // consume the suppress-when-unchanged window. (gpt-5.5 review)
-            if request.mode == .inject,
-               let line = Self.bodyLine(inCapsuleDynamicContext: capsule.dynamicContext) {
-                lastInjectedBodyLine = line
-                lastInjectedBodyLineAt = projection.fixedAt
-            }
-            if request.mode == .inject,
-               let presentationCommit = projection.capsulePresentationCommit {
-                _ = await substrate.applyCapsulePresentationCommit(presentationCommit)
-            }
-            // Persist cadence only after an injected live capsule was committed.
-            if request.mode == .inject {
-                await substrate.flushCommittedCapsulePresentation(at: projection.fixedAt)
-            }
-        }
-    }
-
-    @discardableResult
-    public func runMicrocycle(reason: String) async -> CognitiveBackgroundRunOutcome {
-        await bootstrap()
-        if let bootstrapFailure { return .failed(bootstrapFailure) }
-        do {
-            let snapshot = try await substrate.runMicrocycleChecked(reason: reason)
-            guard snapshot != nil else {
-                return .skipped("cognitive substrate disabled or clean")
-            }
-            publishRuntimeChange(reason: "microcycle:completed")
-            return .completed("cognitive field settled through checked persistence")
-        } catch {
-            publishRuntimeChange(reason: "microcycle:failed")
-            return .failed("cognitive microcycle failed: \(error.localizedDescription)")
-        }
-    }
-
-    func scheduleDirtyMicrocycle(  // internal for actor extensions (move-only Wave C)
-        reason: String
-    ) {
-        // gpt-5.5 fix round: post-flush arrivals (a replay tail, a late
-        // organism drain) must not arm new microcycles after the terminal
-        // snapshot. Same latch the reschedule bodies honor.
-        guard !isFlushedForTermination else { return }
-        microcycleTelemetry.scheduledSignalCount &+= 1
-        if microcycleTimer.isPending {
-            microcycleTelemetry.coalescedReplacementCount &+= 1
-        }
-        microcycleTelemetry.lastScheduledAt = now()
-        microcycleTelemetry.lastReason = String(reason.prefix(160))
-        microcycleTimer.schedule(delay: .seconds(Self.microcycleCoalescingDelay)) { [weak self] generation in
-            await self?.runScheduledMicrocycle(generation: generation, reason: reason)
-        }
-    }
-
-    private func runScheduledMicrocycle(generation: UInt64, reason: String) async {
-        guard !isFlushedForTermination,
-              microcycleTimer.take(generation) else { return }
-        // This generation is now in flight, not pending. A reentrant event
-        // arriving while persistence awaits must start a distinct generation
-        // instead of being merged into work already started by this cycle.
-        let startedAt = now()
-        let monotonicStartedAt = monotonicNowNanoseconds()
-        microcycleTelemetry.executedCount &+= 1
-        microcycleTelemetry.lastStartedAt = startedAt
-        let outcome = await runMicrocycle(reason: reason)
-        switch outcome {
-        case .completed:
-            microcycleTelemetry.completedCount &+= 1
-            microcycleTelemetry.lastOutcome = "completed"
-        case .skipped:
-            microcycleTelemetry.skippedCount &+= 1
-            microcycleTelemetry.lastOutcome = "skipped"
-        case .failed:
-            microcycleTelemetry.failedCount &+= 1
-            microcycleTelemetry.lastOutcome = "failed"
-        }
-        let finishedAt = now()
-        let monotonicFinishedAt = monotonicNowNanoseconds()
-        microcycleTelemetry.lastFinishedAt = finishedAt
-        let elapsedNanoseconds = monotonicFinishedAt >= monotonicStartedAt
-            ? monotonicFinishedAt - monotonicStartedAt
-            : 0
-        microcycleTelemetry.lastDurationMilliseconds = Int(min(
-            elapsedNanoseconds / 1_000_000,
-            UInt64(Int.max)
-        ))
-        // A microcycle may change the field and its visible projections.
-        // Re-project the single maintenance deadline after that canonical
-        // transition; ordinary reads and quiet elapsed time remain wake-free.
-        await caresSourceChanged()
-        await rescheduleCognitionMaintenanceDeadline()
-        // `runMicrocycle` publishes after the substrate commit; scheduled
-        // settlement publishes once more after its telemetry has reached the
-        // same terminal state so Observatory readers cannot see stale counters.
-        publishRuntimeChange(reason: "microcycle_settlement:finished")
-        await rescheduleResidualRepairDeadline()
-    }
-
-    public func microcycleTelemetrySnapshot() -> CognitiveMicrocycleTelemetry {
-        microcycleTelemetry
-    }
-
-    @discardableResult
-    public func runMaintenance(reason: String) async -> CognitiveBackgroundRunOutcome {
-        await bootstrap()
-        if let bootstrapFailure { return .failed(bootstrapFailure) }
-        do {
-            let configuration = await substrate.configurationSnapshot()
-            let persistenceEnabled = configuration.persistenceEnabled
-            let ran = try await substrate.runMaintenanceChecked(reason: reason)
-            guard ran else {
-                // Review round 2 (HIGH): a not-ran outcome includes "still due
-                // but excluded by the microcycle commit window" — re-arming at
-                // the natural (already-due) deadline would spin. The bounded
-                // contention delay wins only when the natural deadline is
-                // effectively now; a genuinely future deadline still wins.
-                await rescheduleCognitionMaintenanceDeadline(
-                    notBefore: now().addingTimeInterval(Self.cognitionMaintenanceContentionRetryDelay)
-                )
-                return .skipped(configuration.enabled
-                    ? "cognitive maintenance not due or busy"
-                    : LoopTickOutcome.offPrefix + "cognition disabled")
-            }
-            await rescheduleCognitionMaintenanceDeadline()
-            publishRuntimeChange(reason: "maintenance:completed")
-            return .completed(persistenceEnabled
-                ? "cognitive maintenance checkpoint and receipt are durable"
-                : "cognitive maintenance completed in memory-only mode")
-        } catch {
-            await rescheduleCognitionMaintenanceDeadline(
-                notBefore: now().addingTimeInterval(Self.cognitionMaintenanceRetryDelay)
-            )
-            publishRuntimeChange(reason: "maintenance:failed")
-            return .failed("cognitive maintenance failed: \(error.localizedDescription)")
-        }
-    }
-
-    @discardableResult
-    public func runReplay(reason: String) async -> CognitiveBackgroundRunOutcome {
-        await bootstrap()
-        if let bootstrapFailure { return .failed(bootstrapFailure) }
-        let configuration = await substrate.configurationSnapshot()
-        guard configuration.enabled else {
-            return .skipped(LoopTickOutcome.offPrefix + "cognitive replay disabled")
-        }
-        do {
-            let persistenceEnabled = configuration.persistenceEnabled
-            let result = try await substrate.integrateReplayChecked(
-                await makeReplayIntegrationInput(reason: reason)
-            )
-            guard !result.episodeIds.isEmpty || !result.schemaProposalIds.isEmpty || !result.timelineEventIds.isEmpty else {
-                return .skipped("no new replay evidence")
-            }
-            scheduleDirtyMicrocycle(reason: "replay_integration")
-            publishRuntimeChange(reason: "replay:completed")
-            return .completed(persistenceEnabled
-                ? "replay artifacts and lineage committed atomically"
-                : "replay evidence integrated in memory-only mode")
-        } catch {
-            publishRuntimeChange(reason: "replay:failed")
-            return .failed("cognitive replay failed: \(error.localizedDescription)")
-        }
-    }
-
-
-    public func flushForTermination() async {
-        // Review round 2 (LOW): latch shutdown so a delayed wake re-anchor
-        // cannot resurrect the deadline timers this flush is about to cancel.
-        isFlushedForTermination = true
-        approvalLifecycleObservationTask?.cancel()
-        approvalLifecycleObservationTask = nil
-        // Pursuit reads are advisory background work, not part of the final
-        // persistence barrier. Quiesce their owner and reject any late result.
-        pursuitProjectionGeneration &+= 1
-        pursuitRefreshQueued = false
-        pursuitObservationTask?.cancel()
-        pursuitObservationTask = nil
-        carriedExperienceObservationTask?.cancel()
-        carriedExperienceObservationTask = nil
-        pursuitRefreshTask?.cancel()
-        pursuitRefreshTask = nil
-        residualDeadline.invalidate()
-        cognitionDeadline.invalidate()
-        // G-H2: quiesce the two remaining unstructured re-arm sources. A
-        // 0.25s-debounced dirty microcycle or a pending replay retry could
-        // otherwise commit — and re-arm a deadline this flush just cancelled —
-        // AFTER the terminal snapshot below. The reschedule bodies also honor
-        // `isFlushedForTermination` so any survivor no-ops instead of re-arming.
-        microcycleTimer.cancel()
-        replayRetryTask?.cancel()
-        replayRetryTask = nil
-        // A4.6: quiesce the event-driven reflection lane the same way — the
-        // latch above stops new schedules; cancel any in-flight task so its
-        // LLM call cannot outlive the terminal snapshot.
-        reflectionEventTask?.cancel()
-        reflectionEventTask = nil
-        let sleepAt = now()
-        let sleepEvent = CognitiveEvent(
-            id: "app-sleep:\(Int(sleepAt.timeIntervalSince1970))",
-            kind: .appSleep,
-            subject: CognitiveSubjectReference(type: "app", id: "NativeAgent", label: "NativeAgent"),
-            sourceClass: .observed,
-            occurredAt: sleepAt,
-            summary: "NativeAgent app is terminating",
-            importance: 0.35
-        )
-        // Her saved mind is written only by a process that has read it
-        // (docs/STOP.md): join the launch restore already running; if it never
-        // ran or failed, nothing of hers is saved and the disk stays as it was.
-        // A quit seconds after launch used to save a fresh, unrestored
-        // substrate over her real one.
-        await bootstrapTask?.value
-        guard bootstrapTask != nil, bootstrapFailure == nil else { return }
-        await substrate.observe(sleepEvent)
-        await somaticSignalBus.observe(sleepEvent)
-        await substrate.runMaintenance(reason: "app termination")
-        try? await substrate.persistSnapshot()
-        await persistOrganismContinuity(reason: "app termination")
-        // Termination is the runtime-owned snapshot point for provider vitals.
-        // It follows lifecycle settlement so the final observed row
-        // cannot be excluded by an early snapshot.
-        await persistProviderVitalsSnapshot()
-    }
-
-
-    public func observatoryDetail() async -> CognitiveObservatoryDetail {
-        await bootstrap()
-        await refreshOrganismBodySchema(reason: "observatory")
-        let organism = await organismKernel.snapshot()
-        // The Capsule Preview mirrors the capsule Agent ACTUALLY received in her
-        // last live chat turn (cached at projection commit), timestamped —
-        // so the panel moves as they talk instead of recompiling a synthetic compile
-        // pinned to a constant "observatory preview" message (which never changes and
-        // never reflects the live conversation). Only when nothing has been injected
-        // this session (fresh boot, no chat yet) do we fall back to a synthetic
-        // inspect-only compile, clearly labeled in the UI.
-        // One organism-projected inspect request serves BOTH the mode chip below and the
-        // synthetic capsule compile — the chip reads the same signals path the fingerprint
-        // does, so what it names is what she'd feel about right now, not a parallel guess.
-        let inspectFixedAt = now()
-        let read = await substrate.frozenRead(at: inspectFixedAt)
-        let configuration = read.configuration
-        let inspectRequest = requestWithOrganismProjection(
-            CognitiveCapsuleRequest(
-                surface: "chat",
-                userMessage: lastInjectedCapsule?.userMessage ?? "observatory preview",
-                mode: .inspectOnly,
-                maximumCharacters: min(1_200, configuration.maximumCapsuleCharacters)
-            ),
-            projection: await organismKernel.projection(),
-            toward: await towardRead(),
-            at: inspectFixedAt
-        )
-        // All workspace-derived fields share the same substrate read epoch.
-        let feltMode = await substrate.feltModeReading(for: inspectRequest, from: read)
-
-        let capsulePreview: CognitiveCapsule?
-        let capsulePreviewInfo: CapsulePreviewInfo?
-        if let last = lastInjectedCapsule {
-            capsulePreview = last.capsule
-            capsulePreviewInfo = CapsulePreviewInfo(
-                source: .liveInjected,
-                userMessage: last.userMessage,
-                at: last.capsule.generatedAt
-            )
-        } else {
-            let synthetic = await substrate.compileFrozenCapsulePresentation(inspectRequest, from: read).capsule
-            let nonEmpty = synthetic.combined.isEmpty ? nil : synthetic
-            capsulePreview = nonEmpty
-            capsulePreviewInfo = nonEmpty == nil ? nil : CapsulePreviewInfo(source: .synthetic, userMessage: nil, at: nil)
-        }
-        let receiptRead = await substrate.receiptReadSnapshot()
-        let schemas = await substrate.schemaProposalSnapshot()
-        let timeline = await substrate.developmentalTimelineSnapshot(proposals: schemas, limit: 240)
-        return CognitiveObservatoryDetail(
-            configuration: configuration,
-            summary: await substrate.observatorySnapshot(from: read),
-            substrate: read.snapshot,
-            workspace: read.workspace,
-            associations: await substrate.associationSnapshot(),
-            episodes: await substrate.episodeSnapshot(),
-            schemaProposals: schemas,
-            developmentalTimeline: Array(timeline.prefix(40)),
-            growthWeek: await substrate.growthWeek(from: timeline),
-            reflections: await substrate.reflectionReceiptSnapshot(),
-            receiptRead: receiptRead,
-            receipts: receiptRead.receipts,
-            facultyMeasurements: await substrate.facultyMeasurementSnapshot(from: read),
-            experiments: await substrate.researchExperimentSnapshot(),
-            welfareBounds: await substrate.welfareBoundsSnapshot(),
-            organism: organism,
-            lastResearchExportPath: lastResearchExportPath,
-            capsulePreview: capsulePreview,
-            capsulePreviewInfo: capsulePreviewInfo,
-            feltMode: feltMode
-        )
-    }
-
-    /// The observational boundary used by mounted Observatory consumers.
-    /// It retains the full live projection while making missing durable receipt
-    /// evidence explicit, so disabled or unreadable persistence never becomes
-    /// a success-shaped empty receipt list.
-    public func observatoryDetailRead() async -> CognitiveObservatoryDetailRead {
-        CognitiveObservatoryDetailRead(detail: await observatoryDetail())
-    }
-
-    public func doctorRead() async -> CognitiveDoctorRead? {
-        guard let bootstrapTask else { return nil }
-        await bootstrapTask.value
-        let date = now()
-        let cognition = await substrate.frozenRead(at: date)
-        let organism = await organismKernel.frozenRead(at: date)
-        return CognitiveDoctorRead(
-            configuration: cognition.configuration,
-            affect: cognition.affect,
-            substrate: cognition.snapshot,
-            workspace: cognition.workspace,
-            associations: await substrate.doctorAssociationSnapshot(at: date),
-            receiptRead: await substrate.receiptReadSnapshot(),
-            welfareBounds: await substrate.welfareBoundsSnapshot(),
-            organism: organism.snapshot,
-            capsulePreviewInfo: lastInjectedCapsule.map {
-                CapsulePreviewInfo(source: .liveInjected, userMessage: $0.userMessage, at: $0.capsule.generatedAt)
-            }
-        )
-    }
-
-    public func setEnabled(_ enabled: Bool) async {
-        preferenceDefaults.set(enabled, forKey: Self.enabledKey)
-        await refreshConfiguration()
-        if enabled { await bootstrap() }
-        publishRuntimeChange(reason: "configuration:enabled")
-    }
-
-    public func setCapsuleEnabled(_ enabled: Bool) async {
-        preferenceDefaults.set(enabled, forKey: Self.capsuleKey)
-        await refreshConfiguration()
-        publishRuntimeChange(reason: "configuration:capsule")
-    }
-
-    public func setBackgroundEnabled(_ enabled: Bool) async {
-        preferenceDefaults.set(enabled, forKey: Self.backgroundKey)
-        await refreshConfiguration()
-        publishRuntimeChange(reason: "configuration:background")
-    }
-
-    public func setReflectionEnabled(_ enabled: Bool) async {
-        preferenceDefaults.set(enabled, forKey: Self.reflectionKey)
-        await refreshConfiguration()
-        publishRuntimeChange(reason: "configuration:reflection")
-    }
-
-
-
-    public func setReflectionBudget(_ budget: Int) async {
-        preferenceDefaults.set(max(0, budget), forKey: Self.reflectionBudgetKey)
-        await refreshConfiguration()
-        publishRuntimeChange(reason: "configuration:reflection_budget")
-    }
-
-    /// The user-facing Subconscious switch is one transaction over the
-    /// existing cognition and organism owners. Keeping this composition here
-    /// prevents UI call sites from omitting a lane or triggering a cascade of
-    /// redundant configuration reloads and invalidations.
-    public func setSubconsciousMasterEnabled(
-        _ enabled: Bool,
-        reflectionBudget: Int
-    ) async -> NativeSubconsciousRuntimeState {
-        Self.writeInnerLifePreferences(
-            enabled: enabled, reflectionBudget: reflectionBudget,
-            defaults: preferenceDefaults, onlyMissing: false
-        )
-
-        let alreadyBootstrapped = bootstrapTask != nil
-        await refreshConfiguration()
-        if enabled {
-            if alreadyBootstrapped {
-                // A launch with the inner life off restored none of her mind;
-                // waking restores it (seeding and migrating her cares) and
-                // reads her recent life if that is still owed.
-                do {
-                    try await substrate.restorePersistentState()
-                } catch {
-                    bootstrapFailure = "cognitive restore failed: \(error.localizedDescription)"
-                    await substrate.recordReceipt(
-                        kind: "lifecycle.restore_failed",
-                        payload: .object(["error": .string(String(describing: error))])
-                    )
-                }
-                Task { await self.readRecentLifeIntoCaresIfOwed() }
-                organismContinuityRestored = false
-                await restoreOrganismContinuityIfAvailable()
-                await refreshOrganismBodySchema(reason: "subconscious enabled")
-                await persistOrganismContinuity(reason: "subconscious enabled")
-                // Desk changes while she was off did not reach the work projection;
-                // waking reads the Desk once.
-                await startPursuitRefresh()
-            } else {
-                await bootstrap()
-            }
-        }
-        await rescheduleResidualRepairDeadline()
-        await rescheduleCognitionMaintenanceDeadline()
-        publishRuntimeChange(reason: "configuration:subconscious_master")
-        return await subconsciousRuntimeState()
-    }
-
-    public func refreshAfterOnboardingTransition() async -> NativeSubconsciousRuntimeState {
-        await refreshConfiguration()
-        let organism = await organismKernel.snapshot()
-        if organism.enabled {
-            organismContinuityRestored = false
-            await restoreOrganismContinuityIfAvailable()
-            await refreshOrganismBodySchema(reason: "onboarding transition")
-            await persistOrganismContinuity(reason: "onboarding transition")
-        } else {
-            cachedBodyRead = nil
-        }
-        await rescheduleResidualRepairDeadline()
-        await rescheduleCognitionMaintenanceDeadline()
-        publishRuntimeChange(reason: "configuration:onboarding_transition")
-        return await subconsciousRuntimeState()
-    }
-
-    /// Setup completion and launch share the explicit switch's preference
-    /// transaction, but automatic initialization never replaces a saved choice.
-    /// The independent hour preference is deliberately not part of this master.
-    nonisolated static func initializeMissingInnerLifePreferences(
-        dataRoot: URL, providerReady: Bool, defaults: UserDefaults
-    ) {
-        guard providerReady,
-              NativeAgentPublicSafety.hasCompletedOnboarding(dataRoot: dataRoot),
-              defaults.object(forKey: enabledKey) == nil else { return }
-        NativeContextFlowConfiguration.initializeMissingInnerLifeMode(defaults: defaults)
-        writeInnerLifePreferences(
-            enabled: true, reflectionBudget: 2, defaults: defaults, onlyMissing: true
-        )
-    }
-
-    private nonisolated static func writeInnerLifePreferences(
-        enabled: Bool, reflectionBudget: Int, defaults: UserDefaults, onlyMissing: Bool
-    ) {
-        for key in [capsuleKey, backgroundKey, reflectionKey, organismKernelEnabledKey] {
-            if !onlyMissing || defaults.object(forKey: key) == nil {
-                defaults.set(enabled, forKey: key)
-            }
-        }
-        if !onlyMissing || defaults.object(forKey: reflectionBudgetKey) == nil {
-            defaults.set(enabled ? max(1, reflectionBudget) : 0, forKey: reflectionBudgetKey)
-        }
-        // Write the master last so an interrupted initialization can resume.
-        if !onlyMissing || defaults.object(forKey: enabledKey) == nil {
-            defaults.set(enabled, forKey: enabledKey)
-        }
-    }
-
-    public func subconsciousRuntimeState() async -> NativeSubconsciousRuntimeState {
-        let configuration = await substrate.configurationSnapshot()
-        let organism = await organismKernel.snapshot()
-        return NativeSubconsciousRuntimeState(
-            enabled: configuration.enabled,
-            capsuleEnabled: configuration.capsuleInjectionEnabled,
-            backgroundEnabled: configuration.backgroundMicrocyclesEnabled,
-            reflectionEnabled: configuration.reflectiveCallsEnabled,
-            reflectionBudget: configuration.dailyReflectionCallBudget,
-            organismEnabled: organism.enabled
-        )
-    }
-
-
-    public func lastInjectedCapsuleBridgeSummary() async -> CognitiveBridgeCapsuleSummary {
-        guard let last = lastInjectedCapsule else {
-            return CognitiveBridgeCapsuleSummary(
-                source: "none",
-                generatedAt: nil,
-                hasBodyLine: false,
-                bodyLine: nil,
-                dynamicContextCharacters: 0,
-                truncated: nil
-            )
-        }
-        let bodyLine = Self.bodyLine(inCapsuleDynamicContext: last.capsule.dynamicContext)
-        return CognitiveBridgeCapsuleSummary(
-            source: "live_injected",
-            generatedAt: last.capsule.generatedAt,
-            hasBodyLine: bodyLine != nil,
-            bodyLine: bodyLine,
-            dynamicContextCharacters: last.capsule.dynamicContext.count,
-            truncated: last.capsule.truncated
-        )
-    }
-
-
-    /// H2 (audit, 2026-07-09): makeOrganismBodyRead does ~15 stats + JSON parses
-    /// + a dream_diary directory listing — and it ran on EVERY tool result (×10
-    /// per multi-tool turn), every turn projection, every Observatory 5s poll,
-    /// every LivingStatusPanel 60s tick, all serialized on THIS actor which the
-    /// chat turn also needs. The underlying files change on the order of minutes;
-    /// a 2s TTL cache removes the per-tool-result cost without dulling the body's
-    /// senses. Debug overrides bypass staleness by construction (checked below).
-    var cachedBodyRead: (read: OrganismBodyRead, at: Date)?  // internal for actor extensions (move-only Wave C)
+    /// Composite body gauges are sampled for two seconds; debug overrides apply after the cache.
+    var cachedBodyRead: (read: OrganismBodyRead, at: Date)?
     /// Payload-free, process-local provider lifecycle evidence. Canonical
     /// successful call receipts are reloaded from the injected trace root at
     /// bootstrap; live started/terminal events replace the same call ID.
@@ -1620,50 +413,21 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
     static let providerLifecycleExpiry: TimeInterval = 45
     static let maximumProviderLifecycleEvidence = 32
 
-
-    private func requestWithOrganismProjection(
-        _ request: CognitiveCapsuleRequest,
-        projection initialProjection: OrganismProjection,
-        toward: OrganismTowardRead? = nil,
-        at fixedAt: Date
-    ) -> CognitiveCapsuleRequest {
-        var projection = initialProjection
-        // The horizon rides BEFORE the neutral-projection early return: it
-        // comes from the prediction ledger, not from chemistry, so a body with
-        // nothing to say is no reason for her to stop looking forward to
-        // Friday.
-        var request = request
-        request.toward = toward
-        guard !projection.isNeutral else { return request }
-        // Suppress-when-unchanged: only for REAL injections (.inject). If the same
-        // line is still fresh, drop it so a held mood goes quiet instead of
-        // repeating for hours. Observatory/preview (.inspectOnly) always sees the
-        // true line and never touches the window. The surfaced-marker is set
-        // post-build in commitTurnProjection, so a preview OR a nil capsule can't consume
-        // the window. (gpt-5.5 review)
-        if request.mode == .inject,
-           let line = projection.bodyLine,
-           line == lastInjectedBodyLine,
-           let last = lastInjectedBodyLineAt,
-           fixedAt.timeIntervalSince(last) < Self.bodyLineRefreshInterval {
-            projection.bodyLine = nil
-        }
-        var copy = request
-        copy.organismProjection = projection
-        return copy
-    }
-
-    public nonisolated static func bodyLine(inCapsuleDynamicContext dynamicContext: String) -> String? {
-        dynamicContext
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { $0.hasPrefix("- Body:") }
-    }
-
-
     @discardableResult
     public func clearTransientState() async -> CognitiveTransientStateClearOutcome {
-        guard let cognitiveStore else {
+        let outcome = await clearTransientStateOnce()
+        await syncBodyEpoch()
+        return outcome
+    }
+
+    private func clearTransientStateOnce() async -> CognitiveTransientStateClearOutcome {
+        // Forgetting is checked recovery, but it still runs only on a mind that
+        // has been opened: a clear before restore would be overlaid by it.
+        await bootstrap()
+        // Clear holds the door: it waits for a fold in flight, and a fold waits for it.
+        await enterDoor()
+        defer { leaveDoor() }
+        guard cognitiveStore != nil else {
             let detail = "cognitive persistent store unavailable"
             await substrate.recordReceipt(
                 kind: "user.clear_transient_state_failed",
@@ -1673,8 +437,14 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             return .persistenceFailed(detail)
         }
         do {
-            try await cognitiveStore.clear()
+            // The store, the mind's forgetting epoch and her resident mind,
+            // under one logical exclusion (`CognitiveSubstrate.forgetMind`).
+            try await substrate.forgetMind()
+            bootstrapFailure = nil
         } catch {
+            // A failed Clear marked her resident mind dirty: the microcycle
+            // re-saves affect and nodes through its normal path.
+            scheduleDirtyMicrocycle(reason: "clear_failed")
             let detail = String(describing: error)
             await substrate.recordReceipt(
                 kind: "user.clear_transient_state_failed",
@@ -1683,15 +453,22 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
             publishRuntimeChange(reason: "transient_clear:failed")
             return .persistenceFailed(detail)
         }
-        await substrate.clearTransientState()
         // The wiped store keeps its four seeds; her life is read again at the next launch.
         await substrate.establishCares()
         await organismKernel.clearTransientState()
+        await syncBodyEpoch()
         await rescheduleCognitionMaintenanceDeadline()
         lastInjectedCapsule = nil
         lastInjectedBodyLine = nil
         lastInjectedBodyLineAt = nil
+        // Clear is checked recovery for the body too: an emptied body may be
+        // written over a file whose restore failed (the freeze comes back if
+        // that write fails).
+        let wasRestoreFrozen = organismRestoreFailedHard
+        organismRestoreFailedHard = false
         guard await persistOrganismContinuity(reason: "clear transient") else {
+            // Clear again to finish a partial clear; forgetting is not journaled.
+            organismRestoreFailedHard = wasRestoreFrozen
             await substrate.recordReceipt(kind: "user.clear_transient_state_partial")
             publishRuntimeChange(reason: "transient_clear:partial")
             return .bodyPersistenceFailed
@@ -1701,266 +478,25 @@ public actor NativeCognitionRuntime: CognitiveRuntimeProviding, OrganismPostureP
         return .cleared
     }
 
-    /// Same seam, carrying the persistence outcome (2026-09-06) so the review
-    /// surfaces can tell "saved" from "changed in memory only".
-
-
-    /// Same seam, carrying the persistence outcome (2026-09-06).
-
-
     public func setAblation(_ key: String, enabled: Bool) async {
         await substrate.setAblation(key, enabled: enabled)
         publishRuntimeChange(reason: "experiment:ablation")
     }
 
     @discardableResult
-    public func pinTopConcern(text: String? = nil, seat: StudioCanonTurnProvenance) async throws -> String? {
+    public func pinTopConcern(text: String? = nil, care: String? = nil, seat: StudioCanonTurnProvenance) async throws -> String? {
         guard seat.isComplete else { return nil }
         await bootstrap()
-        guard let concern = try await substrate.pinConcern(text, source: "turn:\(seat.surface)/\(seat.turnID)") else { return nil }
+        guard let concern = try await substrate.pinConcern(text, in: care, source: "turn:\(seat.surface)/\(seat.turnID)") else { return nil }
         scheduleDirtyMicrocycle(reason: "concern_pinned")
         publishRuntimeChange(reason: "care:pinned")
         return concern
     }
 
-    @discardableResult
-    public func runResearchHarness() async -> CognitiveEvaluationSamplerOutcome {
-        await bootstrap()
-        if let bootstrapFailure {
-            let outcome = CognitiveEvaluationSamplerOutcome(
-                recordedKinds: [],
-                unavailableKinds: CognitiveExperimentKind.allCases,
-                failureDetail: bootstrapFailure
-            )
-            publishRuntimeChange(reason: "experiment:harness_failed")
-            return outcome
-        }
-        var recordedKinds: [CognitiveExperimentKind] = []
-        var unavailableKinds: [CognitiveExperimentKind] = []
-        for kind in CognitiveExperimentKind.allCases {
-            if await substrate.runResearchExperiment(kind: kind, seed: "observatory") != nil {
-                recordedKinds.append(kind)
-            } else {
-                unavailableKinds.append(kind)
-            }
-        }
-        let outcome = CognitiveEvaluationSamplerOutcome(
-            recordedKinds: recordedKinds,
-            unavailableKinds: unavailableKinds,
-            failureDetail: nil
-        )
-        publishRuntimeChange(
-            reason: outcome.isComplete ? "experiment:harness_completed" : "experiment:harness_unavailable"
-        )
-        return outcome
-    }
-
-    @discardableResult
-    public func exportResearchTrace() async -> String? {
-        await bootstrap()
-        let payload = await substrate.exportResearchTrace()
-        let dir = dataRoot
-            .appendingPathComponent("cognition", isDirectory: true)
-            .appendingPathComponent("exports", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        // Second-granularity filenames collapsed repeated Export presses onto
-        // one apparent success. Every completed export needs its own durable
-        // artifact; retention owns the resulting bounded set.
-        let path = dir.appendingPathComponent(
-            "cognitive-research-\(Int(Date().timeIntervalSince1970))-\(UUID().uuidString.lowercased()).json"
-        )
-        do {
-            try await SwiftNativePersistenceCore().writeJSON(payload, to: path)
-            Self.trimResearchExports(in: dir, keeping: 20, preserving: path)
-            lastResearchExportPath = path.path
-            publishRuntimeChange(reason: "experiment:trace_exported")
-            return path.path
-        } catch {
-            await substrate.recordReceipt(
-                kind: "observatory.export_failed",
-                payload: .object(["error": .string(String(describing: error))])
-            )
-            return nil
-        }
-    }
-
-    nonisolated private static func trimResearchExports(
-        in directory: URL,
-        keeping limit: Int,
-        preserving freshlyWrittenPath: URL
-    ) {
-        guard let files = try? FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else { return }
-        let preservedPath = freshlyWrittenPath.standardizedFileURL.path
-        let exports = files
-            .filter { $0.lastPathComponent.hasPrefix("cognitive-research-") && $0.pathExtension == "json" }
-            .sorted {
-                let leftIsPreserved = $0.standardizedFileURL.path == preservedPath
-                let rightIsPreserved = $1.standardizedFileURL.path == preservedPath
-                if leftIsPreserved != rightIsPreserved { return leftIsPreserved }
-                let left = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                let right = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                return left > right
-            }
-        guard exports.count > limit else { return }
-        for stale in exports.dropFirst(limit) { try? FileManager.default.removeItem(at: stale) }
-    }
-
-
     /// True from chat-turn admission through terminal settlement, counted by
     /// runId. Internal microcycles are not turns and do not hold her free time.
-    public var liveTurnInFlight: Bool {  // internal for actor extensions
+    public var liveTurnInFlight: Bool {
         liveTurnLatchCount() > 0
     }
 
-    /// The lane a gate reason belongs to, for the conserve starvation floor.
-    /// Reasons are shaped `<lane>:<class>` ("transcript_aging:reflection",
-    /// "studio_encounter:reflection"); the lane is what gets its own floor, so
-    /// one busy lane cannot consume another's pass.
-
-
-    static func loadConfiguration(  // internal for actor extensions (move-only Wave C)
-        defaults: UserDefaults = .standard,
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> CognitiveConfiguration {
-        let env = environment
-        let enabled = (defaults.object(forKey: enabledKey) == nil
-            || defaults.bool(forKey: enabledKey))
-            || env["NATIVE_AGENT_COGNITION_ENABLED"] == "1"
-        let capsuleEnabled = enabled && (
-            defaults.object(forKey: capsuleKey) as? Bool ?? true
-        )
-        let backgroundEnabled = enabled && (
-            defaults.object(forKey: backgroundKey) as? Bool ?? true
-        )
-        // User, 2026-10-04: the personality ships on, reflection included; off is a choice.
-        let reflectionEnabled = enabled && (
-            defaults.object(forKey: reflectionKey) as? Bool ?? true
-                || env["NATIVE_AGENT_COGNITION_REFLECTION_ENABLED"] == "1"
-        )
-        // The old daily quota is now the HARD cost ceiling per rolling 24h —
-        // same number, so nothing spends more by default; admission is load.
-        let budgetDefault = reflectionEnabled ? 2 : 0
-        let storedBudget = defaults.object(forKey: reflectionBudgetKey) as? Int
-        let budget = max(0, storedBudget ?? budgetDefault)
-        let storedLoadThreshold = defaults.object(forKey: reflectionLoadThresholdKey) as? Double
-        return CognitiveConfiguration(
-            enabled: enabled,
-            persistenceEnabled: enabled,
-            capsuleInjectionEnabled: capsuleEnabled,
-            backgroundMicrocyclesEnabled: backgroundEnabled,
-            reflectiveCallsEnabled: reflectionEnabled,
-            maximumActiveNodes: 256,
-            defaultDecayHalfLife: 60 * 60,
-            maximumCapsuleCharacters: 4_000,
-            maximumWorkspaceItems: 12,
-            dailyReflectionCallBudget: budget,
-            reflectionLoadThreshold: storedLoadThreshold ?? CognitiveConfiguration().reflectionLoadThreshold,
-            reflectionSurface: "cognition_reflection",
-            reflectionReasoningEffort: "high"
-        )
-    }
-
-    nonisolated static func organismConfigurationForLaunch(
-        dataRoot: URL,
-        environment: [String: String] = ProcessInfo.processInfo.environment,
-        storedEnabled: Bool? = nil,
-        storedSubconsciousEnabled: Bool? = nil,
-        defaults: UserDefaults = .standard
-    ) -> OrganismConfiguration {
-        if NativeAgentPublicSafety.shouldForceNeutralOrganism(dataRoot: dataRoot, environment: environment) {
-            return .disabled
-        }
-        let explicitOrganism = storedEnabled
-            ?? (defaults.object(forKey: organismKernelEnabledKey) as? Bool)
-        let subconsciousMaster = storedSubconsciousEnabled
-            ?? (defaults.object(forKey: enabledKey) as? Bool)
-        let enabled = (explicitOrganism ?? subconsciousMaster ?? false)
-            || environment["NATIVE_AGENT_ORGANISM_KERNEL_ENABLED"] == "1"
-        return OrganismConfiguration(enabled: enabled)
-    }
-
-    private static func loadOrganismConfiguration(
-        dataRoot: URL,
-        defaults: UserDefaults = .standard
-    ) -> OrganismConfiguration {
-        reconcileOrganismPreferenceForLaunch(dataRoot: dataRoot, defaults: defaults)
-    }
-
-    /// Existing installs can predate the organism preference while already
-    /// having the Subconscious master enabled. Inherit that master exactly
-    /// once. An explicit organism choice always wins, and public clean-room
-    /// safety remains authoritative before onboarding.
-    nonisolated static func reconcileOrganismPreferenceForLaunch(
-        dataRoot: URL,
-        environment: [String: String] = ProcessInfo.processInfo.environment,
-        defaults: UserDefaults = .standard
-    ) -> OrganismConfiguration {
-        let storedOrganism = defaults.object(forKey: organismKernelEnabledKey) as? Bool
-        let storedMaster = defaults.object(forKey: enabledKey) as? Bool
-        let configuration = organismConfigurationForLaunch(
-            dataRoot: dataRoot,
-            environment: environment,
-            storedEnabled: storedOrganism,
-            storedSubconsciousEnabled: storedMaster,
-            defaults: defaults
-        )
-        if storedOrganism == nil,
-           storedMaster == true,
-           configuration.enabled,
-           !NativeAgentPublicSafety.shouldForceNeutralOrganism(
-               dataRoot: dataRoot,
-               environment: environment
-           ) {
-            defaults.set(true, forKey: organismKernelEnabledKey)
-        }
-        return configuration
-    }
-
-
-    private static func configurationWithoutPersistence(_ configuration: CognitiveConfiguration) -> CognitiveConfiguration {
-        var copy = configuration
-        copy.persistenceEnabled = false
-        return copy
-    }
-
-
-
-    private static let enabledKey = "cognitiveSubstrateEnabled"
-    private static let capsuleKey = "cognitiveSubstrateCapsuleEnabled"
-    private static let backgroundKey = "cognitiveSubstrateBackgroundEnabled"
-    private static let reflectionKey = "cognitiveSubstrateReflectionEnabled"
-    /// Phase 5 D: the opinions-and-interests experiment, default on.
-    private static let reflectionBudgetKey = "cognitiveSubstrateDailyReflectionBudget"
-    /// Unresolved-load admission threshold for spontaneous reflection. No UI
-    /// knob: the ceiling is what User steers; this is the shape's tuning seam.
-    private static let reflectionLoadThresholdKey = "cognitiveSubstrateReflectionLoadThreshold"
-    static let organismKernelEnabledKey = "organismKernelEnabled"  // internal for actor extensions (move-only Wave C)
-}
-
-/// The source epoch belongs to this readout, publication ordering to L0's
-/// LatestRead. No projection helper is ever launched from a view render.
-private actor GrowthWeekProjection {
-    private let faces: Task<PartFaces, Never>
-    private var previous: JSONValue?
-    private var epoch: UInt64 = 0
-
-    init(dataRoot: URL, host: any CognitionHost) {
-        faces = Task { @MainActor in
-            PartFaces(dataRoot: dataRoot) { id, input, version in
-                await host.readoutFace(id: id, input: input, version: version, dataRoot: dataRoot)
-            }
-        }
-    }
-
-    func read(_ input: JSONValue) async -> PartFaceSnapshot {
-        // Native window membership is in the frozen packet. An unchanged
-        // read reuses the face; an edited part invalidates it through L0.
-        if input != previous { epoch += 1; previous = input }
-        let selectedEpoch = epoch
-        return await faces.value.sourceChanged(id: "growth-week", epoch: selectedEpoch, input: input)
-    }
 }

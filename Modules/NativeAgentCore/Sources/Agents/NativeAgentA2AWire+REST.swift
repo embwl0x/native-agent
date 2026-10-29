@@ -62,7 +62,7 @@ extension AgentContactA2AEndpoint {
                 if segments.count == 3 {
                     if method == "POST", taskID.hasSuffix(":cancel") {
                         taskID = String(taskID.dropLast(7)); operation = "CancelTask"
-                    } else if method == "POST", taskID.hasSuffix(":subscribe") {
+                    } else if method == "GET", taskID.hasSuffix(":subscribe") {
                         taskID = String(taskID.dropLast(10)); operation = "SubscribeToTask"
                     } else if method == "GET" { operation = "GetTask" }
                     else { return Self.restError(code: -32601, message: "Unsupported method") }
@@ -88,8 +88,9 @@ extension AgentContactA2AEndpoint {
                     }
                 } else { return Self.restError(code: -32601, message: "Unknown A2A REST operation") }
             }
-            let request = try JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": "rest", "method": operation, "params": params], options: [.sortedKeys])
-            switch await handle(request, principal: principal, version: version ?? "1.0") {
+            let request: [String: Any] = ["jsonrpc": "2.0", "id": "rest", "method": operation, "params": params]
+            switch await handle(request, byteCount: try JSONSerialization.data(withJSONObject: request, options: [.sortedKeys]).count,
+                                principal: principal, version: version ?? "1.0") {
             case .stream(_, let events, _): return .stream(events)
             case .json(let envelope, let onSent):
                 if let error = envelope["error"] as? [String: Any] {

@@ -65,11 +65,7 @@ public enum NativeAgentICloudBridgeConstants {
     public enum KVSKey {
         public static let newMessageInDrive = "new_msg_in_drive"
         public static let chatProgressLatest = "chat_progress_latest"
-        /// 2026-09-06: in-turn NOTICES (provider reconnects, context
-        /// compaction) get their own latest-value key. They used to share
-        /// `chatProgressLatest` with tool events, and a tool event landing in
-        /// the same KVS sync window silently replaced the notice before the
-        /// phone ever saw it.
+        /// Notices use their own latest-value key so tool progress cannot overwrite them in the same KVS sync.
         public static let chatNoticeLatest = "chat_notice_latest"
     }
 

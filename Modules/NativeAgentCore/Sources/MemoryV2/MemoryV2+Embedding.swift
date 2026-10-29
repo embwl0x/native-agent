@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 #if os(Linux)
 import Glibc
 #else
@@ -10,20 +11,15 @@ import PersistenceCore
 import CoreML
 #endif
 
-// Blueprint: | `MemoryV2+Embedding.swift` | Embedding provider contracts and `CoreMLEmbeddingProvider`: real-model loading, artifact epochs, bounded compiled-model storage and fail-closed availability |
+// Blueprint: | `MemoryV2+Embedding.swift` | Embedding provider contracts and `CoreMLEmbeddingProvider`: real-model loading, artifact epochs, bounded compiled-model storage, fail-closed availability, one batch prediction per embed call |
 
-// MARK: - Phase B: Embedding framework + on-disk store + Swift recaller
+// MARK: - Embedding framework + on-disk store + Swift recaller
 //
-// CARVED OUT OF THIS COMMIT (still Phase B / future):
-//   * Production model packaging must happen outside runtime. NativeAgent does
-//     not shell out to a conversion script while running.
-//   * BERT-style WordPiece subword tokenization: lands with the packaged
-//     .mlpackage. The CoreMLEmbeddingProvider here intentionally throws if
-//     anyone tries to embed without a real model, rather than silently producing
-//     wrong vectors with a stand-in tokenizer.
+// Production model packaging happens outside runtime. bge-large-en-v1.5 and
+// its WordPiece vocabulary ship in Resources/embedding; a data-root copy may
+// supply the same model. Missing or broken assets fail closed by path.
 // Production callers go through SwiftNativeMemoryV2.recall(). When the real
-// .mlpackage is absent the wiring uses the fail-closed/mock test path; once the
-// packaged CoreML model is present the same Swift recaller provides dense recall.
+// model is unavailable, only an explicit mock opt-in permits synthetic vectors.
 
 // MARK: - EmbeddingProvider protocol
 
@@ -64,13 +60,7 @@ public extension EmbeddingProvider {
 }
 
 // MARK: - MockEmbeddingProvider
-//
-// Deterministic synthetic embeddings: same input text always produces the same
-// 384-d vector, and different inputs produce different vectors with very high
-// probability (FNV-1a hash seeds a LCG that fills the vector, then L2-normalize).
-//
-// Useful for tests and for any forward-compat path that wants the embedding
-// framework to be exercisable before the real Core ML model is packaged.
+// Explicit synthetic provider: FNV-1a seeds xorshift64*, then L2 normalization.
 public struct MockEmbeddingProvider: EmbeddingProvider {
     public let dimensions: Int
     public let modelId: String = "mock"
@@ -97,16 +87,6 @@ public struct MockEmbeddingProvider: EmbeddingProvider {
         texts.map { Self.vector(for: $0, dim: dimensions) }
     }
 
-    private static func fnv1a64(_ s: String) -> UInt64 {
-        var hash: UInt64 = 0xcbf29ce484222325
-        let prime: UInt64 = 0x100000001b3
-        for byte in s.utf8 {
-            hash ^= UInt64(byte)
-            hash = hash &* prime
-        }
-        return hash
-    }
-
     private static func vector(for text: String, dim: Int) -> [Float] {
         var state = fnv1a64(text)
         if state == 0 { state = 0x9E3779B97F4A7C15 }
@@ -130,21 +110,12 @@ public struct MockEmbeddingProvider: EmbeddingProvider {
 }
 
 // MARK: - FailClosedEmbeddingProvider
-//
-// Throws on every `embed()` call with a canonical NativeAgentMemoryV2 / -100
-// error. Replaces the prior "silently fall back to MockEmbeddingProvider"
-// pattern in production wiring: random vectors looked successful while
-// making memory recall return noise, which the user only noticed via degraded
-// quality, not visible failure. Now the failure is loud and the caller's
-// own error path (refuse to write the migration sentinel; surface to UI;
-// retry on next launch) takes over. The dimensions / modelId fields stay
-// populated so callers that inspect provider metadata before calling
-// embed() (e.g. status panels) don't crash; only embed() throws.
+// Metadata remains readable; every embed call reports the unavailable search model.
 public struct FailClosedEmbeddingProvider: EmbeddingProvider {
     public let dimensions: Int
     public let modelId: String = "fail-closed"
 
-    public init(dimensions: Int = 384) {
+    public init(dimensions: Int = CoreMLEmbeddingProvider.bundledDimensions) {
         self.dimensions = dimensions
     }
 
@@ -166,24 +137,17 @@ public struct FailClosedEmbeddingProvider: EmbeddingProvider {
     public func embed(_ texts: [String]) async throws -> [[Float]] {
         throw MemoryStorageError.searchFailure("The memory search model is unavailable.",
             code: "memory_search_model_unavailable",
-            instruction: "Tell the person: NativeAgent's bundled MiniLM search model is unavailable; read Doctor for the model failure.")
+            instruction: "Tell the person: NativeAgent's bge-large-en-v1.5 search model is unavailable; read Doctor for the model file and failure.")
     }
 }
 
 // MARK: - CoreMLEmbeddingProvider
 //
-// Validates the on-disk model URL, compiles source models when needed, and
-// loads the Core ML model and WordPiece vocabulary. Initialization throws if
-// either cannot load. embed() tokenizes text, runs inference, and normalizes
-// sentence vectors; unavailable inference or unusable output throws rather
-// than returning placeholder vectors.
+// Require a loaded Core ML model and WordPiece vocabulary; inference failures and unusable output throw.
 public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendable {
     public static let allowedModelExtensions: Set<String> = ["mlpackage", "mlmodelc", "mlmodel"]
-    private static let bundledEpochLock = NSLock()
-    nonisolated(unsafe) private static var cachedDefaultBundledEpoch: MemoryEmbeddingEpoch?
-    // 2026-09-22: digest kept apart from epoch so init (own id/dims) can share
-    // the hash without handing bundledEmbeddingEpoch an epoch it did not build.
-    nonisolated(unsafe) private static var cachedExtrasEpoch: (fingerprint: String, digest: String, epoch: MemoryEmbeddingEpoch?)?
+    // Share the artifact digest independently of each provider's epoch parameters.
+    private static let cachedExtrasEpoch = Mutex<(fingerprint: String, digest: String, epoch: MemoryEmbeddingEpoch?)?>(nil)
 
     /// Cheap change detector for an installed extras model: every file under
     /// the package plus the manifest and vocab, as relative path, size and
@@ -194,7 +158,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
             let attrs = (try? fm.attributesOfItem(atPath: url.path)) ?? [:]
             let size = (attrs[.size] as? NSNumber)?.int64Value ?? -1
             let mtime = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
-            let rel = url.path.hasPrefix(base.path) ? String(url.path.dropFirst(base.path.count)) : url.path
+            let rel = NativeAgentWorkspaceRoot.relativePath(url.path, under: base.path).map { $0.isEmpty || base.path == "/" ? $0 : "/" + $0 } ?? url.path
             return "\(rel)|\(size)|\(mtime)"
         }
         var lines: [String] = [stamp(installed.vocabURL, relativeTo: installed.modelURL.deletingLastPathComponent()),
@@ -212,41 +176,29 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     public let modelId: String
     public let embeddingEpoch: MemoryEmbeddingEpoch
     private let modelURL: URL
-    private let modelLoaded: Bool
-    private let tokenizer: WordPieceTokenizer?
+    private let tokenizer: WordPieceTokenizer
     private let maxSeqLength: Int
-    /// The sentence-embedding model shipped in the MemoryV2 resource bundle as
-    /// `minilm.mlpackage` (+ `minilm_vocab.txt`). The resource slot keeps its
-    /// historical name because `config/embeddings.json::backend` values and
-    /// the extras path reference it; the model inside is named here, and this
-    /// id is part of the embedding epoch, so changing the file and this string
-    /// together is what moves every stored vector to the new space.
-    public static let bundledModelID = "all-MiniLM-L6-v2"
+    /// The one production embedding model, shipped in Resources/embedding.
+    public static let bundledModelID = "bge-large-en-v1.5"
+    public static let bundledDimensions = 1024
     #if canImport(CoreML) && !os(Linux)
-    private let mlModel: MLModel?
+    private let mlModel: MLModel
     #endif
 
     /// The embedding model always uses CPU + Neural Engine, never the GPU.
     #if canImport(CoreML) && !os(Linux)
-    public static func modelConfiguration() -> MLModelConfiguration? {
+    public static func modelConfiguration() -> MLModelConfiguration {
         let configuration = MLModelConfiguration()
-        // 2026-10-01: off the GPU. MiniLM compiling GPU pipelines at launch
-        // was caught alongside SwiftUI's RenderBox aborting on its own Metal
-        // library load; the Neural Engine runs this model just as well.
         configuration.computeUnits = .cpuAndNeuralEngine
         return configuration
     }
 
-    private static func loadModel(at url: URL, configuration: MLModelConfiguration?) throws -> MLModel {
-        guard let configuration else { return try MLModel(contentsOf: url) }
-        return try MLModel(contentsOf: url, configuration: configuration)
-    }
     #endif
 
     public init(
         modelURL: URL,
         vocabURL: URL? = nil,
-        dimensions: Int = 384,
+        dimensions: Int = CoreMLEmbeddingProvider.bundledDimensions,
         modelId: String = CoreMLEmbeddingProvider.bundledModelID,
         maxSeqLength: Int = 128
     ) throws {
@@ -264,22 +216,16 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         guard FileManager.default.fileExists(atPath: modelURL.path) else {
             throw EmbeddingError.modelNotFound(path: modelURL.path)
         }
-        // 2026-09-22 WHY: launch hashed the 637 MB package here and again in
-        // bundledEmbeddingEpoch; both now share its fingerprint-keyed digest.
         let modelArtifactDigest: String
         let fingerprint = vocabURL.map { Self.extrasFingerprint(InstalledExtrasModel(
             modelURL: modelURL, vocabURL: $0, modelID: modelId, dimensions: dimensions)) }
-        Self.bundledEpochLock.lock()
-        let cachedDigest = Self.cachedExtrasEpoch.flatMap { $0.fingerprint == fingerprint ? $0.digest : nil }
-        Self.bundledEpochLock.unlock()
+        let cachedDigest = Self.cachedExtrasEpoch.withLock { $0.flatMap { $0.fingerprint == fingerprint ? $0.digest : nil } }
         if let cachedDigest {
             modelArtifactDigest = cachedDigest
         } else {
             modelArtifactDigest = try Self.modelArtifactDigest(modelURL: modelURL)
             if let fingerprint {
-                Self.bundledEpochLock.lock()
-                Self.cachedExtrasEpoch = (fingerprint, modelArtifactDigest, nil)
-                Self.bundledEpochLock.unlock()
+                Self.cachedExtrasEpoch.withLock { $0 = (fingerprint, modelArtifactDigest, nil) }
             }
         }
         self.embeddingEpoch = try Self.epoch(
@@ -292,22 +238,10 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         )
 
         #if canImport(CoreML) && !os(Linux)
-        // F2: .mlpackage cannot be loaded by MLModel(contentsOf:) directly —
-        // it must be compiled to .mlmodelc first. The CoreMLEmbedderTests
-        // parity harness already calls MLModel.compileModel(at:) for the same
-        // reason. Mirror that here: compile .mlpackage on first init, cache
-        // the compiled artifact in tmp so subsequent boots skip the compile,
-        // and load the .mlmodelc result. .mlmodelc inputs skip compile.
-        //
-        // SELF-HEALING (2026-07-12, User's broken-panel incident): an install
-        // restarting the app can race two processes through this cache — the
-        // dying one mid-compile, the new one trusting a half-written slot by
-        // mtime. A cache-load failure therefore wipes the slot and recompiles
-        // ONCE from the pristine bundled .mlpackage before giving up, and the
-        // real underlying error is preserved instead of swallowed.
+        // Compile .mlpackage inputs into the durable cache before loading.
+        // A package load failure wipes that cache and recompiles once; retain the final cause.
         var loadedModel: MLModel?
         var loadFailure: Error?
-        // A5.4: nil configuration == the untouched CoreML default path.
         let configuration = Self.modelConfiguration()
         do {
             let urlToLoad: URL
@@ -319,7 +253,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
             } else {
                 urlToLoad = modelURL
             }
-            loadedModel = try Self.loadModel(at: urlToLoad, configuration: configuration)
+            loadedModel = try MLModel(contentsOf: urlToLoad, configuration: configuration)
         } catch {
             loadFailure = error
             if ext == "mlpackage" {
@@ -329,34 +263,33 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
                         packageURL: modelURL,
                         artifactDigest: modelArtifactDigest
                     )
-                    loadedModel = try Self.loadModel(at: recompiled, configuration: configuration)
+                    loadedModel = try MLModel(contentsOf: recompiled, configuration: configuration)
                     loadFailure = nil
                 } catch {
                     loadFailure = error
                 }
             }
         }
-        self.mlModel = loadedModel
+        var loadedTokenizer: WordPieceTokenizer?
         if let vurl = vocabURL, FileManager.default.fileExists(atPath: vurl.path) {
-            self.tokenizer = try? WordPieceTokenizer(vocabURL: vurl)
-        } else {
-            self.tokenizer = nil
+            do {
+                loadedTokenizer = try WordPieceTokenizer(vocabURL: vurl)
+            } catch {
+                loadFailure = error
+            }
         }
-        self.modelLoaded = (loadedModel != nil && self.tokenizer != nil)
-        #else
-        let loadFailure: Error? = nil
-        self.tokenizer = nil
-        self.modelLoaded = false
-        #endif
-        if !modelLoaded {
-            // Refuse a provider without both model and tokenizer; callers
-            // cannot mistake a valid file path for usable inference.
+        guard let loadedModel, let loadedTokenizer else {
             let underlying = loadFailure.map { " Underlying: \(String(describing: $0))" } ?? ""
-            let missing = (mlModel == nil ? "MLModel" : "WordPiece vocab")
+            let missing = (loadedModel == nil ? "MLModel" : "WordPiece vocab")
             throw EmbeddingError.modelNotLoaded(
                 reason: "CoreMLEmbeddingProvider could not load \(missing) at \(modelURL.path).\(underlying)"
             )
         }
+        self.mlModel = loadedModel
+        self.tokenizer = loadedTokenizer
+        #else
+        throw EmbeddingError.modelNotLoaded(reason: "Core ML is unavailable on this platform.")
+        #endif
     }
 
     private static func epoch(
@@ -395,9 +328,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     }
 
     #if canImport(CoreML) && !os(Linux)
-    /// Remove the cached compiled artifact so the next compileAndCache starts
-    /// from the pristine bundled .mlpackage. Used by the self-healing retry
-    /// above and by the Doctor repair action.
+    /// Remove the package's compiled cache under its cross-process lock.
     public static func wipeCompileCache(packageURL: URL) {
         let base = packageURL.deletingPathExtension().lastPathComponent
         let root = compileCacheRoot()
@@ -411,10 +342,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     #endif
 
     #if canImport(CoreML) && !os(Linux)
-    /// F2: compile an .mlpackage to a durable digest + OS-keyed .mlmodelc slot.
-    /// Publication is atomic under a cross-process flock, so an overlapping app
-    /// restart can never observe a half-written model. Cache-load failure still
-    /// takes the self-healing wipe/recompile path in the initializer above.
+    /// Publish a durable digest/OS-keyed .mlmodelc atomically under a cross-process lock.
     static func compileAndCache(
         packageURL: URL,
         artifactDigest: String,
@@ -440,13 +368,10 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         return try withCompileCacheLock(cacheRoot: root) {
             try fm.createDirectory(at: cacheDir, withIntermediateDirectories: true)
             if fm.fileExists(atPath: cached.path) {
-                // 2026-09-22: prune on a hit too. Pruning only after a compile
-                // left an old OS's 1.3GB folder behind until the next recompile.
-                pruneCompileCache(cacheDir: cacheDir, keeping: cached)
-                pruneOperatingSystemCaches(
-                    modelRoot: cacheDir.deletingLastPathComponent(),
-                    keeping: cacheDir
-                )
+                retainCurrentAndNewest(in: cacheDir, keeping: cached, maximumEntries: 2) { $0.pathExtension == "mlmodelc" }
+                retainCurrentAndNewest(in: cacheDir.deletingLastPathComponent(), keeping: cacheDir, maximumEntries: 1) {
+                    (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+                }
                 return cached
             }
 
@@ -466,11 +391,10 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
                 try? fm.removeItem(at: cached)
             }
             try fm.moveItem(at: staging, to: cached)
-            pruneCompileCache(cacheDir: cacheDir, keeping: cached)
-            pruneOperatingSystemCaches(
-                modelRoot: cacheDir.deletingLastPathComponent(),
-                keeping: cacheDir
-            )
+            retainCurrentAndNewest(in: cacheDir, keeping: cached, maximumEntries: 2) { $0.pathExtension == "mlmodelc" }
+            retainCurrentAndNewest(in: cacheDir.deletingLastPathComponent(), keeping: cacheDir, maximumEntries: 1) {
+                (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            }
             return cached
         }
     }
@@ -519,22 +443,22 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         return String(scalars)
     }
 
-    static func pruneCompileCache(
-        cacheDir: URL,
+    /// Keep the current path first, then the newest candidates; two artifacts protect another process's pending load.
+    static func retainCurrentAndNewest(
+        in directory: URL,
         keeping current: URL,
-        // Two, not one: another process may hold the previous URL between
-        // compileAndCache and MLModel(contentsOf:). Old-OS dirs prune to one.
-        maximumEntries: Int = 2,
-        fileManager fm: FileManager = .default
+        maximumEntries: Int,
+        fileManager fm: FileManager = .default,
+        matching predicate: (URL) -> Bool
     ) {
         guard maximumEntries > 0,
               let entries = try? fm.contentsOfDirectory(
-                at: cacheDir,
+                at: directory,
                 includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey],
                 options: [.skipsHiddenFiles]
               )
         else { return }
-        let candidates = entries.filter { $0.pathExtension == "mlmodelc" }
+        let candidates = entries.filter(predicate)
             .sorted {
                 if $0.standardizedFileURL == current.standardizedFileURL { return true }
                 if $1.standardizedFileURL == current.standardizedFileURL { return false }
@@ -543,33 +467,6 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
                 return lhs > rhs
             }
         for stale in candidates.dropFirst(maximumEntries) {
-            try? fm.removeItem(at: stale)
-        }
-    }
-
-    static func pruneOperatingSystemCaches(
-        modelRoot: URL,
-        keeping current: URL,
-        maximumEntries: Int = 1,
-        fileManager fm: FileManager = .default
-    ) {
-        guard maximumEntries > 0,
-              let entries = try? fm.contentsOfDirectory(
-                at: modelRoot,
-                includingPropertiesForKeys: [.contentModificationDateKey, .isDirectoryKey],
-                options: [.skipsHiddenFiles]
-              )
-        else { return }
-        let directories = entries.filter {
-            (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
-        }.sorted {
-            if $0.standardizedFileURL == current.standardizedFileURL { return true }
-            if $1.standardizedFileURL == current.standardizedFileURL { return false }
-            let lhs = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            let rhs = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            return lhs > rhs
-        }
-        for stale in directories.dropFirst(maximumEntries) {
             try? fm.removeItem(at: stale)
         }
     }
@@ -589,40 +486,25 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
     }
     #endif
 
-    /// Bundle-resolved factory. Looks up `minilm.mlpackage` and
-    /// `minilm_vocab.txt` inside the given bundle (defaults to
-    /// `Bundle.module`, which is the MemoryV2 target's resource bundle).
-    public static func bundled(
-        _ bundle: Bundle? = nil,
-        extrasRoot: URL? = nil
-    ) throws -> CoreMLEmbeddingProvider {
-        if let installed = try installedExtrasModel(root: extrasRoot) {
-            return try CoreMLEmbeddingProvider(
-                modelURL: installed.modelURL,
-                vocabURL: installed.vocabURL,
-                dimensions: installed.dimensions,
-                modelId: installed.modelID
-            )
-        }
-        let resolved = bundle ?? installedAppFallbackBundle() ?? Bundle.module
-        guard let url = resolved.url(forResource: "minilm", withExtension: "mlpackage") else {
-            throw EmbeddingError.modelNotFound(path: "Bundle.module/minilm.mlpackage")
-        }
-        let vocab = resolved.url(forResource: "minilm_vocab", withExtension: "txt")
-        return try CoreMLEmbeddingProvider(modelURL: url, vocabURL: vocab)
+    /// Resolve bge from the data root or Resources/embedding, then load it.
+    public static func bundled(extrasRoot: URL? = nil) throws -> CoreMLEmbeddingProvider {
+        let installed = try installedExtrasModel(root: extrasRoot)
+        return try CoreMLEmbeddingProvider(
+            modelURL: installed.modelURL,
+            vocabURL: installed.vocabURL,
+            dimensions: installed.dimensions,
+            modelId: installed.modelID
+        )
     }
 
-    /// A larger embedding model installed under `<dataRoot>/extras/coreml/`,
+    /// bge installed under `<dataRoot>/extras/coreml/` or Resources/embedding,
     /// described by `embedding.json` beside it:
     ///
     ///     {"model": "embedding.mlpackage", "vocab": "vocab.txt",
     ///      "model_id": "bge-large-en-v1.5", "dimensions": 1024}
     ///
-    /// User, 2026-09-05: the bundled MiniLM is the floor for every install;
-    /// meaning-based memory is opt-in, so a several-hundred-megabyte model
-    /// lives in extras, never in the app bundle or the repository. When it is
-    /// present it wins over the bundled model; its id and dimensions are part
-    /// of the embedding epoch, so the launch warmup re-embeds the store.
+    /// Its artifacts participate in the embedding epoch; launch convergence
+    /// re-embeds a corpus still in an older vector space.
     public struct InstalledExtrasModel: Sendable, Equatable {
         public let modelURL: URL
         public let vocabURL: URL
@@ -630,15 +512,9 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         public let dimensions: Int
     }
 
-    /// nil only when no `embedding.json` is installed. A manifest that IS
-    /// there but cannot be used throws (S12, 2026-09-26): the configured model
-    /// failing must not quietly hand recall to the bundled MiniLM (which would
-    /// also re-embed the store in MiniLM's space). It fails closed instead, and
-    /// Doctor and the memory status name the reason.
-    public static func installedExtrasModel(root: URL?) throws -> InstalledExtrasModel? {
-        // Where the large model is installed: under the data root, else inside
-        // the app bundle (Resources/embedding). With neither, the bundled
-        // MiniLM is the configured model.
+    /// A present but unusable manifest throws immediately. With neither copy,
+    /// fail by name and path, exactly as for a broken install.
+    public static func installedExtrasModel(root: URL?) throws -> InstalledExtrasModel {
         if let root,
            let installed = try extrasModel(inDirectory: root
                .appendingPathComponent("extras", isDirectory: true)
@@ -649,7 +525,13 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
            let shipped = try extrasModel(inDirectory: resources.appendingPathComponent("embedding", isDirectory: true)) {
             return shipped
         }
-        return nil
+        let shippedManifest = (Bundle.main.resourceURL ?? Bundle.main.bundleURL)
+            .appendingPathComponent("embedding/embedding.json")
+        let dataLocation = root.map { " Also checked \($0.appendingPathComponent("extras/coreml/embedding.json").path)." } ?? ""
+        throw EmbeddingError.installedModelUnusable(
+            manifest: shippedManifest.path,
+            reason: "\(bundledModelID) is missing: embedding.json, embedding.mlpackage and vocab.txt are required.\(dataLocation)"
+        )
     }
 
     /// nil when `dir` has no `embedding.json`; throws when it has one that
@@ -675,6 +557,8 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
               let modelID = object["model_id"] as? String, !modelID.isEmpty,
               let dimensions = object["dimensions"] as? Int, dimensions > 0
         else { throw unusable("embedding.json needs model, vocab, model_id and dimensions") }
+        guard modelID == bundledModelID, dimensions == bundledDimensions
+        else { throw unusable("embedding.json must select \(bundledModelID), \(bundledDimensions) dimensions; found \(modelID), \(dimensions) dimensions") }
         guard !model.contains("/"), !vocab.contains("/")
         else { throw unusable("model and vocab must be file names beside embedding.json") }
         let modelURL = dir.appendingPathComponent(model)
@@ -686,165 +570,99 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         guard FileManager.default.fileExists(atPath: vocabURL.path)
         else { throw unusable("\(vocab) is missing") }
         // Both files must resolve inside the extras directory, symlinks included.
-        let base = dir.resolvingSymlinksInPath().path + "/"
-        guard modelURL.resolvingSymlinksInPath().path.hasPrefix(base),
-              vocabURL.resolvingSymlinksInPath().path.hasPrefix(base)
+        let base = dir.resolvingSymlinksInPath().path
+        guard [modelURL, vocabURL].allSatisfy({ NativeAgentWorkspaceRoot.relativePath($0.resolvingSymlinksInPath().path, under: base)?.isEmpty == false })
         else { throw unusable("\(model) or \(vocab) resolves outside \(dir.path)") }
         return InstalledExtrasModel(modelURL: modelURL, vocabURL: vocabURL, modelID: modelID, dimensions: dimensions)
     }
 
-    public static func bundledEmbeddingEpoch(
-        _ bundle: Bundle? = nil,
-        extrasRoot: URL? = nil
-    ) throws -> MemoryEmbeddingEpoch {
-        if let installed = try installedExtrasModel(root: extrasRoot) {
-            // Hashing a large package is not free; remember it per package
-            // and recompute only when any file in it, the manifest, or the
-            // vocab changes (relative path + size + mtime, recursively — a
-            // directory's own mtime does not move when a child is rewritten).
-            let fingerprint = extrasFingerprint(installed)
-            bundledEpochLock.lock()
-            let cached = cachedExtrasEpoch.flatMap { $0.fingerprint == fingerprint ? $0 : nil }
-            bundledEpochLock.unlock()
-            if let epoch = cached?.epoch { return epoch }
-            let digest = try cached?.digest ?? modelArtifactDigest(modelURL: installed.modelURL)
-            let resolvedEpoch = try epoch(
-                modelURL: installed.modelURL,
-                vocabURL: installed.vocabURL,
-                dimensions: installed.dimensions,
-                modelID: installed.modelID,
-                maximumSequenceLength: 128,
-                modelArtifactDigest: digest
-            )
-            bundledEpochLock.lock()
-            cachedExtrasEpoch = (fingerprint, digest, resolvedEpoch)
-            bundledEpochLock.unlock()
-            return resolvedEpoch
-        }
-        if bundle == nil {
-            bundledEpochLock.lock()
-            let cached = cachedDefaultBundledEpoch
-            bundledEpochLock.unlock()
-            if let cached { return cached }
-        }
-        let resolved = bundle ?? installedAppFallbackBundle() ?? Bundle.module
-        guard let url = resolved.url(forResource: "minilm", withExtension: "mlpackage") else {
-            throw EmbeddingError.modelNotFound(path: "Bundle.module/minilm.mlpackage")
-        }
+    public static func bundledEmbeddingEpoch(extrasRoot: URL? = nil) throws -> MemoryEmbeddingEpoch {
+        let installed = try installedExtrasModel(root: extrasRoot)
+        // Invalidate on recursive file stamps, including manifest and vocabulary changes.
+        let fingerprint = extrasFingerprint(installed)
+        let cached = cachedExtrasEpoch.withLock { $0.flatMap { $0.fingerprint == fingerprint ? $0 : nil } }
+        if let epoch = cached?.epoch { return epoch }
+        let digest = try cached?.digest ?? modelArtifactDigest(modelURL: installed.modelURL)
         let resolvedEpoch = try epoch(
-            modelURL: url,
-            vocabURL: resolved.url(forResource: "minilm_vocab", withExtension: "txt"),
-            dimensions: 384,
-            modelID: bundledModelID,
+            modelURL: installed.modelURL,
+            vocabURL: installed.vocabURL,
+            dimensions: installed.dimensions,
+            modelID: installed.modelID,
             maximumSequenceLength: 128,
-            modelArtifactDigest: try modelArtifactDigest(modelURL: url)
+            modelArtifactDigest: digest
         )
-        if bundle == nil {
-            bundledEpochLock.lock()
-            if let cached = cachedDefaultBundledEpoch {
-                bundledEpochLock.unlock()
-                return cached
-            }
-            cachedDefaultBundledEpoch = resolvedEpoch
-            bundledEpochLock.unlock()
-        }
+        cachedExtrasEpoch.withLock { $0 = (fingerprint, digest, resolvedEpoch) }
         return resolvedEpoch
-    }
-
-    /// Wipe the compile cache for the BUNDLED model (Doctor repair action).
-    /// Resolves the same bundle bundled() would, so callers outside this
-    /// module never need the private bundle-fallback plumbing.
-    public static func wipeBundledCompileCache(_ bundle: Bundle? = nil, extrasRoot: URL? = nil) {
-        #if canImport(CoreML) && !os(Linux)
-        if let installed = try? installedExtrasModel(root: extrasRoot) {
-            wipeCompileCache(packageURL: installed.modelURL)
-        }
-        let resolved = bundle ?? installedAppFallbackBundle() ?? Bundle.module
-        if let pkg = resolved.url(forResource: "minilm", withExtension: "mlpackage") {
-            wipeCompileCache(packageURL: pkg)
-        }
-        #endif
     }
 
     /// Cheap bundle-resource probe used by Settings/status. This intentionally
     /// does not compile or load the CoreML model, so merely opening Settings
     /// cannot pull the model into memory.
-    /// False when an installed model's manifest is unusable — the MiniLM floor
-    /// being present does not make a broken configured model available.
-    public static func bundledResourcesAvailable(_ bundle: Bundle? = nil, extrasRoot: URL? = nil) -> Bool {
+    public static func bundledResourcesAvailable(extrasRoot: URL? = nil) -> Bool {
         do {
-            if try installedExtrasModel(root: extrasRoot) != nil { return true }
+            _ = try installedExtrasModel(root: extrasRoot)
+            return true
         } catch {
             return false
         }
-        return bundledFloorResourcesAvailable(bundle)
     }
 
-    /// The shipped MiniLM floor ONLY, ignoring any installed extras model.
-    /// Doctor reports both, so "the embedder loads" can never hide which model
-    /// actually loaded (Agent, 2026-09-06).
-    public static func bundledFloorResourcesAvailable(_ bundle: Bundle? = nil) -> Bool {
-        let resolved = bundle ?? installedAppFallbackBundle() ?? Bundle.module
-        return resolved.url(forResource: "minilm", withExtension: "mlpackage") != nil
-            && resolved.url(forResource: "minilm_vocab", withExtension: "txt") != nil
-    }
-
-    /// 2026-06-07 task #88: installed-app shape fallback.
-    ///
-    /// SPM synthesizes `Bundle.module` to look for `<Pkg>_<Tgt>.bundle` at
-    /// `Bundle.main.bundleURL` (next to Contents/) — that's the .build/
-    /// layout. For a codesigned macOS .app, putting `.bundle` directories
-    /// at the .app top level breaks the strict codesign bundle-layout
-    /// check, so the only safe staging location is `Contents/Resources/`.
-    /// This fallback returns a Bundle pointed at
-    /// `Contents/Resources/NativeAgentCore_MemoryV2.bundle` when that
-    /// directory exists; nil otherwise (dev builds fall through to
-    /// Bundle.module's hardcoded .build/ path).
-    private static func installedAppFallbackBundle() -> Bundle? {
-        let mainResources = Bundle.main.bundleURL
-            .appendingPathComponent("Contents", isDirectory: true)
-            .appendingPathComponent("Resources", isDirectory: true)
-        let stagedPath = mainResources
-            .appendingPathComponent("NativeAgentCore_MemoryV2.bundle", isDirectory: true)
-            .path
-        guard FileManager.default.fileExists(atPath: stagedPath) else { return nil }
-        return Bundle(path: stagedPath)
+    /// The shadow check must not infer absence from a clipped sentence. This
+    /// reads the already-loaded tokenizer's exact window, without inference.
+    func coversCompleteTexts(_ texts: [String]) -> Bool {
+        texts.allSatisfy { tokenizer.encode($0, maxLength: maxSeqLength).isComplete }
     }
 
     public func embed(_ texts: [String]) async throws -> [[Float]] {
+        try await embed(texts.map { tokenizer.encode($0, maxLength: maxSeqLength) })
+    }
+
+    func embedCompleteTexts(_ texts: [String]) async throws -> [[Float]]? {
+        let encoded = texts.map { tokenizer.encode($0, maxLength: maxSeqLength) }
+        guard encoded.allSatisfy({ $0.isComplete }) else { return nil }
+        return try await embed(encoded)
+    }
+
+    private func embed(_ encoded: [(inputIds: [Int], attentionMask: [Int], isComplete: Bool)]) async throws -> [[Float]] {
         #if canImport(CoreML) && !os(Linux)
-        guard let model = mlModel, let tok = tokenizer else {
-            throw EmbeddingError.modelNotLoaded(reason: "model or tokenizer missing")
-        }
-        var results: [[Float]] = []
-        results.reserveCapacity(texts.count)
-        for text in texts {
-            let (ids, mask) = tok.encode(text, maxLength: maxSeqLength)
+        // Predict every text in one call as a single batch.
+        var inputs: [MLFeatureProvider] = []
+        var masks: [[Int]] = []
+        inputs.reserveCapacity(encoded.count)
+        for (ids, mask, _) in encoded {
             let inputArr = try MLMultiArray(shape: [1, NSNumber(value: maxSeqLength)], dataType: .int32)
             let maskArr = try MLMultiArray(shape: [1, NSNumber(value: maxSeqLength)], dataType: .int32)
             for i in 0..<maxSeqLength {
                 inputArr[i] = NSNumber(value: i < ids.count ? Int32(ids[i]) : 0)
                 maskArr[i] = NSNumber(value: i < mask.count ? Int32(mask[i]) : 0)
             }
-            // Try standard MiniLM CoreML input names. If the model rejects
-            // them we surface modelNotLoaded — under the fail-closed contract
-            // that propagates up to the caller as an embed() error unless the
-            // user explicitly opted into mock vectors.
-            let provider: MLFeatureProvider
             do {
-                provider = try MLDictionaryFeatureProvider(dictionary: [
+                inputs.append(try MLDictionaryFeatureProvider(dictionary: [
                     "input_ids": MLFeatureValue(multiArray: inputArr),
                     "attention_mask": MLFeatureValue(multiArray: maskArr),
-                ])
+                ]))
             } catch {
                 throw EmbeddingError.modelNotLoaded(reason: "could not build input feature provider: \(error)")
             }
-            let out: MLFeatureProvider
-            do {
-                out = try await model.prediction(from: provider)
-            } catch {
-                throw EmbeddingError.modelNotLoaded(reason: "CoreML prediction failed: \(error)")
-            }
+            masks.append(mask)
+        }
+        guard !inputs.isEmpty else { return [] }
+        let outputs: MLBatchProvider
+        do {
+            outputs = try await mlModel.predictions(
+                from: MLArrayBatchProvider(array: inputs), options: MLPredictionOptions()
+            )
+        } catch {
+            throw EmbeddingError.modelNotLoaded(reason: "CoreML prediction failed: \(error)")
+        }
+        guard outputs.count == inputs.count else {
+            throw EmbeddingError.modelNotLoaded(reason: "CoreML returned \(outputs.count) predictions for \(inputs.count) inputs")
+        }
+        var results: [[Float]] = []
+        results.reserveCapacity(encoded.count)
+        for index in 0..<outputs.count {
+            let out = outputs.features(at: index)
+            let mask = masks[index]
             // Take the first multiarray output and mean-pool over the token
             // dimension when shape is [1, seq, dim]; if it's already [1, dim]
             // (pooled output), use it as-is.
@@ -861,7 +679,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
         }
         return results
         #else
-        _ = texts
+        _ = encoded
         throw EmbeddingError.modelNotLoaded(reason: "CoreML unavailable on this platform")
         #endif
     }
@@ -892,10 +710,7 @@ public final class CoreMLEmbeddingProvider: EmbeddingProvider, @unchecked Sendab
             if denom > 0 { for d in 0..<dim { sum[d] /= denom } }
             return l2norm(sum)
         }
-        // Unexpected shape (model/config dimension skew): fail closed. The
-        // old fallback flat-took the first `dim` floats — a valid-looking
-        // garbage vector that poisons recall silently, exactly what this
-        // file's fail-closed doctrine forbids (audit 2026-06-09).
+        // Reject unexpected output shapes rather than constructing an unusable vector.
         return nil
     }
 

@@ -1,30 +1,15 @@
 import Foundation
 
-// Blueprint: | `InboxDigestGroupProjection.swift` | `InboxDigestGroupProjection`: read-only platform inbox adapter preferring structured groups over legacy prose |
-
-/// Read-only adapter to each platform's persisted inbox model.
-public protocol InboxDigestItem {
-    associatedtype RelatedGroup: InboxDigestGroup
-    var id: String { get }
-    var title: String { get }
-    var source: String { get }
-    var detail: String? { get }
-    var related_groups: [RelatedGroup]? { get }
-}
-
-/// Construction boundary that leaves group model ownership with each platform.
-public protocol InboxDigestGroup {
-    init(id: String, title: String, count: Int, item_ids: [String]?, source: String?)
-}
+// Blueprint: | `InboxDigestGroupProjection.swift` | `InboxDigestGroups`: read-only platform inbox adapter preferring structured groups over legacy prose |
 
 /// Structured digest groups take precedence over the legacy JSONL prose format.
-public enum InboxDigestGroupProjection {
-    public static func groups<Item: InboxDigestItem>(item: Item, allItems: [Item]) -> [Item.RelatedGroup] {
+public enum InboxDigestGroups {
+    public static func groups(item: InboxItemRecord, allItems: [InboxItemRecord]) -> [InboxRelatedGroup] {
         if let groups = item.related_groups, !groups.isEmpty { return groups }
         return legacyGroups(item: item, allItems: allItems)
     }
 
-    public static func legacyGroups<Item: InboxDigestItem>(item: Item, allItems: [Item]) -> [Item.RelatedGroup] {
+    public static func legacyGroups(item: InboxItemRecord, allItems: [InboxItemRecord]) -> [InboxRelatedGroup] {
         guard (item.source == "autonomy_maintenance:inbox_digest"
                 || item.source.hasPrefix("proactive_autonomy:inbox_digest:")),
               let detail = item.detail,
@@ -34,7 +19,7 @@ public enum InboxDigestGroupProjection {
         guard let start = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespacesAndNewlines) == "Top groups:" }) else {
             return []
         }
-        var groups: [Item.RelatedGroup] = []
+        var groups: [InboxRelatedGroup] = []
         for rawLine in lines.dropFirst(start + 1) {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
             if line.isEmpty { continue }
@@ -44,7 +29,7 @@ public enum InboxDigestGroupProjection {
             let matchingIDs = allItems
                 .filter { $0.id != item.id && $0.title == parsed.title }
                 .map(\.id)
-            groups.append(Item.RelatedGroup(
+            groups.append(InboxRelatedGroup(
                 id: "digest-\(groups.count)-\(parsed.title)",
                 title: parsed.title,
                 count: parsed.count,

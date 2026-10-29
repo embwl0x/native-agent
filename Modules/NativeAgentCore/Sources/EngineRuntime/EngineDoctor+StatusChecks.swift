@@ -20,7 +20,7 @@ extension DoctorFacade {
         let desk = await deskCheck(approvals: approvals, root: root, repair: repairDesk, stuckReason: stuckReason, safeDetail: safeDetail)
         let activity = await activityCheck(root: root, safeDetail: safeDetail)
         let rows = [desk.row, activity]
-        await DoctorStatusProjection.recordReadings(rows, dataRoot: root)
+        await DoctorReadout.recordReadings(rows, dataRoot: root)
         return (rows, desk.repaired)
     }
 
@@ -110,18 +110,14 @@ extension DoctorFacade {
         let id = "status.activity"
         let title = "Recent activity"
         do {
-            let readout = try await RuntimeReadProjection.getActivityReadout(root: root)
+            let readout = try await RuntimeReadouts.getActivityReadout(root: root)
             let cutoff = Date().addingTimeInterval(-15 * 60)
-            let formatter = ISO8601DateFormatter()
-            let fractionalFormatter = ISO8601DateFormatter()
-            fractionalFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
             // A later receipt or an age cutoff cannot reconcile an unknown effect.
             let reconciliation = readout.records.filter(\.needsReconciliation)
             let current = readout.records.filter { record in
                 guard !record.needsReconciliation,
                       ["fail", "failed", "error"].contains(record.event.status.lowercased()),
-                      let date = fractionalFormatter.date(from: record.event.createdAt)
-                        ?? formatter.date(from: record.event.createdAt) else { return false }
+                      let date = NativeTimestampFormat.parseISO8601FractionalFirst(record.event.createdAt) else { return false }
                 return date >= cutoff && date <= Date().addingTimeInterval(60)
             }
             let malformed = readout.malformedRowCount

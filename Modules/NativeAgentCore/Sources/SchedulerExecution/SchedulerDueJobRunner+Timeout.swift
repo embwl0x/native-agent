@@ -1,16 +1,13 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SchedulerDueJobRunner+Timeout.swift` | `SchedulerDueJobRunner`: `jobTimeoutSeconds`, `executeWithTimeout` |
+// Blueprint: | `SchedulerDueJobRunner+Timeout.swift` | `SchedulerDueJobRunner`: `jobTimeoutSeconds`, `executeWithTimeout`; retains the actual body task and its returned result through stopped settlement |
 
 // MARK: - Per-job timeouts
 //
-// Before this seam a single hung job body (a wedged NativeClient call inside
-// execute(job:now:)) kept `running == true` and blocked every later due row for
-// the lifetime of the process. Each job now races its body against a deadline;
-// on timeout the body is cancelled cooperatively, the job is marked failed with
-// an explicit timeout receipt, and the pass STOPS. The runner refuses a new
-// pass until the timed-out body has actually exited.
+// A deadline requests cancellation; settlement joins the body before the
+// timeout receipt records its returned result and channel outcomes.
+// The enclosing managed-loop deadline bounds its caller while this body drains.
 //
 // FAIL LOUD, no retry: a timed-out job records status "error" with
 // failureKind == "job_timeout" and a stderr line — it is never silently retried
@@ -24,35 +21,37 @@ extension SchedulerDueJobRunner {
 
     static func jobTimeoutSeconds(forKind kind: String) -> Double {
         switch kind {
-        case "dream", "rem", "improve", "harness_benchmark":
+        case "dream", "rem", "harness_benchmark", "turn":
             return longJobTimeoutSeconds
         default:
             return defaultJobTimeoutSeconds
         }
     }
 
-    /// Run `execute(job:now:)` under the kind's deadline and always return a
-    /// JobResult (never throws). A thrown job error maps to the SAME error
-    /// receipt the pre-timeout call site produced; a blown deadline maps to a
-    /// distinct loud timeout receipt.
+    /// Run `execute(job:)` under the kind's deadline and return a JobResult.
+    /// Job errors and deadline expiry retain distinct error receipts.
     ///
-    /// Cancellation of the timed-out body: on deadline the body Task is
-    /// `cancel()`ed cooperatively and the caller-facing race resolves promptly.
-    /// A body-exit hook separately owns its real lifecycle: until that hook
-    /// fires, `inFlightJobBodies` keeps every later scheduler pass quarantined.
-    /// This preserves the deadline without allowing a non-cooperative loser to
-    /// overlap another scheduled effect.
-    func executeWithTimeout(job: DueJob, now: Date) async -> JobResult {
+    /// The race requests cancellation promptly. This method then joins actual
+    /// body exit before building a stopped result from its returned output and
+    /// receipts.
+    /// The manager may bound its own wait, but retains this body and prevents
+    /// another scheduled effect from overlapping it until settlement completes.
+    func executeWithTimeout(job: DueJob) async -> JobResult {
+        defer { notificationOutcomes.removeValue(forKey: job.occurrenceKey) }
         let seconds = Self.jobTimeoutSeconds(forKind: job.kind)
-        inFlightJobBodies += 1
-        let outcome = await raceAgainstTimeout(
-            seconds: seconds,
-            onBodyExit: { [weak self] in
-                Task { await self?.scheduledJobBodyDidExit() }
-            }
-        ) { [self] in
-            try await execute(job: job, now: now)
+        // The race selects the terminal reason; this task owns the actual body
+        // and keeps a result returned after cancellation wins that race.
+        let body = Task { [self] in
+            try await execute(job: job)
         }
+        let outcome = await raceAgainstTimeout(seconds: seconds) {
+            try await withTaskCancellationHandler {
+                try await body.value
+            } onCancel: {
+                body.cancel()
+            }
+        }
+        let bodyResult = await settle { await body.result }
         switch outcome {
         case .value(let result):
             return result
@@ -64,44 +63,58 @@ extension SchedulerDueJobRunner {
                 output: .object(output)
             )
         case .timedOut:
-            let detail = "job_timeout: Scheduled Desk task '\(job.kind)' exceeded \(Int(seconds))s; "
-                + "cancellation requested, exit unconfirmed. Effects are unknown; later tasks wait for its exit. Inspect its delivery receipts before resuming it."
-            FileHandle.standardError.write(Data(
-                "[SchedulerDueJobRunner] TIMEOUT \(job.id) (\(job.kind)): \(detail)\n".utf8
-            ))
-            return JobResult(
-                status: "error",
-                detail: detail,
-                output: .object([
-                    "error": .string(detail),
+            let result = stoppedResult(
+                job: job, bodyResult: bodyResult,
+                detail: "job_timeout: Scheduled Desk task '\(job.kind)' exceeded \(Int(seconds))s; cancellation requested.",
+                fields: [
                     "failureKind": .string("job_timeout"),
-                    "effects": .string("unknown"),
                     "timeoutSeconds": .int(Int64(seconds)),
-                ])
+                ]
             )
-        case .cancelled:
-            let detail = "job_cancelled: Cancellation requested for scheduled Desk task '\(job.kind)'; "
-                + "exit unconfirmed. Effects are unknown; later tasks wait for its exit. Inspect its delivery receipts before resuming it."
             FileHandle.standardError.write(Data(
-                "[SchedulerDueJobRunner] CANCELLED \(job.id) (\(job.kind)): \(detail)\n".utf8
+                "[SchedulerDueJobRunner] TIMEOUT \(job.id) (\(job.kind)): \(result.detail)\n".utf8
             ))
-            return JobResult(
-                status: "error",
-                detail: detail,
-                output: .object([
-                    "error": .string(detail),
-                    "failureKind": .string("job_cancelled"),
-                    "effects": .string("unknown"),
-                ])
+            return result
+        case .cancelled:
+            let result = stoppedResult(
+                job: job, bodyResult: bodyResult,
+                detail: "job_cancelled: Cancellation requested for scheduled Desk task '\(job.kind)'.",
+                fields: ["failureKind": .string("job_cancelled")]
             )
+            FileHandle.standardError.write(Data(
+                "[SchedulerDueJobRunner] CANCELLED \(job.id) (\(job.kind)): \(result.detail)\n".utf8
+            ))
+            return result
         }
     }
 
-    private func scheduledJobBodyDidExit() {
-        inFlightJobBodies = max(0, inFlightJobBodies - 1)
-        guard inFlightJobBodies == 0 else { return }
-        let waiters = jobBodyExitWaiters
-        jobBodyExitWaiters.removeAll()
-        waiters.forEach { $0.resume() }
+    private func stoppedResult(
+        job: DueJob, bodyResult: Result<JobResult, Error>, detail: String,
+        fields: [String: JSONValue]
+    ) -> JobResult {
+        var output = fields
+        let finalDetail: String
+        let seen: [String]?
+        switch bodyResult {
+        case .success(let result):
+            finalDetail = detail + " Body returned \(result.status): \(result.detail). Its output is retained; inspect it before resuming."
+            output["bodyResult"] = .object([
+                "status": .string(result.status),
+                "detail": .string(result.detail),
+                "output": result.output,
+            ])
+            seen = result.seen
+        case .failure(let error):
+            finalDetail = detail + " Body exited with error: \(error.localizedDescription). Confirmed channel receipts are retained; other effects remain unknown. Inspect its receipts before resuming."
+            output["bodyError"] = .string(error.localizedDescription)
+            output["effects"] = .string("unknown")
+            seen = nil
+        }
+        output["error"] = .string(finalDetail)
+        if case .object(let receipts)? = notificationOutcomes[job.occurrenceKey] {
+            output.merge(receipts) { _, receipt in receipt }
+        }
+        return JobResult(status: "error", detail: finalDetail, output: .object(output), seen: seen)
     }
+
 }

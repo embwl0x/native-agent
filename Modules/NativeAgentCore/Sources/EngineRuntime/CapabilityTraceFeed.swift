@@ -1,4 +1,3 @@
-import TrustPersistence
 import TurnTrace
 import Foundation
 import PersistenceCore
@@ -36,25 +35,25 @@ public enum CapabilityTraceFeed {
             let evidence = try await TurnTraceRecentReader(dataRootOverride: root)
                 .traceEvidence(maximumReadBytes: maximumReadBytes)
             if evidence.sourceAbsent { return .sourceAbsent }
-            let decoder = JSONDecoder.nativeAgent
             var decoded: [RuntimeTrace] = []
             var rejectedRows = evidence.report.malformedLineCount
             for row in evidence.rows {
-                guard let data = try? row.serializedData(pretty: false),
-                      let trace = try? decoder.decode(RuntimeTrace.self, from: data)
-                else {
-                    rejectedRows += 1
-                    continue
-                }
-                decoded.append(trace)
+                guard let fields = row.objectValue,
+                      let id = fields["id"]?.stringValue,
+                      let kind = fields["kind"]?.stringValue,
+                      let title = fields["title"]?.stringValue,
+                      fields["status"] == nil || fields["status"] == .null || fields["status"]?.stringValue != nil,
+                      fields["createdAt"] == nil || fields["createdAt"] == .null || fields["createdAt"]?.stringValue != nil
+                else { rejectedRows += 1; continue }
+                decoded.append(RuntimeTrace(id: id, kind: kind, title: title,
+                    status: fields["status"]?.stringValue, createdAt: fields["createdAt"]?.stringValue))
             }
 
             let traces = Array(decoded.suffix(limit).reversed())
-            if traces.isEmpty {
-                return rejectedRows == 0
-                    ? .empty
-                    : .unavailable("trace feed contains \(rejectedRows) malformed \(rejectedRows == 1 ? "row" : "rows") and no readable traces")
+            if traces.isEmpty, rejectedRows > 0 {
+                return .unavailable("trace feed contains \(rejectedRows) malformed \(rejectedRows == 1 ? "row" : "rows") and no readable traces")
             }
+            if traces.isEmpty { return .empty }
             return rejectedRows == 0 ? .current(traces) : .partial(traces, rejectedRows: rejectedRows)
         } catch {
             return .unavailable(error.localizedDescription)

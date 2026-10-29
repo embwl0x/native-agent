@@ -1,7 +1,8 @@
+import Transcripts
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `CognitiveSubstrate+Ingest.swift` | `CognitiveSubstrate`: `ingest`, `ingestResident`, `reconsolidatePendingCompletion` |
+// Blueprint: | `CognitiveSubstrate+Ingest.swift` | `CognitiveSubstrate`: `ingest`, `ingestResident`, `reconsolidateCompletion` |
 
 extension CognitiveSubstrate {
     /// The full redacted reply length and tail let Sound inspect text beyond
@@ -14,19 +15,19 @@ extension CognitiveSubstrate {
     }
 
     /// Resident hot-path admission. Canonical in-memory state and the published
-    /// attention projection advance before this returns; the already-existing
+    /// attention projection advance with semantic metadata before this returns; the
     /// dirty microcycle persists the coalesced latest state. Direct library
     /// callers retain `ingest(_:)`'s synchronous durability contract.
     @discardableResult
-    public func ingestResident(_ event: CognitiveEvent) async -> Bool {
+    public func ingestResident(_ event: CognitiveEvent) async -> (accepted: Bool, semanticMetadata: [String: JSONValue]) {
         await ingest(event, defersPersistenceToMicrocycle: true)
     }
 
     private func ingest(
         _ event: CognitiveEvent,
         defersPersistenceToMicrocycle: Bool
-    ) async -> Bool {
-        guard configuration.enabled else { return false }
+    ) async -> (accepted: Bool, semanticMetadata: [String: JSONValue]) {
+        guard configuration.enabled, !field.hasSeenEvent(event) else { return (false, [:]) }
         let aboutness = event.kind == .organismResolutionFelt
             ? "\(event.summary) \(event.subject.id) \(event.subject.label ?? "")"
             : event.summary
@@ -39,46 +40,39 @@ extension CognitiveSubstrate {
         if !(defersPersistenceToMicrocycle && configuration.backgroundMicrocyclesEnabled) {
             await waitForMaintenanceTransition()
         }
-        guard configuration.enabled else { return false }
-        // D-2 (2026-08-02) — STAKES, not event class. A felt resolution about
-        // machinery she holds no concern for is not a feeling; it is her own
-        // plumbing reporting in. Rejected BEFORE any state is touched (no seen
-        // key consumed, no node, no affect, no attention publish), so the felt
-        // layer gets quieter instead of louder. Gates this one event class only.
-        guard feltResolutionIsAtStake(event, cares: touchedCares) else { return false }
+        guard configuration.enabled else { return (false, [:]) }
+        // Felt resolutions without personal stakes are rejected before any state changes.
+        guard feltResolutionIsAtStake(event, cares: touchedCares) else { return (false, [:]) }
         // A duplicate CognitiveEvent is inert across the WHOLE cognition owner,
         // not merely ContinuityField structure. This await-free O(1) check keeps
         // affect, mood, relational-presence anchors, pending completion, revision,
         // attention publication, and persistence untouched on replay.
-        guard !field.hasSeenEvent(event) else { return false }
+        guard !field.hasSeenEvent(event) else { return (false, [:]) }
         let now = dependencies.now()
+        if event.kind == .assistantTurnCompleted || event.kind == .providerFailure,
+           let run = event.metadata["runId"], case .string = run {
+            for index in deferredTurns.indices where deferredTurns[index].event.metadata["runId"] == run {
+                deferredTurns[index].endedAt = event.occurredAt
+            }
+            // Keep each live turn's input until journal recording releases it.
+            var excess = max(0, deferredTurns.filter { $0.endedAt != nil }.count - 32)
+            deferredTurns.removeAll { record in
+                guard excess > 0, record.endedAt != nil else { return false }
+                excess -= 1
+                return true
+            }
+        }
         // One deterministic scan bundle per admitted user turn. This stays
         // inside the actor's await-free transition and owns no state: it only
         // prevents affect, semantic appraisal, and retrospective landing from
         // rescanning the same already-loaded text and cares.
         let buildsAffectBundle = configuration.enabled
             && event.turnKind.contributesToLivedState
-        // Item 8 (2026-09-02) — OTHERS MOVE HER. This used to read
-        // `isUserAuthored(event.kind) ? conversationalAppraisal(…) : empty`,
-        // which cannot tell User from a bridge peer: both arrive as
-        // `.userMessageReceived`, so another agent's words moved her at HIS
-        // weight, wearing his subject. `relationalAppraisal` keeps that
-        // behaviour exactly for User (and for her own output, which stays at
-        // zero — Law 3) and lands a peer at half weight with its own subject.
-        // Still the single pure scan per admitted event: it is threaded into
-        // semanticAppraisal, emotionTag, applyAffectFromEvent and
-        // reconsolidatePendingCompletion below, exactly as before.
-        // See CognitiveSubstrate+ConversationalAppraisal.swift.
         let defersInterpretation = buildsAffectBundle && Self.isUserAuthored(event.kind)
-            && event.sessionId?.hasPrefix("bot-") == false
-        let userAppraisal = buildsAffectBundle && !defersInterpretation
-            ? relationalAppraisal(for: event)
-            : AffectAppraisal()
-        // Semantic relationship stake historically samples this lexical cue
-        // for every lived event, while affect consumes it only for user turns.
-        // Compute it once without changing either caller's gating.
-        // Item 8: the same relational weight applies — warmth from a peer is
-        // real warmth, at half the reach of his.
+            && event.sessionId != nil && !SessionConversation.isHelper(event.sessionId, dataRoot: conversationDataRoot, includingArchived: true)
+        let userAppraisal = AffectAppraisal()
+        // Semantic relationship stake reads warmth for every lived event;
+        // affect consumes it only for user turns. A peer carries half User's reach.
         let turnWarmthBoost = !defersInterpretation && (buildsAffectBundle || event.kind == .userMessageReceived)
             ? relationalWarmthBoost(
                 for: event,
@@ -96,33 +90,25 @@ extension CognitiveSubstrate {
             verificationNodeMayExist = true
         }
         markDirty(at: now)
-        if defersInterpretation, !deferredTurns.contains(where: { $0.context.event.subject == event.subject }) {
-            let context = AfterTurnContext(event: event, caring: caringEventCandidate(for: event),
-                                           generation: caringAppraisalGeneration)
-            deferredTurns.append(DeferredTurn(context: context, completion: pendingCompletion, outcome: ingestOutcome))
+        if defersInterpretation, !deferredTurns.contains(where: { $0.event.subject == event.subject }) {
+            deferredTurns.append(CognitiveDeferredTurnRecord(
+                event: event, caring: caringEventCandidate(for: event),
+                completionNodeKey: pendingCompletion?.nodeKey, completionRecordedAt: pendingCompletion?.recordedAt,
+                completionSessionId: pendingCompletion?.sessionId,
+                outcomeKey: ingestOutcome?.key,
+                mindEpoch: mindEpoch, bodyEpoch: bodyEpoch))
             pendingCompletion = nil
-            // No age eviction: a turn can work for hours, and its own after-turn
-            // (success, stop, or failure) removes the entry. The cap only bounds.
-            if deferredTurns.count > 32 { deferredTurns.removeFirst(deferredTurns.count - 32) }
         }
+        noteTurnForContext(event)
         let contributesToLivedState = event.turnKind.contributesToLivedState
-        // THE ACCEPTED-TURN TICK for the Sound nudge's cadence (2026-09-01).
-        // It used to advance inside the capsule render and stick only through
-        // `applyCapsulePresentationCommit` — so a turn whose capsule came back
-        // EMPTY (`prepareFrozenCapsulePresentation` returns nil, no commit) did
-        // not count, and a stretch of those froze the "20 capsules since it
-        // last spoke" hatch. A completed live assistant turn is the one
-        // accepted-turn boundary the substrate owns by itself, and it happens
-        // whether or not any capsule text was emitted. Free-running on purpose:
-        // it is deliberately excluded from the presentation-commit equality
-        // guard below so an ingest between prepare and commit cannot reject the
-        // whole commit.
+        // Accepted live completions advance cadence even when no cue was emitted.
+        // Commits preserve these counters across a suspended frozen render.
         if contributesToLivedState, event.kind == .assistantTurnCompleted {
-            soundRutTurnsSinceSurfaced = min(soundRutTurnsSinceSurfaced + 1, Self.soundRutTurnCounterCap)
+            capsulePresentationState.soundRutTurnsSinceSurfaced = min(capsulePresentationState.soundRutTurnsSinceSurfaced + 1, Self.soundRutTurnCounterCap)
             // The reminded-of cadence counts the same boundary for the same
             // reason: it is the one accepted-turn tick the substrate owns.
-            remindedOfTurnsSinceSurfaced = min(
-                remindedOfTurnsSinceSurfaced + 1, Self.soundRutTurnCounterCap)
+            capsulePresentationState.remindedOfTurnsSinceSurfaced = min(
+                capsulePresentationState.remindedOfTurnsSinceSurfaced + 1, Self.soundRutTurnCounterCap)
             // The tick is durable state: a restart must not restore the rut
             // counter one turn behind. Written with this ingest's persistence
             // (below, or the resident microcycle's transaction).
@@ -134,12 +120,7 @@ extension CognitiveSubstrate {
             // session followed by absence never manufactures affect-warmth (it stays content-driven).
             if turnWarmthBoost > 0 { lastWarmPresenceAt = now }
         }
-        // Affect apply + emotional-tag stamp run as ONE await-free actor segment right
-        // after field.ingest above, so no reentrant ingest (during a later persistence
-        // await) can swap self.affect or evict/recreate the touched node between deriving
-        // the tag and stamping it (gpt-5.5 concurrency review, 2026-07-02). applyAffect is
-        // synchronous; the affect persistence that updateAffectFromEvent used to do is
-        // moved below, after the state is already consistent.
+        // Affect application and emotional-tag stamping share one await-free segment before persistence.
         let updatedAffect = contributesToLivedState && !defersInterpretation
             ? applyAffectFromEvent(
                 event,
@@ -147,15 +128,12 @@ extension CognitiveSubstrate {
                 precomputedWarmthBoost: turnWarmthBoost
             )
             : affect
-        // Stamp the tag from the affect this event just produced ("how she feels having
-        // just experienced it", Wave A). Gated on affect: no affect, no live feeling.
+        // Stamp the feeling produced by this event only when affect is enabled.
         if contributesToLivedState, configuration.enabled, let ingestOutcome {
-            // R2-A/B: appraise the event's MEANING (pure, no suspension — stays inside
+            // Appraise the event's meaning (pure, no suspension — stays inside
             // this await-free segment) so the stamped feeling is about what happened,
             // not the fact that something happened.
-            // Compute the conversational appraisal ONCE and thread it through both
-            // consumers — semanticAppraisal and emotionTag each used to run the
-            // heavy ~10-pass lexicon scan on the identical summary (hot-path dedup).
+            // Semantic appraisal and emotion tagging share the admitted appraisal.
             let semantic = semanticAppraisal(
                 for: event,
                 post: updatedAffect,
@@ -176,18 +154,34 @@ extension CognitiveSubstrate {
                 configuration: configuration
             )
         }
-        // U1: her work comes to feel like how it landed. Runs inside the SAME
-        // await-free segment as the stamp above, and for the same reason — the
-        // re-stamp reads the remembered node's tag and writes it back, so a
-        // reentrant ingest suspending in between could evict/recreate that node
-        // or swap the slot underneath us. Pure, synchronous, no suspension.
-        if contributesToLivedState, configuration.enabled, !defersInterpretation {
-            reconsolidatePendingCompletion(
-                with: event,
-                outcome: ingestOutcome,
-                now: now,
-                precomputedAppraisal: userAppraisal
-            )
+        // Completion matching, node reconsolidation and resident-slot updates
+        // share this await-free admission transition.
+        var semanticMetadata: [String: JSONValue] = [:]
+        if contributesToLivedState && configuration.enabled && !defersInterpretation {
+            semanticMetadata = Self.foldReaction(event: event, completion: pendingCompletion,
+                outcome: ingestOutcome, now: now, valence: userAppraisal.valence)
+            if let pending = pendingCompletion {
+                let age = now.timeIntervalSince(pending.recordedAt)
+                let expired = age < 0 || age > Self.pendingCompletionMaxAge
+                let switchedSession = event.sessionId != nil && event.sessionId != pending.sessionId
+                if expired || switchedSession || !semanticMetadata.isEmpty { pendingCompletion = nil }
+                if !semanticMetadata.isEmpty {
+                    reconsolidateCompletion(pending, outcome: ingestOutcome, now: now,
+                                            reaction: userAppraisal.valence)
+                }
+            }
+            if event.kind == .assistantTurnCompleted, let outcome = ingestOutcome {
+                pendingCompletion = PendingCompletion(nodeKey: outcome.key, recordedAt: now,
+                                                      sessionId: event.sessionId)
+                if let matchedCareID = touchedCares.first?.id, let care = cares[matchedCareID], care.fadedAt == nil,
+                   let session = event.sessionId, !outcome.key.isEmpty {
+                    semanticMetadata[OrganismSemanticExpectation.mintMetadataKey] = .object([
+                        OrganismSemanticExpectation.concernField: .string("care:" + care.id.uuidString),
+                        OrganismSemanticExpectation.sessionField: .string(session),
+                        OrganismSemanticExpectation.turnField: .string(outcome.key),
+                    ])
+                }
+            }
         }
         // Publish before persistence awaits. The owner transition is already
         // internally consistent, and a slow SQLite write must not delay the
@@ -208,134 +202,44 @@ extension CognitiveSubstrate {
                     )
                 }
             }
-            return true
-        }
-        if contributesToLivedState, configuration.enabled {
-            await persistArtifact(
-                kind: "affect",
-                id: stableArtifactID("affect"),
-                status: "current",
-                score: updatedAffect.arousal,
-                payload: updatedAffect.toJSON(
-                    lastUserPresenceAt: lastUserPresenceAt,
-                    lastWarmPresenceAt: lastWarmPresenceAt
-                )
-            )
+            return (true, semanticMetadata)
         }
         if configuration.persistenceEnabled {
+            await notingPersistence("snapshot") { try await persistAffectAndNodes() }
             if evicted > 0 {
                 await recordReceipt(kind: "workspace.verification_eviction", payload: .object([
                     "evictedCount": .int(Int64(evicted)),
                     "sessionId": event.sessionId.map(JSONValue.string) ?? .null,
                 ]))
             }
-            await notingPersistence("snapshot") { try await persistSnapshot() }
             await flushCapsulePresentationIfNeeded(at: now)
         }
-        return true
+        return (true, semanticMetadata)
     }
 
     // MARK: - Affect dynamics
 
-    /// U1 (2026-07-09): the user's reaction becomes how her work FELT.
-    ///
-    /// Three things happen here, in order, every ingest:
-    ///   1. REMOVALS — a slot older than `pendingCompletionMaxAge` (or from a
-    ///      session the app has since left) is dropped before anything reads it.
-    ///   2. USE — a user-authored turn in the SAME session consumes the slot. Its
-    ///      `conversationalAppraisal` valence (audit C3: this appraisal reads USER
-    ///      text, which is exactly what a reaction is) shifts the remembered
-    ///      completion's stored valence through `stampEmotionTag(isNewNode: false)`
-    ///      — the asymmetric reconsolidation blend, which is precisely the
-    ///      mechanism for "that turn turned out to have landed well/badly": praise
-    ///      lifts it fast, criticism cools it slowly. Arousal and warmth are passed
-    ///      back unchanged, so their blends are exact no-ops. A neutral reaction
-    ///      (valence 0) consumes the slot and leaves the node untouched.
-    ///   3. ADD — an `assistantTurnCompleted` remembers its node as the new slot,
-    ///      replacing any older one. The latest completion is the one in the room.
-    ///
-    /// The incoming valence is `current + reaction`, NOT `reaction` — the blend
-    /// moves the node TOWARD its target, so handing it the bare reaction would drag
-    /// a strongly-positive node DOWN on praise. The shift is what gets blended.
-    ///
-    /// A completion whose node was evicted between the two turns simply finds
-    /// nothing to re-stamp. A user turn with no session id (out-of-band) neither
-    /// consumes nor applies — expiry remains its removal.
-    func reconsolidatePendingCompletion(
-        with event: CognitiveEvent,
+    /// A matched reaction changes only its completion node, never the resident slot.
+    func reconsolidateCompletion(
+        _ completion: PendingCompletion,
         outcome: ContinuityField.IngestOutcome?,
         now: Date,
-        precomputedAppraisal: AffectAppraisal? = nil
+        reaction: Double
     ) {
-        if let pending = pendingCompletion {
-            let age = now.timeIntervalSince(pending.recordedAt)
-            let expired = age < 0 || age > Self.pendingCompletionMaxAge
-            let switchedSession = event.sessionId != nil && event.sessionId != pending.sessionId
-            if expired || switchedSession { pendingCompletion = nil }
+        // A user turn sharing its completion's field key has already stamped
+        // that node; blending its own reaction would count the feeling twice.
+        guard outcome?.key != completion.nodeKey else { return }
+        if let landedNode = field.node(forKey: completion.nodeKey) {
+            stampLandingScore(Self.landingScore(fromReactionValence: reaction),
+                              forNodeId: landedNode.id, at: now)
         }
-
-        // `outcome != nil` means the field ACCEPTED this turn as new. A duplicate
-        // (re-observed messageId) must be wholly inert here: without this guard, a
-        // user turn replayed after a later completion opened the slot would land its
-        // stale reaction on a turn it never saw.
-        if Self.isUserAuthored(event.kind), outcome != nil,
-           let pending = pendingCompletion,
-           // Non-nil session REQUIRED on both sides (gpt-5.5 review MED, 2026-07-09):
-           // optional equality made nil == nil read as "same session", so two
-           // unrelated session-less events could pair a reaction to a completion
-           // it never saw. No session, no reaction linkage.
-           let eventSession = event.sessionId,
-           let pendingSession = pending.sessionId,
-           eventSession == pendingSession {
-            pendingCompletion = nil
-            let reaction = (precomputedAppraisal ?? conversationalAppraisal(in: event.summary)).valence
-            // Item 46 fix (1): the ONLY moment this pairing is visible. Stash it
-            // for the after-ingest metadata hop before the slot is gone. Same
-            // appraisal, same read, no second lexicon pass.
-            lastSemanticReaction = SemanticReactionStash(
-                sessionID: eventSession,
-                turnID: pending.nodeKey,
-                reaction: Self.semanticReactionLabel(fromValence: reaction),
-                recordedAt: now
-            )
-            // A turn cannot be the reaction to ITSELF. Both kinds map to the
-            // .conversationFocus node kind, so the two turns share a field key unless
-            // the subjects differ per-turn (which ChatTurnRuntime mints — audit C2).
-            // If a caller ever reverts to per-session subjects, the user turn's own
-            // stamp already landed on this node and re-stamping would blend it twice.
-            let reactsToItself = outcome?.key == pending.nodeKey
-            // W7/P10 — the same reaction, read a second way. The emotion blend
-            // below asks "how did that turn FEEL in hindsight"; this asks "did
-            // that phrasing LAND", and the echo's ranking is the only consumer.
-            // Same appraisal, same classes, NO new lexicon — praise / enthusiasm
-            // / resolution / affection carry positive valence, dismissal and
-            // criticism carry negative, everything else is exactly zero and
-            // stamps nothing.
-            if !reactsToItself, let landedNode = field.node(forKey: pending.nodeKey) {
-                stampLandingScore(
-                    Self.landingScore(fromReactionValence: reaction),
-                    forNodeId: landedNode.id,
-                    at: now)
-            }
-            if reaction != 0, !reactsToItself, let current = field.storedEmotionTag(forKey: pending.nodeKey) {
-                field.stampEmotionTag(
-                    key: pending.nodeKey,
-                    tag: (
-                        valence: (current.valence + reaction).clampedSigned(),
-                        arousal: current.arousal,
-                        warmth: current.warmth
-                    ),
-                    isNewNode: false,
-                    configuration: configuration
-                )
-            }
-        }
-
-        if event.kind == .assistantTurnCompleted, let outcome {
-            pendingCompletion = PendingCompletion(
-                nodeKey: outcome.key,
-                recordedAt: now,
-                sessionId: event.sessionId
+        if reaction != 0, let current = field.storedEmotionTag(forKey: completion.nodeKey) {
+            field.stampEmotionTag(
+                key: completion.nodeKey,
+                tag: (valence: (current.valence + reaction).clampedSigned(),
+                      arousal: current.arousal, warmth: current.warmth),
+                isNewNode: false,
+                configuration: configuration
             )
         }
     }

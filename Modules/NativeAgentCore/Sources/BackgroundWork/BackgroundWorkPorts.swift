@@ -2,11 +2,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import DoctorChecks
-// Blueprint: | `BackgroundWorkPorts.swift` | Background work ports; typed content-only `AssistanceCardContent`, `BackupTrigger` and maintenance part invocation seams; `storeAndFileEvents` |
-
-public protocol BackgroundWorkEventPort: Sendable {
-    func storeAndFileEvents(paths: [URL], loopId: String?) -> AsyncStream<Void>
-}
+// Blueprint: | `BackgroundWorkPorts.swift` | Background effect ports; typed content-only `AssistanceCardContent`, `BackupTrigger` and maintenance part invocation seams |
 
 public protocol BackgroundWorkNotificationPort: Sendable {
     func notifyIfAttentionWorthy(
@@ -15,18 +11,14 @@ public protocol BackgroundWorkNotificationPort: Sendable {
     ) async
 }
 
-public protocol HeartbeatBackgroundWorkPort: BackgroundWorkEventPort, BackgroundWorkNotificationPort {
-}
-
 public protocol MaintenanceBackgroundWorkPort: BackgroundWorkNotificationPort {
     func assistanceCard(dataRoot: URL, input: JSONValue) async throws -> AssistanceCardContent
     func backupDeadline(dataRoot: URL, input: JSONValue) async throws -> Double?
     func backupTrigger(dataRoot: URL, input: JSONValue) async throws -> BackupTrigger
     func diskStorageOwners(dataRoot: URL) -> [DiskStorageOwner]
-    func runAutoDoctor(checks: any DoctorChecksProtocol, dataRoot: URL) async throws -> [CheckResult]
+    func runAutoDoctor(checks: SwiftNativeDoctorChecks, dataRoot: URL) async throws -> [CheckResult]
     func routeDoctorAsk(eventID: String, title: String, detail: String) async throws
     var unavailableSkipPrefix: String { get }
-    func autoDoctorConfig(dataRoot: URL) -> (enabled: Bool?, intervalSeconds: Int?)
     func offDiskBackupParent() -> URL
     func offDiskAutomaticBackups(in parent: URL) throws -> [(url: URL, date: Date)]
     func createOffDiskBackup(reason: String, dataRoot: URL, parent: URL, now: Date) async throws -> URL
@@ -46,7 +38,7 @@ public enum BackupTrigger: String, Codable, Sendable {
     case current
 }
 
-public protocol DelegationBackgroundWorkPort: BackgroundWorkEventPort, BackgroundWorkNotificationPort {
+public protocol DelegationBackgroundWorkPort: BackgroundWorkNotificationPort {
     func letGoReplies(deliveryIDs: Set<String>, outcome: String, dataRoot: URL, configRoot: URL) async throws
     func reconcileReplyDeliveries(dataRoot: URL) async throws
     func retryRequestedResults(dataRoot: URL) async throws

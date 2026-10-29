@@ -32,42 +32,29 @@ enum ChatQueuePresentation {
     }
 }
 
-/// Compact, session-scoped send-next chrome shared by the main and detached
-/// Mac composers. User, 2026-10-04: messages sent while she works stay here in
-/// send order — up to three one-line chips, the rest behind "+N more" — so a
-/// few sends never push much of the chat away. Each waits its turn unless he
-/// Steers it into the running turn (lands at its next tool boundary) or
-/// sends it now (stops the current reply).
+/// Both Mac composers show queued sends in order, with actions to steer or send now.
 struct ChatQueuedTurnsView: View {
     @Environment(AppModel.self) private var appModel
     let sessionId: String
     let isBusy: Bool
 
-    private var turns: [QueuedChatTurn] {
-        ChatQueuePresentation.visibleTurns(appModel.engine.turns.queued(for: sessionId))
-    }
-
-    private var menuItems: [ChatQueuePresentation.MenuItem] {
-        ChatQueuePresentation.menuItems(appModel.engine.turns.queued(for: sessionId))
-    }
-
     var body: some View {
-        let turns = turns
-        if !turns.isEmpty {
-            let shown = Array(turns.prefix(ChatQueuePresentation.visibleChipCount))
-            let overflow = turns.count - shown.count
+        let items = ChatQueuePresentation.menuItems(appModel.engine.turns.queued(for: sessionId))
+        if !items.isEmpty {
+            let shown = Array(items.prefix(ChatQueuePresentation.visibleChipCount))
+            let overflow = items.count - shown.count
             VStack(spacing: 3) {
-                ForEach(Array(shown.enumerated()), id: \.element.id) { index, turn in
-                    chip(turn, ordinal: index + 1,
-                         overflow: index == shown.count - 1 ? overflow : 0)
+                ForEach(shown) { item in
+                    chip(item.turn, ordinal: item.ordinal,
+                         overflow: item.ordinal == shown.count ? overflow : 0, items: items)
                 }
             }
             .accessibilityElement(children: .contain)
-            .accessibilityLabel("Send-next queue, \(turns.count) queued")
+            .accessibilityLabel("Send-next queue, \(items.count) queued")
         }
     }
 
-    private func chip(_ turn: QueuedChatTurn, ordinal: Int, overflow: Int) -> some View {
+    private func chip(_ turn: QueuedChatTurn, ordinal: Int, overflow: Int, items: [ChatQueuePresentation.MenuItem]) -> some View {
         let paused = appModel.engine.turns.isQueuePaused(sessionId)
         return HStack(spacing: 7) {
             if ordinal == 1 {
@@ -79,8 +66,7 @@ struct ChatQueuedTurnsView: View {
                 .font(.system(size: 10, weight: .bold, design: .rounded))
                 .foregroundStyle(.secondary)
 
-            // 2026-09-06: a queued turn that failed to start paused the
-            // queue and said nothing. The rejection's own words go here.
+            // Show the queue's own rejection reason on its first pending turn.
             if ordinal == 1, let reason = appModel.engine.turns.queuePauseReason(sessionId) {
                 Text(reason)
                     .font(NativeAgentFont.tag)
@@ -105,7 +91,7 @@ struct ChatQueuedTurnsView: View {
                     .labelStyle(.titleAndIcon)
             }
 
-            if overflow > 0 { queueMenu(overflow: overflow) }
+            if overflow > 0 { queueMenu(items: items, overflow: overflow) }
 
             action(for: turn)
 
@@ -158,9 +144,9 @@ struct ChatQueuedTurnsView: View {
         }
     }
 
-    private func queueMenu(overflow: Int) -> some View {
+    private func queueMenu(items: [ChatQueuePresentation.MenuItem], overflow: Int) -> some View {
         Menu {
-            ForEach(menuItems) { item in
+            ForEach(items) { item in
                 if isBusy, item.turn.canSteerRunningTurn,
                    !appModel.engine.turns.isSteering(item.turn.id) {
                     Button {
@@ -186,7 +172,7 @@ struct ChatQueuedTurnsView: View {
                 } label: {
                     Label(item.removeLabel, systemImage: "xmark")
                 }
-                if item.ordinal < menuItems.count { Divider() }
+                if item.ordinal < items.count { Divider() }
             }
         } label: {
             Text("+\(overflow) more")
@@ -196,6 +182,6 @@ struct ChatQueuedTurnsView: View {
         .menuStyle(.borderlessButton)
         .fixedSize()
         .help("Show all queued messages")
-        .accessibilityLabel("Show all \(menuItems.count) queued messages")
+        .accessibilityLabel("Show all \(items.count) queued messages")
     }
 }

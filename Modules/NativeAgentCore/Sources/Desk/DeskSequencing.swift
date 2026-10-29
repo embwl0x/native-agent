@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Foundation
 import PersistenceCore
 
@@ -71,14 +72,16 @@ public enum DeskSequencing {
 
     public struct Plan: Sendable, Equatable {
         public var byHandle: [String: ItemPlan]
+        public var children: [String?: [DeskItem]]
         /// Ready handles, desk-wide, best-first. Capped at `nextUpCap`.
         /// Derived from dependency edges + status + creation time — there is
         /// deliberately NO manual rank field anywhere in the Desk.
         public var nextUp: [String]
 
-        public init(byHandle: [String: ItemPlan] = [:], nextUp: [String] = []) {
+        public init(byHandle: [String: ItemPlan] = [:], nextUp: [String] = [], children: [String?: [DeskItem]] = [:]) {
             self.byHandle = byHandle
             self.nextUp = nextUp
+            self.children = children
         }
     }
 
@@ -109,9 +112,7 @@ public enum DeskSequencing {
         return until > now
     }
 
-    /// Parse a defer stamp: a bare `yyyy-MM-dd` day (which means the END of
-    /// that day in the Mac's zone, whatever its length — an item parked "until
-    /// 2026-08-05" is still parked during the 5th) or a full ISO timestamp.
+    /// A bare `yyyy-MM-dd` defers through that day in the Mac's zone; ISO stamps keep their time.
     public static func parseDeferStamp(_ raw: String) -> Date? {
         if let d = DeskClock.parseDay(raw) { return Calendar.autoupdatingCurrent.date(byAdding: .day, value: 1, to: d) }
         return DeskClock.parseISO(raw)
@@ -127,6 +128,7 @@ public enum DeskSequencing {
 
     public static func compute(_ state: DeskState, now: Date = Date()) -> Plan {
         let items = state.items
+        let children = Dictionary(grouping: items, by: \.parent)
         var byHandle: [String: DeskItem] = [:]
         byHandle.reserveCapacity(items.count)
         for item in items { byHandle[item.handle] = item }
@@ -149,13 +151,6 @@ public enum DeskSequencing {
         }
 
         let onCycle = cycleNodes(in: items, effectiveBlockers: effectiveBlockers)
-
-        // Children index for the subtree rollup.
-        var childrenOf: [String: [String]] = [:]
-        for item in items {
-            guard let parent = item.parent, byHandle[parent] != nil else { continue }
-            childrenOf[parent, default: []].append(item.handle)
-        }
 
         // An item is not actionable while an ANCESTOR is deferred, effectively
         // blocked, or waiting on owner input.
@@ -182,7 +177,7 @@ public enum DeskSequencing {
             let blockers = effectiveBlockers[item.handle] ?? []
             let isDef = deferred[item.handle] ?? false
             let cyc = onCycle.contains(item.handle)
-            let rollup = subtreeRollup(item.handle, childrenOf: childrenOf, byHandle: byHandle)
+            let descendants = SwiftNativeDeskStore.descendants(of: item.handle, in: children, maxDepth: deskMaxGraphDepth)
             let ready = !item.status.isTerminal && item.status != .blocked
                 && !item.requiresOwnerInput
                 && item.blockedReason?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
@@ -196,14 +191,12 @@ public enum DeskSequencing {
                 isDeferred: isDef,
                 isReady: ready,
                 blockedByCycle: cyc,
-                doneCount: rollup.done,
-                totalCount: rollup.total
+                doneCount: descendants.filter { $0.status.isTerminal }.count,
+                totalCount: descendants.count
             )
         }
 
         // nextUp: status rank, then blocker count, then openedAt, then alias seq.
-        // No manual rank field — dependency edges + creation time is enough
-        // (Agent's #4).
         let ready = items.filter { plans[$0.handle]?.isReady == true }
         let ordered = ready.sorted { a, b in
             let ra = statusRank(a.status), rb = statusRank(b.status)
@@ -216,7 +209,7 @@ public enum DeskSequencing {
             if sa != sb { return sa < sb }
             return a.handle < b.handle
         }
-        return Plan(byHandle: plans, nextUp: Array(ordered.prefix(nextUpCap).map(\.handle)))
+        return Plan(byHandle: plans, nextUp: Array(ordered.prefix(nextUpCap).map(\.handle)), children: children)
     }
 
     // MARK: - Graph internals
@@ -263,30 +256,4 @@ public enum DeskSequencing {
         return cyclic
     }
 
-    /// (done, total) over the item's WHOLE descendant subtree, self excluded.
-    /// Everything in `byHandle` is live (archived items are not in DeskState), so
-    /// "non-archived" is the whole set. Cycle-safe via a visited set.
-    static func subtreeRollup(
-        _ handle: String,
-        childrenOf: [String: [String]],
-        byHandle: [String: DeskItem]
-    ) -> (done: Int, total: Int) {
-        var done = 0
-        var total = 0
-        var seen: Set<String> = [handle]
-        var frontier = childrenOf[handle] ?? []
-        var depth = 0
-        while !frontier.isEmpty, depth < deskMaxGraphDepth {
-            depth += 1
-            var next: [String] = []
-            for child in frontier {
-                guard seen.insert(child).inserted, let item = byHandle[child] else { continue }
-                total += 1
-                if item.status.isTerminal { done += 1 }
-                next.append(contentsOf: childrenOf[child] ?? [])
-            }
-            frontier = next
-        }
-        return (done, total)
-    }
 }

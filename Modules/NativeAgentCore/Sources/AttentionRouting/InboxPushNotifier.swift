@@ -2,6 +2,7 @@ import NativeAgentCore
 import Privacy
 import Foundation
 import PersistenceCore
+import NativeAgentShared
 // Blueprint: | `InboxPushNotifier.swift` | `AttentionRouter.notifyIfAttentionWorthy`: severity and live-root notification routing |
 
 extension AttentionRouter {
@@ -17,17 +18,16 @@ extension AttentionRouter {
         /// `AttentionImportance.fromInboxSeverity`.
         importance: AttentionImportance? = nil
     ) async {
-        guard Self.shouldNotify(severity: severity) else { return }
+        let severityImportance = AttentionImportance.fromInboxSeverity(severity)
+        guard severityImportance != .routineSuccess else { return }
         guard Self.usesLiveAppDataRoot(dataRoot) else { return }
         guard ProcessInfo.processInfo.environment["NATIVE_AGENT_DISABLE_INBOX_PUSH"] != "1" else { return }
 
         do {
-            // Item 26: the routing decision belongs to ONE place. The payload
-            // below is unchanged; the router decides whether it reaches User's
-            // phone, his Telegram, or nowhere.
+            // The router decides whether this reaches User's phone, Telegram or neither.
             try await route(
                 eventId: "inbox:\(itemId)",
-                importance: importance ?? AttentionImportance.fromInboxSeverity(severity),
+                importance: importance ?? severityImportance,
                 title: String(NativeAppSecretRedactor.redactText(title).prefix(160)),
                 body: String(NativeAppSecretRedactor.redactText(summary).prefix(500)),
                 reason: "\(severity)|\(summary.prefix(500))",
@@ -36,24 +36,11 @@ extension AttentionRouter {
                     "source": source,
                     "itemId": itemId,
                     "severity": severity,
-                    // 2026-09-13: the urgency stamp is the ROUTER's to make
-                    // (`AttentionRouter.wakesTheDevice`). Marking everything
-                    // that cleared the attention-worthy gate time-sensitive
-                    // made "urgent" mean "notified at all": an important item
-                    // pierced Sleep Focus exactly as hard as a critical one.
+                    // AttentionRouter.wakesTheDevice owns urgency, separately from eligibility.
                 ]
             )
         } catch {
             nativeLog("[InboxPushNotifier] push failed item=%@ source=%@: %@", itemId, source, error.localizedDescription)
-        }
-    }
-
-    private static func shouldNotify(severity: String) -> Bool {
-        switch severity.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "actionable", "important", "critical":
-            return true
-        default:
-            return false
         }
     }
 

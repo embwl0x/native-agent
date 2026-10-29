@@ -1,23 +1,13 @@
 import ProviderRouting
 
 // Blueprint: | `AnthropicSetupTokenInput.swift` | `AnthropicSetupTokenInput`: setup-token paste, submission and visible status through existing provider setup |
-// PATCH-2026-05-07: anthropic-setup-token Paste-token UI for the Anthropic
-// OAuth direct provider.
-//
-// Anthropic's blessed path for third-party harnesses: user generates a
-// long-lived OAuth access token at console.anthropic.com → Settings → OAuth
-// (the "Get Setup Token" button — gives back a `sk-ant-oat01-…` string),
-// pastes it into NativeAgent. No browser flow, no callback listener, no
-// port collisions with codex CLI / Claude Code CLI.
-//
-// Server-side it's used the same way as a browser-flow OAuth token:
-// Authorization: Bearer + Claude Code identity headers + system prompt.
+// Saves a pasted Anthropic setup token, then lets ProvidersFacade adopt it.
 
 import SwiftUI
 import PersistenceCore
 
 struct AnthropicSetupTokenInput: View {
-    var onSuccess: (() -> Void)? = nil
+    @Environment(AppModel.self) private var appModel
 
     @State private var token: String = ""
     @State private var status: SubmitStatus = .idle
@@ -80,14 +70,14 @@ struct AnthropicSetupTokenInput: View {
         lastError = nil
         lastSuccess = nil
         status = .submitting
+        defer { status = .idle }
         let error = NativeOAuthFlow.saveAnthropicSetupToken(token)
-        status = .idle
         if let error {
             lastError = error
         } else {
+            await appModel.adoptProviderForBlankSurfaces("anthropic_oauth_direct")
             token = ""
             lastSuccess = "Setup token saved."
-            onSuccess?()
         }
     }
 

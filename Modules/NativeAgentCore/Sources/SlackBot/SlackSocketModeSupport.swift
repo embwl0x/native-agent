@@ -10,10 +10,6 @@ actor SlackConversationCache {
     private var conversations: [SlackConversationRef] = []
     private var loadedAt: Date?
 
-    func lastGoodValue() -> [SlackConversationRef]? {
-        loadedAt == nil ? nil : conversations
-    }
-
     func value(maxAge: TimeInterval, now: Date = Date()) -> [SlackConversationRef]? {
         guard let loadedAt,
               now.timeIntervalSince(loadedAt) < maxAge else {

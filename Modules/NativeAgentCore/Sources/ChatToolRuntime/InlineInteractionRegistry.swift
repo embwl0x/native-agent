@@ -12,9 +12,9 @@ import TrustCenter
 ///
 /// Everything here is DERIVED from a registry that already exists for its own
 /// reasons — the connector registry on disk, `MacIntegrationID`, the Providers
-/// group table, the trust-policy capability catalog. Adding a connector adds a
-/// row to `connectors/registry.json` and nothing else: no card branch, no
-/// button, no new copy. An id no registry knows produces an `unavailable`
+/// group table, the trust-policy capability catalog. Connector setup uses
+/// the registry and Shared's field vocabulary without renderer branches.
+/// An id no registry knows produces an `unavailable`
 /// descriptor, which the card renders as a statement rather than a dead
 /// control.
 ///
@@ -25,9 +25,7 @@ public enum InlineInteractionRegistry {
 
     // MARK: - Connector setup routes
     //
-    // Moved out of ConnectorWizardView so the wizard and the card cannot
-    // disagree about how a given account is connected. Slack and Telegram
-    // are pasted tokens, NOT OAuth — the card must say "Paste a token".
+    // The wizard and card share setup routes. Slack and Telegram use pasted tokens.
 
     public enum ConnectorSetup: String, Sendable, Equatable {
         case manualToken
@@ -57,8 +55,7 @@ public enum InlineInteractionRegistry {
 
     // MARK: - Descriptors
 
-    /// The descriptor for one need. `dataRoot` is read only for the connector
-    /// registry's display names; every other lookup is in-process.
+    /// The descriptor for one need, derived from its checked owner.
     public static func descriptor(
         kind: InlineInteraction.Kind,
         target: String,
@@ -90,7 +87,6 @@ public enum InlineInteractionRegistry {
                     case .unavailable: return .unavailable
                     }
                 }(),
-                // A pasted secret cannot be completed from the phone.
                 location: .macRequired,
                 unavailableReason: setup == .unavailable
                     ? "This build has no setup flow for \(target)."
@@ -113,8 +109,20 @@ public enum InlineInteractionRegistry {
             // standing posture and no card may move it. When the posture
             // forbids the whole category, the card says so and the only thing
             // it offers is the page where that decision actually lives.
-            let posturePermits = !targets.contains(where: isMacControlCategory)
-                || macControlPostureAllowsCategories(dataRoot: dataRoot)
+            let posturePermits: Bool
+            do {
+                if known && targets.contains(where: isMacControlCategory) {
+                    let policy = try macControlPolicySnapshot(dataRoot: dataRoot)
+                    posturePermits = policy.trustPolicy.map(MacControlGate.fullMacActive) ?? false
+                } else {
+                    posturePermits = true
+                }
+            } catch {
+                return InlineInteractionDescriptor(kind: .permission, target: target,
+                    displayName: macCapabilityDisplayName(target), icon: "lock.shield",
+                    control: .unavailable, location: .macRequired,
+                    unavailableReason: error.localizedDescription)
+            }
             let control: InlineInteractionDescriptor.Control = {
                 guard known else { return .unavailable }
                 return posturePermits ? .macPermissionGrant : .trustPostureRequired
@@ -162,8 +170,6 @@ public enum InlineInteractionRegistry {
                 displayName: providerDisplayName(providerID),
                 icon: "key",
                 control: providerID.isEmpty ? .unavailable : .providerAPIKey,
-                // A key is typed by the person, on the Mac. The phone API
-                // refuses keys through iCloud on purpose.
                 location: .macRequired,
                 unavailableReason: target.isEmpty ? "No provider named." : nil
             )
@@ -235,32 +241,20 @@ public enum InlineInteractionRegistry {
     ]
 
     private static func connectorRegistryNames(dataRoot: URL) -> [String: String] {
-        let path = dataRoot
-            .appendingPathComponent("connectors", isDirectory: true)
-            .appendingPathComponent("registry.json")
+        let path = ConnectorOAuthRegistry.connectorRegistryPath(root: dataRoot)
         guard let data = try? Data(contentsOf: path),
-              let value = try? JSONValue.parse(data)
+              var value = try? JSONValue.parse(data)
         else { return [:] }
-        // The registry is either a bare array of rows or an object wrapping
-        // one; accept both rather than pinning a shape this type does not own.
-        let rows: [JSONValue]
-        switch value {
-        case .array(let array):
-            rows = array
-        case .object(let object):
-            if case .array(let array)? = object["connectors"] ?? object["items"] {
-                rows = array
-            } else {
-                rows = []
-            }
-        default:
-            rows = []
+        // Display-only wrappers do not change the authority parser's contract.
+        if case .object(let object) = value,
+           case .array(let rows)? = object["connectors"] ?? object["items"] {
+            value = .array(rows)
         }
+        guard let rows = try? ConnectorOAuthRegistry.checkedConnectorRows(from: value) else { return [:] }
         var names: [String: String] = [:]
         for row in rows {
-            guard case .object(let object) = row,
-                  case .string(let id)? = object["id"],
-                  case .string(let name)? = object["name"]
+            guard case .string(let id)? = row["id"],
+                  case .string(let name)? = row["name"]
             else { continue }
             names[canonicalConnectorID(id)] = name
         }
@@ -274,7 +268,7 @@ public enum InlineInteractionRegistry {
         if MacIntegrationID.all.contains(id) {
             return MacIntegrationID.displayName(for: id)
         }
-        if let bundleID = SystemAppleScriptAdapter.automationTarget(id) { return "Automation for \(bundleID)" }
+        if let bundleID = AppleScriptExecution.automationTarget(id) { return "Automation for \(bundleID)" }
         // The card names the thing being allowed ("File access"), not the
         // switch's own row title in Trust ("File changes") — a read that says
         // "File changes" reads as a lie to the person granting it.
@@ -319,12 +313,13 @@ public enum InlineInteractionRegistry {
 
     /// Whether the SAVED Trust posture permits Mac Control categories at all.
     ///
-    /// Read straight off `trust/policy.json` through MacControl's own gate, so
+    /// Read through Trust's checked saved-policy owner and MacControl's gate, so
     /// the card cannot disagree with the thing that will refuse the call. Under
     /// Safe or Workspace this is false, and no per-category switch would take
     /// effect even if one were written — so the card must not offer to write one.
     public static func macControlPostureAllowsCategories(dataRoot: URL) -> Bool {
-        guard let trust = macControlPolicySnapshot(dataRoot: dataRoot).trustPolicy
+        guard let policy = try? macControlPolicySnapshot(dataRoot: dataRoot),
+              let trust = policy.trustPolicy
         else { return false }
         return MacControlGate.fullMacActive(trust)
     }
@@ -332,22 +327,27 @@ public enum InlineInteractionRegistry {
     /// Whether the saved policy already allows a category — the same question
     /// the dispatch gate asks, so a settled card and a working call agree.
     public static func macControlCategoryAllowed(_ category: String, dataRoot: URL) -> Bool {
-        let policy = macControlPolicySnapshot(dataRoot: dataRoot)
-        guard let trust = policy.trustPolicy, MacControlGate.fullMacActive(trust) else {
+        guard let policy = try? macControlPolicySnapshot(dataRoot: dataRoot),
+              let trust = policy.trustPolicy, MacControlGate.fullMacActive(trust) else {
             return false
         }
         return MacControlGate.gate(policy, category: category).allowed
     }
 
-    static func macControlPolicySnapshot(dataRoot: URL) -> MacControlPolicy {
-        let path = dataRoot
-            .appendingPathComponent("trust", isDirectory: true)
-            .appendingPathComponent("policy.json")
-        guard let data = try? Data(contentsOf: path),
-              let value = try? JSONValue.parse(data),
-              case .object(let root) = value
-        else { return MacControlPolicy.default }
-        return MacControlPolicy.fromTrustPolicyObject(root, dataRoot: dataRoot)
+    static func macControlPolicySnapshot(dataRoot: URL) throws -> MacControlPolicy {
+        switch SavedTrustPolicyAuthority.read(dataRoot: dataRoot) {
+        case .absent:
+            return .fromTrustPolicyObject([:], dataRoot: dataRoot)
+        case .present(let root):
+            return .fromTrustPolicyObject(root, dataRoot: dataRoot)
+        case .damaged:
+            let path = SavedTrustPolicyAuthority.policyURL(dataRoot: dataRoot).path
+            throw ToolFailureError("Saved Trust policy at \(path) could not be read or validated. Preserve the damaged file and ask the owner to repair it in Trust > Access and policy.",
+                effects: .none, owner: path,
+                tap: "Trust > Access and policy > Preserve damaged policy and authorize Safe",
+                code: "trust_policy_unavailable",
+                instruction: "Ask the owner to preserve the damaged policy and authorize Safe.")
+        }
     }
 
     public static func providerDisplayName(_ id: String) -> String {
@@ -481,9 +481,7 @@ public enum InlineInteractionRegistry {
             target: id,
             title: "Connect \(name)",
             why: why,
-            // Agent, 2026-09-13: the primary says the OUTCOME. "Paste a token"
-            // described the mechanics of one of the two setup routes; what the
-            // person is buying is \(name), connected.
+            // The primary action names the connection outcome.
             primaryActionLabel: "Connect \(name)",
             declineConsequence: declineConsequence
                 ?? "Without \(name) I can't do this part, and " + InlineInteraction.ConsequenceCopy.connectorCarryOn,

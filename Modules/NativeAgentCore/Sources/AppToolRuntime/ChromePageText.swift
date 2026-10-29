@@ -1,4 +1,6 @@
 import Foundation
+import NativeAgentShared
+import NativeAgentCore
 import ChatTurnContracts
 import AgentWorkspace
 import PersistenceCore
@@ -7,22 +9,22 @@ import Senses
 import MacControl
 import Privacy
 import Research
-// Blueprint: | `ChromePageText.swift` | `ChromePageText` enum; one `Projection` shares rendered text and addressable rows with the mirror and envelope; ordered inline prose with link proofs, section-named continuation headers, `project`, `rows`, page and folded-control `next`; `contentVersion` shared by the envelope and Chrome news without rendering |
+// Blueprint: | `ChromePageText.swift` | `ChromePageText` enum; one `VisiblePageText` shares rendered text and addressable rows with the mirror and envelope; ordered inline prose with link proofs, section-named continuation headers, `project`, `rows`, page and folded-control `next`; empty image-document reads point to chrome.look; `readDocument` adds a bounded independent HTTP PDF transcript explicitly unverified against Chrome beside its displayed picture; `contentVersion` shared by the envelope and Chrome news without rendering |
 
 /// Chrome's ordered prose and action rows, with the same receipt on raw and
-/// sense-served reads. Continuations name structural elements on this URL.
+/// sense-served reads. Continuations name positions in the rendered page.
 enum ChromePageText {
-    struct Projection {
+    struct VisiblePageText {
         let text: String?
         let rows: [ChromePageMirror.Row]
         let hasVisibleRows: Bool
     }
 
-    static func project(_ snapshot: JSONValue) -> Projection {
+    static func project(_ snapshot: JSONValue) -> VisiblePageText {
         let nodes: [JSONValue] = if case .object(let page) = snapshot, case .array(let nodes)? = page["nodes"] { nodes } else { [] }
         let visible = renderedRows(nodes)
         let rows = rows(nodes, visible: visible)
-        return Projection(text: render(snapshot, visible: visible, rows: rows), rows: rows, hasVisibleRows: !visible.isEmpty)
+        return VisiblePageText(text: render(snapshot, visible: visible, rows: rows), rows: rows, hasVisibleRows: !visible.isEmpty)
     }
 
     /// Chrome's reader waited for the tab to load and its deadline passed first.
@@ -41,13 +43,13 @@ enum ChromePageText {
         document["source"] = .string("http_pdf")
         document["chrome_document_verified"] = .bool(false)
         do {
-            guard let address = text(page["url"]), let url = URL(string: address),
+            guard let address = page["url"]?.stringValue, let url = URL(string: address),
                   ["https", "http"].contains(url.scheme?.lowercased() ?? "") else {
                 throw SenseFailure(code: "unsupported_document_url", message: "This PDF has no HTTP(S) document address to read.")
             }
             let response = try await URLSessionResearchHTTPClient().getBounded(url: url, timeout: 20,
                 maxBytes: MacDocumentRead.maxFileBytes)
-            document["read_at"] = .string(ISO8601DateFormatter().string(from: Date()))
+            document["read_at"] = .string(NativeTimestampFormat.plainZulu(Date()))
             document["final_url"] = response.finalURL.map { .string($0.absoluteString) } ?? .string(address)
             document["http_status"] = .int(Int64(response.status))
             document["retained_body_bytes"] = .int(Int64(response.body.count))
@@ -79,19 +81,19 @@ enum ChromePageText {
     }
 
     private static func render(_ snapshot: JSONValue, visible: [Line], rows mirrorRows: [ChromePageMirror.Row]) -> String? {
-        guard case .object(let page) = snapshot, text(page["snapshotId"]) != nil,
-              case .array(let nodes)? = page["nodes"] else { return nil }
+        guard case .object(let page) = snapshot else { return nil }
         if case .object(let document)? = page["document"], document["kind"] == .string("pdf") {
-            let content = text(document["text"]) ?? ""
-            let status = content.isEmpty ? "failed" : text(document["status"]) ?? "partial"
-            return safe(text(page["url"]) ?? "") + "\nPDF read: " + status + "\n\n"
-                + safe(text(document["reason"]) ?? "The PDF document text was not read.")
+            let content = document["text"]?.stringValue ?? ""
+            let status = content.isEmpty ? "failed" : document["status"]?.stringValue ?? "partial"
+            return safe(page["url"]?.stringValue ?? "") + "\nPDF read: " + status + "\n\n"
+                + safe(document["reason"]?.stringValue ?? "The PDF document text was not read.")
                 + (content.isEmpty ? "" : "\n\n" + UntrustedText.neutralized(content))
         }
+        guard page["snapshotId"]?.stringValue != nil, case .array(let nodes)? = page["nodes"] else { return nil }
         // Prose uses the home's markup defuse. Code is quoted behind a fence
         // longer than any delimiter in its source, preserving its syntax.
-        let title = safe(text(page["title"]) ?? "")
-        let url = safe(text(page["url"]) ?? "")
+        let title = safe(page["title"]?.stringValue ?? "")
+        let url = safe(page["url"]?.stringValue ?? "")
         let fromViewport: Bool = if case .object(let reading)? = page["reading"] { reading["fromViewport"] == .bool(true) } else { false }
         let byNode = Dictionary(mirrorRows.map { ($0.node, $0) }, uniquingKeysWith: { first, _ in first })
         var head = [(title.isEmpty ? "" : title + " — ") + url]
@@ -101,26 +103,29 @@ enum ChromePageText {
             let topLevel = headings.map(\.level).filter { $0 > 1 }.min() ?? 1
             let visibleHeadings = Set(headings.filter { $0.level <= topLevel }.map { safe($0.original) })
             let capturedHeadings = Set(nodes.compactMap { value -> String? in
-                guard case .object(let node) = value, text(node["role"]) == "heading" else { return nil }
-                return safe(text(node["name"]) ?? text(node["text"]) ?? "")
+                guard case .object(let node) = value, node["role"]?.stringValue == "heading" else { return nil }
+                return safe(node["name"]?.stringValue ?? node["text"]?.stringValue ?? "")
             })
-            let names = sections.compactMap { text($0).map(safe) }
+            let names = sections.compactMap { $0.stringValue.map(safe) }
                 .filter { visibleHeadings.contains($0) || !capturedHeadings.contains($0) }.prefix(8)
             if !names.isEmpty { where_.append("Reading: " + names.joined(separator: " · ")) }
         }
-        if fromViewport { where_.append("sections in the scrolled view") }
+        if fromViewport { where_.append("reading from the current viewport outward") }
         if mainContent(page) {
             where_.append(Self.mainContentFound(page) ? "main content (scope page adds the site's nav)"
-                : "no main or article region on this page: read it with scope page to see its content")
+                : "no main region declared: reading the page without its navigation (scope page adds it)")
         }
         head.append(where_.joined(separator: " · "))
         if loadUnfinished(snapshot) {
             head.append("Still loading: Chrome had not finished loading this page when the read's deadline passed, so this read may be partial. Read it again for the rest.")
         }
+        if case .object(let reading)? = page["reading"], reading["pageMoved"] == .bool(true) {
+            head.append("The page moved while reading; this is what was read.")
+        }
 
         var rows = lines(visible)
         var foot: [String] = []
-        if rows.isEmpty, case .object(let summary)? = page["summary"], let prose = text(summary["text"]) {
+        if rows.isEmpty, case .object(let summary)? = page["summary"], let prose = summary["text"]?.stringValue {
             rows.append(safe(prose))
         }
         if rows.allSatisfy({ $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
@@ -130,8 +135,8 @@ enum ChromePageText {
             foot.append("Read limited: " + strings(summary["truncationReasons"]).map(safe).joined(separator: ", "))
         }
         if case .object(let cursor)? = page["readMore"], let next = next(page) {
-            foot.append("Folded: " + safe(text(cursor["name"]) ?? "Remaining page"))
-            if let address = text(next["more"]) {
+            foot.append("Folded: " + safe(cursor["name"]?.stringValue ?? "Remaining page"))
+            if let address = next["more"]?.stringValue {
                 foot.append("More: " + address + " · app {page: \"site:\(URL(string: url)?.host ?? "")\", item: \"" + address + "\"}")
             }
         } else if page["readMore"] != nil, page["readMore"] != .null {
@@ -139,12 +144,12 @@ enum ChromePageText {
         }
         for case .object(let node) in nodes {
             guard let cursor = node["more"], cursor != .null else { continue }
-            guard let args = next(page, cursor: cursor), let address = text(args["more"]) else {
+            guard let args = next(page, cursor: cursor), let address = args["more"]?.stringValue else {
                 foot.append("Folded control is unavailable: Chrome's reader supplied no readable continuation place. raw view · Chrome continuation metadata is incomplete.")
                 continue
             }
-            let id = text(node["nodeId"]) ?? ""
-            let row = byNode[id]?.number ?? safe(text(node["name"]) ?? "control")
+            let id = node["nodeId"]?.stringValue ?? ""
+            let row = byNode[id]?.number ?? safe(node["name"]?.stringValue ?? "control")
             foot.append("Folded: remaining content of row " + row)
             foot.append("More for row " + row + ": " + address + " · app {page: \"site:\(URL(string: url)?.host ?? "")\", item: \"" + address + "\"}")
         }
@@ -166,43 +171,41 @@ enum ChromePageText {
         return next
     }
 
-    static func envelope(_ snapshot: JSONValue, rendered: String, projection: Projection) throws -> JSONValue {
+    static func envelope(_ snapshot: JSONValue, rendered: String, projection: VisiblePageText) throws -> JSONValue {
         guard case .object(let page) = snapshot else { return .string(rendered) }
         let nodes: [JSONValue] = if case .array(let nodes)? = page["nodes"] { nodes } else { [] }
         let byNode = Dictionary(projection.rows.map { ($0.node, $0) }, uniquingKeysWith: { first, _ in first })
         let elementMore: [JSONValue] = nodes.compactMap { value in
             guard case .object(let node) = value, let cursor = node["more"],
                   let args = next(page, cursor: cursor) else { return nil }
-            let row = text(node["nodeId"]).flatMap { byNode[$0] }
+            let row = node["nodeId"]?.stringValue.flatMap { byNode[$0] }
             return .object(["node_id": row?.number.map(JSONValue.string) ?? row.map { .string($0.label) } ?? .null, "next": .object(args)])
         }
         var fields: [String: JSONValue] = ["ok": .bool(true), "text": .string(rendered),
             "url": page["url"] ?? .null, "title": page["title"] ?? .null,
             "snapshot_id": page["snapshotId"] ?? .null, "captured_at": page["capturedAt"] ?? .null,
             "bytes": .int(Int64(rendered.utf8.count)), "has_more": .bool(next(page) != nil || !elementMore.isEmpty)]
-        if case .object(let document)? = page["document"] {
-            let hasText = !(text(document["text"]) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            fields["ok"] = .bool(hasText && document["chrome_document_verified"] == .bool(true))
-            fields["status"] = .string(hasText ? text(document["status"]) ?? "partial" : "failed")
-            fields["chrome_context"] = .object(["snapshot_id": page["snapshotId"] ?? .null,
-                "captured_at": page["capturedAt"] ?? .null, "url": page["url"] ?? .null])
-            fields["snapshot_id"] = .null
-            fields["captured_at"] = document["read_at"] ?? .null
-            fields["url"] = document["final_url"] ?? .null
-            fields["document"] = .object(document.filter { $0.key != "text" })
-        } else if case .array? = page["nodes"] {
+        if case .array? = page["nodes"] {
             let summary: [String: JSONValue] = if case .object(let summary)? = page["summary"] { summary } else { [:] }
-            let hasContent = projection.hasVisibleRows || !(text(summary["text"]) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let hasContent = projection.hasVisibleRows || !(summary["text"]?.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             fields["ok"] = .bool(hasContent)
             fields["status"] = .string(hasContent ? (summary["truncated"] == .bool(true) || loadUnfinished(snapshot) ? "partial" : "completed")
                 : (next(page) != nil ? "partial" : "failed"))
-            if !hasContent { fields["reason"] = .string("read_window_empty") }
+            if !hasContent {
+                fields["reason"] = .string("read_window_empty")
+                if case .object(let document)? = page["document"], document["kind"] == .string("image") {
+                    fields["next"] = .string("This tab is a picture: chrome.look shows it.")
+                }
+            }
             fields["truncated"] = summary["truncated"] ?? .bool(false)
             fields["truncation_reasons"] = summary["truncationReasons"] ?? .array([])
+            if case .object(let reading)? = page["reading"] {
+                fields["page_moved"] = reading["pageMoved"] ?? .bool(false)
+            }
         }
         if !elementMore.isEmpty { fields["element_more"] = .array(elementMore) }
         fields["version"] = .string(try contentVersion(page))
-        if let next = next(page) { fields["next"] = .object(next) }
+        if fields["next"] == nil, let next = next(page) { fields["next"] = .object(next) }
         return .object(fields)
     }
 
@@ -230,12 +233,12 @@ enum ChromePageText {
     private static func rows(_ nodes: [JSONValue], visible: [Line]) -> [ChromePageMirror.Row] {
         let numbers = Set(visible.map(\.number) + visible.flatMap { $0.references })
         return nodes.compactMap { value -> ChromePageMirror.Row? in
-            guard case .object(let node) = value, let id = text(node["nodeId"]) else { return nil }
+            guard case .object(let node) = value, let id = node["nodeId"]?.stringValue else { return nil }
             var options: [ChromePageMirror.Option] = []
             if case .object(let select)? = node["select"], case .array(let list)? = select["options"] {
                 options = list.compactMap { item in
-                    guard case .object(let option) = item, let raw = text(option["value"]) else { return nil }
-                    return .init(label: text(option["label"]) ?? raw, value: raw)
+                    guard case .object(let option) = item, let raw = option["value"]?.stringValue else { return nil }
+                    return .init(label: option["label"]?.stringValue ?? raw, value: raw)
                 }
             }
             let (role, label) = roleAndLabel(node)
@@ -246,19 +249,19 @@ enum ChromePageText {
     }
 
     private static func roleAndLabel(_ node: [String: JSONValue]) -> (String, String) {
-        if node["preformatted"] == .bool(true) { return ("code", text(node["text"]) ?? "") }
-        if node["time"] == .bool(true) { return ("text", safe(text(node["text"]) ?? "")) }
-        var role = safe(text(node["role"]) ?? text(node["kind"]) ?? "")
-        if text(node["kind"]) == "image" { role = "image" }
+        if node["preformatted"] == .bool(true) { return ("code", node["text"]?.stringValue ?? "") }
+        if node["time"] == .bool(true) { return ("text", safe(node["text"]?.stringValue ?? "")) }
+        var role = safe(node["role"]?.stringValue ?? node["kind"]?.stringValue ?? "")
+        if node["kind"]?.stringValue == "image" { role = "image" }
         if role == "other" || role.isEmpty { role = "text" }
-        if role == "heading", let level = number(node["level"]) { role = "h\(Int(level))" }
-        let name = safe(text(node["name"]) ?? "")
-        let body = safe(text(node["text"]) ?? "")
+        if role == "heading", let level = node["level"]?.numberValue(coercingStrings: false, finiteOnly: false) { role = "h\(Int(level))" }
+        let name = safe(node["name"]?.stringValue ?? "")
+        let body = safe(node["text"]?.stringValue ?? "")
         var label = name.isEmpty ? body : name
         if !body.isEmpty, body != label, !label.contains(body) {
             label = body.contains(label) ? body : label + " — " + body
         }
-        if label.isEmpty, role == "link", let url = text(node["url"]) { label = safe(url) }
+        if label.isEmpty, role == "link", let url = node["url"]?.stringValue { label = safe(url) }
         // Prose keeps a paragraph; a control's name stays short.
         return (role, label)
     }
@@ -294,65 +297,65 @@ enum ChromePageText {
         var byID: [String: [String: JSONValue]] = [:]
         var linkChildren: [String: [[String: JSONValue]]] = [:]
         for case .object(let node) in nodes {
-            if let path = text(node["contentLinkPath"]),
-               node["inline"] != .bool(true) || text(node["role"]) == "heading",
-               !safe(text(node["text"]) ?? "").isEmpty {
+            if let path = node["contentLinkPath"]?.stringValue,
+               node["inline"] != .bool(true) || node["role"]?.stringValue == "heading",
+               !safe(node["text"]?.stringValue ?? "").isEmpty {
                 linkChildren[path, default: []].append(node)
             }
-            guard let id = text(node["nodeId"]) else { continue }
+            guard let id = node["nodeId"]?.stringValue else { continue }
             byID[id] = node
-            if let path = text(node["elementPath"]) { pathIDs[path] = id }
-            if let parent = text(node["parentNodeId"]) { parents[id] = parent }
+            if let path = node["elementPath"]?.stringValue { pathIDs[path] = id }
+            if let parent = node["parentNodeId"]?.stringValue { parents[id] = parent }
         }
         // A card's link belongs on its heading. Only fold the parent link
         // when the retained child blocks account for its entire visible text.
         var contentLinks: [String: String] = [:]
         for case .object(let link) in nodes where link["childTextName"] == .bool(true) {
-            guard let id = text(link["nodeId"]), let path = text(link["elementPath"]) else { continue }
+            guard let id = link["nodeId"]?.stringValue, let path = link["elementPath"]?.stringValue else { continue }
             let children = linkChildren[path] ?? []
-            let childIDs = Set(children.compactMap { text($0["nodeId"]) })
+            let childIDs = Set(children.compactMap { $0["nodeId"]?.stringValue })
             let blocks = children.filter { child in
-                var parent = text(child["parentNodeId"])
+                var parent = child["parentNodeId"]?.stringValue
                 while let key = parent, key != id {
                     if childIDs.contains(key) { return false }
                     parent = parents[key]
                 }
                 return true
             }
-            guard !blocks.isEmpty, safe(blocks.compactMap { text($0["text"]) }.joined(separator: " ")) == safe(text(link["text"]) ?? ""),
-                  let target = (blocks.first { text($0["role"]) == "heading" } ?? blocks.first).flatMap({ text($0["nodeId"]) }) else { continue }
+            guard !blocks.isEmpty, safe(blocks.compactMap { $0["text"]?.stringValue }.joined(separator: " ")) == safe(link["text"]?.stringValue ?? ""),
+                  let target = (blocks.first { $0["role"]?.stringValue == "heading" } ?? blocks.first).flatMap({ $0["nodeId"]?.stringValue }) else { continue }
             contentLinks[id] = target
         }
         // Structure every article shares: a heading prints once. A named
         // region repeating a heading, and a box wrapping a heading (its text
         // is the heading plus controls like "[edit]"), are the same heading.
         var headingNames = Set<String>(), headingChild: [String: String] = [:], linkPaths = Set<String>()
-        for case .object(let node) in nodes where text(node["role"]) == "link" { if let path = text(node["elementPath"]) { linkPaths.insert(path) } }
-        for case .object(let node) in nodes where text(node["role"]) == "heading" {
-            let name = safe(text(node["name"]) ?? text(node["text"]) ?? "")
+        for case .object(let node) in nodes where node["role"]?.stringValue == "link" { if let path = node["elementPath"]?.stringValue { linkPaths.insert(path) } }
+        for case .object(let node) in nodes where node["role"]?.stringValue == "heading" {
+            let name = safe(node["name"]?.stringValue ?? node["text"]?.stringValue ?? "")
             guard !name.isEmpty else { continue }
             headingNames.insert(name)
-            if let parent = text(node["parentNodeId"]) { headingChild[parent] = name }
+            if let parent = node["parentNodeId"]?.stringValue { headingChild[parent] = name }
         }
         var section = 0
         for case .object(let node) in nodes {
-            guard let id = text(node["nodeId"]) else { continue }
+            guard let id = node["nodeId"]?.stringValue else { continue }
             let (role, original) = roleAndLabel(node)
-            let heading = text(node["role"]) == "heading"
+            let heading = node["role"]?.stringValue == "heading"
             if heading { section += 1 }
             if contentLinks[id] != nil { continue }
             let ownActs = !Set(strings(node["actions"])).isDisjoint(with: ["click", "fill", "type", "select", "set_checked", "keypress"])
-            if role == "landmark", !ownActs, headingNames.contains(safe(text(node["name"]) ?? "")) {
+            if role == "landmark", !ownActs, headingNames.contains(safe(node["name"]?.stringValue ?? "")) {
                 // Only a region that holds nothing but its name repeats the heading.
-                let whole = safe(text(node["text"]) ?? "")
-                if whole.isEmpty || whole == safe(text(node["name"]) ?? "") { continue }
+                let whole = safe(node["text"]?.stringValue ?? "")
+                if whole.isEmpty || whole == safe(node["name"]?.stringValue ?? "") { continue }
             }
             if !role.hasPrefix("h"), !ownActs, let heading = headingChild[id],
                case .array(let parts)? = node["inlineText"], !parts.isEmpty {
                 // A box whose only words besides its heading are links ("[edit]").
                 let prose = parts.compactMap { value -> String? in
-                    guard case .object(let part) = value, !linkPaths.contains(text(part["elementPath"]) ?? "") else { return nil }
-                    return text(part["text"])
+                    guard case .object(let part) = value, !linkPaths.contains(part["elementPath"]?.stringValue ?? "") else { return nil }
+                    return part["text"]?.stringValue
                 }.joined()
                 let bare = safe(prose).trimmingCharacters(in: CharacterSet(charactersIn: " []()|·"))
                 if bare == heading { continue }
@@ -361,9 +364,9 @@ enum ChromePageText {
             var references = Set<String>()
             if node["preformatted"] != .bool(true), case .array(let parts)? = node["inlineText"], !parts.isEmpty {
                 let plain = parts.compactMap { value -> String? in
-                    guard case .object(let part) = value else { return nil }; return text(part["text"])
+                    guard case .object(let part) = value else { return nil }; return part["text"]?.stringValue
                 }.joined()
-                if safe(plain) == safe(text(node["text"]) ?? "") {
+                if safe(plain) == safe(node["text"]?.stringValue ?? "") {
                     let marked = inlineRendering(parts, pathIDs: pathIDs, ownID: id)
                     label = parts.contains { if case .object(let p) = $0 { return p["code"] == .bool(true) }; return false }
                         ? marked.label : safe(marked.label)
@@ -375,31 +378,31 @@ enum ChromePageText {
                 label = "[\(label)](\(number))"; references.insert(number)
             }
             labels[id] = original
-            if let parent = text(node["parentNodeId"]) { parents[id] = parent }
+            if let parent = node["parentNodeId"]?.stringValue { parents[id] = parent }
             let acts = !Set(strings(node["actions"])).isDisjoint(with: ["click", "fill", "type", "select", "set_checked", "keypress"])
             var state = rowState(node)
             for (link, target) in contentLinks where target == id {
                 for flag in rowState(byID[link] ?? [:]) where !state.contains(flag) { state.append(flag) }
             }
-            if !acts, state.isEmpty, let ownerPath = text(node["textOwnerPath"]),
+            if !acts, state.isEmpty, let ownerPath = node["textOwnerPath"]?.stringValue,
                let owner = pathIDs[ownerPath], let ownerNode = byID[owner] {
                 if ownerNode["preformatted"] == .bool(true) || ownerNode["time"] == .bool(true)
-                    || safe(text(ownerNode["text"]) ?? "").contains(safe(text(node["text"]) ?? "")) { continue }
+                    || safe(ownerNode["text"]?.stringValue ?? "").contains(safe(node["text"]?.stringValue ?? "")) { continue }
             }
-            if label.isEmpty, state.isEmpty, !acts, text(node["kind"]) != "cell" { continue }
+            if label.isEmpty, state.isEmpty, !acts, node["kind"]?.stringValue != "cell" { continue }
             if node["inline"] == .bool(true), !acts, state.isEmpty,
-               let parent = text(node["parentNodeId"]), let parentLabel = labels[parent], parentLabel.contains(original) { continue }
+               let parent = node["parentNodeId"]?.stringValue, let parentLabel = labels[parent], parentLabel.contains(original) { continue }
             items.append(.init(number: id.hasPrefix("n") ? String(id.dropFirst()) : id, id: id, role: role, label: label, state: state, acts: acts, references: references,
-                original: original, heading: heading, level: Int(number(node["level"]) ?? 1), section: section,
-                rowPath: text(node["tableRowPath"]), cellPath: text(node["tableCellPath"])))
+                original: original, heading: heading, level: Int(node["level"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? 1), section: section,
+                rowPath: node["tableRowPath"]?.stringValue, cellPath: node["tableCellPath"]?.stringValue))
         }
         // Remove a standalone link only after a retained row carries it.
         // A discarded heading wrapper cannot swallow the section's controls.
         var represented = Set(items.flatMap { $0.references.subtracting([$0.number]) })
         for item in items {
             guard case .array(let parts)? = byID[item.id]?["inlineText"], item.role != "code" else { continue }
-            for case .object(let part) in parts where isFootnote(text(part["text"]) ?? "") {
-                if let path = text(part["elementPath"]), let target = pathIDs[path] {
+            for case .object(let part) in parts where isFootnote(part["text"]?.stringValue ?? "") {
+                if let path = part["elementPath"]?.stringValue, let target = pathIDs[path] {
                     represented.insert(target.hasPrefix("n") ? String(target.dropFirst()) : target)
                 }
             }
@@ -423,7 +426,7 @@ enum ChromePageText {
             guard item.heading, !item.acts, item.references.isEmpty else { return true }
             return kept.dropFirst(index + 1).prefix { !$0.heading || $0.level > item.level }.contains {
                 (!$0.heading || !$0.references.isEmpty) && !$0.label.isEmpty
-                    && byID[$0.id].flatMap { text($0["sectionControlHeadingPath"]) } == nil
+                    && byID[$0.id].flatMap { $0["sectionControlHeadingPath"]?.stringValue } == nil
             }
         }.map(\.element)
         // Section actions keep their exact node number when folded.
@@ -431,7 +434,7 @@ enum ChromePageText {
         var folded = Set<String>()
         for index in kept.indices where kept[index].heading {
             let headingID = kept[index].id
-            for control in kept where byID[control.id].flatMap({ text($0["sectionControlHeadingPath"]) }).flatMap({ pathIDs[$0] }) == headingID {
+            for control in kept where byID[control.id].flatMap({ $0["sectionControlHeadingPath"]?.stringValue }).flatMap({ pathIDs[$0] }) == headingID {
                 guard !control.heading else { continue }
                 let label = control.acts ? "[\(control.label)](\(control.number))" : control.label
                 kept[index].label += " · " + label + (control.state.isEmpty ? "" : " [" + control.state.joined(separator: "; ") + "]")
@@ -445,8 +448,8 @@ enum ChromePageText {
         for item in kept {
             if let previous = links.last, item.role == "link", previous.role == "link", item.state == previous.state,
                item.section == previous.section, item.cellPath == previous.cellPath,
-               let previousPath = text(byID[item.id]?["adjacentLinkPath"]), pathIDs[previousPath] == previous.id {
-                links[links.count - 1].label += (text(byID[item.id]?["adjacentLinkGap"]) ?? "") + item.label
+               let previousPath = byID[item.id]?["adjacentLinkPath"]?.stringValue, pathIDs[previousPath] == previous.id {
+                links[links.count - 1].label += (byID[item.id]?["adjacentLinkGap"]?.stringValue ?? "") + item.label
                 links[links.count - 1].references.formUnion(item.references)
                 links[links.count - 1].references.insert(item.number)
                 // Retain the tail identity for a third adjacent link.
@@ -510,7 +513,7 @@ enum ChromePageText {
         }
         var label = "", references = Set<String>(), index = 0
         func prose(_ part: [String: JSONValue]) -> String {
-            let raw = text(part["text"]) ?? ""
+            let raw = part["text"]?.stringValue ?? ""
             if part["code"] == .bool(true) {
                 if raw.contains("\n") {
                     let fence = codeFence(raw)
@@ -525,23 +528,23 @@ enum ChromePageText {
             return UntrustedText.neutralized(raw)
         }
         while index < parts.count {
-            let part = parts[index], raw = text(part["text"]) ?? ""
-            guard !isFootnote(raw), let path = text(part["elementPath"]), let target = pathIDs[path], target != ownID else {
+            let part = parts[index], raw = part["text"]?.stringValue ?? ""
+            guard !isFootnote(raw), let path = part["elementPath"]?.stringValue, let target = pathIDs[path], target != ownID else {
                 label += prose(part); index += 1; continue
             }
             let first = target.hasPrefix("n") ? String(target.dropFirst()) : target
             references.insert(first)
             var words = prose(part), end = index + 1
-            if let href = text(part["href"]) {
+            if let href = part["href"]?.stringValue {
                 while end < parts.count {
                     var next = end, gap = ""
-                    while next < parts.count, text(parts[next]["elementPath"]) == nil,
-                          (text(parts[next]["text"]) ?? "").allSatisfy(\.isWhitespace) {
-                        gap += text(parts[next]["text"]) ?? ""; next += 1
+                    while next < parts.count, parts[next]["elementPath"]?.stringValue == nil,
+                          (parts[next]["text"]?.stringValue ?? "").allSatisfy(\.isWhitespace) {
+                        gap += parts[next]["text"]?.stringValue ?? ""; next += 1
                     }
-                    guard next < parts.count, text(parts[next]["href"]) == href,
-                          !isFootnote(text(parts[next]["text"]) ?? ""),
-                          let nextPath = text(parts[next]["elementPath"]), let nextID = pathIDs[nextPath] else { break }
+                    guard next < parts.count, parts[next]["href"]?.stringValue == href,
+                          !isFootnote(parts[next]["text"]?.stringValue ?? ""),
+                          let nextPath = parts[next]["elementPath"]?.stringValue, let nextID = pathIDs[nextPath] else { break }
                     words += gap + prose(parts[next])
                     references.insert(nextID.hasPrefix("n") ? String(nextID.dropFirst()) : nextID)
                     end = next + 1
@@ -569,15 +572,15 @@ enum ChromePageText {
                 let label = item.acts ? "[\(code)](\(item.number))" : code
                 let state = item.state.isEmpty ? "" : " [" + item.state.joined(separator: "; ") + "]"
                 if let cell = paths[path] {
-                    let ownText = safe(text(byID[pathIDs[path] ?? ""]?["text"]) ?? "")
-                    let childText = safe(text(byID[item.id]?["text"]) ?? "")
+                    let ownText = safe(byID[pathIDs[path] ?? ""]?["text"]?.stringValue ?? "")
+                    let childText = safe(byID[item.id]?["text"]?.stringValue ?? "")
                     if !item.acts && item.state.isEmpty && !childText.isEmpty && ownText.contains(childText) { continue }
                     cells[cell] += (cells[cell].isEmpty ? "" : " · ") + label + state
                 } else {
                     paths[path] = cells.count
                     var spans: [String] = []
-                    if let value = number(byID[item.id]?["columnSpan"]), value > 1 { spans.append("colspan=\(Int(value))") }
-                    if let value = number(byID[item.id]?["rowSpan"]), value > 1 { spans.append("rowspan=\(Int(value))") }
+                    if let value = span(byID[item.id]?["columnSpan"], maximum: 1000) { spans.append("colspan=\(value)") }
+                    if let value = span(byID[item.id]?["rowSpan"], maximum: 65534) { spans.append("rowspan=\(value)") }
                     cells.append(label + state + (spans.isEmpty ? "" : " [" + spans.joined(separator: "; ") + "]"))
                 }
             }
@@ -595,9 +598,9 @@ enum ChromePageText {
         var state: [String] = []
         if case .object(let select)? = node["select"], case .array(let options)? = select["options"] {
             let labels = options.compactMap { value -> String? in
-                guard case .object(let option) = value, let raw = text(option["value"]) else { return nil }
+                guard case .object(let option) = value, let raw = option["value"]?.stringValue else { return nil }
                 let optionValue = safe(raw)
-                let shown = safe(text(option["label"]) ?? raw)
+                let shown = safe(option["label"]?.stringValue ?? raw)
                 let mark = option["selected"] == .bool(true) ? "*" : ""
                 return mark + (shown == optionValue ? optionValue : shown + "=" + optionValue)
             }
@@ -606,7 +609,7 @@ enum ChromePageText {
             let shown = select["optionOffset"] == nil ? 30 : labels.count
             state.append("options: " + labels.prefix(shown).joined(separator: " | ")
                 + (labels.count > shown ? " | +\(labels.count - shown)" : ""))
-        } else if let value = text(node["value"]), !value.isEmpty,
+        } else if let value = node["value"]?.stringValue, !value.isEmpty,
                   value != "0" || (node["states"].flatMap { if case .object(let f) = $0 { f["editable"] } else { nil } } == .bool(true)) {
             state.append("=\"" + String(safe(value).prefix(120)) + "\"")
         }
@@ -637,22 +640,15 @@ enum ChromePageText {
         return false
     }
 
-    private static func text(_ value: JSONValue?) -> String? {
-        if case .string(let raw)? = value { return raw }
-        return nil
-    }
-
-    private static func number(_ value: JSONValue?) -> Double? {
-        switch value {
-        case .int(let n)?: return Double(n)
-        case .double(let n)?: return n
-        default: return nil
-        }
+    private static func span(_ value: JSONValue?, maximum: Int) -> Int? {
+        guard let number = value?.numberValue(coercingStrings: false, finiteOnly: false), number.isFinite,
+              let count = Int(exactly: number), (2...maximum).contains(count) else { return nil }
+        return count
     }
 
     private static func strings(_ value: JSONValue?) -> [String] {
         guard case .array(let values)? = value else { return [] }
-        return values.compactMap { text($0) }
+        return values.compactMap { $0.stringValue }
     }
 
     /// One line, tool markup inert: `UntrustedText`, as home uses it.

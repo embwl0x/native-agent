@@ -6,10 +6,8 @@ import Security
 
 /// Identity-gated state for one accepted connection's exact request-read
 /// deadline. The token prevents a late deadline work item from cancelling a
-/// DIFFERENT connection if an `ObjectIdentifier` is ever reused after the
-/// original connection deallocated. Shared by both bridges as of C5 (was
-/// MacControlBridge-only; ClaudeBridge previously relied on a plain
-/// `[weak conn]` timer keyed by ObjectIdentifier).
+/// different connection if an `ObjectIdentifier` is reused after the
+/// original connection deallocated.
 public struct BridgeReadDeadlineState: Sendable, Equatable {
     public let token: UUID
     public var routed: Bool = false
@@ -55,8 +53,7 @@ public enum BridgeCore {
     /// Ceiling on the header block, enforced BOTH before the `\r\n\r\n`
     /// terminator (bounds pre-auth RAM against a peer that never terminates the
     /// header block) AND on a terminated-but-oversized block. 64KB is far above
-    /// any legitimate request header set. (ClaudeBridge's cap, now shared so
-    /// MacControlBridge gains it.)
+    /// any legitimate request header set.
     public static let headerByteCap = 65_536
 
     // MARK: - Endpoint
@@ -206,6 +203,7 @@ public enum BridgeCore {
                 let body = Data(bodyAlready.prefix(contentLength))
                 server.received(conn: conn, method: method, path: path, headers: headers, body: body)
             } else {
+                guard !isComplete else { conn.cancel(); return }
                 readBody(conn, have: bodyAlready, need: contentLength, method: method, path: path, headers: headers, server: server)
             }
         }
@@ -242,8 +240,7 @@ public enum BridgeCore {
 
     // MARK: - HTTP response
 
-    /// Reason phrase for the status codes both bridges emit (union of the two
-    /// prior tables). Unknown codes fall back to "Internal Server Error".
+    /// Reason phrase for bridge status codes; unknown codes use "Internal Server Error".
     public static func statusText(for status: Int) -> String {
         switch status {
         case 200: return "OK"
@@ -266,9 +263,7 @@ public enum BridgeCore {
 
     /// Serialize `obj` and send a single `Connection: close` JSON response, then
     /// cancel the connection. A payload that is not JSON-serializable falls back
-    /// to a small error body rather than dropping the response entirely
-    /// (ClaudeBridge's safety, now shared — MacControlBridge previously just
-    /// cancelled the socket on that impossible path).
+    /// to a small error body rather than dropping the response entirely.
     public static func writeJSON(_ conn: NWConnection, status: Int, obj: [String: Any], onSent: (@Sendable () -> Void)? = nil,
                                  onFailed: (@Sendable () -> Void)? = nil) {
         let data: Data

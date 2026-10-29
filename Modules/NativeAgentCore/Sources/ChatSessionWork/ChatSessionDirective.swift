@@ -1,26 +1,9 @@
 import Foundation
-// Blueprint: | `ChatSessionDirective.swift` | `ChatSessionDirective` enum; `safeComponent`, `recordURL`; seven-day delivery eligibility leaves expired/delivered records on disk |
+import NativeAgentCore
+import PersistenceCore
+// Blueprint: | `ChatSessionDirective.swift` | `ChatSessionDirective.recordURL` uses canonical session path validation; seven-day delivery eligibility leaves expired/delivered records on disk |
 
-// MARK: - A one-shot system directive bound to ONE chat session
-//
-// Sol's P1-4, 2026-09-15. The first conversation's instructions lived only in
-// the hidden kickoff that produced the opener. That kickoff is a user-role
-// message which is deliberately NOT persisted (`hideUserBubble`), so the turn
-// carrying the person's ANSWER could be assembled without it — leaving the
-// agent looking at "A partner, mostly" with nothing telling it to write a line
-// into SOUL.md. The write then simply does not happen, silently, and the one
-// visible consequence of the whole flow is missing.
-//
-// So the instruction that matters on the NEXT turn is left where the next turn
-// will actually look: the volatile dynamic segment of its system prompt.
-//
-// This is `ChatUpdateNote`'s shape with one difference that is the whole point
-// — the record is keyed by session id. An update note is a global "say this to
-// whoever speaks next"; this is "when THIS conversation continues, it needs to
-// know this". A global note would be consumed by whichever session happened to
-// take the next turn, which on a Mac with a bot shelf running is routinely not
-// the one the person is typing in.
-//
+// One-shot instructions belong to their session's next accepted user turn.
 // One shot, like the note: stamped delivered after provider acceptance.
 // Expiry bounds delivery eligibility; existing records remain on disk.
 // Storage: local backup, data export and phone sync exclude these records;
@@ -60,21 +43,8 @@ public enum ChatSessionDirective {
     /// Seven-day delivery window; expiry returns nil without changing the file.
     public static let retentionSeconds: TimeInterval = 7 * 24 * 60 * 60
 
-    /// Session ids reach this from a stored key, so the path component is
-    /// built from an allowlist rather than sanitized by removal: anything that
-    /// is not alphanumeric, dash or underscore makes the id unusable here and
-    /// the directive is refused rather than written somewhere surprising.
-    /// A traversal attempt (`..`, `/`) cannot survive this.
-    static func safeComponent(_ sessionID: String) -> String? {
-        let trimmed = sessionID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed.count <= 128 else { return nil }
-        let allowed = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
-        guard trimmed.allSatisfy({ allowed.contains($0) }) else { return nil }
-        return trimmed
-    }
-
     public static func recordURL(dataRoot: URL, sessionID: String) -> URL? {
-        guard let component = safeComponent(sessionID) else { return nil }
+        guard let component = NativeAgentChatSessionID.normalizedPathComponent(sessionID) else { return nil }
         return dataRoot
             .appendingPathComponent("context", isDirectory: true)
             .appendingPathComponent("session_directives", isDirectory: true)
@@ -119,7 +89,7 @@ public enum ChatSessionDirective {
         if let expectedDirective, record.directive.trimmingCharacters(in: .whitespacesAndNewlines) != expectedDirective { return }
         record.deliveredAt = ISO8601DateFormatter().string(from: now)
         guard let data = try? JSONEncoder().encode(record) else { return }
-        try? data.write(to: url, options: [.atomic])
+        try? SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
     }
 
     @discardableResult
@@ -132,14 +102,6 @@ public enum ChatSessionDirective {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         guard let data = try? encoder.encode(record) else { return false }
-        try? FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(), withIntermediateDirectories: true
-        )
-        do {
-            try data.write(to: url, options: [.atomic])
-            return true
-        } catch {
-            return false
-        }
+        return NativePrivateFile.write(data, to: url)
     }
 }

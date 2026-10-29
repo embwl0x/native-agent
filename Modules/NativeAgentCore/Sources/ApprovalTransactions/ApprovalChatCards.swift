@@ -7,6 +7,7 @@ import PersistenceCore
 import Privacy
 import TelegramBot
 import Transcripts
+import NativeAgentShared
 // Blueprint: | `ApprovalChatCards.swift` | Approval-card projection and notifications; transcript appends delegate to the chat owner, projection generations to ChatSessionIndexFile |
 
 /// User, 10-03: "any approval the agent needs should pop right up in chat."
@@ -202,19 +203,16 @@ public enum ApprovalChatCards {
     static func appendRow(_ row: JSONValue, sessionID: String, dataRoot: URL, uniqueRunID: String? = nil) async throws {
         let path = dataRoot.appendingPathComponent("chat/messages", isDirectory: true)
             .appendingPathComponent("\(sessionID).jsonl")
-        let persistence = SwiftNativePersistenceCore()
-        try await SwiftNativeChatOrchestrationClient.appendTranscriptRow(
-            row, to: path, persistence: persistence, uniqueRunID: uniqueRunID)
+        try await ContactThread.append(row, to: path, uniqueRunID: uniqueRunID)
         await publishTranscriptChanges(sessionIDs: [sessionID], dataRoot: dataRoot)
     }
 
     /// Card projections change without a new message. Advance the same version
     /// the phone's transcript cache and ordering already consume.
     static func publishTranscriptChanges(sessionIDs: Set<String>, dataRoot: URL) async {
-        let persistence = SwiftNativePersistenceCore()
         do {
             try await ChatSessionIndexFile.recordProjectionChanges(
-                sessionIDs: sessionIDs, dataRoot: dataRoot, persistence: persistence)
+                sessionIDs: sessionIDs, dataRoot: dataRoot)
         } catch {
             nativeLog("[approval-chat-card] transcript generation bump failed: %@", error.localizedDescription)
         }

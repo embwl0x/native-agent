@@ -68,8 +68,7 @@ actor ICloudDeliveryNudgeQueue {
     }
 
     private func startWorkerIfNeeded() {
-        // 2026-09-18: an empty queue must not re-spawn; a cancelled worker
-        // retains ownership until it exits so a new enqueue cannot overlap it.
+        // Only pending work starts a worker; cancellation retains ownership until the worker exits.
         guard workerTask == nil, !pending.isEmpty else { return }
         workerTask = Task { [weak self] in
             await self?.runScheduledNudges()

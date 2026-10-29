@@ -77,7 +77,6 @@ extension MacFourVerbs {
                 $0.provenance == .ax && $0.sourceAXPath == candidate.sourceAXPath && $0.label == candidate.label
             }
             var details = control?.states ?? []
-            if let value = control?.value?.display { details.append(value) }
             details += row?.detail.compactMap(\.display) ?? []
             if !target.enabled, !details.contains("disabled") { details.append("disabled") }
             if target.secret { details.append("secure") }
@@ -132,135 +131,88 @@ extension MacFourVerbs {
         return verbs
     }
 
-    // MARK: - Zoom
-
-    struct Zoom {
-        enum Scope { case whole, controls, readouts, visual }
-        let screen: MacScreenRender.Screen
-        let note: String
-        let scope: Scope
-
-        init(screen: MacScreenRender.Screen, note: String, scope: Scope = .whole) {
-            self.screen = screen; self.note = note; self.scope = scope
-        }
-    }
-
-    /// Scoping, WITHOUT renumbering. Controls carry no ordinals, so a control
-    /// zoom filters them; content rows carry the addresses she acts with, so a
-    /// content zoom names the matching ordinals instead of
-    /// dropping their neighbours.
+    /// Scope the native page from capture-local AX paths, retaining the
+    /// independent pixel renderer without constructing another AX screen.
     static func zoom(
-        _ screen: MacScreenRender.Screen,
-        part: String
-    ) -> Zoom? {
-        let needle = normalize(part)
-        guard !needle.isEmpty else { return nil }
-
-        // A visual world is a first-class screen section, not browser chrome.
-        // Without this branch, "the open X canvas" can fuzzy-match the tab
-        // named X and hide the pixel regions the agent actually asked to see,
-        // forcing another full-screen/provider round before acting.
-        let words = Set(needle.split(separator: " ").map(String.init))
-        let asksForVisualSurface = words.contains("canvas")
-            || words.contains("world")
-            || words.contains("viewport")
-            || needle.contains("visual surface")
-        if asksForVisualSurface,
-           screen.contents.contains(where: { $0.kind == .canvas }) {
-            let visualContents = screen.contents.filter { content in
-                content.kind == .canvas || content.rows.contains { $0.provenance.isVision }
+        _ percept: MacLookPercept, supplement: MacFourVerbsSupplement?,
+        mergedAXPaths: Set<[Int]>, focusedControl: (label: String, kind: String)?, part: String?
+    ) -> (paths: [[Int]], visual: Bool, pixelText: String, fullPixelText: String) {
+        let (rows, controls) = partition(percept)
+        var known = Set((controls + rows).compactMap {
+            MacScreenText($0.label, redacted: $0.labelJSON).display.map(normalize)
+        } + percept.readouts.compactMap { $0.displayText.map(normalize) })
+        let addedControls = (supplement?.controls ?? []).filter { control in
+            if let path = control.sourceAXPath {
+                guard !mergedAXPaths.contains(path) else { return false }
+                if let label = control.label.display { known.insert(normalize(label)) }
+                return true
             }
-            let visualControls = screen.controls.filter { $0.provenance.isVision }
-            let visualRows = visualContents.reduce(0) { $0 + $1.rows.count }
-            let scoped = MacScreenRender.Screen(
-                appName: screen.appName,
-                windowTitle: screen.windowTitle,
-                isFront: screen.isFront,
-                otherWindows: screen.otherWindows,
-                provenance: screen.provenance,
-                modal: screen.modal,
-                whereSteps: screen.whereSteps,
-                contents: visualContents,
-                controls: visualControls,
-                totalControls: visualControls.count,
-                unlabeledControls: [:],
-                values: screen.values,
-                totalValues: screen.totalValues,
-                unclassifiedOmittedTargets: screen.unclassifiedOmittedTargets
-            )
-            return Zoom(
-                screen: scoped,
-                note: "Visual surface retained with \(visualRows + visualControls.count) interpreted region"
-                    + (visualRows + visualControls.count == 1 ? "" : "s")
-                    + "; surrounding controls omitted.",
-                scope: .visual
-            )
+            return control.label.display.map { known.insert(normalize($0)).inserted } ?? true
         }
-
-        let asksForControls = ["controls", "actions", "actionable controls"].contains(needle)
-        let matchingControls = asksForControls ? screen.controls
-            : screen.controls.filter { matches(needle, $0.label.display, kind: $0.kind) }
-        let matchingRows = screen.contents.flatMap { content in
-            content.rows.enumerated().filter { matches(needle, $0.element.label?.display, kind: nil) }
-                .map { $0.offset + 1 }
+        var contents: [MacScreenRender.Content] = []
+        for content in supplement?.contents ?? [] {
+            if content.kind == .canvas {
+                if !contents.contains(where: { $0.kind == .canvas }) { contents.append(content) }
+                continue
+            }
+            let kept = content.rows.filter { row in
+                if let path = row.sourceAXPath {
+                    guard !mergedAXPaths.contains(path) else { return false }
+                    if let label = row.label?.display { known.insert(normalize(label)) }
+                    return true
+                }
+                return row.label?.display.map { known.insert(normalize($0)).inserted } ?? true
+            }
+            if !kept.isEmpty {
+                contents.append(MacScreenRender.Content(kind: content.kind, rows: kept, canvas: content.canvas))
+            }
         }
-
-        let asksForReadouts = ["hud", "the hud", "values", "readouts", "status text"].contains(needle)
-        let matchingValues = asksForReadouts ? screen.values : screen.values.filter {
-            matches(needle, $0.text.display, kind: nil)
+        let values = (supplement?.values ?? []).filter {
+            $0.text.display.map { known.insert(normalize($0)).inserted } ?? true
         }
-        if asksForReadouts || (!matchingValues.isEmpty && matchingControls.isEmpty && matchingRows.isEmpty) {
-            let scoped = MacScreenRender.Screen(
-                appName: screen.appName, windowTitle: screen.windowTitle, isFront: screen.isFront,
-                otherWindows: screen.otherWindows, provenance: screen.provenance,
-                modal: screen.modal, whereSteps: screen.whereSteps,
-                values: matchingValues, totalValues: asksForReadouts ? screen.totalValues : matchingValues.count,
-                unclassifiedOmittedTargets: screen.unclassifiedOmittedTargets
-            )
-            return Zoom(screen: scoped, note: "\(matchingValues.count) observed readout\(matchingValues.count == 1 ? "" : "s") match; surrounding controls omitted.", scope: .readouts)
+        let fullPixelText = MacScreenRender.pixelEvidence(contents: contents,
+            controls: addedControls, values: values)
+        guard let part, !normalize(part).isEmpty else { return ([], false, fullPixelText, fullPixelText) }
+        let needle = normalize(part)
+        let words = Set(needle.split(separator: " ").map(String.init))
+        let visual = (words.contains("canvas") || words.contains("world") || words.contains("viewport")
+            || needle.contains("visual surface")) && contents.contains { $0.kind == .canvas }
+        if visual {
+            let pixelText = MacScreenRender.pixelEvidence(
+                contents: contents.filter { $0.kind == .canvas || $0.rows.contains { $0.provenance.isVision } },
+                controls: addedControls.filter { $0.provenance.isVision }, values: values)
+            return ([], true, pixelText, fullPixelText)
         }
-
-        if asksForControls || (!matchingControls.isEmpty && matchingRows.isEmpty) {
-            let scoped = MacScreenRender.Screen(
-                appName: screen.appName,
-                windowTitle: screen.windowTitle,
-                isFront: screen.isFront,
-                otherWindows: screen.otherWindows,
-                provenance: screen.provenance,
-                modal: screen.modal,
-                whereSteps: screen.whereSteps,
-                contents: [],
-                controls: matchingControls,
-                totalControls: asksForControls ? screen.totalControls : matchingControls.count,
-                unlabeledControls: asksForControls ? screen.unlabeledControls : [:],
-                values: screen.values,
-                totalValues: screen.totalValues,
-                unclassifiedOmittedTargets: screen.unclassifiedOmittedTargets
-            )
-            return Zoom(
-                screen: scoped,
-                note: "\(matchingControls.count) of \(screen.totalControls) actionable match"
-                    // A capped read is not the whole window: say what it left out.
-                    + (asksForControls && screen.unclassifiedOmittedTargets > 0
-                        ? " (\(screen.unclassifiedOmittedTargets) more weren't kept in this read; name one and I'll find it)"
-                        : "")
-                    + "; the rest of the screen is unchanged.",
-                scope: .controls
-            )
+        let allControls = ["controls", "actions", "actionable controls"].contains(needle)
+        let controlPaths = controls.filter {
+            allControls || matches(needle, MacScreenText($0.label, redacted: $0.labelJSON).display,
+                                   kind: MacScreenRender.kindName(role: $0.role))
+        }.map(\.path) + addedControls.filter {
+            allControls || matches(needle, $0.label.display, kind: $0.kind)
+        }.compactMap(\.sourceAXPath)
+        let hasControls = !controlPaths.isEmpty || addedControls.contains {
+            matches(needle, $0.label.display, kind: $0.kind)
+        } || focusedControl.map {
+            !known.contains(normalize($0.label)) && matches(needle, $0.label, kind: $0.kind)
+        } == true
+        let hasRows = rows.contains {
+            matches(needle, MacScreenText($0.label, redacted: $0.labelJSON).display, kind: nil)
+        } || contents.contains { $0.rows.contains { matches(needle, $0.label?.display, kind: nil) } }
+        let allReadouts = ["hud", "the hud", "values", "readouts", "status text"].contains(needle)
+        let readouts = percept.readouts.filter { allReadouts || matches(needle, $0.displayText, kind: nil) }
+        let pixelValues = values.filter { allReadouts || matches(needle, $0.text.display, kind: nil) }
+        if allReadouts || ((!readouts.isEmpty || !pixelValues.isEmpty) && !hasControls && !hasRows) {
+            let texts = Set(readouts.compactMap(\.displayText) + pixelValues.compactMap { $0.text.display })
+            let paths = percept.readouts.filter { $0.displayText.map(texts.contains) ?? false }.map(\.path)
+            return (paths, false, MacScreenRender.pixelEvidence(values: pixelValues), fullPixelText)
         }
-
-        // Content zoom: the whole section, ordinals intact.
-        if matchingRows.isEmpty {
-            return Zoom(
-                screen: screen,
-                note: "Nothing here is named \"\(part)\" — this is the whole screen."
-            )
+        if allControls || (hasControls && !hasRows) {
+            let pixelText = MacScreenRender.pixelEvidence(controls: addedControls.filter {
+                allControls || matches(needle, $0.label.display, kind: $0.kind)
+            }, values: values)
+            return (controlPaths, false, pixelText, fullPixelText)
         }
-        return Zoom(
-            screen: screen,
-            note: "Matching row\(matchingRows.count == 1 ? "" : "s"): "
-                + matchingRows.map(String.init).joined(separator: ", ") + "."
-        )
+        return ([], false, fullPixelText, fullPixelText)
     }
 
     // MARK: - Words
@@ -367,16 +319,8 @@ extension MacFourVerbs {
         let code = evidence?.code ?? (error is CancellationError ? "cancelled" : "mac_action_result_unavailable")
         var remedy = inspectAppRemedy(app, instruction: "Inspect the affected app to establish what changed before another action.")
         if let evidence, effects == .none {
-            if evidence.recovery == .terminal {
-                remedy = Repair.terminal(instruction: evidence.instruction ?? cause)
-            } else if evidence.personDecides, let tap = evidence.tap {
-                remedy = Repair.why(owner: evidence.owner ?? "Mac action", tap: tap, instruction: evidence.instruction)
-            } else if let next = evidence.nextCall, let call = try? JSONValue.parse(Data(next.utf8)), case .object = call {
-                remedy = .object(["kind": .string(evidence.recovery?.rawValue ?? "inspect"),
-                    "instruction": .string(evidence.instruction ?? cause), "next_call": call])
-            } else if let tap = evidence.tap {
-                remedy = Repair.why(owner: evidence.owner ?? "Mac action", tap: tap, instruction: evidence.instruction)
-            }
+            let fix = evidence.remedy()
+            if fix != .null { remedy = fix }
         }
         return MacFourVerbsReply(ok: false,
             text: "\(outcome): \(cause)\nInspect \(app ?? "the affected app") before another action.",
@@ -454,7 +398,7 @@ extension MacFourVerbs {
         }
         if let operationId = result.operationId { detail["operationId"] = .string(operationId) }
         if let state = result.operationState { detail["operationState"] = .string(state.rawValue) }
-        if let verification = result.verification { detail["verification"] = .string(verification.rawValue) }
+        detail["verification"] = .string(SwiftNativeMacControl.verificationState(action: result.action, result: result).rawValue)
         detail["duration_ms"] = .int(Int64(result.durationMs))
         let output = object(result.output)
         for key in ["status", "verified", "status_reason", "status_note", "verification_evidence", "verification_scope",
@@ -464,11 +408,6 @@ extension MacFourVerbs {
         if detail["status"] == .string("outcome_unknown"), let app {
             detail["remedy"] = inspectAppRemedy(app,
                 instruction: "Inspect the affected app to establish what changed before another action.")
-        }
-        if output["verified"] == .bool(true) {
-            detail["verification"] = .string(MotorVerificationState.satisfied.rawValue)
-        } else if output["status"] == .string("acted_mismatch") {
-            detail["verification"] = .string(MotorVerificationState.failed.rawValue)
         }
         return detail
     }

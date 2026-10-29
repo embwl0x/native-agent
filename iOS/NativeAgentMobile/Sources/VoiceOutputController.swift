@@ -3,40 +3,14 @@ import Foundation
 import SwiftUI
 import AVFoundation
 
-enum VoiceOutputPlaybackState: Equatable {
-    case idle
-    case speaking
-
-    var isSpeaking: Bool { self == .speaking }
-
-    mutating func beginIfIdle() -> Bool {
-        guard self == .idle else { return false }
-        self = .speaking
-        return true
-    }
-
-    mutating func finish() {
-        self = .idle
-    }
-}
-
 @MainActor
 final class VoiceOutputController: NSObject, ObservableObject {
     @Published var isSpeaking = false
     @Published var error: String?
-    /// Quiet by default (2026-09-13). A fresh phone install used to speak
-    /// every reply aloud before the person had asked for a voice at all; the
-    /// speaker button is right there when they want one. An existing explicit
-    /// choice is untouched — @AppStorage only uses this default when no value
-    /// has been written, and `setEnabled` writes one on every toggle.
+    /// Spoken replies default to off; the person's saved choice takes precedence.
     @AppStorage("voiceOutputEnabled") var enabled = false
 
-    // 2026-05-09 fix: lazy-init the synthesizer and audio session.  Eagerly
-    // creating AVSpeechSynthesizer + setting AVAudioSession category at app
-    // launch was contributing to startup main-thread pressure (alongside the
-    // iCloudBridge.setup() block that triggered a kernel-watchdog panic).
-    // The synthesizer is heavy enough on first construction that deferring it
-    // to first speak() call shaves seconds off cold launch.
+    // Create the synthesizer and prepare the audio session only when speech is requested.
     private var _synthesizer: AVSpeechSynthesizer?
     private var preparationTask: Task<Void, Never>?
     private var audioToken: UUID?
@@ -45,11 +19,8 @@ final class VoiceOutputController: NSObject, ObservableObject {
     private(set) var audioSessionActive = false
     private let configureAudioSession: @Sendable () throws -> Void
     private let activateAudioSession: @Sendable () throws -> Void
-    /// E5: leaving the session active after the last utterance keeps the audio
-    /// route held and suppresses other apps' audio indefinitely. Deactivating
-    /// with `.notifyOthersOnDeactivation` hands the route back.
+    /// Deactivate with `.notifyOthersOnDeactivation` to return the audio route to other apps.
     private let deactivateAudioSession: @Sendable () throws -> Void
-    private var playbackState: VoiceOutputPlaybackState = .idle
     private var activeUtterance: AVSpeechUtterance?
 
     init(
@@ -80,7 +51,6 @@ final class VoiceOutputController: NSObject, ObservableObject {
             name: AVAudioSession.interruptionNotification,
             object: AVAudioSession.sharedInstance()
         )
-        // Intentionally NO synth init or AVAudioSession setup here — see comment above.
     }
 
     @objc nonisolated private func audioSessionInterrupted(_ notification: Notification) {
@@ -92,29 +62,35 @@ final class VoiceOutputController: NSObject, ObservableObject {
     // MARK: - Public API
 
     func speak(_ text: String) {
-        guard enabled, !text.isEmpty, playbackState == .idle, preparationTask == nil else { return }
+        guard enabled, !text.isEmpty, !isSpeaking, preparationTask == nil else { return }
+        // Use the person's language preferences, as speech input does. A
+        // missing installed voice is a failure, never an English substitution.
+        guard let voice = Locale.preferredLanguages.lazy.compactMap({ AVSpeechSynthesisVoice(language: $0) }).first else {
+            error = "No spoken-reply voice is available for your preferred languages."
+            return
+        }
         let token = UUID()
         audioToken = token
         preparationTask = Task {
             defer { preparationTask = nil }
             do {
-                try await MobileAudioService.shared.prepareOutput(token: token,
+                try await MobileDictation.shared.prepareOutput(token: token,
                     configure: configureAudioSession, activate: activateAudioSession)
                 audioSessionActive = true
                 guard !Task.isCancelled, audioToken == token, enabled else {
                     releaseAudioSessionIfIdle(); return
                 }
                 let synth = ensureSynthesizer()
-                guard !synth.isSpeaking, playbackState.beginIfIdle() else { return }
+                guard !synth.isSpeaking, !isSpeaking else { return }
+                isSpeaking = true
                 let utterance = AVSpeechUtterance(string: text)
-                utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+                utterance.voice = voice
                 utterance.rate = 0.50
                 utterance.pitchMultiplier = 1.0
                 utterance.volume = 1.0
                 activeUtterance = utterance
                 synth.speak(utterance)
                 error = nil
-                isSpeaking = playbackState.isSpeaking
             } catch {
                 self.error = "Spoken reply could not start: \(error.localizedDescription)"
                 finishPlayback()
@@ -122,9 +98,7 @@ final class VoiceOutputController: NSObject, ObservableObject {
         }
     }
 
-    /// 2026-09-06: `enabled` was only consulted when an utterance STARTS, so
-    /// tapping the speaker off mid-reply left the agent talking to the end.
-    /// Turning it off silences what is already playing.
+    /// Disabling spoken replies immediately stops current playback.
     func setEnabled(_ on: Bool) {
         enabled = on
         if !on { stop() }
@@ -154,8 +128,7 @@ final class VoiceOutputController: NSObject, ObservableObject {
 
     private func finishPlayback() {
         activeUtterance = nil
-        playbackState.finish()
-        isSpeaking = playbackState.isSpeaking
+        isSpeaking = false
         releaseAudioSessionIfIdle()
     }
 
@@ -164,14 +137,12 @@ final class VoiceOutputController: NSObject, ObservableObject {
         finishPlayback()
     }
 
-    /// E5: hand the audio route back once nothing is speaking. Only meaningful
-    /// if we actually activated the session; a failure leaves the flag set so
-    /// the next idle transition retries rather than silently keeping the route.
+    /// Release an activated session while idle; a failed release remains owed at the next idle transition.
     private func releaseAudioSessionIfIdle() {
-        guard audioSessionActive, playbackState == .idle, let token = audioToken else { return }
+        guard audioSessionActive, !isSpeaking, let token = audioToken else { return }
         Task {
             do {
-                try await MobileAudioService.shared.releaseOutput(token: token, deactivate: deactivateAudioSession)
+                try await MobileDictation.shared.releaseOutput(token: token, deactivate: deactivateAudioSession)
                 if audioToken == token { audioSessionActive = false }
             } catch {
                 NSLog("[VoiceOutputController] audio session deactivate failed: %@", error.localizedDescription)

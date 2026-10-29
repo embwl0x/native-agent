@@ -11,36 +11,20 @@ public protocol PureToolArgumentValidating: Sendable {
 }
 
 // MARK: - MacIntegrationToolBridge
-//
-// 2026-06-07 — Mac integration chat tools are gated by
-// MacIntegrationPermissionStore (per-integration READ/WRITE bits the user controls
-// from Settings → Mac Integration). The actual EventKit / notification /
-// Spotlight backends live in the NativeAgentApp target (MacPIMConnectorActions,
-// NativeClient.runMacNotify/.runMobileNotify/.runMacSpotlightSearch) and
-// ChatTurnContracts can't import them — Foundation/EventKit headers would pull
-// the whole app surface into a leaf module.
-//
-// The app injects a conforming bridge during ChatOrchestrationClient init.
-// The dispatch path first asks the permission store, THEN calls the bridge.
-// If the bridge is nil (e.g. headless ChatDrive, or app-side init forgot to
-// wire it), the tool returns a `bridge_not_wired` error envelope rather than
-// throwing — keeping the chat turn intact for the LLM to recover from.
+// Dispatch checks MacIntegrationPermissionStore before calling the app-injected bridge.
 public protocol MacIntegrationToolBridge: Sendable {
     func calendarListUpcoming(input: [String: JSONValue]) async throws -> JSONValue
     func calendarCalendars(input: [String: JSONValue]) async throws -> JSONValue
     func calendarFreeBusy(input: [String: JSONValue]) async throws -> JSONValue
     func remindersQuery(input: [String: JSONValue]) async throws -> JSONValue
     func remindersRead(input: [String: JSONValue]) async throws -> JSONValue
+    func remindersLists(input: [String: JSONValue]) async throws -> JSONValue
     func remindersUpdate(input: [String: JSONValue]) async throws -> JSONValue
     func remindersListDueToday(input: [String: JSONValue], dataRoot: URL) async throws -> JSONValue
     func macNotify(input: [String: JSONValue]) async throws -> JSONValue
     func mobileNotify(input: [String: JSONValue], surface: String) async throws -> JSONValue
     func phoneRequest(input: [String: JSONValue]) async throws -> JSONValue
     func spotlightSearch(input: [String: JSONValue]) async throws -> JSONValue
-
-    // ── Phase 2 (2026-06-07): Contacts + Mail + Messages + Notes + Music ──
-    // Backends live in MacContactsActions (W1) and MacAppleScriptActions (W2);
-    // the app wires a single MacIntegrationBridgeImpl that fans these out.
 
     /// Search the user's local Contacts (CNContactStore). Read.
     func contactsSearch(input: [String: JSONValue]) async throws -> JSONValue
@@ -73,15 +57,7 @@ public protocol MacIntegrationToolBridge: Sendable {
     /// Control Apple Music playback (play / pause / toggle / next / previous). Write.
     func musicControl(input: [String: JSONValue]) async throws -> JSONValue
 
-    // ── Phase 3 (2026-06-07): complete read+write coverage on every Mac
-    // Integration toggle. the user said "complete complete" — every tab now has
-    // both axes wired behind it. Sensitive writes (calendar create / reminders
-    // create+complete / mail manage / notes update / contacts delete) stay
-    // default-OFF in MacIntegrationPermissionStore per the existing matrix —
-    // the user flips them in Settings → Mac Integration before they fire.
-    // Scheduler is the one NEW MacIntegrationID surface here: list + create
-    // jobs that the TriggerScheduler module already executes. Spec calls
-    // both .write because scheduler.supportsRead is false.
+    // Sensitive writes default off in MacIntegrationPermissionStore.
 
     // EventKit writes
     /// Create a new EKEvent in the user's Calendar. Write.

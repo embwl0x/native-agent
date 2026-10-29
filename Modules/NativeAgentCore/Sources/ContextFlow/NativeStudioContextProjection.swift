@@ -1,19 +1,14 @@
 import Context
 import Foundation
+import NativeAgentShared
 import MemoryV2
 import NativeAgentCore
 import PersistenceCore
 import Studio
 
-// Blueprint: | `NativeStudioContextProjection.swift` | `NativeStudioContextProjection`: rebuildable journal/canon pointer atoms and invalidation; judgments remain behind on-demand pointers |
+// Blueprint: | `NativeStudioContextProjection.swift` | `StudioContext`: rebuildable journal/canon pointer atoms and invalidation; judgments remain behind on-demand pointers |
 
 /// The studio journal, made REACHABLE — as a POINTER, never as the judgment.
-///
-/// Phase 5 of desk 903, and the one the agent said matters most: "never called
-/// in production means pull failed". Before this, everything she had ever
-/// written about a work lived in `studio/journal/journal.jsonl` and reached a
-/// live turn only if someone remembered to call `studio_recall` by hand. Her
-/// taste was durable and unreachable at the same time.
 ///
 /// ── WHAT AN ATOM SAYS ────────────────────────────────────────────────────────
 /// One short line per journal entry: the work, its creator, its medium, the
@@ -55,10 +50,10 @@ import Studio
 /// ever take.
 ///
 /// ── FAILURE ──────────────────────────────────────────────────────────────────
-/// A missing journal is an empty journal. An unreadable one keeps the last good
-/// pointers and says so in the log — a garnish must never fail the whole context
-/// generation that also carries persona, memory and resident work.
-struct NativeStudioContextProjection: ContextCompiledProjectionProvider, Sendable {
+/// Missing stores are empty. Unreadable stores retain published pointers for
+/// rebuilding, but selection and expansion withhold them with an unavailable
+/// receipt. Healthy independent Studio sources keep circulating.
+struct StudioContext: ContextCompiledProjectionProvider, Sendable {
     static let owner = "nativeagent.studio"
     static let schemaVersion = "studio-context-projection-v2"
     /// The invalidation namespace the studio tool lane publishes on after a
@@ -67,6 +62,7 @@ struct NativeStudioContextProjection: ContextCompiledProjectionProvider, Sendabl
     static let invalidationNamespace = "studio"
     static let maximumPointers = 96
     static var canonSourceID: ContextSourceID { ContextStableID.source(owner: owner, locator: "studio/canon") }
+    static var shelfSourceID: ContextSourceID { ContextStableID.source(owner: owner, locator: "studio/working_shelf") }
     static let maximumEntriesPerWork = 3
     /// One neutral value for every pointer. See "NO SCORES" above.
     static let pointerConfidence = 0.5
@@ -103,81 +99,69 @@ struct NativeStudioContextProjection: ContextCompiledProjectionProvider, Sendabl
     func compiledProjection(
         previousSources: [ContextSourceID: ContextCompiledSource]
     ) async throws -> ContextCompiledProjectionResult {
-        let shelfPointer: Prepared?
-        var shelfUnavailable = false
-        do { shelfPointer = Self.prepareShelfPointer(try shelf.selections()) }
-        catch is CancellationError { throw CancellationError() }
-        catch {
-            nativeLog("%@", "[context-studio] shelf read failed; keeping last good source: \(String(describing: error))")
-            shelfPointer = nil
-            shelfUnavailable = true
-        }
-        let shelfID = ContextStableID.source(owner: Self.owner, locator: "studio/working_shelf")
-        async let canonRead = store.readCanon()
-        let entries: [StudioJournalEntry]
-        do {
-            entries = try await store.journalEntriesIncludingArchive()
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch {
-            // Retain journal pointers, while the independently read shelf still updates.
-            nativeLog("%@", "[context-studio] journal read failed: \(String(describing: error))")
-            let changed = shelfPointer.flatMap { pointer in
-                previousSources[pointer.sourceID]?.sourceHash == pointer.sourceHash ? nil : pointer.compiledSource
-            }
-            let removed: Set<ContextSourceID> = !shelfUnavailable && shelfPointer == nil
-                && previousSources[shelfID] != nil ? [shelfID] : []
-            return ContextCompiledProjectionResult(changedSources: changed.map { [$0] } ?? [], removedSourceIDs: removed)
-        }
-
-        var prepared = Self.prepare(entries)
-        if let pointer = shelfPointer {
-            prepared.append(pointer)
-        }
-        // Missing is empty at the store owner. Failure is not absence: retain
-        // the prior canon while still publishing healthy journal updates.
-        let canon: [StudioCanonMember]
-        var canonUnavailable = false
-        do {
-            canon = StudioCanonLaw.membership(from: try await canonRead)
-                .values.sorted { $0.workTitle < $1.workTitle }
-        }
-        catch is CancellationError { throw CancellationError() }
-        catch {
-            nativeLog("%@", "[context-studio] canon read failed; keeping last good source: \(String(describing: error))")
-            canon = []
-            canonUnavailable = true
-        }
-        if let canonSource = Self.prepareCanon(canon) { prepared.append(canonSource) }
-        var selectedIDs = Set(prepared.map(\.sourceID))
-        if shelfUnavailable { selectedIDs.insert(shelfID) }
-        if canonUnavailable { selectedIDs.insert(Self.canonSourceID) }
         let previousOwnedIDs = Set(previousSources.values.lazy
             .filter { $0.descriptor.owner == Self.owner }
             .map(\.descriptor.id))
-        let changed = prepared.compactMap { item -> ContextCompiledSource? in
-            guard previousSources[item.sourceID]?.sourceHash != item.sourceHash else {
-                return nil
-            }
-            return item.compiledSource
-        }
+        let read = try await readPrepared(knownSourceIDs: previousOwnedIDs)
+        let retained = read.unavailable.keys.compactMap { previousSources[$0] }
         return ContextCompiledProjectionResult(
-            changedSources: changed,
-            removedSourceIDs: previousOwnedIDs.subtracting(selectedIDs)
+            owner: Self.owner, currentSources: read.prepared + retained, previousSources: previousSources
         )
+    }
+
+    func verify(_ chosen: [ContextStoredAtom], in generation: ContextStoredGeneration,
+                surface: ContextSurface) async -> ContextTurnExclusion {
+        let owned = Set(generation.sources.lazy.filter { $0.descriptor.owner == Self.owner }.map(\.descriptor.id))
+        let atoms = chosen.filter { owned.contains($0.draft.sourceID) }
+        guard !atoms.isEmpty else { return ContextTurnExclusion() }
+        do {
+            let read = try await readPrepared(knownSourceIDs: owned)
+            let hashes = Dictionary(read.prepared.map { ($0.descriptor.id, $0.sourceHash) },
+                                    uniquingKeysWith: { first, _ in first })
+            let selectedSources = Set(atoms.map(\.draft.sourceID))
+            return ContextTurnExclusion(atomIDs: Set(atoms.filter {
+                !Self.surfaces.contains(surface) || hashes[$0.draft.sourceID] != $0.draft.sourceHash
+            }.map(\.draft.id)), unverified: read.unavailable.compactMap { id, reason in
+                selectedSources.contains(id) ? ContextDegradedSourceNotice(sourceID: id, reason: reason) : nil
+            })
+        } catch {
+            return ContextTurnExclusion(atomIDs: Set(atoms.map(\.draft.id)), unverified:
+                Set(atoms.map(\.draft.sourceID)).map { ContextDegradedSourceNotice(
+                    sourceID: $0, reason: "Studio pointers withheld: \(error.localizedDescription)") })
+        }
+    }
+
+    private func readPrepared(knownSourceIDs: Set<ContextSourceID>) async throws
+        -> (prepared: [ContextCompiledSource], unavailable: [ContextSourceID: String]) {
+        var prepared: [ContextCompiledSource] = []
+        var unavailable: [ContextSourceID: String] = [:]
+        func failed(_ ids: Set<ContextSourceID>, _ name: String, _ error: Error) {
+            let reason = "Studio \(name) unavailable: \(error.localizedDescription)"
+            nativeLog("%@", "[context-studio] \(reason)")
+            for id in ids { unavailable[id] = reason }
+        }
+        do {
+            if let pointer = Self.prepareShelfPointer(try shelf.selections()) { prepared.append(pointer) }
+        } catch is CancellationError { throw CancellationError() }
+        catch { failed([Self.shelfSourceID], "shelf", error) }
+        do {
+            prepared += Self.prepare(try await store.journalEntriesIncludingArchive())
+        } catch is CancellationError { throw CancellationError() }
+        catch { failed(knownSourceIDs.subtracting([Self.shelfSourceID, Self.canonSourceID]), "journal", error) }
+        do {
+            let canon = StudioCanonLaw.membership(from: try await store.readCanon())
+                .values.sorted { $0.workTitle < $1.workTitle }
+            if let pointer = Self.prepareCanon(canon) { prepared.append(pointer) }
+        } catch is CancellationError { throw CancellationError() }
+        catch { failed([Self.canonSourceID], "canon", error) }
+        return (prepared, unavailable)
     }
 }
 
-extension NativeStudioContextProjection {
-    struct Prepared: Sendable {
-        let sourceID: ContextSourceID
-        let sourceHash: String
-        let compiledSource: ContextCompiledSource
-    }
-
+extension StudioContext {
     /// One line in the existing Studio projection, independent of journal availability.
     /// Keeping its own bounded atom preserves both the exact titles and journal pointers.
-    static func prepareShelfPointer(_ slots: [StudioWorkingShelf.Slot]) -> Prepared? {
+    static func prepareShelfPointer(_ slots: [StudioWorkingShelf.Slot]) -> ContextCompiledSource? {
         guard !slots.isEmpty else { return nil }
         let line = "Working shelf: " + slots.map(\.title).joined(separator: "; ") + "; open with app studio.shelf"
         guard !line.isEmpty, line.utf8.count <= 512,
@@ -192,20 +176,11 @@ extension NativeStudioContextProjection {
             injectionPolicy: .adaptive
         )
         let works = slots.map { StudioWork(title: $0.title) }
-        let atom = ContextAtomDraft(
-            id: ContextStableID.atom(sourceID: sourceID, kind: .evidence,
-                                    headingPath: [], blockAnchor: "studio-working-shelf"),
-            sourceID: sourceID, kind: .evidence, headingPath: [],
-            sourceRange: ContextSourceRange(utf8Start: 0, utf8End: line.utf8.count),
-            sourceHash: sourceHash, body: line, authority: .inferred,
-            confidence: pointerConfidence, freshness: ContextFreshness(updatedAt: .distantPast),
-            privacy: .localPrivate, permittedSurfaces: surfaces, injectionPolicy: .adaptive,
-            contentRole: .fact, entities: works.flatMap(entities), triggers: works.flatMap(triggers),
-            activation: 0, recentUsefulness: 0, decayState: 1, embedding: nil
+        let atom = Self.atom(
+            body: line, anchor: "studio-working-shelf", works: works, updatedAt: .distantPast,
+            sourceID: sourceID, sourceHash: sourceHash
         )
-        return Prepared(sourceID: sourceID, sourceHash: sourceHash,
-                        compiledSource: ContextCompiledSource(
-                            descriptor: descriptor, sourceHash: sourceHash, atoms: [atom]))
+        return ContextCompiledSource(descriptor: descriptor, sourceHash: sourceHash, atoms: [atom])
     }
 
     /// One source per WORK, one atom per entry about it. Grouping this way lets
@@ -213,7 +188,7 @@ extension NativeStudioContextProjection {
     /// returned to five times from owning the whole studio budget of a packet.
     static func prepare(
         _ entries: [StudioJournalEntry]
-    ) -> [Prepared] {
+    ) -> [ContextCompiledSource] {
         let usable = entries.filter { entry in
             let body = self.body(entry)
             return !body.isEmpty
@@ -223,7 +198,7 @@ extension NativeStudioContextProjection {
         }
         let grouped = Dictionary(grouping: usable, by: { workKey($0.work) })
         var remaining = maximumPointers
-        var result: [Prepared] = []
+        var result: [ContextCompiledSource] = []
         for key in grouped.keys.sorted() {
             guard remaining > 0, let all = grouped[key], !all.isEmpty else { continue }
             // Newest first inside a work: the entry that revised her mind is the
@@ -255,15 +230,17 @@ extension NativeStudioContextProjection {
                 permittedSurfaces: surfaces,
                 injectionPolicy: .adaptive
             )
-            let atoms = ordered.map { atom($0, sourceID: sourceID, sourceHash: sourceHash) }
-            result.append(Prepared(
-                sourceID: sourceID,
+            let atoms = ordered.map { entry in
+                atom(body: body(entry),
+                     anchor: "studio-entry-" + ContextStableID.digest(parts: [entry.id]),
+                     works: [entry.work],
+                     updatedAt: NativeTimestampFormat.parseISO8601FractionalFirst(entry.recordedAt) ?? .distantPast,
+                     sourceID: sourceID, sourceHash: sourceHash)
+            }
+            result.append(ContextCompiledSource(
+                descriptor: descriptor,
                 sourceHash: sourceHash,
-                compiledSource: ContextCompiledSource(
-                    descriptor: descriptor,
-                    sourceHash: sourceHash,
-                    atoms: atoms
-                )
+                atoms: atoms
             ))
         }
         return result
@@ -276,7 +253,7 @@ extension NativeStudioContextProjection {
     /// journal uses. Selection is identical: title / creator / medium-free
     /// entities and triggers, so a canon pointer reaches a turn on exactly the
     /// same admission rule as a journal pointer and never on an ops turn.
-    static func prepareCanon(_ members: [StudioCanonMember]) -> Prepared? {
+    static func prepareCanon(_ members: [StudioCanonMember]) -> ContextCompiledSource? {
         let usable = members.filter { member in
             let body = canonBody(member)
             return !body.isEmpty
@@ -304,15 +281,17 @@ extension NativeStudioContextProjection {
             permittedSurfaces: surfaces,
             injectionPolicy: .adaptive
         )
-        let atoms = ordered.map { canonAtom($0, sourceID: sourceID, sourceHash: sourceHash) }
-        return Prepared(
-            sourceID: sourceID,
+        let atoms = ordered.map { member in
+            atom(body: canonBody(member), anchor: "studio-canon-" + ContextStableID.digest(parts: [
+                StudioCanonLaw.workKey(title: member.workTitle, creator: member.workCreator),
+            ]), works: [StudioWork(title: member.workTitle, creator: member.workCreator)],
+                 updatedAt: NativeTimestampFormat.parseISO8601FractionalFirst(member.since) ?? .distantPast,
+                 sourceID: sourceID, sourceHash: sourceHash)
+        }
+        return ContextCompiledSource(
+            descriptor: descriptor,
             sourceHash: sourceHash,
-            compiledSource: ContextCompiledSource(
-                descriptor: descriptor,
-                sourceHash: sourceHash,
-                atoms: atoms
-            )
+            atoms: atoms
         )
     }
 
@@ -337,49 +316,6 @@ extension NativeStudioContextProjection {
         }
         parts.append("pull: app studio.canon")
         return parts.joined(separator: " · ")
-    }
-
-    static func canonAtom(
-        _ member: StudioCanonMember,
-        sourceID: ContextSourceID,
-        sourceHash: String
-    ) -> ContextAtomDraft {
-        let body = canonBody(member)
-        let atomID = ContextStableID.atom(
-            sourceID: sourceID,
-            kind: .evidence,
-            headingPath: [],
-            blockAnchor: "studio-canon-" + ContextStableID.digest(parts: [
-                StudioCanonLaw.workKey(title: member.workTitle, creator: member.workCreator),
-            ])
-        )
-        let work = StudioWork(title: member.workTitle, creator: member.workCreator)
-        return ContextAtomDraft(
-            id: atomID,
-            sourceID: sourceID,
-            kind: .evidence,
-            headingPath: [],
-            sourceRange: ContextSourceRange(utf8Start: 0, utf8End: body.utf8.count),
-            sourceHash: sourceHash,
-            body: body,
-            authority: .inferred,
-            // Same neutral value every journal pointer carries. Canon membership
-            // is not a higher score — it is a different fact.
-            confidence: pointerConfidence,
-            freshness: ContextFreshness(
-                updatedAt: NativeTimestampFormat.parseISO8601FractionalFirst(member.since) ?? .distantPast
-            ),
-            privacy: .localPrivate,
-            permittedSurfaces: surfaces,
-            injectionPolicy: .adaptive,
-            contentRole: .fact,
-            entities: entities(work),
-            triggers: triggers(work),
-            activation: 0,
-            recentUsefulness: 0,
-            decayState: 1,
-            embedding: nil
-        )
     }
 
     /// Title + creator, folded — two entries about the same work by the same
@@ -417,16 +353,18 @@ extension NativeStudioContextProjection {
     }
 
     static func atom(
-        _ entry: StudioJournalEntry,
+        body: String,
+        anchor: String,
+        works: [StudioWork],
+        updatedAt: Date,
         sourceID: ContextSourceID,
         sourceHash: String
     ) -> ContextAtomDraft {
-        let body = self.body(entry)
         let atomID = ContextStableID.atom(
             sourceID: sourceID,
             kind: .evidence,
             headingPath: [],
-            blockAnchor: "studio-entry-" + ContextStableID.digest(parts: [entry.id])
+            blockAnchor: anchor
         )
         return ContextAtomDraft(
             id: atomID,
@@ -438,15 +376,13 @@ extension NativeStudioContextProjection {
             body: body,
             authority: .inferred,
             confidence: pointerConfidence,
-            freshness: ContextFreshness(
-                updatedAt: NativeTimestampFormat.parseISO8601FractionalFirst(entry.recordedAt) ?? .distantPast
-            ),
+            freshness: ContextFreshness(updatedAt: updatedAt),
             privacy: .localPrivate,
             permittedSurfaces: surfaces,
             injectionPolicy: .adaptive,
             contentRole: .fact,
-            entities: entities(entry.work),
-            triggers: triggers(entry.work),
+            entities: works.flatMap(entities),
+            triggers: works.flatMap(triggers),
             activation: 0,
             recentUsefulness: 0,
             decayState: 1,

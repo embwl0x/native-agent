@@ -2,15 +2,9 @@ import AuthoredCapabilities
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `FileSenseRegistry+Storage.swift` | Registry validation, candidate/version-folder source resolution, bounded code manifests and path/symlink fences |
+// Blueprint: | `FileSenseRegistry+Storage.swift` | Registry validation, candidate/version-folder source resolution, bounded code manifests and path/symlink fences. Persisted sense timestamps validate within the supported Date range; built-in and shared records may omit an unknown creation date. |
 
 extension FileSenseRegistry {
-    static func decode(_ value: JSONValue) throws -> Store {
-        let store = try JSONDecoder().decode(Store.self, from: value.serializedData(pretty: false))
-        try validate(store)
-        return store
-    }
-
     public func sourceFiles(_ record: SenseRecord) throws -> [String: Data] {
         if let digest = record.candidateDigest {
             let candidate = try programs.load(id: record.id, digest: digest)
@@ -79,15 +73,18 @@ extension FileSenseRegistry {
 
     static func validate(_ version: Version) throws {
         let record = version.record
+        func valid(_ date: Date) -> Bool {
+            date.timeIntervalSince1970.isFinite && date >= .distantPast && date <= .distantFuture
+        }
         try validateID(record.id)
         if let digest = record.candidateDigest {
             guard record.language == .javascript, digest.count == 64,
                   digest.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else { throw failure("Sense candidate identity is invalid.") }
         }
         guard record.version > 0, record.uses >= 0, record.corrections >= 0,
-              record.createdAt.timeIntervalSince1970.isFinite,
-              record.enabledAt?.timeIntervalSince1970.isFinite != false,
-              record.lastUsedAt?.timeIntervalSince1970.isFinite != false,
+              (record.createdAt.map(valid) ?? (record.origin != .grown)),
+              record.enabledAt.map(valid) != false,
+              record.lastUsedAt.map(valid) != false,
               record.disabledBy == nil || CapabilityLifecycle.offActors.contains(record.disabledBy!),
               let corner = SenseCorner(key: record.corner.key), corner == record.corner,
               version.files.count <= 128,
@@ -108,20 +105,18 @@ extension FileSenseRegistry {
     }
 
     static func validate(_ store: Store) throws {
-        guard store.format == 1, Set(store.senses.map { $0.id.lowercased() }).count == store.senses.count else { throw failure("Unsupported or duplicate sense registry records.") }
+        guard Set(store.senses.map { $0.id.lowercased() }).count == store.senses.count else { throw failure("Duplicate sense records.") }
         var activeCorners: Set<String> = []
         for entry in store.senses {
             try validateID(entry.id)
-            guard !entry.versions.isEmpty,
-                  Set(entry.versions.map(\.record.version)).count == entry.versions.count,
-                  entry.versions.contains(where: { $0.record.version == entry.currentVersion }) else {
+            guard Set(entry.versions.map(\.record.version)).count == entry.versions.count else {
                 throw failure("Sense registry has invalid version history.")
             }
             for version in entry.versions {
                 guard version.record.id == entry.id else { throw failure("Sense version belongs to a different id.") }
                 try validate(version)
             }
-            let record = entry.versions.first { $0.record.version == entry.currentVersion }!.record
+            let record = entry.current.record
             if record.status == .on, !activeCorners.insert(record.corner.key).inserted { throw failure("More than one sense is on for the same corner.") }
         }
     }

@@ -1,4 +1,5 @@
 import Foundation
+import PersistenceCore
 // Blueprint: | `FileSenseRegistry+Sharing.swift` | Approval-gated portable code/record export |
 
 extension FileSenseRegistry {
@@ -12,8 +13,7 @@ extension FileSenseRegistry {
 
     public func exportBundle(id: String, to destination: URL, userApproved: Bool = false) async throws -> SenseExportResult {
         try await withStore { store in
-            let (i, j) = try Self.current(id, in: store)
-            let version = store.senses[i].versions[j]
+            let version = store.senses[try Self.index(id, in: store)].current
             guard version.record.language != .native else { throw Self.failure("Built-in native code cannot be shared as a portable sense.") }
             guard userApproved else { return (false, .approvalNeeded(senseID: id)) }
             let files = try self.sourceFiles(version.record).filter { version.files.contains($0.key) }
@@ -33,7 +33,7 @@ extension FileSenseRegistry {
             let target = destination.standardizedFileURL
             let resolved = target.resolvingSymlinksInPath()
             let dataRoot = self.root.deletingLastPathComponent()
-            guard resolved.path != dataRoot.path, !resolved.path.hasPrefix(dataRoot.path + "/") else {
+            guard NativeAgentWorkspaceRoot.relativePath(resolved.path, under: dataRoot.path) == nil else {
                 throw Self.failure("Export destination must be outside the private data root.")
             }
             guard !FileManager.default.fileExists(atPath: target.path) else { throw Self.failure("Export destination already exists.") }

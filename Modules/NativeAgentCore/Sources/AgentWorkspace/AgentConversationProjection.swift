@@ -1,14 +1,75 @@
 import Foundation
+import Darwin
+import ChatToolParsing
 import NativeAgentCore
 import NativeAgentShared
 import os
 import PersistenceCore
 import Transcripts
-// Blueprint: | `AgentConversationProjection.swift` | `AgentConversationRecord`: reply expectation is explicit or defaults true except short acknowledgements; `nextReadAt` schedules eligible automatic reads/delivery, not reply lifetime. Associated-door history projects through Transcripts' `ContactThread.project`; resumable work retains DataRootLife; other-life (no stamp = first life) work reads stopped/restored and explicit resumption starts fresh |
+// Blueprint: | `AgentConversationProjection.swift` | `AgentConversationRecord`: `sendEvidence`, `sendStatus`, `sendFailed` and `sendReceipt` project one send outcome from its receipt, with failed dispatch above stale executor progress; reply expectation defaults true; `nextReadAt` schedules reads/delivery, not reply lifetime. Associated-door history projects through Transcripts' `ContactThread.project`; resumable work retains DataRootLife; other-life work reads stopped/restored. Selected history read and UTF-8 failures propagate as unavailable. |
 
 /// App-owned routing bookmarks, not another transcript or authority store.
 /// The last receipt is a bounded cache; the adapter remains the evidence owner.
 public struct AgentConversationRecord: Codable, Sendable {
+    /// A retained answer, unwrapping only a single job and preserving reply-key precedence.
+    public var retainedReply: (text: String, resultID: UUID?)? {
+        guard case .object(let root)? = receipt else { return nil }
+        var value = root
+        if case .array(let jobs)? = root["jobs"], jobs.count == 1, case .object(let job) = jobs[0] { value = job }
+        for key in ["reply", "answer", "agent_reply_text", "agent_reply_text_head", "completion_text_head"] {
+            if case .string(let text)? = value[key], !text.isEmpty {
+                let id: UUID? = if case .string(let id)? = value["entry_id"] ?? value["message_id"] { UUID(uuidString: id) } else { nil }
+                return (text, id)
+            }
+        }
+        return nil
+    }
+
+    /// The send's receipt owns its outcome. A failed dispatch outranks stale
+    /// executor progress carried beside it, including on older saved records.
+    public var sendEvidence: [String: JSONValue] { Self.sendEvidence(receipt) }
+
+    public static func sendEvidence(_ receipt: JSONValue?) -> [String: JSONValue] {
+        guard case .object(let root)? = receipt else { return [:] }
+        if Self.failedSend(root) { return root }
+        if case .array(let jobs)? = root["jobs"], jobs.count == 1, case .object(let job) = jobs[0] { return job }
+        return root
+    }
+
+    public var sendFailed: Bool { Self.failedSend(sendEvidence) }
+
+    public var sendStatus: String {
+        let evidence = sendEvidence
+        if sendFailed { return "failed" }
+        if case .string(let status)? = evidence["run_status"] ?? evidence["status"] ?? evidence["state"] { return status }
+        return phase
+    }
+
+    public static func approvalWaits(_ status: String) -> Bool {
+        ["waiting_approval", "waiting_for_approval", "waiting for approval", "approval_filed", "approval_required"].contains(status)
+    }
+
+    private static func failedSend(_ fields: [String: JSONValue]) -> Bool {
+        let status = fields["status"]?.stringValue ?? ""
+        // An approval or a held message has not failed dispatch.
+        if ["held", "delivering"].contains(status) || approvalWaits(status) { return false }
+        return fields["sent"] == .bool(false) || [.failed, .refused].contains(ChatToolOutcome.exactResultClass(.object(fields.filter { $0.key != "result" })))
+            || fields["execution_error"]?.stringValue?.isEmpty == false
+            || ["invalid_arguments", "no_reply_expired"].contains(status)
+            || ["failed", "error"].contains(fields["run_status"]?.stringValue ?? "")
+    }
+
+    /// Receipt detail uses the same state word as home and history, while
+    /// retaining the adapter's failure cause and other evidence.
+    public var sendReceipt: JSONValue? {
+        guard phase != "sending", sendFailed, case .object(var fields)? = receipt else { return receipt }
+        fields["status"] = .string("failed")
+        fields["delivery"] = .string("failed")
+        if fields["sent"] == .bool(false) { fields["delivered"] = .bool(false) }
+        if fields["run_status"] != nil { fields["run_status"] = .string("failed") }
+        return .object(fields)
+    }
+
     public var lifeID: String?
     public var id: String
     public var scopeSessionID: String
@@ -38,8 +99,7 @@ public struct AgentConversationRecord: Codable, Sendable {
     /// The current send was typed by the person in the contact's thread, so
     /// its answer settles here and never starts an agent turn.
     public var personInitiated: Bool?
-    /// Fixed at send time: explicit sender choice, otherwise true except for
-    /// short acknowledgements. Nil on records saved before 2026-09-25.
+    /// Fixed at send time: explicit sender choice, otherwise true; saved records may omit it.
     public var expectsReply: Bool?
     /// Follow-ups written while a reply was still in flight, oldest first.
     /// Each goes by itself, in order, once the reply ahead of it settles.
@@ -204,8 +264,7 @@ public struct AgentConversationExchange: Codable, Sendable {
     public var status: String
     /// Typed by the person in the contact's thread, not sent by the agent.
     public var byPerson: Bool?
-    /// When the reply landed, or (with no reply) when the send settled. Nil
-    /// on exchanges saved before 2026-09-25 and while it is still in flight.
+    /// Reply arrival or send settlement time; nil while in flight or when unrecorded.
     public var settledAt: Date?
     /// The agent's first sign of work on this send (text, a tool, bytes), if any.
     public var firstActivityAt: Date?
@@ -240,8 +299,8 @@ public struct AgentConversationExchange: Codable, Sendable {
 }
 
 /// One contact's conversation with her lives in one chat session the contact
-/// owns (User 10-01, "one brain, many doors"): what she sends it, what it says
-/// to her, and the turns either one starts. Every view of the contact reads it.
+/// owns: what she sends it, what it says to her, and the turns either one starts.
+/// Every view of the contact reads it.
 public typealias ContactThread = Transcripts.ContactThread
 
 extension ContactThread {
@@ -283,19 +342,17 @@ extension ContactThread {
     /// Exact route history; directory counts must not include another door.
     public static func lines(dataRoot: URL, owner: String, tailBytes: Int? = nil, transcripts: [(String, URL)]? = nil) throws -> [Line] {
         let ownerPrefix = prefix(owner: owner)
-        let plan: [(String, URL)]
-        if let transcripts { plan = transcripts.filter { $0.0.hasPrefix(ownerPrefix) } }
-        else {
-            let archived = tailBytes == nil ? try ChatSessionRetention.archivedTranscripts(dataRoot: dataRoot) : [:]
-            plan = try ChatSessionRetention.transcriptFiles(dataRoot: dataRoot, prefix: ownerPrefix, archived: archived)
-        }
+        let plan = try transcripts?.filter { $0.0.hasPrefix(ownerPrefix) }
+            ?? ChatSessionRetention.transcriptFiles(dataRoot: dataRoot, prefix: ownerPrefix,
+                archived: tailBytes == nil ? ChatSessionRetention.archivedTranscripts(dataRoot: dataRoot) : [:])
         let key = "\(dataRoot.path)|\(owner)|\(tailBytes.map(String.init) ?? "")"
-        let stamp = (plan.map(\.1) + [ContactReplyReads.url(dataRoot)]).map { fileStamp($0.path) }
-        if let hit = cache.withLock({ $0[key] }), hit.stamp == stamp { return hit.lines }
+        let paths = plan.map(\.1) + [ContactReplyReads.url(dataRoot)]
+        let stamp = paths.map { fileStamp($0.path) }
+        if !stamp.contains(nil), let hit = cache.withLock({ $0[key] }), hit.paths == paths, hit.stamp == stamp { return hit.lines }
         let fetched = ContactReplyReads.read(dataRoot)
         var rows: [Line] = []
         for (session, file) in plan {
-            guard let text = read(file, tailBytes: tailBytes) else { continue }
+            let text = try read(file, tailBytes: tailBytes)
             for raw in text.split(separator: "\n") {
                 guard case .object(let object)? = try? JSONValue.parse(Data(raw.utf8)),
                       case .string? = object["id"], case .string? = object["content"],
@@ -306,33 +363,37 @@ extension ContactThread {
             }
         }
         let result = project(rows, style: .thread, thread: owner).sorted { $0.at < $1.at }
-        cache.withLock { $0[key] = (stamp, result) }
+        cache.withLock { $0[key] = (paths, stamp, result) }
         return result
     }
 
-    /// `lines` re-parsed every session file a contact owns on each Simple
-    /// refresh, and a Codex state write alone asks for one (perf sweep
-    /// 2026-10-05). Kept per owner until a file it read, or the reply reads,
-    /// changes on disk.
-    private static let cache = OSAllocatedUnfairLock<[String: (stamp: [String], lines: [Line])]>(initialState: [:])
+    /// Cache each owner's transcript lines until a session or reply file changes.
+    private static let cache = OSAllocatedUnfairLock<[String: (paths: [URL], stamp: [SnapshotTailOpLog.FileStamp?], lines: [Line])]>(initialState: [:])
 
     /// A file's identity, size and times; any write moves it.
-    private static func fileStamp(_ path: String) -> String {
+    private static func fileStamp(_ path: String) -> SnapshotTailOpLog.FileStamp? {
         var info = stat()
-        guard lstat(path, &info) == 0 else { return path + " -" }
-        return "\(path) \(info.st_ino) \(info.st_size) "
-            + "\(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec) \(info.st_ctimespec.tv_sec).\(info.st_ctimespec.tv_nsec)"
+        guard lstat(path, &info) == 0 else { return errno == ENOENT ? .absent : nil }
+        return SnapshotTailOpLog.FileStamp(info)
     }
 
-    private static func read(_ file: URL, tailBytes: Int?) -> String? {
-        guard let tailBytes else { return try? String(contentsOf: file, encoding: .utf8) }
-        guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
+    /// Unreadable or undecodable selected history is unavailable, never empty.
+    private static func read(_ file: URL, tailBytes: Int?) throws -> String {
+        guard let tailBytes else { return try String(contentsOf: file, encoding: .utf8) }
+        guard tailBytes > 0 else {
+            throw CocoaError(.fileReadInvalidFileName, userInfo: [NSFilePathErrorKey: file.path])
+        }
+        let handle = try FileHandle(forReadingFrom: file)
         defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()) ?? 0
-        guard var data = read(handle, from: size > UInt64(tailBytes) ? size - UInt64(tailBytes) : 0) else { return nil }
+        let size = try handle.seekToEnd()
+        try handle.seek(toOffset: size > UInt64(tailBytes) ? size - UInt64(tailBytes) : 0)
+        var data = try handle.readToEnd() ?? Data()
         // The first line of a cut window is partial.
         if size > UInt64(tailBytes), let end = data.firstIndex(of: 0x0A) { data = data[data.index(after: end)...] }
-        return String(data: data, encoding: .utf8)
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw CocoaError(.fileReadInapplicableStringEncoding, userInfo: [NSFilePathErrorKey: file.path])
+        }
+        return text
     }
 
     public enum Entry: Sendable {
@@ -372,6 +433,8 @@ extension ContactThread {
         guard let write = writer.withLock({ $0 }) else {
             throw CocoaError(.fileWriteUnknown, userInfo: [NSLocalizedDescriptionKey: "no conversation writer is installed yet"])
         }
+        try await SessionConversation.declare(session(owner: entry.owner), kind: .agent,
+            title: entry.owner, source: "agent-bridge", dataRoot: dataRoot, createIfMissing: false)
         try await write(dataRoot, entry)
     }
 }

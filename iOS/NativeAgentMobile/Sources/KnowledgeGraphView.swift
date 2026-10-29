@@ -1,10 +1,4 @@
-// KnowledgeGraphView.swift — iOS port of Mac KnowledgeGraphView.
-// Data source: a Mac-produced iCloud knowledge_graph.json projection from the
-// canonical KnowledgeGraph reader. The retired /v1 HTTP transport is not
-// available on iPhone.
-// Phone-friendly: list + tap-to-detail sheet and pull-to-refresh.
-//
-// List, detail headers and neighbors all read the sync engine's typed graph.
+// List, detail headers and neighbors read the Mac-produced typed iCloud graph.
 import SwiftUI
 import NativeAgentShared
 // Blueprint: | `KnowledgeGraphView.swift` | Graph presentation and ID-resolved entity details/neighbors from the shared typed graph; local search/loading state |
@@ -41,21 +35,9 @@ enum KnowledgeGraphEmptyStatePresentation {
     static let emptyPublishedDescription = "Knowledge Graph is read-only on iPhone. It will update after the Mac publishes entities; pull to refresh later."
 }
 
-/// User-facing reasons the detail sheet cannot resolve its selected entity.
-/// A downloaded graph can legitimately no longer contain a row that was
-/// selected from an older list snapshot, so do not misreport that case as an
-/// iCloud delivery failure.
 enum KnowledgeGraphDetailNeighborsPresentation {
-    enum UnavailableReason: Equatable {
-        case entityNoLongerPublished
-    }
-
-    static func message(for reason: UnavailableReason) -> String {
-        switch reason {
-        case .entityNoLongerPublished:
-            return "This entity is no longer in the published Knowledge Graph."
-        }
-    }
+    /// A vanished selection is a graph change, not an iCloud delivery failure.
+    static let unavailableMessage = "This entity is no longer in the published Knowledge Graph."
 
     static func neighborName(id: String, publishedName: String?) -> String {
         guard let publishedName = publishedName?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -68,29 +50,16 @@ enum KnowledgeGraphDetailNeighborsPresentation {
 
 // MARK: - Models
 
-// Dual-shape decoder.
-// CANONICAL (Mac-produced checked projection):
-//   {entities: [...], edges: [...], total_entities, total_edges, page}.
-// LEGACY DICT SHAPE remains readable only for pre-SQLite snapshots:
-//   {_commit_seq, version, entities: { "<id>": {...}, ... }, edges: [...]}.
-//
-// We retain both decoders during migration. Either way we expose a normalized
-// `entities: [KGEntity]` array so
-// the SwiftUI view doesn't have to know which path was taken.
+// Canonical array and legacy dictionary snapshots expose the same entity/edge value.
 struct KGEntityResponse: Decodable, Equatable, Sendable {
     var entities: [KGEntity]
-    var edges: [KGEdge]
+    var edges: [KnowledgeGraphEdgeWireSnapshot]
     var total: Int
-    var totalEdges: Int?
-    var page: Int
 
     private enum CodingKeys: String, CodingKey {
-        case entities, page, edges
+        case entities, edges
         case total
         case totalEntities = "total_entities"
-        case totalEdges = "total_edges"
-        case commitSeq = "_commit_seq"
-        case version
     }
 
     init(from decoder: Decoder) throws {
@@ -114,16 +83,13 @@ struct KGEntityResponse: Decodable, Equatable, Sendable {
             }
             // Legacy dict shape has no trustworthy top-level totals.
             total = entities.count
-            // edges is an array of KGEdge; count if present.
-            edges = (try? container.decode([KGEdge].self, forKey: .edges)) ?? []
-            totalEdges = edges.count
-            page = 0
+            edges = try container.decodeIfPresent([KnowledgeGraphEdgeWireSnapshot].self, forKey: .edges) ?? []
             return
         }
 
         // Checked SQLite projection uses an entity array.
         entities = try container.decode([KGEntity].self, forKey: .entities)
-        edges = (try? container.decode([KGEdge].self, forKey: .edges)) ?? []
+        edges = try container.decodeIfPresent([KnowledgeGraphEdgeWireSnapshot].self, forKey: .edges) ?? []
         if let decodedTotal = try? container.decode(Int.self, forKey: .total) {
             total = decodedTotal
         } else if let decodedTotal = try? container.decode(Int.self, forKey: .totalEntities) {
@@ -131,8 +97,6 @@ struct KGEntityResponse: Decodable, Equatable, Sendable {
         } else {
             total = entities.count
         }
-        totalEdges = try? container.decode(Int.self, forKey: .totalEdges)
-        page = (try? container.decode(Int.self, forKey: .page)) ?? 0
     }
 }
 
@@ -186,24 +150,12 @@ struct KGEntity: Decodable, Identifiable, Equatable, Sendable {
 }
 
 private struct KGNeighborsResponse: Sendable {
-    var edges: [KGEdge]
+    var edges: [KnowledgeGraphEdgeWireSnapshot]
     var neighbors: [String: KGEntity]
 }
 
-struct KGEdge: Decodable, Identifiable, Equatable, Sendable {
-    var id: String { "\(from)-\(to)-\(kind)" }
-    var from: String
-    var to: String
-    var kind: String
-    var weight: Double?
-
-    init(from decoder: Decoder) throws {
-        let snapshot = try KnowledgeGraphEdgeWireSnapshot(from: decoder)
-        from = snapshot.from
-        to = snapshot.to
-        kind = snapshot.kind
-        weight = snapshot.weight
-    }
+extension KnowledgeGraphEdgeWireSnapshot: @retroactive Identifiable {
+    public var id: String { "\(from)-\(to)-\(kind)" }
 }
 
 // MARK: - Store
@@ -354,7 +306,7 @@ struct KnowledgeGraphView: View {
             if let entity = MobileDesignSamples.rows(store.entities).first(where: { $0.id == selectedEntityID }) {
                 KGEntityDetailSheet(entity: entity, store: store)
             } else {
-                AliveCalmState(title: "Entity unavailable", line: KnowledgeGraphDetailNeighborsPresentation.message(for: .entityNoLongerPublished))
+                AliveCalmState(title: "Entity unavailable", line: KnowledgeGraphDetailNeighborsPresentation.unavailableMessage)
             }
         }
     }
@@ -493,7 +445,7 @@ private struct KGEntityDetailSheet: View {
 // MARK: - Edge row
 
 private struct KGEdgeRowView: View {
-    let edge: KGEdge
+    let edge: KnowledgeGraphEdgeWireSnapshot
     let neighbors: [String: KGEntity]
     let rootId: String
 
@@ -544,32 +496,15 @@ enum KGEntityMeta {
     struct Presentation {
         let label: String
         let icon: String
-        let color: Color
-        let isKnown: Bool
     }
 
     static func presentation(for rawType: String) -> Presentation {
-        switch rawType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "person":
-            return .init(label: "Person", icon: "person.circle", color: .blue, isKnown: true)
-        case "organization":
-            return .init(label: "Organization", icon: "building.2", color: .indigo, isKnown: true)
-        case "project":
-            return .init(label: "Project", icon: "folder", color: .orange, isKnown: true)
-        case "concept":
-            return .init(label: "Concept", icon: "lightbulb", color: .purple, isKnown: true)
-        case "place":
-            return .init(label: "Place", icon: "mappin.circle", color: .green, isKnown: true)
-        case "event":
-            return .init(label: "Event", icon: "calendar", color: .red, isKnown: true)
-        case "tool":
-            return .init(label: "Tool", icon: "wrench.and.screwdriver", color: .gray, isKnown: true)
-        case "fact":
-            return .init(label: "Fact", icon: "text.quote", color: .teal, isKnown: true)
-        default:
-            let cleanType = rawType.trimmingCharacters(in: .whitespacesAndNewlines)
-            let label = cleanType.isEmpty ? "Type unavailable" : "Unrecognized type: \(cleanType)"
-            return .init(label: label, icon: "questionmark.circle", color: .orange, isKnown: false)
+        let cleanType = rawType.trimmingCharacters(in: .whitespacesAndNewlines)
+        let type = cleanType.lowercased()
+        if let icon = knowledgeGraphTypeSymbols[type] {
+            return .init(label: type.capitalized, icon: icon)
         }
+        let label = cleanType.isEmpty ? "Type unavailable" : "Unrecognized type: \(cleanType)"
+        return .init(label: label, icon: "questionmark.circle")
     }
 }

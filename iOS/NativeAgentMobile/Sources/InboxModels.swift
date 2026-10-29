@@ -1,80 +1,11 @@
-import SwiftUI
+import Foundation
 import NativeAgentShared
-// Blueprint: | `InboxModels.swift` | `InboxItemRecord` transport shape and presentation; status is supplied by the Mac |
+// Blueprint: | `InboxModels.swift` | Phone rendering and bounded notification planning over shared inbox values; status and source meaning are supplied by the Mac |
 
 // MARK: - Model
 
-struct InboxItemRecord: Identifiable, Codable, Hashable, Sendable {
-    let id: String
-    let created_at: String
-    let source: String
-    let severity: String
-    let title: String
-    let summary: String
-    let detail: String?
-    let relatedWorkshopExecutionId: String?
-    let related_approval_id: String?
-    let related_paths: [String]?
-    let related_groups: [InboxRelatedGroup]?
-    let actions: [InboxActionRecord]
-    let status: String
-    let read_at: String?
-    /// The conversation a card raised elsewhere was mirrored into for User.
-    var chat_session_id: String? = nil
-    /// What the source means, as the Mac says it; nil from a Mac too old to say.
-    var presentation: InboxPresentation? = nil
-
-    enum CodingKeys: String, CodingKey {
-        case id, created_at, source, severity, title, summary, detail
-        case relatedWorkshopExecutionId = "related_mission_id" // compatibility wire ID
-        case related_approval_id, related_paths, related_groups, actions, status, read_at, chat_session_id, presentation
-    }
-
-    /// Wave 4 (phase A) read-both: accept the FUTURE `related_execution_id`
-    /// spelling as well as the on-wire `related_mission_id` above. Decode-only —
-    /// `encode(to:)` stays the synthesized one, so anything this build writes
-    /// still carries `related_mission_id`.
-    fileprivate enum FutureCodingKeys: String, CodingKey {
-        case related_execution_id
-    }
-}
-
-// The decoder lives in an extension on purpose: declaring `init(from:)` in the
-// struct body would suppress the synthesized memberwise init.
 extension InboxItemRecord {
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = try c.decode(String.self, forKey: .id)
-        // Every non-optional field keeps the SYNTHESIZED semantics exactly
-        // (`decode`, i.e. a missing key still throws). This init exists only to
-        // widen the one execution-link key; it must not quietly become a more
-        // lenient decoder.
-        created_at = try c.decode(String.self, forKey: .created_at)
-        source = try c.decode(String.self, forKey: .source)
-        severity = try c.decode(String.self, forKey: .severity)
-        title = try c.decode(String.self, forKey: .title)
-        summary = try c.decode(String.self, forKey: .summary)
-        detail = try c.decodeIfPresent(String.self, forKey: .detail)
-        let futureRelatedExecutionId: String? = {
-            guard let future = try? decoder.container(keyedBy: FutureCodingKeys.self) else {
-                return nil
-            }
-            return try? future.decodeIfPresent(String.self, forKey: .related_execution_id)
-        }()
-        relatedWorkshopExecutionId = try futureRelatedExecutionId
-            ?? c.decodeIfPresent(String.self, forKey: .relatedWorkshopExecutionId)
-        related_approval_id = try c.decodeIfPresent(String.self, forKey: .related_approval_id)
-        related_paths = try c.decodeIfPresent([String].self, forKey: .related_paths)
-        related_groups = try c.decodeIfPresent([InboxRelatedGroup].self, forKey: .related_groups)
-        actions = try c.decode([InboxActionRecord].self, forKey: .actions)
-        status = try c.decode(String.self, forKey: .status)
-        read_at = try c.decodeIfPresent(String.self, forKey: .read_at)
-        chat_session_id = try c.decodeIfPresent(String.self, forKey: .chat_session_id)
-        presentation = try? c.decodeIfPresent(InboxPresentation.self, forKey: .presentation)
-    }
-
     var isUnread: Bool { status == "unread" }
-    var hasLinkedApproval: Bool { !(related_approval_id ?? "").isEmpty }
 
     /// Presentation must expose only actions with a real end-to-end native
     /// contract. This is deliberately closed: an action introduced by a card
@@ -84,25 +15,11 @@ extension InboxItemRecord {
         actions.filter { $0.id == "view" || InboxActionVocabulary.supports($0.id, itemID: id) }
     }
 
-    var severityColor: Color {
-        switch severity {
-        case "actionable": return .orange
-        case "important":  return .blue
-        default:           return NativeAgentPalette.agentAccent
-        }
-    }
-
-    /// The Mac's one reading of the source; a card from a Mac too old to
-    /// send it is shown as unclassified, never reclassified here.
-    var sourceIcon: String { presentation?.icon ?? "bell.fill" }
-
-    var sourceBadgeLabel: String { presentation?.badge ?? source.uppercased().prefix(14).description }
-
-    /// Where a card came from, in plain words (the badge label is plumbing).
+    /// The Mac's reading of where a card came from, in plain words.
     var sourceWords: String { presentation?.words ?? "A note from me" }
 
     var createdDate: Date? {
-        ISO8601DateFormatter().date(from: created_at)
+        UserDisplayFormatters.parseISOTimestamp(created_at)
     }
 
     var relativeCreatedAt: String {
@@ -116,18 +33,6 @@ extension InboxItemRecord {
     }
 
 }
-
-/// The Mac's `InboxSourcePresentation`, as the snapshot carries it.
-struct InboxPresentation: Codable, Hashable, Sendable {
-    let icon: String
-    let badge: String
-    let words: String
-    /// Nil: the card's own action label says it.
-    let act_label: String?
-}
-
-typealias InboxRelatedGroup = NativeAgentShared.InboxRelatedGroup
-typealias InboxActionRecord = NativeAgentShared.InboxActionRecord
 
 extension InboxRelatedGroup {
     func matches(_ item: InboxItemRecord) -> Bool {

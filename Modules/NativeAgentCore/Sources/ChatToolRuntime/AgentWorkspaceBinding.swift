@@ -1,3 +1,4 @@
+import AgentConversations
 import AgentWorkspace
 import Foundation
 import NativeAgentCore
@@ -29,9 +30,9 @@ package enum ChatWorkspaceBinding {
         await AgentWorkspaceNavigation.shared.currentPlace(dataRoot: dataRoot, scope: scope)
     }
 
-    package static func glance(dataRoot: URL, scope: String, turn: Date?, message: String, includingMoments: Bool = true) async -> String? {
+    package static func glance(dataRoot: URL, scope: String, turn: Date?, message: String) async -> String? {
         await AgentWorkspacePorts.$binding.withValue(ports) {
-            await HerScreen.glance(dataRoot: dataRoot, scope: scope, turn: turn, message: message, includingMoments: includingMoments)
+            await HerScreen.glance(dataRoot: dataRoot, scope: scope, turn: turn, message: message)
         }
     }
 
@@ -52,12 +53,15 @@ package enum ChatWorkspaceBinding {
             }
         }
         func identity(dataRoot: URL) -> AgentContactIdentity { AgentContactIdentity(dataRoot: dataRoot) }
+        func answeredRequests(dataRoot: URL) -> [(message: String?, run: String?, chat: String?, modified: Date)] {
+            GrokRequestStore(dataRoot: dataRoot).answeredRequests()
+        }
         func openHuman(sessionID: String, limit: Int?, dataRoot: URL) async throws -> JSONValue {
             // The read consumed each message it shows under its own row's stamp.
             await HumanConversationReader.open(sessionID: sessionID, limit: limit, dataRoot: dataRoot)
         }
         func presentation(_ row: AgentConversationRecord) -> JSONValue {
-            AgentConversationSession.conversationPresentation(row)
+            AgentConversationView.conversationPresentation(row)
         }
         func liveHandOff(_ row: AgentConversationRecord) -> Bool { AgentConversationSession.liveHandOff(row) }
         func unsettledAttention(_ row: AgentConversationRecord) -> Bool { AgentConversationSession.unsettledAttention(row) }
@@ -84,19 +88,18 @@ package enum ChatWorkspaceBinding {
         }
         func builtAbilities(dataRoot: URL, now: Date) async -> String {
             do {
-                async let tools = SwiftNativeToolRegistry(root: dataRoot).listTools(filter: .all)
                 async let senses = FileSenseRegistry(dataRoot: dataRoot).all()
-                let callable = Set(SwiftToolDispatcher.authoredTools(dataRoot: dataRoot).map { $0.schema.name })
+                let tools = try await SwiftNativeToolRegistry(root: dataRoot).listTools()
+                let callable = Set(SwiftToolDispatcher.authoredTools(records: tools).map { $0.schema.name })
                 let since = now.addingTimeInterval(-7 * 86_400)
                 var names: [(name: String, changed: Date, builtIn: Bool)] = []
-                for part in try await tools where callable.contains(part.id) {
+                for part in tools where callable.contains(part.id) {
                     let changed = CapabilityLifecycle.date(part.updatedAt ?? part.createdAt) ?? .distantPast
-                    let origin: [String: JSONValue] = if case .object(let row)? = part.extras, case .object(let origin)? = row["origin"] { origin } else { [:] }
-                    let builtIn: Bool = if case .object(let row)? = part.extras { row["overrides"] == .string("built_in") || origin["by"] == .string("pack") } else { false }
+                    let builtIn = part.fields["overrides"] == .string("built_in") || part.fields["origin"]?.objectValue?["by"] == .string("pack")
                     if !builtIn || changed >= since { names.append((part.name + " (ability)", changed, builtIn)) }
                 }
                 for sense in try await senses where sense.status == .on {
-                    let changed = max(sense.createdAt, sense.enabledAt ?? .distantPast)
+                    let changed = max(sense.createdAt ?? .distantPast, sense.enabledAt ?? .distantPast)
                     if sense.origin == .grown || changed >= since {
                         names.append((sense.corner.key + " (sense)", changed, sense.origin != .grown))
                     }
@@ -135,12 +138,9 @@ package enum ChatWorkspaceBinding {
         }
         func appAction(_ tool: String) -> String? { ToolNameAliases.appAction(tool) }
         func macIntegrationGate(_ name: String) -> (integration: String, mode: MacIntegrationPermissionMode)? {
-            ToolPreloadHeuristics.macIntegrationGates[name]
+            MacIntegrationGates.byTool[ToolNameAliases.canonical(name)]
         }
         func markConsumed(peer: String) { PeerDataTaint.markConsumed(peer: peer) }
-        func normalizeWorkspaceAlias(_ path: String, workspaceRoot: URL) -> String {
-            SwiftToolDispatcher.normalizeWorkspaceAlias(path, workspaceRoot: workspaceRoot)
-        }
         func withWebScheme(_ value: String) -> String { SwiftToolDispatcher.withWebScheme(value) }
         func builderSourceRepoRoot(dataRoot: URL) -> URL? { SwiftToolDispatcher.builderSourceRepoRoot(dataRoot: dataRoot) }
         var listedPeerState: String { AgentPeerContactState.listed.rawValue }

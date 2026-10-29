@@ -1,33 +1,31 @@
 import Foundation
+import NativeAgentCore
 import PersistenceCore
 import TurnTrace
+import NativeAgentShared
 
 // Blueprint: | `ToolNameAliases.swift` | `ToolNameAliases`: one spelling/argument translation owner across Trust, dispatch, receipts and visible app-call projection |
 
 // MARK: - Tool-name aliases
 
-/// The ONE table of alternate spellings for a tool name (2026-09-26). Trust,
-/// dispatch, receipts, traces and the chat pill all resolve a requested name
-/// here, so an alias can never be judged as one tool and executed as another
-/// (`browser_navigate` used to be `browser.navigate` to the Trust Center and
-/// `browser.open_url` to the app dispatcher).
+/// Trust, dispatch, receipts, traces and chat pills resolve alternate tool spellings through this one table.
 ///
-/// Every canonical name is a real, model-visible tool name. An alias is never
-/// a tool of its own: it adds nothing to a catalog or schema list, and the
-/// model is only ever offered the canonical spelling. This is not the wire
-/// encoder — `ProviderToolNameMap` still owns provider-safe names at ingress.
+/// Spelling and argument translation grants no model visibility or catalog entries.
+/// `ProviderToolNameMap` owns provider-safe wire names at ingress.
 public enum ToolNameAliases {
     /// canonical name → the spellings that mean it. Both are matched trimmed
     /// and case-insensitively.
     static let aliasesByCanonical: [String: [String]] = [
+        "recall_memory": ["recall_search"],
+        "scheduler_cancel_job": ["scheduler_delete_job"],
+        "search_chat_history": ["session_search"],
         "mobile_notify": [
             "mobile.notify", "iphone.notify", "iphone_notify", "ios.notify", "ios_notify",
             "apns.notify", "apns_notify", "push.notify", "push_notify",
         ],
         "mac_notify": ["mac.notify", "native.notify", "native_notify"],
         "mac_spotlight_search": ["spotlight_search"],
-        // The Trust Center speaks these tools' connector-action ids; a model
-        // that read one called the dotted form (2026-08-22).
+        // Accept the connector-action ids shown by the Trust Center.
         "mac_look": ["mac.look"],
         "mac_view": ["mac.view"],
         "browser.status": ["browser_status", "browser.get_status", "browser_get_status"],
@@ -46,25 +44,21 @@ public enum ToolNameAliases {
         "browser.chrome_setup": ["browser_chrome_setup"],
         "browser.chrome_status": ["browser_chrome_status"],
     ].merging(Dictionary(uniqueKeysWithValues: [
-        "close_tab", "navigate", "snapshot", "click", "fill", "type", "select",
+        "close_tab", "navigate", "snapshot", "look", "click", "fill", "type", "select",
         "keypress", "set_checked", "double_click", "drag", "wait", "scroll", "media",
     ].map { verb in
         ("browser.chrome_\(verb)", ["browser_chrome_\(verb)", "chrome.\(verb)", "chrome_\(verb)"])
     })) { $0 + $1 }
 
-    /// The app's old per-area tools, retired for the one `app` door
-    /// (2026-10-01). Not aliases: a call to one runs nothing, and its
-    /// unknown-tool answer carries `retiredAppToolHint`.
+    /// Retired per-area tools run nothing; their unknown-tool answer carries `retiredAppToolHint`.
     public static let retiredAppTools: Set<String> = [
         "inbox", "chat_session", "upkeep", "provider", "connections", "mind_run", "skill_manage", "ability_manage",
         "workshop_reject", "app_settings_list", "app_setting_set", "app_page_read", "app_page_screenshot",
         "interaction_act", "doctor_status", "telegram_status",
         "chat_conversations", "list_memories", "rewrite_memory",
-        // 10-02: no headless Claude, and one way to send her: `claude.say`,
-        // like every home name. A call runs nothing; its answer is that send (`appCall`).
+        // Refused calls translate to `claude.say` through `appCall`.
         "invoke_claude", "claude_message",
-        // 10-02: craft's three hard-coded methods are gone; a part runs as
-        // authored.<id>. A call runs nothing and points to ability.list.
+        // Refused calls point to ability.list; parts run as authored.<id>.
         "craft_run",
     ]
     /// Retired action ids → the retired tool each ran; a call answers as `appCall` translates it.
@@ -72,20 +66,12 @@ public enum ToolNameAliases {
                                         "mac.screen": "screen", "mac.activity_query": "activity_query", "persona": "get_persona_doc"]
     public static let retiredAppToolHint = "Use app — {} is your home and every page."
 
-    /// One-door phase 2 step 7 (User 10-02): `workspace` is `app`'s home, and
-    /// discovery is `app {find}`. Their old calls answer translated; nothing
-    /// is left to load.
+    /// Discovery names translate to app home/find; there is no load lifecycle.
     public static let mergedTools: Set<String> = ["workspace", "tool_catalog", "list_tools", "tool_load"]
 
-    /// Tools folded into the `app` door (one-door phase 2): name → its action
-    /// id. Their schemas leave the model's list, `tool_catalog` and
-    /// `tool_load`; the executors stay, so internal callers (bridges, bots,
-    /// the scheduler, workspace, the workshop allowlist) still call them by
-    /// name, and the door re-enters under that name, so every gate binds the
-    /// call as it did. A model call to one runs nothing and gets `foldedToolHint`.
-    /// Built keeping the first entry for a repeated name (and logging it), so
-    /// a duplicate here can never trap at launch the way a dictionary
-    /// literal's does.
+    /// Internal tool name → app action id. Actions re-enter the named executor's gates.
+    /// Direct model calls run nothing and receive `foldedToolHint`.
+    /// Duplicate names log and keep their first entry without trapping.
     public static let foldedTools: [String: String] = {
         var out: [String: String] = [:]
         for (tool, id) in foldedEntries.map({ ($0.key, $0.value) })
@@ -103,9 +89,7 @@ public enum ToolNameAliases {
         "time_now": "time.now", "context_expand": "context.expand", "inner_state": "mind.inner_state",
         "agent_introspect": "agent.introspect",
         "recent_trace_summary": "trace.recent",
-        // Step 2, her own state (User 10-02). recall_search is recall_memory's
-        // old alias and folds with it.
-        "desk_read": "desk.read", "desk_add_item": "desk.add", "desk_set_status": "desk.set_status",
+        "desk_read": "desk.read", "desk_add_item": "desk.add", "desk_set_status": "desk.set_status", "desk_wait": "desk.wait",
         "desk_update_item": "desk.update", "desk_note": "desk.note", "desk_add_ref": "desk.add_ref",
         "desk_set_cadence": "desk.set_cadence", "desk_set_notify": "desk.set_notify", "desk_close": "desk.close",
         "desk_archive": "desk.archive", "desk_blocked_on": "desk.blocked_on", "desk_breakdown": "desk.breakdown",
@@ -117,8 +101,8 @@ public enum ToolNameAliases {
         "scheduler_resume_job": "schedule.resume", "scheduler_cancel_job": "schedule.cancel",
         "scheduler_delete_job": "schedule.delete",
         "recall_memory": "memory.recall", "recall_search": "memory.recall", "commit_memory": "memory.commit",
-        "forget_memory": "memory.forget", "memory_moments_pending": "memory.moments",
-        "memory_moment_review": "memory.review", "search_kg": "graph.search", "rebuild_knowledge_graph": "graph.rebuild",
+        "forget_memory": "memory.forget", "memory_proposals_pending": "memory.proposals",
+        "memory_proposal_review": "memory.review", "search_kg": "graph.search", "rebuild_knowledge_graph": "graph.rebuild",
         "scratchpad_read": "chat.scratch_read",
         "bot_list": "bot.list", "bot_create": "bot.create", "bot_update": "bot.update", "bot_pause": "bot.pause",
         "bot_delete": "bot.delete", "bot_run_once": "bot.run_once", "bot_ask": "bot.ask",
@@ -129,14 +113,10 @@ public enum ToolNameAliases {
         "studio_journal": "studio.journal", "studio_journal_amend": "studio.amend", "studio_recall": "studio.recall",
         "studio_shelf_read": "studio.shelf", "studio_shelf_set": "studio.shelf_set", "studio_canon": "studio.canon",
         "studio_canon_resolve": "studio.canon_resolve", "dream_diary_read": "mind.dream_diary",
-        // Step 3, agents (User 10-02): contacts, conversations and the coding
-        // bridges, one action each.
         "agent_contacts": "agent.contacts", "agent_message": "agent.message", "agent_read": "agent.read",
         "agent_connect": "agent.connect", "agent_cancel": "agent.cancel", "delegation_status": "agent.jobs",
         "agent_swarm": "agent.swarm",
         "codex_message": "codex.message", "invoke_codex": "codex.invoke", "omp_message": "omp.message",
-        // Step 4, integrations (User 10-02): Mail; Calendar; Reminders, Notes,
-        // Contacts, Messages; the connectors; notifications, the phone and images.
         "mail_list_recent": "mail.recent", "mail_read_batch": "mail.read", "mail_search": "mail.search", "mail_senders": "mail.senders",
         "mail_save_attachment": "mail.save_attachment",
         "mail_triage_batch": "mail.triage", "mail_mark_read": "mail.mark_read", "mail_archive": "mail.archive",
@@ -144,7 +124,7 @@ public enum ToolNameAliases {
         "mac_calendar_list_upcoming": "calendar.upcoming", "mac_calendar_calendars": "calendar.calendars",
         "mac_calendar_free_busy": "calendar.free_busy", "mac_calendar_create_event": "calendar.create",
         "mac_calendar_modify_event": "calendar.modify", "mac_calendar_delete_event": "calendar.delete",
-        "mac_reminders_list_due_today": "reminders.due_today", "mac_reminders_query": "reminders.query",
+        "mac_reminders_list_due_today": "reminders.due_today", "mac_reminders_query": "reminders.query", "mac_reminders_lists": "reminders.lists",
         "mac_reminders_read": "reminders.read", "mac_reminders_create": "reminders.create",
         "mac_reminders_update": "reminders.update", "mac_reminders_complete": "reminders.complete",
         "mac_reminders_delete": "reminders.delete",
@@ -155,9 +135,6 @@ public enum ToolNameAliases {
         "messages_recent_threads": "messages.recent", "messages_send": "messages.send",
         "mac_notify": "notify.mac", "mobile_notify": "notify.phone", "phone_request": "phone.request",
         "image_generate": "image.generate",
-        // Step 5 (User 10-02): files, shell, the web, the browser, chat search
-        // and result paging. session_search is search_chat_history's alias and
-        // folds with it.
         "read_file": "files.read", "list_dir": "files.list", "file_info": "files.info", "file_excerpt": "files.excerpt", "grep": "files.grep",
         "write_file": "files.write", "move_file": "files.move", "copy_file": "files.copy", "trash_file": "files.trash", "apply_patch": "files.patch", "mac_spotlight_search": "files.spotlight",
         "shell": "shell.run", "bash": "shell.bash", "git": "git.run", "git_status": "git.status",
@@ -174,9 +151,6 @@ public enum ToolNameAliases {
         "search_chat_history": "chat.search", "session_search": "chat.search",
         "read_chat_message": "chat.message", "chat_reply": "chat.reply",
         "tool_result_page": "result.page",
-        // Step 6 (User 10-02): Mac control is the mac page, and the tools left
-        // over fold onto the pages they belong to: music, capabilities, chat
-        // (a setup card, a document by what it was for) and the Desk.
         "screen": "mac.look", "act": "mac.act", "go": "mac.go", "wait": "mac.wait", "read": "mac.read",
         "menu": "mac.menu", "menu_press": "mac.menu_press", "clipboard_read": "mac.clipboard_read",
         "clipboard_write": "mac.clipboard_write", "system_info": "mac.system_info", "mac_volume": "mac.volume", "activity_query": "mac.activity",
@@ -203,26 +177,25 @@ public enum ToolNameAliases {
         // A reader that searches takes `find`; `query` is what the others call it.
         "*": ["max_rows": "max_nodes", "max_results": "limit", "query": "find"],
         "agent.swarm": ["prompt": "objective", "timeout_seconds": "timeoutSeconds"],
-        "desk.close": ["outcome": "outcome_summary"],
+        "desk.close": ["outcome": "summary", "outcome_summary": "summary"],
+        "desk.wait": ["why": "note"],
         "memory.commit": ["content": "text"],
-        // A part is named by id; a skill's name and a tool's tool_id were its older spellings.
-        // Its code is `code`; her ability records call their outline `script` (10-21, ×2).
+        // Parts use id and code; accepted alternate spellings translate here.
         "ability.read": ["name": "id", "tool_id": "id"], "ability.validate": ["name": "id", "tool_id": "id", "fixtures": "input"],
         "ability.enable": ["name": "id", "tool_id": "id", "digest": "version"], "ability.restore": ["name": "id", "tool_id": "id", "digest": "version"],
         "ability.disable": ["name": "id", "tool_id": "id"], "ability.rollback": ["name": "id", "tool_id": "id"],
         "ability.drop": ["name": "id", "tool_id": "id"], "ability.save": ["tool_id": "id", "tests": "fixtures", "script": "code"],
-        // Fresh install 10-19: message for text ×4, contact for agent ×2, each a
-        // refused round. Who and what run by their natural names.
         "agent.message": whom.merging(["message": "text"]) { $1 },
         "agent.read": whom.merging(["id": "message_id"]) { $1 }, "agent.cancel": whom, "agent.verify": whom,
         "agent.rename": whom, "agent.connect": whom, "agent.jobs": whom,
-        // 10-17, Agent: "mac.go wants name, not app; shell.bash wants cmd, not command".
         "mac.go": ["app": "name"], "shell.run": ["command": "cmd"], "shell.bash": ["command": "cmd"],
     ]
 
     private static func argumentNames(_ tool: String, _ input: [String: JSONValue]) -> [String: String] {
         let action = appAction(tool) ?? tool
         var names = argAliases[action] ?? [:]
+        // add_ref already uses id for the linked approval/trace, beside handle.
+        if action.hasPrefix("desk."), action != "desk.add_ref" || input["handle"] == nil { names["id"] = "handle" }
         if action == "agent.swarm", case .int? = input["workers"] { names["workers"] = "agentCount" }
         if action == "agent.jobs" { names["id"] = input["agent"] == .string("swarm") ? "run_id" : "message_id" }
         return names
@@ -240,13 +213,7 @@ public enum ToolNameAliases {
             if stem(name) == stem(candidate) || name == "id" && candidate.hasSuffix("_id") { return true }
             let a = Array(name.lowercased()), b = Array(candidate.lowercased())
             guard min(a.count, b.count) >= 4, abs(a.count - b.count) <= 1 else { return false }
-            var row = Array(0...b.count)
-            for (i, character) in a.enumerated() {
-                var next = [i + 1]
-                for (j, other) in b.enumerated() { next.append(min(next[j] + 1, row[j + 1] + 1, row[j] + (character == other ? 0 : 1))) }
-                row = next
-            }
-            return row[b.count] <= 1
+            return characterEditDistance(a, b) <= 1
         }
         return matches.count == 1 ? matches.first.map { ($0, "T06") } : nil
     }
@@ -296,7 +263,7 @@ public enum ToolNameAliases {
     }
 
     /// Chrome's verbs on her own tab: `browser.chrome_<verb>` is `chrome.<verb>`.
-    public static let chromeVerbs = ["close_tab", "navigate", "snapshot", "click", "fill", "type", "select",
+    public static let chromeVerbs = ["close_tab", "navigate", "snapshot", "look", "click", "fill", "type", "select",
                               "keypress", "set_checked", "double_click", "drag", "wait", "scroll", "media", "reload_extension"]
 
     /// A tool she wrote, active in her registry, as the action that runs it:

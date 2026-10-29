@@ -15,7 +15,7 @@ import Dispatcher
 import MacControl
 import SwarmRuns
 import MacIntegration
-// Blueprint: | `SwiftToolDispatcher.swift` | Native dispatcher construction and built-in and registry catalogs; authored projections share AbilityStore's checked ToolRecord projection and exact catalog revision; named schema construction consumes parsed registry rows and selects before encoding |
+// Blueprint: | `SwiftToolDispatcher.swift` | Native dispatcher construction; capability-filtered schema factory owns native catalog membership; authored projections share AbilityStore's checked ToolRecord projection and exact catalog revision; named schema construction consumes parsed registry rows and selects before encoding |
 
 // MARK: - SwiftToolDispatcher
 
@@ -52,7 +52,6 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
     let memoryV2: SwiftNativeMemoryV2
     /// Exact KG projection belonging to `dataRoot`.
     let knowledgeGraphPath: URL
-    let swarmExecutor: (any AgentSwarmExecuting)?
     let swarmChatFactory: any SwarmChatClientFactory
     let providerLifecycleObserver: (any LLMCallLifecycleObserving)?
     /// Parent conversation approval projection reused by inherited swarm
@@ -94,7 +93,6 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         memoryV2: SwiftNativeMemoryV2? = nil,
         knowledgeGraphPath: URL? = nil,
         allowProcessGlobalTools: Bool = true,
-        swarmExecutor: (any AgentSwarmExecuting)? = nil,
         providerLifecycleObserver: (any LLMCallLifecycleObserving)? = nil,
         swarmApprovalFiler: (any ApprovalFiler)? = nil,
         macIntegrationBridge: (any MacIntegrationToolBridge)? = nil,
@@ -124,7 +122,6 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
             .appendingPathComponent("memory", isDirectory: true)
             .appendingPathComponent("knowledge_graph.json")
         self.allowsCanonicalBodyTools = allowProcessGlobalTools
-        self.swarmExecutor = swarmExecutor
         self.swarmChatFactory = swarmChatFactory
         self.providerLifecycleObserver = providerLifecycleObserver
         self.swarmApprovalFiler = swarmApprovalFiler
@@ -167,14 +164,15 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         }
         builtInSchemaCacheLock.unlock()
 
-        let generated = builtInToolSchemas(
+        let generated = BuiltInToolSchemaFactory(
+            requestedNames: requestedNames,
+            standingBotMinimumInterval: key.standingBotMinimumInterval
+        ).schemas(
             includeFullMacFileTools: includeFullMacFileTools,
             includeFullMacSystemTools: includeFullMacSystemTools,
             includeFullMacAccessibilityReadTools: includeFullMacAccessibilityReadTools,
             includeFullMacAccessibilityInjectionTools: includeFullMacAccessibilityInjectionTools,
-            includeActivityQueryTool: includeActivityQueryTool,
-            standingBotMinimumInterval: key.standingBotMinimumInterval,
-            requestedNames: requestedNames
+            includeActivityQueryTool: includeActivityQueryTool
         )
 
         guard requestedNames == nil else { return generated }
@@ -202,28 +200,34 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         await catalogSnapshot(includeSchemas: true).schemas
     }
 
-    func catalogSnapshot(includeSchemas: Bool, schemaNames: Set<String>? = nil) async -> (names: [String], schemas: [LLMToolSchema]) {
+    func catalogSnapshot(includeSchemas: Bool, schemaNames: Set<String>? = nil, surface: String = "chat") async -> (names: [String], schemas: [LLMToolSchema], access: FullMacToolAccess) {
         let records = readRegistryRecords()
-        let access = await fullMacToolAccess()
+        let access = await fullMacToolAccess(surface: surface)
         let activity = await activityCaptureEnabled()
-        let names = availableToolNames(records: records, access: access, activity: activity)
+        let builtIn = cachedBuiltInToolSchemas(
+            includeFullMacFileTools: access.fileOpsAllowed,
+            includeFullMacSystemTools: access.systemAllowed,
+            includeFullMacAccessibilityReadTools: access.accessibilityAllowed,
+            includeFullMacAccessibilityInjectionTools: access.accessibilityAllowed,
+            includeActivityQueryTool: activity,
+            requestedNames: schemaNames
+        ).filter { usesCanonicalBody || !Self.canonicalBodyOnlyToolNames.contains($0.name) }
+        // Authored rows cannot shadow a native route or one of its aliases.
+        var names = records.filter { $0.fields["status"] == .string("active") }
+            .map(\.id)
+            .sorted().filter(Self.isAuthorableToolName)
+        var seen = Set(names)
+        names.append(contentsOf: (builtIn.map(\.name) + (appTools?.descriptors.map(\.name) ?? []))
+            .filter { seen.insert($0).inserted })
         var schemas: [LLMToolSchema] = []
         if includeSchemas {
-            let builtIn = cachedBuiltInToolSchemas(
-                includeFullMacFileTools: access.fileOpsAllowed,
-                includeFullMacSystemTools: access.systemAllowed,
-                includeFullMacAccessibilityReadTools: access.accessibilityAllowed,
-                includeFullMacAccessibilityInjectionTools: access.accessibilityAllowed,
-                includeActivityQueryTool: activity,
-                requestedNames: schemaNames
-            ).map { executorDescriptors[$0.name]?.schema ?? $0 }
             let registry = Self.authoredTools(records: records, named: schemaNames).map(\.schema)
-            let combined = builtIn + registry
+            let combined = builtIn.map { executorDescriptors[$0.name]?.schema ?? $0 } + registry
             schemas = withContributedSchemas(usesCanonicalBody
                 ? combined
                 : combined.filter { !Self.canonicalBodyOnlyToolNames.contains($0.name) }, named: schemaNames)
         }
-        return (names, schemas)
+        return (names, schemas, access)
     }
 
     /// Assembly and authored admission reserve every executor-owned name.
@@ -245,127 +249,35 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         appTools == nil ? [] : Set(executorDescriptors.keys)
     }
 
-    static func extractSessionId(from input: [String: JSONValue]) -> String {
-        for key in ["__session_id", "session_id", "sessionId"] {
-            if case .string(let s) = input[key] ?? .null {
-                let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { return trimmed }
-            }
-        }
-        return ""
-    }
-
     public func listAvailableTools() async throws -> [String] {
         await catalogSnapshot(includeSchemas: false).names
     }
 
-    private func availableToolNames(records: [JSONRow], access: FullMacToolAccess, activity: Bool) -> [String] {
-        // Registry discovery may never advertise a spelling that dispatch
-        // resolves to a native route. Otherwise a disabled built-in such
-        // as `shell`, or a dotted alias such as `desk.read`, can leak back
-        // into the catalog from registry.json even though its custom manifest
-        // can never own the call.
-        var names = records
-            .filter { $0.fields["status"] == .string("active") }
-            .compactMap { (try? $0.string("id")) ?? (try? $0.string("name")) }
-            .sorted().filter(Self.isAuthorableToolName)
-        // Built-in Swift dispatch-table names always surface, even if
-        // No authored ability files exist on fresh installs.
-        let existing0 = Set(names)
-        names.append(contentsOf: Self.builtInToolNames.filter { !existing0.contains($0) })
-        if access.fileOpsAllowed {
-            let existing = Set(names)
-            names.append(contentsOf: Self.fullMacFileToolNames.filter { !existing.contains($0) })
-            let existingBuilder = Set(names)
-            names.append(contentsOf: Self.fullMacBuilderToolNames.filter { !existingBuilder.contains($0) })
-            let existingRestart = Set(names)
-            names.append(contentsOf: Self.fullMacRestartToolNames.filter { !existingRestart.contains($0) })
-        }
-        if access.systemAllowed {
-            let existing = Set(names)
-            names.append(contentsOf: Self.fullMacSystemToolNames.filter { !existing.contains($0) })
-        }
-        if access.accessibilityAllowed {
-            let existing = Set(names)
-            names.append(contentsOf: Self.fullMacAccessibilityReadToolNames.filter { !existing.contains($0) })
-            // fable51 item 30 — the clipboard READ rides the same access
-            // signal as the perception reads: it changes nothing and needs the
-            // accessibility category plus an active Full Mac window.
-            names.append(contentsOf: Self.macClipboardReadToolNames.filter { !existing.contains($0) })
-            // fable51 item 29 — the menu WALK is perception on the same signal.
-            names.append(contentsOf: Self.macMenuReadToolNames.filter { !existing.contains($0) })
-            // fable51 item 33 — the READ organ rides the same signal: it walks
-            // the same AX tree and moves a viewport it puts back. When the
-            // caller names a `path`, dispatch requires file_ops ON TOP — but
-            // the tool itself is reachable at read tier, because its ordinary
-            // use is "read what is in front of me" and that needs no file
-            // authority at all.
-            names.append(contentsOf: Self.macReadToolNames.filter { !existing.contains($0) })
-        }
-        // fable51 item 30 — the clipboard WRITE rides app control, not the read
-        // tier: it replaces what the next paste anywhere will produce.
-        if access.accessibilityAllowed {
-            let existing = Set(names)
-            names.append(contentsOf: Self.macClipboardWriteToolNames.filter { !existing.contains($0) })
-            // fable51 item 29 — the menu PRESS runs the app's own handler.
-            names.append(contentsOf: Self.macMenuPressToolNames.filter { !existing.contains($0) })
-        }
-        // W2/W3 — INJECTION. Same category, act tier. Catalog visibility here
-        // is not authority: dispatch re-checks the category and MacControl
-        // still requires the active Full Mac window AND a body-bound injection
-        // capability before a single event is emitted. Standard modes obtain
-        // it through approved replay; admitted YOLO obtains it directly for
-        // the exact checked call without a per-call prompt.
-        if access.accessibilityAllowed {
-            let existing = Set(names)
-            names.append(contentsOf: Self.fullMacAccessibilityInjectionToolNames.filter { !existing.contains($0) })
-        }
-        // W7 — activity_query surfaces ONLY when the Trust Center capture
-        // toggle is on. Catalog and dispatch must agree: advertising a tool
-        // whose every call refuses teaches the model to keep trying it, and
-        // advertising it at all when capture is off would tell the model this
-        // Mac records activity when it does not.
-        if activity {
-            let existing = Set(names)
-            names.append(contentsOf: Self.activityQueryToolNames.filter { !existing.contains($0) })
-        }
-        if !usesCanonicalBody {
-            names.removeAll { Self.canonicalBodyOnlyToolNames.contains($0) }
-        }
-        let existingNames = Set(names)
-        names.append(contentsOf: (appTools?.descriptors.map(\.name) ?? []).filter { !existingNames.contains($0) })
-        return names
-    }
-
     func registryToolRecord(_ tool: String) throws -> [String: JSONValue]? {
-        let rows: [JSONValue]
+        let rows: [ToolRecord]
         switch Self.authoredRegistry(dataRoot: dataRoot) {
         case .success(let read): rows = read
         case .failure(let error):
             throw ToolFailureError("Her tool registry did not read (\(error.localizedDescription)), so '\(tool)' could not be looked up. Nothing ran.",
                                    effects: .none, owner: "abilities")
         }
-        for case .object(let row) in rows {
-            let name: JSONValue? = if case .string? = row["id"] { row["id"] } else { row["name"] }
-            if name == .string(tool) { return row }
-        }
+        for row in rows where row.id == tool { return row.fields }
         return nil
     }
 
-    private func readRegistryRecords() -> [JSONRow] { Self.readRegistryRecords(dataRoot: dataRoot) }
+    private func readRegistryRecords() -> [ToolRecord] { Self.readRegistryRecords(dataRoot: dataRoot) }
 
-    private static func readRegistryRecords(dataRoot: URL) -> [JSONRow] {
+    private static func readRegistryRecords(dataRoot: URL) -> [ToolRecord] {
         guard case .success(let rows) = authoredRegistry(dataRoot: dataRoot) else { return [] }
-        let records = rows.compactMap { try? JSONRow($0) }
-        return records.count == rows.count ? records : []
+        return rows
     }
 
     /// Her authored tool registry, or the fault that kept it from reading.
     /// A fault is never an empty registry: the catalog offers none of her
     /// tools while it lasts, and her home owes the repair until a read works.
-    static func authoredRegistry(dataRoot: URL) -> Result<[JSONValue], any Error> {
+    static func authoredRegistry(dataRoot: URL) -> Result<[ToolRecord], any Error> {
         do {
-            let rows = try AbilityStore(dataRoot: dataRoot).checkedToolRecords().map { $0.toJSON() }
+            let rows = try AbilityStore(dataRoot: dataRoot).checkedToolRecords()
             RepairOwed.settle(dataRoot, operation: "abilities.tool_registry", evidence: .init(source: "abilities", id: UUID().uuidString))
             return .success(rows)
         } catch {
@@ -375,16 +287,8 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
         }
     }
 
-    /// R9 (review finding 2): the FULL built-in dispatch namespace — every
-    /// name the dispatch switch or the fullMac catch-alls can match,
-    /// regardless of which gates are currently open. Registry custom tools
-    /// may never shadow these: the switch matches built-ins first, so a
-    /// registry schema under a built-in name would advertise behavior
-    /// dispatch can't deliver (e.g. a custom "shell" schema while Full Mac
-    /// is off).
-    /// Canonical native names: kept as given by alias resolution, and their
-    /// dotted spellings are reserved from registry names so a custom `desk.read`
-    /// can never sit beside the built-in `desk_read` as a look-alike.
+    /// Canonical built-in dispatch names stay reserved regardless of gate state;
+    /// authored tools cannot shadow them or their dotted alias spellings.
     static let nativeCanonicalToolNames = Set(nativeToolDescriptors.keys)
 
     /// Registered with the policy registry once, the first time a dispatcher is made.
@@ -422,6 +326,17 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
 
     /// Inventory readers retain the fault; execution discovery stays fail-closed.
     package static func checkedAuthoredTools(dataRoot: URL) -> Result<[(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)], any Error> {
+        checkedAuthoredCatalog(dataRoot: dataRoot).map(\.tools)
+    }
+
+    /// One checked source snapshot supplies both callable contracts and the
+    /// id/name aliases their dependencies can name. No alias reads the store again.
+    package struct AuthoredCatalog: Sendable {
+        package let tools: [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)]
+        package let aliases: [String: String]
+    }
+
+    package static func checkedAuthoredCatalog(dataRoot: URL) -> Result<AuthoredCatalog, any Error> {
         AbilityStore.withLock {
             let revision: [String]
             do { revision = try AbilityStore(dataRoot: dataRoot).revision() } catch {
@@ -430,45 +345,47 @@ public final class SwiftToolDispatcher: ToolDispatchClient, @unchecked Sendable 
                 return .failure(error)
             }
             let key = (dataRoot.path, revision, AppActionBinding.registeredToolCount)
-            if let memo = authoredToolsMemo, memo.key == key { return .success(memo.tools) }
-            return authoredRegistry(dataRoot: dataRoot).flatMap { rows in
-                Result {
-                    let tools = authoredTools(records: try rows.map { try JSONRow($0) })
-                    authoredToolsMemo = (key, tools)
-                    return tools
+            if let memo = authoredToolsMemo, memo.key == key { return .success(memo.catalog) }
+            return authoredRegistry(dataRoot: dataRoot).map { records in
+                var aliases: [String: String] = [:]
+                for record in records where aliases[record.name.lowercased()] == nil {
+                    aliases[record.name.lowercased()] = record.id
                 }
+                for record in records { aliases[record.id.lowercased()] = record.id }
+                let catalog = AuthoredCatalog(tools: authoredTools(records: records), aliases: aliases)
+                authoredToolsMemo = (key, catalog)
+                return catalog
             }
         }
     }
     nonisolated(unsafe) private static var authoredToolsMemo: (key: (String, [String], Int),
-        tools: [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)])?
+        catalog: AuthoredCatalog)?
 
-    private static func authoredTools(records: [JSONRow], named names: Set<String>? = nil) -> [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)] {
+    static func authoredTools(records: [ToolRecord], named names: Set<String>? = nil) -> [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)] {
         let active = records
             .filter { $0.fields["status"] == .string("active") && $0.fields["disabledBy"] != .string("owner") }
         var tools: [(schema: LLMToolSchema, permissions: [String], actions: [String], page: String?, action: String?)] = []
         for row in active {
-            guard let id = (try? row.string("id")) ?? (try? row.string("name")),
-                  names?.contains(id) != false, isAuthorableToolName(id) else { continue }
+            let id = row.id
+            guard names?.contains(id) != false, isAuthorableToolName(id) else { continue }
             guard row.fields["language"] == .string("javascript") else { continue }
-            guard let digest = try? row.string("codeFingerprint"), !digest.isEmpty,
+            guard let digest = row.codeFingerprint, !digest.isEmpty,
                   case .object(let admission)? = row.fields["admission"], admission["candidate"] == .string(digest) else { continue }
-            guard let description = try? row.string("description") else { continue }
             let schemaObject: [String: JSONValue] = if case .object(let schema)? = row.fields["inputSchema"] {
                 schema
             } else { ["type": .string("object")] }
-            guard let schemaData = try? JSONSerialization.data(withJSONObject: JSONValue.object(schemaObject).foundationValue,
+            guard let schemaData = try? JSONSerialization.data(withJSONObject: JSONValue.object(schemaObject).foundationObject,
                                                                options: [.sortedKeys]) else {
                 continue
             }
             let page: String? = if case .object(let face)? = row.fields["face"], case .string(let page)? = face["page"] { page } else { nil }
             let action: String? = if case .object(let face)? = row.fields["face"], case .string(let action)? = face["action"] { action } else { nil }
-            let permissions = (try? row.strings("permissions")) ?? []
+            let permissions = row.permissions ?? []
             let reach = PermissionLaw.reach(ofPermissions: permissions)
             let toolClass = permissions.map(PermissionLaw.permissionClass).max() ?? (schemaObject["readOnly"] == .bool(true) ? .read : .write)
             tools.append((LLMToolSchema(name: id, toolClass: toolClass, reach: reach,
-                                       capabilities: ["tool_call", "safe_read"], description: description, parametersJSON: schemaData),
-                          permissions, (try? row.strings("actions")) ?? [],
+                                       capabilities: ["tool_call", "safe_read"], description: row.description, parametersJSON: schemaData),
+                          permissions, row.actions ?? [],
                           page, action))
         }
         return tools.sorted { $0.schema.name < $1.schema.name }

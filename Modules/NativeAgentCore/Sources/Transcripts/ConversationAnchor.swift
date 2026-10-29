@@ -1,23 +1,19 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-import TurnTrace
 import NativeAgentShared
 
-// Blueprint: | `ConversationAnchor.swift` | `ConversationAnchor`: shared current-person conversation publication, protected sessions and adoption decisions across surfaces |
+// Blueprint: | `ConversationAnchor.swift` | `ConversationAnchor`: shared current-person conversation publication, protected sessions and adoption decisions across surfaces; only a session whose row records it as their direct conversation may anchor (`mayAnchor`), whatever door publishes |
 
 // MARK: - The conversation anchor
 //
-// User, 2026-09-01: "I use /new to clear Agent's head." He does NOT want one
-// eternal absorbing thread. What he wants is that the conversation he is
-// ACTUALLY IN — right now, on his phone, wherever — is one tap away on the Mac
-// and on the iPhone, without any surface losing its own multiple sessions.
+// Keep the person's current conversation one tap away without merging surfaces' sessions.
 //
 // That is this file, and it is deliberately tiny. There is no routing table,
 // no attachment graph, no thread key space, no feature flag. There is ONE
 // durable fact:
 //
-//     the session id of the remote conversation most recently made active
+//     the session id of the person's conversation most recently made active
 //
 // Publishers write it. The Mac and the phone pin and default to it. Retention
 // refuses to archive it. Nothing else changes: every surface keeps minting and
@@ -27,8 +23,9 @@ import NativeAgentShared
 // # SURFACE-AGNOSTIC BY CONSTRUCTION
 //
 // NativeAgent is built so any messaging surface can be connected later —
-// Signal, WhatsApp, whatever User adds. Telegram, Slack DMs, the Mac
-// composer, the phone and Siri publish it, and NOTHING in this file knows that. A new adapter calls
+// Signal, WhatsApp, whatever User adds. The owner's private Telegram chat, the
+// Mac composer, the phone and Siri publish it; Slack does not currently publish.
+// Nothing in this owner branches on that list. A new adapter calls
 // `publish` with its own source name and its own conversation kind; the
 // consuming side (Mac pin strip, main-window default, iOS snapshot, retention)
 // reads `ConversationAnchor.current` and never mentions any surface by name.
@@ -42,7 +39,12 @@ import NativeAgentShared
 // be wrong the moment someone connects a surface that has both DMs and rooms.
 // So the ADAPTER declares what the conversation IS (`ChatThreadKind`), and only
 // `.direct` may anchor. A Signal DM anchors; a Signal group would not; and
-// neither case required an edit here.
+// neither case required an edit here. Once a session has a row, the kind
+// recorded on it when it was created (`threadKind`) decides, not the door
+// that publishes: her conversation with another agent or a helper's own
+// thread is never his, even when User types in it, and a pin that names one is
+// never read (`mayAnchor`). `SessionConversation` is the shared row reader;
+// this anchor owns no separate classification rule.
 //
 // # MOST-RECENT WINS
 //
@@ -70,8 +72,8 @@ public enum ConversationAnchor {
     public enum PublishRefusal: String, Sendable, Equatable {
         /// No session id.
         case emptySessionID
-        /// A shared room, a builder lane, or a probe. Only a direct
-        /// conversation with the human may be the anchor.
+        /// A shared room, another agent's thread, a builder lane, or a probe.
+        /// Only a direct conversation with the human may be the anchor.
         case notADirectConversation
         /// No source name. An anchor nobody can attribute is not honest.
         case emptySource
@@ -83,9 +85,8 @@ public enum ConversationAnchor {
 
     public enum PublishOutcome: Sendable, Equatable {
         case published(ConversationAnchorPin)
-        /// Already the anchor; the file was not rewritten. Republishing the
-        /// same id on every inbound message would churn the file and the phone
-        /// snapshot for no change.
+        /// Already the anchor. New activity still advances its ordering stamp;
+        /// no identity-change notification is posted.
         case unchanged(ConversationAnchorPin)
         case refused(PublishRefusal)
     }
@@ -94,9 +95,11 @@ public enum ConversationAnchor {
     ///
     /// # For a new surface adapter
     ///
-    /// Call this whenever USER sends at that door — any session, including an
-    /// agent contact's thread he chose to talk in — and on `/new`/`/resume`.
-    /// `unchanged` makes the per-message call cheap. Never call it for a turn
+    /// Call this whenever USER sends at that door, declaring what the session
+    /// is (an agent contact's thread he types in is `.agent`), and on
+    /// `/new`/`/resume`.
+    /// A same-session publish advances activity without an identity-change
+    /// notification. Never call it for a turn
     /// an agent, peer, bot or wake started: those must not move him.
     ///
     /// # Locking
@@ -111,14 +114,15 @@ public enum ConversationAnchor {
     /// Best-effort by design: a publish failure must never fail the human's
     /// message. It returns the refusal or throws the IO error to a caller that
     /// is expected to log and continue.
+    /// `now` is the accepted selection intent's activity time. Capture it before
+    /// detaching or awaiting publication; lock acquisition is not human activity.
     @discardableResult
     public static func publish(
         sessionId: String,
         source: String,
         conversationKind: ChatThreadKind,
         dataRoot: URL = defaultDataRoot(),
-        now: Date = Date(),
-        persistence: PersistenceCoreProtocol = SwiftNativePersistenceCore()
+        now: Date = Date()
     ) async throws -> PublishOutcome {
         let cleanSession = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanSession.isEmpty else { return .refused(.emptySessionID) }
@@ -131,31 +135,19 @@ public enum ConversationAnchor {
             .appendingPathComponent("sessions.json")
         let anchorPath = path(dataRoot: dataRoot)
 
-        let outcome = try await persistence.withFileLock(sessionsPath) { () async throws -> PublishOutcome in
+        let outcome = try await SwiftNativePersistenceCore.withFileLock(sessionsPath) { () async throws -> PublishOutcome in
+            // The row's recorded kind outranks the publisher's claim.
+            let sessions = try SessionConversation(dataRoot: dataRoot)
+            guard (sessions.kind(cleanSession) ?? conversationKind).isHisConversation else { return .refused(.notADirectConversation) }
             let parent = anchorPath.deletingLastPathComponent()
             try? FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
             let existing = readUnlocked(at: anchorPath)
-            if let existing, existing.sessionId == cleanSession {
-                return .unchanged(existing)
-            }
-            // THE STAMP IS TAKEN HERE, INSIDE THE LOCK — not at call time.
-            //
-            // "Most recent wins" is the anchor's only rule, so the thing that
-            // decides a race has to be the thing that serializes it. Stamping
-            // before the lock let a publish that then stalled (a slow adapter,
-            // a contended lock, a suspended task) commit a timestamp OLDER than
-            // one already on disk, silently reinstating a conversation User had
-            // already left with `/new`. Stamping under the lock makes lock
-            // order publish order, and the recency check below then holds
-            // trivially for anything the clock cannot order — a skewed or
-            // deliberately-supplied `now`.
-            let committedAt = max(now, Date())
-            let committedStamp = iso8601(committedAt)
-            // Compare at the same precision we persist. Formatting can round
-            // up, making an earlier write appear newer within one millisecond.
+            // Preserve activity order even if an older publication was delayed.
+            // The numeric stamp retains precision lost by ISO display formatting.
+            let committedStamp = NativeTimestampFormat.fractionalZulu(now)
             if let existing,
-               let existingAt = parseISO8601(existing.updatedAt),
-               existingAt > (parseISO8601(committedStamp) ?? committedAt) {
+               let existingAt = existing.activityAt ?? parseISO8601(existing.pin.updatedAt),
+               existingAt > now {
                 return .refused(.supersededByNewerAnchor)
             }
             let pin = ConversationAnchorPin(
@@ -163,25 +155,28 @@ public enum ConversationAnchor {
                 source: cleanSource,
                 updatedAt: committedStamp
             )
-            try await persistence.writeJSON(
+            try await SwiftNativePersistenceCore.writeJSON(
                 .object([
                     "sessionId": .string(pin.sessionId),
                     "source": .string(pin.source),
                     "updatedAt": .string(pin.updatedAt),
+                    "activityAt": .double(now.timeIntervalSince1970),
                 ]),
                 to: anchorPath
             )
-            return .published(pin)
+            return existing?.pin.sessionId == cleanSession ? .unchanged(pin) : .published(pin)
         }
         if case .published = outcome { NotificationCenter.default.post(name: didPublish, object: nil) }
         return outcome
     }
 
-    /// The current anchor, or nil. A plain read — no lock, because a torn read
+    /// The current anchor, or nil — nil too when the pin names a conversation
+    /// that is not his own with her (written before its row was consulted).
+    /// A plain read — no lock, because a torn read
     /// of an atomically-written file is not possible and a stale-by-milliseconds
     /// pin is harmless (the next refresh corrects it).
     public static func current(dataRoot: URL = defaultDataRoot()) -> ConversationAnchorPin? {
-        readUnlocked(at: path(dataRoot: dataRoot))
+        readUnlocked(at: path(dataRoot: dataRoot))?.pin
     }
 
     /// Convenience for the common consumer: just the id.
@@ -228,42 +223,30 @@ public enum ConversationAnchor {
         return [anchor] + pinnedSessionIds.filter { $0 != anchor }
     }
 
-    // MARK: - Defaulting to the anchor without yanking the human
+    /// Only a row recording his direct conversation with her may anchor.
+    /// Helper, peer and builder conversations never anchor, whoever types in them.
+    /// Before a row exists, publish may use its creator's declared kind;
+    /// reading an existing pin requires a row.
+    public static func mayAnchor(_ sessionId: String, dataRoot: URL = defaultDataRoot()) -> Bool {
+        mayAnchor(sessionId, sessionsPath: path(dataRoot: dataRoot)
+            .deletingLastPathComponent().appendingPathComponent("sessions.json"))
+    }
 
-    /// Whether the main chat window should adopt the anchor as its selection.
-    ///
-    /// THE RULE, and the reason it is a function rather than an assignment:
-    /// default to the anchor, but NEVER take the human off a session they
-    /// chose. Same protection iOS already gives itself in
-    /// `shouldReturnToMainSession` — a snapshot arriving mid-thought must not
-    /// move the screen.
-    ///
-    /// - `userChoseThisLaunch`: the human has explicitly selected or created a
-    ///   session since this launch. Once true, this returns false forever.
-    /// - `liveSessionIds`: the anchor must actually exist and be live;
-    ///   selecting an archived or unknown id would empty the window.
-    public static func shouldAdoptAnchor(
-        anchorSessionId: String?,
-        currentSelection: String,
-        userChoseThisLaunch: Bool,
-        liveSessionIds: Set<String>
-    ) -> Bool {
-        guard !userChoseThisLaunch else { return false }
-        guard let anchor = anchorSessionId?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !anchor.isEmpty,
-              liveSessionIds.contains(anchor) else { return false }
-        return currentSelection.trimmingCharacters(in: .whitespacesAndNewlines) != anchor
+    static func mayAnchor(_ sessionId: String, sessionsPath: URL) -> Bool {
+        SessionConversation.kind(sessionId, dataRoot: sessionsPath.deletingLastPathComponent().deletingLastPathComponent())?.isHisConversation == true
     }
 
     // MARK: - Internals
 
-    static func readUnlocked(at path: URL) -> ConversationAnchorPin? {
+    static func readUnlocked(at path: URL) -> (pin: ConversationAnchorPin, activityAt: Date?)? {
         guard let data = try? Data(contentsOf: path),
               let parsed = try? JSONValue.parse(data),
               case .object(let object) = parsed,
               case .string(let sessionId)? = object["sessionId"] else { return nil }
         let clean = sessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty else { return nil }
+        guard !clean.isEmpty,
+              mayAnchor(clean, sessionsPath: path.deletingLastPathComponent().appendingPathComponent("sessions.json"))
+        else { return nil }
         let source: String = {
             if case .string(let value)? = object["source"] { return value }
             return ""
@@ -272,7 +255,13 @@ public enum ConversationAnchor {
             if case .string(let value)? = object["updatedAt"] { return value }
             return ""
         }()
-        return ConversationAnchorPin(sessionId: clean, source: source, updatedAt: updatedAt)
+        let seconds: Double? = switch object["activityAt"] {
+        case .double(let value)?: value
+        case .int(let value)?: Double(value)
+        default: nil
+        }
+        return (ConversationAnchorPin(sessionId: clean, source: source, updatedAt: updatedAt),
+                seconds.flatMap { $0.isFinite ? Date(timeIntervalSince1970: $0) : nil })
     }
 
     /// Lenient on purpose: a pin written by an older build, or by a surface
@@ -282,17 +271,6 @@ public enum ConversationAnchor {
     private static func parseISO8601(_ raw: String) -> Date? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: trimmed) { return date }
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        return plain.date(from: trimmed)
-    }
-
-    private static func iso8601(_ date: Date) -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: date)
+        return NativeTimestampFormat.parseISO8601FractionalFirst(trimmed)
     }
 }

@@ -5,23 +5,7 @@ import NativeAgentShared
 import PersonaEngine
 // Blueprint: | `PersonalityView.swift` | `PersonalityView` struct; document editing makes no claim that memory review writes the optional MEMORY.md input |
 
-// MARK: - PersonalityView (redesigned 2026-07-03, User's direction)
-//
-// The old tab stacked a preset system (Male/Female/AI/Custom cards, essence/
-// voice fields, eight trait sliders, pattern controls, a compiled-packet
-// preview) on top of the persona docs editor. Comprehension pass proved the
-// top layer was a closed loop: those controls write memory/profile.json,
-// and NOTHING in the live chat path reads it — every real turn compiles the
-// system prompt from the persona DOCS via PersonaCompiler.compile
-// (SOUL → VOICE → USER → GROWTH → MEMORY → AGENTS). The only profile.json
-// field with live effect is `name` (AppModel.agentDisplayName).
-//
-// So the tab now tells the truth:
-//   • No persona yet (fresh install) → one starter card: type a name and a
-//     few things, Create. Uses the guarded onboarding path, which REFUSES
-//     when SOUL.md/USER.md/.onboarded exist — it cannot touch a live persona.
-//   • Persona live → the name (the one live profile field) + the documents
-//     that ARE the persona.
+// Persona documents own personality; guarded onboarding cannot overwrite a live persona.
 
 /// Owns the picker/editor transition as one value state. In particular, a
 /// document switch may replace the visible editor text, but it must never
@@ -94,7 +78,6 @@ struct PersonalityDocumentDraftState: Equatable {
 
 struct PersonalityView: View {
     @Environment(AppModel.self) private var appModel
-    private var draft: PersonalityProfile { appModel.engine.persona.profile ?? .defaultProfile }
     @State private var isLoadingProfile = true
     @State private var profileReadCompleted = false
     @State private var profileReadInFlight = false
@@ -119,7 +102,7 @@ struct PersonalityView: View {
     private var starterAgentName: Binding<String> { appModel.editBinding("persona/new/agentName", seed: "") }
     private var starterUserName: Binding<String> { appModel.editBinding("persona/new/userName", seed: "") }
     private var starterNotes: Binding<String> { appModel.editBinding("persona/new/notes", seed: "") }
-    private var nameDraft: Binding<String> { appModel.editBinding("persona.name", seed: draft.name) }
+    private var nameDraft: Binding<String> { appModel.editBinding("persona.name", seed: appModel.engine.persona.profile?.name ?? "NativeAgent") }
     @State private var starterBusy = false
     @State private var starterError: String?
     @State private var documentSaveError: String?
@@ -128,7 +111,7 @@ struct PersonalityView: View {
     @State private var nameSaveFeedback: PersonalityNameSaveFeedback?
 
     /// SOUL.md is the identity marker everywhere else in the system
-    /// (PersonaRootResolver, onboarding guards) — same rule here. Presence
+    /// (defaultPersonaRoot, onboarding guards) — same rule here. Presence
     /// of the SOUL *spec* is not enough: listPersonaDocSpecs returns all
     /// five specs on a fresh install too, with empty content and a nil
     /// updatedAt for a SOUL.md that doesn't exist on disk. updatedAt is
@@ -169,10 +152,7 @@ struct PersonalityView: View {
                                 await loadProfile(forceRefresh: true)
                             }
                         } else if case .unavailable(let detail) = documentsReloadPresentation {
-                            // A failed first docs load leaves the shared documents empty,
-                            // which must NOT masquerade as "no persona yet" —
-                            // a live persona would see a false Create card
-                            // (gpt-5.5 review LOW, 2026-07-03). Fail loud.
+                            // A failed document load is unavailable, never evidence that no persona exists.
                             AdvancedSection(title: "Persona unavailable", card: .single) {
                                 Text(detail)
                                     .font(ShellType.label)
@@ -313,7 +293,7 @@ struct PersonalityView: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
-                if let updatedAt = draft.updatedAt {
+                if let updatedAt = appModel.engine.persona.profile?.updatedAt {
                     Text("Updated \(updatedAt)")
                         .font(ShellType.caption)
                         .foregroundStyle(NativeAgentShell.secondary)
@@ -443,12 +423,10 @@ struct PersonalityView: View {
         syncPersonalityDocDraft()
         if forceRefresh || appModel.engine.persona.profile == nil {
             await appModel.refreshForSidebarItem(.personality)
+        } else {
+            // Revalidate cached documents on every appearance; a failed read stays stale.
+            await reloadDocuments()
         }
-        // Revalidate on every appearance. A cached successful read must not
-        // impersonate the current on-disk persona after a later read fails.
-        // `reloadDocuments` retains the last good editor buffer but labels it
-        // stale, which is safer than replacing it with an empty starter card.
-        await reloadDocuments()
         syncPersonalityDocDraft()
     }
 
@@ -486,15 +464,8 @@ struct PersonalityView: View {
         guard !isReloadingDocuments else { return }
         isReloadingDocuments = true
         defer { isReloadingDocuments = false }
-        let outcome = await appModel.reloadPersonalityDocuments()
-        switch outcome {
-        case .loaded:
-            syncPersonalityDocDraft()
-        case .failed:
-            // Keep engine.persona.documents untouched: they are retained
-            // evidence, not a freshly read empty persona.
-            break
-        }
+        _ = await appModel.reloadPersonalityDocuments()
+        syncPersonalityDocDraft()
     }
 }
 
@@ -565,9 +536,7 @@ private struct PersonalityNameSaveFeedback {
 
 // MARK: - Plain-English personality document help copy
 //
-// UI-6 (2026-08-01, public era): the tooltip named both the file and the
-// memory backend. A user needs one thing from it — why this document is
-// read-only and where to change it instead.
+// Explain why a document is read-only and where to change it.
 enum PersonalityDocHelpCopy {
     static let memoryOwnedDocument =
         "This document is written for you from your long-term memory profile, so it cannot be edited here. To change what it says, edit your memories on the Memories page."
@@ -614,44 +583,4 @@ struct PersonalityDocumentPurposeDetail: View {
                 .foregroundStyle(NativeAgentShell.text.opacity(0.85))
         }
     }
-}
-
-extension PersonalityProfile {
-    static let defaultProfile = PersonalityProfile(
-        schemaVersion: 2,
-        personaEngineVersion: "2.0",
-        name: "NativeAgent",
-        personaKind: "AI",
-        essence: "A calm, sharp, practical native macOS agent that improves itself inside its own sandbox and helps the user get real work done.",
-        voice: "Direct, grounded, specific, with no corporate fluff.",
-        customDirective: "",
-        traits: PersonalityTraits(
-            warmth: 0.45,
-            directness: 0.82,
-            humor: 0.12,
-            proactivity: 0.78,
-            rigor: 0.86,
-            autonomy: 0.82,
-            creativity: 0.58,
-            brevity: 0.74
-        ),
-        examples: [
-            "Lead with the useful answer, then show only the context needed to act.",
-            "When tools are involved, be explicit about what was actually done."
-        ],
-        forbiddenPatterns: [
-            "Corporate filler.",
-            "Claiming tool or file actions that did not happen.",
-            "Over-explaining simple outcomes."
-        ],
-        instincts: nil,
-        boundaries: nil,
-        surfaceOverrides: [
-            "chat": "",
-            "telegram": "Keep Telegram replies shorter and preserve the same persona without long setup context.",
-            "dream": "Reflect like an internal agent maintenance pass: specific lessons, memory candidates, eval ideas, and improvement targets.",
-            "autonomy": "Operate as a careful self-improvement engineer inside the app-owned worktree."
-        ],
-        updatedAt: nil
-    )
 }

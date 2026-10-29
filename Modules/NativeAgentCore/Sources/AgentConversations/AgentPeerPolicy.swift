@@ -15,8 +15,8 @@ package enum AgentPeerPolicy {
         envelope["completed"] = .bool(false)
         envelope["detail"] = .string(failure.errorDescription!)
         envelope["work"] = .string(failure.work.rawValue)
-        if let data = try? JSONEncoder().encode(failure) {
-            envelope["provider_failure"] = try? JSONDecoder().decode(JSONValue.self, from: data)
+        if let value = try? JSONValue.fromEncodable(failure) {
+            envelope["provider_failure"] = value
         }
     }
 

@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import ChatSessionWork
@@ -13,8 +14,7 @@ extension ResponseOutcomeObservationV2 {
         observedAt: Date,
         responsePersistence: String,
         result: TurnEngineResult? = nil,
-        context: TurnContext? = nil,
-        interventionAssignment explicitInterventionAssignment: CausalInterventionAssignment? = nil
+        context: TurnContext? = nil
     ) -> Self? {
         guard let turnID = OutcomeTraceIdentity.normalized(rawTurnID),
               let messageID = closedToken(rawMessageID, maximum: 128),
@@ -24,7 +24,6 @@ extension ResponseOutcomeObservationV2 {
         else { return nil }
 
         let observation = context.map(TurnEngineResult.TerminalObservation.init(context:))
-            ?? result?.terminalObservation
         let packet = context?.fluidContextTurn?.packet
         let toolReferences = Array((result?.toolDispatches ?? []).prefix(64).enumerated()).compactMap {
             index, dispatch -> ResponseOutcomeToolReference? in
@@ -71,14 +70,12 @@ extension ResponseOutcomeObservationV2 {
             "reaction": .unknown,
         ]
         if responsePersistence != "persisted" { states["responsePersistence"] = .unverified }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return Self(
             turnID: turnID,
             messageID: messageID,
             sessionID: sessionID,
             surface: surface,
-            observedAt: formatter.string(from: observedAt),
+            observedAt: NativeTimestampFormat.fractionalZulu(observedAt),
             responsePersistence: responsePersistence,
             contextGenerationID: packet?.generationID,
             contextSelectionReceiptID: packet.flatMap {
@@ -91,19 +88,7 @@ extension ResponseOutcomeObservationV2 {
             tools: toolReferences,
             motorActions: motorReferences,
             dimensionStates: states,
-            interventionAssignment: {
-                // An explicit live assignment is authoritative for this
-                // observation. If it is malformed, fail closed; never replace
-                // it with an unrelated task-local laboratory assignment.
-                if let explicitInterventionAssignment {
-                    return validAssignment(explicitInterventionAssignment)
-                        ? explicitInterventionAssignment
-                        : nil
-                }
-                return validAssignment(OutcomeInterventionContext.assignment)
-                    ? OutcomeInterventionContext.assignment
-                    : nil
-            }()
+            interventionAssignment: nil
         )
     }
 

@@ -1,10 +1,11 @@
 import AppKit
 import AppToolRuntime
 import Foundation
+import MemoryV2
 import Observation
 import PersistenceCore
 
-// Blueprint: | `NativeAgentAppCoordinator.swift` | `NativeAgentAppCoordinator`: process bootstrap and queued scene navigation; delivery receipts prove scene acceptance, not finished rendering or work |
+// Blueprint: | `NativeAgentAppCoordinator.swift` | `ApplicationLifetime`: process bootstrap and queued scene navigation; delivery receipts prove scene acceptance, not finished rendering or work |
 
 enum NativeAgentNavigationDestination: Equatable, Sendable {
     case sidebar(SidebarItem)
@@ -87,49 +88,29 @@ enum NativeAgentNavigationRequestReceipt: Equatable, Sendable {
 }
 
 @MainActor @Observable
-final class NativeAgentAppCoordinator {
+final class ApplicationLifetime {
     static let mainSceneID = "main"
-    var appModel: AppModel?
+    var appModel: AppModel? {
+        didSet { bootstrapProcessServicesIfReady() }
+    }
     @ObservationIgnored private var preparationTask: Task<Void, Error>?
 
     func prepare() async throws {
-        if preparationTask == nil {
-            preparationTask = Task {
-                guard await NativeAgentApp.prepare() else { throw CocoaError(.fileReadUnknown) }
-            }
+        if let preparationTask {
+            try await preparationTask.value
+            return
         }
-        try await preparationTask!.value
-    }
-
-    struct ProcessBootstrapDependencies {
-        var restoreDetachedChats: () -> Void
-        var wireGlobalHotkey: () -> Void
-        var warmEmbeddings: () -> Void
-    }
-
-    struct WindowActions {
-        var activateApplication: @MainActor () -> Void
-        var openMainWindow: @MainActor () -> Void
-
-        @MainActor
-        static var live: WindowActions {
-            WindowActions(
-                activateApplication: {
-                    NSApp.activate(ignoringOtherApps: true)
-                },
-                openMainWindow: {}
-            )
+        let task = Task {
+            guard await NativeAgentApp.prepare() else { throw CocoaError(.fileReadUnknown) }
         }
+        preparationTask = task
+        try await task.value
     }
 
-    static let shared = NativeAgentAppCoordinator(
-        notificationCenter: .default,
-        windowActions: .live
-    )
+    static let shared = ApplicationLifetime()
 
-    private let notificationCenter: NotificationCenter
-    private var windowActions: WindowActions
-    private var processDependencies: ProcessBootstrapDependencies?
+    private let notificationCenter = NotificationCenter.default
+    private var openMainWindow: @MainActor () -> Void = {}
     private var didFinishLaunching = false
     private var didBootstrapProcessServices = false
     private var routeObserverTokens: [NSObjectProtocol] = []
@@ -140,25 +121,11 @@ final class NativeAgentAppCoordinator {
         deliver: (NativeAgentNavigationDestination) -> Void
     )?
 
-    init(
-        notificationCenter: NotificationCenter,
-        windowActions: WindowActions
-    ) {
-        self.notificationCenter = notificationCenter
-        self.windowActions = windowActions
-    }
-
-    func configureProcessBootstrap(_ dependencies: ProcessBootstrapDependencies) {
-        guard !didBootstrapProcessServices else { return }
-        processDependencies = dependencies
-        bootstrapProcessServicesIfReady()
-    }
-
     /// Retain the scene's opening action so routing can reopen a closed window.
     func configureMainWindowOpening(_ open: @escaping @MainActor () -> Void) {
-        windowActions.openMainWindow = open
+        openMainWindow = open
         if !pendingDestinations.isEmpty {
-            windowActions.activateApplication()
+            NSApp.activate(ignoringOtherApps: true)
             open()
         }
     }
@@ -196,8 +163,8 @@ final class NativeAgentAppCoordinator {
     @discardableResult
     func request(_ destination: NativeAgentNavigationDestination) -> NativeAgentNavigationRequestReceipt {
         pendingDestinations.append(destination)
-        windowActions.activateApplication()
-        windowActions.openMainWindow()
+        NSApp.activate(ignoringOtherApps: true)
+        openMainWindow()
         return drainPendingDestinations()
             ? .deliveredToMountedScene
             : .queuedForMainScene
@@ -219,12 +186,16 @@ final class NativeAgentAppCoordinator {
     private func bootstrapProcessServicesIfReady() {
         guard didFinishLaunching,
               !didBootstrapProcessServices,
-              let processDependencies else { return }
+              let appModel else { return }
         didBootstrapProcessServices = true
-        self.processDependencies = nil
-        processDependencies.restoreDetachedChats()
-        processDependencies.wireGlobalHotkey()
-        processDependencies.warmEmbeddings()
+        DetachedChatWindowController.shared.attach(appModel: appModel)
+        DetachedChatWindowController.shared.restoreFromPersist()
+        Task { @MainActor in await appModel.loadChatState() }
+        NativeAgentHotkeyBootstrap.shared.start(appModel: appModel)
+        Task.detached(priority: .utility) {
+            await EmbeddingModelDownloadController.shared.start()
+            await SwiftNativeMemoryV2.shared.warmUpEmbeddingsAtLaunch()
+        }
     }
 
     @discardableResult
@@ -241,12 +212,6 @@ final class NativeAgentAppCoordinator {
     private func installLegacyRouteObservers() {
         guard routeObserverTokens.isEmpty else { return }
 
-        observe(.openNextGenRequest) { _ in
-            // The request is for the Next-gen section, which is collapsed by
-            // default; open it before landing on Capabilities.
-            CapabilitiesDisclosurePreference.setNextGenExpanded(true, in: .standard)
-            return .sidebar(.capabilities)
-        }
         observe(.openApprovalsRequest) { _ in .activity(.approvals) }
         observe(.openTelegramRequest) { _ in .sidebar(.telegram) }
         observe(.openTrustMultimodalRequest) { _ in
@@ -256,9 +221,7 @@ final class NativeAgentAppCoordinator {
         // Inbox act → chat draft: the coordinator only activates the window and
         // lands on Chat; ContentView's receiver does the draft injection.
         observe(.openChatDraftRequest) { _ in .sidebar(.chat) }
-        // L5 G6, same shape: her message is already persisted, so the
-        // coordinator's only job is window activation + landing on Chat.
-        // ContentView's receiver reloads the transcript.
+        // The message is persisted; ContentView reloads it after navigation.
         observe(.openSpokenChatRequest) { _ in .sidebar(.chat) }
         observe(.openCommandRouteRequest) { note in
             NativeAgentNavigationDestination.route(note.object as? String)

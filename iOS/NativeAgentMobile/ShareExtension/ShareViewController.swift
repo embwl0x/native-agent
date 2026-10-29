@@ -1,7 +1,6 @@
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
-import ImageIO
 import NativeAgentShared
 
 final class ShareViewController: UIViewController {
@@ -33,6 +32,7 @@ final class ShareComposeModel: ObservableObject {
     @Published var saved = false
     private let context: NSExtensionContext?
     private let id = UUID()
+    private let pairingFingerprint = SharedChatInbox.identityDefaults?.string(forKey: SharedChatInbox.identityPairingKey)
 
     init(context: NSExtensionContext?) { self.context = context }
 
@@ -47,23 +47,18 @@ final class ShareComposeModel: ObservableObject {
             }
             var parts: [String] = []
             var files: [MultimodalAttachment] = []
-            let binaryCount = providers.filter {
-                $0.hasItemConformingToTypeIdentifier(UTType.image.identifier)
-                    || $0.hasItemConformingToTypeIdentifier(UTType.pdf.identifier)
-            }.count
-            let fileBudget = MobileChatAttachmentPreparation.payloadBudgetBytes / max(1, binaryCount)
             for provider in providers {
                 if provider.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) {
                     let data = try await data(from: provider, type: UTType.pdf.identifier)
-                    guard data.count <= fileBudget else {
-                        throw SharedChatInbox.failure("This PDF is too large for chat. Share a smaller PDF (up to \(fileBudget / 1024) KB).")
+                    guard !data.isEmpty, data.count <= ChatAttachmentTypeResolver.fileByteLimit else {
+                        throw SharedChatInbox.failure("PDFs must be nonempty and no larger than 10 MB.")
                     }
                     files.append(MultimodalAttachment(type: "file", base64: data.base64EncodedString(),
                         mime: "application/pdf", name: provider.suggestedName ?? "Shared.pdf", byteSize: data.count))
                 } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
                     let raw = try await data(from: provider, type: UTType.image.identifier)
                     guard let jpeg = await Task.detached(priority: .userInitiated, operation: {
-                        MobileChatAttachmentPreparation.preparedJPEGData(from: raw, maxBytes: fileBudget)
+                        MobileChatAttachmentPreparation.preparedJPEGData(from: raw)
                     }).value else {
                         throw SharedChatInbox.failure("This image could not be prepared for chat.")
                     }
@@ -112,7 +107,8 @@ final class ShareComposeModel: ObservableObject {
         do {
             let body = [note.trimmingCharacters(in: .whitespacesAndNewlines), text]
                 .filter { !$0.isEmpty }.joined(separator: "\n\n")
-            try SharedChatInbox.save(SharedChatItem(id: id, createdAt: Date(), text: body, attachments: attachments))
+            try SharedChatInbox.save(SharedChatItem(id: id, createdAt: Date(), text: body, attachments: attachments,
+                                                 pairingFingerprint: pairingFingerprint))
             saved = true
         } catch { self.error = error.localizedDescription }
     }
@@ -129,15 +125,15 @@ private struct ShareComposeView: View {
                 VStack(alignment: .leading, spacing: NativeAgentMobileTheme.Spacing.lg) {
                     if model.saved {
                         Label("Saved for \(model.name)", systemImage: "checkmark.circle")
-                            .mobileTypography(.title, weight: .semibold)
+                            .font(.system(.title2, weight: .semibold))
                         Text("Open NativeAgent to send your share. It will appear in Chat.")
                     } else if model.loading {
                         ProgressView("Loading shared item…")
                     } else {
                         TextField("Add a note (optional)", text: $model.note, axis: .vertical)
-                            .lineLimit(3...6).mobileTypography(.body).mobileCard()
+                            .lineLimit(3...6).font(.system(.body, weight: .regular)).mobileCard()
                         if !model.text.isEmpty {
-                            Text(model.text).mobileTypography(.body).textSelection(.enabled).mobileCard()
+                            Text(model.text).font(.system(.body, weight: .regular)).textSelection(.enabled).mobileCard()
                         }
                         ForEach(model.attachments) { item in
                             VStack(alignment: .leading) {
@@ -146,11 +142,11 @@ private struct ShareComposeView: View {
                                     Image(uiImage: image).resizable().scaledToFit().frame(maxHeight: 180)
                                 }
                                 Label(item.name ?? "Attachment", systemImage: item.type == "image" ? "photo" : "doc")
-                                    .mobileTypography(.label)
+                                    .font(.system(.callout, weight: .regular))
                             }.mobileCard()
                         }
                         Text("Saved on this iPhone, then sent when you open NativeAgent.")
-                            .mobileTypography(.caption).foregroundStyle(NativeAgentMobileTheme.Colors.secondary)
+                            .font(.system(.caption, weight: .regular)).foregroundStyle(NativeAgentMobileTheme.Colors.secondary)
                     }
                     if let error = model.error {
                         Text(error).foregroundStyle(NativeAgentMobileTheme.Colors.trouble)

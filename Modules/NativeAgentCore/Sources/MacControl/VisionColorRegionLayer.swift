@@ -3,18 +3,6 @@ import CoreGraphics
 // Blueprint: | `VisionColorRegionLayer.swift` | `VisionColorRegionResult`, `VisionPixelGrid`, `VisionColorRegionLayer` |
 
 // MARK: - ELEMENT LAYER (a): structure from pixels, no model
-//
-// Element-layer spike (a) v1 (docs/build_plans/native-look.md): colour-region
-// growing alone produced 12 candidates in **1 ms** and recalled 8/11 targets —
-// ALL filled borderless buttons (the case `VNDetectRectangles` missed
-// entirely), ALL bordered fields, and the fill-contrast list rows. The misses
-// were white-on-background rows, which is CORRECT behaviour for a colour
-// heuristic and is what the y-band text clusterer exists for.
-//
-// The latency headroom is enormous (1 ms against a 150 ms/look budget), which
-// is why the design layers text-banding and saliency on top instead of
-// reaching for a CoreML detector. The detector stays contingent on MEASURED
-// misses; it does not get to arrive on a hunch.
 
 public struct VisionColorRegionResult: Sendable, Equatable {
     public let candidates: [VisionCandidate]
@@ -177,8 +165,7 @@ public struct VisionPixelGrid: Sendable {
 }
 
 public enum VisionColorRegionLayer {
-    /// Target sample count along the long axis. The scan is a COARSE GRID —
-    /// this is what keeps it at ~1 ms on a 2560px frame.
+    /// Target sample count along the frame's long axis.
     static let gridLongAxisSamples: Int = 320
     /// Two colours within this squared RGB distance (channels 0…1) are "the
     /// same fill".
@@ -212,8 +199,8 @@ public enum VisionColorRegionLayer {
         return red * red + green * green + blue * blue
     }
 
-    /// Coarse-grid scan → similar-colour box growth → dedupe. The spike's
-    /// approach, ported properly.
+    /// Coarse-grid scan → similar-colour box growth → dedupe.
+    /// Rows without fill contrast rely on text-band candidates.
     public static func candidates(
         grid: VisionPixelGrid
     ) -> VisionColorRegionResult {
@@ -423,16 +410,8 @@ public enum VisionColorRegionLayer {
     /// Deterministic reading order. Two frames of the same scene must compile
     /// to the same rows in the same order or handles are not stable.
     static func readingOrder(_ candidates: [VisionCandidate]) -> [VisionCandidate] {
-        let rows = toleranceGroups(candidates.sorted(by: geometryPrecedes), coordinate: { $0.rect.y })
-        return rows.flatMap { row in
-            let byX = row.sorted {
-                $0.rect.x == $1.rect.x ? geometryPrecedes($0, $1) : $0.rect.x < $1.rect.x
-            }
-            return toleranceGroups(byX, coordinate: { $0.rect.x }).flatMap { column in
-                column.sorted {
-                    $0.rect.area == $1.rect.area ? geometryPrecedes($0, $1) : $0.rect.area > $1.rect.area
-                }
-            }
+        VisionRect.readingOrder(candidates, rect: \.rect, tolerance: 2, geometryPrecedes: geometryPrecedes) {
+            $0.rect.area == $1.rect.area ? geometryPrecedes($0, $1) : $0.rect.area > $1.rect.area
         }
     }
 
@@ -443,17 +422,4 @@ public enum VisionColorRegionLayer {
         return lhs.rect.h < rhs.rect.h
     }
 
-    private static func toleranceGroups(
-        _ candidates: [VisionCandidate], coordinate: (VisionCandidate) -> Double
-    ) -> [[VisionCandidate]] {
-        var groups: [[VisionCandidate]] = []
-        for candidate in candidates {
-            if let anchor = groups.last?.first, coordinate(candidate) - coordinate(anchor) <= 2 {
-                groups[groups.count - 1].append(candidate)
-            } else {
-                groups.append([candidate])
-            }
-        }
-        return groups
-    }
 }

@@ -11,7 +11,7 @@ import TurnTrace
 import TrustCenter
 // Blueprint: | `EngineDoctor+Cognition.swift` | `EngineDoctorRuntime`: cognition health and repair; APNs diagnostics name the canonical push-token store, never retained mobile_push/tokens.json |
 
-// Doctor reads mounted owners without starting Observatory refresh work.
+// Doctor reads mounted owners without changing their state.
 extension EngineDoctorRuntime {
     public func doctorCognitionChecks() async -> [CheckResult] {
         guard dataRoot.standardizedFileURL
@@ -26,7 +26,6 @@ extension EngineDoctorRuntime {
             rows.append(doctorReceiptCheck(detail))
             rows.append(doctorReadoutCheck(detail))
             rows.append(doctorBodyCheck(detail))
-            rows.append(doctorWelfareCheck(detail))
             rows.append(doctorCapacityCheck(detail))
             rows.append(doctorAssociationCheck(detail))
         } else {
@@ -46,8 +45,8 @@ extension EngineDoctorRuntime {
         guard detail.configuration.enabled, detail.configuration.persistenceEnabled else {
             return CheckResult(source: "cognition/cognition.sqlite", id: id, title: title, status: "off", detail: "Cognition persistence is intentionally off.")
         }
-        if health.status == .restoring {
-            return CheckResult(source: "cognition/cognition.sqlite", id: id, title: title, status: "unmeasured", detail: "Cognition persistence restore is in progress.")
+        if health.status == .restoring || health.status == .ready {
+            return CheckResult(source: "cognition/cognition.sqlite", id: id, title: title, status: "unmeasured", detail: "Her saved mind has not been opened yet; writes wait for the restore.")
         }
         guard health.status == .degraded || health.writesBlocked else {
             return CheckResult(source: "cognition/cognition.sqlite", id: id, title: title, status: "ok", detail: "Persistence is \(health.status.rawValue); writes are unblocked.")
@@ -181,37 +180,16 @@ extension EngineDoctorRuntime {
     private func doctorCognitionReadoutFailures(_ detail: CognitiveDoctorRead) -> [String] {
         var failures: [String] = []
         let configuration = detail.configuration
-        if configuration.enabled && configuration.observatoryEnabled && configuration.affectEnabled {
-            let affect = detail.affect
-            if ![affect.arousal, affect.uncertainty, affect.taskPressure, affect.socialWarmth]
-                .allSatisfy({ $0.isFinite && (0...1).contains($0) }) {
+        if configuration.enabled {
+            if !detail.affect.observatoryValuesAreValid {
                 failures.append("mood: Affect snapshot contains an invalid value and is withheld")
             }
         }
         let snapshot = detail.organism
         if snapshot.enabled {
-            let now = Date()
-            let age = now.timeIntervalSince(snapshot.generatedAt)
-            if !snapshot.generatedAt.timeIntervalSinceReferenceDate.isFinite
-                || !now.timeIntervalSinceReferenceDate.isFinite || age < -60 || age > 5 * 60 {
+            if !snapshot.observatorySampleIsCurrent(now: Date(), maximumSampleAge: 5 * 60) {
                 failures.append("body: The last organism body sample is stale or has an invalid timestamp and is withheld")
-            } else if ![
-                snapshot.chemicalState.warmth,
-                snapshot.chemicalState.vigilance,
-                snapshot.chemicalState.coherence,
-                snapshot.chemicalState.confidence,
-                snapshot.chemicalState.fatigue,
-                snapshot.chemicalState.agency,
-                snapshot.fieldSummary.strongestEdgeWeight,
-                snapshot.fieldSummary.totalCharge,
-                snapshot.fieldSummary.averageUncertainty,
-                snapshot.predictionSummary.peripheralUncertainty,
-                snapshot.predictionSummary.strategyCaution,
-                snapshot.predictionSummary.bodyConfidence.toolPath,
-                snapshot.predictionSummary.bodyConfidence.providerPath,
-                snapshot.predictionSummary.bodyConfidence.phonePath,
-                snapshot.residualRepairOpportunity.pressure,
-            ].allSatisfy(\.isFinite) {
+            } else if !snapshot.observatoryValuesAreValid {
                 failures.append("body: The organism body sample contains an invalid value and is withheld")
             }
         }
@@ -227,20 +205,6 @@ extension EngineDoctorRuntime {
         }
         return CheckResult(source: "cognition/organism_state.json", id: id, title: title, status: "fail",
                            detail: failures.joined(separator: "; ") + ".")
-    }
-
-    private func doctorWelfareCheck(_ detail: CognitiveDoctorRead) -> CheckResult {
-        let id = "live.cognition.welfare"
-        let title = "Cognition welfare bounds"
-        guard detail.configuration.enabled else {
-            return CheckResult(source: "cognition configuration: welfare bounds", id: id, title: title, status: "off", detail: "Cognition is intentionally off.")
-        }
-        guard !detail.welfareBounds.withinBounds else {
-            return CheckResult(source: "cognition configuration: welfare bounds", id: id, title: title, status: "ok", detail: "Welfare readings are within bounds.")
-        }
-        return CheckResult(source: "cognition configuration: welfare bounds", id: id, title: title, status: "warn",
-                           detail: "Welfare bounds report attention; max affect \(detail.welfareBounds.maxAffectValue), reflection pressure \(detail.welfareBounds.reflectionBudgetPressure).",
-                           human_action: "Open Diagnostics → Cognition → Welfare bounds and review the current reading before changing reflection controls.")
     }
 
     private func doctorCapacityCheck(_ detail: CognitiveDoctorRead) -> CheckResult {

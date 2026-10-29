@@ -1,36 +1,24 @@
 import ChatTurnRuntime
 import ChatSessionWork
+import Transcripts
 import EngineRuntime
 import SwiftUI
 import NativeAgentShared
 import TrustCenter
-// Blueprint: | `ChatShellViews.swift` | `ShellRoomHeader` struct |
-
-// ui-simplify 2026-09-02 (Lane A): the room's furniture.
-//
-// Agent's read, against the real screen: "stop building a control panel with a
-// chat in it and build a desk with a drawer." These are the pieces that make
-// the room a room — one status dot instead of two warning surfaces, a
-// conversation list that shows what a conversation was ABOUT, tool traffic as
-// one quiet line, and a composer that is obviously the thing.
+// Blueprint: | `ChatShellViews.swift` | `ShellRoomHeader`; `ShellConversationRow` reads subtitle timestamps from its injected transcript-root opening-line owner |
 
 // MARK: - The header: her name and one dot
 
 struct ShellRoomHeader: View {
     var name: String
-    /// The settled posture is the composer's to say (its trust word, wave 3:
-    /// once, not in both places); the dot shows when something waits or went
-    /// wrong.
+    /// The dot shows waits and failures; the composer alone states settled trust.
     var status: ChatShellStatus
-    /// Simple view has no conversations list; this is its one way to start a
-    /// fresh thread besides /new (User 09-27). The phone follows the Mac.
+    /// Simple view starts a fresh thread here or through /new.
     var onNewChat: (() -> Void)? = nil
-    /// Fluid glass A2: unread notes as one "N updates" capsule.
+    /// Unread notes appear as one "N updates" capsule.
     var notes: InboxNotesCapsule? = nil
     /// The Work pane's button, main window only (WorkPane.swift).
     var work: WorkPaneHeaderButton? = nil
-
-    private var isSettled: Bool { if case .settled = status { true } else { false } }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -55,18 +43,13 @@ struct ShellRoomHeader: View {
 
             Spacer(minLength: 12)
 
-            // Agent, 2026-09-02, glyph diet: the magnifier that used to sit
-            // here was the room's SECOND search box, next to the one over the
-            // conversations list, and neither said which was which. The
-            // transcript search kept its own way in — Chat ▸ Find in
-            // Conversation… (⌘F) — so this one is simply gone.
-            // Conversation controls live beside the draft in the composer.
+            // Transcript search lives in Chat → Find in Conversation (⌘F).
 
             work
 
             notes
 
-            if !isSettled {
+            if status != .settled {
                 Button {
                     NotificationCenter.default.post(name: .openCommandRouteRequest, object: "trust")
                 } label: {
@@ -89,21 +72,12 @@ struct ShellRoomHeader: View {
                 .padding(.leading, 4)
             }
         }
-        // Agent, 2026-09-02: her name used to float at the far left of the
-        // pane while the conversation sat in a centred column, so the header
-        // belonged to a different room than the words under it. It is now the
-        // same 720pt column as the transcript and the composer.
-        // Agent, 2026-09-03: the right cluster used to end on the 960 column's
-        // edge, 204pt past the last word of every reply, so it floated in a
-        // margin attached to nothing. The header now wears the room's gutter
-        // inside the room's column, which puts "Agent" on the first character
-        // of her replies and the status dot on their last.
+        // The header shares the transcript and composer's column and inner gutter.
         .padding(.horizontal, NativeAgentShellLayout.roomGutter)
         .frame(maxWidth: NativeAgentShellLayout.roomColumn, alignment: .topLeading)
         .padding(.leading, NativeAgentShellLayout.roomLeadingInset)
         .padding(.trailing, NativeAgentShellLayout.roomTrailingInset)
         .frame(maxWidth: .infinity, alignment: NativeAgentShellLayout.roomAlignment)
-        // User, 2026-10-04: a slim bar like Claude's, not a band over her chat.
         .padding(.top, NativeAgentShellLayout.columnHeaderTopInset)
         .padding(.bottom, 4)
     }
@@ -113,26 +87,18 @@ struct ShellRoomHeader: View {
 
 /// One row: a title a person recognises, and where and when it happened.
 struct ShellConversationRow: View {
-    /// The one id the travelling selection bar is known by.
-    static let selectionBarID = "shell.conversations.selection-bar"
     var session: ChatSession
+    var openingLines: ChatShellOpeningLine
     var selected: Bool
     var isPinned: Bool
-    var onSelect: () -> Void
-    /// User, 2026-09-02: "a way to pin sessions you want at top." The pin was
-    /// only in the right-click menu; now it is on the row, shown when the
-    /// row is hovered or already pinned.
+    /// The row shows its pin control while hovered or pinned.
     var onTogglePin: () -> Void = {}
-    /// Shared with every other row so the selection bar travels, same as the
-    /// rail's does.
-    var barNamespace: Namespace.ID
 
     @State private var hovering = false
     @FocusState private var pinFocused: Bool
 
     var body: some View {
-        // The native List draws selection and takes the click (User 09-27:
-        // all controls Mac native); the row is just its words and the pin.
+        // Native List owns selection; the row displays its words and pin.
         let title = ChatShellConversationRow.title(for: session)
         VStack(alignment: .leading, spacing: 2) {
             Text(title)
@@ -140,8 +106,7 @@ struct ShellConversationRow: View {
                 .foregroundStyle(NativeAgentShell.text)
                 .lineLimit(1)
                 .truncationMode(.tail)
-            // Wave 3: rows sharing a title ("Codex check-in") are told
-            // apart by their last line; the title never changes with it.
+            // Last-line previews distinguish conversations without changing their titles.
             let preview = ChatShellConversationRow.listPreview(for: session, title: title)
             HStack(alignment: .firstTextBaseline, spacing: NativeAgentSpacing.sm) {
                 if !preview.isEmpty {
@@ -153,7 +118,7 @@ struct ShellConversationRow: View {
                         .layoutPriority(1)
                     Spacer(minLength: 0)
                 }
-                Text(ChatShellConversationRow.subtitle(for: session, relativeTimestamp: {
+                Text(ChatShellConversationRow.subtitle(for: session, openingLines: openingLines, relativeTimestamp: {
                     UserDisplayFormatters.relativeISOTimestamp($0, unitsStyle: .abbreviated, fallback: "")
                 }))
                     .font(preview.isEmpty ? ShellType.labelMedium : ShellType.caption)
@@ -189,12 +154,7 @@ struct ShellConversationRow: View {
 
 // MARK: - Tool traffic
 
-/// Fluid glass A2: the transcript's ONE activity row. Tool folds, the live
-/// tool line, single tool calls, working notes and worker replies were four
-/// styles (an arrow with Show/Hide, a spinner box, a 24pt-indented card in
-/// system fonts with a Details label, a small chevron); they are all this
-/// now. One chevron that turns, one indent for what opens, the shell's type.
-/// It is a hinge, not a card (Agent, 2026-09-03): no fill, no border.
+/// Transcript activity shares one disclosure row with no fill or border.
 struct ChatActivityRow<Leading: View, Detail: View>: View {
     let title: String
     var trailing: String = ""
@@ -284,7 +244,7 @@ struct ShellEnvelopeRow: View {
 
     var body: some View {
         ChatActivityRow(title: ChatShellEnvelope.headline(content), isExpanded: $expanded) {
-            Text(ChatShellEnvelope.reply(content))
+            Text(DelegatedReplyEnvelope(content).reply)
         }
     }
 }
@@ -318,19 +278,7 @@ struct ShellToolRow: View {
         .accessibilityLabel(headline)
         .quietReadTask(id:Revision(messages:messages,expanded:expanded)) {
             let revision=Revision(messages:messages,expanded:expanded)
-            let statuses=revision.messages.map { message in
-                ChatShellToolSummary.status(kind:message.metadata?.kind,ok:message.metadata?.ok,
-                    resultSummary:message.metadata?.resultSummary,resultStatus:message.metadata?.resultStatus,
-                    interactionState:message.metadata?.interactionState)
-            }
-            await words.prepare(headlineKey,input:ChatShellToolSummary.headlineInput(count:revision.messages.count,
-                failed:statuses.filter { $0 == .failed }.count,needsYou:statuses.filter { $0 == .needsYou }.count))
-            if revision.expanded {
-                for (message,status) in zip(revision.messages,statuses).prefix(ChatShellToolSummary.detailLimit) {
-                    await words.prepare("detail:"+message.id,input:ChatShellToolSummary.detailInput(toolName:message.metadata?.toolName,
-                        inputJSON:message.metadata?.inputJSON,status:status))
-                }
-            }
+            await appModel.engine.transcripts.prepareToolFold(revision.messages, expanded: revision.expanded)
             if !Task.isCancelled { preparedRevision=revision }
         }
     }

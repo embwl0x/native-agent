@@ -7,15 +7,7 @@ import PersistenceCore
 /// Trust Center roots that should be treated as app-approved workspaces even
 /// when broad Full Mac mode is off.
 public enum TrustCenterDefaultWorkspaceRoots {
-    /// The agent's OWN workspace, and nothing else.
-    ///
-    /// The iCloud Obsidian vault folder used to be seeded here, so a fresh
-    /// install — whose autonomy default is `workspace_autonomous` — could edit
-    /// a stranger's entire vault with no approval at all. "Everything on" does
-    /// not extend to someone's notes (User, 2026-09-17): the vault becomes a
-    /// workspace root when the person connects Obsidian, not before. Installs
-    /// that already saved it in `filePolicy.workspaceRoots` keep it — this
-    /// changes only what a NEW policy is born with.
+    /// Only the agent's workspace is seeded; Obsidian roots require connection or an existing saved grant.
     public static func defaultRoots(
         dataRoot: URL = defaultDataRoot()
     ) -> [URL] {

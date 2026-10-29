@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `OutcomeFeedbackStore.swift` | `OutcomeFeedbackStore` struct; `record`, `recordConversationContinuation`; the locked validation supplies physical rows and append bytes to shared retention |
@@ -42,18 +43,15 @@ public struct OutcomeFeedbackStore: Sendable {
     public static let maximumExistingBytes = 16 * 1_024 * 1_024
 
     private let dataRoot: URL
-    private let persistence: any PersistenceCoreProtocol
     private let clock: @Sendable () -> Date
     private let makeEventID: @Sendable () -> String
 
     public init(
         dataRoot: URL,
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
         clock: @escaping @Sendable () -> Date = { Date() },
         makeEventID: @escaping @Sendable () -> String = { UUID().uuidString.lowercased() }
     ) {
         self.dataRoot = dataRoot
-        self.persistence = persistence
         self.clock = clock
         self.makeEventID = makeEventID
     }
@@ -79,12 +77,12 @@ public struct OutcomeFeedbackStore: Sendable {
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(sessionID).jsonl")
 
-        let anchor: (turnID: String, surface: String, contextSelectionReceiptID: String?) = try await persistence.withFileLock(transcript) {
+        let anchor: (turnID: String, surface: String, contextSelectionReceiptID: String?) = try await SwiftNativePersistenceCore.withFileLock(transcript) {
             guard FileManager.default.fileExists(atPath: transcript.path) else {
                 throw OutcomeFeedbackError.transcriptMissing
             }
             let rows: [JSONValue]
-            do { rows = try await persistence.readJSONL(transcript) }
+            do { rows = try await SwiftNativePersistenceCore.readJSONL(transcript) }
             catch { throw OutcomeFeedbackError.transcriptCorrupt }
             let matching = rows.filter { row in
                 guard case .object(let object) = row,
@@ -126,7 +124,7 @@ public struct OutcomeFeedbackStore: Sendable {
             ?? CausalTransitionEvidence.opaqueIdentity(rawEventID)
         let observedAt = NativeTimestampFormat.fractionalZulu(clock())
         let reaction = rating == "up" ? "thumbs_up" : "thumbs_down"
-        return try await persistence.withFileLock(feedbackPath) {
+        return try await SwiftNativePersistenceCore.withFileLock(feedbackPath) {
             let existing = try Self.readExistingFeedbackFile(feedbackPath)
             let prior = existing.rows.reversed().first { row in
                 guard case .object(let object) = row else { return false }
@@ -164,10 +162,8 @@ public struct OutcomeFeedbackStore: Sendable {
             try await appendJSONLCapped(
                 record,
                 to: feedbackPath,
-                using: persistence,
                 maxLines: Self.maximumExistingRows,
                 logLabel: "OutcomeFeedbackStore",
-                takeLock: false,
                 maxBytes: Self.maximumExistingBytes,
                 validatedExistingCounts: (existing.physicalRows, existing.bytes)
             )
@@ -193,25 +189,20 @@ public struct OutcomeFeedbackStore: Sendable {
         let transcript = dataRoot
             .appendingPathComponent("chat/messages", isDirectory: true)
             .appendingPathComponent("\(sessionID).jsonl")
-        let anchor: (messageID: String, turnID: String, surface: String)? = try await persistence.withFileLock(transcript) {
+        let anchor: (messageID: String, turnID: String, surface: String)? = try await SwiftNativePersistenceCore.withFileLock(transcript) {
             guard FileManager.default.fileExists(atPath: transcript.path) else {
                 throw OutcomeFeedbackError.transcriptMissing
             }
             let rows: [JSONValue]
-            do { rows = try await persistence.readJSONL(transcript) }
+            do { rows = try await SwiftNativePersistenceCore.readJSONL(transcript) }
             catch { throw OutcomeFeedbackError.transcriptCorrupt }
             guard rows.count >= 3,
                   case .object(let reactionRow) = rows[rows.count - 1],
                   reactionRow["id"] == .string(reactionMessageID),
-                  reactionRow["sessionId"] == .string(sessionID),
-                  reactionRow["role"] == .string("user"),
                   case .object(let assistant) = rows[rows.count - 2],
-                  assistant["role"] == .string("assistant"),
-                  assistant["sessionId"] == .string(sessionID),
-                  case .string(let assistantRunID)? = assistant["runId"],
-                  Self.hasOriginatingRequest(
-                    in: rows[..<(rows.count - 2)].reversed(),
-                    sessionID: sessionID, runID: assistantRunID),
+                  Self.hasCanonicalContinuation(
+                    assistant: assistant, reaction: rows[rows.count - 1],
+                    precedingRows: rows[..<(rows.count - 2)].reversed(), sessionID: sessionID),
                   case .string(let messageID)? = assistant["id"],
                   case .object(let metadata)? = assistant["metadata"],
                   case .object(let outcome)? = metadata["outcomeObservation"],
@@ -247,7 +238,7 @@ public struct OutcomeFeedbackStore: Sendable {
             "payloadFree": .bool(true),
             "controlAuthority": .bool(false),
         ])
-        return try await persistence.withFileLock(feedbackPath) {
+        return try await SwiftNativePersistenceCore.withFileLock(feedbackPath) {
             let existing = try Self.readExistingFeedbackFile(feedbackPath)
             if let prior = existing.rows.first(where: { row in
                 guard case .object(let object) = row else { return false }
@@ -259,15 +250,31 @@ public struct OutcomeFeedbackStore: Sendable {
             try await appendJSONLCapped(
                 record,
                 to: feedbackPath,
-                using: persistence,
                 maxLines: Self.maximumExistingRows,
                 logLabel: "OutcomeFeedbackStore",
-                takeLock: false,
                 maxBytes: Self.maximumExistingBytes,
                 validatedExistingCounts: (existing.physicalRows, existing.bytes)
             )
             return record
         }
+    }
+
+    /// Adjacent assistant/user rows prove continuation only with a same-run originating request.
+    static func hasCanonicalContinuation(
+        assistant: [String: JSONValue],
+        reaction: JSONValue,
+        precedingRows: some Sequence<JSONValue>,
+        sessionID: String
+    ) -> Bool {
+        guard assistant["role"] == .string("assistant"),
+              assistant["sessionId"] == .string(sessionID),
+              case .string(let assistantRunID)? = assistant["runId"],
+              case .object(let row) = reaction,
+              row["role"] == .string("user"),
+              row["sessionId"] == .string(sessionID),
+              case .string(let reactionMessageID)? = row["id"],
+              OutcomeTraceIdentity.normalized(reactionMessageID) != nil else { return false }
+        return hasOriginatingRequest(in: precedingRows, sessionID: sessionID, runID: assistantRunID)
     }
 
     /// Walk only same-run tool receipts back to the originating request.
@@ -292,7 +299,7 @@ public struct OutcomeFeedbackStore: Sendable {
     /// lacking transcript-bound identities are ignored, never upgraded.
     public func reactionEvidenceKeys() async throws -> Set<OutcomeReactionEvidenceKey> {
         let path = dataRoot.appendingPathComponent("context/feedback.jsonl")
-        return try await persistence.withFileLock(path) {
+        return try await SwiftNativePersistenceCore.withFileLock(path) {
             let existing = try Self.readExistingFeedbackFile(path)
             return Set(existing.rows.compactMap { row in
                 guard case .object(let object) = row,

@@ -7,7 +7,7 @@ public struct ReleaseChecklistItem: Identifiable, Codable, Hashable {
     public var status: String = ""
     public var detail: String = ""
 
-    // FIX-2026-05-28: see EvalCheck. id required; everything else lenient.
+    // Items require id; all other item and checklist keys may be absent.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try c.decode(String.self, forKey: .id)
@@ -22,7 +22,6 @@ public struct ReleaseChecklist: Codable, Hashable {
     public var items: [ReleaseChecklistItem] = []
     public var createdAt: String = ""
 
-    // FIX-2026-05-28: no id — every field tolerates a missing key.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.status = try c.decodeIfPresent(String.self, forKey: .status) ?? ""

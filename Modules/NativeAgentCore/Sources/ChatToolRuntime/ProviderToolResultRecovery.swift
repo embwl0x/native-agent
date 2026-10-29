@@ -4,7 +4,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
-// Blueprint: | `ProviderToolResultRecovery.swift` | `SwiftToolDispatcher`: `impl_tool_result_page`; retained-response search coverage and source-positioned matching records |
+// Blueprint: | `ProviderToolResultRecovery.swift` | `SwiftToolDispatcher`: `impl_tool_result_page`; retained-response search coverage, matching/displayed/remaining counts and source-positioned matching records |
 
 /// Lossless, turn-scoped spill storage for provider results that are too large
 /// to inject in one model message. Files live under the user's private temp
@@ -15,16 +15,7 @@ package actor ProviderToolResultRecoveryStore {
 
     package static let pageUTF8Bytes = 8_000
 
-    /// User, 2026-09-06: a page is embedded as a JSON STRING in the
-    /// `tool_result_page` envelope, and this codebase serializes with
-    /// `ensure_ascii=True` — every non-ASCII scalar becomes `\uXXXX` (6 bytes,
-    /// 12 for a surrogate pair) and every quote/backslash/newline doubles. So
-    /// 8 000 RAW bytes of CJK or escape-heavy JSON serialized past the 12 000
-    /// byte `tool_result_page` projection ceiling, and the page spilled into
-    /// ANOTHER handle: paging a large result could never return the result.
-    /// Pages are now bounded by BOTH the raw cap above and this serialized
-    /// cap, which leaves the envelope's own fields room under that ceiling.
-    /// Pure ASCII is unaffected — the raw cap still binds first.
+    /// Bound pages by raw and serialized bytes, leaving envelope space below the projection ceiling.
     package static let pageSerializedUTF8Bytes = 10_000
 
     /// Bytes one scalar costs INSIDE a serialized JSON string, matching
@@ -42,16 +33,10 @@ package actor ProviderToolResultRecoveryStore {
     package static let maxEntryBytes = 64 * 1024 * 1024
     package static let maxTotalBytes = 128 * 1024 * 1024
     package static let maxEntries = 32
+    /// Cleanup age for unowned spill files.
     package static let ttl: TimeInterval = 30 * 60
 
-    /// User, 2026-09-06: the 30-minute TTL ran from CREATION and nothing renewed
-    /// it, so a long permitted turn (Telegram and the agent bridges get 180
-    /// iterations and a 6 h ceiling) watched its own spill handles expire under
-    /// it and `tool_result_page` answered "expired, invalid, or belongs to a
-    /// different turn" for a handle it had just been handed. A handle whose turn
-    /// is still live is never expired; the idle TTL applies once the turn ends,
-    /// and this is the ceiling that stops a leaked scope from pinning bytes
-    /// forever. Matches the turn wall-clock ceiling.
+    /// Turns retain handles until scope removal or this absolute wall-clock ceiling.
     package static let liveTurnMaxLifetime: TimeInterval = 6 * 60 * 60
 
     package struct Scope: Hashable, Sendable {
@@ -87,11 +72,8 @@ package actor ProviderToolResultRecoveryStore {
         let sectionBudget: Int
         let version: JSONValue?
         let createdAt: Date
-        /// Last time the model actually read a page. The idle clock runs from
-        /// here, not from creation.
-        var lastReadAt: Date
-        var sectionProjection: [(value: JSONValue, text: String, bytes: Int)]?
-        var sectionPages: (query: String, pages: [[JSONValue]])?
+        let sectionProjection: [(value: JSONValue, text: String, bytes: Int)]
+        var sectionPages: (query: String, pages: [[JSONValue]], counts: [Int])?
     }
 
     // Turn-scoped UTF-8 envelopes in OS temporary storage, excluded from
@@ -99,10 +81,6 @@ package actor ProviderToolResultRecoveryStore {
     private let root: URL
     private var entries: [String: Entry] = [:]
     private var totalBytes = 0
-    /// Scopes whose turn has not ended yet. A turn seeds this the first time it
-    /// spills; `remove(scope:)` — which every loop calls in its `defer` — clears
-    /// it. Handles in a live scope survive the idle TTL.
-    private var liveScopes: Set<Scope> = []
     private struct ReadCursor {
         let handle: String
         let nextPage: Int?
@@ -134,20 +112,13 @@ package actor ProviderToolResultRecoveryStore {
         }
     }
 
-    /// Classify the exact redacted envelope, not a head/tail excerpt. A page
-    /// being readable is separate evidence from the original action outcome.
-    package nonisolated static func resultClass(content: String) -> ChatToolOutcome.ExactResultClass {
-        guard content.utf8.count <= maxEntryBytes,
-              let value = try? JSONValue.parse(Data(content.utf8)) else { return .unknown }
-        return ChatToolOutcome.exactResultClass(value)
-    }
-
     package func store(
         content: String,
+        parsed: JSONValue?,
         toolName: String,
         sessionId: String?,
         turnId: String?,
-        originalResultClass: ChatToolOutcome.ExactResultClass? = nil,
+        originalResultClass: ChatToolOutcome.ExactResultClass,
         sectionBudget: Int = ToolResultSections.pageBudget
     ) -> Receipt? {
         guard let scope = Scope(sessionId: sessionId, turnId: turnId) else { return nil }
@@ -179,11 +150,12 @@ package actor ProviderToolResultRecoveryStore {
             byteOffset += scalarBytes
             pageSerializedBytes += escapedBytes
         }
-        if pageByteOffsets.last != byteOffset {
+        // Every page has a start and end, including one empty page at [0, 0].
+        if pageByteOffsets.count == 1 || pageByteOffsets.last != byteOffset {
             pageByteOffsets.append(byteOffset)
         }
 
-        let fields: [String: JSONValue] = if case .object(let fields)? = try? JSONValue.parse(data) { fields } else { [:] }
+        let fields = parsed?.objectValue ?? [:]
         let receipt = if case .string(let id)? = fields["dispatch_receipt_id"] { UUID(uuidString: id) } else { nil as UUID? }
         let source = if case .string(let source)? = fields["dispatch_receipt_source"] { source } else { "" }
         let day = URL(fileURLWithPath: source).deletingPathExtension().lastPathComponent
@@ -192,8 +164,7 @@ package actor ProviderToolResultRecoveryStore {
             .map { "receipt-" + $0.uuidString.lowercased() + (dated ? "." + day : "") } ?? UUID().uuidString.lowercased()
         let url = root.appendingPathComponent(handle, isDirectory: false)
         do {
-            try data.write(to: url, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
         } catch {
             try? FileManager.default.removeItem(at: url)
             return nil
@@ -208,15 +179,14 @@ package actor ProviderToolResultRecoveryStore {
             url: url,
             characters: content.count,
             bytes: data.count,
-            resultClass: originalResultClass ?? Self.resultClass(content: content),
+            resultClass: originalResultClass,
             pageByteOffsets: pageByteOffsets,
             sectionBudget: sectionBudget,
             version: version,
             createdAt: now,
-            lastReadAt: now
+            sectionProjection: ToolResultSections.projection(content: content, value: parsed, budget: sectionBudget)
         )
         entries[handle] = entry
-        liveScopes.insert(scope)
         totalBytes += data.count
         return Receipt(
             handle: handle,
@@ -287,22 +257,6 @@ package actor ProviderToolResultRecoveryStore {
         return page(handle: entry.handle, page: 0, sessionId: sessionId, turnId: turnId, query: "")
     }
 
-    private func sectionPages(handle: String, entry: Entry, query: String) -> [[JSONValue]]? {
-        if let cached = entry.sectionPages, cached.query == query { return cached.pages }
-        let projection: [(value: JSONValue, text: String, bytes: Int)]
-        if let cached = entry.sectionProjection {
-            projection = cached
-        } else {
-            guard let data = try? Data(contentsOf: entry.url),
-                  let content = String(data: data, encoding: .utf8) else { return nil }
-            projection = ToolResultSections.projection(content: content, budget: entry.sectionBudget)
-            entries[handle]?.sectionProjection = projection
-        }
-        let pages = ToolResultSections.pages(sections: projection, query: query, budget: entry.sectionBudget)
-        entries[handle]?.sectionPages = (query, pages)
-        return pages
-    }
-
     private func unavailable(handle: String, reason: String, sessionId: String?) -> JSONValue {
         let parts = handle.dropFirst(8).split(separator: ".")
         let receipt = handle.hasPrefix("receipt-") ? parts.first.flatMap { UUID(uuidString: String($0)) } : nil
@@ -324,18 +278,23 @@ package actor ProviderToolResultRecoveryStore {
     ) -> JSONValue {
         cleanupExpired(now: Date())
         guard let scope = Scope(sessionId: sessionId, turnId: turnId),
-              let entry = entries[handle],
+              var entry = entries[handle],
               entry.scope == scope else {
             return unavailable(handle: handle, reason: "result_handle_unavailable", sessionId: sessionId)
         }
-        if let query, let pages = sectionPages(handle: handle, entry: entry, query: query) {
+        if let query {
+            if entry.sectionPages?.query != query {
+                let pages = ToolResultSections.pages(sections: entry.sectionProjection, query: query, budget: entry.sectionBudget)
+                entry.sectionPages = (query, pages, pages.reduce(into: [0]) { $0.append($0[$0.count - 1] + $1.count) })
+                entries[handle] = entry
+            }
+            let (_, pages, counts) = entry.sectionPages!
             guard pages.indices.contains(page) else {
                 return .object(["status": .string("failed"), "reason": .string("page_out_of_range"),
                     "page_count": .int(Int64(pages.count)),
                     "recovery_hint": .string("Read the same retained result with a page from 0 through \(pages.count - 1), keeping query and raw unchanged; do not rerun the original operation.")])
             }
-            entries[handle]?.lastReadAt = Date()
-            let remaining = pages.dropFirst(page + 1).reduce(0) { $0 + $1.count }
+            let matching = counts[pages.count], remaining = matching - counts[page + 1]
             let sections = pages[page].map { section -> JSONValue in
                 guard case .object(var row) = section,
                       case .int(let start)? = row["raw_byte_start"],
@@ -352,13 +311,14 @@ package actor ProviderToolResultRecoveryStore {
                 "result_handle": .string(handle), "query": .string(query),
                 "page": .int(Int64(page)), "page_count": .int(Int64(pages.count)),
                 "sections": .array(sections),
-                "searched_sections": .int(Int64(entries[handle]?.sectionProjection?.count ?? 0)),
-                "matching_sections": .int(Int64(pages.reduce(0) { $0 + $1.count })),
+                "searched_sections": .int(Int64(entries[handle]?.sectionProjection.count ?? 0)),
+                "matching_sections": .int(Int64(matching)),
+                "displayed_sections": .int(Int64(sections.count)),
                 "remaining_sections": .int(Int64(remaining)),
                 "has_more": .bool(page + 1 < pages.count),
                 "next_page": page + 1 < pages.count ? .int(Int64(page + 1)) : .null,
                 "raw_page_count": .int(Int64(max(1, entry.pageByteOffsets.count - 1))),
-                "detail": .string("Page \(page + 1) of \(pages.count). \(remaining) matching sections follow in source order. Paths and line numbers identify positions in this retained response only; unread source content was not searched. Continue with next_call. raw=true reads the original response bytes."),
+                "detail": .string("Page \(page + 1) of \(pages.count) displays \(sections.count) of \(matching) matching sections; \(remaining) remain after this page. Paths and line numbers identify positions in this retained response only; unread source content was not searched. Continue with next_call. raw=true reads the original response bytes."),
             ])
         }
         let pageCount = max(1, entry.pageByteOffsets.count - 1)
@@ -378,14 +338,11 @@ package actor ProviderToolResultRecoveryStore {
         }
         defer { try? file.close() }
         guard (try? file.seek(toOffset: UInt64(startByte))) != nil,
-              let data = try? file.read(upToCount: endByte - startByte),
+              let data = endByte == startByte ? Data() : (try? file.read(upToCount: endByte - startByte)),
               let content = String(data: data, encoding: .utf8) else {
             remove(handle: handle)
             return unavailable(handle: handle, reason: "result_spill_unreadable", sessionId: sessionId)
         }
-        // Reading renews the handle: a result the model is still working
-        // through is in use, whatever the clock says.
-        entries[handle]?.lastReadAt = Date()
         let hasMore = page + 1 < pageCount
         let nextPage: JSONValue = hasMore ? .int(Int64(page + 1)) : .null
         return .object([
@@ -407,7 +364,6 @@ package actor ProviderToolResultRecoveryStore {
     }
 
     package func remove(scope: Scope) {
-        liveScopes.remove(scope)
         for handle in entries.values.filter({ $0.scope == scope }).map(\.handle) {
             remove(handle: handle)
         }
@@ -419,18 +375,8 @@ package actor ProviderToolResultRecoveryStore {
             // thing that frees a scope whose `remove(scope:)` never arrived.
             if now.timeIntervalSince(entry.createdAt) >= Self.liveTurnMaxLifetime {
                 remove(handle: entry.handle)
-                continue
-            }
-            // A live turn keeps its handles: the turn's own `defer` is what ends
-            // them, not the clock.
-            guard !liveScopes.contains(entry.scope) else { continue }
-            if now.timeIntervalSince(entry.lastReadAt) >= Self.ttl {
-                remove(handle: entry.handle)
             }
         }
-        // A scope with nothing left to protect stops being tracked, so a turn
-        // that ended without its `defer` cannot pin the set forever.
-        liveScopes.formIntersection(Set(entries.values.map(\.scope)))
         let liveNames = Set(entries.values.map { $0.url.lastPathComponent })
         let cutoff = now.addingTimeInterval(-Self.ttl)
         let urls = try? FileManager.default.contentsOfDirectory(
@@ -468,10 +414,10 @@ extension SwiftToolDispatcher {
                 return .object(["status": .string("failed"), "reason": .string("conflicting_read_selection"),
                     "recovery_hint": .string("Use continue:true with optional result_handle and page, or omit continue to select an explicit page/query/raw mode. Continue ignores page and retains the previous mode and position.")])
             }
-            let handle = jsonString(input["result_handle"])?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let handle = input["result_handle"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
             return await ProviderToolResultRecoveryStore.shared.continueReading(
                 handle: handle?.isEmpty == false ? handle : nil,
-                sessionId: Self.extractSessionId(from: input), turnId: TurnTraceContext.turnId)
+                sessionId: ChatToolSessionInjection.explicitSessionId(in: input), turnId: TurnTraceContext.turnId)
         }
         guard case .string(let handle)? = input["result_handle"], !handle.isEmpty else {
             return .object([
@@ -502,9 +448,9 @@ extension SwiftToolDispatcher {
         return await ProviderToolResultRecoveryStore.shared.page(
             handle: handle,
             page: page,
-            sessionId: Self.extractSessionId(from: input),
+            sessionId: ChatToolSessionInjection.explicitSessionId(in: input),
             turnId: TurnTraceContext.turnId,
-            query: input["raw"] == .bool(true) ? nil : (jsonString(input["query"]) ?? "")
+            query: input["raw"] == .bool(true) ? nil : (input["query"]?.stringValue ?? "")
         )
     }
 }

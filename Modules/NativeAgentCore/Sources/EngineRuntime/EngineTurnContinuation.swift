@@ -23,6 +23,7 @@ import TrustCenter
 import WorkshopExecution
 import TurnTrace
 import ApprovalTransactions
+import os
 // Blueprint: | `EngineTurnContinuation.swift` | `TurnContinuationRuntime` struct; process checkpoint resume, Desk verification/resumption and approval follow-up share turn admission and reply settlement; caller-result recovery registers with the retained task's worker and cancellation owner; completion destination recovery uses the bound engine and attention router; composes existing TurnTrace state and helper ownership; retains anchor mirror intent and reconciles its lifecycle with injected platform senders; `TurnContinuationRuntime` struct; process checkpoint resume, Desk verification/resumption and approval follow-up share turn admission and reply settlement; caller-result recovery registers with the retained task's worker and cancellation owner; composes existing TurnTrace state and helper ownership; retains anchor mirror intent and reconciles its lifecycle with injected platform senders |
 
 /// Continuations use the same admitted turn and reply path; Desk receipts and
@@ -60,16 +61,9 @@ public struct TurnContinuationRuntime: Sendable {
         } else { try await resumeTurn(checkpoint) }
     }
 
-    /// User, 2026-10-01: what is said in the conversation he is in reaches his other
-    /// doors — and only that conversation. After a turn User started there at the
-    /// Mac, the phone or Slack (never an agent's, judged by the turn's user row),
-    /// its reply goes to the Telegram chat bound to that session, and to the phone
-    /// as a push unless the phone asked. A Telegram turn travels nowhere: Telegram
-    /// already notifies his phone, and a second push doubled it. User, 2026-10-04:
-    /// a Mac turn means he is at the Mac, so its Telegram copy lands silently and
-    /// the phone gets no push, only the transcript snapshot every completion
-    /// already publishes. Terminal settlement retains the exact mirror intent;
-    /// the delivery-state event owner sends it without blocking the turn's stream.
+    /// Only person-started anchor replies from Mac, iPhone or Slack mirror to Telegram (Mac silently).
+    /// Only Slack replies push to the phone; Telegram replies stay in Telegram.
+    /// Settlement retains intent; the delivery-state owner sends without blocking the turn.
     @MainActor
     public static func installReplyMirror() {
         AbandonedTurnReconciliationHook.installReplyMirror { root, session, run in
@@ -89,8 +83,7 @@ public struct TurnContinuationRuntime: Sendable {
               let response = try await SwiftNativeChatOrchestrationClient.savedReply(dataRoot: dataRoot, sessionId: sessionId, runId: runId),
               !response.output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         let path = dataRoot.appendingPathComponent("chat/messages/\(sessionId).jsonl")
-        let persistence = SwiftNativePersistenceCore()
-        let read = try await persistence.withFileLock(path) { try await persistence.readJSONLReporting(path) }
+        let read = try await SwiftNativePersistenceCore.withFileLock(path) { try await SwiftNativePersistenceCore.readJSONLReporting(path) }
         guard read.report.malformedLineCount == 0, !read.report.trailingPartialLine,
               read.rows.allSatisfy({ if case .object = $0 { return true }; return false }) else { throw CocoaError(.fileReadCorruptFile) }
         guard case .object(let reply)? = read.rows.last(where: {
@@ -172,7 +165,7 @@ public struct TurnContinuationRuntime: Sendable {
                     guard let execution = try await runner.getWorkshopExecution(id) else {
                         return .unknown("workshop execution \(id) not found")
                     }
-                    if ["queued", "running", "pending"].contains(execution.status) { return .waiting }
+                    if ["queued", "running", "pending", "blocked_on_approval"].contains(execution.status) { return .waiting }
                     guard execution.status == "completed", execution.verification?.status == .satisfied else {
                         return .unknown("workshop execution \(id) ended \(execution.status) without satisfied verification")
                     }
@@ -186,6 +179,7 @@ public struct TurnContinuationRuntime: Sendable {
                       record.fileAccess != "none", let peerSources = record.peerSources else {
                     return .unknown("\(step.tool) has no domain verifier")
                 }
+                guard bytes >= 0 else { return .unknown("write_file checkpoint has a negative byte count") }
                 let envelope = try continuationEnvelope(record)
                 _ = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadAuthorizationSnapshotChecked()
                 let dispatcher = makeGatedToolDispatchClient(
@@ -195,25 +189,63 @@ public struct TurnContinuationRuntime: Sendable {
                     fileAccess: record.fileAccess, surface: record.surface, envelope: envelope,
                     verifiedSessionID: .some(record.sessionID), verifiedChatID: .some(envelope.verifiedChatId),
                     verifiedUserID: .some(envelope.verifiedUserId))
-                let receipt = try await PeerDataTaint.$current.withValue(PeerDataTaint(restoring: peerSources)) {
+                return try await PeerDataTaint.$current.withValue(PeerDataTaint(restoring: peerSources)) {
                     try await verification.bind {
-                        try await dispatcher.dispatch(tool: "read_file",
-                            input: ["path": .string(path), "max_bytes": .int(bytes + 1)], surface: record.surface)
+                        var offset: Int64 = 0
+                        var version: String?
+                        var hash = SHA256()
+                        while true {
+                            try Task.checkCancellation()
+                            var input: [String: JSONValue] = ["path": .string(path), "max_bytes": .int(200_000),
+                                "offset": .int(offset), "raw": .bool(true)]
+                            if let version { input["version"] = .string(version) }
+                            let receipt = try await dispatcher.dispatch(tool: "read_file", input: input, surface: record.surface)
+                            guard case .object(let fields) = receipt else {
+                                return DeskContinuationScheduler.Verdict.unknown("write_file \(path) observation returned no read receipt")
+                            }
+                            guard fields["ok"] == .bool(true) else {
+                                let cause = fields["error"]?.stringValue ?? "read receipt omitted its failure cause"
+                                return .unknown("write_file \(path) could not be observed: \(cause)")
+                            }
+                            guard fields["offset"] == .int(offset),
+                                  case .string(let observedVersion)? = fields["version"], !observedVersion.isEmpty,
+                                  version == nil || version == observedVersion,
+                                  case .int(let total)? = fields["bytes"], total >= 0,
+                                  case .bool(let hasMore)? = fields["has_more"],
+                                  case .string(let content)? = fields["content"] else {
+                                return .unknown("write_file \(path) observation is incomplete or changed between windows")
+                            }
+                            guard total == bytes else { return .unknown("write_file \(path) byte count does not match the checkpoint") }
+                            let chunk: Data?
+                            if fields["encoding"] == .string("base64") { chunk = Data(base64Encoded: content) }
+                            else { chunk = Data(content.utf8) }
+                            guard let chunk, fields["returned_bytes"] == .int(Int64(chunk.count)) else {
+                                return .unknown("write_file \(path) observation did not preserve the returned bytes")
+                            }
+                            let next = offset.addingReportingOverflow(Int64(chunk.count))
+                            guard !next.overflow, next.partialValue <= total,
+                                  hasMore ? (!chunk.isEmpty && next.partialValue < total) : next.partialValue == total else {
+                                return .unknown("write_file \(path) observation has incomplete byte coverage")
+                            }
+                            hash.update(data: chunk)
+                            if !hasMore {
+                                guard hash.finalize().map({ String(format: "%02x", $0) }).joined() == digest else {
+                                    return .unknown("write_file \(path) does not match the checkpointed content")
+                                }
+                                return .settled("write_file \(path) matches the checkpointed content digest")
+                            }
+                            offset = next.partialValue
+                            version = observedVersion
+                        }
                     }
                 }
-                guard case .object(let fields) = receipt, fields["ok"] == .bool(true),
-                      fields["truncated"] == .bool(false), case .string(let content)? = fields["content"],
-                      SHA256.hash(data: Data(content.utf8)).map({ String(format: "%02x", $0) }).joined() == digest else {
-                    return .unknown("write_file \(path) does not match the checkpointed content")
-                }
-                return .settled("write_file \(path) matches the checkpointed content digest")
             },
             resume: { item, record in
                 try await resumeDeskContinuation(item: item, record: record)
             })
     }
 
-    public func resumeTurn(_ checkpoint: TurnCheckpoint, progress: ChatOrchestrationProgressHandler? = nil) async throws {
+    public func resumeTurn(_ checkpoint: TurnCheckpoint, progress: TurnEventSink? = nil) async throws {
         guard try DataRootLife.isCurrent(checkpoint.lifeID, in: dataRoot) else { throw CancellationError() }
         guard let surface = text(checkpoint.replyRoute, "surface") else { throw DeskContinuationError.unavailable }
         let route = AgentBridgeCompletionRoute(surface: surface, sessionId: checkpoint.sessionId,
@@ -229,7 +261,7 @@ public struct TurnContinuationRuntime: Sendable {
     }
 
     private func resumeCheckpoint(_ checkpoint: TurnCheckpoint, route: AgentBridgeCompletionRoute,
-                                  progress: ChatOrchestrationProgressHandler?) async throws {
+                                  progress: TurnEventSink?) async throws {
         guard let saved = TurnEnvelope.fromPersistedMetadata(.object(checkpoint.envelope)),
               let name = checkpoint.capabilityProfile,
               let profile = NativeAgentAppChatSurfaceProfile(rawValue: name),
@@ -429,17 +461,13 @@ public struct TurnContinuationRuntime: Sendable {
         }
     }
 
-    /// Her normal tools on the card's own door (Wave 2 #8): Trust, the peer
+    /// Her normal tools on the card's own door: Trust, the peer
     /// floor and the steer bound around this turn judge every call in it.
     private func runApprovalFollowUp(sessionID: String, envelope: TurnEnvelope, prompt: String,
                                      fileAccess: String,
                                      turnOptions: @escaping @Sendable () -> (persona: String?, serviceTier: String?)) async throws {
         let door = ConversationSurfaceProfile(envelope.surface)
-        // A named bridge's follow-up carries its verified principal, not its route name.
-        if let lane = ["claude-bridge": "claude", "codex-bridge": "codex"][door.id] {
-            PeerDataTaint.current?.mark(peer: envelope.verifiedUserId.map { "peer:" + $0 } ?? lane)
-        }
-        let profile: NativeAgentAppChatSurfaceProfile = door.isAgentBridge || ["claude-bridge", "codex-bridge"].contains(door.id)
+        let profile: NativeAgentAppChatSurfaceProfile = door.isAgentBridge
             ? .bridge : door.isIOSRemote ? .ios : NativeAgentAppChatSurfaceProfile(rawValue: door.id) ?? .mac
         let client = engine.chatClient(profile: profile,
             approvalFiler: profile == .telegram ? telegramApprovalFiler() : nil)
@@ -450,11 +478,10 @@ public struct TurnContinuationRuntime: Sendable {
         // The approval claim covers both the turn and its one delivery attempt.
         // A failed or uncertain send must never cause another model turn.
         let saved = envelope.replyRoute
-        let deliverySurface = saved.surface.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard ["telegram", "slack", "ios", "iphone", "mobile", "icloud"].contains(deliverySurface) else { return }
         let route = AgentBridgeCompletionRoute(surface: saved.surface, sessionId: sessionID,
             destinationId: saved.destinationId, threadId: saved.threadId, sourceKey: saved.sourceKey,
             replyTo: saved.replyTo, correlationId: saved.correlationId, requesterUserId: saved.requesterUserId)
+        guard route.kind?.hasRedeliveryOwner == true else { return }
         _ = try await settleReply(response: response, route: route, envelope: envelope, settlement: .approvalClaim)
     }
 
@@ -486,7 +513,7 @@ public struct TurnContinuationRuntime: Sendable {
             throw NSError(domain: "ApprovalContinuationAdmission", code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "The saved Telegram destination is unavailable."])
         }
-        try await TelegramTurnCoordinator.shared.runApprovalContinuation(
+        try await TelegramTurns.shared.runApprovalContinuation(
             destination: TelegramDestination(chatId: chatID, threadId: threadID),
             text: prompt, operation: { try await runAdmittedContinuation(sessionID: sessionID, operation: operation) })
     }
@@ -578,19 +605,22 @@ public struct EngineAgentBridgeCompletionSender: AgentBridgeCompletionSending {
             let config = TelegramConfig.loadFromDisk(dataRoot: dataRoot), config.enabled,
             authorizeTelegramReply?(config, chatID) != false,
             route.threadId == nil || route.threadId.flatMap(Int.init) != nil,
-            let loop = await BackgroundLoops.BackgroundLoopsManager.shared.loopRunner(loopId: "telegram_poll") as? TelegramPollLoop else {
+            let loop = await BackgroundLoops.BackgroundLoopLifetimes.shared.loopRunner(loopId: "telegram_poll") as? TelegramPollLoop else {
         throw DeliveryError.invalidTelegramDestination
       }
       return try await loop.recoverReply(response, originRunId: response.runId,
         destination: TelegramDestination(chatId: chatID, threadId: route.threadId.flatMap(Int.init)),
         requesterUserId: route.requesterUserId.flatMap(Int.init), silent: silentTelegram, priorVerdict: priorVerdict)
     }, recoverSlack: {
-      guard let loop = await BackgroundLoops.BackgroundLoopsManager.shared.loopRunner(loopId: "slack_socket_mode") as? SlackSocketModeLoop else {
+      guard let loop = await BackgroundLoops.BackgroundLoopLifetimes.shared.loopRunner(loopId: "slack_socket_mode") as? SlackSocketModeLoop else {
         throw DeliveryError.missingSlackDestination
       }
       return try await loop.recoverReply(response, originRunId: response.runId, route: route, priorVerdict: priorVerdict)
     }, recoverIOS: {
-      try await engine().deviceSync!.bridge.recoverReply(response, route: route, priorVerdict: priorVerdict)
+      guard let sync = engine().deviceSync else {
+        throw PersistenceCoreError.ioFailure("The originating runtime has no phone delivery owner.")
+      }
+      return try await sync.bridge.recoverReply(response, route: route, priorVerdict: priorVerdict)
     }, deliverRequestedResult: {
       guard try await router().deliverRequestedResult(
         deliveryID: requestedResultDeliveryID ?? deliveryId, sessionID: route.turnSessionId ?? response.sessionId,
@@ -623,18 +653,4 @@ public struct EngineAgentBridgeCompletionSender: AgentBridgeCompletionSending {
     await AgentBridgeCompletionRouter.sendCallerResult(artifact: artifact, idempotencyKey: idempotencyKey,
       route: route, tasks: { engine().agents.tasks })
   }
-}
-
-/// The running Telegram loop's approval filer, so an approval follow-up on
-/// Telegram files its cards with the same inline buttons (Wave 2 #8).
-public final class TelegramApprovalFilerRef: @unchecked Sendable {
-    public static let shared = TelegramApprovalFilerRef()
-    private let lock = NSLock()
-    private var filer: TelegramApprovalFiler?
-
-    public func configure(_ filer: TelegramApprovalFiler) {
-        lock.withLock { self.filer = filer }
-        ApprovalChatCards.useTelegram(filer)
-    }
-    public func current() -> TelegramApprovalFiler? { lock.withLock { filer } }
 }

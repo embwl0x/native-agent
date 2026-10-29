@@ -5,8 +5,7 @@ import PersistenceCore
 // Blueprint: | `MemoryStorage+Proposals.swift` | `MemoryStorage`: `repairSupersededTombstones`, `stagePendingProposal`, `updateProposalMetadata` |
 
 extension MemoryStorage {
-    // 2026-09-18: repair and cursor commit together. Old rows must eventually
-    // be visited, and a failed write must never advance past an unfinished row.
+    // Repair and cursor commit together; every row is visited without advancing past failed repairs.
     public func repairSupersededTombstones() async throws {
         try await dbPool.write { db in
             try db.execute(sql: """
@@ -32,8 +31,10 @@ extension MemoryStorage {
                 guard row.status == "superseded"
                     || (row.status == "rejected" && reason.hasPrefix("superseded by a correction:"))
                     || (row.status == "pending" && marker != nil) else { continue }
-                try db.execute(sql: "DELETE FROM tombstones WHERE content_hash = ?",
-                               arguments: [Self.contentHash(row.content)])
+                if reason.hasPrefix(prefix), !reason.dropFirst(prefix.count).isEmpty {
+                    try db.execute(sql: "DELETE FROM tombstones WHERE content_hash = ? AND content = ? AND reason = ?",
+                                   arguments: [Self.contentHash(row.content), row.content, reason])
+                }
                 var metadata: [String: JSONValue] = [:]
                 if case .object(let existing)? = row.metadata { metadata = existing }
                 let successor = marker ?? (reason.hasPrefix(prefix)
@@ -120,8 +121,6 @@ extension MemoryStorage {
             let now = Self.nowISO8601()
             metadata["supersededBy"] = .string(successorId)
             metadata["supersededAt"] = .string(now)
-            try db.execute(sql: "DELETE FROM tombstones WHERE content_hash = ?",
-                           arguments: [Self.contentHash(proposal.content)])
             try db.execute(sql: """
                 UPDATE proposals SET metadata_json = ?, status = 'superseded',
                     resolved_at = ?, rejection_reason = ? WHERE id = ?
@@ -133,15 +132,7 @@ extension MemoryStorage {
     }
 
     @discardableResult
-    /// User, 2026-09-06: the pending-proposal dedup as ONE transaction.
-    /// `SwiftNativeMemoryV2.propose` used to list pending proposals, merge the
-    /// new evidence in Swift, then call `updateProposalMetadata`, which
-    /// overwrites `metadata_json` unconditionally. Two observations of the same
-    /// fact landing together both read the pre-merge row and the second write
-    /// erased the first one's supporting sessions and recurrence — or, when
-    /// neither saw a pending row yet, both inserted and the review queue got
-    /// the duplicates the dedup exists to prevent. Doing the match, the merge
-    /// and the insert under one write lock closes both.
+    /// Match, merge and insert pending proposals under one write lock to preserve concurrent evidence.
     ///
     /// `foldedKey` is the caller's normalisation (article folding + content
     /// hash); `merge` receives the row found under the lock and returns the
@@ -210,7 +201,6 @@ extension MemoryStorage {
 
     public func acceptProposal(
         id: String,
-        review: ReviewedMomentAcceptance? = nil,
         superseding: SupersedingAcceptance? = nil
     ) async throws -> StoredMemory {
         let turnProvenance = try MemorySenseProvenance.stamping(nil)
@@ -235,17 +225,6 @@ extension MemoryStorage {
                 metadata.merge(provenance) { _, incoming in incoming }
                 proposal.metadata = .object(metadata)
             }
-            if let review {
-                guard proposal.content == review.expectedContent, MemoryMoments.isMoment(proposal.metadata) else {
-                    throw MemoryV2Error.underlying("moment changed since review; review it again")
-                }
-                if let reason = MemoryCandidateQuality.rejectionReason(
-                    text: review.content, source: proposal.source, kind: MemoryMoments.kind
-                ) { throw MemoryV2Error.rejectedCandidate(reason) }
-                proposal.content = review.content
-                proposal.embedding = review.embedding
-                proposal.embeddingEpoch = review.embeddingEpoch
-            }
             // Recheck the exact denylist inside the admission transaction.
             // A tombstone can arrive after the caller's earlier check, and
             // embeddingless legacy claims cannot rely on the semantic gate.
@@ -254,7 +233,6 @@ extension MemoryStorage {
                 arguments: [Self.contentHash(proposal.content)]
             ) ?? 0 > 0
             if exactTombstone {
-                if review != nil { throw MemoryStorageError.tombstoned(id) }
                 try db.execute(sql: """
                     UPDATE proposals SET status = 'rejected', resolved_at = ?, rejection_reason = ?
                     WHERE id = ?
@@ -262,18 +240,14 @@ extension MemoryStorage {
                 try Self.pruneTerminalProposals(in: db)
                 return .tombstoned
             }
-            // Semantic tombstone gate at acceptance, in the SAME transaction
-            // (wave1 T3): a proposal that paraphrases a tombstoned claim must
-            // not promote even if its exact hash differs. Legacy/no-embedding
-            // proposals skip (the transaction's exact-hash gate covers them).
+            // Acceptance checks semantic tombstones in the same transaction; rows without embeddings use the exact-hash gate.
             if let pe = proposal.embedding,
                try Self.tombstoneMatch(
                    db: db,
                    query: pe,
                    queryEpoch: proposal.embeddingEpoch,
-                   threshold: memoryTombstoneMatchThreshold
+                   threshold: memoryNearVerbatimSimilarity
                ) {
-                if review != nil { throw MemoryStorageError.tombstoned(id) }
                 try db.execute(sql: """
                     UPDATE proposals SET status = 'rejected', resolved_at = ?, rejection_reason = ?
                     WHERE id = ?
@@ -282,10 +256,7 @@ extension MemoryStorage {
                 return .tombstoned
             }
             let now = Self.nowISO8601()
-            // #1: stamp the extractor's real confidence on the memory instead of
-            // hardcoding 1.0, and keep `kind` in the memory metadata. The signal
-            // rides in proposal.metadata.{confidence,kind}; default to 1.0 when
-            // absent (legacy proposals / consolidator durability path).
+            // Preserve the proposal's confidence and kind, defaulting absent confidence to 1.0.
             let proposalMeta: [String: JSONValue] = {
                 if case .object(let o)? = proposal.metadata { return o }
                 return [:]
@@ -314,9 +285,7 @@ extension MemoryStorage {
                 }
             }
             let stampedConfidence: Double = {
-                // Accept double / int / numeric-string forms and clamp to 0...1
-                // (gpt-5.5 review finding 2: a string "0.85" must not silently
-                // overtrust to 1.0). Absent or unparseable → 1.0 (legacy default).
+                // Accept double, int and numeric-string confidence, clamp to 0...1; absent or unparseable defaults to 1.0.
                 let raw: Double? = {
                     switch proposalMeta["confidence"] {
                     case .double(let d)?: return d
@@ -328,15 +297,6 @@ extension MemoryStorage {
                 guard let raw else { return 1.0 }
                 return min(max(raw, 0.0), 1.0)
             }()
-            let kindMetadata = MemoryKindStamp.stampingDefaultKind(proposal.metadata)
-            let originatingTimestamp = Self.metadataString(proposalMeta, "observed_at", fallback: "observedAt")
-                ?? proposal.stagedAt
-            let stampedMetadata: JSONValue?
-            if let origin = MemoryRecallScoring.parseTimestamp(originatingTimestamp) {
-                stampedMetadata = MemoryDueDateStamp.stamping(kindMetadata, text: proposal.content, at: origin)
-            } else {
-                stampedMetadata = kindMetadata
-            }
             let mem = StoredMemory(
                 id: proposal.id,
                 content: proposal.content,
@@ -352,35 +312,12 @@ extension MemoryStorage {
                 validTo: Self.metadataString(proposalMeta, "valid_to", fallback: "validTo"),
                 observedAt: Self.metadataString(proposalMeta, "observed_at", fallback: "observedAt"),
                 evidence: proposalMeta["evidence"],
-                // U3 wave-2 item 5a: promotion is a NEW write — proposals
-                // whose extractor carried no kind get the semantics-neutral
-                // default ("general" → decayFactor 1.0, no supersession).
-                // Extractor-provided kinds pass through untouched.
-                // Item 5 follow-up (2026-09-02): promotion is a NEW write, so
-                // the due-date extractor runs here too. Both write paths — the
-                // explicit `commit_memory` store above and this promoter
-                // acceptance — stamp through the same extractor, so a plan is
-                // dated the same way however it got remembered.
-                metadata: stampedMetadata
+                // Promotion preserves supplied kinds and defaults missing kinds to "general" (no decay or supersession).
+                // Keep the writer's named date as supplied in the proposal.
+                metadata: MemoryKindStamp.stampingDefaultKind(proposal.metadata)
             )
             try Self.validateTemporalEvidence(mem)
-            try db.execute(sql: """
-                INSERT INTO memories
-                  (id, content, persona_id, source, confidence,
-                   created_at, updated_at, embedding, status, metadata_json, lifecycle, embedding_epoch,
-                   valid_from, valid_to, observed_at, evidence_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, arguments: [
-                mem.id, mem.content, mem.personaId, mem.source, mem.confidence,
-                mem.createdAt, mem.updatedAt,
-                Self.encodeEmbedding(mem.embedding),
-                mem.status,
-                Self.encodeMetadata(mem.metadata),
-                mem.lifecycle,
-                mem.embeddingEpoch,
-                mem.validFrom, mem.validTo, mem.observedAt,
-                Self.encodeMetadata(mem.evidence)
-            ])
+            try Self.executeMemoryInsert(mem, in: db)
             try db.execute(sql: """
                 UPDATE proposals SET status = 'accepted', resolved_at = ? WHERE id = ?
             """, arguments: [now, id])
@@ -423,7 +360,7 @@ extension MemoryStorage {
     }
 
     /// Demote the memory an accepted update replaces, inside the acceptance
-    /// transaction. Same lineage write as `markCorrected` — lifecycle
+    /// transaction. The one replacement lineage write — lifecycle
     /// 'corrected', queryable corrected_by/at plus history, DEMOTION not
     /// erasure — with one addition: the row must still hash to what it hashed
     /// to when the proposal was staged. If it has changed, or is gone, or is
@@ -470,11 +407,13 @@ extension MemoryStorage {
         row.metadata = .object(meta)
         row.lifecycle = MemoryLifecycle.corrected
         row.updatedAt = now
+        // It was true until its replacement became true; the row stays.
+        row.validTo = replacement.validFrom ?? now
         try db.execute(sql: """
-            UPDATE memories SET lifecycle = ?, updated_at = ?, metadata_json = ?
+            UPDATE memories SET lifecycle = ?, updated_at = ?, metadata_json = ?, valid_to = ?
             WHERE id = ? AND status = 'active'
               AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
-        """, arguments: [row.lifecycle, row.updatedAt, Self.encodeMetadata(row.metadata), row.id])
+        """, arguments: [row.lifecycle, row.updatedAt, Self.encodeMetadata(row.metadata), row.validTo, row.id])
         guard db.changesCount > 0 else {
             throw ToolFailureError("Could not demote the memory this update replaces (\(superseding.targetId)).", effects: .none,
                 owner: "memory store", nextCall: ToolFailureError.call("app", ["page": .string("memories")]),
@@ -484,8 +423,7 @@ extension MemoryStorage {
         return row
     }
 
-    @discardableResult
-    public func rejectProposal(id: String, reason: String?) async throws -> StoredTombstone {
+    public func rejectProposal(id: String, reason: String?) async throws {
         try await dbPool.write { db in
             guard let proposal = try Row.fetchOne(db, sql: "SELECT * FROM proposals WHERE id = ?", arguments: [id]).map(Self.decodeProposal) else {
                 throw MemoryStorageError.notFound(id)
@@ -494,103 +432,21 @@ extension MemoryStorage {
                 throw MemoryStorageError.alreadyResolved(id)
             }
             let now = Self.nowISO8601()
-            let hash = Self.contentHash(proposal.content)
-            // Carry the rejected proposal's embedding so paraphrases of the
-            // rejected claim block at the semantic gate (wave1 T2).
-            let tomb = StoredTombstone(
-                contentHash: hash, content: proposal.content,
-                rejectedAt: now, reason: reason, embedding: proposal.embedding,
-                embeddingEpoch: proposal.embeddingEpoch
-            )
+            // Preserve the rejected proposal's embedding so the semantic gate blocks paraphrases.
             try Self.upsertTombstone(
-                db: db, content: tomb.content, reason: tomb.reason,
-                embedding: tomb.embedding,
-                embeddingEpoch: tomb.embeddingEpoch
+                db: db, content: proposal.content, reason: reason,
+                embedding: proposal.embedding,
+                embeddingEpoch: proposal.embeddingEpoch
             )
             try db.execute(sql: """
                 UPDATE proposals SET status = 'rejected', resolved_at = ?, rejection_reason = ?
                 WHERE id = ?
             """, arguments: [now, reason, id])
             try Self.pruneTerminalProposals(in: db)
-            return tomb
         }
     }
 
-    /// Commit duplicate corroboration and proposal resolution together, using
-    /// the memory metadata read under the same SQLite write transaction.
-    func mergeProposal(id: String, intoMemoryID: String, resolvedAt: String) async throws {
-        let updated = try await dbPool.write { db -> StoredMemory in
-            guard let proposal = try Row.fetchOne(
-                db, sql: "SELECT * FROM proposals WHERE id = ?", arguments: [id]
-            ).map(Self.decodeProposal) else {
-                throw MemoryStorageError.notFound(id)
-            }
-            guard proposal.status == "pending" else {
-                throw MemoryStorageError.alreadyResolved(id)
-            }
-            guard var memory = try Row.fetchOne(
-                db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [intoMemoryID]
-            ).map(Self.decodeMemory) else {
-                throw MemoryStorageError.notFound(intoMemoryID)
-            }
-            var metadata: [String: JSONValue] = [:]
-            if case .object(let existing)? = memory.metadata { metadata = existing }
-            let currentCount: Int64 = try {
-                if case .int(let n)? = metadata["recall_count"] { return n }
-                if case .double(let d)? = metadata["recall_count"] {
-                    guard let count = Int64(exactly: d.rounded(.towardZero)) else {
-                        throw MemoryStorageError.databaseUnavailable("merge proposal: recall_count is outside Int64 range")
-                    }
-                    return count
-                }
-                return 0
-            }()
-            let (nextCount, overflow) = currentCount.addingReportingOverflow(1)
-            guard !overflow else {
-                throw MemoryStorageError.databaseUnavailable("merge proposal: recall_count overflow")
-            }
-            metadata["recall_count"] = .int(nextCount)
-            memory.metadata = .object(metadata)
-            memory.updatedAt = Self.nowISO8601()
-            try Self.validateTemporalEvidence(memory)
-            try Self.requireWritableEpoch(in: db, vector: nil, epoch: nil)
-            try db.execute(sql: """
-                UPDATE memories SET metadata_json = ?, updated_at = ? WHERE id = ?
-                """, arguments: [Self.encodeMetadata(memory.metadata), memory.updatedAt, memory.id])
-            try db.execute(sql: """
-                UPDATE proposals SET status = 'merged', resolved_at = ? WHERE id = ?
-                """, arguments: [resolvedAt, id])
-            try Self.pruneTerminalProposals(in: db)
-            return memory
-        }
-        invalidateRecallCache()
-        pokeUserMDRegen(persona: updated.personaId)
-        await pokeProjectionHooks(updated)
-    }
-
-    /// Set a proposal's `status` (and optional `resolved_at`) without going
-    /// through accept/reject. Used by MemoryConsolidator to record 'merged'
-    /// outcomes for proposals deduped against existing active memories.
-    /// No-op when the proposal id isn't found; doesn't enforce a pending
-    /// precondition (consolidator is idempotent and tolerates re-runs).
-    public func markProposalStatus(
-        id: String,
-        status: String,
-        resolvedAt: String?
-    ) async throws {
-        try await dbPool.write { db in
-            try db.execute(sql: """
-                UPDATE proposals SET status = ?, resolved_at = COALESCE(?, resolved_at)
-                WHERE id = ?
-            """, arguments: [status, resolvedAt, id])
-            try Self.pruneTerminalProposals(in: db)
-        }
-    }
-
-    /// U5 W-G fix (2026-06-11): direct by-id lookup. `SwiftNativeMemoryV2.
-    /// getProposal` used to call `listProposals(status: nil)` (full-table
-    /// scan + decode) per lookup, which made the auto-accept sweep O(N²)
-    /// over a multi-hundred-proposal backlog.
+    /// Fetch a proposal directly by id.
     public func getProposal(id: String) async throws -> StoredProposal? {
         try await dbPool.read { db in
             try Row.fetchOne(
@@ -601,20 +457,8 @@ extension MemoryStorage {
         }
     }
 
-    /// 2026-07-21 audit fix: metadata rewrite for the pending-proposal
-    /// content-hash dedup (SwiftNativeMemoryV2.propose merges session
-    /// evidence / recurrence onto the surviving row instead of inserting a
-    /// duplicate). PENDING-ONLY: a resolved proposal's metadata is part of
-    /// its audit trail and must not be rewritten — a non-pending or missing
-    /// id returns nil so the caller falls back to a fresh insert.
-    ///
-    /// `superseded` is the one resolved status this also accepts (Astra comb 4,
-    /// lane5 finding 2). Supersession is bookkeeping, not a person's decision,
-    /// and the successor link IS that row's audit trail: the 2026-09-11 build
-    /// retired `CE41D07E-806A-4794-9F98-AFD44E4AAB7E` with no reason and no
-    /// relationship, and the launch recovery cannot write the link it
-    /// reconstructs without this. `accepted`, `rejected` and `merged` stay
-    /// closed.
+    /// Rewrite pending or superseded metadata; superseded rows need successor links for their audit trail.
+    /// Accepted, rejected, merged and missing rows return nil without a write.
     @discardableResult
     public func updateProposalMetadata(id: String, metadata: JSONValue?) async throws -> StoredProposal? {
         try await dbPool.write { db in
@@ -625,27 +469,6 @@ extension MemoryStorage {
             guard db.changesCount > 0 else { return nil }
             return try Row.fetchOne(db, sql: "SELECT * FROM proposals WHERE id = ?", arguments: [id])
                 .map(Self.decodeProposal)
-        }
-    }
-
-    /// The moments-lane COUNT. A scalar SQL aggregate — no `SELECT *`, no row
-    /// decode, no Swift-side JSON walk — because the nudge line asks this on
-    /// the turn path and only ever needs the number.
-    ///
-    /// The `kind` disjunct mirrors `MemoryMoments.isMoment`: a row staged
-    /// before `lane` existed is identified by its kind, and the SQL must agree
-    /// with the Swift predicate or the nudge would count a different set than
-    /// the tool lists.
-    public func countMomentProposals(status: String?) async throws -> Int {
-        try await dbPool.read { db in
-            var sql = """
-                SELECT COUNT(*) FROM proposals
-                WHERE (json_extract(metadata_json, '$.lane') = 'moment'
-                       OR json_extract(metadata_json, '$.kind') = 'moment')
-            """
-            var args: [DatabaseValueConvertible] = []
-            if let status { sql += " AND status = ?"; args.append(status) }
-            return try Int.fetchOne(db, sql: sql, arguments: StatementArguments(args)) ?? 0
         }
     }
 

@@ -3,9 +3,7 @@ import UIKit
 import NativeAgentShared
 
 extension ChatStore {
-    /// 2026-09-06: a session load reads the same two-state transcript the
-    /// refresh lane does — no row published, or a row that may legitimately be
-    /// empty because the chat was cleared on the Mac.
+    /// Session loading and refresh share MacTranscriptRead's distinction between unavailable and published empty.
     typealias SessionTranscriptLoader = (String?) async throws -> MacTranscriptRead
 
     static func shouldReturnToMainSession(
@@ -25,10 +23,7 @@ extension ChatStore {
         // from one or more Mac snapshots. Never classify that publication gap
         // as an externally removed pinned chat.
         if selected == cleanSessionID(locallyCreatedSessionID) { return false }
-        // 2026-09-06: a conversation the human opened by tapping its reply
-        // notification was never a pinned tab, so its absence from the pinned
-        // snapshot is not evidence of a removed pin. Bouncing it back to the
-        // main chat threw away the conversation they asked to see.
+        // Explicitly opened conversations survive absence from the Mac's pinned snapshot.
         if selected == cleanSessionID(explicitlySelectedSessionID) { return false }
         return !availablePinnedSessionIDs.contains(selected)
     }
@@ -75,55 +70,29 @@ extension ChatStore {
     /// Mirrors loadSelectedSession's
     /// in-flight reset so no stale stream/poll bleeds into the new session.
     func startNewSession() {
-        // A new chat is the human's own choice of session: the chat stops
-        // defaulting to the conversation anchor for the rest of this launch.
-        // "New chat" is otherwise untouched — a real new session, no merge.
-        MobileChatSelectionIntent.noteUserChoice()
-        // 2026-09-06: a new chat is a session change like any other; the
-        // dictation started in the chat being left ends here too.
+        let freshSessionID = UUID().uuidString
+        MobileChatSelectionIntent.selectSession(freshSessionID)
+        // Dictation ends with the conversation it belongs to.
         onSessionChange?()
-        // Escape hatch: usable even while a turn is still "working" — that is
-        // exactly when the user reaches for it (a hung iCloud round-trip leaves
-        // isLoading stuck true). A session history read is cancellable, so a
-        // new chat takes priority and releases the composer immediately.
+        // New chat takes priority over pending history reads and releases the composer immediately.
         cancelSessionSwitch()
         sendTask?.cancel()
         sendTask = nil
-        // Detach observation without discarding an unaccepted signed handoff.
-        // Clearing the pending maps alone makes their eventual signed replies
-        // look unsolicited. Retire every old correlation first so sessionless
-        // stragglers are rejected as well as replies carrying the old session id.
+        // Retire old visible correlations, including sessionless replies, while retaining signed handoffs.
         let retiringCorrelations = Set(pendingICloudPlaceholders.keys)
-            .union(pendingSendArgs.keys)
             .union(timedOutPendingIds.keys)
             .union(maxDeltaSeqByCorrelation.keys)
+            .union(pendingTimeouts.keys)
         for correlationID in retiringCorrelations {
             markICloudReplyResolved(correlationID, discardRetainedSend: false)
         }
-        pendingTimeouts.values.forEach { $0.cancel() }
-        pendingTimeouts.removeAll()
-        pendingPolls.values.forEach { $0.cancel() }
-        pendingPolls.removeAll()
-        pendingICloudPlaceholders.removeAll()
-        pendingSendArgs.removeAll()
-        retriedSignatureCorrelations.removeAll()
-        timedOutPendingIds.removeAll()
-        expiredPendingIds.removeAll()
-        streamingHintsByMessageId.removeAll()
-        maxDeltaSeqByCorrelation.removeAll()
-        // 2026-09-06: both sets name rows of the session being left.
         isPollingFallback = false
         errorBanner = nil
-        // The in-flight turn (if any) was just cancelled above; a brand-new
-        // session has nothing loading. Without this, a stuck isLoading would
-        // persist into the new session and keep the composer + this button
-        // disabled — the very freeze this escape hatch exists to clear.
+        // The fresh session starts with an unlocked composer.
         isLoading = false
         // Switch to the fresh id BEFORE clearing messages so the empty
         // transcript never persists over the previous session.
-        let freshSessionID = UUID().uuidString
         markLocallyCreatedSession(freshSessionID)
-        MobileChatSelectionIntent.noteNotifiedSelection(freshSessionID)
         setSelectedSessionID(freshSessionID)
         messages = []
         lastRefreshAt = .distantPast
@@ -139,43 +108,23 @@ extension ChatStore {
     private func loadSelectedSession(
         loadTranscript: @escaping SessionTranscriptLoader
     ) {
-        // 2026-09-06: every switch that actually changes conversation lands
-        // here (switchSession, switchToMainSession, the evaluation variant);
-        // startNewSession is the only other one and calls this hook itself.
+        // Every conversation change ends dictation at its owner.
         onSessionChange?()
         sendTask?.cancel()
         sendTask = nil
         // Detachment retires visible callbacks, not the retained transport queue.
         let retiringCorrelations = Set(pendingICloudPlaceholders.keys)
-            .union(pendingSendArgs.keys)
             .union(timedOutPendingIds.keys)
             .union(maxDeltaSeqByCorrelation.keys)
+            .union(pendingTimeouts.keys)
         for correlationID in retiringCorrelations {
             markICloudReplyResolved(correlationID, discardRetainedSend: false)
         }
-        pendingTimeouts.values.forEach { $0.cancel() }
-        pendingTimeouts.removeAll()
-        pendingPolls.values.forEach { $0.cancel() }
-        pendingPolls.removeAll()
-        pendingICloudPlaceholders.removeAll()
-        pendingSendArgs.removeAll()
-        retriedSignatureCorrelations.removeAll()
-        timedOutPendingIds.removeAll()
-        expiredPendingIds.removeAll()
-        streamingHintsByMessageId.removeAll()
-        // PATCH-2026-05-30: session switch — clear text_delta seq tracking too.
-        maxDeltaSeqByCorrelation.removeAll()
-        // 2026-09-06: both sets name rows of the session being left.
         isPollingFallback = false
         isSwitchingSession = true
         sessionSwitchGeneration &+= 1
         let switchGeneration = sessionSwitchGeneration
-        // 2026-09-06: the turn that owned `isLoading` was just cancelled and
-        // its pending maps emptied above; only `isSwitchingSession` was ever
-        // cleared at the end. Loading is a property of the turn, not of the
-        // app, so a switch made during a reply left the destination chat
-        // showing a spinner and a disabled composer forever. Ordered after
-        // `isSwitchingSession = true` so the didSet's queue drain stays gated.
+        // Gate queue draining before releasing the previous turn's composer.
         isLoading = false
         errorBanner = nil
         let loadingSessionID = selectedSessionID
@@ -192,8 +141,7 @@ extension ChatStore {
                 self.restorePendingExchanges(for: loadingSessionID)
                 self.lastRefreshAt = Date()
             } catch is CancellationError {
-                // The explicit cancellation owner clears the gate immediately;
-                // defer remains as a backstop for a cooperative loader.
+                // cancelSessionSwitch releases the gate; deferred cleanup is guarded by the switch generation.
             } catch {
                 guard !Task.isCancelled, self.selectedSessionID == loadingSessionID else { return }
                 errorBanner = "Could not load this chat."

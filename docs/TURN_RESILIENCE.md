@@ -1,16 +1,14 @@
 # Turn resilience map
 
-> One structure (docs/NORTHSTAR.md, first law): this doc is part of one whole. A change here is molded into every doc that states the same thing, in the same commit, with what comes out named; a contradiction is a defect.
-
 How a turn keeps working, stops, and leaves evidence. One brain, many doors:
 `EngineRuntime/EngineTurns.swift` holds Mac turn state through
 `MacChatTurnRuntime`; `ChatTurnRuntime` owns the shared turn engine.
 Source paths below are relative to `Modules/NativeAgentCore/Sources/`.
 
-Agent's one always-on tool is `app`. `app {}` returns home, where they left
+The agent's one always-on tool is `app`. `app {}` returns home, where they left
 off; `page`, `item`, `find`, `action` and `script` reach its contents.
-`AppToolRuntime/AppActionRegistry.swift` defines the actions and
-`AppScriptRunner.swift` runs JavaScriptCore scripts. The model-facing tool
+`AppToolRuntime/AppActions+Declarations.swift` defines the actions and
+`AppScriptRunner.swift` binds scripts to the shared executor. The model-facing tool
 contract is in [Tool loading](TOOL_LOADING.md).
 
 ## The rule each piece follows
@@ -31,19 +29,18 @@ contract is in [Tool loading](TOOL_LOADING.md).
 
 ### 1. One clean exit
 
-`ChatTurnRuntime/ChatOrchestration+StreamingToolLoop.swift` continues until
-the model answers with no calls or pending work. Stop interrupts; a Mac
-takeover waits for the person. A result waiting on an approval or a question
-reaches their part like any other, with the card it waits on: they says what they
-says and the turn ends waiting, the card still gating the effect and its
-answer resuming the request. The card is the effect's one execution claim:
+The turn part's `reply.end` ends conversational work, including incomplete
+provider-failure outcomes. Stop interrupts; Mac takeover waits for the person.
+An approval or question reaches their part with its card; their reply can end
+waiting while the card gates the effect and its answer resumes the request.
+The card is the effect's one execution claim:
 while it is undecided, the same call (tool and arguments) proposed again runs
 nothing and gets the card's waiting receipt; after the decision, one
 re-proposal gets the card's receipt, and an identical call after that is a
-fresh invocation through the gate. There is no iteration or
-whole-turn clock limit. Helper owners can still request a per-run token budget;
-when it is spent their part reads a `provider_failure` receipt naming the cap and
-its control, and ends the turn, incomplete, on what was written.
+fresh invocation through the gate. Ordinary conversation has no universal clock or iteration limit.
+Each dispatch batch lazily reads claimed cards once, retaining the records or the read failure.
+Callers may bound [practice and helper work](AGENT_IS_THE_APP.md#practice-compiles-the-night-as-built-10-27)
+with output budgets and active-work deadlines; a spent output budget returns `provider_failure`, naming the cap and its control, and ends the turn incomplete.
 Mac takeover suspends the same conversation on `MacAttentionSessionStore`'s
 driver-change stream. Returning control continues from the recorded results;
 task cancellation or the run-tagged Stop flag releases the wait. A waiting turn
@@ -51,9 +48,7 @@ keeps the return-control action reachable under Full Mac.
 
 ### 2. Progress
 
-Tool results reach their unchanged by repetition coaching. L17/L18/L19's
-no-progress detectors, model nudges and canned person-facing notice were
-retired on 2026-10-22 after the reported four-day silent receipt window.
+Tool results reach their unchanged by repetition coaching.
 Whether to continue from the results is theirs.
 
 ### 3. Tool dispatch deadline
@@ -63,14 +58,28 @@ Whether to continue from the results is theirs.
 use the underlying tool's name and arguments to select their deadline.
 Defaults are 900 seconds for interactive work and 3,900 for unattended work;
 an integer `timeout_seconds` is clamped to 30–3,600 seconds plus a 30-second
-cleanup margin. Tool-specific defaults can differ.
+cleanup margin. Tool-specific defaults can differ. The deadline bounds time without
+progress: a part that carries itself (`{again: input}`) renews it with every run.
+Expansion's speculative delivery instead uses a wall-clock ceiling: progress
+and a person's wait cannot renew or pause the bound on the original result.
 
 `NATIVE_AGENT_TOOL_DISPATCH_TIMEOUT_SECONDS` overrides this policy;
 nonpositive or nonfinite values disable the dispatch backstop. Expiry returns
 model-visible error feedback stating that effects may already have occurred.
 The deadline helper delegates to `NativeAgentCore/TurnDeadline.swift`, whose
-resume-once race releases the caller without waiting for uncooperative work.
+inner resume-once race selects the timeout outcome without waiting for
+uncooperative work. The dispatch still joins its actual body's settlement
+before returning, and the outer path joins the retained dispatch, as required
+by [Stop's dispatch lifetime law](STOP.md).
+Its resolved state carries the value directly, including cancellation before
+the waiter arrives; nested human waits keep tokens rather than an integer
+counter. The helper refuses nonfinite, negative or unrepresentable seconds
+before constructing a duration.
 Cancellation of that work is not proof that its effects stopped or rolled back.
+
+The resident loop refuses a part's out-of-round call index before dispatch.
+A restored negative commentary length contributes no commentary, and a helper
+round with missing tool results is refused before formatting its feedback.
 
 ### 4. Provider timeouts
 
@@ -82,14 +91,14 @@ bounded to 0–86,400 seconds, with zero disabling that timeout. Background
 calls use the same settings. Idle time is wire activity (headers, SSE
 comments, events); a cut is the typed `ProviderFailure.noReply`, and every
 stream failure's `Diagnostic` records whether the provider admitted the request.
-Until anything arrives on the wire (headers, comments, events), the guard
-also cuts at the provider's first-output deadline: a connection that never
-opened or hung before headers. A live wire is a provider thinking, bounded by
-idle and wall. The deadline is the slowest adapter `ttftMs` of its retained
-calls on that model and stream kind (`ProviderVitalsSensor`: read from the trace's `llm.call` rows at
-launch, joined by each live call's `ttftMs`, nothing written). Under 100 calls
-it is unmeasured and only the wall stands; buffered kinds record no `ttftMs`,
-so idle and wall bound them.
+An HTTP request awaiting its response head uses the same idle, wall and
+learned first-output bounds as the answer. There is no separate fixed
+response-head timer: a provider can withhold headers during prefill or thought,
+so cutting that wire early can repeatedly restart real work. Before any wire
+activity, the learned first-output deadline applies: the slowest retained adapter `ttftMs` on that model and
+stream kind (`ProviderVitalsSensor`, from trace `llm.call` rows at launch and
+live calls). Under 100 calls it is unmeasured; buffered kinds record no `ttftMs`.
+A live wire is bounded by idle and wall; between attempts only the wall runs.
 The cut text says the seconds waited, what arrived, and that evidence.
 The request's progress writer wakes deadline evaluation, registered before the
 state read; no interval samples it. Termination closes activity admission and
@@ -99,16 +108,21 @@ Wall-off streams retain their existing behavior without a deadline worker.
 Error-body diagnostics use their byte writer's wake with the same idle threshold
 and absolute cap, return partial bytes on read timeout, and preserve user cancellation.
 
-Buffered Anthropic lanes and interactive Codex still send operation-owned
-synthetic keep-alives. They hold the idle guard open while those calls cannot
-produce incremental output; they prove neither provider progress nor first
-output. Removal remains gated on a guard-visible buffered-call lifecycle.
+Anthropic-compatible message streams, including tool-free API and Kimi Code
+calls, use SSE. Buffered transports such as interactive Codex expose no wire
+progress and use only the configured wall deadline; synthetic keep-alives
+prove neither provider progress nor first output.
+Anthropic's event consumer owns frame validation, timing, text/thinking liveness,
+usage and terminal receipts for both native-tool and OAuth text-marker streams;
+native signed-thinking replay and tool commitment remain payload handling.
 
 `ProviderRouting/LLMClient+Real.swift` wraps streams with the configured
 per-call guard and uses `withCompletionWall` for buffered calls. A guard cut
-is input to recovery, never a whole-turn deadline: their turn part asks again
-once only when `retry_now` permits it, the wire has not redialed, nothing ran
-and no repair is owed. Otherwise it says the failure.
+is input to recovery, never a whole-turn deadline. Before any answer arrives,
+sent HTTP calls can redial for lost wires, overload or retryable rate limits,
+up to ten total attempts within the call's wall. Separately, their turn part asks
+again once only when `retry_now` permits it, the wire has not redialed, nothing
+ran or was sent, and no repair is owed. Otherwise it says the failure.
 
 ### 5. In-loop provider recovery
 
@@ -137,7 +151,6 @@ Repeated blocks/actions, invented results and prose after a call are
 correctness boundaries: complete
 calls before the cut run and their results carry the observation. The third
 identical read in one reply is a boundary even when other reads intervene.
-Line-density and inline short-unit rules and harness notices are removed.
 
 Authentication, missing configuration/routing and unavailable-model errors
 still name the needed repair; a thrown turn ends failed rather than persisting
@@ -153,7 +166,7 @@ existing meaning. Streaming surfaces keep editing the same reply after cuts.
 
 ### 7. Cancellation trace
 
-`ChatTurnRuntime/ChatOrchestrationClient+StructuredChat.swift` records
+`ChatTurnRuntime/ChatTurnSettlement.swift` records
 `turn.cancelled` with a `where` field and persists the visible partial.
 `EngineRuntime/EngineTurns.swift` delegates Mac Stop to `MacChatTurnRuntime`.
 Stop (the run's cancel flag) is the one cancel link: it cancels the turn's
@@ -161,10 +174,9 @@ work at once, wherever it waits. The Mac registers the run at admission,
 before any await, so a Stop always names the live run. A door that stops listening only detaches;
 the accepted turn runs on and lands in its transcript.
 
-At dispatch, a call stopped before it starts has a skipped result; an already
-started call carries `effects_unknown: true`. A late tool result cannot replace
-the first terminal outcome of the dispatch race. Check the action's receipt
-and current state before trying it again.
+At dispatch, a call stopped before it starts carries `execution:not_run` and `effects:none`; an already started call carries `execution:attempted` and `effects:unknown`.
+A late tool result cannot replace the dispatch race's first terminal outcome.
+Check the action's receipt and current state before trying it again.
 
 ### 8. Context compaction
 
@@ -184,45 +196,132 @@ Trace `context.intraTurnCompaction` records the mode, trigger and size change;
 the status notice is `context_compaction`.
 
 Persisted history has a separate owner:
-`ChatSessionWork/ChatSessionAutocompactor.swift`. It creates and verifies a
-backup before replacing older rows with a recollection, retains pending cards
-and recent rows, and writes durably. `ChatCompactionDistiller.swift` writes the
-recollection; one that fails leaves its summary pending, unrendered, with the
-original turns in the backup and its repair owed. A turn
+`ChatSessionWork/ChatSessionAutocompactor.swift`. Background aging starts at
+85% of the effective compaction threshold; the pre-turn backstop stays at
+100%. Aging distills with the transcript unchanged and unlocked. If the
+backstop replaces its source meanwhile, the turn waits for the foreground
+pending recollection and aging discards its stale result at the prefix check.
+Neither lane waits for the other's model call under the transcript lock.
+
+Transcript status, aging and compaction share `ContextBudgetPolicy.transcriptCharactersPerToken`
+(3.5), an approximation where tokenizer counts are unavailable, independent of
+model-name spelling. Prompt assembly deliberately uses a separate 3.2-character
+safety factor. The copied 3.5/4.0 model-name switches are removed.
+
+Both lanes fold only enough oldest turns to leave about 55% of the effective
+threshold as raw history, rather than retaining a fixed number of rows.
+At a 240k threshold, the first 85% crossing is about 204k raw tokens: about
+72k fold and 132k stay verbatim. Earlier recollections do not spend that raw
+allowance; preserved live cards/results do. The cut keeps the user's turn
+intact and respects the dream mark, so those boundaries can leave more raw
+history. An explicit manual fold below that target instead keeps half of its
+smaller raw stretch.
+
+An ordinary fold creates and verifies a backup, retains earlier recollection
+blocks verbatim (including their original line bytes), pending cards and
+recent rows, and appends new blocks after the earlier blocks in source order.
+The compactor carries its selected source into `ChatCompactionDistiller`,
+recovering pending source once from the verified backup and recorded retention
+metadata. The distiller receives only the newly folded stretch; no prior
+stored recollection is merged into every output. Its `+SourceComposition.swift`
+extension splits that stretch into consecutive chunks of at most 32,000 rendered
+source characters (roughly 8k prose tokens; smaller on a constrained model window).
+Chunk planning uses overflow-safe source totals and ceiling division; every
+selected row still enters the chunks in order.
+Each block targets one fifth of its own chunk: up to 6,400 characters, with
+a proportional one-third cap of at most 10,666 and a one-tenth minimum (models miss an exact length; a near miss must not fail the fold).
+The allowance scales down with smaller chunks; a rich source cannot pass as
+a few headline sentences. Block-local receipt notes and a preserved-card
+clause sit outside that body allowance. Each block records its own coverage
+and continuity provenance. The latest tool-receipt pointer belongs to that
+block's source, never a changing shared header.
+First-person chronology, meaningful quotes, people, decisions and their
+reasons, promises, open threads, emotional continuity, corrections and action
+receipts remain the distiller's quality rules. A wide row is split without
+clipping its tail; its original coverage/provenance follows each piece.
+Whole-row preference merges a tail below half the nominal chunk budget with
+its neighbour when the source ceiling allows, preserving split-row boundaries.
+Quotes remain verbatim but their count is
+limited by available source lines and the block allowance; genuinely tiny
+sources can use fewer quotes or paraphrase within their proportional cap.
+
+All chunks distill concurrently, with no serial interim rewrite. Results
+are ordered before one durable transcript replacement; a failed, empty,
+undersized or oversized chunk fails the entire fold visibly, with no partial
+blocks stored. Once every valid block has returned, `settle` commits it,
+publishes the transcript change and records its terminal trace even after Stop;
+the locked destination/prefix checks still reject stale results. Stop before a
+complete fold leaves its pending source intact. At 48–55 output tokens/second, a full
+chunk's ~1,600-token target takes about 29–34 seconds of output, or 49–56
+seconds at its ~2,667-token cap (10,666 characters at roughly four characters
+per token). Concurrent wall time follows the slowest chunk plus commit
+overhead, rather than the sum of chunk times. These output-rate estimates are
+not installed measurements or deadlines:
+provider queueing, reasoning, prefill and concurrency limits can extend it.
+The existing 300-second aging cancellation deadline remains.
+
+At a needed compaction pass, earlier blocks can themselves fold when their
+leading run exceeds 10% of the effective context window and 8,000 characters.
+Each selected group must exceed 8,000 characters; it uses the same consecutive
+chunks, proportional detail and atomic ordered commit, without crossing the
+dream high-water mark. This is the rare exception to append-only recollection,
+and raw newer turns stay outside that rollup.
+Existing on-disk recollections need no migration and keep their 40,000-character
+history read allowance; an existing pending fold still reads its retained
+backup, including prior recollections it already replaced.
+
+A failed foreground distillation leaves its block pending, unrendered, with
+the original turns in the backup and its repair owed. A failed aging pass
+leaves its source in the live transcript. Prompt history retains every
+recollection in transcript order. Its replayed head is pinned by the shared
+row/character window cursor, whose exact boundary the reader retains; opening
+anchors are dropped through that boundary. See the
+[prompt layout](ANATOMY_OF_A_TURN.md#how-prompt-caching-reduces-token-cost).
+A turn
 whose pre-turn compaction did not finish answers from the history that is
 there, and its message carries the failure and its repair call.
 Compaction is bounded summarization, not lossless retention.
 
 ### 9. Process continuation
 
-`TurnTrace/AbandonedTurnReconciler.swift` owns the small atomic checkpoint at
+`TurnTrace/AbandonedTurnReconciler.swift` owns the small durably committed checkpoint at
 `chat/session_state/<session>/turn-<turnId>.json` (a worker, which has no
 conversation, owns `chat/session_state/worker-<runId>/` and removes it when it
-ends). Acceptance writes it before
-any context is built; the shared loop writes it again before each provider
-iteration and before dispatch, its part log carrying their final words for a
-resume to settle with; durable tool receipts
-advance its step count and the turn's steering peers in the same checkpoint
-write. Receipts retain the sources their results labelled (provenance); a
-steered turn's checkpoint keeps its steering peers and the person's answer, so
-a resume continues under the same one card, never a second. It keeps identity, input, envelope and reply
-route, iteration, kept prose, working notes and a possibly running step, never the
+ends). Writes flush the encoded bytes and parent directory through PersistenceCore's
+durable atomic writer before returning. Acceptance writes it before
+any context is built; the shared loop saves its part log at effect boundaries,
+including their final words for a resume to settle with. `runningStep` is a
+1-or-nil sentinel for in-flight calls, never a step index or iteration count;
+durable receipts update that presence and the turn's steering peers together.
+Receipts retain their results' labelled sources (provenance); a checkpoint
+keeps steering peers and the person's answer so a resume uses the same card.
+It keeps identity, input, envelope, reply route, kept prose, working notes and replay evidence, never the
 provider message array. Input attachment bytes stay in `chat/attachments/`;
 their existing transcript metadata supplies the saved paths.
 
-At launch, the reconciliation hook discovers checkpoints independently of the
-legacy trace window and excludes the in-flight registry and claimed resumes.
-An unreadable trace day or checkpoint owes its own repair; every readable
-checkpoint still resumes.
+The reconciliation hook discovers checkpoints independently of the legacy
+trace date window and excludes the in-flight registry and claimed resumes.
+An unreadable checkpoint does not prevent discovery of readable siblings.
+Resume admission also requires the checkpoint's necessary terminal evidence
+to have clean trace coverage; an unreadable required day or checkpoint owes
+repair rather than admitting that resume.
 `EngineRuntime/EngineTurnContinuation.swift` restores the original admission,
 surface capabilities, peer provenance, helper ownership and delivery route.
+File-write verification rejects negative saved byte counts and checks read
+arithmetic before dispatch; malformed saved sizes cannot abort recovery.
+It hashes authorized file-read windows incrementally under one file version,
+including raw binary bytes where supported. The read owner's window cap is
+not a file-size cap. Incomplete, changed or refused observations are named
+separately from a witnessed byte-count or digest mismatch.
 `ChatOrchestration+Continuation.swift` re-enters the shared loop under the old
 runId and turnId with `suppressUserAppend: true`. It rebuilds the current turn
 from the durable user row and the same tool-receipt projection later turns use,
 restores working notes and kept prose, and applies `TurnObservation.restarted`.
 Saved dispatch receipts also rebuild delivery artifacts; generated-image paths
 survive transcript body clipping. Mac recovery connects the existing stream
-adapter and lifecycle intake under the saved identity.
+adapter and lifecycle intake under the saved identity. Once that turn settles,
+its reservation is released and Send-next drains through normal queue admission,
+which keeps stopped or paused queues held.
 An unrecorded effect is unknown, not permission to repeat it; the restart
 observation names each call their part's log shows started without a receipt
 (tool and redacted arguments), and an attached Desk journal admits the same
@@ -230,18 +329,28 @@ call proposed again (tool and argument digest) as that unresolved step, so its
 receipt settles it instead of a fresh step beside it. Oversize-result
 pages cannot survive the process; the observation says they are unavailable.
 
-Terminal settlement retains a completed restart-resume checkpoint only when
-it is not helper-owned and its shared completion route has a redelivery owner
-(Telegram, Slack, iOS or caller-result). It atomically marks deliveryPending
-before the durable terminal append, then the existing reply owner removes it
-after completed delivery. Every other terminal removes its checkpoint after
-the durable append. All terminals retire the live spill scope; Mac recovery
+Terminal settlement retains a checkpoint when status is completed or waiting
+and `hasRedeliveryOwner` holds: no stopped reason or helper owner, and a
+Telegram, Slack or iOS reply route. It durably marks `deliveryPending` before
+the terminal append; the reply owner removes it after delivery settlement.
+Other terminals remove their checkpoint after the durable append. All retire the live spill scope; Mac recovery
 still posts chatTurnCompleted to refresh its transcript without pushed delivery.
 If the answer was already saved, recovery uses it without another provider call.
 Pending checkpoints with no redelivery owner retire at launch with one
 turn.checkpoint_retired trace row; bridge responses and internal helper turns
 leave no pending checkpoint. Scheduled helpers settle through BotRunner.
 Terminal persistence awaits its own append, without draining process-wide telemetry.
+
+Turn cards render an invalid or unrepresentable elapsed interval as
+“Duration unavailable”; a finite saved date alone does not establish a
+representable duration.
+
+The composer's context receipt requires complete trace-read coverage for
+today and yesterday before identifying the latest accepted turn or claiming
+there is none. A truncated window, malformed rows or an unfinished final row
+produces an unavailable receipt with that coverage gap, never an older receipt
+presented as the latest turn.
+
 Live terminal deduplication matches decoded rows by turn and status; unrelated
 malformed or torn rows do not prevent the known terminal from landing. The
 canonical JSONL writer closes a torn tail before appending the new row. Recovery
@@ -250,12 +359,22 @@ An existing Desk journal stays attached to its original item; its scheduler
 does not compete with checkpoint recovery. Ordinary turns acquire no Desk item.
 There is no process-resume count limit or new timer.
 
-Turns from older builds with no checkpoint keep guarded legacy reconciliation:
-`turn.terminal` with `status: "abandoned"` and
-`observedBy: "terminal_reconciliation"`. Their existing remote system note and
-Mac outcome-unknown card say, “This reply did not finish before the app restarted.”
-The hook reuses settled-boundary sweeps, throttled to once every five minutes;
-those legacy scans do not bound checkpoint discovery or the running turn.
+For an accepted turn with no checkpoint or confirmed terminal, guarded legacy
+reconciliation records an experience-backed recovery obligation with the stable
+identity `turn-recovery:<turnId>`. Restore its checkpoint from retained evidence
+before resuming; do not repeat uncertain effects. The current writer does not
+emit an abandoned terminal or append a remote restart note.
+
+Retained historical evidence can include `turn.terminal` with
+`status: "abandoned"` and `observedBy: "terminal_reconciliation"`, plus the old
+remote system note or Mac outcome-unknown card saying, “This reply did not finish
+before the app restarted.” Reader compatibility with those rows does not make
+them a current reconciliation output.
+
+Launch and eligible settled-boundary sweeps use the same reconciliation hook.
+Its five-minute gate applies before the shared sweep, including checkpoint
+discovery. The legacy trace date window does not bound checkpoint discovery,
+and this sweep cadence imposes no clock limit on a running turn.
 
 ### 10. Bridge deadlines
 
@@ -268,7 +387,7 @@ resend merely because the response is pending.
 
 ### 11. Mobile action uncertainty
 
-The repository's `iOS/NativeAgentMobile/Sources/iCloudSyncEngine+Actions.swift`
+The repository's `iOS/NativeAgentMobile/Sources/iCloudSyncEngine+Transactions.swift`
 retains signed CloudKit action envelopes before submission. Retries of an
 unresolved action reuse the original signed message and transaction, including
 after relaunch. Ambiguous delivery remains `outcome_unknown`. While an identical
@@ -278,9 +397,25 @@ message identity.
 
 ## Reading a stopped turn
 
-`TurnTrace/TurnTrace.swift` writes `turn_traces/<yyyy-MM-dd>.jsonl` under
+`TurnTrace/TurnTracePersistLane.swift` writes `turn_traces/<yyyy-MM-dd>.jsonl` under
 the data root. Group events by `turnId`, then read `kind`, `ts`, `surface`
 and the terminal payload together:
+
+Date-based trace retention deletes only regular files, checking entry type
+without following symlinks before locking and again before deletion. Unsupported
+entries and paths outside the data root are preserved and reported as errors.
+
+Trace token and duration measurements accept nonnegative integers and use
+checked accumulation. Invalid or unrepresentable totals report damaged evidence;
+Inspector leaves the total unavailable and shows the measurement error in the
+turn's first row. Statistics fail explicitly rather than returning wrapped totals.
+
+Usage totals read the same reconciled evidence as model-call statistics: daily
+turn traces plus standalone `traces/events.jsonl` calls, matched historical copies
+counted once. Usage preserves malformed-row, partial-line and turn-read coverage;
+damaged coverage returns `incomplete` with the recorded totals.
+Model-call statistics derive heavy-turn titles and dispatch descriptions from
+that first week's snapshot, including `work.identified`, without rereading days.
 
 | Evidence | What to inspect |
 |---|---|
@@ -288,5 +423,5 @@ and the terminal payload together:
 | `context.intraTurnCompaction` | Trigger, mode and before/after size. |
 | `turn.cancelled` | The `where` field and any interrupted action's effects. |
 | `turn.failed` or `turn.terminal` | The recorded outcome and reason. |
-| Terminal from `terminal_reconciliation` | A previous process left the turn unfinished. |
+| Historical terminal from `terminal_reconciliation` | An older build recorded that a previous process left the turn unfinished; current reconciliation records recovery obligations. |
 | No terminal | Check process continuity and the last recorded boundary; a missing row alone does not identify the cause. |

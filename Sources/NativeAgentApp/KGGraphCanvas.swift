@@ -3,7 +3,7 @@ import MemoryV2
 // Blueprint: | `KGGraphCanvas.swift` | `KGGraphCanvas` struct |
 
 // ---------------------------------------------------------------------------
-// MARK: - KGGraphCanvas — node-link force-directed graph (F3)
+// MARK: - KGGraphCanvas — node-link force-directed graph
 // ---------------------------------------------------------------------------
 //
 // Hand-rolled spring-mass relaxation (Fruchterman-Reingold flavor): 10 fixed
@@ -30,45 +30,30 @@ struct KGGraphCanvas: View {
     private let nodeRadius: CGFloat = 14
     private let hitRadius: CGFloat = 22
 
-    /// One canonical graph slice drives drawing, hit testing, and force layout.
-    /// This prevents duplicated/blank ids or edges outside the current filter
-    /// from creating invisible physics participants.
-    private var visibleEntities: [KnowledgeGraphEntity] {
-        KGGraphCanvasLayout.canonicalEntities(entities)
-    }
-
-    private var visibleEdges: [KnowledgeGraphEdge] {
-        KGGraphCanvasLayout.visibleEdges(edges, among: visibleEntities)
-    }
-
-    private var renderSafety: KGGraphCanvasLayout.RenderSafety {
-        KGGraphCanvasLayout.renderSafety(for: entities)
-    }
-
     var body: some View {
+        // One canonical slice serves drawing, accessibility and layout inputs.
+        let nodes = KGGraphCanvasLayout.canonicalEntities(entities)
+        let links = KGGraphCanvasLayout.visibleEdges(edges, among: nodes)
+        let signature = KGGraphCanvasLayout.signature(entities: nodes, edges: links)
         GeometryReader { geo in
             Group {
-                switch renderSafety {
+                switch KGGraphCanvasLayout.renderSafety(entityCount: nodes.count) {
                 case .render:
                     ZStack {
                         Canvas { ctx, size in
-                // Resolve the canonical slice once per draw. Recomputing it
-                // for every label sorts/deduplicates the full graph per node.
-                let drawnEntities = visibleEntities
-                let drawnEdges = KGGraphCanvasLayout.visibleEdges(edges, among: drawnEntities)
                 let labels = KGGraphCanvasLayout.labelFrames(
-                    entities: drawnEntities, positions: positions, in: size,
+                    entities: nodes, positions: positions, in: size,
                     selectedID: selectedId, nodeRadius: nodeRadius
                 )
                 // Edges first so node circles overlay them.
-                for edge in drawnEdges {
+                for edge in links {
                     guard let p1 = positions[edge.from], let p2 = positions[edge.to] else { continue }
                     var path = Path()
                     path.move(to: p1)
                     path.addLine(to: p2)
                     ctx.stroke(path, with: .color(.secondary.opacity(0.35)), lineWidth: 1)
                 }
-                for entity in drawnEntities {
+                for entity in nodes {
                     guard let p = positions[entity.id] else { continue }
                     let color = KGEntityRow.typeColor(entity.type)
                     let isSelected = entity.id == selectedId
@@ -100,7 +85,7 @@ struct KGGraphCanvas: View {
                         .background(Color.gray.opacity(0.04))
                         .accessibilityLabel("Knowledge graph")
                         .accessibilityChildren {
-                            accessibleNodes
+                            ForEach(nodes) { accessibleNode($0) }
                         }
                         .gesture(
                             DragGesture(minimumDistance: 0)
@@ -108,7 +93,7 @@ struct KGGraphCanvas: View {
                                     hitTest(at: value.location)
                                 }
                         )
-                        if visibleEntities.isEmpty {
+                        if nodes.isEmpty {
                             ContentUnavailableView(
                                 "No renderable graph nodes",
                                 systemImage: "exclamationmark.triangle",
@@ -125,11 +110,9 @@ struct KGGraphCanvas: View {
                     )
                 }
             }
-            .task(id: "\(graphSignature):\(geo.size)") {
+            .task(id: "\(signature):\(geo.size)") {
                 let size = geo.size
                 guard size.width > 1, size.height > 1 else { return }
-                let nodes = visibleEntities
-                let links = visibleEdges
                 let radius = nodeRadius
                 let worker = Task.detached(priority: .userInitiated) {
                     KGGraphCanvasLayout.positions(entities: nodes, edges: links, in: size, nodeRadius: radius)
@@ -145,12 +128,6 @@ struct KGGraphCanvas: View {
         }
     }
 
-    private var accessibleNodes: some View {
-        ForEach(visibleEntities) { entity in
-            accessibleNode(entity)
-        }
-    }
-
     private func accessibleNode(_ entity: KnowledgeGraphEntity) -> some View {
         let selectionValue = selectedId == entity.id ? "Selected" : ""
         return Button(action: { selectedId = entity.id }) {
@@ -159,19 +136,13 @@ struct KGGraphCanvas: View {
         .accessibilityValue(Text(verbatim: selectionValue))
     }
 
-    private var graphSignature: String {
-        // Relationships participate in force attraction, so an edge-only
-        // refresh must invalidate the cached positions as well as a node edit.
-        KGGraphCanvasLayout.signature(entities: visibleEntities, edges: visibleEdges)
-    }
-
     private func hitTest(at point: CGPoint) {
         var best: (id: String, dist: CGFloat)?
         for (id, p) in positions {
             let dx = p.x - point.x
             let dy = p.y - point.y
             let d = (dx * dx + dy * dy).squareRoot()
-            if d <= hitRadius, best == nil || d < best!.dist {
+            if d <= hitRadius, best.map({ d < $0.dist }) ?? true {
                 best = (id, d)
             }
         }
@@ -180,18 +151,9 @@ struct KGGraphCanvas: View {
         }
     }
 
-    /// `String.hashValue` is deliberately seeded per process, so it cannot
-    /// back a stable graph layout across relaunch. This fixed FNV-1a digest is
-    /// only a layout seed, never an identity or security primitive.
-    static func stableSeed(for id: String) -> UInt64 {
-        KGGraphCanvasLayout.stableSeed(for: id)
-    }
 }
 
-/// The real graph-canvas layout owner. Keeping its inputs and output explicit
-/// makes the renderer's safety boundary executable without a SwiftUI snapshot:
-/// only unique, named nodes and edges whose two endpoints are on the canvas may
-/// influence layout or selection geometry.
+/// Only unique, named nodes and edges with visible endpoints influence layout.
 enum KGGraphCanvasLayout {
     static func compactLabel(_ name: String) -> String {
         let normalized = name.split(whereSeparator: \.isWhitespace).joined(separator: " ")
@@ -241,8 +203,7 @@ enum KGGraphCanvasLayout {
         case tooLarge(entityCount: Int)
     }
 
-    static func renderSafety(for entities: [KnowledgeGraphEntity]) -> RenderSafety {
-        let entityCount = canonicalEntities(entities).count
+    static func renderSafety(entityCount: Int) -> RenderSafety {
         return entityCount <= maximumRenderableEntities
             ? .render(entityCount: entityCount)
             : .tooLarge(entityCount: entityCount)
@@ -306,13 +267,13 @@ enum KGGraphCanvasLayout {
             var displacement: [String: CGPoint] = Dictionary(
                 uniqueKeysWithValues: ids.map { ($0, .zero) }
             )
-            for index in 0..<ids.count {
+            for (index, firstID) in ids.enumerated() {
                 guard !Task.isCancelled else { return [:] }
-                let firstID = ids[index]
-                let first = positions[firstID]!
-                for otherIndex in (index + 1)..<ids.count {
-                    let secondID = ids[otherIndex]
-                    let second = positions[secondID]!
+                guard let first = positions[firstID] else { continue }
+                for secondID in ids.dropFirst(index + 1) {
+                    guard let second = positions[secondID],
+                          let firstDisplacement = displacement[firstID],
+                          let secondDisplacement = displacement[secondID] else { continue }
                     var dx = Double(first.x - second.x)
                     var dy = Double(first.y - second.y)
                     var distance = (dx * dx + dy * dy).squareRoot()
@@ -324,12 +285,10 @@ enum KGGraphCanvasLayout {
                     let force = (k * k) / distance
                     let ux = dx / distance
                     let uy = dy / distance
-                    let firstDisplacement = displacement[firstID]!
                     displacement[firstID] = CGPoint(
                         x: firstDisplacement.x + CGFloat(ux * force),
                         y: firstDisplacement.y + CGFloat(uy * force)
                     )
-                    let secondDisplacement = displacement[secondID]!
                     displacement[secondID] = CGPoint(
                         x: secondDisplacement.x - CGFloat(ux * force),
                         y: secondDisplacement.y - CGFloat(uy * force)
@@ -337,31 +296,31 @@ enum KGGraphCanvasLayout {
                 }
             }
             for edge in liveEdges {
-                guard let first = positions[edge.from], let second = positions[edge.to] else { continue }
+                guard let first = positions[edge.from], let second = positions[edge.to],
+                      let firstDisplacement = displacement[edge.from],
+                      let secondDisplacement = displacement[edge.to] else { continue }
                 let dx = Double(first.x - second.x)
                 let dy = Double(first.y - second.y)
                 let distance = max(0.01, (dx * dx + dy * dy).squareRoot())
                 let force = (distance * distance) / k
                 let ux = dx / distance
                 let uy = dy / distance
-                let firstDisplacement = displacement[edge.from]!
                 displacement[edge.from] = CGPoint(
                     x: firstDisplacement.x - CGFloat(ux * force),
                     y: firstDisplacement.y - CGFloat(uy * force)
                 )
-                let secondDisplacement = displacement[edge.to]!
                 displacement[edge.to] = CGPoint(
                     x: secondDisplacement.x + CGFloat(ux * force),
                     y: secondDisplacement.y + CGFloat(uy * force)
                 )
             }
             for id in ids {
-                let delta = displacement[id]!
+                guard let delta = displacement[id], let position = positions[id] else { continue }
                 let magnitude = (Double(delta.x) * Double(delta.x) + Double(delta.y) * Double(delta.y)).squareRoot()
                 guard magnitude > 0.01 else { continue }
                 let limited = min(magnitude, Double(temperature))
-                let x = Double(positions[id]!.x) + Double(delta.x) / magnitude * limited
-                let y = Double(positions[id]!.y) + Double(delta.y) / magnitude * limited
+                let x = Double(position.x) + Double(delta.x) / magnitude * limited
+                let y = Double(position.y) + Double(delta.y) / magnitude * limited
                 positions[id] = CGPoint(
                     x: CGFloat(max(nodeRadius, min(Double(size.width) - Double(nodeRadius), x))),
                     y: CGFloat(max(nodeRadius, min(Double(size.height) - Double(nodeRadius), y)))

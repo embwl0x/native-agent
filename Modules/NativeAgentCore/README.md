@@ -47,8 +47,8 @@ Key ownership boundaries:
   **BackgroundWork** own unattended work from the Swift app. **EngineRuntime**
   owns the evaluation artifact reads and manual diagnostic support projections.
 - **PersonaEngine** owns built-in skill guidance and its display inventory;
-  **TrustCenter** owns capability-pack admission and the part-installation port.
-- **ToolRegistry**, **WorkflowOrchestration**,
+  **TrustCenter** owns capability-pack admission, saved workflow templates and the part-installation port.
+- **ToolRegistry**,
   **WorkshopExecution**, **Research**, **Connectors**, and **MacControl** serve their
   runtime surfaces directly from Swift modules and the shared data root.
 - **DoctorChecks** and release verification are guardrails that specifically
@@ -72,8 +72,8 @@ For app-runtime behavior changes, rebuild/install with `./script/install_app.sh`
 before treating the change as shipped. iOS source changes still require an Xcode
 simulator/device build.
 
-## Rollback
+## Recovery
 
-Rollback is now normal Swift rollback: revert the bad change or ship a follow-up
-build that gates the feature off in Swift. Do not start an external runtime or
-restore retired backend code to recover behavior.
+Fix the failure at its owning Swift boundary and ship the corrected build.
+Follow [NORTHSTAR](../../docs/NORTHSTAR.md): fix forward; no fallbacks or
+rollbacks. Do not restore an external runtime or retired backend code.

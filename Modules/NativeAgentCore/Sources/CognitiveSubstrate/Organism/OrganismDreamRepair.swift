@@ -61,30 +61,6 @@ public struct OrganismDreamRepairEvidence: Codable, Sendable, Equatable, Identif
     }
 }
 
-public struct OrganismStandingViewProposal: Codable, Sendable, Equatable, Identifiable {
-    public var id: String
-    public var title: String
-    public var rationale: String
-    public var evidenceIDs: [String]
-    public var reviewRequired: Bool
-
-    public init(
-        id: String,
-        title: String,
-        rationale: String,
-        evidenceIDs: [String],
-        reviewRequired: Bool = true
-    ) {
-        self.id = OrganismDreamRepairEvidence.clean(id, limit: 120, fallback: "standing-view-proposal")
-        self.title = OrganismDreamRepairEvidence.clean(title, limit: 100, fallback: "Review recurring pattern")
-        self.rationale = OrganismDreamRepairEvidence.clean(rationale, limit: 220, fallback: "Dream repair found a recurring pattern.")
-        self.evidenceIDs = evidenceIDs.prefix(6).map {
-            OrganismDreamRepairEvidence.clean($0, limit: 120, fallback: "evidence")
-        }
-        self.reviewRequired = reviewRequired
-    }
-}
-
 public struct OrganismDreamRepairReceipt: Codable, Sendable, Equatable, Identifiable {
     public var id: UUID
     public var generatedAt: Date
@@ -92,8 +68,6 @@ public struct OrganismDreamRepairReceipt: Codable, Sendable, Equatable, Identifi
     public var feltDaySummaryCharacters: Int
     public var operations: [OrganismRepairOperation]
     public var evidence: [OrganismDreamRepairEvidence]
-    public var standingViewProposals: [OrganismStandingViewProposal]
-    public var proposedStandingViewCount: Int
     public var flagCount: Int
     public var sourceFieldGeneration: UInt64
 
@@ -104,8 +78,6 @@ public struct OrganismDreamRepairReceipt: Codable, Sendable, Equatable, Identifi
         feltDaySummaryCharacters: Int,
         operations: [OrganismRepairOperation],
         evidence: [OrganismDreamRepairEvidence] = [],
-        standingViewProposals: [OrganismStandingViewProposal] = [],
-        proposedStandingViewCount: Int = 0,
         flagCount: Int = 0,
         sourceFieldGeneration: UInt64 = 0
     ) {
@@ -115,8 +87,6 @@ public struct OrganismDreamRepairReceipt: Codable, Sendable, Equatable, Identifi
         self.feltDaySummaryCharacters = max(0, feltDaySummaryCharacters)
         self.operations = Array(operations.prefix(32))
         self.evidence = Array(evidence.prefix(16))
-        self.standingViewProposals = Array(standingViewProposals.prefix(8))
-        self.proposedStandingViewCount = max(0, proposedStandingViewCount)
         self.flagCount = max(0, flagCount)
         self.sourceFieldGeneration = sourceFieldGeneration
     }
@@ -128,8 +98,6 @@ public struct OrganismDreamRepairReceipt: Codable, Sendable, Equatable, Identifi
         case feltDaySummaryCharacters
         case operations
         case evidence
-        case standingViewProposals
-        case proposedStandingViewCount
         case flagCount
         case sourceFieldGeneration
     }
@@ -143,15 +111,13 @@ public struct OrganismDreamRepairReceipt: Codable, Sendable, Equatable, Identifi
             feltDaySummaryCharacters: try c.decodeIfPresent(Int.self, forKey: .feltDaySummaryCharacters) ?? 0,
             operations: try c.decodeIfPresent([OrganismRepairOperation].self, forKey: .operations) ?? [],
             evidence: try c.decodeIfPresent([OrganismDreamRepairEvidence].self, forKey: .evidence) ?? [],
-            standingViewProposals: try c.decodeIfPresent([OrganismStandingViewProposal].self, forKey: .standingViewProposals) ?? [],
-            proposedStandingViewCount: try c.decodeIfPresent(Int.self, forKey: .proposedStandingViewCount) ?? 0,
             flagCount: try c.decodeIfPresent(Int.self, forKey: .flagCount) ?? 0,
             sourceFieldGeneration: try c.decodeIfPresent(UInt64.self, forKey: .sourceFieldGeneration) ?? 0
         )
     }
 
     public static let empty = OrganismDreamRepairReceipt(
-        id: UUID(uuidString: "00000000-0000-0000-0000-000000000000")!,
+        id: UUID(uuid: (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)),
         generatedAt: Date(timeIntervalSince1970: 0),
         reason: "none",
         feltDaySummaryCharacters: 0,
@@ -168,10 +134,8 @@ public struct OrganismDreamRepairSummary: Codable, Sendable, Equatable {
     public var strengthenedEdges: Int
     public var weakenedEdges: Int
     public var flaggedContradictions: Int
-    public var proposedStandingViews: Int
     public var feltDaySummaryCharacters: Int
     public var latestEvidence: [OrganismDreamRepairEvidence]
-    public var standingViewProposals: [OrganismStandingViewProposal]
 
     public init(
         receiptCount: Int = 0,
@@ -182,10 +146,8 @@ public struct OrganismDreamRepairSummary: Codable, Sendable, Equatable {
         strengthenedEdges: Int = 0,
         weakenedEdges: Int = 0,
         flaggedContradictions: Int = 0,
-        proposedStandingViews: Int = 0,
         feltDaySummaryCharacters: Int = 0,
-        latestEvidence: [OrganismDreamRepairEvidence] = [],
-        standingViewProposals: [OrganismStandingViewProposal] = []
+        latestEvidence: [OrganismDreamRepairEvidence] = []
     ) {
         self.receiptCount = max(0, receiptCount)
         self.lastRepairAt = lastRepairAt
@@ -195,10 +157,8 @@ public struct OrganismDreamRepairSummary: Codable, Sendable, Equatable {
         self.strengthenedEdges = max(0, strengthenedEdges)
         self.weakenedEdges = max(0, weakenedEdges)
         self.flaggedContradictions = max(0, flaggedContradictions)
-        self.proposedStandingViews = max(0, proposedStandingViews)
         self.feltDaySummaryCharacters = max(0, feltDaySummaryCharacters)
         self.latestEvidence = Array(latestEvidence.prefix(12))
-        self.standingViewProposals = Array(standingViewProposals.prefix(8))
     }
 
     public static let empty = OrganismDreamRepairSummary()
@@ -241,14 +201,8 @@ public struct OrganismDreamRepairState: Codable, Sendable, Equatable {
             strengthenedEdges: receipt.operations.filter { $0.kind == .strengthenWarmAssociation }.count,
             weakenedEdges: receipt.operations.filter { $0.kind == .weakenNoisyLoop }.count,
             flaggedContradictions: receipt.flagCount,
-            // Legacy receipts may carry the pre-2026-07-12 generic
-            // "review recurring pattern" suggestion. It was never an actual
-            // CognitiveStandingView and had no durable resolution path, so it
-            // must not keep presenting itself as work awaiting review.
-            proposedStandingViews: 0,
             feltDaySummaryCharacters: receipt.feltDaySummaryCharacters,
-            latestEvidence: receipt.evidence,
-            standingViewProposals: []
+            latestEvidence: receipt.evidence
         )
     }
 }
@@ -256,6 +210,14 @@ public struct OrganismDreamRepairState: Codable, Sendable, Equatable {
 public enum OrganismDreamRepair {
     private static let maximumOperations = 16
     private static let maximumFeltSummaryCharacters = 1_200
+
+    static func hasRepairableCharge(_ node: OrganismNode) -> Bool {
+        node.charge >= 0.12
+    }
+
+    static func hasRepairableNoise(_ edge: OrganismEdge) -> Bool {
+        edge.uncertainty >= 0.18 || (edge.eligibility >= 0.45 && edge.weight >= 0.12)
+    }
 
     public static func applying(
         signal: SomaticSignal,
@@ -271,9 +233,23 @@ public enum OrganismDreamRepair {
         var nextField = field
         var operations: [OrganismRepairOperation] = []
 
-        repairHighChargeNodes(in: &nextField, operations: &operations, limit: maximumOperations)
+        repairResidualCharge(
+            ids: nextField.nodes.values.filter(hasRepairableCharge).sorted {
+                if $0.charge != $1.charge { return $0.charge > $1.charge }
+                return $0.id < $1.id
+            }.map(\.id),
+            in: &nextField, operations: &operations, limit: maximumOperations
+        )
         strengthenWarmAssociations(in: &nextField, operations: &operations, limit: maximumOperations)
-        weakenNoisyLoops(in: &nextField, operations: &operations, limit: maximumOperations)
+        let noiseLimit = min(maximumOperations, operations.count + 4)
+        repairResidualNoise(
+            ids: nextField.edges.values.filter(hasRepairableNoise).sorted {
+                if $0.uncertainty != $1.uncertainty { return $0.uncertainty > $1.uncertainty }
+                if $0.eligibility != $1.eligibility { return $0.eligibility > $1.eligibility }
+                return $0.id < $1.id
+            }.map(\.id),
+            in: &nextField, operations: &operations, limit: noiseLimit
+        )
 
         let flags = contradictionFlags(in: feltSummary, remaining: max(0, maximumOperations - operations.count))
         operations.append(contentsOf: flags)
@@ -290,8 +266,6 @@ public enum OrganismDreamRepair {
             feltDaySummaryCharacters: feltSummary.count,
             operations: operations,
             evidence: evidence,
-            standingViewProposals: [],
-            proposedStandingViewCount: 0,
             flagCount: flags.count,
             sourceFieldGeneration: acknowledgedGeneration(
                 after: nextField,
@@ -303,7 +277,7 @@ public enum OrganismDreamRepair {
         return (
             nextField,
             OrganismDreamRepairState(
-                receiptCount: state.receiptCount + 1,
+                receiptCount: min(state.receiptCount, Int.max - 1) + 1,
                 lastReceipt: receipt
             )
         )
@@ -353,8 +327,6 @@ public enum OrganismDreamRepair {
             feltDaySummaryCharacters: 0,
             operations: operations,
             evidence: evidence,
-            standingViewProposals: [],
-            proposedStandingViewCount: 0,
             flagCount: 0,
             sourceFieldGeneration: acknowledgedGeneration(
                 after: nextField,
@@ -366,7 +338,7 @@ public enum OrganismDreamRepair {
         return (
             nextField,
             OrganismDreamRepairState(
-                receiptCount: state.receiptCount + 1,
+                receiptCount: min(state.receiptCount, Int.max - 1) + 1,
                 lastReceipt: receipt
             )
         )
@@ -379,7 +351,7 @@ public enum OrganismDreamRepair {
         limit: Int
     ) {
         for id in ids.prefix(max(0, limit - operations.count)) {
-            guard var node = field.nodes[id], node.charge >= 0.12 else { continue }
+            guard var node = field.nodes[id], hasRepairableCharge(node) else { continue }
             let before = node.charge
             node.charge = OrganismNode.clamp01(node.charge * 0.52)
             node.activation = max(0.05, OrganismNode.clamp01(node.activation * 0.82))
@@ -393,19 +365,14 @@ public enum OrganismDreamRepair {
         }
     }
 
-    /// A field generation is acknowledged only after every repairable charge
-    /// or noisy-loop target from that generation has fallen below threshold.
-    /// Bounded passes therefore keep re-arming without replaying settled
-    /// targets or losing the fifth-and-later target behind an operation cap.
+    /// A generation is acknowledged only when no repairable charge or noisy-loop target remains.
     private static func acknowledgedGeneration(
         after field: OrganismField,
         currentGeneration: UInt64,
         previousGeneration: UInt64
     ) -> UInt64 {
-        let hasChargedNode = field.nodes.values.contains { $0.charge >= 0.12 }
-        let hasNoisyEdge = field.edges.values.contains {
-            $0.uncertainty >= 0.18 || ($0.eligibility >= 0.45 && $0.weight >= 0.12)
-        }
+        let hasChargedNode = field.nodes.values.contains(where: hasRepairableCharge)
+        let hasNoisyEdge = field.edges.values.contains(where: hasRepairableNoise)
         return hasChargedNode || hasNoisyEdge
             ? min(previousGeneration, currentGeneration)
             : currentGeneration
@@ -418,9 +385,7 @@ public enum OrganismDreamRepair {
         limit: Int
     ) {
         for id in ids.prefix(max(0, limit - operations.count)) {
-            guard var edge = field.edges[id],
-                  edge.uncertainty >= 0.18 || (edge.eligibility >= 0.45 && edge.weight >= 0.12)
-            else { continue }
+            guard var edge = field.edges[id], hasRepairableNoise(edge) else { continue }
             let before = edge.weight
             edge.weight = max(0.01, OrganismNode.clamp01(edge.weight * 0.76))
             edge.uncertainty = OrganismNode.clamp01(edge.uncertainty * 0.62)
@@ -431,34 +396,6 @@ public enum OrganismDreamRepair {
                 kind: .weakenNoisyLoop,
                 targetID: id,
                 delta: edge.weight - before
-            ))
-        }
-    }
-
-    private static func repairHighChargeNodes(
-        in field: inout OrganismField,
-        operations: inout [OrganismRepairOperation],
-        limit: Int
-    ) {
-        guard operations.count < limit else { return }
-        let targets = field.nodes.values
-            .filter { $0.charge >= 0.12 }
-            .sorted {
-                if $0.charge != $1.charge { return $0.charge > $1.charge }
-                return $0.id < $1.id
-            }
-            .prefix(max(0, limit - operations.count))
-        for node in targets {
-            guard var copy = field.nodes[node.id] else { continue }
-            let before = copy.charge
-            copy.charge = OrganismNode.clamp01(copy.charge * 0.52)
-            copy.activation = max(0.05, OrganismNode.clamp01(copy.activation * 0.82))
-            field.nodes[node.id] = copy
-            operations.append(OrganismRepairOperation(
-                id: "soften:\(node.id)",
-                kind: .softenHighArousal,
-                targetID: node.id,
-                delta: copy.charge - before
             ))
         }
     }
@@ -485,36 +422,6 @@ public enum OrganismDreamRepair {
             operations.append(OrganismRepairOperation(
                 id: "warm:\(edge.id)",
                 kind: .strengthenWarmAssociation,
-                targetID: edge.id,
-                delta: copy.weight - before
-            ))
-        }
-    }
-
-    private static func weakenNoisyLoops(
-        in field: inout OrganismField,
-        operations: inout [OrganismRepairOperation],
-        limit: Int
-    ) {
-        guard operations.count < limit else { return }
-        let targets = field.edges.values
-            .filter { $0.uncertainty >= 0.18 || ($0.eligibility >= 0.45 && $0.weight >= 0.12) }
-            .sorted {
-                if $0.uncertainty != $1.uncertainty { return $0.uncertainty > $1.uncertainty }
-                if $0.eligibility != $1.eligibility { return $0.eligibility > $1.eligibility }
-                return $0.id < $1.id
-            }
-            .prefix(min(4, max(0, limit - operations.count)))
-        for edge in targets {
-            guard var copy = field.edges[edge.id] else { continue }
-            let before = copy.weight
-            copy.weight = max(0.01, OrganismNode.clamp01(copy.weight * 0.76))
-            copy.uncertainty = OrganismNode.clamp01(copy.uncertainty * 0.62)
-            copy.eligibility = OrganismNode.clamp01(copy.eligibility * 0.50)
-            field.edges[edge.id] = copy
-            operations.append(OrganismRepairOperation(
-                id: "weaken:\(edge.id)",
-                kind: .weakenNoisyLoop,
                 targetID: edge.id,
                 delta: copy.weight - before
             ))

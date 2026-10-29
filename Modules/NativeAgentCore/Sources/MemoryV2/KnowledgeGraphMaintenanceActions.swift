@@ -19,8 +19,8 @@ public struct KnowledgeGraphMaintenanceActions: Sendable {
     }
 
     public func previewOrphanSweep() async throws -> KnowledgeGraphGCReport {
-        let (indexer, facts) = try await liveIndexerAndFacts()
-        return try await indexer.collectGarbage(liveFacts: facts, apply: false)
+        let indexer = try await liveIndexer()
+        return try await indexer.collectGarbage(apply: false)
     }
 
     /// Applies only when the candidate set is still exactly the one the user
@@ -28,11 +28,9 @@ public struct KnowledgeGraphMaintenanceActions: Sendable {
     /// contain a newly orphaned item the user never saw. Both require a new
     /// confirmation instead of silently broadening or narrowing deletion.
     public func applyOrphanSweep(expectedCandidateIDs: Set<String>) async throws -> ApplyResult {
-        let (indexer, facts) = try await liveIndexerAndFacts()
+        let indexer = try await liveIndexer()
         let applied = try await indexer.collectGarbage(
-            liveFacts: facts,
             apply: true,
-            approvedOverThreshold: true,
             expectedCandidateIDs: expectedCandidateIDs
         )
         if applied.candidateSetDiverged {
@@ -41,10 +39,8 @@ public struct KnowledgeGraphMaintenanceActions: Sendable {
         return .applied(applied)
     }
 
-    private func liveIndexerAndFacts() async throws -> (SwiftNativeKnowledgeGraphIndexer, [KnowledgeGraphMemoryFact]) {
+    private func liveIndexer() async throws -> SwiftNativeKnowledgeGraphIndexer {
         let storage = try await SwiftNativeMemoryV2.resolvedStorage(dataRoot: dataRoot)
-        let facts = try await MemoryConsolidationHygiene.listGCFacts(storage)
-        let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: await storage.path)
-        return (indexer, facts)
+        return try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: await storage.path)
     }
 }

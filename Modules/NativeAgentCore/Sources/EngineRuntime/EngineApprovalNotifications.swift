@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import ApprovalInbox
 import ApprovalTransactions
 import AttentionRouting

@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `CognitiveSubstrate+Restore.swift` | `CognitiveSubstrate`: `backupPersistentStateForDoctor`, `restorePersistentState`, `stringArrayValue` |
+// Blueprint: | `CognitiveSubstrate+Restore.swift` | `CognitiveSubstrate`: `backupPersistentStateForDoctor`, `restorePersistentState` |
 
 extension CognitiveSubstrate {
     public func backupPersistentStateForDoctor() async throws -> URL {
@@ -12,20 +12,27 @@ extension CognitiveSubstrate {
     public func restorePersistentState() async throws {
         guard configuration.enabled else { return }
         guard configuration.persistenceEnabled else {
-            persistenceWritesBlocked = false
             persistenceHealth = .disabled
             return
         }
-        guard !restoreInFlight else {
-            throw CognitivePersistenceError.writesBlocked(status: .restoring, detail: nil)
-        }
+        // Restore and Clear exclude each other: a restore waits for a Clear in
+        // flight (and then finds her mind already read: the cleared one), and a
+        // Clear waits for a restore in flight, so a bundle loaded before the
+        // clear can never be reconciled into the store after it.
+        await waitForLifecycleHold()
+        // Restore runs once: a mind already read (or cleared) in this process
+        // is the resident truth, and re-reading the disk over it would lose
+        // what it has not saved yet (map risk 6).
+        guard !persistenceRestored else { return }
         restoreInFlight = true
-        defer { restoreInFlight = false }
+        defer {
+            restoreInFlight = false
+            releaseLifecycleHold()
+        }
         await waitForMaintenanceTransition()
 
         let attemptAt = dependencies.now()
         guard let store else {
-            persistenceWritesBlocked = true
             persistenceHealth = CognitivePersistenceHealth(
                 status: .degraded,
                 writesBlocked: true,
@@ -39,7 +46,6 @@ extension CognitiveSubstrate {
 
         let previouslyDegraded = persistenceHealth.status == .degraded
         let previousSuccessAt = persistenceHealth.lastSuccessfulRestoreAt
-        persistenceWritesBlocked = true
         persistenceHealth = CognitivePersistenceHealth(
             status: .restoring,
             writesBlocked: true,
@@ -47,16 +53,21 @@ extension CognitiveSubstrate {
             lastSuccessfulRestoreAt: previousSuccessAt
         )
 
-        let bundle: CognitiveSQLiteRestoreBundle
+        var bundle: CognitiveSQLiteRestoreBundle
+        let decoded: (episodes: [UUID: CognitiveEpisodeReference], proposals: [UUID: CognitiveSchemaProposal],
+                      timeline: [UUID: CognitiveDevelopmentalTimelineEvent], reflections: [UUID: CognitiveReflectionReceipt],
+                      cares: [UUID: CognitiveCare], migration: CognitiveCareMigration?)
         do {
+            // The forgetting boundary is read with her mind: a turn admitted
+            // from here on is stamped with it.
+            mindEpoch = try await store.loadEpoch("mind")
             bundle = try await store.loadRestoreBundle(
                 artifactFamilies: restoreArtifactFamilyLoads()
             )
-            try validateRestoreBundle(bundle)
+            decoded = try decodeRestoreBundle(bundle)
         } catch {
             let stage = restoreFailureStage(for: error)
             let detail = bounded(String(describing: error), maxCharacters: 320)
-            persistenceWritesBlocked = true
             persistenceHealth = CognitivePersistenceHealth(
                 status: .degraded,
                 writesBlocked: true,
@@ -77,6 +88,10 @@ extension CognitiveSubstrate {
             )
             throw error
         }
+        // The retired kinds are read only for their one conversion into cares:
+        // never reconciled, rewritten or deleted here.
+        let retiredViews = bundle.artifacts.removeValue(forKey: "standing_view") ?? []
+        let retiredSeeds = bundle.artifacts.removeValue(forKey: "thought_seed") ?? []
 
         // Read resident state AFTER the suspended load. On recovery it is the
         // complete current family, including removals; on the first load its
@@ -107,6 +122,15 @@ extension CognitiveSubstrate {
                 }
             }
         }
+        if !residentRestoreIsAuthoritative {
+            episodes = decoded.episodes.merging(episodes) { _, live in live }
+            schemaProposals = decoded.proposals.merging(schemaProposals) { _, live in live }
+            developmentalTimeline = decoded.timeline.merging(developmentalTimeline) { _, live in live }
+            reflectionReceipts = decoded.reflections.merging(reflectionReceipts) { _, live in live }
+            cares = decoded.cares.merging(cares) { _, live in live }
+            careMigration = careMigration ?? decoded.migration
+        }
+        for (id, care) in cares where care.origin == .seed { cares[id]?.open = nil }
         applyRestoreBundle(reconciled)
         residentRestoreIsAuthoritative = true
         // Commit the reconciled nodes and artifacts together, including the
@@ -114,7 +138,6 @@ extension CognitiveSubstrate {
         do {
             try await persistReconciledRestoreState(replacing: bundle)
         } catch {
-            persistenceWritesBlocked = true
             persistenceHealth = CognitivePersistenceHealth(
                 status: .degraded, writesBlocked: true,
                 lastRestoreAttemptAt: attemptAt, lastSuccessfulRestoreAt: previousSuccessAt,
@@ -123,16 +146,15 @@ extension CognitiveSubstrate {
             )
             throw error
         }
-        persistenceWritesBlocked = false
+        persistenceRestored = true
         persistenceHealth = CognitivePersistenceHealth(
             status: .healthy,
             writesBlocked: false,
             lastRestoreAttemptAt: attemptAt,
             lastSuccessfulRestoreAt: dependencies.now()
         )
-        await reconcileRestoredAffectWithRecentConversation(nodes: field.peekNodes())
         publishAttentionProjection(at: dependencies.now())
-        await establishCares()
+        await establishCares(retiredViews: retiredViews, retiredSeeds: retiredSeeds)
         try? await store.appendReceipt(
             kind: "lifecycle.restore",
             payload: .object([
@@ -141,7 +163,6 @@ extension CognitiveSubstrate {
                 "schemaProposalCount": .int(Int64(schemaProposals.count)),
                 "timelineCount": .int(Int64(developmentalTimeline.count)),
                 "reflectionCount": .int(Int64(reflectionReceipts.count)),
-                "experimentCount": .int(Int64(experimentResults.count)),
                 "status": .string(previouslyDegraded ? "recovered" : "restored"),
                 "writesBlocked": .bool(false),
             ]),
@@ -150,15 +171,12 @@ extension CognitiveSubstrate {
     }
 
     private func residentRestoreArtifacts(at now: Date) -> [String: [JSONValue]] {
-        let careRows = careRestoreRows()
         var rows: [String: [JSONValue]] = [
             "episode": episodes.values.map { $0.toJSON() },
             "schema_proposal": schemaProposals.values.map { $0.toJSON() },
-            "care": careRows.cares,
-            "care_migration": careRows.migration,
+            "care_retired_migration": careRetiredMigration.map { [$0] } ?? [],
             "developmental_timeline": developmentalTimeline.values.map { $0.toJSON() },
             "reflection_receipt": reflectionReceipts.values.map { $0.toJSON() },
-            "experiment": experimentResults.values.map { $0.toJSON() },
             "emotional_consolidation": lastEmotionalConsolidationAt.map {
                 [.object(["ranAt": .double($0.timeIntervalSince1970)])]
             } ?? [],
@@ -178,8 +196,8 @@ extension CognitiveSubstrate {
         if residentRestoreIsAuthoritative || dreamResidueClaimKey != nil || dreamResidue != nil {
             rows["dream_residue"] = [dreamResidueArtifactPayload(at: now)]
         }
-        if residentRestoreIsAuthoritative || !associationSuppressions.isEmpty || !undoLedger.isEmpty {
-            rows["mind_ledger"] = [mindLedgerArtifactPayload(at: now)]
+        if residentRestoreIsAuthoritative || !associationSuppressions.isEmpty || dispositionUndo != nil {
+            rows["mind_ledger"] = [mindLedgerArtifactPayload(at: now, undoEntry: dispositionUndo)]
         }
         return rows
     }
@@ -189,10 +207,9 @@ extension CognitiveSubstrate {
         return uuidValue(object["id"]) ?? stableArtifactID(family)
     }
 
-    private func persistReconciledRestoreState(replacing bundle: CognitiveSQLiteRestoreBundle) async throws {
-        guard let store else { throw CognitivePersistenceError.storeUnavailable }
-        let now = dependencies.now()
-        let families = residentRestoreArtifacts(at: now)
+    private func residentArtifactWrites(
+        _ families: [String: [JSONValue]], bundle: CognitiveSQLiteRestoreBundle?
+    ) -> (artifacts: [CognitiveArtifactWrite], retainedIDs: Set<UUID>) {
         var artifacts: [CognitiveArtifactWrite] = []
         var retainedIDs: Set<UUID> = []
         for (family, rows) in families {
@@ -202,18 +219,21 @@ extension CognitiveSubstrate {
                 retainedIDs.insert(id)
                 // Counts in this diagnostic payload live only in SQLite. A
                 // matching consolidation clock does not replace that evidence.
-                if family == "emotional_consolidation",
-                   case .object(let persisted)? = bundle.artifacts[family]?.first,
-                   object["ranAt"] == persisted["ranAt"] { continue }
-                var status = stringValue(object["status"]) ?? "current"
-                var score = doubleValue(object["confidence"]) ?? doubleValue(object["score"]) ?? 0
+                // Without a loaded bundle to compare (a failed Clear's whole
+                // save) it is never overwritten blind.
+                if family == "emotional_consolidation" {
+                    guard let bundle else { continue }
+                    if case .object(let persisted)? = bundle.artifacts[family]?.first,
+                       object["ranAt"] == persisted["ranAt"] { continue }
+                }
+                var status = object["status"]?.stringValue ?? "current"
+                var score = object["confidence"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? object["score"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? 0
                 switch family {
                 case "episode", "developmental_timeline": status = "recorded"; score = 0.5
                 case "reflection_receipt": status = object["cancelled"] == .bool(true) ? "cancelled" : "recorded"
-                case "experiment": status = "recorded"
                 case "care": status = (object["fadedAt"] ?? .null) == .null ? "live" : "faded"
-                case "disposition": score = ((doubleValue(object["valence"]) ?? 0) + 1) / 2
-                case "affect": score = doubleValue(object["arousal"]) ?? 0
+                case "disposition": score = ((object["valence"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? 0) + 1) / 2
+                case "affect": score = object["arousal"]?.numberValue(coercingStrings: false, finiteOnly: false) ?? 0
                 default: break
                 }
                 artifacts.append(CognitiveArtifactWrite(
@@ -221,6 +241,16 @@ extension CognitiveSubstrate {
                 ))
             }
         }
+        return (artifacts, retainedIDs)
+    }
+
+    private func persistReconciledRestoreState(replacing bundle: CognitiveSQLiteRestoreBundle) async throws {
+        guard let store else { throw CognitivePersistenceError.storeUnavailable }
+        let now = dependencies.now()
+        var families = residentRestoreArtifacts(at: now)
+        families["care"] = try cares.values.map { try Self.careJSON($0) }
+        families["care_migration"] = try careMigration.map { [try Self.careJSON($0)] } ?? []
+        let (artifacts, retainedIDs) = residentArtifactWrites(families, bundle: bundle)
         let deletedIDs = bundle.artifacts.flatMap { family, rows in
             rows.map { restoreArtifactID(family: family, payload: $0) }
         }.filter { !retainedIDs.contains($0) }
@@ -254,6 +284,13 @@ extension CognitiveSubstrate {
             CognitiveArtifactFamilyLoad(key: "care", kindPrefix: "care", limit: 0, whole: true),
             CognitiveArtifactFamilyLoad(key: "care_migration", kindPrefix: "care_migration", limit: 1),
             CognitiveArtifactFamilyLoad(
+                key: "care_retired_migration",
+                kindPrefix: "care_retired_migration",
+                limit: 1
+            ),
+            CognitiveArtifactFamilyLoad(key: "standing_view", kindPrefix: "standing_view", limit: 0, whole: true),
+            CognitiveArtifactFamilyLoad(key: "thought_seed", kindPrefix: "thought_seed", limit: 0, whole: true),
+            CognitiveArtifactFamilyLoad(
                 key: "developmental_timeline",
                 kindPrefix: "developmental_timeline",
                 limit: 160
@@ -261,14 +298,21 @@ extension CognitiveSubstrate {
             CognitiveArtifactFamilyLoad(
                 key: "reflection_receipt",
                 kindPrefix: "reflection_receipt",
-                limit: max(40, configuration.dailyReflectionCallBudget * 4)
+                limit: reflectionReceiptCap
             ),
-            CognitiveArtifactFamilyLoad(key: "experiment", kindPrefix: "experiment", limit: 40),
             CognitiveArtifactFamilyLoad(key: "mind_ledger", kindPrefix: "mind_ledger", limit: 1),
         ]
     }
 
-    private func validateRestoreBundle(_ bundle: CognitiveSQLiteRestoreBundle) throws {
+    private func decodeRestoreBundle(_ bundle: CognitiveSQLiteRestoreBundle) throws -> (episodes: [UUID: CognitiveEpisodeReference], proposals: [UUID: CognitiveSchemaProposal],
+                                     timeline: [UUID: CognitiveDevelopmentalTimelineEvent], reflections: [UUID: CognitiveReflectionReceipt],
+                                     cares: [UUID: CognitiveCare], migration: CognitiveCareMigration?) {
+        var episodes: [UUID: CognitiveEpisodeReference] = [:]
+        var proposals: [UUID: CognitiveSchemaProposal] = [:]
+        var timeline: [UUID: CognitiveDevelopmentalTimelineEvent] = [:]
+        var reflections: [UUID: CognitiveReflectionReceipt] = [:]
+        var cares: [UUID: CognitiveCare] = [:]
+        var migration: CognitiveCareMigration?
         for family in restoreArtifactFamilyLoads() {
             guard let payloads = bundle.artifacts[family.key] else {
                 throw CognitivePersistenceError.invalidRestoreArtifact(
@@ -278,7 +322,36 @@ extension CognitiveSubstrate {
                 )
             }
             for (index, payload) in payloads.enumerated() {
-                guard validRestorePayload(payload, family: family.key) else {
+                let valid: Bool
+                switch family.key {
+                case "episode":
+                    let value = CognitiveEpisodeReference(payload: payload)
+                    if let value { episodes[value.id] = value }
+                    valid = value != nil
+                case "schema_proposal":
+                    let value = CognitiveSchemaProposal(payload: payload)
+                    if let value { proposals[value.id] = value }
+                    valid = value != nil
+                case "developmental_timeline":
+                    let value = CognitiveDevelopmentalTimelineEvent(payload: payload)
+                    if let value { timeline[value.id] = value }
+                    valid = value != nil
+                case "reflection_receipt":
+                    let value = CognitiveReflectionReceipt(payload: payload)
+                    if let value { reflections[value.id] = value }
+                    valid = value != nil
+                case "care":
+                    let value = Self.careDecoded(CognitiveCare.self, payload)
+                    if let value { cares[value.id] = value }
+                    valid = value != nil
+                case "care_migration":
+                    let value = Self.careDecoded(CognitiveCareMigration.self, payload)
+                    if migration == nil { migration = value }
+                    valid = value != nil
+                default:
+                    valid = validRestorePayload(payload, family: family.key)
+                }
+                guard valid else {
                     throw CognitivePersistenceError.invalidRestoreArtifact(
                         family: family.key,
                         index: index,
@@ -287,6 +360,7 @@ extension CognitiveSubstrate {
                 }
             }
         }
+        return (episodes, proposals, timeline, reflections, cares, migration)
     }
 
     private func validRestorePayload(_ payload: JSONValue, family: String) -> Bool {
@@ -298,54 +372,18 @@ extension CognitiveSubstrate {
             return dateValue(object["updatedAt"]) != nil
         case "disposition":
             return dateValue(object["updatedAt"]) != nil
-                && doubleValue(object["valence"]) != nil
+                && object["valence"]?.numberValue(coercingStrings: false, finiteOnly: false) != nil
         case "dream_residue":
             return dateValue(object["updatedAt"]) != nil
         case "emotional_consolidation":
             return dateValue(object["ranAt"]) != nil
-        case "episode":
-            return uuidValue(object["id"]) != nil
-                && stringValue(object["title"]) != nil
-                && stringValue(object["summary"]) != nil
-                && dateValue(object["occurredAt"]) != nil
-        case "schema_proposal":
-            return uuidValue(object["id"]) != nil
-                && stringValue(object["title"]) != nil
-                && stringValue(object["body"]) != nil
-                && stringValue(object["target"]) != nil
-                && dateValue(object["createdAt"]) != nil
-        case "developmental_timeline":
-            guard let kind = stringValue(object["kind"]) else { return false }
-            return uuidValue(object["id"]) != nil
-                && CognitiveDevelopmentalTimelineKind(rawValue: kind) != nil
-                && stringValue(object["title"]) != nil
-                && stringValue(object["summary"]) != nil
-                && dateValue(object["occurredAt"]) != nil
-        case "reflection_receipt":
-            return uuidValue(object["id"]) != nil
-                && stringValue(object["reason"]) != nil
-                && stringValue(object["prompt"]) != nil
-                && stringValue(object["surface"]) != nil
-                && stringValue(object["model"]) != nil
-                && stringValue(object["requestProvider"]) != nil
-                && stringValue(object["reasoningEffort"]) != nil
-                && dateValue(object["requestedAt"]) != nil
-                && stringValue(object["resultSummary"]) != nil
-                && stringValue(object["provider"]) != nil
-                && dateValue(object["createdAt"]) != nil
         case "mind_ledger":
             return dateValue(object["updatedAt"]) != nil
-        case "care":
-            return Self.careDecoded(CognitiveCare.self, payload) != nil
-        case "care_migration":
-            return Self.careDecoded(CognitiveCareMigration.self, payload) != nil
-        case "experiment":
-            guard let kind = stringValue(object["kind"]) else { return false }
-            return uuidValue(object["id"]) != nil
-                && CognitiveExperimentKind(rawValue: kind) != nil
-                && stringValue(object["seed"]) != nil
-                && stringValue(object["reproducibilityKey"]) != nil
-                && dateValue(object["generatedAt"]) != nil
+        case "care_retired_migration":
+            return uuidValue(object["id"]) != nil && dateValue(object["migratedAt"]) != nil
+        // A retired row the conversion cannot read is dropped there, never a failed restore.
+        case "standing_view", "thought_seed":
+            return true
         default:
             return false
         }
@@ -371,19 +409,12 @@ extension CognitiveSubstrate {
         restoreDisposition(from: payloads("disposition"))
         restoreEmotionalConsolidation(from: payloads("emotional_consolidation"))
         restoreDreamResidue(from: payloads("dream_residue"))
-        restoreEpisodes(from: payloads("episode"))
-        restoreSchemaProposals(from: payloads("schema_proposal"))
-        restoreCares(from: payloads("care"))
-        restoreCareMigration(from: payloads("care_migration"))
-        restoreDevelopmentalTimeline(from: payloads("developmental_timeline"))
-        restoreReflectionReceipts(from: payloads("reflection_receipt"))
-        restoreExperimentResults(from: payloads("experiment"))
+        careRetiredMigration = payloads("care_retired_migration").first
         restoreMindLedger(from: payloads("mind_ledger"))
         enforceEpisodeCap()
         enforceSchemaProposalCap()
         enforceDevelopmentalTimelineCap()
         enforceReflectionReceiptCap()
-        enforceExperimentResultCap()
     }
 
     private func restoreFailureStage(for error: Error) -> String {
@@ -396,86 +427,7 @@ extension CognitiveSubstrate {
         return "sqlite_read"
     }
 
-    private func restoreEpisodes(from payloads: [JSONValue]) {
-        episodes.removeAll(keepingCapacity: true)
-        for payload in payloads {
-            guard case .object(let object) = payload,
-                  let id = uuidValue(object["id"]),
-                  let title = stringValue(object["title"]),
-                  let summary = stringValue(object["summary"]),
-                  let occurredAt = dateValue(object["occurredAt"]) else {
-                continue
-            }
-            episodes[id] = CognitiveEpisodeReference(
-                id: id,
-                title: title,
-                summary: summary,
-                occurredAt: occurredAt,
-                evidenceNodeIds: uuidArrayValue(object["evidenceNodeIds"]),
-                externalEvidenceIds: stringArrayValue(object["externalEvidenceIds"]),
-                lineageId: stringValue(object["lineageId"]) ?? ""
-            )
-        }
-    }
-
-    private func restoreSchemaProposals(from payloads: [JSONValue]) {
-        schemaProposals.removeAll(keepingCapacity: true)
-        for payload in payloads {
-            guard case .object(let object) = payload,
-                  let id = uuidValue(object["id"]),
-                  let title = stringValue(object["title"]),
-                  let body = stringValue(object["body"]),
-                  let target = stringValue(object["target"]),
-                  let createdAt = dateValue(object["createdAt"]) else {
-                continue
-            }
-            schemaProposals[id] = CognitiveSchemaProposal(
-                id: id,
-                title: title,
-                body: body,
-                target: target,
-                confidence: doubleValue(object["confidence"]) ?? 0,
-                createdAt: createdAt,
-                evidenceNodeIds: uuidArrayValue(object["evidenceNodeIds"]),
-                externalEvidenceIds: stringArrayValue(object["externalEvidenceIds"]),
-                lineageId: stringValue(object["lineageId"]) ?? ""
-            )
-        }
-    }
-
-    private func restoreDevelopmentalTimeline(from payloads: [JSONValue]) {
-        developmentalTimeline.removeAll(keepingCapacity: true)
-        for payload in payloads {
-            guard case .object(let object) = payload,
-                  let id = uuidValue(object["id"]),
-                  let kindRaw = stringValue(object["kind"]),
-                  let kind = CognitiveDevelopmentalTimelineKind(rawValue: kindRaw),
-                  let title = stringValue(object["title"]),
-                  let summary = stringValue(object["summary"]),
-                  let occurredAt = dateValue(object["occurredAt"]) else {
-                continue
-            }
-            developmentalTimeline[id] = CognitiveDevelopmentalTimelineEvent(
-                id: id,
-                kind: kind,
-                title: title,
-                summary: summary,
-                occurredAt: occurredAt,
-                artifactId: uuidValue(object["artifactId"]),
-                lineageId: stringValue(object["lineageId"]) ?? "",
-                subjectId: stringValue(object["subjectId"]) ?? "",
-                instanceId: stringValue(object["instanceId"]) ?? "",
-                forkMetadata: stringDictionaryValue(object["forkMetadata"]),
-                externalEvidenceIds: stringArrayValue(object["externalEvidenceIds"])
-            )
-        }
-    }
-
-    /// Restore the Wave D overnight-consolidation cadence gate. Reads only `ranAt` from
-    /// the single "emotional_consolidation" artifact. Clears the gate FIRST so a re-run
-    /// of restore on a live actor with a missing/corrupt artifact behaves as never-run
-    /// (sweep due) instead of keeping a stale in-memory gate (gpt-5.5 review, 2026-07-02).
-    /// Mirrors `restoreAffect`.
+    /// Restore the consolidation clock; an absent artifact leaves the sweep due.
     private func restoreEmotionalConsolidation(from payloads: [JSONValue]) {
         lastEmotionalConsolidationAt = nil
         guard case .object(let object)? = payloads.first,
@@ -483,43 +435,4 @@ extension CognitiveSubstrate {
         lastEmotionalConsolidationAt = ranAt
     }
 
-    private func restoreExperimentResults(from payloads: [JSONValue]) {
-        experimentResults.removeAll(keepingCapacity: true)
-        for payload in payloads {
-            guard case .object(let object) = payload,
-                  let id = uuidValue(object["id"]),
-                  let kindRaw = stringValue(object["kind"]),
-                  let kind = CognitiveExperimentKind(rawValue: kindRaw),
-                  let seed = stringValue(object["seed"]),
-                  let reproducibilityKey = stringValue(object["reproducibilityKey"]),
-                  let generatedAt = dateValue(object["generatedAt"]) else {
-                continue
-            }
-            experimentResults[id] = CognitiveExperimentResult(
-                id: id,
-                kind: kind,
-                seed: seed,
-                score: doubleValue(object["score"]) ?? 0,
-                metrics: doubleDictionaryValue(object["metrics"]),
-                notes: stringArrayValue(object["notes"]),
-                reproducibilityKey: reproducibilityKey,
-                generatedAt: generatedAt
-            )
-        }
-    }
-
-    func stringArrayValue(_ value: JSONValue?) -> [String] {
-        guard case .array(let values)? = value else { return [] }
-        return values.compactMap(stringValue)
-    }
-
-    private func stringDictionaryValue(_ value: JSONValue?) -> [String: String] {
-        guard case .object(let object)? = value else { return [:] }
-        return object.compactMapValues(stringValue)
-    }
-
-    private func doubleDictionaryValue(_ value: JSONValue?) -> [String: Double] {
-        guard case .object(let object)? = value else { return [:] }
-        return object.compactMapValues(doubleValue)
-    }
 }

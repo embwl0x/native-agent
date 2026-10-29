@@ -1,8 +1,4 @@
-// Phase 14e-iCloud HMAC self-heal: iCloud-only pairing flow.
-// The legacy LAN/HTTP transport (QR scan + bearer token) was retired in the
-// iOS iCloud-only sweep (see MacBridgeClient.swift). This view now offers only:
-//   1) Automatic iCloud KVS bootstrap (no user input — happens on init).
-//   2) Check for Mac: re-read the Mac's published pairing key.
+// Pairing uses automatic iCloud KVS bootstrap and an explicit Check for Mac refresh.
 import SwiftUI
 import NativeAgentShared
 
@@ -26,7 +22,6 @@ enum IOSPairingPresentation {
     static var manualSectionDetail: String { "Open \(macPairingRoute), then tap Check for Mac. Keep the Mac app open and both devices connected to the internet." }
     static var missingKeyMessage: String { "The Mac’s pairing details haven’t arrived. Open \(macPairingRoute), check that both devices are online, then tap Check for Mac again." }
     static var notSignedSyncMessage: String { "iCloud sync is waiting for pairing. Open \(macPairingRoute), then open Pair with Mac on this phone and tap Check for Mac." }
-    static var signatureRetryMessage: String { "The Mac could not verify this phone’s pairing key. Open \(macPairingRoute), then open Pair with Mac on this phone and tap Check for Mac." }
 }
 
 struct PairingView: View {
@@ -220,11 +215,11 @@ struct PairingView: View {
             repeat {
                 try Task.checkCancellation()
                 let id = try await iCloudSyncEngine.shared.sendAction(.make(action: "pairDevice", payload: [:]), intentionalNewRequest: true)
-                let result = await iCloudSyncEngine.shared.pollWithTimeout(
+                let result = try await iCloudSyncEngine.shared.pollWithTimeout(
                     msgId: id, timeout: min(30, max(0, deadline.timeIntervalSinceNow)), interval: 0.5, expectedAction: "pairDevice"
                 )
                 try Task.checkCancellation()
-                if repairing, result?["code"] == "device_not_verified", deadline.timeIntervalSinceNow > 10 {
+                if repairing, result["code"] == "device_not_verified", deadline.timeIntervalSinceNow > 10 {
                     try await Task.sleep(for: .seconds(10))
                     continue
                 }

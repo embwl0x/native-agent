@@ -19,12 +19,7 @@ public struct REMReport: Sendable, Codable, Equatable {
     /// keyed by reason ("over 240 characters": 1). nil when none, and optional
     /// so older run reports decode unchanged.
     public var passageBoundDrops: [String: Int]?
-    /// Why this pass did no work, when it did none. 2026-09-06: losing the run
-    /// reservation to a concurrent pass returned a report indistinguishable
-    /// from a genuine zero-proposal week, so the scheduler recorded the week
-    /// "completed" and never came back — the week was silently dropped. nil on
-    /// a pass that actually ran, and omitted on the wire so older run reports
-    /// decode unchanged.
+    /// Distinguishes skipped work from a completed quiet week; nil is omitted so older reports decode unchanged.
     public var skipReason: String?
     /// Of the survivors, how many are one lived occasion dreamt about more than
     /// once — kept and labelled `dwelt_on`, never counted as a pattern. nil
@@ -144,13 +139,7 @@ extension REMRunReportPayload {
     }
 
     private static func nonnegativeInt(_ rawValue: Any?) -> Int? {
-        // 2026-09-17: `is Bool` is not a boolean test on a decoded JSON value.
-        // JSONSerialization hands back an NSNumber, and Swift bridges an
-        // NSNumber holding 0 or 1 to Bool as readily as it bridges a real
-        // boolean — so this guard rejected every record whose counts were 0,
-        // and a young root's nothing-to-consolidate pass (proposals 0,
-        // archived 0) read as an incomplete completion record before the
-        // skipReason below was ever consulted. Reject only a true boolean.
+        // Reject genuine booleans by CF type, preserving numeric counts of 0 and 1 despite Bool bridging.
         if isBoolean(rawValue) { return nil }
         let value: Int?
         if let integer = rawValue as? Int {

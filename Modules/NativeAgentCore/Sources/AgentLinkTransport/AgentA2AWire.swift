@@ -64,7 +64,6 @@ public enum AgentA2AWire {
         public let completed: Bool
         public let needsInput: Bool
         public let needsAuthentication: Bool
-        public let raw: JSONValue
         public var failure: ProviderFailure.Report? = nil
     }
 
@@ -168,7 +167,7 @@ public enum AgentA2AWire {
         if let tenant = interface.tenant { params["tenant"] = .string(tenant) }
         let method = streaming ? (legacy ? "message/stream" : "SendStreamingMessage") : (legacy ? "message/send" : "SendMessage")
         return try request(interface: interface, method: method, params: params,
-                           requestID: requestID ?? messageID, taskID: nil)
+                           requestID: requestID ?? messageID, path: { streaming ? "/message:stream" : "/message:send" })
     }
 
     public static func cancelRequest(taskID: String, interface: Interface, requestID: String = UUID().uuidString) throws -> Request {
@@ -176,7 +175,7 @@ public enum AgentA2AWire {
         var params: [String: JSONValue] = ["id": .string(try requiredString(.string(taskID), "taskId"))]
         if let tenant = interface.tenant { params["tenant"] = .string(tenant) }
         return try request(interface: interface, method: interface.version == "0.3" ? "tasks/cancel" : "CancelTask",
-                           params: params, requestID: requestID, taskID: taskID)
+                           params: params, requestID: requestID, path: { try "/tasks/" + pathIdentifier(params["id"], "taskId") + ":cancel" }, taskID: taskID)
     }
 
     public static func taskRequest(taskID: String, interface: Interface, requestID: String = UUID().uuidString) throws -> Request {
@@ -185,10 +184,12 @@ public enum AgentA2AWire {
         var params: [String: JSONValue] = ["id": .string(taskID)]
         if let tenant = interface.tenant { params["tenant"] = .string(tenant) }
         return try request(interface: interface, method: interface.version == "0.3" ? "tasks/get" : "GetTask",
-                           params: params, requestID: requestID, taskID: taskID)
+                           params: params, requestID: requestID, path: { try "/tasks/" + pathIdentifier(params["id"], "taskId") },
+                           httpMethod: "GET", pathKeys: ["id"], taskID: taskID)
     }
 
-    private static func request(interface: Interface, method: String, params: [String: JSONValue], requestID: String, taskID: String?) throws -> Request {
+    static func request(interface: Interface, method: String, params: [String: JSONValue], requestID: String,
+                        path: () throws -> String, httpMethod: String = "POST", pathKeys: Set<String> = [], taskID: String? = nil) throws -> Request {
         let expectedTaskID: String? = if case .object(let message)? = params["message"], case .string(let id)? = message["taskId"] { id } else { taskID }
         if interface.binding == "GRPC" {
             return Request(url: interface.endpoint, httpMethod: "POST", headers: [:],
@@ -196,8 +197,7 @@ public enum AgentA2AWire {
                            streamInterface: interface, expectedTaskID: expectedTaskID)
         }
         let rpc = interface.binding == "JSONRPC"
-        let streaming = ["message/stream", "SendStreamingMessage"].contains(method)
-        let cancelling = ["tasks/cancel", "CancelTask"].contains(method)
+        let streaming = ["message/stream", "SendStreamingMessage", "SubscribeToTask"].contains(method)
         let headers = ["Content-Type": rpc ? "application/json" : "application/a2a+json",
                        "Accept": streaming ? "text/event-stream" : (rpc ? "application/json" : "application/a2a+json"), "A2A-Version": interface.version]
         if rpc {
@@ -209,16 +209,24 @@ public enum AgentA2AWire {
         }
         guard var components = URLComponents(url: interface.endpoint, resolvingAgainstBaseURL: false) else { throw WireError.invalid("endpoint URL") }
         let base = try httpPathBase(components, tenant: params["tenant"])
-        if let taskID {
-            let safe = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_~"))
-            guard let encoded = taskID.addingPercentEncoding(withAllowedCharacters: safe), taskID != ".", taskID != ".." else { throw WireError.invalid("task path identifier") }
-            components.percentEncodedPath = base + "/tasks/" + encoded + (cancelling ? ":cancel" : "")
-        } else { components.percentEncodedPath = base + (streaming ? "/message:stream" : "/message:send") }
-        guard let url = components.url else { throw WireError.invalid("request URL") }
+        components.percentEncodedPath = try base + path()
         var body = params
         body.removeValue(forKey: "tenant")
-        return Request(url: url, httpMethod: taskID == nil || cancelling ? "POST" : "GET", headers: headers,
-                       body: taskID == nil || cancelling ? .object(body) : nil, requestID: nil,
+        if httpMethod != "POST" {
+            components.queryItems = try (components.queryItems ?? []) + body.keys.sorted().filter { !pathKeys.contains($0) }.map { key in
+                let text: String
+                switch body[key]! {
+                case .string(let value): text = value
+                case .int(let value): text = String(value)
+                case .bool(let value): text = value ? "true" : "false"
+                default: throw WireError.invalid("query parameter \(key)")
+                }
+                return URLQueryItem(name: key, value: text)
+            }
+        }
+        guard let url = components.url else { throw WireError.invalid("request URL") }
+        return Request(url: url, httpMethod: httpMethod, headers: headers,
+                       body: httpMethod == "POST" ? .object(body) : nil, requestID: nil,
                        streamInterface: interface, expectedTaskID: expectedTaskID)
     }
 
@@ -234,18 +242,7 @@ public enum AgentA2AWire {
     public static func normalizeResponse(_ value: JSONValue, interface: Interface,
                                          expectedRequestID: String? = nil, expectedTaskID: String? = nil) throws -> Result {
         try validate(interface)
-        var payload = try object(value, "response")
-        if interface.binding == "JSONRPC" {
-            guard payload["jsonrpc"] == .string("2.0"), let expectedRequestID,
-                  payload["id"] == .string(expectedRequestID) else { throw WireError.invalid("JSON-RPC response ID/version mismatch or missing expected ID") }
-            guard (payload["result"] != nil) != (payload["error"] != nil) else { throw WireError.invalid("response must contain exactly one result or error") }
-            if let error = payload["error"] {
-                let error = try object(error, "RPC error")
-                guard case .int(let code)? = error["code"] else { throw WireError.invalid("RPC error code") }
-                throw WireError.remote(code: code, message: try requiredString(error["message"], "RPC error message"))
-            }
-            payload = try object(payload["result"]!, "RPC result")
-        }
+        var payload = try object(operationResult(value, interface: interface, requestID: expectedRequestID), "response")
         let legacy = interface.version == "0.3"
         let kind: String
         if legacy { kind = try requiredString(payload["kind"], "result kind") }
@@ -294,7 +291,7 @@ public enum AgentA2AWire {
         var result = Result(kind: kind, taskID: taskID, contextID: contextID, messageID: messageID, text: text,
                       parts: parts, artifacts: artifacts, state: state,
                       terminal: ["completed", "failed", "canceled", "rejected"].contains(state), completed: state == "completed",
-                      needsInput: state == "input-required", needsAuthentication: state == "auth-required", raw: value)
+                      needsInput: state == "input-required", needsAuthentication: state == "auth-required")
         if case .object(let status)? = payload["status"], case .object(let message)? = status["message"],
            case .object(let metadata)? = message["metadata"], let failure = metadata["provider_failure"],
            let data = try? failure.serializedData(pretty: false) {
@@ -313,7 +310,7 @@ public enum AgentA2AWire {
             _ = try canonicalPart(part, version: legacy ? "0.3" : "1.0")
         }
     }
-    private static func canonicalVersion(_ version: String) -> String? {
+    package static func canonicalVersion(_ version: String) -> String? {
         let pieces = version.split(separator: ".", omittingEmptySubsequences: false)
         guard (2...3).contains(pieces.count), pieces.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isNumber) }) else { return nil }
         let pair = pieces.prefix(2).joined(separator: ".")

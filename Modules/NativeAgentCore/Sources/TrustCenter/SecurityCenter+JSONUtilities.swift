@@ -1,6 +1,6 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `SecurityCenter+JSONUtilities.swift` | Trust JSON primitives and workspace roots; byte-exact containment of resolved paths; transport policy decoding belongs to TransportAllowlist in PersistenceCore |
+// Blueprint: | `SecurityCenter+JSONUtilities.swift` | Trust JSON primitives and workspace roots; resolved containment uses NativeAgentWorkspaceRoot's byte-exact component law; transport policy decoding belongs to TransportAllowlist in PersistenceCore |
 
 extension SwiftNativeSecurityCenter {
     static func object(_ value: JSONValue?) -> [String: JSONValue] {
@@ -8,36 +8,18 @@ extension SwiftNativeSecurityCenter {
         return [:]
     }
 
-    static func string(_ value: JSONValue?) -> String? {
-        switch value {
-        case .string(let s): return s
-        case .int(let i): return String(i)
-        case .double(let d): return String(d)
-        case .bool(let b): return b ? "true" : "false"
-        default: return nil
-        }
-    }
-
     static func bool(_ value: JSONValue?, default fallback: Bool) -> Bool {
-        switch value {
-        case .bool(let b): return b
-        case .string(let s):
-            let v = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if ["true", "1", "yes", "on"].contains(v) { return true }
-            if ["false", "0", "no", "off"].contains(v) { return false }
-            return fallback
-        case .int(let i): return i != 0
-        default: return fallback
-        }
+        if case .double = value { return fallback }
+        return ConnectorInputValue.bool(value, default: fallback)
     }
 
     static func stringArray(_ value: JSONValue?) -> [String] {
         guard case .array(let array)? = value else { return [] }
-        return array.compactMap { string($0)?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        return array.compactMap { $0.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
     }
 
-    static func trustedWorkspaceRoots(
+    package static func trustedWorkspaceRoots(
         policy: [String: JSONValue],
         filePolicy: [String: JSONValue],
         dataRoot: URL = defaultDataRoot()
@@ -49,8 +31,13 @@ extension SwiftNativeSecurityCenter {
                 guard case .array(let values)? = obj[key] else { continue }
                 for value in values {
                     guard case .string(let raw) = value else { continue }
-                    let expanded = HomePath.expand(raw)
-                    guard expanded.hasPrefix("/") else { continue }
+                    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else { continue }
+                    // Only current-user shorthand expands; relative roots retain URL's process-directory interpretation.
+                    let home = FileManager.default.homeDirectoryForCurrentUser
+                    var expanded = trimmed
+                    if trimmed == "~" { expanded = home.path }
+                    else if trimmed.hasPrefix("~/") { expanded = home.appendingPathComponent(String(trimmed.dropFirst(2))).path }
                     roots.append(URL(fileURLWithPath: expanded))
                 }
             }
@@ -61,13 +48,12 @@ extension SwiftNativeSecurityCenter {
         return normalizedUniqueRoots(roots)
     }
 
-
     static func normalizedUniqueRoots(_ roots: [URL]) -> [URL] {
-        var seen: Set<String> = []
+        var seen: Set<Data> = []
         var out: [URL] = []
         for root in roots {
             let normalized = root.standardizedFileURL.resolvingSymlinksInPath()
-            guard seen.insert(normalized.path).inserted else { continue }
+            guard seen.insert(Data(normalized.path.utf8)).inserted else { continue }
             out.append(normalized)
         }
         return out
@@ -82,18 +68,10 @@ extension SwiftNativeSecurityCenter {
             .contains { isSelfOrAncestor(root: $0, of: file) }
     }
 
-    static func isSelfOrAncestor(root: URL, of candidate: URL) -> Bool {
-        let rootPath = root.standardizedFileURL.resolvingSymlinksInPath().path
-        let candidatePath = candidate.standardizedFileURL.resolvingSymlinksInPath().path
-        return isSelfOrAncestor(rootPath: rootPath, candidatePath: candidatePath)
-    }
-
-    static func isSelfOrAncestor(rootPath: String, candidatePath: String) -> Bool {
-        // Swift String equality/prefix matching folds canonically equivalent
-        // Unicode spellings; filesystem containment compares the actual bytes.
-        if candidatePath.utf8.elementsEqual(rootPath.utf8) { return true }
-        let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
-        return candidatePath.utf8.starts(with: prefix.utf8)
+    package static func isSelfOrAncestor(root: URL, of candidate: URL) -> Bool {
+        let rootPath = NativeAgentWorkspaceRoot.canonicalFileURL(root).path
+        let candidatePath = NativeAgentWorkspaceRoot.canonicalFileURL(candidate).path
+        return NativeAgentWorkspaceRoot.relativePath(candidatePath, under: rootPath) != nil
     }
 
 }

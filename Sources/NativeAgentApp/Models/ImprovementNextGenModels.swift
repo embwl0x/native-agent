@@ -15,7 +15,7 @@ extension ImprovementGauntletRun {
         try await run(
             dataRoot: dataRoot,
             runProcess: { executable, arguments, directory, timeout in
-                let result = try await SystemProcessAdapter.runBounded(
+                let result = try await ProcessExecution.runBounded(
                     executable: executable, arguments: arguments,
                     currentDirectory: directory, timeout: timeout
                 )

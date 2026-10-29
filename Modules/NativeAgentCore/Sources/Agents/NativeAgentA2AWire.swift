@@ -22,7 +22,6 @@ public enum NativeAgentA2AWire {
         let rpcID: Any
         let context: String
         let request: String
-        let text: String
         /// The CALLER's own `messageId`, kept rather than discarded: `request`
         /// below is a freshly minted server UUID and so is unique on every
         /// resend, which makes it useless as a replay identity. This is the id
@@ -36,16 +35,15 @@ public enum NativeAgentA2AWire {
         var pushConfig: JSONValue?
         var taskID: String { "na3.\(context).\(request)" }
 
-        public init(rpcID: Any, context: String, request: String, text: String, clientMessageID: String,
+        public init(rpcID: Any, context: String, request: String, clientMessageID: String,
                     parts: [AgentContactPart] = []) {
             self.rpcID = rpcID; self.context = context; self.request = request
-            self.text = text; self.clientMessageID = clientMessageID; self.parts = parts
+            self.clientMessageID = clientMessageID; self.parts = parts
         }
-        var body: Data { try! JSONSerialization.data(withJSONObject: ["text": text, "sessionId": context, "request_id": request]) }
     }
     enum Action: @unchecked Sendable {
         case send(Send)
-        case get(id: Any, task: String, context: String, request: String)
+        case get(id: Any, task: String)
         case subscribe(id: Any, task: String)
         case cancel(id: Any, task: String)
         case list(id: Any, params: [String: Any])
@@ -72,11 +70,11 @@ public enum NativeAgentA2AWire {
               NativeAgentChatSessionID.normalizedPathComponent(context) == context else { return nil }
         return (context, String(request))
     }
-    static func parse(_ body: Data, defaultContext: String? = nil) -> Action {
-        guard body.count <= 4 * 1024 * 1024 else {
+    static func parse(_ decoded: Any?, byteCount: Int, defaultContext: String? = nil) -> Action {
+        guard byteCount <= 4 * 1024 * 1024 else {
             return .response(error(NSNull(), -32600, "Message is too large"))
         }
-        guard let decoded = try? JSONSerialization.jsonObject(with: body, options: [.fragmentsAllowed]) else {
+        guard let decoded else {
             return .response(error(NSNull(), -32700, "Invalid JSON"))
         }
         guard let json = decoded as? [String: Any] else {
@@ -160,23 +158,21 @@ public enum NativeAgentA2AWire {
                   !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || decodedParts.contains(where: { $0.isAttachment }) else {
                 return .response(error(id, -32602, "Provide text or an attachment; text is limited to 64000 bytes"))
             }
-            var send = Send(rpcID: id, context: context, request: UUID().uuidString.lowercased(), text: text, clientMessageID: messageID)
-            send.parts = decodedParts
+            var send = Send(rpcID: id, context: context, request: UUID().uuidString.lowercased(), clientMessageID: messageID, parts: decodedParts)
             send.streaming = method == "message/stream" || method == "SendStreamingMessage"
             send.blocking = blocking
             send.continuedTask = message["taskId"] as? String
             send.acceptedOutputModes = acceptedOutputModes
             if let config = params["configuration"] as? [String: Any], let push = config["taskPushNotificationConfig"] {
-                guard modern, push is [String: Any], let bytes = try? JSONSerialization.data(withJSONObject: push),
-                      let value = try? JSONDecoder().decode(JSONValue.self, from: bytes) else {
+                guard modern, push is [String: Any] else {
                     return .response(error(id, -32602, "Invalid taskPushNotificationConfig"))
                 }
-                send.pushConfig = value
+                send.pushConfig = JSONValue(fromFoundation: push)
             }
             return .send(send)
         case "tasks/get", "GetTask", "tasks/cancel", "CancelTask", "tasks/resubscribe", "SubscribeToTask":
             guard params["id"] is String else { return .response(error(id, -32602, "A task ID is required")) }
-            guard let task = params["id"] as? String, let value = locator(task) else {
+            guard let task = params["id"] as? String, locator(task) != nil else {
                 return .response(error(id, -32001, "Task not found; use the exact returned task ID"))
             }
             if let length = params["historyLength"] {
@@ -186,7 +182,7 @@ public enum NativeAgentA2AWire {
             }
             if method == "tasks/cancel" || method == "CancelTask" { return .cancel(id: id, task: task) }
             if method == "tasks/resubscribe" || method == "SubscribeToTask" { return .subscribe(id: id, task: task) }
-            return .get(id: id, task: task, context: value.context, request: value.request)
+            return .get(id: id, task: task)
         case "ListTasks": return .list(id: id, params: params)
         case "CreateTaskPushNotificationConfig", "GetTaskPushNotificationConfig", "ListTaskPushNotificationConfigs", "DeleteTaskPushNotificationConfig":
             return .push(id: id, operation: method, params: params)

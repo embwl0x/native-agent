@@ -1,7 +1,8 @@
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MemoryV2+Recall.swift` | `SwiftNativeMemoryV2`: `recordRecallHits`, `recall`, `readMemoryRecord`; invocation-local ranked voices reused for disclosure refill |
+import NativeAgentShared
+// Blueprint: | `MemoryV2+Recall.swift` | `SwiftNativeMemoryV2`: `recordRecallHits`, counted/capped candidate-paged `recall`, `readMemoryRecord`; invocation-local ranked voices reused for disclosure refill |
 
 extension SwiftNativeMemoryV2 {
 
@@ -33,29 +34,19 @@ extension SwiftNativeMemoryV2 {
         instruction: "Check memory search progress before recalling again.", recovery: .inspect
     )
 
-    /// Access-signal bump for records served OUTSIDE the recall lane (the
-    /// fluid-context serve path, task #42). Same storage write as recall's
-    /// fire-and-forget bump; unwired actors fail closed like every other
-    /// storage-backed method.
+    /// Records served outside recall use the same access write; unwired storage fails closed.
     public func recordRecallHits(ids: [String]) async throws {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         try await storage.recordRecallHits(ids: ids)
     }
 
-    /// Embed the query via the wired `EmbeddingProvider` (MiniLM on the Neural
+    /// Embed the query via the wired `EmbeddingProvider` (bge on the Neural
     /// Engine in production), then ask `MemoryStorage` for the top-K nearest
-    /// records by cosine. Hits are sorted by score descending; `total` reflects
-    /// how many records the storage layer returned (≤ topK).
+    /// records by cosine. Pages walk disclosed ranked candidates; only a fully
+    /// examined first page claims an exact relevant total.
     ///
-    /// User, 2026-09-06: `recordingUsage` false suppresses the access bump below
-    /// for callers that RETRIEVE more than they DELIVER — the Mac memory
-    /// search asks for 50 rows on every keystroke pause and shows whatever
-    /// subset it can map, so crediting the recall set made browsing your own
-    /// store look like the agent using every row in it, and use_count is the
-    /// signal that vetoes eviction. Those callers report what they actually
-    /// delivered with `recordRecallHits(ids:)`. Default true: every existing
-    /// caller behaves exactly as before.
+    /// Callers retrieving more than they deliver set `recordingUsage` false and report delivered ids with `recordRecallHits(ids:)`.
     public func recall(
         _ query: MemoryV2RecallRequest,
         recordingUsage: Bool = true
@@ -111,15 +102,14 @@ extension SwiftNativeMemoryV2 {
             throw MemoryStorageError.searchFailure("The memory search model returned no query vectors.",
                 code: "memory_search_vectors_missing", instruction: "Inspect Doctor's model findings; repair the missing query vectors before searching again.")
         }
-        let queryEmbedding = (vector: qvec, epoch: embedded.epoch)
         try Task.checkCancellation()
-        let topK = max(1, query.topK)
+        let topK = min(memoryStoredRowCap, max(1, query.topK))
         // Explicit recall judges the bounded corpus in one pass rather than
         // paying for a small window and then judging a refill. Other callers
         // retain their wider disclosure window. SQLite scans/sorts the same
         // canonical set either way; only the retained window changes.
         let storageTopK: Int
-        if query.requiresRelevance == true {
+        if query.requiresRelevance == true || (query.offset ?? 0) > 0 {
             storageTopK = memoryStoredRowCap
         } else {
             storageTopK = (query.surface != nil || query.persona != nil)
@@ -133,27 +123,10 @@ extension SwiftNativeMemoryV2 {
             && embedded.vectors.count > 1 ? (embedded.vectors[1], embedded.epoch) : nil
         timings["embedding_ms"] = milliseconds(since: embeddingStarted)
         try Task.checkCancellation()
-        let canonicalStorage = await storage.underlyingStorage()
-        func dense(
-            _ text: String, _ vector: [Float], _ epoch: MemoryEmbeddingEpoch
-        ) async throws -> [(memory: StoredMemory, similarity: Double)] {
-            func read(_ vector: [Float], _ epoch: MemoryEmbeddingEpoch) async throws -> [(memory: StoredMemory, similarity: Double)] {
-                try await canonicalStorage.rankedRecall(
-                    embedding: vector, embeddingEpoch: epoch, queryText: text,
-                    persona: query.persona
-                )
-            }
-            do {
-                return try await read(vector, epoch)
-            } catch let error as MemoryStorageError {
-                guard case .embeddingEpochMismatch = error else { throw error }
-                requestEmbeddingEpochReconcile()
-                throw Self.recallCorpusConverging
-            }
-        }
+        let canonicalStorage = storage
         func disclosedRows(_ rows: [ScoredMemoryRecord]) -> [ScoredMemoryRecord] {
             var seen: Set<String> = []
-            return rows.sorted { $0.score > $1.score }.filter { scoredRecord in
+            return rows.sorted { $0.score == $1.score ? $0.record.id < $1.record.id : $0.score > $1.score }.filter { scoredRecord in
                 guard let classification = MemoryRecordDisclosurePolicy.classify(scoredRecord.record) else {
                     return false
                 }
@@ -181,13 +154,23 @@ extension SwiftNativeMemoryV2 {
         }
         // Keep each voice's full ranking; deduplication and record conversion
         // stop at its requested window, including when disclosure widens it.
-        let primaryRanked = try await dense(query.text, qvec, queryEmbedding.epoch)
+        let candidates: [MemoryStorage.RecallCandidate]
+        do {
+            candidates = try await canonicalStorage.recallCandidates(queryEpoch: embedded.epoch)
+        } catch let error as MemoryStorageError {
+            guard case .embeddingEpochMismatch = error else { throw error }
+            requestEmbeddingEpochReconcile()
+            throw Self.recallCorpusConverging
+        }
+        let primaryRanked = try MemoryStorage.rankedRecall(
+            embedding: qvec, queryText: query.text, persona: query.persona, candidates: candidates)
         let rewrittenRanked: [(memory: StoredMemory, similarity: Double)]?
         if let rewritten,
            let other = rewrittenEmbedding,
            other.vector.contains(where: { $0 != 0 && $0.isFinite }) {
             try Task.checkCancellation()
-            rewrittenRanked = try await dense(rewritten, other.vector, other.epoch)
+            rewrittenRanked = try MemoryStorage.rankedRecall(
+                embedding: other.vector, queryText: rewritten, persona: query.persona, candidates: candidates)
         } else {
             rewrittenRanked = nil
         }
@@ -215,6 +198,11 @@ extension SwiftNativeMemoryV2 {
         var disclosureFilteredCount = scored.count - disclosed.count
         timings["disclosure_ms"] = milliseconds(since: disclosureStarted)
         timings["candidates"] = Double(disclosed.count)
+        let candidateCount = disclosed.count
+        let offset = min(max(0, query.offset ?? 0), candidateCount)
+        disclosed = Array(disclosed.dropFirst(offset))
+        var examinedCount = MemoryRecallScoring.relevanceCandidateLimit(topK: topK, count: disclosed.count)
+        let rankedCandidates = disclosed
         if query.requiresRelevance == true, !disclosed.isEmpty {
             let relevanceStarted = ProcessInfo.processInfo.systemUptime
             let admitted = try await AdaptiveMemoryPromoter.shared.relevantRecallIDs(query: query.text,
@@ -227,25 +215,42 @@ extension SwiftNativeMemoryV2 {
         }
         // Non-judged callers retain the disclosure refill. Explicit recall
         // already fetched the row cap and never repeats retrieval or judgment.
-        if disclosed.count < topK, scored.count >= storageTopK, storageTopK < memoryStoredRowCap {
+        if query.requiresRelevance != true, disclosed.count < topK, scored.count >= storageTopK, storageTopK < memoryStoredRowCap {
             retrievalStarted = ProcessInfo.processInfo.systemUptime
             scored = retrieve(memoryStoredRowCap)
             timings["retrieval_ms", default: 0] += milliseconds(since: retrievalStarted)
             try Task.checkCancellation()
-            disclosed = disclosedRows(scored)
-            disclosureFilteredCount = scored.count - disclosed.count
+            let allDisclosed = disclosedRows(scored)
+            disclosureFilteredCount = scored.count - allDisclosed.count
+            disclosed = Array(allDisclosed.dropFirst(offset))
         }
         // storageTopK is a wider disclosure candidate window, not the result
         // budget: cut AFTER disclosure at the actual requested size.
         let selectionStarted = ProcessInfo.processInfo.systemUptime
-        let sorted = Array(disclosed.sorted { $0.score > $1.score }.prefix(max(0, topK)))
+        let sorted = Array(disclosed.sorted { $0.score == $1.score ? $0.record.id < $1.record.id : $0.score > $1.score }.prefix(max(0, topK)))
+        // The judge settles the whole prefix through the kth admitted row.
+        // If it finds fewer, it examined its entire bounded candidate window.
+        // Continue after that prefix, including rejected rows, so even an empty
+        // page makes progress without judging the same evidence again.
+        let next: Int
+        let hasMore: Bool
+        let capped: Bool
+        if query.requiresRelevance == true {
+            if sorted.count == topK, let last = sorted.last,
+               let index = rankedCandidates.firstIndex(where: { $0.record.id == last.record.id }) {
+                examinedCount = index + 1
+            }
+            next = offset + examinedCount
+            hasMore = next < candidateCount
+            capped = offset > 0 || hasMore
+        } else {
+            next = offset + sorted.count
+            hasMore = sorted.count < disclosed.count || scored.count >= storageTopK && storageTopK < memoryStoredRowCap
+            capped = offset > 0 || hasMore
+        }
         timings["selection_ms"] = milliseconds(since: selectionStarted)
         timings["results"] = Double(sorted.count)
-        // Fire-and-forget access bump: record that these memories were used,
-        // AFTER we've computed the answer, WITHOUT awaiting — so recall's read
-        // latency is unchanged (Agent's zero-read-cost constraint). This is the
-        // signal that stops archiveStale from evicting hot-but-never-merged
-        // memories as "unused" (#0).
+        // Record access after computing recall without awaiting; scoring and capacity retention use it, but disuse never archives rows.
         try Task.checkCancellation()
         let usedIds = recordingUsage ? sorted.map { $0.record.id } : []
         if !usedIds.isEmpty {
@@ -254,21 +259,14 @@ extension SwiftNativeMemoryV2 {
                 do {
                     try await storageRef.recordRecallHits(ids: usedIds)
                 } catch {
-                    // Don't swallow silently: use_count is eviction-protective
-                    // (gpt-5.5 review finding 3). A dropped bump self-heals on
-                    // any later recall within the 365d window, so logging (not
-                    // retry machinery) is the proportionate response here.
+                    // Log failed access bumps without retries; recalls within 365 days restore eviction protection.
                     FileHandle.standardError.write(
                         Data("MemoryV2: recall-hit bump failed for \(usedIds.count) ids: \(error)\n".utf8)
                     )
                 }
             }
         }
-        // U3 wave-1 item 1: carry the FULL text (sentence-safe capped) on
-        // every hit — the 200-char preview was the felt truncation. Pure
-        // output shaping on rows already selected: ranking and row set are
-        // untouched, and no extra storage round-trip happens (zero added
-        // read latency).
+        // Shape full text on selected hits without changing ranking, row selection or storage reads.
         let hits: [MemoryRecallHit] = sorted.map { sr in
             let canonicalText = MemoryTextClip.memoryDisplayText(
                 sr.record.text,
@@ -276,15 +274,9 @@ extension SwiftNativeMemoryV2 {
             )
             let displayText = (MemorySenseProvenance.warning(in: sr.record.extras).map { "[\($0)]\n" } ?? "") + canonicalText
             let content = MemoryTextClip.sentenceClip(displayText, cap: memoryRecallContentCap)
-            // Sweep R4 A4: the prompt renderer stamps a compact
-            // `[YYYY-MM-DD, kind]` provenance marker on each recalled row so the
-            // model can tell a stale fact from a fresh correction. `ts` was
-            // already carried; the kind rides in the free-form `extras` bag
-            // (documented as the landing spot for extra keys) rather than a new
-            // struct field, so the hit shape is unchanged.
             var extras: [String: JSONValue] = ["id": .string(sr.record.id)]
             extras.merge(MemoryDataProvenance.fields(in: sr.record.extras)) { _, value in value }
-            if let origin = MemoryMoments.recallOrigin(source: sr.record.sourceRunId, metadata: sr.record.extras) {
+            if let origin = MemoryMoments.recallOrigin(source: sr.record.sourceRunId, metadata: sr.record.extras, dataRoot: canonicalDataRoot ?? defaultDataRoot()) {
                 extras["origin"] = origin
             }
             if let warning = MemorySenseProvenance.warning(in: sr.record.extras) {
@@ -297,6 +289,7 @@ extension SwiftNativeMemoryV2 {
                 extras["content_truncated"] = .bool(true)
                 extras["full_content_chars"] = .int(Int64(displayText.count))
             }
+            // Carry kind in extras for the renderer's optional provenance marker.
             if let kind = sr.record.memoryKind?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
                !kind.isEmpty {
@@ -337,7 +330,10 @@ extension SwiftNativeMemoryV2 {
             scored: sorted,
             total: sorted.count,
             disclosureFilteredCount: disclosureFilteredCount,
-            timings: timings
+            timings: timings,
+            capped: capped,
+            hasMore: hasMore,
+            nextOffset: hasMore ? next : nil
         )
     }
 
@@ -355,7 +351,7 @@ extension SwiftNativeMemoryV2 {
         try await ensureCanonicalAttachment()
         guard let storage else { throw MemoryV2Error.storageUnavailable }
         try Task.checkCancellation()
-        guard let record = try await storage.lookupMemoryRecord(id: id),
+        guard let record = try await storage.memory(id: id).map(MemoryRecord.init(stored:)),
               record.id == id,
               persona == nil || record.personaId == persona,
               let disclosure = MemoryRecordDisclosurePolicy.classify(record),

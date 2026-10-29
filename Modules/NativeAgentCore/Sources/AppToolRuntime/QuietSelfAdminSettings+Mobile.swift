@@ -4,15 +4,6 @@ import PersistenceCore
 import TrustCenter
 // Blueprint: | `QuietSelfAdminSettings+Mobile.swift` | mobile settings projection and writes |
 
-extension TrustPolicyPreset {
-    public static func saveMobilePreset(_ preset: MobileTrustAction.Preset, dataRoot: URL, fullMacConfirmed: Bool) async throws -> TrustPolicy {
-        guard let canonical = allCases.first(where: { $0.quietID == preset.rawValue }) else {
-            throw QuietSettingError.badValue("Invalid or unconfirmed trust change.")
-        }
-        return try await canonical.save(dataRoot: dataRoot, fullMacConfirmed: fullMacConfirmed)
-    }
-}
-
 extension QuietSettings {
     @MainActor
     public static func mobileSettings(host: any QuietSettingsHost) async throws -> [MobileAppSetting] {

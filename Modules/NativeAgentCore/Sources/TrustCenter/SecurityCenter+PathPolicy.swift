@@ -1,7 +1,7 @@
 import Foundation
 import PersistenceCore
 import ToolRegistry
-// Blueprint: | `SecurityCenter+PathPolicy.swift` | SecurityCenter owns byte-exact, component-wise containment of resolved absolute I/O paths for capability effects and Mac Control file admission; supported file mutations use NativeAgentWorkspaceRoot's execution resolver and relative base; unknown relative capability paths count as outside; `capabilityWritesOutsideAppData`, `pathIsInsideRoots`, `pathLikeStrings` |
+// Blueprint: | `SecurityCenter+PathPolicy.swift` | Capability effects and Mac Control file admission use NativeAgentWorkspaceRoot's byte-exact path law; supported file mutations share execution's resolver and relative base; unknown relative capability paths count as outside; `capabilityWritesOutsideAppData`, `pathIsInsideRoots`, `pathLikeStrings` |
 
 extension SwiftNativeSecurityCenter {
     /// Her line for the paths a call names: true when one lands beyond her
@@ -28,7 +28,7 @@ extension SwiftNativeSecurityCenter {
             else { pathInput = arguments }
         }
         return pathLikeStrings(in: .object(pathInput)).contains { raw in
-            let expanded = (raw as NSString).expandingTildeInPath
+            let expanded = NativeAgentWorkspaceRoot.fileSpelling(raw)
             guard expanded.hasPrefix("/") else { return true }
             let resolved = URL(fileURLWithPath: expanded).standardizedFileURL.resolvingSymlinksInPath().path
             return !pathIsInsideRoots(resolved, roots: [dataRoot] + trustedWorkspaceRoots)
@@ -40,8 +40,7 @@ extension SwiftNativeSecurityCenter {
     static func pathIsInsideRoots(_ resolvedPath: String, roots: [URL]) -> Bool {
         guard resolvedPath.hasPrefix("/") else { return false }
         return roots.contains {
-            isSelfOrAncestor(rootPath: $0.standardizedFileURL.resolvingSymlinksInPath().path,
-                             candidatePath: resolvedPath)
+            NativeAgentWorkspaceRoot.relativePath(resolvedPath, under: NativeAgentWorkspaceRoot.canonicalFileURL($0).path) != nil
         }
     }
 

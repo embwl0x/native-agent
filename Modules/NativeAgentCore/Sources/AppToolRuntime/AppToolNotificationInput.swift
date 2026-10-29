@@ -13,12 +13,11 @@ extension NativeAgentNotificationDefaults {
         toolName: String
     ) throws -> (title: String, message: String) {
         let input = input.filter { $0.value != .string("") }
-        let resolvedTitle = Self.title(AppToolExecutor.inputString(input["title"]))
-        // D2 (2026-09-11 tools review): a present-but-blank body and a missing
-        // one are different faults; the refusal names the one that happened.
-        guard let message = AppToolExecutor.inputString(input["message"])
-            ?? AppToolExecutor.inputString(input["body"])
-            ?? AppToolExecutor.inputString(input["text"]) else {
+        let resolvedTitle = Self.title(input["title"]?.scalarText)
+        // Refusals distinguish a blank message body from a missing one.
+        guard let message = input["message"]?.scalarText
+            ?? input["body"]?.scalarText
+            ?? input["text"]?.scalarText else {
             throw NotificationInputError.missingMessage(toolName)
         }
         guard !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {

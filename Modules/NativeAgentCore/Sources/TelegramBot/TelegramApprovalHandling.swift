@@ -12,14 +12,7 @@ public enum TelegramApprovalDecision: String, Sendable, Equatable {
 public struct TelegramApprovalCommand: Sendable, Equatable {
     public let id: String
     public let decision: TelegramApprovalDecision
-    /// 2026-09-06: the `@bot` the command was addressed to, if any
-    /// (`/approve@OtherBot id` -> "OtherBot"). The text parser used to strip
-    /// this suffix WITHOUT reading it, so the value was only recoverable by
-    /// re-parsing the raw text; the poll loop's own gate does that today, and
-    /// a future caller reaching the parser directly would have silently
-    /// answered an approval addressed to another bot in the room. Nil means
-    /// the command named no bot, or did not arrive as text at all (a callback
-    /// button is delivered only to the bot that sent it).
+    /// The command's `@bot` suffix, or nil for commands without one and callback buttons.
     public let addressedBot: String?
     /// A mirrored inline card's option, by index (`na_approval:c<n>:<id>`).
     public let choice: Int?
@@ -36,33 +29,15 @@ public struct TelegramApprovalCommand: Sendable, Equatable {
         self.choice = choice
     }
 
-    public static func parse(text raw: String) -> TelegramApprovalCommand? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.hasPrefix("/") else { return nil }
-        let parts = trimmed.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" })
-            .map(String.init)
-        guard parts.count >= 2 else { return nil }
-        let command = parts[0]
-            .dropFirst()
-            .split(separator: "@", maxSplits: 1, omittingEmptySubsequences: true)
-            .first
-            .map { String($0).lowercased() } ?? ""
+    public static func parse(command: TelegramParsedSlashCommand, addressedBot: String?) -> TelegramApprovalCommand? {
         let decision: TelegramApprovalDecision
-        switch command {
-        case "approve", "approved", "allow":
-            decision = .approved
-        case "deny", "denied", "reject", "rejected":
-            decision = .denied
-        default:
-            return nil
+        switch command.definition.handler {
+        case .approve: decision = .approved
+        case .deny: decision = .denied
+        default: return nil
         }
-        let id = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !id.isEmpty else { return nil }
-        return TelegramApprovalCommand(
-            id: id,
-            decision: decision,
-            addressedBot: TelegramCommandRegistry.addressedBotUsername(text: trimmed)
-        )
+        guard let id = command.args.first else { return nil }
+        return TelegramApprovalCommand(id: id, decision: decision, addressedBot: addressedBot)
     }
 
     public static func parse(callbackData raw: String) -> TelegramApprovalCommand? {
@@ -90,13 +65,7 @@ public struct TelegramApprovalCommand: Sendable, Equatable {
 public protocol TelegramApprovalHandling: Sendable {
     func startApprovalDelivery() async
     func stopApprovalDelivery() async
-    func resolveTelegramApproval(
-        id: String,
-        decision: TelegramApprovalDecision,
-        chatId: Int,
-        fromUserId: Int?
-    ) async throws -> TelegramApprovalResolution
-    /// The same, carrying a mirrored card's picked option.
+    /// Slash decisions carry nil; mirrored cards carry their picked option.
     func resolveTelegramApproval(
         id: String,
         decision: TelegramApprovalDecision,
@@ -106,46 +75,12 @@ public protocol TelegramApprovalHandling: Sendable {
     ) async throws -> TelegramApprovalResolution
 }
 
-extension TelegramApprovalHandling {
-    public func startApprovalDelivery() async {}
-    public func stopApprovalDelivery() async {}
-    public func resolveTelegramApproval(
-        id: String, decision: TelegramApprovalDecision, choice: Int?, chatId: Int, fromUserId: Int?
-    ) async throws -> TelegramApprovalResolution {
-        try await resolveTelegramApproval(id: id, decision: decision, chatId: chatId, fromUserId: fromUserId)
-    }
-}
-
-/// The canonical approval result plus an optional internal continuation turn.
-/// A non-blocking Telegram approval ends the original model turn, so a
-/// successful replay must explicitly resume it; otherwise the tool executes
-/// but the assistant never receives the outcome needed to answer the user.
+/// Telegram acknowledges the decision; the shared approval owner reports its result.
 public struct TelegramApprovalResolution: Sendable, Equatable {
     public let acknowledgement: String
-    public let continuationPrompt: String?
-    /// 2026-09-06: the chat session the interrupted turn belonged to, read off
-    /// the approval record. The continuation MUST resume that session: the
-    /// chat's active session binding can have moved (`/new`, `/resume`) while
-    /// the approval sat pending, and resolving the binding at delivery time
-    /// dropped the tool result into whatever session is current instead.
-    public let sessionId: String?
-    /// 2026-09-06: the chat and forum topic the approval was raised in, read
-    /// off the approval record. `/approve <id>` can be typed in any topic of
-    /// the supergroup (or in General), and the continuation, its progress card
-    /// and its reply belong to the topic the interrupted turn ran in — not to
-    /// wherever the command happened to be typed.
-    public let destination: TelegramDestination?
 
-    public init(
-        acknowledgement: String,
-        continuationPrompt: String? = nil,
-        sessionId: String? = nil,
-        destination: TelegramDestination? = nil
-    ) {
+    public init(acknowledgement: String) {
         self.acknowledgement = acknowledgement
-        self.continuationPrompt = continuationPrompt
-        self.sessionId = sessionId
-        self.destination = destination
     }
 }
 
@@ -153,8 +88,7 @@ public struct TelegramApprovalCallback: Sendable, Equatable {
     public let callbackId: String
     public let command: TelegramApprovalCommand
     public let chatId: Int
-    /// 2026-09-06: the forum topic the button lives in, so the acknowledgement
-    /// and any continuation answer in that topic rather than in General.
+    /// The button's forum topic, shared by acknowledgements and continuation replies.
     public let threadId: Int?
     public let messageId: Int
     public let fromUserId: Int?

@@ -1,4 +1,5 @@
 import Foundation
+import os
 import PersistenceCore
 
 // Blueprint: | `ChatCancelFlag.swift` | `ChatCancelFlag`: run-identity Stop markers and in-flight registration; later acceptance never erases a prior turn's Stop |
@@ -8,9 +9,7 @@ import PersistenceCore
 /// marker through a URL carrying that id (in its fragment, which `.path`
 /// ignores). A Stop writes the run ids in flight on the session (or its last
 /// run) INTO the marker, and a turn counts it only when its own id is there.
-/// Acceptance used to delete the marker instead, so a bridge turn accepted
-/// right after a Mac Stop erased that Stop before the turn it was meant for
-/// saw it. Empty content (older writers, tests) and an untagged URL count any
+/// Acceptance preserves prior Stop markers. Empty content and an untagged URL count any
 /// marker; a stale marker naming an old run never matches a new one.
 /// Storage: Stop markers are excluded from local backup, data export and phone
 /// sync; included in off-disk backup and PrivacyMap/chat.
@@ -26,10 +25,12 @@ public enum ChatCancelFlag {
     /// One accepted run, whichever door started it: its session, the trace
     /// turn its milestones carry, and when it was accepted.
     public struct InFlightTurn: Sendable {
-        let runId: String
+        public let runId: String
         public let sessionId: String
         public let turnId: String
         public let acceptedAt: Date
+        /// The marker as this run watches it (tagged with its run id).
+        public let stop: URL
     }
 
     /// Registers `runId` (trace turn `turnId`) as in flight on the session;
@@ -39,18 +40,19 @@ public enum ChatCancelFlag {
     public static func accept(dataRoot: URL, sessionId: String, runId: String, turnId: String) -> URL {
         let file = path(dataRoot: dataRoot, sessionId: sessionId)
         let key = file.standardizedFileURL.path
+        var parts = URLComponents(url: file, resolvingAgainstBaseURL: false)
+        parts?.fragment = runId
+        let stop = parts?.url ?? file
         registry.withLock { runs in
             runs.completed.removeAll { $0 == key }
             if runs.inFlight[key]?.contains(where: { $0.runId == runId }) != true {
                 runs.inFlight[key, default: []].append(
-                    InFlightTurn(runId: runId, sessionId: sessionId, turnId: turnId, acceptedAt: Date()))
+                    InFlightTurn(runId: runId, sessionId: sessionId, turnId: turnId, acceptedAt: Date(), stop: stop))
             }
             runs.latest[key] = runId
         }
         NotificationCenter.default.post(name: inFlightDidChange, object: nil)
-        guard var parts = URLComponents(url: file, resolvingAgainstBaseURL: false) else { return file }
-        parts.fragment = runId
-        return parts.url ?? file
+        return stop
     }
 
     /// A run was accepted or finished, on any session and surface: whoever
@@ -116,13 +118,5 @@ public enum ChatCancelFlag {
         // Keep up to 256 completed sessions for Stop; in-flight sessions stay retained.
         var completed: [String] = []
     }
-    private static let registry = Locked()
-    private final class Locked: @unchecked Sendable {
-        private let lock = NSLock()
-        private var runs = Runs()
-        func withLock<T>(_ body: (inout Runs) -> T) -> T {
-            lock.lock(); defer { lock.unlock() }
-            return body(&runs)
-        }
-    }
+    private static let registry = OSAllocatedUnfairLock(initialState: Runs())
 }

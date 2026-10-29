@@ -1,19 +1,5 @@
-// Swift-native cutover/fix-memory-wiring: process-wide SwiftNativeMemoryV2 instance
-// rooted at <dataRoot>/memory/memory.sqlite (the same SQLite store
-// MemoryConsolidator / UserMDGenerator / proposal flows write through).
-//
-// The production chat path used to recall from a SwiftNativeMemoryRecaller
-// over <dataRoot>/memory_embeddings.jsonl with MockEmbeddingProvider — a
-// different on-disk store than everything else. This file plugs the chat
-// path into the same SQLite-backed store every other MemoryV2 caller uses.
-//
-// MemoryStorageBridge translates MemoryRecord/ProposalRecord to the
-// canonical storage's StoredMemory/StoredProposal schemas. The production embedder is a
-// managed Swift runtime that lazy-loads CoreML MiniLM and honors Settings'
-// on/off configuration. When CoreML can't load and the user hasn't
-// explicitly opted into mock (config backend=mock OR
-// NATIVE_AGENT_EMBEDDING_MOCK=1), the runtime fails closed — embed() throws
-// instead of silently producing random vectors.
+// SwiftNativeMemoryV2 owns canonical MemoryStorage at <dataRoot>/memory/memory.sqlite.
+// Stored rows become MemoryRecord values only at the outward boundary.
 
 import Foundation
 import Senses
@@ -21,328 +7,13 @@ import GRDB
 import NativeAgentCore
 import PersistenceCore
 import Synchronization
-// Blueprint: | `MemoryV2+SharedInstance.swift` | Concrete `MemoryStorageBridge` translates canonical records; attachment readiness, engine-closed projection hooks and unavailable-storage admission; late canonical attachment never reopens stopped projections |
-
-// MARK: - MemoryStorageBridge
-
-public actor MemoryStorageBridge {
-    private let storage: MemoryStorage
-    /// The SQLite file this bridge fronts; `profile.json` lives beside it.
-    public var path: URL { storage.path }
-
-    public init(storage: MemoryStorage) {
-        self.storage = storage
-    }
-
-    func repairSupersededTombstones() async throws {
-        try await storage.repairSupersededTombstones()
-    }
-
-    public func underlyingStorage() -> MemoryStorage { storage }
-
-    public func lookupMemoryRecord(id: String) async throws -> MemoryRecord? {
-        guard let stored = try await storage.memory(id: id) else { return nil }
-        return Self.toMemoryRecord(stored)
-    }
-
-    public func lookupMemoryRecords(ids: [String]) async throws -> [MemoryRecord] {
-        try await storage.memories(ids: ids).map(Self.toMemoryRecord)
-    }
-
-    public func listMemory(kind: String?) async throws -> [MemoryRecord] {
-        // R13 (review HIGH): status:nil deliberately includes archived rows,
-        // but lifecycle-TERMINAL rows (corrected/contradicted/deleted) must
-        // never surface through the public list — this path feeds dream
-        // context and active re-embedding, and a corrected fact leaking back
-        // in defeats the whole correction. memory(id:) stays unfiltered for
-        // lineage/admin walks.
-        let mems = try await storage.listMemories(persona: nil, status: nil, limit: nil)
-            .filter { !MemoryLifecycle.recallExcluded.contains(MemoryLifecycle.normalized($0.lifecycle)) }
-        let filtered: [StoredMemory]
-        if let kind {
-            // Kind lives in metadata_json under "kind" (same convention as
-            // kind-scoped decay). This used to filter on STATUS == kind, so
-            // every real kind ("preference", "semantic") returned [] —
-            // memory looked empty, not broken (audit 2026-06-09).
-            filtered = mems.filter { Self.metadataString($0.metadata, "kind") == kind }
-        } else {
-            filtered = mems
-        }
-        return filtered.map(Self.toMemoryRecord)
-    }
-
-    public func insert(
-        record: MemoryRecord,
-        embedding: [Float]?,
-        embeddingEpoch: MemoryEmbeddingEpoch?,
-        superseding: [SupersedingAcceptance]
-    ) async throws -> MemoryRecord {
-        let stored = Self.toStoredMemory(record, embedding: embedding, embeddingEpoch: embeddingEpoch)
-        let inserted = try await storage.insertMemory(stored, superseding: superseding)
-        return Self.toMemoryRecord(inserted)
-    }
-
-    public func admit(
-        record: MemoryRecord, embedding: [Float]?, embeddingEpoch: MemoryEmbeddingEpoch?,
-        insertIfMissing: Bool, preserveID: Bool
-    ) async throws -> MemoryRecord? {
-        let stored = Self.toStoredMemory(record, embedding: embedding, embeddingEpoch: embeddingEpoch)
-        return try await storage.admitMemory(
-            stored, insertIfMissing: insertIfMissing, preserveID: preserveID
-        ).map(Self.toMemoryRecord)
-    }
-
-    static func toStoredMemory(
-        _ record: MemoryRecord, embedding: [Float]?, embeddingEpoch: MemoryEmbeddingEpoch?,
-        defaultPersonaID: String = MemoryV2Defaults.personaID
-    ) -> StoredMemory {
-        // Fold the typed MemoryRecord fields that StoredMemory has no column
-        // for into metadata_json so they round-trip (they were silently
-        // amputated in transit — pin/tags/importance/kind all lost; audit
-        // 2026-06-09). Existing metadata keys win — never overwrite what a
-        // caller already stamped.
-        var meta: [String: JSONValue]
-        if case .object(let m)? = record.extras { meta = m } else { meta = [:] }
-        if meta["kind"] == nil, let k = record.memoryKind { meta["kind"] = .string(k) }
-        if meta["tags"] == nil, let t = record.tags, !t.isEmpty {
-            meta["tags"] = .array(t.map { .string($0) })
-        }
-        if meta["importance"] == nil, let imp = record.importance { meta["importance"] = .double(imp) }
-        if meta["pinned"] == nil, let pin = record.pinned { meta["pinned"] = .bool(pin) }
-        return StoredMemory(
-            id: record.id,
-            content: record.text,
-            personaId: record.personaId ?? defaultPersonaID,
-            source: record.sourceRunId,
-            confidence: record.confidence ?? 1.0,
-            createdAt: record.createdAt,
-            updatedAt: record.updatedAt,
-            embedding: embedding,
-            embeddingEpoch: embeddingEpoch?.rawValue,
-            status: record.status ?? "active",
-            lifecycle: record.lifecycle ?? MemoryLifecycle.confirmed,
-            validFrom: record.validFrom,
-            validTo: record.validTo,
-            observedAt: record.observedAt,
-            evidence: record.evidence,
-            metadata: meta.isEmpty ? nil : .object(meta)
-        )
-    }
-
-    public func updateMemory(
-        id: String,
-        patch: JSONValue,
-        newEmbedding: [Float]?,
-        embeddingEpoch: MemoryEmbeddingEpoch?
-    ) async throws -> MemoryRecord {
-        var p = MemoryPatch()
-        if case .object(let obj) = patch {
-            if case .string(let s)? = obj["text"] { p.content = s }
-            if case .string(let s)? = obj["content"] { p.content = s }
-            if case .string(let s)? = obj["status"] { p.status = s }
-            // The agent's restore lifts a corrected row back to current.
-            if case .string(let s)? = obj["lifecycle"] { p.lifecycle = s }
-            if case .double(let d)? = obj["confidence"] { p.confidence = d }
-            if case .int(let i)? = obj["confidence"] { p.confidence = Double(i) }
-            if case .string(let value)? = obj["validFrom"] { p.validFrom = value }
-            if case .string(let value)? = obj["valid_from"] { p.validFrom = value }
-            if case .string(let value)? = obj["validTo"] { p.validTo = value }
-            if case .string(let value)? = obj["valid_to"] { p.validTo = value }
-            if case .string(let value)? = obj["observedAt"] { p.observedAt = value }
-            if case .string(let value)? = obj["observed_at"] { p.observedAt = value }
-            if let evidence = obj["evidence"] { p.evidence = evidence }
-            // Keys with no typed MemoryPatch slot (the Mac UI pin path sends
-            // "pinned") round-trip through metadata_json. This bridge used to
-            // DROP them and still return ok — pin was a silent no-op (audit
-            // 2026-06-09). Storage merges these keys inside the same SQLite
-            // transaction as the row update. "kind" is
-            // deliberately NOT passthrough — it's semantics-owned (kind-scoped
-            // decay) and no UI path patches it (gpt-5.5 review).
-            // recall_count added 2026-07-24 (gpt-5.5 BLOCKING): store()'s
-            // write-time duplicate guard bumps it as merge-corroboration
-            // evidence; without passthrough the bump silently no-oped on
-            // production SQLite while the in-memory fixture hid it.
-            // source_history / duplicate_occurrences added 2026-08-02 (gpt-5.5
-            // review A3): store()'s byte-identical collapse writes the LATER
-            // run's provenance here. Without passthrough the second run's
-            // identity is dropped on production SQLite exactly the way the
-            // recall_count bump was.
-            let passthrough = obj.filter {
-                MemoryPatchContract.untypedPassthroughKeys.contains($0.key)
-            }
-            if !passthrough.isEmpty {
-                p.metadataMerge = passthrough
-            }
-        }
-        if let newEmbedding {
-            p.embedding = newEmbedding
-            p.embeddingEpoch = embeddingEpoch?.rawValue
-        }
-        guard let updated = try await storage.updateMemory(id: id, patch: p) else {
-            throw MemoryV2Error.recordNotFound
-        }
-        return Self.toMemoryRecord(updated)
-    }
-
-    public func deleteMemory(id: String) async throws -> Bool {
-        try await storage.deleteMemory(id: id)
-    }
-
-    /// Bounded, two-column lane enumeration straight from SQLite.
-    public func memoryHandles(sourcePrefix: String, limit: Int?) async throws -> [MemoryLaneHandle] {
-        try await storage.laneHandles(sourcePrefix: sourcePrefix, limit: limit)
-    }
-
-    public func recall(
-        embedding: [Float],
-        embeddingEpoch: MemoryEmbeddingEpoch?,
-        queryText: String,
-        topK: Int,
-        persona: String?
-    ) async throws -> [ScoredMemoryRecord] {
-        let hits = try await storage.recall(
-            embedding: embedding,
-            embeddingEpoch: embeddingEpoch,
-            queryText: queryText,
-            topK: topK,
-            persona: persona
-        )
-        return hits.map { ScoredMemoryRecord(record: Self.toMemoryRecord($0.memory), score: $0.similarity) }
-    }
-
-    public func isTombstoned(content: String) async throws -> Bool {
-        try await storage.isTombstoned(content: content)
-    }
-
-    public func recordRecallHits(ids: [String]) async throws {
-        try await storage.recordRecallHits(ids: ids)
-    }
-
-    /// R13: mark an existing memory corrected by a newer one (single
-    /// transaction, lineage in metadata; corrected rows drop out of recall).
-    @discardableResult
-    public func markCorrected(id: String, by newerId: String, reason: String? = nil) async throws -> Bool {
-        try await storage.markCorrected(id: id, by: newerId, reason: reason)
-    }
-
-    public func matchesTombstone(
-        embedding: [Float],
-        embeddingEpoch: MemoryEmbeddingEpoch?
-    ) async throws -> Bool {
-        try await storage.matchesTombstone(
-            embedding: embedding,
-            embeddingEpoch: embeddingEpoch
-        )
-    }
-
-    public func stagePendingProposal(
-        _ proposal: ProposalRecord,
-        embedding: [Float]?,
-        embeddingEpoch: MemoryEmbeddingEpoch?,
-        insertIfAbsent: Bool,
-        foldedKey: @Sendable (String) -> String,
-        merge: @Sendable (ProposalRecord) throws -> JSONValue?
-    ) async throws -> ProposalRecord? {
-        let stored = StoredProposal(
-            id: proposal.id,
-            content: proposal.content,
-            personaId: MemoryV2Defaults.personaID,
-            source: proposal.source,
-            stagedAt: proposal.createdAt,
-            status: proposal.status,
-            resolvedAt: nil,
-            rejectionReason: proposal.rejectionReason,
-            embedding: embedding,
-            embeddingEpoch: embeddingEpoch?.rawValue,
-            metadata: proposal.metadata
-        )
-        let result = try await storage.stagePendingProposal(
-            stored,
-            insertIfAbsent: insertIfAbsent,
-            foldedKey: foldedKey,
-            merge: { try merge(Self.toProposalRecord($0)) }
-        )
-        return result.map(Self.toProposalRecord)
-    }
-
-    public func getProposal(id: String) async throws -> ProposalRecord? {
-        // U5 W-G fix (2026-06-11): by-id SQL lookup instead of a full
-        // listProposals(status: nil) scan per call — the auto-accept sweep
-        // calls this once per proposal, so the scan made it O(N²).
-        guard let p = try await storage.getProposal(id: id) else { return nil }
-        return Self.toProposalRecord(p)
-    }
-
-    public func acceptProposal(id: String) async throws -> MemoryRecord {
-        let accepted = try await storage.acceptProposal(id: id)
-        return Self.toMemoryRecord(accepted)
-    }
-
-    /// Accept and demote in one transaction.
-    public func acceptProposal(
-        id: String,
-        superseding: SupersedingAcceptance
-    ) async throws -> MemoryRecord {
-        Self.toMemoryRecord(try await storage.acceptProposal(id: id, superseding: superseding))
-    }
-
-    public func acceptReviewedMoment(id: String, review: ReviewedMomentAcceptance) async throws -> MemoryRecord {
-        Self.toMemoryRecord(try await storage.acceptProposal(id: id, review: review))
-    }
-
-    public func updateProposalStatus(id: String, status: String, rejectionReason: String?) async throws {
-        if status == "rejected" {
-            _ = try await storage.rejectProposal(id: id, reason: rejectionReason)
-            return
-        }
-        try await storage.markProposalStatus(id: id, status: status, resolvedAt: MemoryStorage.nowISO8601())
-    }
-
-    public func supersedeProposal(id: String, by successorId: String) async throws -> Bool {
-        try await storage.supersedeProposal(id: id, by: successorId)
-    }
-
-    public func updateProposalMetadata(id: String, metadata: JSONValue?) async throws -> ProposalRecord {
-        guard let updated = try await storage.updateProposalMetadata(id: id, metadata: metadata) else {
-            throw MemoryV2Error.recordNotFound
-        }
-        return Self.toProposalRecord(updated)
-    }
-
-    /// One scalar out of SQLite instead of every pending row through the
-    /// decoder — this runs on the turn path (the moments nudge line).
-    public func countMomentProposals(status: String?) async throws -> Int {
-        try await storage.countMomentProposals(status: status)
-    }
-
-    public func listProposals(status: String?) async throws -> [ProposalRecord] {
-        let list = try await storage.listProposals(status: status)
-        return list.map(Self.toProposalRecord)
-    }
-
-    private static func toMemoryRecord(_ s: StoredMemory) -> MemoryRecord {
-        MemoryRecord(stored: s)
-    }
-
-    private static func metadataString(_ metadata: JSONValue?, _ key: String) -> String? {
-        guard case .object(let obj)? = metadata, case .string(let v)? = obj[key] else { return nil }
-        return v
-    }
-
-    private static func toProposalRecord(_ p: StoredProposal) -> ProposalRecord {
-        ProposalRecord(stored: p)
-    }
-}
+import NativeAgentShared
+// Blueprint: | `MemoryV2+SharedInstance.swift` | `SwiftNativeMemoryV2` directly owns canonical `MemoryStorage`; attachment readiness, engine-closed projection hooks and unavailable-storage admission; late canonical attachment never reopens stopped projections |
 
 // MARK: - SwiftNativeMemoryV2.shared
 
 extension SwiftNativeMemoryV2 {
-    /// True when `dataRoot` names the process-wide production store.
-    ///
-    /// Keep this comparison in one place. Long-lived app factories used to
-    /// spell it several different ways (`==`, `standardizedFileURL`, or no
-    /// check at all), which could create a second MemoryV2 actor, SQLite pool,
-    /// embedding cache, and projection-hook owner over the live database.
+    /// True when canonical path identity matches the process-wide production store.
     public static func usesDefaultDataRoot(_ dataRoot: URL) -> Bool {
         canonicalRootIdentity(dataRoot)
             == canonicalRootIdentity(PersistenceCore.defaultDataRoot())
@@ -367,7 +38,7 @@ extension SwiftNativeMemoryV2 {
         }
         return SwiftNativeMemoryV2(
             embedder: alternateRootEmbedder ?? ManagedEmbeddingProvider(dataRoot: root),
-            storage: MemoryStorageBridge(storage: storage)
+            storage: storage
         )
     }
 
@@ -378,10 +49,10 @@ extension SwiftNativeMemoryV2 {
     /// than quietly constructing a hookless second owner over live memory.
     public static func resolvedStorage(dataRoot: URL) async throws -> MemoryStorage {
         if usesDefaultDataRoot(dataRoot) {
-            guard let bridge = await SwiftNativeMemoryV2.shared.underlyingBridge() else {
+            guard let storage = await SwiftNativeMemoryV2.shared.underlyingStorage() else {
                 throw MemoryV2Error.storageUnavailable
             }
-            return await bridge.underlyingStorage()
+            return storage
         }
         return try MemoryStorage(dataRoot: dataRoot.standardizedFileURL)
     }
@@ -401,8 +72,7 @@ extension SwiftNativeMemoryV2 {
         userProjectionBinding = (dataRoot, personaRoot, debounceInterval)
         do { try await ensureCanonicalAttachment() }
         catch { emitDiagnostic("[MemoryV2] USER projection attachment failed: \(error)"); return nil }
-        guard let bridge = storage else { return nil }
-        let underlying = await bridge.underlyingStorage()
+        guard let underlying = storage else { return nil }
         guard !memoryProjectionsStopped else { return nil }
         let storagePath = underlying.path
         let storageDataRoot = storagePath
@@ -426,10 +96,7 @@ extension SwiftNativeMemoryV2 {
     /// Retire projection resources without closing the canonical write store.
     public func shutdownProjections() async {
         memoryProjectionsStopped = true
-        if let storage {
-            let underlying = await storage.underlyingStorage()
-            await underlying.shutdownProjections()
-        }
+        if let storage { await storage.shutdownProjections() }
         await canonicalAttachmentReady?.value
     }
 
@@ -439,10 +106,9 @@ extension SwiftNativeMemoryV2 {
     @discardableResult
     public func reconcileKnowledgeGraphProjection() async throws -> KnowledgeGraphMemoryRebuildReport {
         try await ensureCanonicalAttachment()
-        guard let bridge = storage else {
+        guard let underlying = storage else {
             throw MemoryV2Error.storageUnavailable
         }
-        let underlying = await bridge.underlyingStorage()
         let sqlitePath = underlying.path
         let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
         return try await indexer.rebuildMemoryDerivedGraphFromCanonicalStore(
@@ -456,34 +122,24 @@ extension SwiftNativeMemoryV2 {
         root.standardizedFileURL.resolvingSymlinksInPath().path
     }
 
-    /// Mark an existing memory corrected by a newer one in one transaction.
-    @discardableResult
-    public func markCorrected(id: String, by newerId: String, reason: String? = nil) async throws -> Bool {
-        try await ensureCanonicalAttachment()
-        guard let storage else { throw MemoryV2Error.storageUnavailable }
-        let corrected = try await storage.markCorrected(id: id, by: newerId, reason: reason)
-        return corrected
-    }
-
-    /// Phase 5 B0: one record by exact id, unfiltered, for the authority
-    /// check in front of her association rejections. Not a recall path.
+    /// Unfiltered exact-ID authority lookup; never a recall path.
     public func authorityRecord(id: String) async throws -> MemoryRecord? {
         try await ensureCanonicalAttachment()
-        guard let bridge = storage else { throw MemoryV2Error.storageUnavailable }
-        return try await bridge.lookupMemoryRecord(id: id)
+        guard let underlying = storage else { throw MemoryV2Error.storageUnavailable }
+        return try await underlying.memory(id: id).map(MemoryRecord.init(stored:))
     }
 
     /// Uses disclosure-filtered user facts until a pinned core is chosen.
     public func userPromptCore(surface: String) async throws -> [String]? {
         try await ensureCanonicalAttachment()
-        guard let bridge = storage else { throw MemoryV2Error.storageUnavailable }
-        return try await bridge.underlyingStorage().userPromptCore(surface: surface)
+        guard let underlying = storage else { throw MemoryV2Error.storageUnavailable }
+        return try await underlying.userPromptCore(surface: surface)
     }
 
     /// Process-wide instance rooted at the default data root. Uses the same
     /// SQLite store the rest of MemoryV2 writes through. Uses the
-    /// `ManagedEmbeddingProvider` which tries CoreML MiniLM
-    /// (bundled minilm.mlpackage) first; if the model fails to load it
+    /// `ManagedEmbeddingProvider` which loads CoreML bge-large-en-v1.5
+    /// from the data root or Resources/embedding; if the model fails to load it
     /// **fails closed** (embed() throws) unless the user explicitly opted
     /// into mock vectors via config (`config/embeddings.json::backend = "mock"`)
     /// or the developer-test env var `NATIVE_AGENT_EMBEDDING_MOCK=1`.
@@ -501,9 +157,9 @@ extension SwiftNativeMemoryV2 {
         }
         guard storage == nil, let dataRoot = canonicalDataRoot else { return }
         do {
-            let (bridge, ready) = try Self.sharedBackingStore(dataRoot: dataRoot, userProjectionBinding: userProjectionBinding,
+            let (storage, ready) = try Self.sharedBackingStore(dataRoot: dataRoot, userProjectionBinding: userProjectionBinding,
                                                             projectionsEnabled: !memoryProjectionsStopped)
-            storage = bridge
+            self.storage = storage
             canonicalAttachmentReady = ready
             Self.sharedOpenFailureSlot.withLock { $0 = nil }
             await ready.value
@@ -517,8 +173,7 @@ extension SwiftNativeMemoryV2 {
 
     public func repairCanonicalAttachment() async throws {
         try await ensureCanonicalAttachment()
-        guard let bridge = storage else { throw MemoryV2Error.storageUnavailable }
-        let underlying = await bridge.underlyingStorage()
+        guard let underlying = storage else { throw MemoryV2Error.storageUnavailable }
         _ = try await underlying.listMemories(persona: nil, status: nil, limit: 1)
         guard try await underlying.quickCheck() == ["ok"] else {
             throw MemoryV2Error.underlying("Canonical memory integrity check failed; the store was retained without rebuilding its graph.")
@@ -531,10 +186,9 @@ extension SwiftNativeMemoryV2 {
         dataRoot: URL,
         userProjectionBinding: (dataRoot: URL, personaRoot: URL?, debounceInterval: TimeInterval)?,
         projectionsEnabled: Bool
-    ) throws -> (MemoryStorageBridge, Task<Void, Never>) {
+    ) throws -> (MemoryStorage, Task<Void, Never>) {
         let storage = try MemoryStorage(dataRoot: dataRoot)
-        let bridge = MemoryStorageBridge(storage: storage)
-        guard projectionsEnabled else { return (bridge, Task {}) }
+        guard projectionsEnabled else { return (storage, Task {}) }
         // Spotlight indexing hook: every memory mutation (insert/update/
         // delete/acceptProposal) reflects into the Spotlight index so the
         // system surfaces them. Built lazily to avoid retaining the indexer
@@ -555,28 +209,27 @@ extension SwiftNativeMemoryV2 {
                 ))
             }
             await storage.attachSpotlightHook { stored, deleted in
-                if deleted {
-                    try? await indexer.remove(id: stored.id)
-                } else {
-                    try? await indexer.indexRecord(id: stored.id, text: stored.content, kind: stored.status)
+                do {
+                    if deleted {
+                        try await indexer.remove(id: stored.id)
+                    } else {
+                        try await indexer.indexRecord(id: stored.id, text: stored.content, kind: stored.status)
+                    }
+                } catch {
+                    await SwiftNativeMemoryIndexer.recordProjectionFailure(
+                        "Canonical memory change committed; Spotlight \(deleted ? "removal" : "indexing") failed for \(stored.id): \(error)",
+                        dataRoot: dataRoot, storage: storage)
                 }
             }
             do {
-                await storage.attachKnowledgeGraphHook { stored, deleted in
-                    // Settings ▸ "Knowledge graph": off means no graph is
-                    // PRODUCED. A delete still reaches the graph, and a write
-                    // while off retires the memory-derived graph, so a rewritten or
-                    // forgotten memory never lingers with old text (reviewer,
-                    // 2026-09-05). Read fresh per mutation.
+                await storage.attachKnowledgeGraphHook { id in
+                    // Read production policy per mutation; off retires the
+                    // memory-derived graph, including rewritten or forgotten facts.
                     let producing = MemoryPolicyGate.knowledgeGraphEnabled(dataRoot: dataRoot)
                     do {
                         try await kgIndexer.reconcileProjectionIfNeeded(producing: producing)
                         graphProjectionFailureSlot.withLock { $0 = nil }
-                        try await kgIndexer.indexMemory(
-                            stored.id,
-                            deleted: deleted,
-                            producing: producing
-                        )
+                        try await kgIndexer.indexMemory(id, producing: producing)
                     } catch {
                         await kgIndexer.markProjectionDirty()
                         graphProjectionFailureSlot.withLock { $0 = String(describing: error) }
@@ -599,11 +252,10 @@ extension SwiftNativeMemoryV2 {
                 }
             }
         }
-        return (bridge, ready)
+        return (storage, ready)
     }
 
-    /// Why the last canonical attachment failed, or nil when memory.sqlite
-    /// opened. Launch and Doctor show it; the log line alone was the only trace.
+    /// Last canonical attachment failure for Launch and Doctor, or nil after a successful open.
     public static var sharedOpenFailure: String? {
         _ = shared
         return sharedOpenFailureSlot.withLock { $0 }
@@ -615,11 +267,8 @@ extension SwiftNativeMemoryV2 {
         graphProjectionFailureSlot.withLock { $0 }
     }
 
-    /// Bridge access for callers that need to attach the UserMDGenerator
-    /// to the same underlying MemoryStorage instance — write-side hook
-    /// callers (insertMemory / acceptProposal) only fire pokeUserMDRegen
-    /// on the MemoryStorage that holds the generator reference.
-    public func underlyingBridge() async -> MemoryStorageBridge? {
+    /// The exact canonical owner, after attachment readiness has settled.
+    public func underlyingStorage() async -> MemoryStorage? {
         do { try await ensureCanonicalAttachment() }
         catch { emitDiagnostic("[MemoryV2] Canonical attachment failed: \(error)") }
         return storage
@@ -636,31 +285,18 @@ extension MemoryStorage {
 
 // MARK: - MemoryRecalling adapter
 
-/// MemoryRecalling impl backed by SwiftNativeMemoryV2.shared. Use this in
-/// the chat-orchestration factory instead of SwiftNativeMemoryRecaller so
-/// recall hits the same SQLite store the rest of MemoryV2 uses.
+/// Disclosure-aware recall and delivered-hit credit against the same memory owner.
 public struct SwiftNativeMemoryV2Recaller: Sendable {
     private let memory: SwiftNativeMemoryV2
     public init(memory: SwiftNativeMemoryV2 = .shared) {
         self.memory = memory
     }
-    /// User, 2026-09-06: retrieves WITHOUT crediting `use_count`. This adapter
-    /// feeds the chat turn's legacy recall lane, which then drops rows a REM
-    /// pin already states and trims the rest to the prompt's row/character
-    /// budget — so crediting here made rows the model never saw look used, and
-    /// use_count is the signal that vetoes eviction. The turn engine reports
-    /// what it actually delivered through `recordServedContextHits`.
-    public func recall(_ query: String, k: Int) async throws -> [MemoryRecallHit] {
-        let request = MemoryV2RecallRequest(text: query, topK: k, persona: nil)
-        let response = try await memory.recall(request, recordingUsage: false)
-        return await annotatedWithRelatedEntities(response, query: request)
-    }
-
+    /// Retrieve without credit; the accepted context credits only delivered IDs.
     public func recall(
         _ query: String,
         k: Int,
-        persona: String?,
-        surface: String?
+        persona: String? = nil,
+        surface: String? = nil
     ) async throws -> [MemoryRecallHit] {
         let request = MemoryV2RecallRequest(
             text: query,
@@ -668,36 +304,27 @@ public struct SwiftNativeMemoryV2Recaller: Sendable {
             persona: persona,
             surface: surface
         )
-        // Same contract as the overload above: retrieve, do not credit.
         let response = try await memory.recall(request, recordingUsage: false)
         return await annotatedWithRelatedEntities(response, query: request)
     }
 
-    /// B4 (2026-08-28): attach each hit's one-hop Knowledge Graph entities under
-    /// `extras["kg_related"]`, for the prompt renderer to fold into a single
-    /// `related:` line.
-    ///
-    /// ── WHY HERE ─────────────────────────────────────────────────────────────
-    /// This adapter is the narrowest place that has both halves: recall has
-    /// already applied `MemoryRecordDisclosurePolicy`, and the shared instance
-    /// can still reach the SQLite file the graph lives in. The renderer
-    /// downstream is a pure `nonisolated static` function with no handles, and
-    /// giving it a database would be a far larger change than the feature is
-    /// worth.
-    ///
-    /// ── DISCLOSURE ───────────────────────────────────────────────────────────
-    /// The classification is re-asserted here rather than inherited. `hits` is
-    /// already disclosure-filtered upstream, so this is belt-and-braces — but it
-    /// is the check that makes the privacy argument local and readable: only
-    /// memories that classify AND permit this exact surface/persona are used to
-    /// seed the graph hop, and each memory's entities were extracted from that
-    /// memory's own text. A memory that fails the check contributes no seed and
-    /// therefore no entity names.
-    ///
-    /// ── FAIL-OPEN ────────────────────────────────────────────────────────────
-    /// Any failure — no bridge, missing database, unreadable graph — returns the
-    /// hits exactly as recall produced them. The `related:` line is an
-    /// enrichment; it must never be able to cost a turn its memories.
+    /// Credit only the hits the accepted context delivered; report write failures.
+    public func recordServedContextHits(ids: [String]) async {
+        guard !ids.isEmpty else { return }
+        do {
+            try await memory.recordRecallHits(ids: ids)
+        } catch {
+            FileHandle.standardError.write(
+                Data("MemoryV2: context-serve bump failed for \(ids.count) ids: \(error)\n".utf8)
+            )
+        }
+    }
+
+    /// Add one-hop entities from this memory owner's SQLite graph to `extras["kg_related"]`.
+    /// Seed only records that classify and permit this surface/persona under `MemoryRecordDisclosurePolicy`.
+    /// Recall's `extras["id"]` ties each hit to entities extracted from its own memory text.
+    /// The prompt renderer presents entity names as one `related:` line.
+    /// Unavailable storage or graph enrichment failure leaves recall hits unchanged.
     private func annotatedWithRelatedEntities(
         _ response: MemoryV2RecallResponse,
         query: MemoryV2RecallRequest
@@ -717,10 +344,10 @@ public struct SwiftNativeMemoryV2Recaller: Sendable {
             }
         )
         guard !disclosedIDs.isEmpty else { return response.hits }
-        guard let bridge = await memory.underlyingBridge() else { return response.hits }
+        guard let storage = await memory.underlyingStorage() else { return response.hits }
         let related: [String: [String]]
         do {
-            let sqlitePath = await bridge.underlyingStorage().path
+            let sqlitePath = storage.path
             let indexer = try SwiftNativeKnowledgeGraphIndexer(memorySQLitePath: sqlitePath)
             related = try await indexer.relatedEntityNames(
                 forMemoryIDs: Array(disclosedIDs)
@@ -817,5 +444,22 @@ extension SwiftNativeMemoryV2 {
         } catch {
             return []
         }
+    }
+}
+
+extension MemoryPatch {
+    init(update: JSONValue, embedding: [Float]?, epoch: MemoryEmbeddingEpoch?) {
+        self.init(embedding: embedding, embeddingEpoch: epoch?.rawValue)
+        guard case .object(let object) = update else { return }
+        content = SwiftNativeMemoryV2.patchText(update)
+        status = object["status"]?.stringValue
+        lifecycle = object["lifecycle"]?.stringValue
+        confidence = object["confidence"]?.numberValue(coercingStrings: false, finiteOnly: false)
+        validFrom = object["valid_from"]?.stringValue ?? object["validFrom"]?.stringValue
+        validTo = object["valid_to"]?.stringValue ?? object["validTo"]?.stringValue
+        observedAt = object["observed_at"]?.stringValue ?? object["observedAt"]?.stringValue
+        evidence = object["evidence"]
+        let passthrough = object.filter { MemoryPatchContract.untypedPassthroughKeys.contains($0.key) }
+        if !passthrough.isEmpty { metadataMerge = passthrough }
     }
 }

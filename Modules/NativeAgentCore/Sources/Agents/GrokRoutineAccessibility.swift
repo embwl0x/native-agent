@@ -1,4 +1,3 @@
-import GrokLink
 import AppKit
 import os
 import ApplicationServices
@@ -7,146 +6,7 @@ import MacControl
 import NativeAgentCore
 import PersistenceCore
 import Senses
-// Blueprint: | `GrokRoutineAccessibility.swift` | A client of MacControl hands: shared bounded window/subtree reads find the Routines anchor outside the transcript, then search only its section; budget exhaustion reports search purpose and extent, never recipe drift; shared attribute/label/frame reads, transient menu roots, actuator mutations and event-sink input replace private AX primitives. Native-only routine credential transfer for the contact's selected Bot: editable recipe steps select the exact title with its Pause switch inside the Routines content list, `AXShowMenu` on its title group then Webhook; no chat-link or row-press path; masked fields use only their own Copy control with bounded native clipboard release through `settle`; field counts/readability and missing controls/menu items are reported without values, with their recipe file as the UI-drift lever; setup/send and foreground restoration use `SystemMacAXActSource.activate` under the original driver generation; panel cleanup and foreground release run through `settle` with an independent cancellation lifetime, still revoked by physical takeover; front waits use workspace events only; shared `DesktopRouteObservation` registers before the condition read and surfaces failed registration/renewal only after that read, uses 250ms `external_protocol_poll` wakes only for `source_unsupported` within each step's own deadline, and records the actual read method and wake; reverse navigation settlement dismisses only steps this import opened, stops on a failed child dismissal, and appends cleanup failure after the original blocker |
-
-/// One desktop operation's observation, registered before its first predicate
-/// read. AX/workspace/input events wake it; a one-shot timer settles a quiet
-/// interval or ends a bounded wait. With no supported AX notifications, reads
-/// wake every 250ms only inside the caller's deadline. Every caller stops it.
-/// Observation is a wake, never a precondition: a failed registration or
-/// renewal is reported only after the caller has read its condition.
-@MainActor final class DesktopRouteObservation {
-    enum Wake: String, Sendable {
-        case initialRead = "initial_read"
-        // The AX stream includes its registration-race signal. A wake does
-        // not claim that a change notification or content change occurred.
-        case accessibility = "accessibility_subscription"
-        case workspace, keyboard
-        case boundary = "time_boundary"
-        case interval = "external_protocol_poll"
-        case unavailable = "observation_unavailable"
-    }
-    private let stream: AsyncThrowingStream<Wake, Error>
-    private let signal: AsyncThrowingStream<Wake, Error>.Continuation
-    private let source: MacAppSourceEvents?
-    private var sourceFailure: Error?
-    private let timer: DispatchSourceTimer
-    private var pollTimer: DispatchSourceTimer?
-    private(set) var pollingReason: String?
-    private var lastWake: Wake = .initialRead
-    private var stopped = false
-    private var reader: Task<Void, Never>?
-    private var workspace: [NSObjectProtocol] = []
-    private var input: [Any] = []
-
-    init(bundleID: String, accessibility: Bool = true, keyboard: Bool = false) throws {
-        try Task.checkCancellation()
-        do { source = accessibility ? try MacAppSourceEvents(bundleID: bundleID) : nil }
-        catch is CancellationError { throw CancellationError() }
-        catch {
-            source = nil
-            pollingReason = Self.unsupportedReason(error)
-            if pollingReason == nil {
-                sourceFailure = GrokRoutineAccessibility.observationFailure(error, operation: "for \(bundleID) could not start")
-            }
-        }
-        let pair = AsyncThrowingStream<Wake, Error>.makeStream(bufferingPolicy: .bufferingNewest(1))
-        stream = pair.stream; signal = pair.continuation
-        timer = DispatchSource.makeTimerSource(queue: .main)
-        timer.setEventHandler { pair.continuation.yield(.boundary) }
-        timer.resume()
-        workspace = [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didActivateApplicationNotification,
-                     NSWorkspace.didTerminateApplicationNotification, NSWorkspace.didUnhideApplicationNotification].map { name in
-            NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: nil) { _ in
-                pair.continuation.yield(.workspace)
-            }
-        }
-        if keyboard {
-            if let monitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: { _ in pair.continuation.yield(.keyboard) }) {
-                input.append(monitor)
-            }
-            if let monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { event in
-                pair.continuation.yield(.keyboard); return event
-            }) { input.append(monitor) }
-        }
-        if let source {
-            reader = Task { [weak self] in
-                do {
-                    for try await _ in source.stream {
-                        guard !Task.isCancelled else { return }
-                        pair.continuation.yield(.accessibility)
-                    }
-                    guard !Task.isCancelled else { return }
-                    self?.sourceFailure = GrokRoutineAccessibility.Failure(detail: "Accessibility observation ended before the condition was confirmed. Bring the app forward with its Accessibility tree available, then continue.")
-                } catch {
-                    guard !Task.isCancelled else { return }
-                    if let reason = Self.unsupportedReason(error) { self?.pollingReason = reason }
-                    else { self?.sourceFailure = GrokRoutineAccessibility.observationFailure(error, operation: "stopped") }
-                }
-                // Let the caller read once before surfacing the lost wake.
-                pair.continuation.yield(.unavailable)
-            }
-        }
-    }
-
-    private static func unsupportedReason(_ error: Error) -> String? {
-        guard let failure = error as? SenseFailure, failure.code == "source_unsupported" else { return nil }
-        return failure.message
-    }
-
-    func receipt(readBy: String) -> JSONValue {
-        var fields: [String: JSONValue] = ["read_by": .string(readBy), "wake": .string(lastWake.rawValue),
-            "mode": .string(pollingReason != nil ? "external_protocol_poll" : sourceFailure != nil ? "unavailable" : "source_events")]
-        if let pollingReason { fields["reason"] = .string(pollingReason) }
-        if let sourceFailure { fields["reason"] = .string(sourceFailure.localizedDescription) }
-        return .object(fields)
-    }
-
-    func next(until deadline: Date? = nil) async throws {
-        try Task.checkCancellation()
-        if let sourceFailure { throw sourceFailure }
-        if let deadline {
-            guard deadline > Date() else { lastWake = .boundary; return }
-            timer.schedule(deadline: .now() + max(0, deadline.timeIntervalSinceNow))
-        } else { timer.schedule(deadline: .distantFuture) }
-        if pollingReason != nil {
-            guard let deadline else {
-                throw GrokRoutineAccessibility.Failure(detail: "Desktop interval observation requires the step's own deadline; no unbounded interval reader was started.")
-            }
-            if Date().addingTimeInterval(0.25) < deadline {
-                let polling = DispatchSource.makeTimerSource(queue: .main)
-                let signal = self.signal
-                polling.setEventHandler { signal.yield(.interval) }
-                polling.schedule(deadline: .now() + 0.25)
-                pollTimer = polling
-                polling.resume()
-            }
-        }
-        defer { pollTimer?.cancel(); pollTimer = nil }
-        var iterator = stream.makeAsyncIterator()
-        do {
-            guard let wake = try await iterator.next() else { throw CancellationError() }
-            lastWake = wake
-        } catch is CancellationError { throw CancellationError() }
-        catch {
-            throw GrokRoutineAccessibility.observationFailure(error, operation: "stopped")
-        }
-        try Task.checkCancellation()
-    }
-
-    func stop() {
-        guard !stopped else { return }
-        stopped = true
-        reader?.cancel(); reader = nil
-        source?.cancel()
-        pollTimer?.cancel(); pollTimer = nil
-        timer.cancel()
-        signal.finish()
-        workspace.forEach { NSWorkspace.shared.notificationCenter.removeObserver($0) }; workspace.removeAll()
-        input.forEach { NSEvent.removeMonitor($0) }; input.removeAll()
-    }
-}
-
+// Blueprint: | `GrokRoutineAccessibility.swift` | Native Grok routine setup/submission/import and masked-field transfer through the existing MacControl driver |
 /// Native-only secret transfer. AX values never cross a model, screenshot,
 /// tool result, log, approval preview or transcript boundary. A masked field's
 /// own Copy control transfers only inside native code and clears its clipboard.
@@ -218,13 +78,11 @@ import Senses
     private static func outsideTranscript(_ node: AXUIElement) -> Bool {
         MacAXAttributeRead.text(node, kAXSubroleAttribute) != "AXApplicationLog"
     }
-
-    private static func navigationNodes(searching: String = "Grok Bot's navigation controls") throws -> [AXUIElement] {
+    static func navigationNodes(searching: String = "Grok Bot's navigation controls") throws -> [AXUIElement] {
         try MacAccessibilityReader.elements(in: window(), searching: searching,
             descendInto: outsideTranscript)
     }
-    /// Seen on the installed app (09-20): the box has no placeholder attribute;
-    /// an empty box reports "Message <chat name>" as its value. Match only the
+    /// An empty box reports "Message <chat name>" as its value. Match only the
     /// verified destination's exact placeholder, never a generic prose prefix.
     static func isEmptyBox(_ value: String, conversation: String = "grok") -> Bool {
         let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -292,25 +150,25 @@ import Senses
         } onCancel: { binding.cancel() }
     }
     /// No model-driven screen access while a secret-bearing panel is open.
-    static func requireChatOnly() throws {
+    static func requireChatOnly(_ nodes: [AXUIElement]) throws {
         // The secret-bearing panel shows its values in text fields; a chat
         // message that merely says "key" or carries a link is not that panel.
-        let tree = (try navigationNodes()).filter { MacAXAttributeRead.text($0, kAXRoleAttribute) == kAXTextFieldRole }
+        let tree = nodes.filter { MacAXAttributeRead.text($0, kAXRoleAttribute) == kAXTextFieldRole }
         guard !tree.contains(where: { node in
             let labels = [kAXValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute].map { MacAXAttributeRead.text(node, $0).lowercased() }
             return labels.contains { $0 == "post to" || $0 == "key" || $0 == "webhook key" || $0.hasPrefix("https://") }
         }) else { throw Blocker.panelOpen }
     }
-    static func isCurrentBotChat(_ bot: String) throws -> Bool {
-        (try navigationNodes()).contains { MacAXAttributeRead.text($0, kAXRoleAttribute) == "AXHeading"
+    static func isCurrentBotChat(_ bot: String, in tree: [AXUIElement]) -> Bool {
+        tree.contains { MacAXAttributeRead.text($0, kAXRoleAttribute) == "AXHeading"
             && (MacAXAttributeRead.text($0, kAXTitleAttribute) == bot || MacAXAttributeRead.text($0, kAXDescriptionAttribute) == bot) }
     }
     static func prepareConversation(bot: String) throws -> AXUIElement {
-        try requireChatOnly()
-        guard try isCurrentBotChat(bot) else {
+        let tree = try navigationNodes()
+        try requireChatOnly(tree)
+        guard isCurrentBotChat(bot, in: tree) else {
             throw Failure(detail: "Chat \"\(bot)\" is not the open Grok Bot chat. Open that exact chat, then Connect again.")
         }
-        let tree = try navigationNodes()
         let boxes = tree.filter { MacAXAttributeRead.text($0, kAXRoleAttribute) == kAXTextAreaRole
             && MacAXAttributeRead.text($0, kAXDescriptionAttribute).lowercased() == "prompt" }
         guard boxes.count == 1 else {
@@ -351,13 +209,12 @@ import Senses
         } while true
         throw failure
     }
-    /// Seen on the installed app (09-20): a routine can only be created in the
-    /// 1:1 chat with a Bot ("needs Auto-review, which this bridge room can't
-    /// do"). The sidebar lists that chat as a button titled with the Bot's name,
+    /// Routine creation requires the 1:1 Bot chat with Auto-review. The sidebar
+    /// lists that chat as a button titled with the Bot's name,
     /// or "<name>, Unread activity"; once open, the heading is the name.
     static func openBotChat(_ bot: String) async throws {
         func heading() throws -> Bool {
-            try isCurrentBotChat(bot)
+            isCurrentBotChat(bot, in: try navigationNodes())
         }
         if try heading() { return }
         let chats = (try navigationNodes()).filter {
@@ -462,8 +319,8 @@ import Senses
         guard CFEqual(box, try prepareConversation(bot: bot)) else {
             throw Failure(detail: "Grok Bot's message box changed after focus. Open the intended chat with no draft before continuing; no text was pasted.")
         }
-        guard let baseline = try GrokDesktopReply.outgoingOccurrences(text, chat: bot) else { throw Blocker.transcript }
-        sentLayout = try GrokDesktopReply.layout(text, chat: bot)
+        guard let submission = try GrokDesktopReply.submission(text, chat: bot) else { throw Blocker.transcript }
+        sentLayout = submission.layout
         let pasteboard = NSPasteboard.general
         let saved = try copyPasteboard(pasteboard)
         pasteboard.clearContents()
@@ -495,17 +352,17 @@ import Senses
         try requireFrontmost()
         reached = .submitted
         submit.forEach(sink.postNative)
-        try await verifySubmission(text, bot: bot, baseline: baseline)
+        try await verifySubmission(text, bot: bot, baseline: submission.baseline)
     }
     static func verifySubmission(_ message: String, bot: String, baseline: Int) async throws {
         submissionObservation = try await waitUntil(seconds: 10, failure: Blocker.submission) {
-            guard try isCurrentBotChat(bot) else { throw Blocker.conversation }
             let tree = try navigationNodes()
+            guard isCurrentBotChat(bot, in: tree) else { throw Blocker.conversation }
             let boxes = tree.filter { MacAXAttributeRead.text($0, kAXRoleAttribute) == kAXTextAreaRole
                 && MacAXAttributeRead.text($0, kAXDescriptionAttribute).lowercased() == "prompt" }
             if boxes.count == 1, let value = MacAXAttributeRead.copyRaw(boxes[0], kAXValueAttribute) as? String,
                isEmptyBox(value, conversation: bot),
-               let count = try GrokDesktopReply.outgoingOccurrences(message, chat: bot), count > baseline { return true }
+               let read = try GrokDesktopReply.submission(message, chat: bot), read.baseline > baseline { return true }
             return false
         }
     }
@@ -516,7 +373,6 @@ import Senses
             + dataRoot.appendingPathComponent("agents/recipes/grok-bot.json").path
             + " is yours to update: read agent.recipe {host:\"grok-bot\"}, update host.grokRoutine with agent.recipe_write, then Connect again.")
     }
-
     private static func actionFailure(_ result: Result<AXError, MacNativeActionFailure>, action: String, step: String, dataRoot: URL) -> any Error {
         let error: AXError
         switch result {
@@ -528,7 +384,6 @@ import Senses
         if error == .actionUnsupported { return recipeFailure(detail, dataRoot: dataRoot) }
         return Failure(detail: detail + " The native control did not respond successfully. Check that control in Grok Bot before continuing.")
     }
-
     private static func matches(_ node: AXUIElement, _ control: RoutineRecipe.Control) -> Bool {
         control.roles.contains(MacAXAttributeRead.text(node, kAXRoleAttribute))
             && (control.subrole.map { MacAXAttributeRead.text(node, kAXSubroleAttribute) == $0 } ?? true)
@@ -539,7 +394,6 @@ import Senses
             if !result.contains(where: { CFEqual($0, value) }) { result.append(value) }
         }
     }
-
     /// Resolve the section's own content list, never a title in the chat log.
     /// Starting at its label, the nearest containing list is the section.
     private static func routineList(_ recipe: RoutineRecipe, dataRoot: URL) throws -> AXUIElement? {
@@ -567,7 +421,6 @@ import Senses
         }
         return lists.first
     }
-
     private static func routineRow(_ recipe: RoutineRecipe, title: String, dataRoot: URL) throws -> AXUIElement? {
         guard let pause = recipe.pause else { throw Blocker.recipe }
         guard let list = try routineList(recipe, dataRoot: dataRoot) else { return nil }
@@ -590,13 +443,11 @@ import Senses
         }
         return rows.first
     }
-
     private static func menus() throws -> [AXUIElement] {
         guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: GrokBotRoute.bundleID).first else { throw Blocker.offline }
         let source = SystemMacAXElementSource()
         return source.transientMenuRoots(pid: app.processIdentifier).compactMap(source.element)
     }
-
     /// The menu may open a sheet, popover or a separate native window. Read
     /// the owning app's windows without treating that expected view as a second
     /// chat. These nodes stay inside the native credential/dismissal boundary.
@@ -606,7 +457,6 @@ import Senses
         let windows = try SystemMacAXElementSource().nativeWindows(pid: app.processIdentifier)
         return try windows.flatMap { try MacAccessibilityReader.elements(in: $0, searching: "the native routine view", descendInto: outsideTranscript) }
     }
-
     /// The recipe contains selectors and navigation only. Credential handling
     /// and clipboard lifetime remain native and cannot be changed by the file.
     static func importRoutine(peer: String, dataRoot: URL, waitForCreation: Bool) async throws -> String {
@@ -619,7 +469,7 @@ import Senses
         return try await restoringForeground {
             _ = try await awake()
             // Do not close an unrelated panel or invent one after awakening.
-            try requireChatOnly()
+            try requireChatOnly(navigationNodes())
             var opened: [RoutineRecipe.Step] = []
             let result: Result<String, Error>
             do {
@@ -652,7 +502,6 @@ import Senses
             }
         }
     }
-
     private static func dismiss(_ dismissal: RoutineRecipe.Dismissal, step: String, openMarker: RoutineRecipe.Control?,
                                 dataRoot: URL) async throws {
         let tree = dismissal.control.roles.contains(kAXMenuRole) ? try menus() : try nativeViewNodes()
@@ -681,7 +530,6 @@ import Senses
         } while true
         throw recipeFailure("After \(step), the closing action ran but the view's closing control remains present; closure is unconfirmed.", dataRoot: dataRoot)
     }
-
     private static func importRoutineInForeground(peer: String, dataRoot: URL, waitForCreation: Bool,
         recipe: RoutineRecipe, navigation: [RoutineRecipe.Step], opened: inout [RoutineRecipe.Step]) async throws -> String {
         let store = AgentPeerStore(dataRoot: dataRoot)
@@ -759,17 +607,15 @@ import Senses
             }
             opened.append(step)
         }
-
-        func fields(_ name: String) throws -> [AXUIElement] {
-            try nativeViewNodes().filter { MacAXAttributeRead.text($0, kAXRoleAttribute) == kAXTextFieldRole && MacAXAttributeRead.label($0) == name }
-        }
         let events = try DesktopRouteObservation(bundleID: GrokBotRoute.bundleID)
         defer { events.stop() }
         let deadline = Date().addingTimeInterval(4)
         var urlFields: [AXUIElement] = [], keyFields: [AXUIElement] = []
         repeat {
             try Task.checkCancellation()
-            urlFields = try fields(recipe.webhookURL); keyFields = try fields(recipe.webhookKey)
+            let fields = try nativeViewNodes().filter { MacAXAttributeRead.text($0, kAXRoleAttribute) == kAXTextFieldRole }
+            urlFields = fields.filter { MacAXAttributeRead.label($0) == recipe.webhookURL }
+            keyFields = fields.filter { MacAXAttributeRead.label($0) == recipe.webhookKey }
             if urlFields.count == 1 && keyFields.count == 1 { break }
             if Date() >= deadline { break }
             try await events.next(until: deadline)
@@ -788,7 +634,6 @@ import Senses
         }
         return "Webhook view exposed one URL text field (\(url.exposure)) and one key text field (\(key.exposure)); no values were reported."
     }
-
     private static func masked(_ value: String) -> Bool {
         value.contains("•") || value.contains("●") || value.hasPrefix("***")
             || (!value.isEmpty && value.allSatisfy { "*·".contains($0) })

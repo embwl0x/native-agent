@@ -13,7 +13,7 @@ import PersistenceCore
 import Desk
 import ProviderRouting
 import Transcripts
-// Blueprint: | `MacSyncActionRouter.swift` | `MacSyncActionRouter` struct; `surfaceSelection`; approval, memory and inbox mutations return affected canonical records/removals for the shared phone projection; no complete inbox or memory lists in action replies; readback revisions are captured on the Mac before the canonical read |
+// Blueprint: | `MacSyncActionRouter.swift` | `MacSyncActionRouter` struct; `surfaceSelection`; routing receipts use committed selection snapshots; approval, memory and inbox mutations return affected canonical records/removals for the shared phone projection; no complete inbox or memory lists in action replies; other readback revisions are captured on the Mac before the canonical read |
 
 @MainActor
 struct MacSyncActionRouter {
@@ -107,18 +107,8 @@ struct MacSyncActionRouter {
         )
     }
 
-    /// A phone delivery acknowledgement becomes organism evidence only after
-    /// its canonical receipt is durable. The injected seams keep the ordering
-    /// contract directly testable without touching the live data root.
-    ///
-    /// `senderIsAuthenticatedIOSPeer` is the router's only source of direction
-    /// when the payload omits one. Every phone shipped before 2026-09-01 sent
-    /// `eventId`+`channel` and nothing else, so this lane rejected 100% of its
-    /// receipts as `invalid_direction`. An HMAC-verified inbox action can only
-    /// have come from the paired iPhone, and the only delivery it can confirm
-    /// is the Mac→iOS one, so that is what the absent field means. A direction
-    /// that IS present is still taken literally — a wrong one is a real error,
-    /// never something to guess past.
+    /// Publish organism evidence only after the canonical phone-delivery receipt is durable.
+    /// Only authenticated iOS receipts default an omitted direction to mac_to_ios; explicit values stay literal.
     static func notificationReceiptResponse(
         payload: [String: String],
         senderIsAuthenticatedIOSPeer: Bool,
@@ -186,16 +176,7 @@ struct MacSyncActionRouter {
     }
 
     func dispatch(_ action: InboxAction) async -> [String: String] {
-        let requiresDevice = action.action.hasPrefix("approve") || action.action.hasPrefix("reject")
-            || ["create_scheduler_job", "pause_scheduler_job", "resume_scheduler_job", "cancel_scheduler_job"].contains(action.action)
-            || ["cancelApproval", "inboxAction", "app_settings", "app_setting_set", "chat_history_page", "set_trust_policy", "pairDevice", "disconnect_telegram", "set_telegram_settings", "set_mac_integration_permission"].contains(action.action)
-            || ["get_helper", "save_helper", "pause_helper", "run_helper", "get_agent_thread", "send_agent_message", "steerChat"].contains(action.action)
-            || ["configure_provider_secret", "start_provider_sign_in", "interaction_action", "registerPushToken"].contains(action.action)
-            || ["createDeskItem", "setDeskItemStatus", "appendDeskItemNote", "submitWorkshopTask", "submitMission", "deleteMemory"].contains(action.action)
-            || ["registerWorkActivity", "recordNotificationReceipt", "cancelChat", "unpinChatSession", "mac_control"].contains(action.action)
-            || ["configure_provider", "test_provider", "clear_provider", "set_active_provider", "set_surface_model", "configure_surface_selection"].contains(action.action)
-            || ["set_connector_enabled", "disconnect_connector"].contains(action.action)
-        if let message = await sync.pairedPhones.authorize(action, requiresPairing: requiresDevice) {
+        if let message = await sync.pairedPhones.authorize(action) {
             sync.engine.syncError = message
             return ["status": "error", "ok": "false", "code": "device_not_verified", "message": message]
         }
@@ -309,44 +290,29 @@ struct MacSyncActionRouter {
                 let result = try await api.submitWorkshopExecution(title: title, objective: objective)
                 return [
                     "status": "ok",
-                    // Wave 4 phase A: STILL the old key. A 0.3.7 iOS install
-                    // reads this response, so the emitted spelling does not
-                    // move until the iOS floor does.
+                    // Preserve the response key read by existing iOS installations.
                     InboxActionExecutionIdVocabulary.wireKey: result.executionId ?? result.id ?? "",
                     "deskHandle": result.desk_handle ?? "",
                     "deskAlias": result.desk_alias ?? "",
                 ]
 
-            case "approveStep":
-                // Wave 4 (phase A) read-both: a future iOS build may send
-                // `executionId`; 0.3.7 sends `missionId`. Accept either. The
-                // iOS writer and the submit response above BOTH still emit
-                // `missionId`, so nothing on this wire changed shape.
+            case "approveStep", "rejectStep":
+                let rejecting = action.action == "rejectStep"
+                // Accept both executionId and the phone's missionId wire spelling.
                 let executionId = InboxActionExecutionIdVocabulary.executionId(payload) ?? ""
                 let stepId = payload["stepId"] ?? ""
                 guard !executionId.isEmpty, !stepId.isEmpty, stepId != "pending" else {
-                    return ["status": "error", "error": "missing_real_step_id"]
+                    let response = ["status": "error", "error": "missing_real_step_id"]
+                    return rejecting ? observed(response) : response
                 }
-                _ = try await api.approveStep(
+                try await api.resolveWorkshopStep(
                     executionId: executionId,
                     stepId: stepId,
+                    decision: rejecting ? "reject" : "approve",
                     provenance: .signedIOS(clientID: action.clientId, decidedBy: "ios_signed_operator")
                 )
-                return ["status": "ok"]
-
-            case "rejectStep":
-                // Wave 4 (phase A) read-both — see `approveStep` above.
-                let executionId = InboxActionExecutionIdVocabulary.executionId(payload) ?? ""
-                let stepId = payload["stepId"] ?? ""
-                guard !executionId.isEmpty, !stepId.isEmpty, stepId != "pending" else {
-                    return observed(["status": "error", "error": "missing_real_step_id"])
-                }
-                _ = try await api.rejectStep(
-                    executionId: executionId,
-                    stepId: stepId,
-                    provenance: .signedIOS(clientID: action.clientId, decidedBy: "ios_signed_operator")
-                )
-                return observed(["status": "ok"])
+                let response = ["status": "ok"]
+                return rejecting ? observed(response) : response
 
             case "approveMemoryProposal":
                 let proposalId = payload["proposalId"] ?? ""
@@ -365,52 +331,21 @@ struct MacSyncActionRouter {
                 try await api.deleteMemory(id: memoryId)
                 return observed(try await memoryActionResponse(["status": "ok", "ok": "true"], memoryID: memoryId, api: api))
 
-            case "approvePromotion", "rejectPromotion":
-                return observed(["status": "error", "message": "Training promotion is no longer available."])
-
-            case "approveApproval":
+            case "approveApproval", "rejectApproval", "cancelApproval":
                 let approvalId = payload["approvalId"] ?? payload["id"] ?? ""
-                guard !approvalId.isEmpty else { return ["status": "error", "message": "Missing approvalId"] }
-                let row = try await api.resolveApproval(
-                    id: approvalId,
-                    decision: "approve",
-                    provenance: .signedIOS(
-                        clientID: action.clientId,
-                        decidedBy: "ios_signed_operator"
-                    )
-                )
-                return try await approvalActionResponse(row, approvalId: approvalId, fallbackStatus: "approved")
-
-            case "rejectApproval":
-                let approvalId = payload["approvalId"] ?? payload["id"] ?? ""
-                guard !approvalId.isEmpty else { return observed(["status": "error", "message": "Missing approvalId"]) }
-                let row = try await api.resolveApproval(
-                    id: approvalId,
-                    decision: "reject",
-                    provenance: .signedIOS(
-                        clientID: action.clientId,
-                        decidedBy: "ios_signed_operator"
-                    )
-                )
-                return observed(try await approvalActionResponse(row, approvalId: approvalId, fallbackStatus: "rejected"))
-
-            case "cancelApproval":
-                let approvalId = payload["approvalId"] ?? payload["id"] ?? ""
-                guard !approvalId.isEmpty else { return observed(["status": "error", "message": "Missing approvalId"]) }
-                let row = try await api.resolveApproval(
-                    id: approvalId,
-                    decision: "cancel",
-                    provenance: .signedIOS(
-                        clientID: action.clientId,
-                        decidedBy: "ios_signed_operator"
-                    )
-                )
-                return observed(try await approvalActionResponse(row, approvalId: approvalId, fallbackStatus: "canceled"))
+                let response: [String: String]
+                if approvalId.isEmpty {
+                    response = ["status": "error", "message": "Missing approvalId"]
+                } else {
+                    response = try await approvalActionResponse(approvalId: approvalId,
+                        decision: String(action.action.dropLast("Approval".count)), action: action)
+                }
+                return action.action == "approveApproval" ? response : observed(response)
 
             case "interaction_action":
                 guard action.payload.count == 1,
                       let sealed = action.payload[SecretActionEnvelope.field],
-                      let encodedSecret = try PairingSecretManager.existingSecretBase64(),
+                      let encodedSecret = try PairingSecret.existingSecretBase64(),
                       let secret = Data(base64Encoded: encodedSecret) else {
                     return ["status": "error", "message": "Could not decrypt the card answer. Check pairing and try again."]
                 }
@@ -430,19 +365,8 @@ struct MacSyncActionRouter {
                 }
                 let endpointAction = InboxActionVocabulary.routedAction(actionId, itemID: itemId)
                 if (endpointAction == "approve" || endpointAction == "reject"), !itemId.hasPrefix("interaction:") {
-                    let row = try await api.resolveApproval(
-                        id: itemId,
-                        decision: endpointAction,
-                        provenance: .signedIOS(
-                            clientID: action.clientId,
-                            decidedBy: "ios_signed_operator"
-                        )
-                    )
-                    return observed(try await inboxActionResponse(approvalActionResponse(
-                        row,
-                        approvalId: itemId,
-                        fallbackStatus: endpointAction == "approve" ? "approved" : "rejected"
-                    ), itemID: itemId, api: api))
+                    return observed(try await approvalActionResponse(approvalId: itemId,
+                        decision: endpointAction, action: action, inboxItemID: itemId))
                 }
                 try await api.inboxAction(itemId, action: endpointAction)
                 return observed(try await inboxActionResponse([
@@ -451,26 +375,6 @@ struct MacSyncActionRouter {
                     "itemId": itemId,
                     "actionId": actionId,
                 ], itemID: itemId, api: api))
-
-            case "inboxReply":
-                // Compatibility boundary for older iOS builds/cards only.
-                // Current iOS does not present this action: proactive inbox
-                // items have no typed reply destination, transcript owner, or
-                // user-visible result contract. Do not improvise those semantics
-                // by silently turning a card reply into an arbitrary chat turn.
-                let itemId = payload["itemId"] ?? payload["id"] ?? ""
-                let replyText = payload["replyText"] ?? payload["reply_text"] ?? payload["message"] ?? ""
-                guard !itemId.isEmpty else { return ["status": "error", "message": "Missing inbox item id"] }
-                guard !replyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    return ["status": "error", "message": "Missing reply text"]
-                }
-                return [
-                    "status": "error",
-                    "ok": "false",
-                    "code": "not_implemented",
-                    "message": "Inbox reply is not yet supported from iOS.",
-                    "itemId": itemId,
-                ]
 
             case "registerWorkActivity":
                 guard let deviceID = payload["deviceId"], !deviceID.isEmpty,
@@ -498,7 +402,6 @@ struct MacSyncActionRouter {
                     startToken: payload["startToken"], workID: payload["workId"],
                     activityToken: payload["activityToken"].flatMap { $0.isEmpty ? nil : $0 },
                     observedWorkIDs: observedWorkIDs, dataRoot: sync.dataRoot)
-                sync.engine.workActivityVersion &+= 1
                 sync.engine.requestWorkActivityPublication()
                 return ["status": "ok", "ok": "true"]
 
@@ -695,25 +598,11 @@ struct MacSyncActionRouter {
                 guard !model.isEmpty else {
                     return ["status": "error", "message": "Missing model"]
                 }
-                let reasoning = payload["reasoning_effort"]
-                let serviceTier = payload["service_tier"]
-                if let reasoning, !reasoning.isEmpty {
-                    _ = try await api.configureModel(
-                        surface: surface,
-                        model: model,
-                        reasoningEffort: reasoning,
-                        serviceTier: serviceTier,
-                        inferProvider: false
-                    )
-                } else {
-                    _ = try await api.setSurfaceModel(
-                        surface: surface,
-                        model: model,
-                        inferProvider: false
-                    )
-                }
-                let recovered = try await SwiftNativeProviderRouting()
-                    .checkedRoutingSnapshot()
+                let reasoning = payload["reasoning_effort"].flatMap { $0.isEmpty ? nil : $0 }
+                let recovered = try await api.saveSurfaceSelection(
+                    surface: surface, model: model, reasoningEffort: reasoning,
+                    serviceTier: reasoning == nil ? nil : payload["service_tier"], providerID: nil
+                )
                 return observed(Self.canonicalSurfaceModelResponse(
                     surface: surface,
                     requestedModel: model,
@@ -731,18 +620,13 @@ struct MacSyncActionRouter {
                         "message": "A complete valid provider/model/reasoning/tier tuple is required for a canonical surface",
                     ])
                 }
-                _ = try await api.configureSurfaceSelection(
+                let recovered = try await api.saveSurfaceSelection(
                     surface: request.surface,
-                    providerID: request.providerID,
                     model: request.model,
                     reasoningEffort: request.reasoningEffort,
-                    serviceTier: request.serviceTier
+                    serviceTier: request.serviceTier,
+                    providerID: request.providerID
                 )
-                // Return the recovered owner state, not the optimistic request.
-                // ProviderRouting may normalize effort/tier or reconcile a model
-                // that the selected provider cannot actually serve.
-                let recovered = try await SwiftNativeProviderRouting()
-                    .checkedRoutingSnapshot()
                 guard let preference = ProviderRoutingSurfaceLookup.value(
                           recovered.preferences, request.surface),
                       let providerID = ProviderRoutingSurfaceLookup.value(
@@ -779,28 +663,6 @@ struct MacSyncActionRouter {
         }
     }
 
-    private func stringifyResponse(_ result: [String: Any], fallbackStatus: String) -> [String: String] {
-        var out: [String: String] = [:]
-        for (key, value) in result {
-            if let string = value as? String {
-                out[key] = string
-            } else if let bool = value as? Bool {
-                out[key] = bool ? "true" : "false"
-            } else {
-                out[key] = "\(value)"
-            }
-        }
-        let error = out["error"] ?? out["code"]
-        if out["ok"] == "false" || !(error?.isEmpty ?? true) {
-            out["status"] = "error"
-            out["ok"] = "false"
-            out["message"] = out["message"] ?? error
-        } else {
-            out["status"] = out["status"] ?? fallbackStatus
-        }
-        return out
-    }
-
     private func inboxActionResponse(_ response: [String: String], itemID: String, api: any DeviceSyncHost) async throws -> [String: String] {
         var response = response
         response["inboxReadbackRevision"] = String(Date().timeIntervalSince1970)
@@ -823,93 +685,70 @@ struct MacSyncActionRouter {
         return response
     }
 
-    private func approvalRecordToDict(_ row: ApprovalRecord) -> [String: Any] {
-        var dict: [String: Any] = [
-            "ok": true,
-            "id": row.id,
-            "status": row.status,
-            "action": row.action,
-            "title": row.title,
-            "risk": row.risk,
-            "decisionAccepted": row.status == "resolved",
-            "decisionStatus": row.status,
-            "createdAt": row.createdAt,
-            "reason": row.reason,
-        ]
-        if let decision = row.decision { dict["decision"] = decision }
-        if let resolvedAt = row.resolvedAt { dict["resolvedAt"] = resolvedAt }
+    private func approvalActionResponse(approvalId: String, decision: String, action: InboxAction,
+                                        inboxItemID: String? = nil) async throws -> [String: String] {
+        let row = try await sync.host.resolveApproval(id: approvalId, decision: decision,
+            provenance: .signedIOS(clientID: action.clientId, decidedBy: "ios_signed_operator"))
+        let accepted = row.status == "resolved"
+        var out = ["ok": "true", "id": row.id, "status": row.status, "action": row.action,
+            "title": row.title, "risk": row.risk, "decisionAccepted": accepted ? "true" : "false",
+            "decisionStatus": row.status, "createdAt": row.createdAt, "reason": row.reason]
+        out["decision"] = row.decision
+        out["resolvedAt"] = row.resolvedAt
         if row.decision == "approved" {
-            // The resolver returns the record as its executor left it.
-            var execution: [String: Any] = [:]
+            var status: String?
+            var error: String?
+            var message: String?
+            var ok: Bool?
+            let liveWaiter: Bool
             if case .object(let fields)? = row.executedAction {
-                for key in ["status", "error", "message"] {
-                    if case .string(let value)? = fields[key] {
-                        execution[key] = String(value.unicodeScalars.prefix(512))
-                    }
+                func bounded(_ key: String) -> String? {
+                    guard case .string(let value)? = fields[key] else { return nil }
+                    return String(value.unicodeScalars.prefix(512))
                 }
-                if case .bool(let ok)? = fields["ok"] { execution["ok"] = ok }
-                execution["status"] = execution["status"] ?? "recorded"
-            } else if row.status == "resolved",
-                      ["agent.acp.permission", "agent.acp.connect"].contains(row.action),
+                status = bounded("status") ?? "recorded"
+                error = bounded("error")
+                message = bounded("message")
+                if case .bool(let value)? = fields["ok"] { ok = value }
+                liveWaiter = false
+            } else if accepted, ["agent.acp.permission", "agent.acp.connect"].contains(row.action),
                       case .object(let payload) = row.payload,
                       case .string("agent_acp_live_approval")? = payload["kind"] {
-                // A live ACP waiter consumes the decision; the resolver does
-                // not execute the peer action. Report only the settled decision.
-                return dict
+                liveWaiter = true
             } else {
-                execution["status"] = "outcome_unknown"
-                execution["message"] = "No execution outcome is available."
+                status = "outcome_unknown"
+                message = "No execution outcome is available."
+                liveWaiter = false
             }
-            if execution["message"] == nil, let detail = row.detail {
-                execution["message"] = String(detail.unicodeScalars.prefix(512))
-            }
-            dict["executedAction"] = execution
+            if !liveWaiter {
+                message = message ?? row.detail.map { String($0.unicodeScalars.prefix(512)) }
+                // Preserve the bounded execution-description wire field.
+                var execution: [String: Any] = [:]
+                if let status { execution["status"] = status }
+                if let error { execution["error"] = error }
+                if let message { execution["message"] = message }
+                if let ok { execution["ok"] = ok }
+                out["executedAction"] = String(describing: execution)
+                let verdict = row.executionResultClass
+                out["executionStatus"] = (status ?? "").lowercased()
+                out["result_class"] = verdict.rawValue
+                out["status"] = verdict.receipt.status
+                out["ok"] = verdict.receipt.ok.map { String($0) }
+                out["message"] = [error, message].compactMap { $0 }.first { !$0.isEmpty }
+                if verdict.isFailure, accepted {
+                    out["message"] = "Decision accepted. " + (out["message"] ?? "Execution did not succeed (\(verdict.rawValue)).")
+                }
+            } else { out["status"] = "pending_approval"; out["result_class"] = "unknown" }
         }
-        return dict
-    }
-
-    private func approvalActionResponse(_ row: ApprovalRecord, approvalId: String, fallbackStatus: String) async throws -> [String: String] {
-        let result = approvalRecordToDict(row)
-        var out = stringifyResponse(result, fallbackStatus: fallbackStatus)
         out["approvalReadbackRevision"] = String(Date().timeIntervalSince1970)
+        if inboxItemID != nil { out["inboxReadbackRevision"] = String(Date().timeIntervalSince1970) }
         let projection = await sync.host.workOverview()
         let canonical = try projection.approvals.get().first { $0.id == approvalId }
         out["approvalJSON"] = String(decoding: try JSONEncoder().encode(canonical), as: UTF8.self)
         out["approvalId"] = approvalId
-        if let error = result["error"] as? String, !error.isEmpty {
-            out["message"] = error
-            out["status"] = "error"
-            out["ok"] = "false"
-        }
-        if (result["ok"] as? Bool) == false {
-            out["status"] = "error"
-            out["ok"] = "false"
-        }
-        if let executed = result["executedAction"] as? [String: Any] {
-            let executedOk = executed["ok"] as? Bool
-            let executedStatus = (executed["status"] as? String ?? "").lowercased()
-            out["executionStatus"] = executedStatus
-            if let status = executed["status"] as? String, !status.isEmpty {
-                out["status"] = status
-            }
-            if let error = executed["error"] as? String, !error.isEmpty {
-                out["message"] = error
-                out["status"] = "error"
-                out["ok"] = "false"
-            } else if let message = executed["message"] as? String, !message.isEmpty {
-                out["message"] = message
-            }
-            if executedOk == false || ["error", "failed", "blocked", "outcome_unknown", "unknown"].contains(executedStatus) {
-                out["status"] = "error"
-                out["ok"] = "false"
-            }
-            if out["ok"] == "false", (result["decisionAccepted"] as? Bool) == true {
-                let detail = out["message"] ?? "Execution did not succeed (\(executedStatus))."
-                out["message"] = "Decision accepted. \(detail)"
-            }
-        }
-        if let decision = result["decision"] as? String, out["decision"] == nil {
-            out["decision"] = decision
+        if let inboxItemID {
+            out["inboxItemId"] = inboxItemID
+            out["inboxItemJSON"] = String(decoding: try JSONEncoder().encode(projection.inbox.get().first { $0.id == inboxItemID }), as: UTF8.self)
         }
         return out
     }

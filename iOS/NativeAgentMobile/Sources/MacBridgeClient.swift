@@ -1,142 +1,10 @@
-// PATCH-2026-06-02: iOS iCloud-only flow — HTTP transport stripped.
-// MacBridgeClient is now iCloud-only. URLSession, bearer-token, and all /v1/*
-// HTTP fallbacks are removed; iOS talks to the Mac through signed iCloud
-// messages and snapshots. Public surface preserved for view compatibility:
-//   - chat: sendMessage / cancelChat / observeICloudReplies → iCloudBridge
-//   - readChatTranscript → reads from iCloudSyncEngine snapshots.
-
 import Foundation
 import Combine
-import SwiftUI
 import NativeAgentShared
 #if canImport(UIKit)
 import UIKit
 #endif
-
-private final class DeviceSourceKeyCache: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value: String?
-
-    func store(_ value: String) {
-        lock.lock()
-        self.value = value
-        lock.unlock()
-    }
-
-    func load() -> String? {
-        lock.lock()
-        defer { lock.unlock() }
-        return value
-    }
-}
-
-struct ChatRuntimeControls: Equatable, Sendable, Codable {
-    var model: String
-    var reasoningEffort: String
-    var serviceTier: String = "default"
-    var fileAccess: String
-    var providerId: String = ""
-
-    /// No model named here (2026-09-13): an empty model is sent as no override,
-    /// so the Mac resolves the turn through the Chat group's choice.
-    static let defaults = ChatRuntimeControls(model: "", reasoningEffort: "high", serviceTier: "default", fileAccess: "auto")
-
-    var normalized: ChatRuntimeControls {
-        ChatRuntimeControls(
-            model: model.trimmingCharacters(in: .whitespacesAndNewlines),
-            reasoningEffort: reasoningEffort.trimmingCharacters(in: .whitespacesAndNewlines),
-            serviceTier: serviceTier.trimmingCharacters(in: .whitespacesAndNewlines),
-            fileAccess: fileAccess.trimmingCharacters(in: .whitespacesAndNewlines),
-            providerId: providerId.trimmingCharacters(in: .whitespacesAndNewlines)
-        )
-    }
-
-    func metadata(transport: String) -> [String: String] {
-        let clean = normalized
-        var out: [String: String] = [
-            "clientSurface": "iphone",
-            "source": "ios",
-            "transport": transport,
-            "sourceKey": NativeAgentICloudBridgeConstants.mobileSourceKey,
-            "routeKey": Self.deviceSourceKey
-        ]
-        if !clean.model.isEmpty { out["model"] = clean.model }
-        if !clean.reasoningEffort.isEmpty { out["reasoningEffort"] = clean.reasoningEffort }
-        if !clean.serviceTier.isEmpty { out["serviceTier"] = clean.serviceTier }
-        if !clean.fileAccess.isEmpty { out["fileAccess"] = clean.fileAccess }
-        if !clean.providerId.isEmpty { out["providerId"] = clean.providerId }
-        return out
-    }
-
-    private static let deviceSourceKeyCache = DeviceSourceKeyCache()
-
-    static func makeDeviceSourceKey(deviceName: String) -> String {
-        let name = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
-        return name.isEmpty ? "iphone" : "iphone:\(name)"
-    }
-
-    @MainActor
-    static func primeDeviceSourceKey() {
-        #if canImport(UIKit)
-        deviceSourceKeyCache.store(makeDeviceSourceKey(deviceName: UIDevice.current.name))
-        #else
-        deviceSourceKeyCache.store("iphone")
-        #endif
-    }
-
-    // Background iCloud scanners read only the launch-primed value. They never
-    // cross into UIKit actor isolation and therefore cannot race device metadata.
-    static var deviceSourceKey: String {
-        deviceSourceKeyCache.load() ?? "iphone"
-    }
-}
-
-enum BridgeStatus: Equatable {
-    case online
-    case awaitingMacActivity
-    case offline
-    case macUnreachable
-    /// E8: this phone has no usable network path. Distinct from every other
-    /// case, all of which blame the Mac or iCloud for a local outage.
-    case deviceOffline
-    case iCloudAccountAttention
-    case stale(minutesAgo: Int)
-    case connecting
-
-    var displayName: String {
-        switch self {
-        case .online:
-            return "Connected via iCloud"
-        case .awaitingMacActivity:
-            return "Waiting for Mac activity"
-        case .offline:
-            return "iCloud unreachable"
-        case .macUnreachable:
-            // A Mac that has not answered is UNAVAILABLE. Why it went quiet
-            // (asleep, shut, offline) is a guess this app does not make.
-            return "Mac unavailable"
-        case .deviceOffline:
-            return "iPhone offline"
-        case .iCloudAccountAttention:
-            return DeviceSyncAccountFailure.phoneMessage
-        case .stale(let minutesAgo):
-            return "Last seen \(minutesAgo)m ago"
-        case .connecting:
-            return "Connecting via iCloud…"
-        }
-    }
-
-    var color: Color {
-        switch self {
-        case .online:
-            return .green
-        case .offline, .macUnreachable, .deviceOffline, .iCloudAccountAttention:
-            return .red
-        case .awaitingMacActivity, .stale, .connecting:
-            return .orange
-        }
-    }
-}
+// Blueprint: | `MacBridgeClient.swift` | Signed iCloud chat transport, pairing and connection observation |
 
 @MainActor
 enum MacBridgeReconnectPolicy {
@@ -145,16 +13,12 @@ enum MacBridgeReconnectPolicy {
     }
 }
 
-/// E8: the status chip used to be recomputed by a 5s timer that ran for the
-/// life of the process, including on a phone that had been idle and settled for
-/// hours. `bridgeStatusDecision` is a pure function of three ages, so the timer
-/// is only needed while one of those ages can still cross a boundary.
-enum MacBridgeStatusRefreshPolicy {
-    /// Cadence while a boundary is imminent (online → stale, connecting →
-    /// offline, offline → macUnreachable).
+/// Refresh only while an age can change the connection or its displayed recency.
+enum MacConnectionRefreshPolicy {
+    /// Cadence while a presence, startup or transport boundary is imminent.
     static let activeInterval: TimeInterval = 5
-    /// Cadence once the only thing still changing is the displayed minute count.
-    static let minuteCounterInterval: TimeInterval = 60
+    /// Foreground presence rereads are at most once a minute.
+    static let presenceRefreshInterval: TimeInterval = 60
 
     /// Seconds until the next recompute, or nil when nothing time-dependent
     /// remains — the availability publisher and any Mac confirmation re-arm it.
@@ -172,20 +36,16 @@ enum MacBridgeStatusRefreshPolicy {
            now.timeIntervalSince(connectingStartedAt) <= initialConnectingInterval {
             return activeInterval
         }
-        // Paired + unavailable is still counting up to the .macUnreachable flip.
+        // Paired + unavailable is still counting up to the transport diagnosis.
         if isPaired, let bridgeUnavailableSince,
            now.timeIntervalSince(bridgeUnavailableSince) < macUnreachableThreshold {
             return activeInterval
         }
         if let lastSeenAt {
-            // Still recent: the online → stale boundary is imminent. Past it,
-            // only the "Nm ago" counter moves — once a minute while minutes
-            // are what the label shows, hourly once it reads in hours
-            // (review fix, 2026-08-28: a long-settled stale state kept a 60s
-            // wakeup forever; the label's own granularity is the honest tick).
+            // After the presence window, refresh at minute or hour granularity.
             let age = now.timeIntervalSince(lastSeenAt)
             if age <= recentLastSeenInterval { return max(activeInterval, recentLastSeenInterval - age) }
-            return age < 3600 ? minuteCounterInterval : 3600
+            return age < 3600 ? presenceRefreshInterval : 3600
         }
         // Never seen, not connecting, already past the unreachable threshold:
         // the projection is settled until an event changes an input.
@@ -196,28 +56,26 @@ enum MacBridgeStatusRefreshPolicy {
 @MainActor
 final class MacBridgeClient: ObservableObject {
     private let bridge: iCloudBridge
-    @Published var bridgeStatus: BridgeStatus = .offline
+    @Published private(set) var connection = NAPhoneConnection(
+        pairing: .init(.waiting, AliveConnection.unpaired),
+        transport: .init(.waiting, "Not connected yet; pairing starts it"),
+        exchange: .init(.waiting, "Not heard from your Mac yet")
+    )
     @Published var lastSeenAt: Date? {
-        didSet { refreshBridgeStatus() }
+        didSet { refreshConnection() }
     }
 
     private var reconnectTask: Task<Void, Never>?
     private var reconnectGeneration = 0
     private var bridgeAvailabilityCancellable: AnyCancellable?
     private var macKeyCancellable: AnyCancellable?
+    private var pairingCancellable: AnyCancellable?
     /// The key the account's Mac pairing record held when last read.
     @Published private(set) var macPairingKey: iCloudBridge.MacPairingKeyReading?
     private var networkPathCancellable: AnyCancellable?
     private var statusRefreshTask: Task<Void, Never>?
     private let pathObserver: NetworkPathObserver = .shared
-    /// E8: fired when the device's network path comes back, so the chat store
-    /// can auto-resume its durable queued sends.
-    ///
-    /// The path observer starts in this init, so its one-shot nil -> online
-    /// fire routinely lands before `ContentView.onAppear` installs this
-    /// callback — always so when onboarding is on screen first. A missed fire
-    /// is latched and replayed on install, or the cold-launch-online resume is
-    /// silently lost for the session.
+    /// Resume queued sends on network restoration; replay a missed event when the callback is set.
     var onNetworkPathRestored: (() -> Void)? {
         didSet {
             guard missedPathRestore, let onNetworkPathRestored else { return }
@@ -226,8 +84,7 @@ final class MacBridgeClient: ObservableObject {
         }
     }
     private var missedPathRestore = false
-    /// When the presence beat was last re-read for a stale status: at most
-    /// once a minute (the stale label's own tick), only while the app is open.
+    /// When the presence beat was last re-read, only while the app is open.
     private var presenceRereadAt: Date?
     /// nil until NWPathMonitor reports; nil never paints an outage. Republished
     /// here so views observing the client see the transition.
@@ -238,12 +95,17 @@ final class MacBridgeClient: ObservableObject {
     }
     var connectingStartedAt: Date?
     private var bridgeUnavailableSince: Date?
-    /// F4: when paired and the bridge stays unavailable >30s, status flips to
-    /// `.macUnreachable` instead of the generic `.offline`.
-    weak var pairingStore: PairingStore?
+    /// Pairing distinguishes an unreachable Mac after 30 seconds of bridge unavailability.
+    weak var pairingStore: PairingStore? {
+        didSet {
+            pairingCancellable = pairingStore?.objectWillChange.sink { [weak self] _ in
+                Task { @MainActor in self?.refreshConnection() }
+            }
+            refreshConnection()
+        }
+    }
 
-    /// The Mac beats every two minutes when nothing else goes out
-    /// (`NAMacPresence`); a minute's silence was never evidence of anything.
+    /// NAMacPresence defines the phone's window for the Mac's two-minute idle heartbeat.
     private static let recentLastSeenInterval = NAMacPresence.phoneWindow
     private static let initialConnectingInterval: TimeInterval = 30
     private static let macUnreachableThreshold: TimeInterval = 30
@@ -256,40 +118,32 @@ final class MacBridgeClient: ObservableObject {
                     if let timestamp = self?.bridge.lastMacConfirmationAt {
                         self?.recordMacConfirmation(at: timestamp)
                     }
-                    self?.refreshBridgeStatus()
+                    self?.refreshConnection()
                 }
             }
         macKeyCancellable = bridge.$macPairingKey
             .sink { [weak self] key in
-                Task { @MainActor in self?.macPairingKey = key }
+                Task { @MainActor in
+                    self?.macPairingKey = key
+                    self?.refreshConnection()
+                }
             }
-        // E8: replaces the unconditional 5s forever-timer. refreshBridgeStatus
-        // re-arms this with an interval derived from the current ages, and
-        // stops arming it entirely once the projection is settled.
         networkPathCancellable = pathObserver.$isOffline
             .sink { [weak self] offline in
                 Task { @MainActor in
-                    self?.deviceIsOffline = offline
-                    self?.refreshBridgeStatus()
+                    guard let self else { return }
+                    let wasOffline = self.deviceIsOffline
+                    self.deviceIsOffline = offline
+                    self.refreshConnection()
+                    // An already-online cold launch also resumes retained sends.
+                    if wasOffline != false, offline == false {
+                        if let handler = self.onNetworkPathRestored { handler() }
+                        else { self.missedPathRestore = true }
+                    }
                 }
             }
-        pathObserver.onPathRestored = { [weak self] in
-            guard let self else { return }
-            if let handler = onNetworkPathRestored {
-                handler()
-            } else {
-                missedPathRestore = true
-            }
-        }
         pathObserver.start()
-        refreshBridgeStatus()
-    }
-
-    /// The phone's connection as this phone knows it: pairing, iCloud and
-    /// the last word from the Mac, each with who can fix it and how. Every
-    /// place on the phone that says where the Mac stands says it through this.
-    var connection: NAPhoneConnection {
-        NAPhoneConnection(pairing: pairingFact, transport: transportFact, exchange: exchangeFact)
+        refreshConnection()
     }
 
     private var pairingFact: NAPhoneConnection.Fact {
@@ -312,48 +166,43 @@ final class MacBridgeClient: ObservableObject {
         return .init(.holds, "Paired with your Mac")
     }
 
-    private var transportFact: NAPhoneConnection.Fact {
-        switch bridgeStatus {
-        case .deviceOffline:
-            return .init(.broken, "You\u{2019}re offline. I\u{2019}ll send when you\u{2019}re back", owner: .network,
+    /// Each fact comes directly from this phone's pairing, transport and Mac evidence.
+    private func assessedConnection(now: Date) -> NAPhoneConnection {
+        var transport = NAPhoneConnection.Fact(.holds, "iCloud is carrying our messages")
+        var exchange = NAPhoneConnection.Fact(.waiting, "Not heard from your Mac yet")
+        let connecting = connectingStartedAt.map { now.timeIntervalSince($0) <= Self.initialConnectingInterval } ?? false
+        if deviceIsOffline == true {
+            transport = .init(.broken, "You\u{2019}re offline. I\u{2019}ll send when you\u{2019}re back", owner: .network,
                          lever: "Reconnect this iPhone to Wi-Fi or cellular data.")
-        case .iCloudAccountAttention:
-            return .init(.broken, DeviceSyncAccountFailure.phoneMessage, owner: .iCloudAccount,
+        } else if bridge.accountFailure != nil {
+            transport = .init(.broken, DeviceSyncAccountFailure.phoneMessage, owner: .iCloudAccount,
                          lever: "Open Settings \u{203A} Apple Account on this iPhone and finish signing in to iCloud.")
-        case .offline:
-            // Unpaired, the bridge never started: nothing is wrong with iCloud.
-            guard pairingStore?.isICloudSigned == true else {
-                return .init(.waiting, "Not connected yet; pairing starts it")
-            }
-            return .init(.broken, AliveConnection.noICloud, owner: .iCloudAccount,
-                         lever: "Sign in to iCloud in Settings on this iPhone, with the same Apple Account as your Mac.")
-        case .connecting:
-            return .init(.waiting, "Finding your Mac\u{2026}")
-        case .macUnreachable:
-            return .init(.waiting, "iCloud isn\u{2019}t connecting", owner: .network,
-                         lever: "Check this iPhone\u{2019}s connection; I keep trying.")
-        case .online, .stale, .awaitingMacActivity:
-            return .init(.holds, "iCloud is carrying our messages")
-        }
-    }
-
-    private var exchangeFact: NAPhoneConnection.Fact {
-        let heard = lastSeenAt.map { " Last heard \($0.formatted(date: .abbreviated, time: .shortened))." } ?? ""
-        switch bridgeStatus {
-        case .online:
-            return .init(.holds, lastSeenAt.map { "Heard from your Mac \($0.formatted(date: .omitted, time: .shortened))" } ?? "Here")
-        case .stale, .macUnreachable, .awaitingMacActivity:
-            return .init(.waiting, AliveConnection.unreachable, owner: .personOnMac,
+        } else if bridge.available, let lastSeenAt, now.timeIntervalSince(lastSeenAt) <= Self.recentLastSeenInterval {
+            exchange = .init(.holds, "Heard from your Mac \(lastSeenAt.formatted(date: .omitted, time: .shortened))")
+        } else if connecting {
+            transport = .init(.waiting, "Finding your Mac\u{2026}")
+        } else if bridge.available || (pairingStore?.isPaired == true
+                    && bridgeUnavailableSince.map { now.timeIntervalSince($0) >= Self.macUnreachableThreshold } == true) {
+            let heard = lastSeenAt.map { " Last heard \($0.formatted(date: .abbreviated, time: .shortened))." } ?? ""
+            exchange = .init(.waiting, AliveConnection.unreachable, owner: .personOnMac,
                          lever: "Open NativeAgent on your Mac and keep it awake." + heard)
-        case .connecting, .offline, .deviceOffline, .iCloudAccountAttention:
-            return .init(.waiting, "Not heard from your Mac yet")
+            if !bridge.available {
+                transport = .init(.waiting, "iCloud isn\u{2019}t connecting", owner: .network,
+                                 lever: "Check this iPhone\u{2019}s connection; I keep trying.")
+            }
+        } else if pairingStore?.isICloudSigned == true {
+            transport = .init(.broken, AliveConnection.noICloud, owner: .iCloudAccount,
+                             lever: "Sign in to iCloud in Settings on this iPhone, with the same Apple Account as your Mac.")
+        } else {
+            transport = .init(.waiting, "Not connected yet; pairing starts it")
         }
+        return NAPhoneConnection(pairing: pairingFact, transport: transport, exchange: exchange)
     }
 
     func configureICloud() {
         connectingStartedAt = Date()
         bridge.setup()
-        refreshBridgeStatus()
+        refreshConnection()
         reconnectGeneration += 1
         let generation = reconnectGeneration
         reconnectTask?.cancel()
@@ -362,7 +211,7 @@ final class MacBridgeClient: ObservableObject {
             var attempts = 0
             while !Task.isCancelled, generation == self.reconnectGeneration {
                 self.bridge.setup()
-                self.refreshBridgeStatus()
+                self.refreshConnection()
                 if self.bridge.available { break }
                 attempts += 1
                 try? await Task.sleep(
@@ -374,17 +223,13 @@ final class MacBridgeClient: ObservableObject {
         }
     }
 
-    func connect() {
-        configureICloud()
-    }
-
     func disconnect() {
         reconnectGeneration += 1
         reconnectTask?.cancel()
         reconnectTask = nil
         connectingStartedAt = nil
         bridge.tearDown()
-        refreshBridgeStatus()
+        refreshConnection()
     }
 
     func repairConnection() async throws {
@@ -414,16 +259,12 @@ final class MacBridgeClient: ObservableObject {
         bridge.clearMacConfirmationForConnectionRepair()
         bridge.tearDown(preservingConsumers: true)
         sync.clearConnectionDeliveryHistory()
-        refreshBridgeStatus()
+        refreshConnection()
         bridge.setup()
-        refreshBridgeStatus()
+        refreshConnection()
     }
 
     // MARK: - Chat
-
-    enum ChatSendResult {
-        case queuedMessageId(String)
-    }
 
     func sendMessage(
         _ text: String,
@@ -432,12 +273,12 @@ final class MacBridgeClient: ObservableObject {
         attachments: [MultimodalAttachment] = [],
         suppressRemoteUserAppend: Bool = false,
         replacementAssistantMessageID: UUID? = nil,
-        /// 2026-09-06: the caller mints the correlation id so it can name this
-        /// run in a Stop issued before this call returns.
+        /// A caller-supplied correlation ID lets Stop name the run before send returns.
         messageID: String = UUID().uuidString,
         preparedMessage: BridgeMessage? = nil,
+        expectedPairing: String? = nil,
         onPrepared: ((BridgeMessage) async throws -> Void)? = nil
-    ) async throws -> ChatSendResult {
+    ) async throws -> String {
         let metadata = Self.chatSendMetadata(
             controls: controls,
             suppressRemoteUserAppend: suppressRemoteUserAppend,
@@ -462,9 +303,10 @@ final class MacBridgeClient: ObservableObject {
             metadata: metadata,
             attachments: references,
             preparedMessage: preparedMessage,
+            expectedPairing: expectedPairing,
             onPrepared: onPrepared
         )
-        return .queuedMessageId(msg.id)
+        return msg.id
     }
 
     static func chatSendMetadata(
@@ -516,8 +358,7 @@ final class MacBridgeClient: ObservableObject {
         bridge.observeRejectedMessages(onReject: onReject)
     }
 
-    /// Phase 14e-iCloud HMAC self-heal: observe unsigned signature_invalid_resync
-    /// hints from Mac so ChatView can refresh + retry the most recent unACK'd send.
+    /// Observe unsigned signature_invalid_resync hints for chat send recovery.
     @discardableResult
     func observeICloudResyncHints(onHint: @escaping (BridgeMessage) -> Void) -> UUID? {
         // Unsigned, so it is no evidence the Mac is up.
@@ -539,7 +380,7 @@ final class MacBridgeClient: ObservableObject {
     @discardableResult
     func pollICloudRepliesNow() async -> Bool {
         let delivered = await bridge.pollIncomingNow()
-        refreshBridgeStatus()
+        refreshConnection()
         return delivered
     }
 
@@ -552,30 +393,34 @@ final class MacBridgeClient: ObservableObject {
         lastSeenAt = timestamp
     }
 
-    func refreshBridgeStatus(now: Date = Date()) {
-        let next = computedBridgeStatus(now: now)
-        // Stale while the app is open: the presence beat is pushed to no one,
-        // so read it (a fresh beat returns to online). Going stale from online
-        // waits for that read rather than flashing "unreachable".
-        if case .stale = next, UIApplication.shared.applicationState == .active,
-           now.timeIntervalSince(presenceRereadAt ?? .distantPast) >= MacBridgeStatusRefreshPolicy.minuteCounterInterval {
+    func refreshConnection(now: Date = Date()) {
+        if bridge.available {
+            bridgeUnavailableSince = nil
+        } else if bridgeUnavailableSince == nil {
+            bridgeUnavailableSince = now
+        }
+        var next = assessedConnection(now: now)
+        // An old sighting waits for a foreground presence read before losing contact.
+        if next.transport.state == .holds, next.exchange.state == .waiting, lastSeenAt != nil,
+           UIApplication.shared.applicationState == .active,
+           now.timeIntervalSince(presenceRereadAt ?? .distantPast) >= MacConnectionRefreshPolicy.presenceRefreshInterval {
             presenceRereadAt = now
             Task { @MainActor [weak self] in
                 await self?.bridge.readMacPresence()
-                self?.refreshBridgeStatus()
+                self?.refreshConnection()
             }
-            if bridgeStatus == .online { return }
+            if connection.exchange.state == .holds { next.exchange = connection.exchange }
         }
-        if bridgeStatus != next {
-            bridgeStatus = next
+        if connection != next {
+            connection = next
         }
         rescheduleStatusRefresh(now: now)
     }
 
-    /// E8: arm exactly one recompute, at the cadence the current ages justify.
+    /// Arm one recompute at the cadence the current ages justify.
     private func rescheduleStatusRefresh(now: Date) {
         statusRefreshTask?.cancel()
-        guard let interval = MacBridgeStatusRefreshPolicy.refreshInterval(
+        guard let interval = MacConnectionRefreshPolicy.refreshInterval(
             now: now,
             lastSeenAt: lastSeenAt,
             connectingStartedAt: connectingStartedAt,
@@ -591,70 +436,13 @@ final class MacBridgeClient: ObservableObject {
         statusRefreshTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
             guard !Task.isCancelled, let self else { return }
-            self.refreshBridgeStatus()
+            self.refreshConnection()
         }
-    }
-
-    private func computedBridgeStatus(now: Date) -> BridgeStatus {
-        let bridgeAvailable = bridge.available
-        if bridgeAvailable {
-            bridgeUnavailableSince = nil
-        } else if bridgeUnavailableSince == nil {
-            bridgeUnavailableSince = now
-        }
-        // E8: a phone with no network path must say so rather than blaming the
-        // Mac. Only an observed outage overrides; an unknown path does not.
-        if deviceIsOffline == true { return .deviceOffline }
-        if bridge.accountFailure != nil { return .iCloudAccountAttention }
-        return Self.bridgeStatusDecision(
-            bridgeAvailable: bridgeAvailable,
-            lastSeenAt: lastSeenAt,
-            connectingStartedAt: connectingStartedAt,
-            bridgeUnavailableSince: bridgeUnavailableSince,
-            isPaired: pairingStore?.isPaired == true,
-            now: now
-        )
-    }
-
-    /// The status surface is a compact projection of real bridge, pairing, and
-    /// recency evidence. Keeping its table value-only lets every caller use
-    /// the same boundaries; it does not create a second health owner.
-    static func bridgeStatusDecision(
-        bridgeAvailable: Bool,
-        lastSeenAt: Date?,
-        connectingStartedAt: Date?,
-        bridgeUnavailableSince: Date?,
-        isPaired: Bool,
-        now: Date
-    ) -> BridgeStatus {
-        let connecting = connectingStartedAt.map { now.timeIntervalSince($0) <= initialConnectingInterval } ?? false
-        if bridgeAvailable, let lastSeenAt {
-            let age = now.timeIntervalSince(lastSeenAt)
-            if age <= recentLastSeenInterval { return .online }
-            // Opening the app re-reads the Mac's beat; an old sighting is not
-            // "unreachable" until that read has had its chance.
-            if !connecting { return .stale(minutesAgo: minutesAgo(since: lastSeenAt, now: now)) }
-        }
-        if connecting { return .connecting }
-        if bridgeAvailable { return .awaitingMacActivity }
-        // Paired + unavailable means the transport is reachable enough to
-        // diagnose, but the Mac has not resumed its side of the boundary.
-        if isPaired, let start = bridgeUnavailableSince,
-           now.timeIntervalSince(start) >= macUnreachableThreshold {
-            return .macUnreachable
-        }
-        return .offline
-    }
-
-    private static func minutesAgo(since date: Date, now: Date) -> Int {
-        max(1, Int(now.timeIntervalSince(date) / 60))
     }
 
     // MARK: - Chat history refresh (iCloud snapshot read)
 
-    /// 2026-09-06: the transcript read the chat store consumes. It keeps the
-    /// Mac's own distinction — no row published for this session vs. a row that
-    /// says the transcript is empty — instead of flattening both to "nothing".
+    /// Preserve the distinction between an unpublished session and an explicitly empty transcript.
     func readChatTranscript(sessionID: String?) async -> MacTranscriptRead {
         let engine = iCloudSyncEngine.shared
         let sid: String
@@ -668,52 +456,5 @@ final class MacBridgeClient: ObservableObject {
         // The snapshot reader retains last-good rows if the read is unavailable.
         await engine.refreshChatTranscriptsSnapshot()
         return engine.transcriptRead(for: sid)
-    }
-
-    nonisolated static func projectChatRecords(_ records: [ChatMessageRecord]) -> [ChatMessage] {
-        // eval3/T3 data-flow:
-        // iOS send → BridgeMessage.attachments → Mac Swift runtime forwarding
-        //   → ChatOrchestrationClient.appendMessage writes
-        //     `metadata.attachments=[{id,type,mime,name,byteSize}]` into
-        //     data/chat/messages/<sid>.jsonl
-        //   → NativeClient.getChatMessages decodes into ChatMessageMetadata
-        //     (which now carries `attachments`)
-        //   → MacSyncEngine snapshots [ChatMessage] into
-        //     iCloud chat_transcripts.json
-        //   → iCloudSyncEngine.refreshChatTranscriptsSnapshot reads it as
-        //     [ChatMessageRecord] (carries `metadata.attachments`)
-        //   → here: project metadata.attachments → [ChatAttachmentSummary]
-        //     so the rebuilt ChatMessage on refresh preserves attachments.
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return records.compactMap { rec in
-            let roleStr = rec.role
-            let interaction = rec.interactionJSON.flatMap { try? decoder.decode(InlineInteraction.self, from: Data($0.utf8)) }
-            let descriptor = rec.interactionDescriptorJSON.flatMap { try? decoder.decode(InlineInteractionDescriptor.self, from: Data($0.utf8)) }
-            guard roleStr == "user" || roleStr == "assistant" || interaction != nil else { return nil }
-            let role: ChatMessage.Role = roleStr == "user" ? .user : .assistant
-            let uuid = UUID(uuidString: rec.id) ?? UUID()
-            let attachments: [ChatAttachmentSummary] = (rec.metadata?.attachments ?? []).map { a in
-                ChatAttachmentSummary(
-                    id: a.id,
-                    name: a.name ?? "attachment",
-                    type: a.type,
-                    mime: a.mime,
-                    base64: a.preview?.png?.base64EncodedString(),
-                    byteSize: a.byteSize.map(Int.init),
-                    utterance: a.utterance
-                )
-            }
-            var message = ChatMessage(id: uuid, role: role, text: interaction == nil ? rec.content : "", attachments: attachments, runId: rec.runId,
-                interaction: interaction, interactionDescriptor: descriptor, interactionSessionID: rec.interactionSessionID)
-            message.toolEvents = rec.toolEvents ?? []
-            if roleStr == "assistant" {
-                message.turnID = rec.metadata?.turnTraceId
-                message.failureDetail = rec.metadata?.error
-                message.completionState = rec.metadata?.failureWork != nil || rec.metadata?.error != nil ? "failed"
-                    : rec.metadata?.partial == true || rec.metadata?.cancelled == true ? "incomplete" : rec.metadata?.completionState
-            }
-            return message
-        }
     }
 }

@@ -5,7 +5,8 @@ import PersistenceCore
 import Desk
 import Dispatcher
 import ToolRegistry
-// Blueprint: | `SwiftToolDispatcher+ArtifactContext.swift` | `SwiftToolDispatcher`: `impl_artifact_find` |
+import Transcripts
+// Blueprint: | `SwiftToolDispatcher+ArtifactContext.swift` | `SwiftToolDispatcher`: artifact recall through the canonical hot/archive transcript inventory, deduplicating retained messages and reporting unavailable or sampled evidence |
 
 // A lazy projection over existing evidence, not another artifact registry.
 // Paths and versions below describe what a record said at the time; opening
@@ -27,57 +28,54 @@ extension SwiftToolDispatcher {
         } else { session = nil }
         let limit = max(1, min(Self.jsonInt(input["limit"]) ?? 6, 12))
         let offset = max(0, Self.jsonInt(input["session_offset"]) ?? 0)
-        let directory = dataRoot.appendingPathComponent("chat/messages", isDirectory: true)
         var listingFailed = false
-        let files: [URL]
-        if let session {
-            files = [directory.appendingPathComponent(session + ".jsonl")]
-        } else {
-            do {
-                let listed = try FileManager.default.contentsOfDirectory(at: directory,
-                    includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey], options: [.skipsHiddenFiles])
-                files = listed.filter { $0.pathExtension == "jsonl" }.sorted {
-                    let lhs = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                    let rhs = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                    return lhs == rhs ? $0.lastPathComponent < $1.lastPathComponent : lhs > rhs
-                }
-            } catch {
-                files = []
-                listingFailed = (error as? CocoaError)?.code != .fileReadNoSuchFile
-            }
+        var archived: [String: [URL]] = [:]
+        do { archived = try ChatSessionRetention.archivedTranscripts(dataRoot: dataRoot) }
+        catch { listingFailed = true }
+        let files: [(String, URL)]
+        do {
+            files = try ChatSessionRetention.transcriptFiles(dataRoot: dataRoot, sessionId: session, archived: archived)
+        } catch {
+            files = []
+            listingFailed = true
         }
-        let page = Array(files.dropFirst(session == nil ? offset : 0).prefix(24))
-        var failures = 0
+        let page = Array(files.dropFirst(offset).prefix(24))
+        var failures: Set<String> = []
         var malformed = 0
-        var sampled = 0
+        var sampled: Set<String> = []
         var fullReadBytes = 0
         var candidates: [ArtifactContextCandidate] = []
+        var seenMessages: Set<String> = []
         let reader = SessionHistoryReader(dataRoot: dataRoot)
-        for file in page {
+        for (sessionID, file) in page {
             try Task.checkCancellation()
-            let sessionID = file.deletingPathExtension().lastPathComponent
             let size = (try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? Int.max
             // Full read where proportionate; canonical bounded sampling on
             // large histories. Never represent sampling as exhaustive recall.
             let useFull = size <= 4 * 1024 * 1024 && fullReadBytes + size <= 24 * 1024 * 1024
-            let read: SessionHistoryReadResult
+            let reads: [SessionHistoryReadResult]
             do {
                 if useFull {
                     fullReadBytes += size
-                    read = try await reader.messagesWithStats(forSessionId: sessionID, strictEvidence: true)
+                    reads = [try await reader.messagesWithStats(forSessionId: sessionID, strictEvidence: true, transcriptURL: file)]
                 } else {
-                    read = try await reader.relevanceMessagesWithStats(forSessionId: sessionID)
+                    reads = [
+                        try await reader.relevanceMessagesWithStats(forSessionId: sessionID, transcriptURL: file),
+                        try await reader.messagesWithStats(forSessionId: sessionID, limit: 512,
+                            maximumBytes: 1024 * 1024, transcriptURL: file),
+                    ]
                 }
-            } catch { failures += 1; continue }
-            if ["missing", "read_failed", "invalid_session_id", "invalid_encoding"].contains(read.stats.mode) {
-                failures += 1; continue
+            } catch is CancellationError { throw CancellationError() }
+            catch { failures.insert(sessionID); continue }
+            if reads.contains(where: { ["missing", "read_failed", "invalid_session_id", "invalid_encoding"].contains($0.stats.mode) }) {
+                failures.insert(sessionID); continue
             }
-            malformed += read.stats.malformedRowCount + read.stats.invalidShapeRowCount
-            let sampledHistory = !useFull || read.stats.truncated
-            if sampledHistory { sampled += 1 }
-            candidates += ArtifactContextProjection.chatCandidates(
-                read.messages, sessionID: sessionID, query: query, topic: topic,
-                sampled: sampledHistory, dataRoot: dataRoot)
+            malformed += reads.reduce(0) { $0 + $1.stats.malformedRowCount + $1.stats.invalidShapeRowCount }
+            let sampledHistory = !useFull || reads.contains { $0.stats.truncated }
+            if sampledHistory { sampled.insert(sessionID) }
+            candidates += ArtifactContext.chatCandidates(
+                reads.flatMap(\.messages), sessionID: sessionID, query: query, topic: topic,
+                sampled: sampledHistory, dataRoot: dataRoot, seenMessages: &seenMessages)
         }
         var deskAvailable = true
         // A requested chat is an exact scope, never permission to silently
@@ -85,7 +83,7 @@ extension SwiftToolDispatcher {
         if session == nil {
             do {
                 let state = try await SwiftNativeDeskStore(dataRoot: dataRoot).liveState()
-                candidates += ArtifactContextProjection.deskCandidates(state.items, query: query, topic: topic, dataRoot: dataRoot)
+                candidates += ArtifactContext.deskCandidates(state.items, query: query, topic: topic, dataRoot: dataRoot)
             } catch { deskAvailable = false }
         }
         candidates.sort {
@@ -93,13 +91,13 @@ extension SwiftToolDispatcher {
             if $0.timestamp != $1.timestamp { return $0.timestamp > $1.timestamp }
             return $0.tie < $1.tie
         }
-        let hasMoreSessions = session == nil && offset + page.count < files.count
-        let complete = !listingFailed && failures == 0 && malformed == 0 && sampled == 0
+        let hasMoreSessions = offset + page.count < files.count
+        let complete = !listingFailed && failures.isEmpty && malformed == 0 && sampled.isEmpty
             && !hasMoreSessions && offset == 0 && deskAvailable
         let artifacts = candidates.prefix(limit).map(\.value)
         var result: [String: JSONValue] = [
             "status": .string(candidates.isEmpty ? (complete ? "not_found" : "incomplete") : "ok"),
-            "query": .string(ArtifactContextProjection.safeText(query, cap: 500)),
+            "query": .string(ArtifactContext.safeText(query, cap: 500)),
             "artifacts": .array(artifacts),
             "matched_record_count": .int(Int64(candidates.count)),
             "more_matches_in_page": .bool(candidates.count > limit),
@@ -107,14 +105,15 @@ extension SwiftToolDispatcher {
             "coverage": .object([
                 "complete_in_declared_scope": .bool(complete),
                 "scope": .string(session == nil ? "chat_history_and_live_desk" : "explicit_chat_session"),
-                "sessions_scanned": .int(Int64(page.count)),
-                "session_offset": .int(Int64(session == nil ? offset : 0)),
-                "sampled_sessions": .int(Int64(sampled)),
-                "unavailable_sessions": .int(Int64(failures)),
+                "sessions_scanned": .int(Int64(Set(page.map { $0.0 }).count)),
+                "transcripts_scanned": .int(Int64(page.count)),
+                "session_offset": .int(Int64(offset)),
+                "sampled_sessions": .int(Int64(sampled.count)),
+                "unavailable_sessions": .int(Int64(failures.count)),
                 "malformed_rows": .int(Int64(malformed)),
                 "directory_listing_failed": .bool(listingFailed),
                 "desk_available": .bool(deskAvailable),
-                "note": .string("Searches structured attachments, retained structured artifact receipts and live Desk file/URL references. Does not crawl disk, infer paths from prose, scan archived Desk records, or establish absence of artifacts that were never recorded. Large histories are sampled; search_chat_history can locate exact older evidence."),
+                "note": .string("Searches structured attachments and artifact receipts in hot, archived and pre-compaction transcripts, plus live Desk file/URL references. Paging counts transcript files, including retained copies; repeated messages within the page are deduplicated. Does not crawl disk, infer paths from prose, scan archived Desk records, or establish absence of unrecorded artifacts. Sampled histories use bounded interior windows and a recent tail; unsampled attachments and receipts may be missed."),
             ]),
         ]
         if hasMoreSessions { result["next_session_offset"] = .int(Int64(offset + page.count)) }
@@ -129,7 +128,7 @@ struct ArtifactContextCandidate {
     var value: JSONValue
 }
 
-enum ArtifactContextProjection {
+enum ArtifactContext {
     static func string(_ value: JSONValue?) -> String? {
         guard case .string(let text)? = value else { return nil }
         return text
@@ -221,7 +220,7 @@ enum ArtifactContextProjection {
     }
 
     static func chatCandidates(_ messages: [ChatMessage], sessionID: String, query: String, topic: WorkContextQuery,
-                               sampled: Bool, dataRoot: URL) -> [ArtifactContextCandidate] {
+                               sampled: Bool, dataRoot: URL, seenMessages: inout Set<String>) -> [ArtifactContextCandidate] {
         var candidates: [ArtifactContextCandidate] = []
         for (index, message) in messages.enumerated() {
             let meta = metadata(message)
@@ -236,12 +235,14 @@ enum ArtifactContextProjection {
                                                  inputJSON: string(meta["inputJSON"] ?? row["inputJSON"])).name
                 let raw = string(meta["resultSummary"] ?? row["resultSummary"]) ?? message.content
                 if raw.utf8.count <= 128 * 1024 {
-                    let scrubbed = ChatToolJSONRedaction.screenViewRedactedResultJSON(tool: tool, json: raw)
-                    let safe = ChatToolJSONRedaction.injectionRedactedResultJSON(tool: tool, json: scrubbed)
+                    let safe = ChatToolJSONRedaction.redactedResultJSON(tool: tool, json: raw)
                     refs += receiptReferences(object(.string(ChatSecretRedactor.redactText(safe))))
                 }
             }
             guard !refs.isEmpty else { continue }
+            let messageKey = sessionID + ":" + message.historyIdentity()
+            guard !seenMessages.contains(messageKey) else { continue }
+            let before = candidates.count
             // Sampling destroys adjacency: only the exact source is then
             // returned, never unrelated rows labeled neighboring conversation.
             let neighbors = sampled ? [message] : Array(messages[max(0, index - 2)...min(messages.count - 1, index + 2)])
@@ -288,6 +289,7 @@ enum ArtifactContextProjection {
                 } else { value["availability_note"] = .string("Attachment identity was recorded without a reusable file path. The source conversation is available; do not invent a path.") }
                 candidates.append(.init(score: match.score, timestamp: message.timestamp, tie: "\(sessionID):\(index):\(path ?? id ?? name)", value: .object(value)))
             }
+            if candidates.count > before { seenMessages.insert(messageKey) }
         }
         return candidates
     }

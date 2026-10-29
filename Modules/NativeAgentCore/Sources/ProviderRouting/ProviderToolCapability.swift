@@ -18,16 +18,16 @@ public enum ProviderToolWire: Sendable, Equatable {
 /// Transport capability, independent of the selected model's catalog claims:
 /// the route id names its adapter, and the adapter's declarations answer.
 public enum ProviderToolCapability {
-    static func transport(providerID: String) -> (any LLMAdapter.Type)? {
+    static func transport(providerID: String) -> (any LLMTransport.Type)? {
         switch providerID {
-        case "anthropic", "kimi-code": AnthropicAdapter.self
-        case "anthropic_oauth_direct": AnthropicOAuthDirectAdapter.self
-        case "openai": OpenAIAdapter.self
-        case "openai_oauth_direct": OpenAIOAuthDirectAdapter.self
-        case "openrouter": OpenRouterAdapter.self
-        case "moonshot": MoonshotAdapter.self
-        case "xai_oauth_direct": XAIOAuthDirectAdapter.self
-        case "codex": CodexAdapter.self
+        case "anthropic", "kimi-code": AnthropicTransport.self
+        case "anthropic_oauth_direct": AnthropicOAuthTransport.self
+        case "openai": OpenAITransport.self
+        case "openai_oauth_direct": ChatGPTTransport.self
+        case "openrouter": OpenRouterTransport.self
+        case "moonshot": MoonshotTransport.self
+        case "xai_oauth_direct": XAIOAuthTransport.self
+        case "codex": CodexProcess.self
         default: nil
         }
     }
@@ -49,21 +49,11 @@ public enum ProviderToolCapability {
         supportsTools(providerID: providerID) ? nil : "text only, no tools"
     }
 
-    /// Said to the model before its brief on an account that cannot call tools.
-    public static let textOnlyTurnPreface = "Note: this account cannot use tools in NativeAgent, so nothing can be read, fetched or checked in this turn. Begin the reply by saying so plainly, and never present remembered or earlier text as freshly observed."
-
     public static let unavailableNote = "This account cannot use tools in NativeAgent; choose ChatGPT (OAuth) or another account for tasks that read pages or files."
 
     static func recordOfferedTools(providerID: String, tools: [LLMToolSchema]?) {
         if tools?.isEmpty == false, !supportsTools(providerID: providerID) {
             LLMCallContext.toolCapabilityNote?(unavailableNote)
         }
-    }
-}
-
-/// The text-marker codec's question, answered by the declared wire.
-public enum NativeToolCapability {
-    public static func providerSupportsNativeTools(_ providerId: String?) -> Bool {
-        providerId.map { ProviderToolCapability.wire(providerID: $0) == .native } ?? false
     }
 }

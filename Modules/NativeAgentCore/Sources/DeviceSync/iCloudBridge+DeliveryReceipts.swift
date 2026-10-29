@@ -5,8 +5,7 @@ import PersistenceCore
 
 extension iCloudBridge {
     /// The durable receipt seam for both CloudKit and Drive sends. Keeping the
-    /// row construction and durable append here lets evaluations exercise the
-    /// exact persisted evidence without opening a live transport.
+    /// Ephemeral phone presentation never enters the durable delivery journal.
     @discardableResult
     nonisolated static func appendChatDeliveryReceipt(
         _ message: BridgeMessage,
@@ -17,6 +16,11 @@ extension iCloudBridge {
         dataRoot: URL,
         detail: String? = nil
     ) async -> Bool {
+        if direction == "mac_to_ios",
+           let kind = message.metadata?["kind"],
+           ["text_delta", "progress", "notice", "tool_use", "tool_result"].contains(kind) {
+            return true
+        }
         var fields: [String: JSONValue] = [
             "at": .string(ISO8601DateFormatter().string(from: Date())),
             "messageId": .string(message.id),
@@ -180,7 +184,7 @@ extension iCloudBridge {
         return Set(rows.compactMap { fields in
             fields["direction"] == .string("mac_to_ios")
                 && fields["status"] == .string(ChatDeliveryReceiptStatus.confirmedByPeer.rawValue)
-                ? stringField(fields["eventId"]) : nil
+                ? fields["eventId"]?.stringValue : nil
         })
     }
 
@@ -195,7 +199,7 @@ extension iCloudBridge {
         let eventID: String
 
         func matches(_ fields: [String: JSONValue]) -> Bool {
-            stringField(fields["direction"]) == direction && stringField(fields["eventId"]) == eventID
+            fields["direction"]?.stringValue == direction && fields["eventId"]?.stringValue == eventID
         }
     }
 
@@ -207,13 +211,12 @@ extension iCloudBridge {
         dataRoot: URL
     ) async throws -> Bool {
         let path = chatDeliveryReceiptsURL(dataRoot: dataRoot)
-        let persistence = SwiftNativePersistenceCore()
-        return try await persistence.withFileLock(path) {
+        return try await SwiftNativePersistenceCore.withFileLock(path) {
             let existing = try loadChatDeliveryReceiptRows(path: path)
             var rows = existing
             var matchedIndex: Int?
-            if case .object(let fields) = appendRow, let id = stringField(fields["messageId"]) {
-                matchedIndex = rows.firstIndex { stringField($0["messageId"]) == id && $0["direction"] == fields["direction"] }
+            if case .object(let fields) = appendRow, let id = fields["messageId"]?.stringValue {
+                matchedIndex = rows.firstIndex { $0["messageId"]?.stringValue == id && $0["direction"] == fields["direction"] }
             }
             if let match {
                 for index in rows.indices.reversed() {
@@ -232,7 +235,7 @@ extension iCloudBridge {
             } else if case .object(let fields) = appendRow {
                 if let matchedIndex {
                     let accepted = ["accepted_by_transport", "confirmed_by_peer", "delivered_to_mac"]
-                    if !accepted.contains(stringField(rows[matchedIndex]["status"]) ?? "") || fields["status"] == .string("confirmed_by_peer") {
+                    if !accepted.contains(rows[matchedIndex]["status"]?.stringValue ?? "") || fields["status"] == .string("confirmed_by_peer") {
                         rows[matchedIndex].merge(fields, uniquingKeysWith: { _, new in new })
                     }
                 } else { rows.append(fields) }
@@ -240,9 +243,7 @@ extension iCloudBridge {
                 return false
             }
             try saveChatDeliveryReceiptRows(rows, path: path)
-            // 2026-09-07: true means "durably persisted", whether by updating a
-            // matched row or appending the first one; the caller reports false as
-            // receipt_persistence_failed, which a successful append is not.
+            // True means the receipt is durably persisted, whether updated or appended.
             return true
         }
     }
@@ -277,15 +278,7 @@ extension iCloudBridge {
     }
 
     nonisolated private static func saveChatDeliveryReceiptRows(_ rows: [[String: JSONValue]], path: URL) throws {
-        let serialized = try rows.map { try JSONValue.object($0).serialize(pretty: false) }
-            .joined(separator: "\n")
-        let data = Data((serialized.isEmpty ? "" : serialized + "\n").utf8)
+        let data = try SwiftNativePersistenceCore.serializeJSONL(rows.map(JSONValue.object))
         try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: path)
     }
-
-    nonisolated private static func stringField(_ value: JSONValue?) -> String? {
-        guard case .string(let string)? = value else { return nil }
-        return string
-    }
-
 }

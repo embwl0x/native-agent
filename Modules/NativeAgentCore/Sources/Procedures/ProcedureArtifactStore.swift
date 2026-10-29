@@ -1,235 +1,24 @@
 import NativeAgentCore
 import Foundation
+import NativeAgentShared
 import PersistenceCore
-// Blueprint: | `ProcedureArtifactStore.swift` | `ProcedureArtifactStore` actor; artifact installation and invocation admission/receipts; explicit backup/export/sync decisions and privacy-map coverage; all store instances share one coalesced retention flight per canonical root, opened and terminally closed/drained by engine lifecycle, with cancellation checked before deletion; the invocation-ledger file lock excludes reference publication from retention eligibility/deletion across store instances; automatic admission takes it before the active-pointer lock |
-
-public enum ProcedureArtifactStoreError: String, Error, Sendable, Equatable {
-    case invalidArtifact = "invalid_artifact"
-    case immutableConflict = "immutable_conflict"
-    case artifactNotFound = "artifact_not_found"
-    case corruptArtifact = "corrupt_artifact"
-    case legacyArtifactRequiresRevalidation = "legacy_artifact_requires_revalidation"
-    /// The installed-artifact directory crossed the hard discovery ceiling —
-    /// NOT a corrupt row. Added 2026-07-21 (audit): the ceiling guard used to
-    /// throw `corruptArtifact`, mislabeling capacity as damage. Existing raw
-    /// values are untouched (wire-compatible).
-    case artifactCapacityExceeded = "artifact_capacity_exceeded"
-    case corruptInvocationLedger = "corrupt_invocation_ledger"
-    case invocationNotEligible = "invocation_not_eligible"
-    case invalidInputReference = "invalid_input_reference"
-    case invalidExecutionResult = "invalid_execution_result"
-}
-
-/// Closed, payload-free result vocabulary from a canonical domain executor.
-/// Arbitrary executor prose must never be persisted into the invocation ledger.
-public enum ProcedureCanonicalExecutionStatus: String, Codable, Sendable, Equatable {
-    case verifiedSuccess = "verified_success"
-    case verifiedFailure = "verified_failure"
-    case cancelled
-    case abstained
-    case unverified
-}
-
-public struct ProcedureCanonicalExecutionResult: Sendable, Equatable {
-    public let status: ProcedureCanonicalExecutionStatus
-    public let authorityRechecked: Bool
-    public let canonicalEvidenceMatched: Bool
-    public let verified: Bool
-
-    public init(
-        status: ProcedureCanonicalExecutionStatus,
-        authorityRechecked: Bool,
-        canonicalEvidenceMatched: Bool,
-        verified: Bool
-    ) {
-        self.status = status
-        self.authorityRechecked = authorityRechecked
-        self.canonicalEvidenceMatched = canonicalEvidenceMatched
-        self.verified = verified
-    }
-}
-
-/// Domain executors remain the only action owners. This seam never receives
-/// parameter values: it passes an opaque canonical-store reference and one
-/// already-admitted transition rule. The executor must refetch input, recheck
-/// TrustCenter/approval, and return exact verification.
-public protocol ProcedureCanonicalExecuting: Sendable {
-    func executeProcedureRule(
-        artifact: DeclarativeProcedureArtifact,
-        rule: ProcedureTransitionRule,
-        opaqueInputReference: String,
-        invocationID: String
-    ) async throws -> ProcedureCanonicalExecutionResult
-}
-
-public struct ProcedureInvocationReceipt: Codable, Sendable, Equatable {
-    public static let schema = "declarative-procedure-invocation.v1"
-    public let schema: String
-    public let invocationID: String
-    public let artifactID: String
-    public let opaqueInputReference: String
-    public let requestedAt: String
-    public let dryRunStatus: ProcedureDryRunStatus
-    public let dryRunReason: ProcedureDryRunReason
-    public let executorStatus: ProcedureCanonicalExecutionStatus?
-    public let authorityRechecked: Bool
-    public let canonicalEvidenceMatched: Bool
-    public let verified: Bool
-    public let fallback: ProcedureFallbackRoute
-    public let dispatched: Bool
-    public let payloadFree: Bool
-    public let permissionAuthority: Bool
-    public let automaticSelection: Bool
-    /// Present only when an exact typed activation admitted the invocation.
-    /// Older/manual rows decode with nil and retain their original meaning.
-    public let activationID: String?
-    public let procedureID: String?
-    public let selectionMode: String?
-
-    public init(
-        schema: String,
-        invocationID: String,
-        artifactID: String,
-        opaqueInputReference: String,
-        requestedAt: String,
-        dryRunStatus: ProcedureDryRunStatus,
-        dryRunReason: ProcedureDryRunReason,
-        executorStatus: ProcedureCanonicalExecutionStatus?,
-        authorityRechecked: Bool,
-        canonicalEvidenceMatched: Bool,
-        verified: Bool,
-        fallback: ProcedureFallbackRoute,
-        dispatched: Bool,
-        payloadFree: Bool,
-        permissionAuthority: Bool,
-        automaticSelection: Bool,
-        activationID: String? = nil,
-        procedureID: String? = nil,
-        selectionMode: String? = nil
-    ) {
-        self.schema = schema
-        self.invocationID = invocationID
-        self.artifactID = artifactID
-        self.opaqueInputReference = opaqueInputReference
-        self.requestedAt = requestedAt
-        self.dryRunStatus = dryRunStatus
-        self.dryRunReason = dryRunReason
-        self.executorStatus = executorStatus
-        self.authorityRechecked = authorityRechecked
-        self.canonicalEvidenceMatched = canonicalEvidenceMatched
-        self.verified = verified
-        self.fallback = fallback
-        self.dispatched = dispatched
-        self.payloadFree = payloadFree
-        self.permissionAuthority = permissionAuthority
-        self.automaticSelection = automaticSelection
-        self.activationID = activationID
-        self.procedureID = procedureID
-        self.selectionMode = selectionMode
-    }
-}
-
-/// Bounded, payload-free operator projection. It reports whether an approved
-/// native procedure actually exists and whether it has ever been invoked;
-/// candidate prose, input values, Workshop IDs, and outputs are excluded.
-public struct ProcedureArtifactStatusSnapshot: Sendable, Equatable {
-    public let artifactCount: Int
-    public let corruptArtifactCount: Int
-    public let corruptInvocationCount: Int
-    public let invocationCount: Int
-    public let manualInvocationCount: Int
-    public let automaticInvocationCount: Int
-    public let verifiedInvocationCount: Int
-    public let lastInvocationStatus: ProcedureCanonicalExecutionStatus?
-    public let activationArtifactCount: Int
-    public let corruptActivationArtifactCount: Int
-    public let activeAutomaticProcedureCount: Int
-    public let automaticSelectionEnabled: Bool
-    public let payloadFree: Bool
-    /// Sources this snapshot could not read or resolve, each with its cause.
-    /// Empty means every count above was observed, zeros included.
-    public let unreadable: [String]
-}
+import Darwin
+// Blueprint: | `ProcedureArtifactStore.swift` | ProcedureArtifactStore immutable artifact installation, discovery, revalidation and status; explicit backup/export/sync decisions and privacy-map coverage |
 
 /// Immutable procedure artifacts, canonical invocation receipts and exact activations.
 public actor ProcedureArtifactStore {
-    // Owns the procedure schemas below, including exact activations. Local backup,
+    // Owns persisted procedure schemas, including exact activations. Local backup,
     // production export and phone sync exclude this store; off-disk backup includes
     // it without lock sidecars. PrivacyMap lists living_fabric/procedures.
     package let root: URL
-    package let persistence: any PersistenceCoreProtocol
     package let clock: @Sendable () -> Date
-    private static let retention = Retention()
-
-    /// The engine opens/closes one root; store instances only request its flight.
-    private actor Retention {
-        struct Root {
-            let id = UUID()
-            var open = true
-            var owed: ProcedureArtifactStore?
-            var flight: Task<Void, Never>?
-        }
-        var roots: [String: Root] = [:]
-
-        func start(_ key: String) {
-            if roots[key] == nil { roots[key] = Root() }
-        }
-
-        func request(_ store: ProcedureArtifactStore, key: String) {
-            guard roots[key]?.open == true else { return }
-            roots[key]?.owed = store
-            guard roots[key]?.flight == nil, let id = roots[key]?.id else { return }
-            roots[key]?.flight = Task.detached(priority: .utility) {
-                while let store = await self.claim(key, id: id) {
-                    _ = await store.sweepUnreferencedArtifacts()
-                }
-            }
-        }
-
-        func claim(_ key: String, id: UUID) -> ProcedureArtifactStore? {
-            guard roots[key]?.id == id else { return nil }
-            guard roots[key]?.open == true, !Task.isCancelled, let store = roots[key]?.owed else {
-                roots[key]?.flight = nil
-                return nil
-            }
-            roots[key]?.owed = nil
-            return store
-        }
-
-        func stop(_ key: String) async {
-            // Termination is terminal, including a launch continuation that
-            // reaches start after this stop closed admission.
-            if roots[key] == nil { roots[key] = Root() }
-            guard let root = roots[key] else { return }
-            roots[key]?.open = false
-            roots[key]?.owed = nil
-            root.flight?.cancel()
-            await root.flight?.value
-        }
-    }
-
-    private static func retentionKey(_ dataRoot: URL) -> String {
-        dataRoot.standardizedFileURL.resolvingSymlinksInPath().path
-    }
-
-    public static func startRetention(dataRoot: URL) async { await retention.start(retentionKey(dataRoot)) }
-    public static func stopRetention(dataRoot: URL) async { await retention.stop(retentionKey(dataRoot)) }
-
     public init(
         dataRoot: URL,
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
         clock: @escaping @Sendable () -> Date = Date.init
     ) {
         self.root = dataRoot.appendingPathComponent("living_fabric/procedures", isDirectory: true)
-        self.persistence = persistence
         self.clock = clock
     }
-
-    /// Retention keeps installed artifacts below the admission ceiling.
-    static let maxInstalledArtifacts = 1_024
-    static let artifactRetentionTarget = 768
-    /// Unreferenced artifacts become sweep-eligible after this file age.
-    static let artifactRetentionAge: TimeInterval = 30 * 24 * 60 * 60
 
     @discardableResult
     public func install(_ artifact: DeclarativeProcedureArtifact) async throws -> URL {
@@ -238,22 +27,16 @@ public actor ProcedureArtifactStore {
         }
         let path = artifactPath(artifact.id)
         let value = try JSONValue.parse(JSONEncoder().encode(artifact))
-        try await persistence.withFileLock(path) {
+        try await SwiftNativePersistenceCore.withFileLock(path) {
             if FileManager.default.fileExists(atPath: path.path) {
                 // Immutability is semantic, not dependent on a particular
                 // PersistenceCore JSON whitespace/ordering implementation.
-                guard let existing = try? Data(contentsOf: path),
-                      existing.count <= 2 * 1_024 * 1_024,
-                      let decoded = try? JSONDecoder().decode(
-                          DeclarativeProcedureArtifact.self,
-                          from: existing
-                      ),
-                      Self.valid(decoded), decoded == artifact else {
+                guard let decoded = try? await load(artifact.id), decoded == artifact else {
                     throw ProcedureArtifactStoreError.immutableConflict
                 }
                 return
             }
-            try await persistence.writeJSON(value, to: path)
+            try await SwiftNativePersistenceCore.writeJSON(value, to: path)
         }
         // Retention runs off this actor after installation. Reference admission
         // shares the invocation ledger lock with a sweep's eligibility/deletion.
@@ -262,12 +45,12 @@ public actor ProcedureArtifactStore {
     }
 
     public func load(_ artifactID: String) async throws -> DeclarativeProcedureArtifact {
-        guard Self.digest(artifactID) else { throw ProcedureArtifactStoreError.artifactNotFound }
+        guard ProcedureTrajectoryExtractor.isOpaqueIdentity(artifactID) else { throw ProcedureArtifactStoreError.artifactNotFound }
         let path = artifactPath(artifactID)
         guard FileManager.default.fileExists(atPath: path.path) else {
             throw ProcedureArtifactStoreError.artifactNotFound
         }
-        guard let data = try? Data(contentsOf: path), data.count <= 2 * 1_024 * 1_024,
+        guard let data = Self.checkedRegularFile(path, maximumBytes: 2 * 1_024 * 1_024),
               let artifact = try? JSONDecoder().decode(DeclarativeProcedureArtifact.self, from: data),
               Self.valid(artifact), artifact.id == artifactID else {
             throw ProcedureArtifactStoreError.corruptArtifact
@@ -289,14 +72,14 @@ public actor ProcedureArtifactStore {
         }
         let receipt = try legacyRevalidationReceipt(artifact)
         let path = legacyRevalidationPath(artifactID)
-        try await persistence.withFileLock(path) {
+        try await SwiftNativePersistenceCore.withFileLock(path) {
             if FileManager.default.fileExists(atPath: path.path) {
                 guard await legacyRevalidationMatches(artifact) else {
                     throw ProcedureArtifactStoreError.immutableConflict
                 }
                 return
             }
-            try await persistence.writeJSON(receipt, to: path)
+            try await SwiftNativePersistenceCore.writeJSON(receipt, to: path)
         }
     }
 
@@ -308,7 +91,7 @@ public actor ProcedureArtifactStore {
         return artifact
     }
 
-    private nonisolated func legacyRevalidationMatches(_ artifact: DeclarativeProcedureArtifact) -> Bool {
+    internal nonisolated func legacyRevalidationMatches(_ artifact: DeclarativeProcedureArtifact) -> Bool {
         let path = legacyRevalidationPath(artifact.id)
         guard let data = Self.checkedRegularFile(path, maximumBytes: 64 * 1_024),
               let receipt = try? JSONValue.parse(data),
@@ -362,18 +145,7 @@ public actor ProcedureArtifactStore {
         var artifacts: [DeclarativeProcedureArtifact] = []
         artifacts.reserveCapacity(urls.count)
         for url in urls {
-            guard let values = try? url.resourceValues(
-                forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
-            ),
-                  values.isRegularFile == true,
-                  values.isSymbolicLink != true,
-                  let data = try? Data(contentsOf: url),
-                  data.count <= 2 * 1_024 * 1_024,
-                  let artifact = try? JSONDecoder().decode(
-                    DeclarativeProcedureArtifact.self,
-                    from: data
-                  ), Self.valid(artifact),
-                  url.deletingPathExtension().lastPathComponent == artifact.id else {
+            guard let artifact = try? await load(url.deletingPathExtension().lastPathComponent) else {
                 throw ProcedureArtifactStoreError.corruptArtifact
             }
             if domain == nil || artifact.domain == domain {
@@ -391,11 +163,7 @@ public actor ProcedureArtifactStore {
         var validArtifacts = 0
         var corruptArtifacts = 0
         for url in artifactURLs {
-            guard let data = try? Data(contentsOf: url), data.count <= 2 * 1_024 * 1_024,
-                  let artifact = try? JSONDecoder().decode(
-                    DeclarativeProcedureArtifact.self,
-                    from: data
-                  ), Self.valid(artifact) else {
+            guard (try? await load(url.deletingPathExtension().lastPathComponent)) != nil else {
                 corruptArtifacts += 1
                 continue
             }
@@ -409,7 +177,7 @@ public actor ProcedureArtifactStore {
         // consumers, but status is the explicit integrity-facing surface.
         var invocationRead: SwiftNativePersistenceCore.JSONLTailReadReceipt?
         do {
-            invocationRead = try await persistence.tailJSONLReadReceipt(
+            invocationRead = try await SwiftNativePersistenceCore.tailJSONLReadReceipt(
                 invocationPath,
                 limit: 10_000,
                 maxBytes: 8 * 1_024 * 1_024
@@ -466,705 +234,34 @@ public actor ProcedureArtifactStore {
     public func loadInvocationReceipts(
         artifactID: String? = nil
     ) async throws -> [ProcedureInvocationReceipt] {
-        if let artifactID, !Self.digest(artifactID) {
+        if let artifactID, !ProcedureTrajectoryExtractor.isOpaqueIdentity(artifactID) {
             throw ProcedureArtifactStoreError.corruptInvocationLedger
         }
         let path = root.appendingPathComponent("invocations.jsonl")
         guard FileManager.default.fileExists(atPath: path.path) else { return [] }
-        guard let size = (try? FileManager.default.attributesOfItem(
+        guard let size = try FileManager.default.attributesOfItem(
             atPath: path.path
-        )[.size]) as? NSNumber, size.intValue <= 8 * 1_024 * 1_024 else {
-            throw ProcedureArtifactStoreError.corruptInvocationLedger
+        )[.size] as? NSNumber else {
+            throw ToolFailureError("Procedure invocation ledger has no readable byte count", effects: .none, owner: path.path)
         }
-        let (rows, report) = try await persistence.readJSONLReporting(path)
+        guard size.int64Value <= 8 * 1_024 * 1_024 else {
+            throw ToolFailureError("Procedure invocation ledger exceeds 8 MiB (\(size.int64Value) bytes)", effects: .none, owner: path.path)
+        }
+        let (rows, report) = try await SwiftNativePersistenceCore.readJSONLReporting(path)
         guard report.isClean, report.physicalLineCount <= 10_000 else {
-            throw ProcedureArtifactStoreError.corruptInvocationLedger
+            throw ToolFailureError("Procedure invocation ledger contains \(report.malformedLineCount) malformed JSON rows across \(report.physicalLineCount) physical lines (limit 10,000)", effects: .none, owner: path.path)
         }
-        return try rows.compactMap { row in
+        return try rows.enumerated().compactMap { index, row in
             guard let receipt = Self.invocationReceipt(row) else {
-                throw ProcedureArtifactStoreError.corruptInvocationLedger
+                throw ToolFailureError("Procedure invocation ledger record \(index + 1) is not a valid invocation receipt", effects: .none, owner: path.path)
             }
             return artifactID == nil || receipt.artifactID == artifactID ? receipt : nil
         }
     }
 
-    @discardableResult
-    public func invokeManual(
-        artifactID: String,
-        opaqueInputReference: String,
-        context: ProcedureDryRunContext,
-        executor: any ProcedureCanonicalExecuting
-    ) async throws -> ProcedureInvocationReceipt {
-        try await invoke(
-            artifactID: artifactID,
-            opaqueInputReference: opaqueInputReference,
-            context: context,
-            selection: .manual,
-            executor: executor
-        )
-    }
-
-    /// Admission for an exact typed operation after a separate immutable local
-    /// activation. The active pointer and implementation identity are reread
-    /// here, inside the procedure owner, immediately before canonical dispatch.
-    @discardableResult
-    public func invokeAutomaticExact(
-        procedureID: String,
-        implementationIdentity: String,
-        expectedArtifactID: String,
-        opaqueInputReference: String,
-        context: ProcedureDryRunContext,
-        executor: any ProcedureCanonicalExecuting
-    ) async throws -> ProcedureInvocationReceipt {
-        let pointerPath = exactActivationPointerPath(procedureID)
-        let invocationPath = root.appendingPathComponent("invocations.jsonl")
-        // Always take the shared retention/reference lock before the pointer
-        // lock, as activation does. Admission and dispatch retain both.
-        return try await persistence.withFileLock(invocationPath) {
-            try await persistence.withFileLock(pointerPath) {
-                let active = try await loadActiveExactProcedure(
-                    procedureID: procedureID,
-                    implementationIdentity: implementationIdentity
-                )
-                guard active.artifact.id == expectedArtifactID else {
-                    throw ProcedureExactActivationError.activationBindingMismatch
-                }
-                return try await invoke(
-                    artifactID: expectedArtifactID,
-                    opaqueInputReference: opaqueInputReference,
-                    context: context,
-                    selection: .automaticExact(active.manifest),
-                    executor: executor
-                )
-            }
-        }
-    }
-
-    private enum InvocationSelection: Sendable {
-        case manual
-        case automaticExact(ProcedureExactActivationManifest)
-
-        var automatic: Bool {
-            if case .automaticExact = self { return true }
-            return false
-        }
-
-        var activationID: String? {
-            if case .automaticExact(let manifest) = self { return manifest.id }
-            return nil
-        }
-
-        var procedureID: String? {
-            if case .automaticExact(let manifest) = self {
-                return manifest.proposal.procedureID
-            }
-            return nil
-        }
-
-        var mode: String? { automatic ? "exact_typed" : nil }
-    }
-
-    private func invoke(
-        artifactID: String,
-        opaqueInputReference: String,
-        context: ProcedureDryRunContext,
-        selection: InvocationSelection,
-        executor: any ProcedureCanonicalExecuting
-    ) async throws -> ProcedureInvocationReceipt {
-        guard Self.digest(opaqueInputReference) else {
-            throw ProcedureArtifactStoreError.invalidInputReference
-        }
-        let artifact = try await loadForInvocation(artifactID)
-        guard artifact.domain == "workshop_execution",
-              artifact.authorityClass == "low_risk" else {
-            throw ProcedureArtifactStoreError.invocationNotEligible
-        }
-        let dry = ProcedureReplayEngine.dryRun(artifact, context: context)
-        let requestedAt = Self.iso8601(clock())
-        // Stable across retries and store instances. A crash after dispatch but
-        // before receipt persistence must replay the same domain idempotency key.
-        let invocationID = CausalTransitionEvidence.opaqueIdentity(
-            "\(artifactID)|\(opaqueInputReference)|\(context.nextRuleIndex)"
-        )
-        let invocationPath = root.appendingPathComponent("invocations.jsonl")
-        return try await persistence.withFileLock(invocationPath) {
-            // Re-read after exclusion is acquired: a sweep may have removed
-            // the artifact while this invocation was waiting for the ledger.
-            guard try await loadForInvocation(artifactID) == artifact else {
-                throw ProcedureArtifactStoreError.immutableConflict
-            }
-            if let existing = try await Self.existingReceipt(
-                invocationID: invocationID,
-                artifactID: artifact.id,
-                inputReference: opaqueInputReference,
-                expectedFallback: artifact.deterministicFallback,
-                path: invocationPath,
-                persistence: persistence
-            ) {
-                return existing
-            }
-            var execution: ProcedureCanonicalExecutionResult?
-            if (dry.status == .wouldAdvance || dry.status == .wouldComplete),
-               let rule = dry.proposedRule {
-                execution = try await executor.executeProcedureRule(
-                    artifact: artifact,
-                    rule: rule,
-                    opaqueInputReference: opaqueInputReference,
-                    invocationID: invocationID
-                )
-            }
-            let accepted: Bool
-            if let execution {
-                let exactVerification = execution.authorityRechecked
-                    && execution.canonicalEvidenceMatched
-                    && execution.verified
-                switch execution.status {
-                case .verifiedSuccess, .verifiedFailure, .cancelled:
-                    guard exactVerification else {
-                        throw ProcedureArtifactStoreError.invalidExecutionResult
-                    }
-                    accepted = true
-                case .abstained, .unverified:
-                    guard !execution.verified else {
-                        throw ProcedureArtifactStoreError.invalidExecutionResult
-                    }
-                    accepted = false
-                }
-            } else {
-                accepted = false
-            }
-            let receipt = ProcedureInvocationReceipt(
-                schema: ProcedureInvocationReceipt.schema,
-                invocationID: invocationID,
-                artifactID: artifact.id,
-                opaqueInputReference: opaqueInputReference,
-                requestedAt: requestedAt,
-                dryRunStatus: dry.status,
-                dryRunReason: dry.reason,
-                executorStatus: execution?.status,
-                authorityRechecked: execution?.authorityRechecked ?? false,
-                canonicalEvidenceMatched: execution?.canonicalEvidenceMatched ?? false,
-                verified: accepted,
-                fallback: dry.fallback,
-                dispatched: execution != nil,
-                payloadFree: true,
-                permissionAuthority: false,
-                automaticSelection: selection.automatic,
-                activationID: selection.activationID,
-                procedureID: selection.procedureID,
-                selectionMode: selection.mode
-            )
-            // No `trimWhenBytesExceed` soft trigger here: a receipt row is well
-            // under 1KiB, so 10_000 rows is ~6-7MB — an 8MiB trigger would
-            // short-circuit the cap on every append, while `loadInvocationReceipts`
-            // throws `corruptInvocationLedger` the moment the ledger passes 10_000
-            // rows. The byte trigger made the cap unreachable and bricked the store
-            // instead. The exact newest-10_000 invariant must hold after EVERY
-            // append; `enforceJSONLLineCap`'s `size < maxLines` lower bound still
-            // keeps small ledgers O(1).
-            try await appendJSONLCapped(
-                try JSONValue.parse(JSONEncoder().encode(receipt)),
-                to: invocationPath,
-                using: persistence,
-                maxLines: 10_000,
-                logLabel: "ProcedureArtifactStore",
-                takeLock: false
-            )
-            return receipt
-        }
-    }
-
-    /// Best-effort installed-artifact GC (audit 2026-07-21). Removes DECODABLE,
-    /// VALID artifacts that neither an active pointer references NOR a recent
-    /// invocation receipt names, once they are older than `artifactRetentionAge`;
-    /// if the store is still above `artifactRetentionTarget`, the oldest such
-    /// unreferenced artifacts go next.
-    /// Never deletes a file it cannot decode (fail-closed damage evidence
-    /// stays put), never deletes a pointer-referenced artifact, and aborts
-    /// entirely if any active pointer is undecodable (its artifactID is then
-    /// unknowable, so nothing is provably safe to delete). Never throws — a GC
-    /// failure must not break install or discovery. Returns the confirmed removals.
-    ///
-    /// Round-3 audit (F3-M2): manual-invocable artifacts are loaded by
-    /// `invoke()`/`invokeManual()` by artifactID with NO active pointer — the
-    /// active/ directory only tracks exact automatic activations. Keying the
-    /// referenced set on pointers alone therefore counted an in-active-use
-    /// manual artifact as unreferenced and deleted it once its file mtime aged
-    /// out (load/invoke never touch mtime). Fix: also treat any artifact whose
-    /// invocation ledger carries a receipt younger than `artifactRetentionAge`
-    /// as referenced. Genuinely-abandoned manual artifacts (no recent receipt)
-    /// stay collectable. The ledger read is fail-safe: an unreadable, oversized,
-    /// or undecodable ledger aborts the sweep, exactly like an undecodable
-    /// pointer — a recent receipt we cannot parse might name an artifact we are
-    /// about to delete.
-    /// One root-scoped, engine-owned flight; a request during a pass earns
-    /// one more pass, including requests from another store instance.
-    func requestRetentionSweep() async {
-        let dataRoot = root.deletingLastPathComponent().deletingLastPathComponent()
-        await Self.retention.request(self, key: Self.retentionKey(dataRoot))
-    }
-
-    @discardableResult
-    public nonisolated func sweepUnreferencedArtifacts(now: Date = Date()) async -> Int {
-        let invocationPath = root.appendingPathComponent("invocations.jsonl")
-        do {
-            return try await persistence.withFileLock(invocationPath) {
-                await sweepUnreferencedArtifactsWithReferencesLocked(now: now)
-            }
-        } catch {
-            nativeLog("ProcedureArtifactStore: retention sweep could not acquire reference lock: %@",
-                      error.localizedDescription)
-            return 0
-        }
-    }
-
-    // The same ledger lock excludes activation publication and invocation
-    // references across this entire eligibility snapshot and deletion pass,
-    // including across store instances. Actor isolation alone cannot do that.
-    private nonisolated func sweepUnreferencedArtifactsWithReferencesLocked(now: Date) async -> Int {
-        guard !Task.isCancelled else { return 0 }
-        let fm = FileManager.default
-        let artifactsDirectory = root.appendingPathComponent("artifacts", isDirectory: true)
-        guard let urls = try? fm.contentsOfDirectory(
-            at: artifactsDirectory,
-            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey, .isSymbolicLinkKey],
-            options: [.skipsHiddenFiles]
-        ).filter({ $0.pathExtension == "json" }) else { return 0 }
-
-        let cutoff = now.addingTimeInterval(-Self.artifactRetentionAge)
-
-        // Referenced set: artifactIDs named by the active pointers. An
-        // undecodable pointer aborts the sweep (fail-safe).
-        var referenced = Set<String>()
-        let activeDirectory = root.appendingPathComponent("active", isDirectory: true)
-        let pointerURLs: [URL]
-        do {
-            pointerURLs = try fm.contentsOfDirectory(
-                at: activeDirectory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
-            )
-        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            pointerURLs = []
-        } catch {
-            return 0
-        }
-        for url in pointerURLs where url.pathExtension == "json" {
-            guard let data = try? Data(contentsOf: url),
-                  let pointer = try? JSONDecoder().decode(
-                      ProcedureExactActivationPointer.self, from: data
-                  ),
-                  pointer.validates else { return 0 }
-            referenced.insert(pointer.artifactID)
-        }
-
-        // Recency-referenced set (F3-M2): manual invocations leave no pointer,
-        // so any artifact with an invocation receipt younger than the retention
-        // age is treated as in active use. Read synchronously and fail-safe —
-        // an unreadable or undecodable ledger aborts the sweep (a recent
-        // receipt we cannot parse might name an artifact we are about to
-        // delete). An OVERSIZED ledger does NOT abort (gpt-5.5 review, round
-        // 3: abort-on-size made GC permanently nonfunctional once the file
-        // crossed the cap): the ledger is append-only, so the newest receipts
-        // — the only ones that can beat `cutoff` — live at the END. Read the
-        // newest 8 MiB tail, drop the partial first line, and decode the rest.
-        // An in-retention receipt buried under >8 MiB of newer traffic loses
-        // only its recency protection (pointer + mtime retention still apply);
-        // that narrow edge is strictly better than GC-off-forever.
-        let invocationPath = root.appendingPathComponent("invocations.jsonl")
-        if fm.fileExists(atPath: invocationPath.path) {
-            let tailCap = 8 * 1_024 * 1_024
-            guard let size = (try? fm.attributesOfItem(
-                atPath: invocationPath.path
-            )[.size]) as? NSNumber,
-                  var data = try? Self.readNewestTail(
-                      of: invocationPath, fileSize: size.intValue, maxBytes: tailCap
-                  ) else { return 0 }
-            if size.intValue > tailCap,
-               let firstNewline = data.firstIndex(of: UInt8(ascii: "\n")) {
-                // Tail starts mid-line: drop the partial first record.
-                data = data[data.index(after: firstNewline)...]
-            }
-            let decoder = JSONDecoder()
-            for line in data.split(separator: UInt8(ascii: "\n")) where !line.isEmpty {
-                // Skip an undecodable receipt line rather than abandoning the
-                // whole sweep: bailing here let ONE bad line permanently disable
-                // the GC, which walks the store into the 1024-artifact cap and
-                // fails installs closed. A line we cannot read simply protects
-                // no artifact; every readable line still does.
-                guard let receipt = try? decoder.decode(
-                    ProcedureInvocationReceipt.self, from: Data(line)
-                ) else { continue }
-                if let requested = Self.parsedTimestamp(receipt.requestedAt),
-                   requested >= cutoff {
-                    referenced.insert(receipt.artifactID)
-                }
-            }
-        }
-
-        struct Candidate {
-            let url: URL
-            let modified: Date
-        }
-        var candidates: [Candidate] = []
-        for url in urls {
-            guard !Task.isCancelled else { return 0 }
-            let id = url.deletingPathExtension().lastPathComponent
-            guard !referenced.contains(id),
-                  let values = try? url.resourceValues(
-                      forKeys: [.contentModificationDateKey, .isRegularFileKey, .isSymbolicLinkKey]
-                  ),
-                  values.isRegularFile == true,
-                  values.isSymbolicLink != true,
-                  let data = try? Data(contentsOf: url),
-                  data.count <= 2 * 1_024 * 1_024,
-                  let artifact = try? JSONDecoder().decode(
-                      DeclarativeProcedureArtifact.self, from: data
-                  ),
-                  Self.valid(artifact),
-                  !artifact.requiresLegacyRevalidation || legacyRevalidationMatches(artifact),
-                  artifact.id == id else { continue }
-            candidates.append(Candidate(
-                url: url, modified: values.contentModificationDate ?? now
-            ))
-        }
-        candidates.sort { $0.modified < $1.modified }
-        var removed = 0
-        var remaining = urls.count
-        var failures: [String] = []
-        for candidate in candidates {
-            if Task.isCancelled { break }
-            // Oldest-first: once a candidate is neither aged out nor needed
-            // for the target, no later (newer) candidate is either.
-            guard candidate.modified < cutoff || remaining > Self.artifactRetentionTarget else { break }
-            // Counts follow effects: a file still present is neither removed
-            // nor off the retention bound.
-            do {
-                try fm.removeItem(at: candidate.url)
-                removed += 1
-                remaining -= 1
-            } catch {
-                failures.append("\(candidate.url.lastPathComponent): \(error.localizedDescription)")
-            }
-        }
-        if removed > 0 {
-            nativeLog("ProcedureArtifactStore: retention sweep removed %d unreferenced artifact(s)", removed)
-        }
-        if !failures.isEmpty {
-            nativeLog("ProcedureArtifactStore: retention sweep could not remove %d artifact(s): %@",
-                      failures.count, failures.joined(separator: "; "))
-        }
-        let reapedLocks = await reapOrphanArtifactLocks(in: artifactsDirectory, cutoff: cutoff)
-        if reapedLocks > 0 {
-            nativeLog("ProcedureArtifactStore: retention sweep removed %d orphan lock sidecar(s)", reapedLocks)
-        }
-        return removed
-    }
-
-    /// Remove `<artifacts>/<id>.json.lock` sidecars whose `<id>.json` is gone
-    /// (L1, 2026-08-01 audit). `install()` wraps its write in
-    /// `persistence.withFileLock(artifactPath)`, which O_CREATs that sidecar —
-    /// and NOTHING ever removed it, so the directory accumulated one dead lock
-    /// per swept or hand-deleted artifact forever. `loadInstalledArtifacts`
-    /// filters on `pathExtension == "json"`, so the orphans never tripped the
-    /// capacity ceiling; they just grew, invisibly, which is exactly the shape
-    /// `TurnTraceRetention` already fixed for the turn-trace feed. This is that
-    /// second pass, keyed on the artifact instead of the date.
-    ///
-    /// Unlinking a lock file is only sound under TWO protections:
-    /// 1. The unlink happens while HOLDING `withFileLock(artifact)` — i.e. an
-    ///    exclusive flock on that very sidecar. An in-flight `install()` for
-    ///    the same id either finishes first (then the artifact exists and the
-    ///    re-check skips) or waits for us; it can never be mid-critical-section
-    ///    while we unlink. Without this, a sweep could unlink the lock an
-    ///    active install re-opened, splitting mutual exclusion across two
-    ///    inodes (gpt-5.5 review BLOCKING — the mtime gate alone fails for an
-    ///    old orphan a NEW install just re-opened: mtime is old, install live).
-    /// 2. `withFileLock` validates its fd's inode against whatever is at
-    ///    `lockPath` AFTER flock succeeds and retries on a mismatch
-    ///    (PersistenceCore+FileLock.swift:19-74, added 2026-07-25 for exactly
-    ///    this sweep) — so a waiter that lost its lock file to us re-opens the
-    ///    fresh one instead of proceeding on a deleted inode.
-    /// The aged-mtime pre-filter remains as a cheap candidate gate; both gates
-    /// are re-checked inside the lock before the unlink.
-    private nonisolated func reapOrphanArtifactLocks(in directory: URL, cutoff: Date) async -> Int {
-        let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey, .isSymbolicLinkKey],
-            options: [.skipsHiddenFiles]
-        ) else { return 0 }
-        var reaped = 0
-        for entry in entries where entry.lastPathComponent.hasSuffix(".json.lock") {
-            let artifact = entry.deletingPathExtension()   // drop ".lock"
-            // Cheap pre-filter outside the lock; both gates re-checked inside.
-            guard !fm.fileExists(atPath: artifact.path) else { continue }
-            guard Self.lockSidecarIsAgedOrphan(entry, cutoff: cutoff) else { continue }
-            let didReap = (try? await persistence.withFileLock(artifact) { () -> Bool in
-                // Holding the sidecar's flock: no install is mid-write for
-                // this id. Re-check both gates — the world may have moved
-                // while we waited for the lock.
-                guard !FileManager.default.fileExists(atPath: artifact.path) else { return false }
-                guard Self.lockSidecarIsAgedOrphan(entry, cutoff: cutoff) else { return false }
-                return (try? FileManager.default.removeItem(at: entry)) != nil
-            }) ?? false
-            if didReap { reaped += 1 }
-        }
-        return reaped
-    }
-
-    private static func lockSidecarIsAgedOrphan(_ entry: URL, cutoff: Date) -> Bool {
-        // Fresh URL so the stat can never be satisfied from cached resource
-        // values — the in-lock re-check must see the current file.
-        let fresh = URL(fileURLWithPath: entry.path)
-        guard let values = try? fresh.resourceValues(
-                  forKeys: [.contentModificationDateKey, .isRegularFileKey, .isSymbolicLinkKey]
-              ),
-              values.isRegularFile == true,
-              values.isSymbolicLink != true,
-              let modified = values.contentModificationDate else { return false }
-        return modified < cutoff
-    }
-
-    private func artifactPath(_ id: String) -> URL {
+    internal func artifactPath(_ id: String) -> URL {
         root.appendingPathComponent("artifacts", isDirectory: true)
             .appendingPathComponent("\(id).json")
     }
 
-    private static func valid(_ value: DeclarativeProcedureArtifact) -> Bool {
-        guard let expectedDomain = ProcedureDomainContract.named(value.domain) else { return false }
-        let allowedEffects = Set(value.inputContract.allowedExternalEffectClasses)
-        let expectedPreconditions = Set([
-            "authority_class_matches",
-            "canonical_executor_available",
-            "domain_state_matches",
-            "input_schema_matches",
-        ])
-        let expectedRechecks: [ProcedureSafetyRecheckPoint] = [
-            .beforeInvocation, .beforeEveryAction, .afterEveryCheckpoint,
-        ]
-        let validAuthority = value.authorityClass == "low_risk"
-            || value.authorityClass == "confirm_required"
-        let validApprovalOwner = value.authorityClass == "confirm_required"
-            ? value.safety.canonicalApprovalOwner == "approval_inbox"
-            : value.safety.canonicalApprovalOwner == nil
-        let validRules = value.transitionTable.enumerated().allSatisfy { index, rule in
-            index == rule.sequence
-                && token(rule.onTransitionKind, maximum: 64)
-                && token(rule.beforeState, maximum: 64, optional: true)
-                && token(rule.afterState, maximum: 64, optional: true)
-                && token(rule.actionKind, maximum: 64, optional: true)
-                && token(rule.requiredEvidenceKind, maximum: 64, optional: true)
-                && token(rule.expectedNextEvidence, maximum: 64, optional: true)
-                && token(rule.checkpointClass, maximum: 64, optional: true)
-                && token(rule.verificationClass, maximum: 64, optional: true)
-                && allowedEffects.contains(rule.externalEffectClass)
-                && token(rule.externalEffectClass, maximum: 64)
-                && rule.externalEffectClass != "external_send"
-                && rule.externalEffectClass != "unknown"
-                && (rule.terminalClass == nil || index == value.transitionTable.count - 1)
-        }
-        let terminalCount = value.transitionTable.filter { $0.terminalClass != nil }.count
-        let expectedAbandonConditions = Set(ProcedureCandidateCompiler.deterministicAbandonConditions)
-        return (value.schema == DeclarativeProcedureArtifact.schema
-                || value.schema == DeclarativeProcedureArtifact.legacySchema)
-            && digest(value.id)
-            && compilerIdentityMatches(value)
-            && digest(value.procedureShapeIdentity)
-            && !value.sourceTrajectoryIdentities.isEmpty
-            && value.sourceTrajectoryIdentities.count <= 64
-            && value.sourceTrajectoryIdentities.allSatisfy(digest)
-            && Set(value.sourceTrajectoryIdentities).count == value.sourceTrajectoryIdentities.count
-            && value.sourceTrajectoryIdentities == value.sourceTrajectoryIdentities.sorted()
-            && value.interpretation == "trusted_declarative_transition_table_v1"
-            && token(value.domain, maximum: 64)
-            && token(value.inputContract.taskFamily, maximum: 128)
-            && token(value.inputContract.inputClass, maximum: 128)
-            && token(value.inputContract.parameterSchemaClass, maximum: 128)
-            && !value.inputContract.acceptedParameterSchemaIdentities.isEmpty
-            && value.inputContract.acceptedParameterSchemaIdentities.count <= 64
-            && value.inputContract.acceptedParameterSchemaIdentities.allSatisfy(digest)
-            && Set(value.inputContract.acceptedParameterSchemaIdentities).count
-                == value.inputContract.acceptedParameterSchemaIdentities.count
-            && value.inputContract.acceptedParameterSchemaIdentities
-                == value.inputContract.acceptedParameterSchemaIdentities.sorted()
-            && !allowedEffects.isEmpty
-            && allowedEffects.count == value.inputContract.allowedExternalEffectClasses.count
-            && allowedEffects.allSatisfy { token($0, maximum: 64) }
-            && value.inputContract.allowedExternalEffectClasses
-                == value.inputContract.allowedExternalEffectClasses.sorted()
-            && !allowedEffects.contains("external_send")
-            && !allowedEffects.contains("unknown")
-            && validAuthority
-            && validApprovalOwner
-            && value.canonicalOracle == expectedDomain.oracle
-            && value.deterministicFallback == expectedDomain.fallback
-            && value.safety.trustCenterCapability == expectedDomain.capability
-            && Set(value.safety.requiredPreconditions) == expectedPreconditions
-            && value.safety.requiredPreconditions.count == expectedPreconditions.count
-            && value.safety.recheckPoints == expectedRechecks
-            && digest(value.reviewerDecision.reviewerIdentity)
-            && digest(value.reviewerDecision.approvalReceiptIdentity)
-            && digest(value.reviewerDecision.candidateEvidenceDigest)
-            && value.reviewerDecision.candidateShapeIdentity == value.procedureShapeIdentity
-            && value.reviewerDecision.verdict == .approve
-            && validTimestamp(value.reviewerDecision.decidedAt)
-            && (!value.canaryEligible || value.reviewerDecision.scope == .manualAndCanary)
-            && value.manualInvocationEligible
-            && !value.automaticSelectionEligible
-            && !value.generatedExecutableCode
-            && !value.safety.externalSendsEligible
-            && !value.safety.permissionAuthority
-            && !value.safety.automaticActivationAllowed
-            && Set(value.deterministicAbandonConditions) == expectedAbandonConditions
-            && value.deterministicAbandonConditions.count == expectedAbandonConditions.count
-            && (3...ProcedureTrajectoryExtractor.maximumSteps).contains(value.transitionTable.count)
-            && validRules
-            && terminalCount == 1
-            && !value.inputContract.allowedExternalEffectClasses.contains("external_send")
-            && value.rollbackDeclaration == "delete_artifact_restore_fallback_no_data_migration"
-    }
-
-    /// Verify the versioned compiler identity. Original v1 fingerprints admit
-    /// discovery only; execution also requires a full-digest revalidation receipt.
-    private static func compilerIdentityMatches(_ value: DeclarativeProcedureArtifact) -> Bool {
-        guard let identity = try? value.canonicalIdentity() else { return false }
-        switch value.schema {
-        case DeclarativeProcedureArtifact.schema:
-            return value.id == identity
-        case DeclarativeProcedureArtifact.legacySchema:
-            // Full-digest v1 artifacts were produced before the schema bump.
-            return value.id == identity || value.id == value.legacyIdentity()
-        default:
-            return false
-        }
-    }
-
-    private static func digest(_ raw: String) -> Bool {
-        raw.count == 64 && raw.allSatisfy { $0.isHexDigit && !$0.isUppercase }
-    }
-
-    private static func token(_ raw: String, maximum: Int) -> Bool {
-        token(Optional(raw), maximum: maximum, optional: false)
-    }
-
-    private static func token(_ raw: String?, maximum: Int, optional: Bool) -> Bool {
-        guard let raw else { return optional }
-        guard !raw.isEmpty, raw.count <= maximum else { return false }
-        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._:"))
-        return raw.unicodeScalars.allSatisfy { allowed.contains($0) }
-    }
-
-    /// Newest-`maxBytes` tail of an append-only file (whole file when it fits).
-    /// Throws on any I/O failure — the GC caller treats that as fail-safe abort.
-    private static func readNewestTail(
-        of url: URL, fileSize: Int, maxBytes: Int
-    ) throws -> Data {
-        if fileSize <= maxBytes {
-            return try Data(contentsOf: url)
-        }
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        try handle.seek(toOffset: UInt64(fileSize - maxBytes))
-        return try handle.read(upToCount: maxBytes) ?? Data()
-    }
-
-    private static func validTimestamp(_ raw: String) -> Bool {
-        parsedTimestamp(raw) != nil
-    }
-
-    private static func parsedTimestamp(_ raw: String) -> Date? {
-        NativeTimestampFormat.parseISO8601FractionalFirst(raw)
-    }
-
-    private static func invocationReceipt(_ row: JSONValue) -> ProcedureInvocationReceipt? {
-        guard let data = try? row.serializedData(pretty: false),
-              let receipt = try? JSONDecoder().decode(ProcedureInvocationReceipt.self, from: data),
-              receipt.schema == ProcedureInvocationReceipt.schema,
-              digest(receipt.invocationID), digest(receipt.artifactID), digest(receipt.opaqueInputReference),
-              validTimestamp(receipt.requestedAt),
-              receipt.payloadFree, !receipt.permissionAuthority,
-              validSelectionReceipt(receipt), validExecutionReceipt(receipt) else { return nil }
-        return receipt
-    }
-
-    private static func existingReceipt(
-        invocationID: String,
-        artifactID: String,
-        inputReference: String,
-        expectedFallback: ProcedureFallbackRoute,
-        path: URL,
-        persistence: any PersistenceCoreProtocol
-    ) async throws -> ProcedureInvocationReceipt? {
-        guard FileManager.default.fileExists(atPath: path.path) else { return nil }
-        guard let size = (try? FileManager.default.attributesOfItem(atPath: path.path)[.size]) as? NSNumber,
-              size.intValue <= 8 * 1_024 * 1_024 else {
-            throw ProcedureArtifactStoreError.corruptInvocationLedger
-        }
-        let rows: [JSONValue]
-        do {
-            let scan = try await persistence.readJSONLReporting(path)
-            guard scan.report.isClean, scan.report.physicalLineCount <= 10_000 else {
-                throw ProcedureArtifactStoreError.corruptInvocationLedger
-            }
-            rows = scan.rows
-        }
-        catch { throw ProcedureArtifactStoreError.corruptInvocationLedger }
-        guard rows.count <= 10_000 else {
-            throw ProcedureArtifactStoreError.corruptInvocationLedger
-        }
-        var existing: ProcedureInvocationReceipt?
-        for row in rows.reversed() {
-            guard let receipt = invocationReceipt(row) else {
-                throw ProcedureArtifactStoreError.corruptInvocationLedger
-            }
-            // Eligibility-only attempts are audit rows, not durable action
-            // claims. They must not block a later exact retry after TrustCenter
-            // or a canonical approval becomes available.
-            if receipt.invocationID == invocationID, receipt.dispatched {
-                guard receipt.artifactID == artifactID,
-                      receipt.opaqueInputReference == inputReference,
-                      receipt.fallback == expectedFallback else {
-                    throw ProcedureArtifactStoreError.corruptInvocationLedger
-                }
-                if existing == nil { existing = receipt }
-            }
-        }
-        return existing
-    }
-
-    private static func validExecutionReceipt(_ receipt: ProcedureInvocationReceipt) -> Bool {
-        guard receipt.dispatched == (receipt.executorStatus != nil) else { return false }
-        guard receipt.dispatched else {
-            return !receipt.authorityRechecked
-                && !receipt.canonicalEvidenceMatched
-                && !receipt.verified
-        }
-        switch receipt.executorStatus {
-        case .verifiedSuccess?, .verifiedFailure?, .cancelled?:
-            return receipt.authorityRechecked
-                && receipt.canonicalEvidenceMatched
-                && receipt.verified
-        case .abstained?, .unverified?:
-            return !receipt.verified
-        case nil:
-            return false
-        }
-    }
-
-    private static func validSelectionReceipt(_ receipt: ProcedureInvocationReceipt) -> Bool {
-        if receipt.automaticSelection {
-            guard let activationID = receipt.activationID,
-                  let procedureID = receipt.procedureID,
-                  receipt.selectionMode == "exact_typed",
-                  digest(activationID),
-                  token(procedureID, maximum: 80) else { return false }
-            return true
-        }
-        return receipt.activationID == nil
-            && receipt.procedureID == nil
-            && receipt.selectionMode == nil
-    }
-
-    private static func iso8601(_ date: Date) -> String {
-        NativeTimestampFormat.fractionalZulu(date)
-    }
 }

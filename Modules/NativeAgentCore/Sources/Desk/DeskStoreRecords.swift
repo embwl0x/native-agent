@@ -1,3 +1,4 @@
+import NativeAgentShared
 import Darwin
 import Foundation
 import PersistenceCore
@@ -15,16 +16,14 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     case archiveRefusedNonTerminalSelf(handle: String, status: DeskStatus)
     case archiveRefusedUnresolvedContinuation(handle: String)
     case queueCreationRequiresQueuePath
-    // Pursuit invariants (H2 / M7).
+    // Pursuit invariants.
     case pursuitCapReached(openCount: Int)
     case pursuitFieldMissing(reason: String)
     case pursuitDossierInvalid(reason: String)
     case genericPathCannotCreateAgent(handle: String)
     case notAPursuit(handle: String)
     case vetoRefusedTerminal(handle: String, status: DeskStatus)
-    /// 2026-09-06: closing an item that is ALREADY terminal silently replaced
-    /// its outcome — a `canceled` became `done`, and the recorded summary and
-    /// closedAt were overwritten by whichever writer arrived last.
+    /// Terminal outcomes, summaries and closure timestamps cannot be overwritten.
     case closeRefusedTerminal(handle: String, status: DeskStatus)
     case workSessionCapReached(scope: String, limit: Int, handle: String)
     case unknownReservation(reservationId: String, handle: String)
@@ -43,11 +42,7 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
     /// the tail alone would silently blank every compacted item, so reads FAIL
     /// LOUD instead (fail-loud over fail-over).
     case compactionBaseCorrupt(path: String)
-    /// The compaction base exists but its BYTES could not be read (transient IO:
-    /// EMFILE burst, a not-yet-materialized iCloud dataless file). Distinct from
-    /// compactionBaseCorrupt so a retryable IO error is never laundered into a
-    /// permanent corruption verdict that bricks every read AND write
-    /// (2026-07-31 sweep wave 2; same fix landed in TaskLedger/GitHubCommand).
+    /// Unreadable bytes remain a retryable I/O error, distinct from a corrupt compaction base.
     case compactionBaseUnreadable(path: String)
 
     public var errorDescription: String? {
@@ -96,7 +91,7 @@ public enum DeskError: Error, LocalizedError, Sendable, Equatable {
         case let .reservationAlreadyComplete(reservationId, handle):
             return "desk: reservation \(reservationId) on \(handle) is already complete; a slot completes once"
         case .workReservationNotReady(let handle):
-            return "desk: cannot reserve work on \(handle); resolve its or its ancestor's blockers, owner input, or deferral first"
+            return "desk: cannot reserve work on \(handle); inspect its pursuit lifetime and resolve its or its ancestor's blockers, owner input, or deferral first"
         case let .blockedOnUnknown(handle, blocker):
             return "desk: cannot block \(handle) on '\(blocker)' — no live item with that handle; blockers point at ITEMS, not prose"
         case .blockedOnSelf(let handle):
@@ -176,44 +171,11 @@ struct DeskCompactionBase: Sendable {
         ])
     }
 
-    /// STRICT decode — any malformed row fails the whole base, and the caller
-    /// throws rather than replaying from the tail alone. The ledger maps are
-    /// REQUIRED keys (the writer always emits them, even empty): a base
-    /// missing them would decode "valid" with empty ledgers and silently
-    /// reuse retired aliases / degrade reconcile repairs to `.watch`
-    /// (gpt-5.5 compaction review HIGH).
+    /// Compaction-base decode requires every row and ledger key; the tail cannot replace missing data.
     static func fromJSON(_ value: JSONValue) -> DeskCompactionBase? {
         guard case .object(let obj) = value,
               let stateVal = obj["state"], let state = DeskState.fromJSON(stateVal),
-              // ROUND-TRIP GATE. The shared decoders are deliberately tolerant
-              // (unknown ref kinds skipped, wrong-typed string arrays → []),
-              // which is right for forward-compat readers but wrong for the
-              // base — after the truncate this snapshot is the ONLY copy, so a
-              // tolerated-then-DROPPED field (a shrunken notify.on, a lost
-              // citation list, a future version's extra key) means the decode
-              // did NOT faithfully reproduce the snapshot → corrupt, fail loud.
-              //
-              // The gate is DECODE-STABILITY + SHAPE-PRESERVATION, not byte
-              // identity. Byte identity was wrong: the store's own MIGRATION
-              // vocabulary legitimately rewrites values on decode — the retired
-              // private origin raw value maps to `.agent` (DeskOrigin
-              // .decodePersisted) and re-encodes as "agent", and Pursuit's
-              // init clamps maxSessions/maxDays into range. A base carrying
-              // either failed the identity check, so fromJSON returned nil and
-              // readFeedUnlocked threw compactionBaseCorrupt — bricking EVERY
-              // desk read and write on launch with no degradation path.
-              // Normalization is not corruption; DROPPED DATA is. So:
-              //   1. re-encode, decode again, re-encode — the two encodings must
-              //      match, i.e. normalization applied once is a FIXED POINT
-              //      (a decoder that keeps changing its mind is not trustworthy
-              //      as the sole surviving copy);
-              //   2. the encoding must have the SAME SHAPE as the tree on disk
-              //      — same object key sets, same array counts, recursively.
-              // (2) is what preserves the fail-loud contract: a value the
-              // decoder normalizes in place (origin, a clamped bound) keeps the
-              // key and passes; anything the decoder cannot represent —
-              // an unknown extra field, a dropped ref, a collapsed notify.on —
-              // changes the shape and still fails loud.
+              // The sole surviving snapshot must decode stably and preserve all data outside named migrations.
               deskBaseRoundTripIsFaithful(decoded: state, onDisk: stateVal),
               case .string(let lastCompactedOpId)? = obj["lastCompactedOpId"],
               !lastCompactedOpId.isEmpty,
@@ -271,14 +233,7 @@ func deskBaseRoundTripIsFaithful(decoded state: DeskState, onDisk: JSONValue) ->
     return deskJSONShapeMatches(encoded, .object(original))
 }
 
-/// Recursive shape equality: same object key sets, same array counts, same
-/// scalar kinds. Scalar payloads are compared EXCEPT under the named migration
-/// keys — the only places the decoder legitimately rewrites a value in place
-/// (retired origin raw value → "agent"; Pursuit bounds clamped into range).
-/// Everything else must round-trip byte-faithful: without this allowlist, any
-/// unknown enum token that decodes to a default (a future notify.level, a
-/// future cadence.mode) would be silently rewritten in the only surviving
-/// base snapshot (gpt-5.5 wave review, 2026-07-31).
+/// Recursive equality preserves keys, array counts, scalar kinds and values except named scalar migrations.
 private let deskScalarMigrationKeys: Set<String> = ["origin", "maxSessions", "maxDays"]
 
 private func deskJSONShapeMatches(_ a: JSONValue, _ b: JSONValue, key: String? = nil) -> Bool {
@@ -315,12 +270,7 @@ struct DeskFeed: Sendable {
     /// truncate would erase exactly the rows we just skipped.
     var integrity: SnapshotTailOpLog.OpLogIntegrity = .clean
 
-    /// The number the compaction threshold is compared against: PHYSICAL rows
-    /// in `desk_ops.jsonl`, not decoded ops (gpt-5.5 review 2026-08-02, finding
-    /// 2). `fileOpCount` counts what `DeskOp.fromJSON` accepted, so a feed of
-    /// 100k rows written by a newer build plus 10 this one understands measured
-    /// as 10 — under the threshold, so compaction never ran, so `mayCompact`
-    /// never logged the refusal, so the unbounded growth was invisible.
+    /// Compaction thresholds count physical `desk_ops.jsonl` rows, including undecodable ops.
     var compactionRowCount: Int { integrity.feedRowCount(decodedCount: fileOpCount) }
 
     /// Account for ops this writer just appended to the file under the flock.

@@ -134,7 +134,7 @@ extension SwiftToolDispatcher {
             return .object(fields)
         }
         do {
-            let result = try await SystemProcessAdapter().run(executable: node.path, arguments: [helper.path],
+            let result = try await ProcessExecution().run(executable: node.path, arguments: [helper.path],
                 currentDirectory: dataRoot, environment: environment, standardInput: bytes,
                 timeoutSeconds: 166, outputByteLimit: nil)
             let receipt = result.stdout.data(using: .utf8).flatMap { try? JSONDecoder().decode(JSONValue.self, from: $0) }
@@ -148,6 +148,16 @@ extension SwiftToolDispatcher {
                         "helper_receipt": receipt ?? .null])
             }
             return receipt
+        } catch let stopped as ProcessRunCancellation {
+            // Stop after launch: what the helper drained before it stopped stays with the receipt.
+            let result = stopped.result
+            return unconfirmed("dot_helper_cancelled", status: "cancelled",
+                evidence: ["process_error": .string(stopped.localizedDescription),
+                    "exit_code": .int(Int64(result.exitCode)), "timed_out": .bool(result.timedOut),
+                    "stdout_tail": .string(String(result.stdout.suffix(2000))),
+                    "stdout_tail_truncated": .bool(result.stdoutTruncated || result.stdout.count > 2000),
+                    "stderr_tail": .string(String(result.stderr.suffix(1000))),
+                    "stderr_tail_truncated": .bool(result.stderrTruncated || result.stderr.count > 1000)])
         } catch {
             return unconfirmed(error is CancellationError ? "dot_helper_cancelled" : "dot_helper_process_failed", status: error is CancellationError ? "cancelled" : "outcome_unknown",
                 evidence: ["process_error": .string(error.localizedDescription)])

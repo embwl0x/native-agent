@@ -1,3 +1,4 @@
+import NativeAgentShared
 import EngineRuntime
 import Connectors
 import ProviderRouting
@@ -6,8 +7,9 @@ import AppKit
 import TrustCenter
 import ChatToolRuntime
 import SlackBot
+import NativeAgentCore
 
-// Blueprint: | `ConnectorWizardView.swift` | `ConnectorWizardView` and state: existing connector setup routes, cancellable sign-in/save steps and truthful external-browser handoff outcomes |
+// Blueprint: | `ConnectorWizardView.swift` | `ConnectorWizardView` and state: existing connector setup routes, cancellable sign-in/save steps; successful Slack save reconciles the worker and connector projection through `settle` before canceled view updates stop; truthful external-browser handoff outcomes |
 
 // MARK: - Models
 
@@ -381,27 +383,6 @@ struct ConnectorWizardView: View {
         state.flowTask = Task { await work() }
     }
 
-    /// One line: what happened, and what to do. The service's own text can
-    /// echo a token, so it goes to the log only — through the same reason
-    /// classes the inline chat card uses.
-    private func failure(_ raw: String?, typed: [String] = [], fallback: String) -> String {
-        let reason = NativeOAuthFlow.inlineSetupFailureReason(
-            raw ?? "", service: displayName, typed: typed, otherwise: fallback)
-        if reason.hasPrefix("Couldn't reach") {
-            return "\(reason) Check your internet connection, then try again."
-        }
-        if reason.hasSuffix("rejected the token.") {
-            return "\(reason) Check it's pasted in full, then try again."
-        }
-        if reason.contains("missing a permission") {
-            return "\(reason) Add it in \(displayName), then try again."
-        }
-        if reason.contains("needs a valid allowed") {
-            return "\(reason) Check the IDs, then try again."
-        }
-        return reason
-    }
-
     private func showFirstStep() {
         state.step = .loading
         state.errorMessage = nil
@@ -433,20 +414,23 @@ struct ConnectorWizardView: View {
             requireMention: submittedMention,
             dataRoot: appModel.engine.dataRoot
         )
+        if result.ok {
+            await settle { @MainActor [appModel] in
+                _ = await NativeAgentEngine.restartBackgroundLoop(id: "slack_socket_mode")
+                _ = await appModel.refreshForSidebarItem(.connectors)
+            }
+        }
         guard !Task.isCancelled else { return }
         if result.ok {
-            await appModel.engine.connectors.refresh()
             if slackAllowedChannels == submittedChannels, slackAllowedUsers == submittedUsers,
                slackRequireMention == submittedMention { clearDraft() }
             slackToken = ""
             slackAppToken = ""
             state.step = .success
-            _ = await NativeAgentEngine.restartBackgroundLoop(id: "slack_socket_mode")
-            await appModel.refreshForSidebarItem(.connectors)
         } else {
-            state.errorMessage = failure(
-                result.error, typed: [slackToken, slackAppToken],
-                fallback: "Couldn't save the Slack settings. Go Back to check the tokens, then try again.")
+            state.errorMessage = NativeOAuthFlow.inlineSetupFailureReason(
+                result.error ?? "", service: displayName, typed: [slackToken, slackAppToken],
+                otherwise: "Couldn't save the Slack settings. Go Back to check the tokens, then try again.")
         }
     }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import NativeAgentCore
 // Blueprint: | `BotRunQueue.swift` | `BotRunQueue` struct; `enqueue`, `presence` |
 
 public struct BotRunReceipt: Sendable, Equatable {
@@ -105,12 +106,7 @@ public struct BotRunQueue: Sendable {
     // Serializes the short disk transaction and process-wide active claims.
     private final class Admission: @unchecked Sendable {
         let lock = NSLock()
-        var active: [String: [UUID: Int32]] = [:]
-        /// Waiters keyed by their own id so a cancelled one can be REMOVED and
-        /// resumed by its cancellation handler. An array could only ever be
-        /// drained by `finish`, which is exactly the claim a self-call is
-        /// waiting on.
-        var waiting: [String: [UUID: [UUID: CheckedContinuation<Bool, Never>]]] = [:]
+        var active: [String: [UUID: (descriptor: Int32, done: ScopedWaiter)]] = [:]
     }
 
     /// The bots whose runs are on this task's stack. Self-calls are refused
@@ -282,32 +278,12 @@ public struct BotRunQueue: Sendable {
                 guard Self.ancestry.isEmpty else {
                     throw StandingBotsError.invalidValue("This helper is already running. A running helper cannot wait for another active helper; continue without waiting.")
                 }
-                // Register under the same lock as finish; no missed wakeup and
-                // no polling timer. External processes still fail closed at flock.
-                let waiterID = UUID()
-                let waited = await withTaskCancellationHandler {
-                    await withCheckedContinuation { continuation in
-                        Self.admission.lock.lock()
-                        if !Task.isCancelled, Self.admission.active[rootKey]?[id] != nil {
-                            Self.admission.waiting[rootKey, default: [:]][id, default: [:]][waiterID] = continuation
-                            Self.admission.lock.unlock()
-                        } else {
-                            Self.admission.lock.unlock()
-                            continuation.resume(returning: false)
-                        }
-                    }
-                } onCancel: {
-                    // The deadline's only way out: take this waiter off the
-                    // list and resume it, since `finish` may never run.
-                    Self.admission.lock.lock()
-                    let continuation = Self.admission.waiting[rootKey]?[id]?.removeValue(forKey: waiterID)
-                    Self.admission.lock.unlock()
-                    continuation?.resume(returning: false)
-                }
-                if !waited {
+                // Select the execution under admission; finish may resolve it before parking.
+                guard let waiter = Self.admission.lock.withLock({ Self.admission.active[rootKey]?[id]?.done }) else {
                     try Task.checkCancellation()
                     return try claim(bot: id, requestID: requestID, manual: manual)
                 }
+                await waiter.park()
             }
         }
     }
@@ -362,7 +338,7 @@ public struct BotRunQueue: Sendable {
                   metadata.withUnsafeBytes({ Darwin.write(descriptor, $0.baseAddress, $0.count) }) == metadata.count else {
                 throw StandingBotsError.corruptStore("bot run claim metadata unavailable")
             }
-            Self.admission.active[rootKey, default: [:]][id] = descriptor
+            Self.admission.active[rootKey, default: [:]][id] = (descriptor, ScopedWaiter())
             retained = true
             return ClaimedRun(runID: admittedID, bot: bot, context: context, provenance: provenance)
         }
@@ -374,13 +350,12 @@ public struct BotRunQueue: Sendable {
             Self.admission.lock.unlock()
             NotificationCenter.default.post(name: Self.didChange, object: dataRoot)
         }
-        if let descriptor = Self.admission.active[rootKey]?.removeValue(forKey: id) { close(descriptor) }
+        let execution = Self.admission.active[rootKey]?.removeValue(forKey: id)
+        if let execution { close(execution.descriptor) }
         if Self.admission.active[rootKey]?.isEmpty == true {
             Self.admission.active.removeValue(forKey: rootKey)
         }
-        let waiting = Self.admission.waiting[rootKey]?.removeValue(forKey: id) ?? [:]
-        if Self.admission.waiting[rootKey]?.isEmpty == true { Self.admission.waiting.removeValue(forKey: rootKey) }
-        waiting.values.forEach { $0.resume(returning: true) }
+        execution?.done.resume()
     }
 
     /// One cross-process transaction before any effects. Existing unreadable

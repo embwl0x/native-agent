@@ -17,6 +17,7 @@ public enum MacIntegrationGates {
         "mac_calendar_delete_event": (MacIntegrationID.calendar, .write),
         "mac_reminders_list_due_today": (MacIntegrationID.reminders, .read),
         "mac_reminders_query": (MacIntegrationID.reminders, .read),
+        "mac_reminders_lists": (MacIntegrationID.reminders, .read),
         "mac_reminders_read": (MacIntegrationID.reminders, .read),
         "mac_reminders_update": (MacIntegrationID.reminders, .write),
         "mac_reminders_create": (MacIntegrationID.reminders, .write),
@@ -54,12 +55,7 @@ public enum MacIntegrationGates {
         "music_list_library": (MacIntegrationID.music, .read),
         "music_list_playlists": (MacIntegrationID.music, .read),
         "music_control": (MacIntegrationID.music, .write),
-        // Not in any preload pattern group, but the table doubles as the
-        // parallel-dispatch write veto (U1 step 6) — it must cover EVERY
-        // dispatchMacIntegrationTool case, not just preloadable ones
-        // (gpt-5.5 review, 2026-06-10: scheduler_list_jobs gates on .write
-        // — scheduler has no read axis — yet its "list" name walked the
-        // positive read-signal branch into the parallel set).
+        // The parallel write veto covers every dispatchMacIntegrationTool case.
         "mac_notify": (MacIntegrationID.notifyMac, .write),
         "mobile_notify": (MacIntegrationID.notifyMobile, .write),
         "phone_request": (MacIntegrationID.notifyMobile, .write),
@@ -68,7 +64,6 @@ public enum MacIntegrationGates {
         "scheduler_list_jobs": (MacIntegrationID.scheduler, .write),
         "scheduler_create_job": (MacIntegrationID.scheduler, .write),
         "scheduler_cancel_job": (MacIntegrationID.scheduler, .write),
-        "scheduler_delete_job": (MacIntegrationID.scheduler, .write),
         "scheduler_pause_job": (MacIntegrationID.scheduler, .write),
         "scheduler_resume_job": (MacIntegrationID.scheduler, .write),
         "scheduler_update_job": (MacIntegrationID.scheduler, .write),

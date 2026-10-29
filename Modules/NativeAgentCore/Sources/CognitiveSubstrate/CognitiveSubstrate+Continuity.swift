@@ -1,17 +1,7 @@
 // CognitiveSubstrate+Continuity.swift
-// Phase 5 B (2026-10-03) — two continuity cues that compete for the one felt
-// slot like every other cue. Neither is ever always-on.
-//
-// B1 DREAM RESIDUE. Last night's diary themes (her own phrases, embedded on
-// device by the wiring) surface only when THIS message is about one of them,
-// and only as a dream association. Agent: a dream can suggest an association;
-// it can never establish something User said or something she did. Nothing here
-// writes memory.
-//
-// B2 SINCE. The gap is measured on User's own turns across his doors (Mac,
-// phone, Telegram); a door switch is not a gap, and her wakes and peer threads
-// never open or close one. The line is built from what actually happened in
-// between, or it is not built at all.
+// Dream and gap cues compete for the one felt slot.
+// Dreams suggest associations without establishing facts or writing memory.
+// Gaps span User's own turns across surfaces; wakes and peer threads do not open or close them.
 
 import Foundation
 import NativeAgentCore
@@ -41,7 +31,6 @@ extension CognitiveSubstrate {
     /// A phrase surfaces once in its diary's life (the wiring retires a diary
     /// after 60 h; this outlives it).
     static let dreamThemeRepeatWindow: TimeInterval = 72 * 3_600
-    static let dreamThemeLedgerCapacity = 16
     /// "ok", "lol", "yes do it" have nothing for a dream to rhyme with.
     static let dreamThemeMinimumTerms = 2
 
@@ -73,7 +62,7 @@ extension CognitiveSubstrate {
         let themes = await dependencies.dreamThemes(request.userMessage, spent)
         unreadable += themes.unreadable
         let residues = themes.value
-        let live = capsulePresentationStateSnapshot().dreamThemeSurfaced
+        let live = capsulePresentationState.dreamThemeSurfaced
         guard !residues.isEmpty, Self.dreamThemeCadenceAllows(live, at: read.fixedAt) else { return nil }
         return residues
             .filter { !isSuppressed("dream:" + $0.id, messageTerms: terms) }
@@ -91,13 +80,6 @@ extension CognitiveSubstrate {
         let line = "- Dream: last night's dream kept circling \"\(text)\""
             + " (an association from a dream, not something that happened)"
         return line
-    }
-
-    static func boundDreamThemeLedger(_ ledger: inout [String: Date]) {
-        guard ledger.count > dreamThemeLedgerCapacity else { return }
-        for key in ledger.sorted(by: { $0.value < $1.value }).prefix(ledger.count - dreamThemeLedgerCapacity).map(\.key) {
-            ledger.removeValue(forKey: key)
-        }
     }
 
     // MARK: - B2 since we last talked
@@ -131,7 +113,6 @@ extension CognitiveSubstrate {
         unreadable: inout [String]
     ) async -> [String]? {
         guard read.configuration.enabled,
-              read.configuration.enabled,
               read.configuration.capsuleInjectionEnabled,
               request.mode == .inject,
               request.resolvedTurnKind == .live,
@@ -141,7 +122,10 @@ extension CognitiveSubstrate {
                 dynamics: read.personalityDynamics, at: read.fixedAt) else { return nil }
         let gap = await dependencies.sinceGap(opened, read.fixedAt, request.surface)
         unreadable += gap.unreadable
-        return gap.value
+        let moved = read.cares.flatMap(\.story)
+            .filter { $0.moved != 0 && !$0.note.isEmpty && $0.at > opened && $0.at <= read.fixedAt }
+            .max { $0.at < $1.at }
+        return (moved.map { ["a moment: \"\(capsuleLineText($0.note, maxCharacters: 90))\""] } ?? []) + gap.value
     }
 
     /// The receipt for a continuity source that could not be read: one line
@@ -151,9 +135,9 @@ extension CognitiveSubstrate {
     }
 
     static func sinceGapPhrase(_ elapsed: TimeInterval) -> String {
-        let hours = Int((elapsed / 3_600).rounded())
-        guard hours >= 36 else { return "\(hours) hours" }
-        let days = Int((elapsed / 86_400).rounded())
-        return days == 1 ? "a day" : "\(days) days"
+        let hours = (elapsed / 3_600).rounded() + 0
+        guard hours >= 36 else { return String(format: "%.0f hours", hours) }
+        let days = (elapsed / 86_400).rounded() + 0
+        return days == 1 ? "a day" : String(format: "%.0f days", days)
     }
 }

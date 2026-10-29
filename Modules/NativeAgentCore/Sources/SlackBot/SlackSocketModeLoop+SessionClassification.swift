@@ -1,44 +1,36 @@
 import Foundation
 import BackgroundLoops
-// Blueprint: | `SlackSocketModeLoop+SessionClassification.swift` | `SlackSocketModeLoop`: `classifySessionClosure`, `disconnectDisposition`, `classifyReceiveLoopReturn` |
+// Blueprint: | `SlackSocketModeLoop+SessionClassification.swift` | `SlackSocketModeLoop`: one closure classifier for receive return, disconnect and transport error; fatal disconnects outrank planned recycling |
 
 extension SlackSocketModeLoop {
     static func classifySessionClosure(
-        _ closure: SlackSocketSessionClosure,
+        _ error: Error?,
         sessionDuration: TimeInterval,
         recyclePlanned: Bool,
         recycleInterval: TimeInterval
     ) -> LoopTickOutcome {
-        // A planned recycle only claims the closure when the socket did not
-        // ALSO report a fatal condition. A `link_disabled`/`too_many_connections`
-        // disconnect racing the recycle timer must still fail the tick, or
-        // backoff is suppressed on a genuinely broken socket.
-        if recyclePlanned,
-           case .disconnect(let reason) = closure,
+        let closure = error as? SlackSocketSessionClosure
+        let rounded = Int(sessionDuration.rounded())
+        // Fatal disconnect evidence outranks planned recycling.
+        if case .disconnect(let reason)? = closure,
            disconnectDisposition(forReason: reason) == .fatal {
-            return .failed(
-                error: "Slack socket reported \(reason) during a planned recycle"
-            )
+            return .failed(error: recyclePlanned
+                ? "Slack socket reported \(reason) during a planned recycle"
+                : "Slack socket disconnected after \(rounded)s (\(reason))")
         }
         if recyclePlanned {
             return .completed(
                 result: "Slack socket session recycled after \(Int(recycleInterval))s"
             )
         }
-        switch closure {
-        case .disconnect(let reason):
-            let rounded = Int(sessionDuration.rounded())
-            let message = "Slack socket disconnected after \(rounded)s (\(reason))"
-            switch disconnectDisposition(forReason: reason) {
-            case .fatal:
-                return .failed(error: message)
-            case .routine:
-                guard sessionDuration < shortLivedSessionFloor else {
-                    return .completed(result: message)
-                }
-                return .failed(error: message)
-            }
+        if let error, closure == nil {
+            return .failed(error: Self.redact(String(describing: error)))
         }
+        let message: String
+        if case .disconnect(let reason)? = closure {
+            message = "Slack socket disconnected after \(rounded)s (\(reason))"
+        } else { message = "Slack socket receive loop ended after \(rounded)s" }
+        return sessionDuration < shortLivedSessionFloor ? .failed(error: message) : .completed(result: message)
     }
 
     /// Slack's `disconnect` reasons are not interchangeable. `link_disabled`
@@ -62,22 +54,4 @@ extension SlackSocketModeLoop {
         }
     }
 
-    /// A session whose receive loop returned with no `disconnect` frame. The
-    /// planned recycle stays success; anything shorter than the floor is churn.
-    static func classifyReceiveLoopReturn(
-        sessionDuration: TimeInterval,
-        recyclePlanned: Bool,
-        recycleInterval: TimeInterval
-    ) -> LoopTickOutcome {
-        if recyclePlanned {
-            return .completed(
-                result: "Slack socket session recycled after \(Int(recycleInterval))s"
-            )
-        }
-        let rounded = Int(sessionDuration.rounded())
-        guard sessionDuration >= shortLivedSessionFloor else {
-            return .failed(error: "Slack socket receive loop ended after \(rounded)s")
-        }
-        return .completed(result: "Slack socket receive loop ended after \(rounded)s")
-    }
 }

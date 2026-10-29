@@ -97,8 +97,8 @@ public enum ChatWrittenFileArtifacts {
         var budget = captureBudget
         for written in folders {
             guard budget > 0 else { note(written, "not listed: this turn's listing ran out of budget"); continue }
-            guard let folder = try? await policy.resolveTrustedFilePath(written), folder.path != own,
-                  !folder.path.hasPrefix(own + "/") else { continue }
+            guard let folder = try? await policy.resolveTrustedFilePath(written),
+                  NativeAgentWorkspaceRoot.relativePath(folder.path, under: own) == nil else { continue }
             budget -= 1
             // The folder admitted, listed through its verified descriptor: no
             // component, and no entry, is followed if it became a link.

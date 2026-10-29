@@ -1,4 +1,4 @@
-// Blueprint: | `RunKindVocabulary.swift` | `RunKindVocabulary.displayName`: shared safe display names for extensible run-kind wire values |
+// Blueprint: | `RunKindVocabulary.swift` | Shared safe display names and recognized symbols for extensible run-kind wire values; unknown symbols stay platform-owned |
 
 /// Human-facing vocabulary for the durable `RunRecord.kind` wire field.
 ///
@@ -10,6 +10,16 @@ public enum RunKindVocabulary {
     public enum Surface: Sendable {
         case mac
         case iOS
+    }
+
+    public static func symbol(_ kind: String) -> String? {
+        switch kind.lowercased() {
+        case "codex": return "terminal"
+        case "claude": return "sparkles"
+        case "swarm": return "circle.hexagongrid.fill"
+        case "mission": return "target"
+        default: return nil
+        }
     }
 
     public static func displayName(_ kind: String, on surface: Surface) -> String {

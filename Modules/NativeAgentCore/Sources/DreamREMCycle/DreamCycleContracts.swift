@@ -36,6 +36,8 @@ public struct DreamReport: Sendable, Equatable {
     /// Her cares as the committed dream was shown them, with its answer lines.
     public var careNight: CognitiveCareNight?
 
+    public var committed: Bool { entriesWritten > 0 && !disabled && errors.isEmpty }
+
     public init(
         sessionsProcessed: Int = 0,
         entriesWritten: Int = 0,
@@ -74,56 +76,11 @@ public typealias DreamMemoryDeltaProvider = @Sendable (_ since: Date) async thro
 /// `feltDaySummary(at:)`. It colors the dream's TONE — it never scripts content.
 public typealias DreamFeltSummaryProvider = @Sendable () async throws -> String?
 
-/// The PROVENANCE half of one felt node — subject + metadata, and nothing else.
-/// `DreamFeltSummaryProvider` says what the day felt like; this says where a
-/// feeling CAME FROM, which is the only thing the dream needs beyond the tone.
-///
-/// Desk 903 phase 2 (the studio journal on the cognitive bus) mints a felt node
-/// carrying its journal entry id in BOTH `subject.id` (with subject type
-/// `studio_entry`) and `metadata["studioEntryId"]` — see the DREAM-CITATION
-/// SEAM note in CognitiveSubstrate+StudioEvents.swift. Either alone is enough
-/// here, so a node minted by either half still cites.
-public struct DreamFeltOrigin: Sendable, Equatable {
-    /// The seam's subject type for a filed journal entry.
-    public static let studioEntrySubjectType = "studio_entry"
-    /// The seam's metadata key for the same id.
-    public static let studioEntryIDMetadataKey = "studioEntryId"
-
-    public var subjectType: String?
-    public var subjectID: String?
-    public var metadata: [String: String]
-
-    public init(
-        subjectType: String? = nil,
-        subjectID: String? = nil,
-        metadata: [String: String] = [:]
-    ) {
-        self.subjectType = subjectType
-        self.subjectID = subjectID
-        self.metadata = metadata
-    }
-
-    /// The journal entry this feeling came from, or nil when it came from
-    /// anywhere else. Nil is the common case and is not a gap.
-    public var studioEntryID: String? {
-        if let value = metadata[Self.studioEntryIDMetadataKey]?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
-            return value
-        }
-        if subjectType == Self.studioEntrySubjectType,
-           let value = subjectID?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !value.isEmpty {
-            return value
-        }
-        return nil
-    }
-}
-
 /// Provider for the felt nodes' provenance behind `DreamFeltSummaryProvider`'s
 /// text — the same last-24h felt population, subject/metadata only. Default is
 /// empty, so a dream with nothing wired cites nothing and reads exactly as it
 /// did before.
-public typealias DreamFeltOriginProvider = @Sendable () async throws -> [DreamFeltOrigin]
+public typealias DreamFeltOriginProvider = @Sendable () async throws -> [CognitiveFeltOrigin]
 
 /// Her cares for the dream prompt: what moved her today and what is still open,
 /// with the keys the dream may answer by. nil when the inner life is off.

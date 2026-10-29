@@ -6,6 +6,8 @@ struct SharedChatItem: Codable, Identifiable, Sendable {
     let createdAt: Date
     let text: String
     let attachments: [MultimodalAttachment]
+    /// The peer visible when the share was accepted, never assigned on import.
+    var pairingFingerprint: String? = nil
 }
 
 enum SharedChatInbox {
@@ -62,7 +64,7 @@ enum SharedChatInbox {
         }
         guard (!item.text.isEmpty || !item.attachments.isEmpty), item.text.utf8.count <= maxTextBytes,
               item.attachments.count <= maxItems,
-              item.attachments.reduce(0, { $0 + $1.byteSize }) <= MobileChatAttachmentPreparation.payloadBudgetBytes else {
+              item.attachments.allSatisfy({ $0.byteSize > 0 && $0.byteSize <= ChatAttachmentTypeResolver.fileByteLimit }) else {
             throw failure("This share is too large. Use less text or a smaller file.")
         }
         // The codec counts escaped JSON/base64 and the duplicated text field.

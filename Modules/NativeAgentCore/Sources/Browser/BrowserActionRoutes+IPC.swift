@@ -64,13 +64,14 @@ extension BrowserActionRoutes {
 
         switch path {
         case "/browser/navigate":
-            guard let urlStr = json["url"] as? String, let url = URL(string: urlStr) else {
+            guard let urlStr = json["url"] as? String else {
                 throw BrowserError.badRequest("url required")
             }
-            // C7 fix: reject non-http/https schemes so bearer-token holders
-            // cannot exfiltrate local files via file:// URLs.
-            let scheme = url.scheme?.lowercased() ?? ""
-            guard scheme == "http" || scheme == "https" else {
+            let parsed: ValidBrowserURL
+            do { parsed = try ValidBrowserURL(urlStr) }
+            catch let error as NSError where error.userInfo["url_parse_failed"] as? Bool == true { throw BrowserError.badRequest("url required") }
+            catch let error as NSError where error.userInfo["scheme"] is String {
+                let scheme = error.userInfo["scheme"] as! String
                 return ["ok": false, "error": "url_scheme_not_allowed",
                         "detail": "Only http and https URLs are permitted; got '\(scheme)://'"]
             }
@@ -85,7 +86,7 @@ extension BrowserActionRoutes {
             // runs still acquire exclusive browser ownership at the effect.
             let routes = BrowserActionRoutes(effects: effects)
             let run = try BrowserRun(row: try await routes.executeVisibleBrowserRun(
-                parsed: try routes.validBrowserURL(urlStr), runID: runID, approvalId: nil,
+                parsed: parsed, runID: runID, approvalId: nil,
                 captureSource: false, captureScreenshot: false))
             let receipt = (run.sourceReceipt.flatMap { try? $0.serializedData(pretty: false) })
                 .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]

@@ -1,69 +1,26 @@
 import Foundation
-// Blueprint: | `TurnSummaryRecord.swift` | `TurnSummaryRecord`, `TurnSummaryFile`, `TurnSummaryComputer`, `TurnSummarySource` |
+import NativeAgentShared
+// Blueprint: | `TurnSummaryRecord.swift` | `TurnSummaryComputer`, `TurnSummarySource`: Mac-owned Inspector privacy projection and byte budgets |
 
-// MARK: - Turn Inspector W4 — per-turn SUMMARY records for the iCloud snapshot lane
+// MARK: - Per-turn summaries for the iCloud snapshot lane
 //
 // The iOS read-only inspector does NOT receive the full per-event stream (size
 // budget — turn_traces files run to 20k rows/day). The engine's Inspector
 // projection supplies a compact summary PER TURN, and Mac sync writes a
 // single bounded `turn_summaries.json` into the iCloud snapshot dir. iOS decodes
-// it with its own lenient struct (it cannot import this target) and renders a
+// it through NativeAgentShared's lenient wire value and renders a
 // flat list of turn cards.
 //
-// PRIVACY (hard constraint): a summary carries ONLY numeric/count fields and the
-// kind strings — NEVER event payloads, args, results, prompt bodies, or any
-// content. Events are already redacted at emission (W1/W2); this lane goes
-// further and emits counts/metrics exclusively.
+// Phone summaries carry bounded identities, dates, metrics and allowlisted kind
+// counts; event payloads and content previews stay local (TurnTraceRedactor).
 //
-// The mapping reads the engine's already grouped `InspectorTurnCard`s, so
-// grouping / ordering / token+ttft summarization is not repeated. It only
-// projects each card down to the summary shape + computes the
-// cheap per-kind breakdown, then applies the size budget.
-
-// MARK: - TurnSummaryRecord
-
-/// One turn, summarized for the iOS snapshot lane. Mirrors `TurnTraceGroup`'s
-/// summary fields (id, surface, sessionId, startedAt, lastAt, eventCount, wallMs,
-/// llmTokens, ttftMs) plus a `kinds` breakdown (kind → count). No content.
-public struct TurnSummaryRecord: Codable, Identifiable, Sendable, Equatable {
-    public let id: String              // turnId
-    public let surface: String?
-    public let sessionId: String?
-    public let startedAt: Date
-    public let lastAt: Date
-    public let eventCount: Int
-    public let wallMs: Int
-    public let llmTokens: Int?
-    public let ttftMs: Int?
-    /// kind → count breakdown (e.g. ["tool.dispatch": 3, "llm.call": 1]). Cheap,
-    /// content-free, lets iOS show a per-turn mix without the event stream.
-    public let kinds: [String: Int]
-}
-
-// MARK: - TurnSummaryFile (the snapshot wrapper + truncation marker)
-
-/// The serialized `turn_summaries.json` shape. The wrapper (vs a bare array)
-/// carries the size-budget bookkeeping HONESTLY: `truncated` marks that the
-/// oldest turns were dropped to stay under the byte budget, and `totalTurnsSeen`
-/// records how many turns the day file actually held so iOS can say "showing N
-/// of M" rather than silently capping.
-public struct TurnSummaryFile: Codable, Sendable, Equatable {
-    /// Newest-first turn summaries (matches the grouping's newest-started-on-top
-    /// order; iOS renders top-down without re-sorting).
-    public let summaries: [TurnSummaryRecord]
-    /// True when older turns were dropped to fit the byte / count budget.
-    public let truncated: Bool
-    /// How many distinct turns the source day file held before capping.
-    public let totalTurnsSeen: Int
-    // NO generatedAt: the snapshot writer digest-skips unchanged bytes; an
-    // always-changing stamp would force a write (and a KVS sync signal) every
-    // 30s pass even when no turns changed. iOS decodes it as optional.
-}
+// Project the engine's grouped trace evidence directly, preserving its order
+// and metrics without constructing Inspector presentation rows.
 
 // MARK: - TurnSummaryComputer (pure projection + size budget)
 
-/// Pure transform: the engine's grouped Inspector cards → a bounded
-/// content-free `TurnSummaryFile`. No independent IO or grouping.
+/// Pure transform: the engine's grouped trace evidence → a bounded
+/// encoded content-free `TurnSummaryFile`. No independent IO or grouping.
 public enum TurnSummaryComputer {
 
     /// Hard cap on the number of turns carried in the snapshot. Newest-first;
@@ -92,74 +49,60 @@ public enum TurnSummaryComputer {
     /// them so a pathological value can't bloat or leak through the snapshot.
     public static let maxIdentityFieldLength = 120
 
-    /// Project grouped cards to summary records (newest-first preserved) and
-    /// apply the count + byte budgets, oldest-first truncation. Budgets are
-    /// injectable for deterministic truncation tests; production callers use the
-    /// defaults.
+    /// Project grouped evidence to summaries, preserving newest-first order
+    /// and applying count and byte budgets with oldest-first truncation.
     public static func compute(
-        from cards: [InspectorTurnCard],
+        from groups: [TurnTraceGroup],
         encoder: JSONEncoder = TurnSummaryComputer.makeEncoder(),
         maxTurns: Int = TurnSummaryComputer.maxTurns,
         maxBytes: Int = TurnSummaryComputer.maxBytes
-    ) -> TurnSummaryFile {
-        let totalTurnsSeen = cards.count
+    ) throws -> Data {
+        let totalTurnsSeen = groups.count
 
         func capped(_ s: String?) -> String? {
             guard let s else { return nil }
             return s.count > maxIdentityFieldLength ? String(s.prefix(maxIdentityFieldLength)) : s
         }
 
-        var all: [TurnSummaryRecord] = cards.prefix(maxTurns).map { card in
+        let all: [TurnSummaryRecord] = groups.prefix(maxTurns).map { group in
             var kinds: [String: Int] = [:]
-            for row in card.rows {
-                let key = allowedKinds.contains(row.kind) ? row.kind : otherKindBucket
+            for event in group.events {
+                let key = allowedKinds.contains(event.kind) ? event.kind : otherKindBucket
                 kinds[key, default: 0] += 1
             }
             return TurnSummaryRecord(
-                id: capped(card.id) ?? card.id,
-                surface: capped(card.surface),
-                sessionId: capped(card.sessionId),
-                startedAt: card.startedAt,
-                lastAt: card.lastAt,
-                eventCount: card.eventCount,
-                wallMs: card.wallMs,
-                llmTokens: card.llmTokens,
-                ttftMs: card.ttftMs,
+                id: capped(group.id) ?? group.id,
+                surface: capped(group.surface),
+                sessionId: capped(group.sessionId),
+                startedAt: group.startedAt,
+                lastAt: group.lastAt,
+                eventCount: group.eventCount,
+                wallMs: group.wallMs,
+                llmTokens: group.llmTokens,
+                ttftMs: group.ttftMs,
                 kinds: kinds
             )
         }
 
-        var truncated = totalTurnsSeen > maxTurns
-
-        func file(_ records: [TurnSummaryRecord], truncated: Bool) -> TurnSummaryFile {
+        func file(_ count: Int, truncated: Bool = true) -> TurnSummaryFile {
             TurnSummaryFile(
-                summaries: records,
+                summaries: Array(all.prefix(count)),
                 truncated: truncated,
                 totalTurnsSeen: totalTurnsSeen
             )
         }
 
-        // Byte budget: drop oldest-first (array tail) until the serialized file
-        // fits — all the way to EMPTY if a single record alone busts the budget
-        // (the wrapper itself is tiny + fixed-size). The final guard below means
-        // this function can never hand the snapshot writer an over-budget file.
-        var current = file(all, truncated: truncated)
-        while !all.isEmpty,
-              let data = try? encoder.encode(current),
-              data.count > maxBytes {
-            all.removeLast()
-            truncated = true
-            current = file(all, truncated: true)
+        var current = file(all.count, truncated: totalTurnsSeen > maxTurns)
+        let bounded = try? EncodedPrefix.largestPrefix(count: all.count, maximumEncodedBytes: maxBytes) { count in
+            current = file(count, truncated: totalTurnsSeen > count)
+            return try encoder.encode(current)
         }
-        if let data = try? encoder.encode(current), data.count > maxBytes {
-            return file([], truncated: true)
-        }
-        return current
+        guard let bounded else { return try encoder.encode(current) }
+        if totalTurnsSeen == 0 && bounded.data.count > maxBytes { return try encoder.encode(file(0)) }
+        return bounded.data
     }
 
-    /// The encoder used for both the byte-budget check and the actual snapshot
-    /// write — they MUST match so the in-loop size estimate equals what lands on
-    /// disk. ISO8601 dates + sorted keys mirror the snapshot writer's encoder.
+    /// ISO8601 dates + sorted keys for the measured snapshot bytes.
     public static func makeEncoder() -> JSONEncoder {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -168,13 +111,34 @@ public enum TurnSummaryComputer {
     }
 }
 
+public enum EncodedPrefix {
+    /// Measures the caller's complete envelope; encoded size grows with the prefix.
+    public static func largestPrefix(count: Int, maximumEncodedBytes: Int,
+                                     encode: (Int) throws -> Data) throws -> (data: Data, included: Int) {
+        let fullData = try encode(count)
+        guard fullData.count > maximumEncodedBytes else { return (fullData, count) }
+        var low = 0, high = count - 1
+        var bestData = try encode(0)
+        var bestCount = 0
+        while low <= high {
+            let midpoint = low + (high - low) / 2
+            let data = try encode(midpoint)
+            if data.count <= maximumEncodedBytes {
+                bestData = data
+                bestCount = midpoint
+                low = midpoint + 1
+            } else {
+                high = midpoint - 1
+            }
+        }
+        return (bestData, bestCount)
+    }
+}
+
 // MARK: - TurnSummarySource (the engine projection's persisted reader)
 
-/// Reads today's (and optionally yesterday's) persisted turn-trace day files
-/// from the SAME root the live persist lane writes to — env override
-/// (`NATIVE_AGENT_TURN_TRACE_ROOT`) → process static → `defaultDataRoot()` — and
-/// decodes through `TurnTraceReplayReader`. Read failures or incomplete framing
-/// throw so the snapshot publisher cannot label a partial read as a complete day.
+/// Reads today's and optionally yesterday's canonical day files under the supplied root.
+/// Read failures or incomplete framing throw.
 public enum TurnSummarySource {
 
     /// Load + decode today's (and optionally yesterday's) day files under `root`,
@@ -187,7 +151,7 @@ public enum TurnSummarySource {
         guard today.report.isClean else { throw CocoaError(.fileReadCorruptFile) }
         out.append(contentsOf: today.events)
         if includeYesterday {
-            let yDate = Calendar.current.date(byAdding: .day, value: -1, to: now) ?? now
+            let yDate = TurnTracePersistLane.dayCalendar.date(byAdding: .day, value: -1, to: now) ?? now
             let yesterday = try await TurnTraceReplayReader.read(TurnTraceReplayReader.fileURL(for: yDate, root: root))
             guard yesterday.report.isClean else { throw CocoaError(.fileReadCorruptFile) }
             out.append(contentsOf: yesterday.events)

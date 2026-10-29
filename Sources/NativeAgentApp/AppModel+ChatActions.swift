@@ -1,45 +1,13 @@
 import Foundation
-import os
-import Observation
-import Darwin
-import AppKit
-@preconcurrency import EventKit
-import SwiftUI
 import NativeAgentShared
-import PersistenceCore
+import NativeAgentCore
+import EngineRuntime
 import Transcripts
 import TurnTrace
-import NativeAgentCore
-import MemoryV2
-import ToolRegistry
-import ProviderRouting
-import BackgroundLoops
-import ApprovalInbox
-import ToolExecution
-import PersonaEngine
 import ChatTurnRuntime
 import ChatSessionWork
-import TrustCenter
-import DreamREMCycle
-import DoctorChecks
-import EngineRuntime
-import Research
-import MultimodalTTS
-import TriggerScheduler
-import WorkshopExecution
-import NotificationInbox
-import SystemOps
-import ScreenVision
-import TelegramBot
-import Dispatcher
-import MacControl
-import Onboarding
-import MacIntegration
-import WorkflowOrchestration
-import Connectors
-import Browser
-import DeviceSync
-// Blueprint: | `AppModel+ChatActions.swift` | `AppModel`: `compactActiveChat`, `clearActiveChatMessages`, `regenerateAssistantMessage`, `startActiveChatTurn`, `startChatTurnForSession`; turn options from `ChatTurnRuntime/MacChatTurnCommands.swift` |
+import ToolExecution
+// Blueprint: | `AppModel+ChatActions.swift` | `AppModel`: `compactSession`, `compactActiveChat`, `clearActiveChatMessages`, `regenerateAssistantMessage`, `startActiveChatTurn`, `startChatTurnForSession`; turn options from `ChatTurnRuntime/MacChatTurnCommands.swift` |
 
 struct AppMutationResult: Equatable, Sendable {
     let succeeded: Bool
@@ -77,21 +45,12 @@ extension AppModel {
                 statusText = failure
                 return .failure(failure)
             }
-            let lifecycleBeforeReload = engine.turns.lifecycle(for: sessionID)
-            let messagesBeforeReload = engine.transcripts.messages(for: sessionID)
-            let messages: [ChatMessage]
             do {
-                messages = try await engine.transcripts.loadMessages(sessionId: sessionID, cached: true)
+                try await engine.transcripts.refreshMessages(sessionId: sessionID, cached: true)
             } catch {
                 ModuleLog.app("%@", "[chat] compact reload failed: \(error)")
                 setFailureStatus("Chat compacted, but it couldn't reload. " + UserFacingError.advice(for: error), cause: error)
                 return .failure(statusText, cause: statusCause)
-            }
-            let lifecycleAfterReload = engine.turns.lifecycle(for: sessionID)
-            if !engine.turns.streamingSessions.contains(sessionID),
-               lifecycleAfterReload == lifecycleBeforeReload,
-               engine.transcripts.messages(for: sessionID) == messagesBeforeReload {
-                engine.transcripts.setMessages(messages, for: sessionID)
             }
             statusText = "Session compacted"
             return .success(statusText)
@@ -117,10 +76,8 @@ extension AppModel {
             }
         }
         do {
-            try await clearMacChatTranscript(
+            try await engine.clearMacChatTranscript(
                 sessionId: clearingSessionID,
-                clear: { [transcripts = engine.transcripts] in try await transcripts.clear(sessionId: $0) },
-                didTruncate: { $0 is ChatMessageClearError },
                 didClear: { transcriptCleared = true }
             )
             statusText = "Chat messages cleared"
@@ -156,14 +113,12 @@ extension AppModel {
             return
         }
         let sessionId = message.sessionId ?? activeChatSessionId
-        await regenerateMacChatResponse(
+        await engine.regenerateMacChatResponse(
+            port: self,
             target: message, sessionId: sessionId,
             syntheticPrefix: Self.syntheticErrorIDPrefix,
             client: macChatClient,
             serviceTier: { NativeChatTurnOptions.current(surface: "chat").serviceTier },
-            makeReplacement: { output, runId in
-                ChatMessage(sessionId: sessionId, role: "assistant", content: output, runId: runId)
-            },
             presentFailure: { [self] in setFailureStatus($0, action: "try that again") },
             didComplete: {
                 NotificationCenter.default.post(
@@ -247,14 +202,10 @@ extension AppModel {
             return .failure(statusText, cause: statusCause)
         }
         do {
-            guard try await archiveMacChatTranscript(
+            guard try await engine.archiveMacChatTranscript(
+                port: self,
                 sessionId: archivingId,
-                archive: { [transcripts = engine.transcripts] in try await transcripts.archive(id: $0) },
                 prunePresentation: { [self] sessionId in
-                    engine.turns.streamingTexts[sessionId] = nil
-                    engine.turns.streamingBubbleIds[sessionId] = nil
-                    engine.turns.streamingUserTurnIds[sessionId] = nil
-                    engine.turns.streamingUserTurnTexts[sessionId] = nil
                     pruneSessionChatState(sessionId)
                 }
             ) else {
@@ -267,10 +218,7 @@ extension AppModel {
             if activeChatSessionId == archivingId {
                 chatSelectionGeneration += 1
                 activeChatSessionId = ""
-                persistActiveChatSessionID(nil)
-                if let replacement = engine.transcripts.sessions.first(where: { $0.archived != true }) {
-                    await selectChatSession(replacement)
-                }
+                try await selectAutomaticChatSession()
             }
             statusText = "Chat archived"
             publishChatSnapshot()
@@ -294,6 +242,7 @@ extension AppModel {
         attachments: [MultimodalAttachment] = [],
         expectedSessionId: String? = nil
     ) async -> ChatTurnAcceptance {
+        let activityAt = Date()
         guard let targetSessionId = readyActiveChatSessionId() else {
             return rejectChatTurn(activeChatReadinessFailureMessage())
         }
@@ -303,11 +252,11 @@ extension AppModel {
         }
         return publishConversationAnchor(for: await startChatTurn(
             text,
-            attachments: ChatComposerSupport.submittingSpeech(attachments, text: text),
+            attachments: ChatAttachmentTypeResolver.submittingSpeech(attachments, text: text),
             sessionId: targetSessionId,
             hideUserBubble: false,
             requireActiveSession: true
-        ).acceptance)
+        ).acceptance, activityAt: activityAt)
     }
 
     /// Fixed-session acceptance boundary for detached chat panels. Like the
@@ -319,43 +268,58 @@ extension AppModel {
         attachments: [MultimodalAttachment] = [],
         sessionId: String
     ) async -> ChatTurnAcceptance {
-        publishConversationAnchor(for: await startChatTurn(
+        let activityAt = Date()
+        return publishConversationAnchor(for: await startChatTurn(
             text,
-            attachments: ChatComposerSupport.submittingSpeech(attachments, text: text),
+            attachments: ChatAttachmentTypeResolver.submittingSpeech(attachments, text: text),
             sessionId: sessionId,
             hideUserBubble: false,
             requireActiveSession: false
-        ).acceptance)
+        ).acceptance, activityAt: activityAt)
     }
 
     /// User sent this from the Mac, so its session is now the conversation he
-    /// is in — the anchor the phone, both Siris and Simple follow. Best-effort
-    /// like every publisher: a failed publish never fails his message.
+    /// is in — the anchor the phone, both Siris and Simple follow. Publication
+    /// failure is reported separately and never fails his accepted message.
     @discardableResult
-    func publishConversationAnchor(for acceptance: ChatTurnAcceptance) -> ChatTurnAcceptance {
+    func publishConversationAnchor(for acceptance: ChatTurnAcceptance, activityAt: Date = Date()) -> ChatTurnAcceptance {
         let sessionId: String
         switch acceptance {
         case .accepted(let id), .queued(let id, _): sessionId = id
         case .rejected: return acceptance
         }
-        Task.detached {
-            _ = try? await ConversationAnchor.publish(
-                sessionId: sessionId, source: "mac", conversationKind: .direct
-            )
-        }
+        publishConversationAnchor(sessionId: sessionId, conversationKind: nil, activityAt: activityAt)
         return acceptance
     }
 
+    /// Both accepted messages and New Chat settle the same publication. Keep
+    /// any write failure in the existing notice owner after chat has succeeded.
+    func publishConversationAnchor(sessionId: String, conversationKind: ChatThreadKind?, activityAt: Date) {
+        let dataRoot = engine.dataRoot
+        Task { @MainActor in
+            let result: Result<ConversationAnchor.PublishOutcome, Error> = await settle {
+                do {
+                    return .success(try await ConversationAnchor.publish(sessionId: sessionId, source: "mac",
+                        conversationKind: conversationKind ?? SessionConversation.kind(sessionId, dataRoot: dataRoot) ?? .legacy,
+                        dataRoot: dataRoot, now: activityAt))
+                } catch { return .failure(error) }
+            }
+            if case .failure(let error) = result {
+                let line = "Your chat is ready, but its shared conversation couldn't be updated. Other surfaces may still open the previous conversation."
+                setFailureStatus(line, cause: error)
+                systemToasts.push(error: UserFacingError.forAgent(line, cause: error.localizedDescription), autoDismissAfter: nil)
+            }
+        }
+    }
+
     @MainActor
-    // PATCH-2026-05-06: multimodal-ui Sprint 3 — sendChat now accepts optional attachments
-    // PATCH-2026-05-08: wave2-chat-ux — wraps body in cancellable Task, sets isChatStreaming
-    // PATCH-2026-05-13: parallel-sessions — guard and bookkeep per-session
     /// Returns the turn's acceptance so one-shot callers (first-run welcome)
     /// can tell a rejected send from an accepted one; ordinary callers ignore
     /// it. Acceptance means the turn was installed, not that streaming
     /// succeeded — mid-stream failures surface in the transcript, not here.
     @discardableResult
     func sendChat(_ text: String, attachments: [MultimodalAttachment] = [], sessionId: String? = nil, hideUserBubble: Bool = false, requireIdleAndEmpty: Bool = false) async -> ChatTurnAcceptance {
+        let activityAt = Date()
         let started: _StartedChatTurn
         if let sessionId, !sessionId.isEmpty {
             // Fixed-session callers (detached windows, first-run greeting) own
@@ -382,7 +346,7 @@ extension AppModel {
                 requireIdleAndEmpty: requireIdleAndEmpty
             )
         }
-        if !hideUserBubble { publishConversationAnchor(for: started.acceptance) }
+        if !hideUserBubble { publishConversationAnchor(for: started.acceptance, activityAt: activityAt) }
         await started.task?.value
         return started.acceptance
     }
@@ -412,31 +376,21 @@ extension AppModel {
 
     static let syntheticErrorIDPrefix = MacChatTurnRuntime.syntheticErrorIDPrefix
 
-    func isCompletedAssistant(_ message: ChatMessage?) -> Bool {
-        MacChatTurnRuntime.isCompletedAssistant(message)
-    }
 }
 
-extension AppModel: MacChatTurnTranscriptPort {
-    var macChatSessionRows: [ChatSession] {
-        get { engine.transcripts.sessions }
-        set { engine.transcripts.sessions = newValue }
-    }
-
-    var macChatMessageRows: [String: [ChatMessage]] {
-        get { engine.transcripts.messagesBySession }
-        set { engine.transcripts.messagesBySession = newValue }
-    }
-
-    func loadMacChatMessages(sessionId: String, cached: Bool) async throws -> [ChatMessage] {
-        try await engine.transcripts.loadMessages(sessionId: sessionId, cached: cached)
-    }
-
-    func loadMacChatSessions() async throws -> [ChatSession] {
-        try await engine.transcripts.list()
-    }
-
-    func appendMacChatMessage(_ message: ChatMessage, to sessionId: String) {
-        appendChatMessage(message, to: sessionId)
+extension AppModel {
+    // MARK: Chat context / tools
+    /// ChatOrchestration's canonical transcript compactor, so automatic and
+    /// manual requests share validation, verified backup, durable
+    /// replacement, traces, and optional distillation.
+    func compactSession(
+        sessionId: String,
+        model: String? = nil,
+        providerID: String? = nil,
+        force: Bool = false
+    ) async throws -> ChatSessionCompactionOutcome {
+        try await engine.compactSession(
+            sessionId: sessionId, model: model, providerID: providerID, force: force, client: macChatClient
+        )
     }
 }

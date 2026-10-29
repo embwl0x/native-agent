@@ -1,14 +1,10 @@
 import Foundation
 import MacIntegration
 import PersistenceCore
+import Transcripts
 // Blueprint: | `HerScreenRooms+Comms.swift` | `HerScreen`: `sendTrouble`, `roomCounts`, `notConnected` |
 
-/// Her comms on her screen (2026-09-24): Mail, Messages, Notes and Contacts
-/// are places, their items stable names (`mail.3`, `messages.2`, `notes.1`,
-/// `contacts.4`) that open as short text rooms, and
-/// each item's verbs take its name (`mail.3.archive`, `notes.1.append`).
-/// Lists are the owners' own reads laid out by `textRoom`; the rooms here are
-/// one item each, from the read that opened it. Nothing is read on home.
+/// Comms items open by stable name, reuse the owner's read and expose verbs without reading on home.
 extension HerScreen {
     // MARK: Places
 
@@ -32,23 +28,19 @@ extension HerScreen {
     ]
     /// Rooms whose numbers stay with each item (by its message or contact
     /// identity), never its row: a `mail.3.reply` kept from an older look
-    /// still reaches the same email, not whatever is third now. So a gap
-    /// (music.2: a list now folded as a duplicate) is by design; the note says
-    /// so, since walk 6 still read the bare note's gap as a bug.
+    /// still reaches the same email, not whatever is third now; gaps are normal.
     static let numbersNote = "numbers stay with each item, gaps are normal"
 
-    /// A warning for each shown contact whose last send went wrong and
-    /// nothing newer came from them since, by agent id (walk 4: omp's 403s
-    /// showed nothing in connections). New inbound evidence is checked at render.
+    /// Warn on failed sends only while no newer inbound evidence is available at render.
     static func sendTrouble(agents: [String], dataRoot: URL, now: Date) -> [String: String] {
         guard !agents.isEmpty else { return [:] }
-        let root = dataRoot.standardizedFileURL.path + "\u{0}sendTrouble."
-        let records: [AgentConversationRecord] = HerMemo.shared.cached(root + "records", stamp: [stamp(dataRoot.appendingPathComponent("agents/conversations.json"))]) {
+        let records: [AgentConversationRecord] = HerMemo.shared.cached(dataRoot.standardizedFileURL.path + "\u{0}sendTrouble.records", stamp: [stamp(dataRoot.appendingPathComponent("agents/conversations.json"))]) {
             ((try? AgentWorkspacePorts.current.conversations.records(dataRoot: dataRoot, locked: true)) ?? []).filter { !$0.agent.hasPrefix("bot") }
         }
         let chats = bridgeChats(dataRoot: dataRoot)
         let identity = AgentWorkspacePorts.current.conversations.identity(dataRoot: dataRoot)
-        let contacts = contacts(identity: identity, usable: AgentWorkspacePorts.current.tools.usableAgentLanes(dataRoot: dataRoot))
+        let contacts = contacts(identity: identity)
+        let transcripts = try? ChatSessionRetention.transcriptFiles(dataRoot: dataRoot, archived: [:])
         var out: [String: String] = [:]
         let health = AgentWorkspacePorts.current.conversations.liveHealth(dataRoot: dataRoot)
         for agent in Set(agents.map { $0.lowercased() }) {
@@ -57,9 +49,9 @@ extension HerScreen {
                   let record = latest(contact, records: records),
                   record.phase == "attention" else { continue }
             if health[agent]?.resolves(record) == true { continue }
-            let receipt = unwrap(record.receipt)
+            let receipt = record.sendEvidence
             if receipt["needs_input"] == .bool(true) || receipt["needs_authentication"] == .bool(true) { continue }
-            let heard = thread(contact, dataRoot: dataRoot, identity: identity)?.heard
+            let heard = transcripts.flatMap { thread(contact, dataRoot: dataRoot, identity: identity, transcripts: $0) }?.heard
             let inbound = chats.filter { $0.who == contact.id || contact.agents.contains($0.who) || $0.who == record.name.lowercased() }
                 .compactMap(\.heard).max()
             if max(heard ?? .distantPast, inbound ?? .distantPast) > record.updatedAt { continue }
@@ -100,7 +92,7 @@ extension HerScreen {
     // MARK: Lists
 
     /// Rows for the places above; each row opens its item by a stable read.
-    static func commsProjection(tool: String, input: [String: JSONValue], result: JSONValue) -> AgentWorkspaceProjection? {
+    static func commsProjection(tool: String, input: [String: JSONValue], result: JSONValue) -> WorkspacePage? {
         func rows(_ key: String) -> [[String: JSONValue]] {
             guard case .object(let root) = result, case .array(let list)? = root[key] else { return [] }
             return list.compactMap { if case .object(let row) = $0 { row } else { nil } }
@@ -142,189 +134,178 @@ extension HerScreen {
 
     // MARK: Rooms
 
+    static func noteAppend(id: String, title: String) -> AgentWorkspaceAction {
+        .perform(tool: "notes_update", input: ["id": .string(id)], title: "Add to " + title, textField: "append", isEffect: true)
+    }
+
     /// A comms record as text: one item's room, or a list read (a search, a
     /// next page) laid out like its place. Nil leaves the old view.
-    static func commsRoom(_ location: AgentWorkspaceLocation, value: JSONValue?, dataRoot: URL, issue: String?) async -> String? {
-        if let batch = mailBatchRoom(location, value: value, dataRoot: dataRoot) { return batch }
-        guard case .record(let tool, let input, let title) = location, let value else { return nil }
-        let now = Date()
-        guard let family = commsFamily[tool] else { return nil }
-        let object: [String: JSONValue] = if case .object(let row) = value { row } else { [:] }
-        let single: Bool = switch tool {
-        case "mail_list_recent": input["message_id"] != nil
-        case "messages_recent_threads": input["thread_id"] != nil
-        case "notes_search": input["title"] != nil || input["id"] != nil
-        case "contacts_search": input["identifier"] != nil
-        default: false
-        }
-        // Keep the connector owner's fix visible.
-        if notConnected(object) {
-            return screen([family.uppercased(), "not connected"], [[failureFace(value)]],
-                          verbs: [], back: "Back: home.", verbWidth: 24, omitEmptyHeader: true)
-        }
-        if let issue { return screen([family.uppercased(), text(object["status"]) ?? "failed"], [[issue]], verbs: []) }
-        guard single else {
-            let status = issue == nil ? (text(object["status"]) ?? "ok") : "failed"
-            return textRoom(family, place: location, projection: await .project(location: location, result: value, dataRoot: dataRoot),
-                            frame: .object(["status": .string(status)]), dataRoot: dataRoot, now: now)
-        }
-        // The item's name is the one its list row minted: a next page of the
-        // same message or thread keeps it.
-        let identity = input.filter { !["body_offset", "text_offset", "before_message_id", "limit", "position"].contains($0.key) }
-        let itemKey = key(.record(tool: tool, input: identity, title: title)) ?? title
-        let name = family + ".\(withNames(dataRoot) { book in book.number("item." + family, id: itemKey) { [itemKey] } })"
-        func rowsOf(_ key: String) -> [[String: JSONValue]] {
-            guard case .array(let list)? = object[key] else { return [] }
-            return list.compactMap { if case .object(let row) = $0 { row } else { nil } }
-        }
-        var verbs: [(String, String)] = [], keep: [String: AgentWorkspaceAction] = [:]
-        func verb(_ word: String, _ about: String, _ action: AgentWorkspaceAction) {
-            guard AgentWorkspaceReadiness.allows(action) else { return }
-            verbs.append((name + "." + word, about)); keep[name + "." + word] = action
-        }
-        var header: [String] = [name], sections: [[String]] = []
-        switch tool {
-        case "mail_list_recent":
-            guard let row = rowsOf("messages").first else { return nil }
-            let bound = input.filter { MailReadLocator.fields.union(["mailbox"]).contains($0.key) }
-            header += [who(text(row["sender"])), when(text(row["date"]), now: now)] + (row["unread"] == .bool(true) ? ["unread"] : [])
-            let (lines, used) = bodyLines(text(row["body"]) ?? "")
-            let start = int(row["body_offset"]) ?? 0, total = int(row["body_total"]) ?? 0
-            let body = tabled(lines, row["body_tables"])
-            sections = [section("SUBJECT", [clip(text(row["subject"]) ?? "(no subject)", 100)]), section("BODY", body.isEmpty ? ["(empty)"] : body)]
-            let attachments = mailAttachmentLines(row)
-            if !attachments.isEmpty { sections.append(section("ATTACHMENTS", attachments)) }
-            if start + used < total {
-                sections.append(["+\(total - start - used) more characters · \(name).more"])
-                keep[name + ".more"] = .open(.record(tool: "mail_list_recent", input: bound.merging(["body_offset": .int(Int64(start + used))]) { _, new in new }, title: title))
+    static func commsRoom(_ location: AgentWorkspaceLocation, value: JSONValue?, projection: WorkspacePage?, dataRoot: URL, scope: String, issue: String?) async -> String? {
+        do {
+            if let batch = mailBatchRoom(location, value: value, dataRoot: dataRoot, scope: scope) { return batch }
+            guard case .record(let tool, let input, let title) = location, let value, let projection else { return nil }
+            let now = Date()
+            guard let family = commsFamily[tool] else { return nil }
+            let object: [String: JSONValue] = if case .object(let row) = value { row } else { [:] }
+            let single: Bool = switch tool {
+            case "mail_list_recent": input["message_id"] != nil
+            case "messages_recent_threads": input["thread_id"] != nil
+            case "notes_search": input["title"] != nil || input["id"] != nil
+            case "contacts_search": input["identifier"] != nil
+            default: false
             }
-            if case .string(let expectedID)? = bound["expected_message_id"], !expectedID.isEmpty {
-                if (bound["scope"] ?? bound["mailbox"] ?? .string("inbox")) == .string("inbox") {
-                    verb("draft", "saves an unsent reply in Mail → Drafts (text)", .perform(tool: "mail_draft", input: bound, title: "Draft: " + title, textField: "body", isEffect: true))
-                    verb("reply", "sends a reply now to the sender (text)", .perform(tool: "mail_reply", input: bound, title: "Reply: " + title, textField: "body", isEffect: true))
-                    verb("reply-all", "sends a reply now to everyone (text)", .perform(tool: "mail_reply", input: bound.merging(["reply_all": .bool(true)]) { _, new in new },
-                                                                          title: "Reply all: " + title, textField: "body", isEffect: true))
-                    verb("archive", "archive it", .perform(tool: "mail_archive", input: bound, title: "Archive " + title, textField: nil, isEffect: true))
-                    verb("mark-read", "mark it read", .perform(tool: "mail_mark_read", input: bound, title: "Mark read: " + title, textField: nil, isEffect: true))
+            // Keep the connector owner's fix visible.
+            if notConnected(object) {
+                return screen([family.uppercased(), "not connected"], [[failureFace(value)]],
+                              verbs: [], back: "Back: home.", verbWidth: 24, omitEmptyHeader: true)
+            }
+            if let issue { return screen([family.uppercased(), text(object["status"]) ?? "failed"], [[issue]], verbs: []) }
+            guard single else {
+                let status = issue == nil ? (text(object["status"]) ?? "ok") : "failed"
+                return textRoom(family, place: location, projection: projection,
+                                status: .string(status), dataRoot: dataRoot, scope: scope, now: now)
+            }
+            // The item's name is the one its list row minted: a next page of the
+            // same message or thread keeps it.
+            let identity = input.filter { !["body_offset", "text_offset", "before_message_id", "limit", "position"].contains($0.key) }
+            let itemKey = key(.record(tool: tool, input: identity, title: title)) ?? title
+            let name = family + ".\(try withNames(dataRoot) { book in try book.number("item." + family, id: itemKey) { [itemKey] } })"
+            func rowsOf(_ key: String) -> [[String: JSONValue]] {
+                guard case .array(let list)? = object[key] else { return [] }
+                return list.compactMap { if case .object(let row) = $0 { row } else { nil } }
+            }
+            var verbs: [(String, String)] = [], keep: [String: AgentWorkspaceAction] = [:]
+            func verb(_ word: String, _ about: String, _ action: AgentWorkspaceAction) {
+                guard AgentWorkspaceReadiness.allows(action) else { return }
+                verbs.append((name + "." + word, about)); keep[name + "." + word] = action
+            }
+            var header: [String] = [name], sections: [[String]] = []
+            switch tool {
+            case "mail_list_recent":
+                guard let row = rowsOf("messages").first else { return nil }
+                let bound = input.filter { MailReadLocator.fields.union(["mailbox"]).contains($0.key) }
+                header += [who(text(row["sender"])), when(text(row["date"]), now: now)] + (row["unread"] == .bool(true) ? ["unread"] : [])
+                let (lines, used) = bodyLines(text(row["body"]) ?? "")
+                let start = int(row["body_offset"]) ?? 0, total = int(row["body_total"]) ?? 0
+                let body = tabled(lines, row["body_tables"])
+                sections = [section("SUBJECT", [clip(text(row["subject"]) ?? "(no subject)", 100)]), section("BODY", body.isEmpty ? ["(empty)"] : body)]
+                let attachments = mailAttachmentLines(row)
+                if !attachments.isEmpty { sections.append(section("ATTACHMENTS", attachments)) }
+                if start + used < total {
+                    sections.append(["+\(total - start - used) more characters · \(name).more"])
+                    keep[name + ".more"] = .open(.record(tool: "mail_list_recent", input: bound.merging(["body_offset": .int(Int64(start + used))]) { _, new in new }, title: title))
                 }
-                verb("delete", "move it to Trash", .perform(tool: "mail_delete", input: bound, title: "Delete " + title, textField: nil, isEffect: true))
-            }
-        case "messages_recent_threads":
-            guard let thread = rowsOf("threads").first else { return nil }
-            let people: [[String: JSONValue]] = if case .array(let list)? = thread["participants"] {
-                list.compactMap { if case .object(let row) = $0 { row } else { nil } }
-            } else { [] }
-            header += [clip(text(thread["name"]) ?? people.compactMap { text($0["name"]) ?? text($0["handle"]) }.joined(separator: ", "), 50)]
-            let talk = rowsOf("messages").suffix(10).map { row -> String in
-                let prefix = pad(when(text(row["date"]), now: now, short: true), 7)
-                    + pad(row["from_me"] == .bool(true) ? "me" : clip(text(row["sender_name"]) ?? who(text(row["sender"])), 16), 12)
-                if text(row["text"]) == nil, row["text_status"] == .string("archived_text_not_decoded") {
-                    return prefix + failureFace(.object(["status": .string("unavailable"), "reason": .string("message_format_unsupported"),
-                        "detail": .string("This reader does not decode the message's archived text format."), "effects": .string("none"),
-                        "remedy": Repair.reconcile(instruction: "Read the original conversation in Messages with mac.look.",
-                            nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("mac.look"), "args": .object(["app": .string("Messages")])])]))]))
+                let actions = AgentWorkspaceMail.itemActions(input: bound, title: title)
+                for (word, about) in [("draft", "saves an unsent reply in Mail → Drafts (text)"), ("reply", "sends a reply now to the sender (text)"),
+                    ("reply-all", "sends a reply now to everyone (text)"), ("archive", "archive it"), ("mark-read", "mark it read"), ("delete", "move it to Trash")] {
+                    if let action = actions[word] { verb(word, about, action) }
                 }
-                let said = text(row["text"]) ?? (row["has_attachments"] == .bool(true) ? "(attachment)" : "(no text retained)")
-                return prefix + clip(said, 90)
-            }
-            sections = [section("TALK", talk.isEmpty ? [clip(text(object["history_note"]) ?? "no messages to show", 110)] : talk)]
-            if let older = object["older_before_message_id"], let id = text(thread["thread_id"]) {
-                keep[name + ".older"] = .open(.record(tool: "messages_recent_threads", input: ["thread_id": .string(id), "before_message_id": older], title: title))
-                sections.append(["earlier messages · \(name).older"])
-            }
-            let handles = people.compactMap { text($0["handle"]) }
-            if let id = text(thread["thread_id"]), !handles.isEmpty, handles.count == people.count {
-                verb("reply", "sends a reply now in this thread (text)", .perform(tool: "messages_send", input: ["thread_id": .string(id),
-                    "expected_participants": .array(handles.map(JSONValue.string))], title: "Reply: " + title, textField: "body", isEffect: true))
-            }
-        case "notes_search":
-            guard let note = rowsOf("notes").first else { return nil }
-            header += [text(note["folder"]), when(text(note["modified_at"]), now: now)].compactMap { $0 }.filter { !$0.isEmpty }
-            // A note's text starts with its title; the room shows what comes after it.
-            let body = if case .string(let value)? = note["body"] ?? note["body_preview"] { value } else { "" }
-            var (lines, used) = bodyLines(body)
-            let start = int(note["body_offset"]) ?? 0
-            if start == 0, let first = lines.first, first == clip(text(note["name"]) ?? "", 110) { lines.removeFirst() }
-            sections = [section("TITLE", [clip(text(note["name"]) ?? title, 100)]), section("TEXT", lines.isEmpty ? ["(no text on this page)"] : lines)]
-            if let total = int(object["total"]), total > 1 {
-                sections.append(["\(total) notes have this title; this is one · notes.find (text) to pick another"])
-            }
-            // Only by the note's id: a title can belong to two notes.
-            if let id = text(note["id"]) {
-                let next = start + body.prefix(used).utf16.count
-                if let total = int(note["body_total"]), next < total {
-                    sections.append(["more text · \(name).more"])
-                    keep[name + ".more"] = .open(.record(tool: "notes_search", input: ["id": .string(id), "body_offset": .int(Int64(next))], title: title))
+            case "messages_recent_threads":
+                guard let thread = rowsOf("threads").first else { return nil }
+                let people: [[String: JSONValue]] = if case .array(let list)? = thread["participants"] {
+                    list.compactMap { if case .object(let row) = $0 { row } else { nil } }
+                } else { [] }
+                header += [clip(text(thread["name"]) ?? people.compactMap { text($0["name"]) ?? text($0["handle"]) }.joined(separator: ", "), 50)]
+                let talk = rowsOf("messages").suffix(10).map { row -> String in
+                    let prefix = pad(when(text(row["date"]), now: now, short: true), 7)
+                        + pad(row["from_me"] == .bool(true) ? "me" : clip(text(row["sender_name"]) ?? who(text(row["sender"])), 16), 12)
+                    if text(row["text"]) == nil, row["text_status"] == .string("archived_text_not_decoded") {
+                        return prefix + failureFace(.object(["status": .string("unavailable"), "reason": .string("message_format_unsupported"),
+                            "detail": .string("This reader does not decode the message's archived text format."), "effects": .string("none"),
+                            "remedy": Repair.reconcile(instruction: "Read the original conversation in Messages with mac.look.",
+                                nextCall: .object(["tool": .string("app"), "input": .object(["action": .string("mac.look"), "args": .object(["app": .string("Messages")])])]))]))
+                    }
+                    let said = text(row["text"]) ?? (row["has_attachments"] == .bool(true) ? "(attachment)" : "(no text retained)")
+                    return prefix + clip(said, 90)
                 }
-                verb("append", "add a line to it (text)", .perform(tool: "notes_update", input: ["id": .string(id)], title: "Add to " + title, textField: "append", isEffect: true))
+                sections = [section("TALK", talk.isEmpty ? [clip(text(object["history_note"]) ?? "no messages to show", 110)] : talk)]
+                if let older = object["older_before_message_id"], let id = text(thread["thread_id"]) {
+                    keep[name + ".older"] = .open(.record(tool: "messages_recent_threads", input: ["thread_id": .string(id), "before_message_id": older], title: title))
+                    sections.append(["earlier messages · \(name).older"])
+                }
+                if let reply = AgentWorkspaceMessages.replyAction(thread, requested: text(input["thread_id"]), title: title) {
+                    verb("reply", "sends a reply now in this thread (text)", reply)
+                }
+            case "notes_search":
+                guard let note = rowsOf("notes").first else { return nil }
+                header += [text(note["folder"]), when(text(note["modified_at"]), now: now)].compactMap { $0 }.filter { !$0.isEmpty }
+                // The Notes reader already elides the stored title line and returns raw offsets.
+                let body = if case .string(let value)? = note["body"] ?? note["body_preview"] { value } else { "" }
+                let (lines, used) = bodyLines(body)
+                let start = int(note["body_offset"]) ?? 0
+                sections = [section("TITLE", [clip(text(note["name"]) ?? title, 100)]), section("TEXT", lines.isEmpty ? ["(no text on this page)"] : lines)]
+                if let total = int(object["total"]), total > 1 {
+                    sections.append(["\(total) notes have this title; this is one · notes.find (text) to pick another"])
+                }
+                // Only by the note's id: a title can belong to two notes.
+                if let id = text(note["id"]) {
+                    let next = start + body.prefix(used).utf16.count
+                    if let total = int(note["body_total"]), next < total {
+                        sections.append(["more text · \(name).more"])
+                        keep[name + ".more"] = .open(.record(tool: "notes_search", input: ["id": .string(id), "body_offset": .int(Int64(next))], title: title))
+                    }
+                    verb("append", "add a line to it (text)", noteAppend(id: id, title: title))
+                }
+            case "contacts_search":
+                guard let card = rowsOf("contacts").first else { return nil }
+                let phones = values(card["phones"]), emails = values(card["emails"])
+                header += [clip(text(card["name"]) ?? title, 40)] + (text(card["organizationName"]).map { [$0] } ?? [])
+                sections = [section("PHONES", phones.isEmpty ? ["none"] : phones.prefix(4).map { clip($0, 40) }),
+                            section("EMAILS", emails.isEmpty ? ["none"] : emails.prefix(4).map { clip($0, 60) })]
+                if let phone = values(card["phones"], labels: false).first {
+                    verb("text", "sends a text now to \(phones.count > 1 ? "the first number" : "them") (text)", .perform(tool: "messages_send", input: ["to": .string(phone)],
+                        title: "Text " + title, textField: "body", isEffect: true))
+                }
+                if let email = values(card["emails"], labels: false).first {
+                    verb("email", "sends an email now (form)", .configure(tool: "mail_send", input: ["to": .string(email)], title: "Email " + title))
+                }
+                if let id = text(card["identifier"]) {
+                    verb("edit", "add a number or email (form)", .configure(tool: "contacts_create_or_update", input: ["identifier": .string(id)], title: "Edit " + title))
+                }
+            default: return nil
             }
-        case "contacts_search":
-            guard let card = rowsOf("contacts").first else { return nil }
-            let phones = values(card["phones"]), emails = values(card["emails"])
-            header += [clip(text(card["name"]) ?? title, 40)] + (text(card["organizationName"]).map { [$0] } ?? [])
-            sections = [section("PHONES", phones.isEmpty ? ["none"] : phones.prefix(4).map { clip($0, 40) }),
-                        section("EMAILS", emails.isEmpty ? ["none"] : emails.prefix(4).map { clip($0, 60) })]
-            if let phone = values(card["phones"], labels: false).first {
-                verb("text", "sends a text now to \(phones.count > 1 ? "the first number" : "them") (text)", .perform(tool: "messages_send", input: ["to": .string(phone)],
-                    title: "Text " + title, textField: "body", isEffect: true))
-            }
-            if let email = values(card["emails"], labels: false).first {
-                verb("email", "sends an email now (form)", .configure(tool: "mail_send", input: ["to": .string(email)], title: "Email " + title))
-            }
-            if let id = text(card["identifier"]) {
-                verb("edit", "add a number or email (form)", .configure(tool: "contacts_create_or_update", input: ["identifier": .string(id)], title: "Edit " + title))
-            }
-        default: return nil
-        }
-        HerNamed.shared.keep(dataRoot, keep.filter { AgentWorkspaceReadiness.allows($0.value) }, room: name)
-        return screen(header, sections, verbs: verbs, back: "Back: home · \(family).", verbWidth: 24, omitEmptyHeader: true)
+            if !previewing { HerNamed.shared.keep(dataRoot, keep.filter { AgentWorkspaceReadiness.allows($0.value) }, room: name, scope: scope) }
+            return screen(header, sections, verbs: verbs, back: "Back: home · \(family).", verbWidth: 24, omitEmptyHeader: true)
+        } catch { return nameFailure(error) }
     }
 
     /// `mail.3.archive` from names.json when the room that named it was shown
     /// before a restart: mail verbs rebuild from the item's own read; the
     /// others reopen the item, which names its verbs again.
     static func commsTarget(_ raw: String, dataRoot: URL) -> Target? {
-        let selection = raw.split(whereSeparator: { $0.isWhitespace || $0 == "," }).map(String.init)
-        if let verb = selection.first, ["mail.read-batch", "mail.mark-read-batch", "mail.flag-batch", "mail.unflag-batch", "mail.archive-batch"].contains(verb),
-           (1...10).contains(selection.count - 1) {
-            let items: [JSONValue] = selection.dropFirst().map { name in
-                var row: [String: JSONValue] = ["name": .string(name)]
-                switch verb {
-                case "mail.mark-read-batch": row["mark_read"] = .bool(true)
-                case "mail.flag-batch": row["flagged"] = .bool(true)
-                case "mail.unflag-batch": row["flagged"] = .bool(false)
-                case "mail.archive-batch": row["archive"] = .bool(true)
-                default: break
+        do {
+            let selection = raw.split(whereSeparator: { $0.isWhitespace || $0 == "," }).map(String.init)
+            if let verb = selection.first, ["mail.read-batch", "mail.mark-read-batch", "mail.flag-batch", "mail.unflag-batch", "mail.archive-batch"].contains(verb),
+               (1...10).contains(selection.count - 1) {
+                let items: [JSONValue] = selection.dropFirst().map { name in
+                    var row: [String: JSONValue] = ["name": .string(name)]
+                    switch verb {
+                    case "mail.mark-read-batch": row["mark_read"] = .bool(true)
+                    case "mail.flag-batch": row["flagged"] = .bool(true)
+                    case "mail.unflag-batch": row["flagged"] = .bool(false)
+                    case "mail.archive-batch": row["archive"] = .bool(true)
+                    default: break
+                    }
+                    return .object(row)
                 }
-                return .object(row)
+                let input: [String: JSONValue] = ["items": .array(items)]
+                if verb == "mail.read-batch" { return .action(.open(.record(tool: "mail_read_batch", input: input, title: "Selected email"))) }
+                return .action(.perform(tool: "mail_triage_batch", input: input, title: "Triage selected email", textField: nil, isEffect: true))
             }
-            let input: [String: JSONValue] = ["items": .array(items)]
-            if verb == "mail.read-batch" { return .action(.open(.record(tool: "mail_read_batch", input: input, title: "Selected email"))) }
-            return .action(.perform(tool: "mail_triage_batch", input: input, title: "Triage selected email", textField: nil, isEffect: true))
-        }
-        let parts = raw.split(separator: ".").map(String.init)
-        guard parts.count == 3, let n = Int(parts[1]), commsItemVerbs.keys.contains(parts[0]) || parts[0] == "messages",
-              let place = itemPlace(parts[0], n, dataRoot: dataRoot), case .record(let tool, let input, let title) = place else { return nil }
-        let bound = input.filter { MailReadLocator.fields.union(["mailbox"]).contains($0.key) }
-        if tool == "mail_list_recent", bound["message_id"] != nil,
-           case .string(let expectedID)? = bound["expected_message_id"], !expectedID.isEmpty {
-            if parts[2] != "delete", (bound["scope"] ?? bound["mailbox"] ?? .string("inbox")) != .string("inbox") { return nil }
-            switch parts[2] {
-            case "draft": return .action(.perform(tool: "mail_draft", input: bound, title: "Draft: " + title, textField: "body", isEffect: true))
-            case "reply": return .action(.perform(tool: "mail_reply", input: bound, title: "Reply: " + title, textField: "body", isEffect: true))
-            case "archive": return .action(.perform(tool: "mail_archive", input: bound, title: "Archive " + title, textField: nil, isEffect: true))
-            case "mark-read": return .action(.perform(tool: "mail_mark_read", input: bound, title: "Mark read: " + title, textField: nil, isEffect: true))
-            case "delete": return .action(.perform(tool: "mail_delete", input: bound, title: "Delete " + title, textField: nil, isEffect: true))
-            default: break
+            let parts = raw.split(separator: ".").map(String.init)
+            guard parts.count == 3, let n = Int(parts[1]), commsItemVerbs.keys.contains(parts[0]) || parts[0] == "messages",
+                  let place = try itemPlace(parts[0], n, dataRoot: dataRoot), case .record(let tool, let input, let title) = place else { return nil }
+            if tool == "mail_list_recent", let action = AgentWorkspaceMail.itemActions(input: input, title: title)[parts[2]] {
+                return .action(action)
             }
-        }
-        if tool == "notes_search", parts[2] == "append", case .string(let id)? = input["id"] {
-            return .action(.perform(tool: "notes_update", input: ["id": .string(id)], title: "Add to " + title, textField: "append", isEffect: true))
-        }
-        return .action(.window(AgentWorkspaceNavigation.windowAction(place)))
+            if tool == "notes_search", parts[2] == "append", case .string(let id)? = input["id"] {
+                return .action(noteAppend(id: id, title: title))
+            }
+            return .action(.window(AgentWorkspaceNavigation.windowAction(place)))
+        } catch { return .page(nameFailure(error)) }
     }
 
-    private static func mailBatchRoom(_ location: AgentWorkspaceLocation, value: JSONValue?, dataRoot: URL) -> String? {
+    private static func mailBatchRoom(_ location: AgentWorkspaceLocation, value: JSONValue?, dataRoot: URL, scope: String) -> String? {
         let tool: String, result: JSONValue
         switch location {
         case .record(let name, _, _):
@@ -365,7 +346,7 @@ extension HerScreen {
             }
             return lines.map { UntrustedText.neutralized($0) }
         }
-        HerNamed.shared.keep(dataRoot, keep, room: "mail-batch")
+        if !previewing { HerNamed.shared.keep(dataRoot, keep, room: "mail-batch", scope: scope) }
         return screen(["MAIL BATCH", text(root["status"]) ?? "unknown"], sections, verbs: verbs, back: "Back: mail.", verbWidth: 24, omitEmptyHeader: true)
     }
 
@@ -382,7 +363,7 @@ extension HerScreen {
     }
 
     /// "mail 3 unread of 12 (4m ago)" from the last inbox read anyone made; bare "mail" before one.
-    static func mailPulse(dataRoot: URL, now: Date) -> String { HerMailStatus.shared.pulse(dataRoot: dataRoot, now: now) }
+    static func mailPulse(dataRoot: URL, now: Date) -> String { HerReadBadges.shared.pulse(dataRoot: dataRoot, now: now) }
 
     // MARK: Pieces
 
@@ -411,11 +392,8 @@ extension HerScreen {
         return (lines, min(used, body.count))
     }
 
-    /// A mail body's simple HTML tables (the owner's `body_tables`) row by
-    /// row. Mail's plain text puts every cell on its own line, so labels over
-    /// values read as all the labels, then all the values (desk walk 4). Only
-    /// a run of lines that is exactly a table's cells, in order, is replaced;
-    /// anything else stays as the body said it.
+    /// Reconstruct `body_tables` only where consecutive body lines exactly match
+    /// the table's cells in order; preserve all unmatched body text.
     static func tabled(_ lines: [String], _ tables: JSONValue?) -> [String] {
         guard case .array(let list)? = tables else { return lines }
         func norm(_ text: String) -> String { text.split(whereSeparator: \.isWhitespace).joined(separator: " ") }
@@ -483,13 +461,19 @@ extension HerScreen {
     }
 }
 
-/// The last inbox count any Mail read returned (a tool call or her mail
-/// room), in memory only: home shows it with its age and never reads Mail.
-package final class HerMailStatus: @unchecked Sendable {
-    package static let shared = HerMailStatus()
+/// Root-keyed last-read badges, in memory only: home shows their ages without integration reads.
+package final class HerReadBadges: @unchecked Sendable {
+    package static let shared = HerReadBadges()
     private let lock = NSLock()
-    private var last: (root: String, at: Date, total: Int64, unread: Int64?)?
-    private var previews: (root: String, at: Date, text: String)?
+    private var rows: [String: [String: (words: String, at: Date)]] = [:]
+
+    func note(_ name: String, _ words: String, dataRoot: URL) {
+        lock.withLock { rows[dataRoot.standardizedFileURL.path, default: [:]][name] = (words, Date()) }
+    }
+
+    func latest(_ name: String, dataRoot: URL) -> (words: String, at: Date)? {
+        lock.withLock { rows[dataRoot.standardizedFileURL.path]?[name] }
+    }
 
     package func note(_ result: JSONValue, dataRoot: URL) {
         guard case .object(let row) = result, row["status"] == .string("completed") else { return }
@@ -499,21 +483,21 @@ package final class HerMailStatus: @unchecked Sendable {
                       case .string(let sender)? = message["sender"] else { return nil }
                 return HerScreen.clip(sender, 28) + " — " + HerScreen.clip(subject, 70)
             }.joined(separator: "; ")
-            lock.withLock { previews = (dataRoot.standardizedFileURL.path, Date(), text) }
+            note("mail.previews", text, dataRoot: dataRoot)
         }
         guard case .int(let total)? = row["inbox_total"] else { return }
-        let unread: Int64? = if case .int(let n)? = row["inbox_unread"] { n } else { nil }
-        lock.withLock { last = (dataRoot.standardizedFileURL.path, Date(), total, unread) }
+        let words = if case .int(let unread)? = row["inbox_unread"] { "\(unread) unread of \(total)" } else { "\(total)" }
+        note("mail", words, dataRoot: dataRoot)
     }
 
     func pulse(dataRoot: URL, now: Date) -> String {
-        guard let last = lock.withLock({ last }), last.root == dataRoot.standardizedFileURL.path else { return "mail" }
-        return "mail " + (last.unread.map { "\($0) unread of \(last.total)" } ?? "\(last.total)") + " (\(HerScreen.age(now.timeIntervalSince(last.at))) ago)"
+        guard let last = latest("mail", dataRoot: dataRoot) else { return "mail" }
+        return "mail " + last.words + " (\(HerScreen.age(now.timeIntervalSince(last.at))) ago)"
     }
 
     func notable(dataRoot: URL, now: Date) -> String? {
         guard AgentWorkspaceReadiness.allows(tool: "mail_search"),
-              let previews = lock.withLock({ previews }), previews.root == dataRoot.standardizedFileURL.path, !previews.text.isEmpty else { return nil }
-        return "Last Mail read (\(HerScreen.age(now.timeIntervalSince(previews.at))) ago); up to 4 previews, not a current inbox scan: " + previews.text
+              let previews = latest("mail.previews", dataRoot: dataRoot), !previews.words.isEmpty else { return nil }
+        return "Last Mail read (\(HerScreen.age(now.timeIntervalSince(previews.at))) ago); up to 4 previews, not a current inbox scan: " + previews.words
     }
 }

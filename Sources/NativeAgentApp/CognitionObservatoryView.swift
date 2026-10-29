@@ -1,10 +1,12 @@
 import Foundation
+import NativeAgentShared
 import EngineRuntime
 import Cognition
+import BackgroundLoops
 import TurnTrace
 import SwiftUI
 
-// Blueprint: | `CognitionObservatoryView.swift` | `CognitionObservatoryView`: research panel assembly, live dependency reads, override controls and persistence/feedback presentation |
+// Blueprint: | `CognitionObservatoryView.swift` | `CognitionObservatoryView`: live panel assembly, live dependency reads, override controls and persistence/feedback presentation |
 
 enum CognitionObservatoryPanelID: String, CaseIterable, Sendable {
     case controls
@@ -12,7 +14,6 @@ enum CognitionObservatoryPanelID: String, CaseIterable, Sendable {
     case workshop
     case organism
     case loop
-    case harness
     case workspace
     case associations
     case tensions
@@ -39,7 +40,7 @@ struct CognitionObservatoryView: View {
         @MainActor
         static func live(appModel: AppModel) -> Self {
             Self(
-                dataRoot: appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot(),
+                dataRoot: appModel.engine.dataRoot,
                 agentDisplayName: appModel.agentDisplayName,
                 systemToasts: appModel.systemToasts,
                 contextFlowHealth: { await appModel.engine.contextFlow.observatoryHealthState() }
@@ -50,53 +51,7 @@ struct CognitionObservatoryView: View {
     let cognition: CognitionViewFacade
     let runtime: NativeCognitionRuntime
     let dependencies: Dependencies
-    private var detail: CognitiveObservatoryDetail? {
-        get { cognition.detail }
-        nonmutating set { cognition.detail = newValue }
-    }
-    private var detailEvidenceStatus: CognitiveObservatoryDetailRead.EvidenceStatus? {
-        get { cognition.detailEvidenceStatus }
-        nonmutating set { cognition.detailEvidenceStatus = newValue }
-    }
-    private var contextFlowHealth: ContextFlowObservatoryHealthState {
-        get { cognition.contextFlowHealth }
-        nonmutating set { cognition.contextFlowHealth = newValue }
-    }
-    private var workshop: WorkshopObservatorySnapshot? {
-        get { cognition.workshop }
-        nonmutating set { cognition.workshop = newValue }
-    }
-    private var enabled: Bool {
-        get { cognition.enabled }
-        nonmutating set { cognition.enabled = newValue }
-    }
-    private var capsuleEnabled: Bool {
-        get { cognition.capsuleEnabled }
-        nonmutating set { cognition.capsuleEnabled = newValue }
-    }
-    private var backgroundEnabled: Bool {
-        get { cognition.backgroundEnabled }
-        nonmutating set { cognition.backgroundEnabled = newValue }
-    }
-    private var reflectionEnabled: Bool {
-        get { cognition.reflectionEnabled }
-        nonmutating set { cognition.reflectionEnabled = newValue }
-    }
-    private var organismEnabled: Bool {
-        get { cognition.organismEnabled }
-        nonmutating set { cognition.organismEnabled = newValue }
-    }
-    private var reflectionBudget: Int {
-        get { cognition.reflectionBudget }
-        nonmutating set { cognition.reflectionBudget = newValue }
-    }
     @State private var isRunningReflection = false
-    @State private var isRunningEvaluationSamplers = false
-    @State private var evaluationSamplerOutcome: CognitiveEvaluationSamplerOutcome?
-    private var lastRefresh: Date? {
-        get { cognition.lastRefresh }
-        nonmutating set { cognition.lastRefresh = newValue }
-    }
 
     init(
         cognition: CognitionViewFacade,
@@ -108,38 +63,35 @@ struct CognitionObservatoryView: View {
         self.dependencies = dependencies
     }
 
-    private var isRefreshing: Bool { cognition.isRefreshing }
-
-    private var initialStateLabel: String {
-        if case .receiptEvidenceUnavailable = detailEvidenceStatus { return "Unavailable" }
-        return "Loading…"
-    }
-
-    private var workspaceAblated: Bool { detail?.summary.ablations["workspace"] == false }
+    private var workspaceAblated: Bool { cognition.detail?.summary.ablations["workspace"] == false }
     private var affectPresentation: CognitionObservatoryAffectPresentation {
         CognitionObservatoryAffectPresentation(
-            configuration: detail?.configuration,
-            affect: detail?.summary.affect,
-            capsulePreviewInfo: detail?.capsulePreviewInfo
+            configuration: cognition.detail?.configuration,
+            affect: cognition.detail?.summary.affect,
+            capsulePreviewInfo: cognition.detail?.capsulePreviewInfo
         )
     }
 
     var body: some View {
+        let enabled = cognition.detail?.configuration.enabled ?? false
+        let reflectionEnabled = cognition.detail?.configuration.reflectiveCallsEnabled ?? false
+        let reflectionBudget = cognition.detail?.configuration.dailyReflectionCallBudget ?? 0
+        let organismEnabled = cognition.detail?.organism.enabled ?? false
         ScrollView {
             VStack(alignment: .leading, spacing: NativeAgentSpacing.lg) {
                 HStack {
                     Text("Cognition").font(NativeAgentFont.title).foregroundStyle(NativeAgentShell.text)
                     Spacer()
-                    StatusBadge(text: detail == nil ? initialStateLabel : (enabled ? "Enabled" : "Off"),
-                                status: detail == nil ? "pending" : (enabled ? "ok" : "warn"))
-                    if let lastRefresh {
+                    StatusBadge(text: cognition.detail == nil ? "Loading…" : (enabled ? "Enabled" : "Off"),
+                                status: cognition.detail == nil ? "pending" : (enabled ? "ok" : "warn"))
+                    if let lastRefresh = cognition.lastRefresh {
                         Text("updated \(lastRefresh, style: .time)")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
                 }
 
-                if case .receiptEvidenceUnavailable(let reason) = detailEvidenceStatus {
+                if case .unavailable(let reason) = cognition.detail?.receiptRead {
                     Label(
                         CognitionObservatoryPresentation.receiptEvidenceUnavailableText(reason),
                         systemImage: "exclamationmark.triangle.fill"
@@ -149,7 +101,7 @@ struct CognitionObservatoryView: View {
                 }
 
                 collapsible(.controls, title: "Controls", systemImage: "slider.horizontal.3", tint: .teal,
-                            hint: detail == nil ? initialStateLabel : (enabled ? "on" : "off")) {
+                            hint: cognition.detail == nil ? "Loading…" : (enabled ? "on" : "off")) {
                     VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
                         Toggle("Give me a thought summary", isOn: capsuleEnabledBinding)
                             .disabled(!enabled)
@@ -159,7 +111,7 @@ struct CognitionObservatoryView: View {
                             .disabled(!enabled || !reflectionEnabled)
                         // One home per switch: the inner life, reflection and
                         // moods are switched on Settings, and the master sets
-                        // ALL of these together; these are the research-console
+                        // ALL of these together; these are the Observatory
                         // overrides that live only here.
                         Text("An inner life, reflection and moods are switched in Settings \u{25B8} Inner life. Turning the inner life on or off there resets these too.")
                             .font(.caption2)
@@ -168,7 +120,7 @@ struct CognitionObservatoryView: View {
                             Button("Refresh", systemImage: "arrow.clockwise") {
                                 Task { await refresh() }
                             }
-                            .disabled(isRefreshing)
+                            .disabled(cognition.isRefreshing)
                             Button("Think now", systemImage: "waveform.path.ecg") {
                                 Task {
                                     await runtime.runMicrocycle(reason: "observatory manual run")
@@ -180,7 +132,6 @@ struct CognitionObservatoryView: View {
                                 Task {
                                     isRunningReflection = true
                                     let outcome = await runtime.runManualReflection()
-                                    _ = await runtime.observatoryDetailRead()
                                     CognitionObservatoryControlFeedback.publish(outcome, to: dependencies.systemToasts)
                                     await refresh()
                                     isRunningReflection = false
@@ -205,7 +156,6 @@ struct CognitionObservatoryView: View {
                             Button("Settle body", systemImage: "leaf") {
                                 Task {
                                     let outcome = await runtime.settleOrganismContinuityChecked()
-                                    _ = await runtime.observatoryDetailRead()
                                     CognitionObservatoryControlFeedback.publish(outcome, action: "settle", to: dependencies.systemToasts)
                                     await refresh()
                                 }
@@ -214,36 +164,11 @@ struct CognitionObservatoryView: View {
                             Button("Reset body", systemImage: "waveform.path.ecg.rectangle") {
                                 Task {
                                     let outcome = await runtime.resetOrganismContinuityChecked()
-                                    _ = await runtime.observatoryDetailRead()
                                     CognitionObservatoryControlFeedback.publish(outcome, action: "reset", to: dependencies.systemToasts)
                                     await refresh()
                                 }
                             }
                             .disabled(!enabled || !organismEnabled)
-                            Button("Run checks", systemImage: "checklist") {
-                                Task {
-                                    isRunningEvaluationSamplers = true
-                                    let outcome = await runtime.runResearchHarness()
-                                    evaluationSamplerOutcome = outcome
-                                    if outcome.isComplete {
-                                        dependencies.systemToasts.push(success: outcome.presentationText)
-                                    } else if outcome.isFailed {
-                                        dependencies.systemToasts.push(error: outcome.presentationText)
-                                    } else {
-                                        dependencies.systemToasts.push(info: outcome.presentationText)
-                                    }
-                                    await refresh()
-                                    isRunningEvaluationSamplers = false
-                                }
-                            }
-                            .disabled(!enabled || isRunningEvaluationSamplers)
-                            Button("Export", systemImage: "square.and.arrow.down") {
-                                Task {
-                                    _ = await runtime.exportResearchTrace()
-                                    await refresh()
-                                }
-                            }
-                            .disabled(!enabled)
                             Button("Leave workspace out", systemImage: "eye.slash") {
                                 Task {
                                     await runtime.setAblation("workspace", enabled: false)
@@ -264,20 +189,10 @@ struct CognitionObservatoryView: View {
                                 .font(.caption2)
                                 .foregroundStyle(.orange)
                         }
-                        if let evaluationSamplerOutcome {
-                            Label(
-                                evaluationSamplerOutcome.presentationText,
-                                systemImage: evaluationSamplerOutcome.isComplete
-                                    ? "checkmark.circle"
-                                    : "exclamationmark.triangle"
-                            )
-                            .font(.caption2)
-                            .foregroundStyle(evaluationSamplerOutcome.isComplete ? .green : .orange)
-                        }
                     }
                 }
 
-                if let detail {
+                if let detail = cognition.detail {
                     metrics(detail)
                     if detail.substrate.persistenceHealth.status == .degraded {
                         Label(
@@ -292,41 +207,30 @@ struct CognitionObservatoryView: View {
                         title: "Context flow",
                         systemImage: "arrow.triangle.branch",
                         tint: .cyan,
-                        hint: contextFlowHint(contextFlowHealth)
+                        hint: contextFlowHint(cognition.contextFlowHealth)
                     ) {
-                        ContextFlowObservatoryPanel(healthState: contextFlowHealth)
+                        ContextFlowObservatoryPanel(healthState: cognition.contextFlowHealth)
                     }
-                    // L11 (Desk→Workshop): the workshop's counts, cadence and
-                    // session receipts. Sourced from STORE QUERIES (liveState),
-                    // never the capped Desk projection. The VETO control and the
-                    // per-pursuit list it sat on moved to the primary Desk's item
-                    // row (item 36) — owner authority does not live behind the
-                    // developer gate.
+                    // Workshop diagnostics use live store queries; owner controls live on Desk item rows.
                     collapsible(
                         .workshop,
                         title: "Desk",
                         systemImage: "hammer",
                         tint: .purple,
-                        count: workshop?.model?.openPursuitCount,
-                        hint: workshop?.hint
+                        count: cognition.workshop?.model?.openPursuitCount,
+                        hint: cognition.workshop?.hint
                     ) {
-                        WorkshopObservatoryPanel(snapshot: workshop)
+                        WorkshopObservatoryPanel(snapshot: cognition.workshop)
                     }
                     collapsible(.organism, title: "Body signals", systemImage: "waveform.path.ecg", tint: .green,
                                 hint: Self.organismHint(detail.organism)) {
                         organism(detail.organism)
                     }
-                    // Every readout group collapses to one clickable header row
-                    // (User, 2026-07-03) — the badge/hint says whether there's
-                    // anything alive inside without opening it.
+                    // Collapsed readout headers show whether their group has activity.
                     collapsible(.loop, title: "Loop activity", systemImage: "clock.arrow.circlepath", tint: .teal,
                                 count: CognitionLoopActivityPresentation.receiptCount(for: detail.receiptRead),
                                 hint: CognitionLoopActivityPresentation.collapsedHint(for: detail.receiptRead)) {
                         loopActivity(detail.receiptRead)
-                    }
-                    collapsible(.harness, title: "Research checks", systemImage: "testtube.2", tint: .orange,
-                                hint: detail.welfareBounds.withinBounds ? "bounded" : "attention") {
-                        researchHarness(detail)
                     }
                     collapsible(.workspace, title: "Workspace", systemImage: "rectangle.3.group", tint: .blue,
                                 count: detail.workspace.items.count) {
@@ -343,10 +247,6 @@ struct CognitionObservatoryView: View {
                                 hint: affectPresentation.collapsedHint) {
                         affect(affectPresentation)
                     }
-                    // Predictions/commitments panels were removed with the underlying
-                    // task-tracking machinery (fully deleted 2026-07-01) — task-tracking is
-                    // out of Agent's cognition (User, 2026-06-30). Her cognition is
-                    // feelings/views/continuity, not a to-do.
                     collapsible(.timeline, title: "How I have grown", systemImage: "timeline.selection", tint: .pink,
                                 count: detail.developmentalTimeline.count) {
                         developmentalTimeline(detail.developmentalTimeline, week: detail.growthWeek)
@@ -367,8 +267,7 @@ struct CognitionObservatoryView: View {
                     }
                     NativeEmptyState(
                         title: "Cognition",
-                        detail: isRefreshing ? "Loading." : "Nothing has loaded yet.",
-                        systemImage: "brain.head.profile"
+                        detail: cognition.isRefreshing ? "Loading." : "Nothing has loaded yet."
                     )
                 }
 
@@ -381,14 +280,10 @@ struct CognitionObservatoryView: View {
             }
             .padding(NativeAgentSpacing.xl)
         }
-        // Embedded as the Diagnostics ▸ Cognition segment (B2.4): Diagnostics
-        // owns the navigation chrome, so no navigationTitle/toolbar here. The
-        // Controls panel already carries a Refresh button.
+        // Diagnostics owns navigation; Controls carries Refresh.
         .task(id: expandedPanels.contains(CognitionObservatoryPanelID.workshop.rawValue)) {
             let changes = await cognition.changes()
-            // Subscribe before the initial read. A cognition event that lands
-            // while refresh is in flight is then buffered instead of being
-            // lost between the old polling replacement's read and watch arm.
+            // Subscribe before reading so changes during refresh are buffered.
             await refresh()
             for await _ in changes {
                 guard !Task.isCancelled else { return }
@@ -400,22 +295,22 @@ struct CognitionObservatoryView: View {
     }
 
     private var capsuleEnabledBinding: Binding<Bool> {
-        Binding(get: { capsuleEnabled }, set: { value in
-            capsuleEnabled = value
+        Binding(get: { cognition.detail?.configuration.capsuleInjectionEnabled ?? false }, set: { value in
+            cognition.detail?.configuration.capsuleInjectionEnabled = value
             Task { await runtime.setCapsuleEnabled(value); await refresh() }
         })
     }
 
     private var backgroundEnabledBinding: Binding<Bool> {
-        Binding(get: { backgroundEnabled }, set: { value in
-            backgroundEnabled = value
+        Binding(get: { cognition.detail?.configuration.backgroundMicrocyclesEnabled ?? false }, set: { value in
+            cognition.detail?.configuration.backgroundMicrocyclesEnabled = value
             Task { await runtime.setBackgroundEnabled(value); await refresh() }
         })
     }
 
     private var reflectionBudgetBinding: Binding<Int> {
-        Binding(get: { reflectionBudget }, set: { value in
-            reflectionBudget = value
+        Binding(get: { cognition.detail?.configuration.dailyReflectionCallBudget ?? 0 }, set: { value in
+            cognition.detail?.configuration.dailyReflectionCallBudget = value
             Task { await runtime.setReflectionBudget(value); await refresh() }
         })
     }
@@ -459,7 +354,7 @@ struct CognitionObservatoryView: View {
     }
 
     /// Same card chrome as NativePanel, but the header row is the disclosure
-    /// control: count badge + optional pending badge + a one-line hint while
+    /// control: count badge + a one-line hint while
     /// collapsed, chevron flips on expand. Panel ids must not contain commas.
     private func collapsible<Content: View>(
         _ id: CognitionObservatoryPanelID,
@@ -467,7 +362,6 @@ struct CognitionObservatoryView: View {
         systemImage: String,
         tint: Color,
         count: Int? = nil,
-        pending: Int = 0,
         hint: String? = nil,
         @ViewBuilder content: @escaping () -> Content
     ) -> some View {
@@ -476,7 +370,7 @@ struct CognitionObservatoryView: View {
             raw: hint,
             isExpanded: isExpanded
         )
-        return NativePanel(title: nil, systemImage: nil, tint: tint) {
+        return NativePanel(title: nil) {
             VStack(alignment: .leading, spacing: isExpanded ? NativeAgentSpacing.md : 0) {
                 Button {
                     togglePanel(id.rawValue)
@@ -488,16 +382,8 @@ struct CognitionObservatoryView: View {
                             .font(NativeAgentFont.section)
                             .foregroundStyle(.primary)
                         CognitionObservatoryCountBadge(count: count, tint: tint)
-                        if pending > 0 {
-                            Text("\(pending) pending")
-                                .font(.caption2.weight(.semibold))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Capsule().fill(Color.orange.opacity(0.18)))
-                                .foregroundStyle(.orange)
-                        }
                         if let collapsedHint {
-                            Text(collapsedHint.text)
+                            Text(collapsedHint)
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
@@ -514,7 +400,6 @@ struct CognitionObservatoryView: View {
                 .accessibilityLabel(CognitionObservatoryCollapsedRowPresentation.accessibilityLabel(
                     title: title,
                     count: count,
-                    pending: pending,
                     hint: collapsedHint
                 ))
                 .accessibilityValue(isExpanded ? "Expanded" : "Collapsed")
@@ -563,12 +448,7 @@ struct CognitionObservatoryView: View {
 enum CognitionObservatoryCollapsedRowPresentation {
     static let maximumVisibleHintCharacters = 96
 
-    struct Hint: Equatable {
-        let text: String
-        let isTruncated: Bool
-    }
-
-    static func hint(raw: String?, isExpanded: Bool) -> Hint? {
+    static func hint(raw: String?, isExpanded: Bool) -> String? {
         guard !isExpanded,
               let raw else { return nil }
         let normalized = raw
@@ -576,30 +456,23 @@ enum CognitionObservatoryCollapsedRowPresentation {
             .joined(separator: " ")
         guard !normalized.isEmpty else { return nil }
         guard normalized.count > maximumVisibleHintCharacters else {
-            return Hint(text: normalized, isTruncated: false)
+            return normalized
         }
-        return Hint(
-            text: String(normalized.prefix(maximumVisibleHintCharacters)) + "…",
-            isTruncated: true
-        )
+        return String(normalized.prefix(maximumVisibleHintCharacters)) + "…"
     }
 
     static func accessibilityLabel(
         title: String,
         count: Int?,
-        pending: Int,
-        hint: Hint?
+        hint: String?
     ) -> String {
         var parts = [title]
         if let badge = CognitionObservatoryCountBadgePresentation.badge(for: count) {
             let count = badge.count
             parts.append("\(count) item\(count == 1 ? "" : "s")")
         }
-        if pending > 0 {
-            parts.append("\(pending) pending")
-        }
         if let hint {
-            parts.append(hint.text)
+            parts.append(hint)
         }
         return parts.joined(separator: ", ")
     }
@@ -623,11 +496,11 @@ enum CognitionObservatoryPresentation {
 
 @MainActor
 enum CognitionObservatoryControlFeedback {
-    static func publish(_ outcome: CognitiveBackgroundRunOutcome, to toasts: SystemToastCenter) {
+    static func publish(_ outcome: LoopTickOutcome, to toasts: SystemToastCenter) {
         switch outcome {
         case .completed:
             toasts.push(success: "Reflection recorded.")
-        case .skipped(let reason):
+        case .skipped(let reason, _):
             toasts.push(info: "Reflection skipped: \(reason)")
         case .failed(let reason):
             toasts.push(error: "Reflection failed: \(reason)")

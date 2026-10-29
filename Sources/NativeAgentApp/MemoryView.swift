@@ -18,61 +18,22 @@ import CloudKit
 import DeviceSync
 #endif
 
-// Blueprint: | `MemoryView.swift` | Memory page upkeep/status components: canonical consolidate/hygiene/Spotlight actions, full text and explicit storage/embedder availability |
+// Blueprint: | `MemoryView.swift` | Memory page upkeep/status components: canonical Spotlight actions, full text and explicit storage/embedder availability |
 
-@MainActor
-@Observable
-final class MemoryMenuActionController {
-    enum Action: Equatable {
-        case consolidate
-        case hygiene
-    }
-
-    var runningAction: Action?
-    var feedback: MemoryMenuActionFeedback?
-
-    func run(_ action: Action, appModel: AppModel) async {
-        guard runningAction == nil else { return }
-        feedback = nil
-        runningAction = action
-        defer { runningAction = nil }
-        switch action {
-        case .consolidate:
-            feedback = await appModel.consolidateMemory()
-        case .hygiene:
-            feedback = await appModel.runMemoryHygiene()
-        }
-    }
-}
-
-/// The memory store's upkeep and its status, as one fold at the foot of the
-/// Memories page: consolidate, tidy (hygiene), rebuild the Spotlight index,
-/// check again, and the status block with its Advanced diagnostics. The same
-/// calls, the same operations and the same status panel the classic Memory
-/// page carried in its Actions menu and header.
 struct MemoryUpkeepPanel: View {
     @Environment(AppModel.self) private var appModel
-    @State private var menuActionController = MemoryMenuActionController()
     @State private var spotlightStatus: String?
     @State private var isReindexing = false
     @State private var isRefreshing = false
     @State private var refreshNotice: MemoryToolbarRefreshPresentation?
 
-    private var busy: Bool { menuActionController.runningAction != nil || isReindexing || isRefreshing }
+    private var busy: Bool { isReindexing || isRefreshing }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             EmbeddingModelDownloadRow()
 
             HStack(spacing: 8) {
-                Button(menuActionController.runningAction == .consolidate ? "Consolidating…" : "Consolidate now") {
-                    Task { await menuActionController.run(.consolidate, appModel: appModel) }
-                }
-                .accessibilityIdentifier("memories.upkeep.consolidate")
-                Button(menuActionController.runningAction == .hygiene ? "Tidying…" : "Run hygiene") {
-                    Task { await menuActionController.run(.hygiene, appModel: appModel) }
-                }
-                .accessibilityIdentifier("memories.upkeep.hygiene")
                 Button(isReindexing ? "Reindexing Spotlight…" : "Reindex Spotlight") {
                     Task { await reindexSpotlight() }
                 }
@@ -99,12 +60,11 @@ struct MemoryUpkeepPanel: View {
             MemoryV2NativeStackPanel(
                 snapshot: appModel.engine.memory.diagnostics,
                 summaryStatus: appModel.engine.memory.status,
-                latestHygiene: appModel.latestMemoryHygiene,
                 isReindexing: isReindexing,
                 onReindex: { Task { await reindexSpotlight() } }
             )
         }
-        // Fast mode warms MiniLM at process launch. Follow that one startup
+        // Fast mode warms bge at process launch. Follow that one startup
         // attempt for at most ten seconds and read only runtime state; the
         // full memory/Spotlight snapshot is intentionally not rescanned.
         .task { await appModel.engine.memory.refreshEmbeddingDiagnostics() }
@@ -113,9 +73,6 @@ struct MemoryUpkeepPanel: View {
     /// Every result line the upkeep has to say, in the order it happened.
     private var notices: [(text: String, adverse: Bool)] {
         var lines: [(text: String, adverse: Bool)] = []
-        if let feedback = menuActionController.feedback {
-            lines.append((feedback.message, feedback.isAdverse))
-        }
         if let spotlightStatus, !spotlightStatus.isEmpty {
             lines.append((spotlightStatus, false))
         }
@@ -124,10 +81,6 @@ struct MemoryUpkeepPanel: View {
         }
         if appModel.engine.memory.statusRefresh?.isStale == true {
             lines.append((MemoryToolbarRefreshPresentation.resolve(staleNotice: nil, storageReadable: false).text, true))
-        }
-        // F2: a disabled hygiene / consolidate says so instead of a fake success.
-        if let disabled = appModel.memoryFeatureDisabledMessage, !disabled.isEmpty {
-            lines.append((disabled, true))
         }
         return lines
     }
@@ -151,16 +104,11 @@ struct MemoryUpkeepPanel: View {
     private func reindexSpotlight() async {
         isReindexing = true
         defer { isReindexing = false }
-        let dataRoot = appModel.dataRootOverride ?? PersistenceCore.defaultDataRoot()
-        let outcome = await MemorySpotlightReindexOperation.run(dataRoot: dataRoot)
+        let outcome = await MemorySpotlightReindexOperation.run(dataRoot: appModel.engine.dataRoot)
         spotlightStatus = outcome.userMessage
         // The status line and count must be read after the durable result, not
         // retained from before a delete-and-rebuild attempt.
         await appModel.engine.memory.refreshDiagnostics()
-    }
-
-    static func localTimestamp(_ iso: String) -> String {
-        UserDisplayFormatters.mediumDateTime(iso)
     }
 }
 
@@ -210,27 +158,23 @@ struct MemoryFullTextView: View {
 /// receipt because zero is meaningful only after the store was actually read.
 struct MemoryToolbarRefreshPresentation: Equatable {
     let text: String
-    let systemImage: String
     let isAdverse: Bool
 
     static func resolve(staleNotice: String?, storageReadable: Bool?) -> Self {
         if storageReadable == false {
             return Self(
                 text: "Saved memories could not be read. Existing memory data is shown only where it was already loaded.",
-                systemImage: "exclamationmark.triangle",
                 isAdverse: true
             )
         }
         if let staleNotice, !staleNotice.isEmpty {
             return Self(
                 text: staleNotice,
-                systemImage: "exclamationmark.triangle",
                 isAdverse: true
             )
         }
         return Self(
             text: "Memory refreshed.",
-            systemImage: "arrow.clockwise",
             isAdverse: false
         )
     }
@@ -315,8 +259,6 @@ extension MemoryV2NativeStackSnapshot.EmbedderHealth {
 
 // MARK: - Plain-English memory status copy
 //
-// UI-5 (2026-08-01, public era): pure string helpers so the honesty copy is
-// unit-testable without a UI snapshot harness. Values in, Strings out.
 enum MemoryStatusPlainCopy {
     enum StorageAvailability: Equatable {
         case checking
@@ -483,21 +425,15 @@ enum MemoryStatusPlainCopy {
 
 private struct MemoryV2NativeStackPanel: View {
     let snapshot: MemoryV2NativeStackSnapshot
-    // 2026-07-23 B2.5b: summary counts/backend/hygiene folded in from the
-    // former standalone MemoryV2SummaryBar so this panel is the ONE Memory
-    // status block. Optional so the panel still renders on a fresh install.
+    // Optional so the panel still renders on a fresh install.
     var summaryStatus: MemoryV2Status? = nil
-    var latestHygiene: MemoryHygieneReport? = nil
     let isReindexing: Bool
     let onReindex: () -> Void
     // Collapsed by default; mirrors the Advanced disclosures in TrustCenterView
     // and MacControlPermissionsView.
     @State private var showAdvancedDiagnostics = false
 
-    // UI-5 (public-user honesty, 2026-08-01): the panel used to open on SQLite,
-    // Core ML, CoreSpotlight, CloudKit and a data-root path. A person who did
-    // not build this app has no way to read that. Plain status leads; every
-    // backend row still ships inside Advanced Diagnostics.
+    // Plain status leads; backend details remain in Advanced Diagnostics.
     private var storageAvailability: MemoryStatusPlainCopy.StorageAvailability {
         MemoryStatusPlainCopy.storageAvailability(
             status: summaryStatus?.status,
@@ -512,16 +448,8 @@ private struct MemoryV2NativeStackPanel: View {
         )
     }
 
-    private var healthTint: Color {
-        switch statusText {
-        case "ok": return .green
-        case "failed": return .red
-        default: return .orange
-        }
-    }
-
     var body: some View {
-        NativePanel(title: "Memory Status", systemImage: "brain.head.profile", tint: healthTint) {
+        NativePanel(title: "Memory Status") {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(alignment: .firstTextBaseline) {
                     InlineStatusDot(status: statusText)
@@ -594,7 +522,7 @@ private struct MemoryV2NativeStackPanel: View {
     @ViewBuilder
     private var advancedDiagnostics: some View {
         VStack(alignment: .leading, spacing: 8) {
-            MemoryV2SummaryBar(status: summaryStatus, latest: latestHygiene)
+            MemoryV2SummaryBar(status: summaryStatus)
             HStack(spacing: 12) {
                 stackRow(
                     icon: "cylinder.split.1x2",
@@ -609,19 +537,12 @@ private struct MemoryV2NativeStackPanel: View {
                         ? .red
                         : (snapshot.sqliteRecordCount > 0 ? .green : .secondary)
                 )
-                    // 2026-06-07: at-a-glance embedder health. the user asked
-                    // for a clear "tell me if it's not working" indicator.
-                    //   green  = inference running, N successful loads
-                    //   orange = resources reachable but model not loaded yet
-                    //   red    = lastLoadError set OR resources missing
-                    // detail shows model + dimensions; on broken state the
-                    // detail surfaces the actual error message so the user
-                    // can see exactly what went wrong.
+                    // Embedder health distinguishes running, unloaded and broken states with their actual errors.
                     stackRow(
                         icon: snapshot.embedderHealth.needsAttention
                             ? "exclamationmark.triangle.fill"
                             : "cpu",
-                        title: "Core ML MiniLM",
+                        title: "Core ML bge-large",
                         value: snapshot.embedderHealth.label,
                         detail: "\(snapshot.embedderDimensions)-d · \(snapshot.coreMLModelLabel)",
                         tint: {
@@ -695,63 +616,9 @@ private struct MemoryV2NativeStackPanel: View {
 
 private struct MemoryV2SummaryBar: View {
     let status: MemoryV2Status?
-    let latest: MemoryHygieneReport?
 
     private var counts: MemoryV2Counts? { status?.counts }
     private var backend: String { status?.embedding?.activeBackend ?? "unknown" }
-    private var hygieneText: String {
-        if let latest {
-            return Self.hygieneText(for: latest)
-        }
-        if let h = status?.hygiene {
-            return Self.hygieneText(for: h)
-        }
-        return "hygiene scheduled"
-    }
-
-    private static func hygieneText(for report: MemoryHygieneReport) -> String {
-        let before = report.beforeCount ?? report.afterCount ?? 0
-        let processed = report.normalized ?? 0
-        let merged = report.archivedDuplicates ?? 0
-        let archived = report.archivedReflections ?? 0
-        let accepted = report.distilledFactsAdded ?? 0
-        let decayed = report.decayedMemories ?? 0
-        let changed = merged + archived + accepted + decayed
-        let runLabel = report.createdAt.map { "last hygiene \(MemoryUpkeepPanel.localTimestamp($0))" } ?? "last hygiene"
-        let scanned = "scanned \(before) \(before == 1 ? "memory" : "memories") / \(processed) \(processed == 1 ? "proposal" : "proposals")"
-        var parts: [String] = []
-        if merged > 0 { parts.append("merged \(merged)") }
-        if archived > 0 { parts.append("archived \(archived)") }
-        if accepted > 0 { parts.append("accepted \(accepted)") }
-        if decayed > 0 { parts.append("decayed \(decayed)") }
-        // Honest-status fix (2026-07-24): a staged run planned work on a
-        // candidate; it is not applied until the Activity card is approved.
-        if report.status == "staged" {
-            let planned = parts.isEmpty ? "changes" : parts.joined(separator: ", ")
-            return "\(runLabel): staged \(planned) for approval" + nextSuffix(for: report)
-        }
-        if report.status == "refused" {
-            return "\(runLabel): probe gate refused to stage" + nextSuffix(for: report)
-        }
-        if report.status == "failed" {
-            return "\(runLabel): failed; no consolidation changes applied"
-        }
-        if report.status == "projection_failed" {
-            let applied = parts.isEmpty ? "changes applied" : parts.joined(separator: ", ")
-            return "\(runLabel): \(applied); projection reconciliation failed, retry pending"
-        }
-        if changed == 0 {
-            return "\(runLabel): \(scanned), no cleanup needed" + nextSuffix(for: report)
-        }
-        return "\(runLabel): \(scanned), \(parts.joined(separator: ", "))" + nextSuffix(for: report)
-    }
-
-    // Taste pass 2026-07-24: the next-scheduled stamp used to live on a second
-    // hygiene line below the tab picker; it belongs in this panel's single
-    // status line (B2.5b: one memory status block).
-    private static func nextSuffix(for report: MemoryHygieneReport) -> String {
-        report.nextScheduled.map { " · next \(MemoryUpkeepPanel.localTimestamp($0))" } ?? ""
-    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -778,9 +645,6 @@ private struct MemoryV2SummaryBar: View {
                         .foregroundStyle(status?.embedding?.realSemanticAvailable == true ? .green : .orange)
                 }
                 .font(.caption)
-                Text(hygieneText)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
             }
         }
         .padding(10)

@@ -8,7 +8,7 @@ import AuthoredCapabilities
 import Desk
 import ChatSessionWork
 import ProviderRouting
-// Blueprint: | `ChatOrchestrationClient+EphemeralToolTurn.swift` | `SwiftNativeChatOrchestrationClient`: `runEphemeralToolTurn`, `runPartToolTurn`; prepared part messages enter the same canonical loop and admitted routing with caller limits, restricted tools and taint, without persona/recall assembly, parent checkpoints or after-turn mind work; explicit part-thought surfaces admit their saved route without the parent's ProviderTurnChoice, omitted surfaces inherit; PartToolThinkingContext marks only that internal thought |
+// Blueprint: | `ChatOrchestrationClient+EphemeralToolTurn.swift` | `SwiftNativeChatOrchestrationClient`: `runEphemeralToolTurn`, `runPartToolTurn`; prepared part messages enter the same canonical loop and admitted routing with caller limits, restricted tools and taint, without persona/recall assembly, parent checkpoints or after-turn mind work; every exit joins answer/heard settlement with retained prose and dispatch artifacts; interrupted errors keep partial output and distinguish Stop; explicit part-thought surfaces admit their saved route without the parent's ProviderTurnChoice, omitted surfaces inherit; PartToolThinkingContext marks only that internal thought |
 
 /// An internal thought owns no reply or after-turn mind work. It uses the
 /// canonical loop and inherits its caller's gates, taint and remaining limits.
@@ -60,9 +60,11 @@ extension SwiftNativeChatOrchestrationClient {
                 face: Self.face(text(last), []), addressedTo: ["her"], owes: ["answer": .init(to: "caller")])
             let began = ExperienceStore.record(root, thought) { try await $0.begin(heard) }
             await began.value
-            var produced = ""
+            let observation = ToolLoopTraceObservation()
+            var produced: TurnEngineResult?
             do {
-            let result = try await PartToolThinkingContext.$active.withValue(true) {
+            let result = try await ToolLoopTraceObservation.$current.withValue(observation) {
+            try await PartToolThinkingContext.$active.withValue(true) {
             try await TurnTraceContext.$turnId.withValue(thought) {
             try await LLMCallContext.$sessionId.withValue(thought) {
             try await ConversationPrefixTelemetry.$sink.withValue(.unmeasuredRequestShape) {
@@ -74,37 +76,28 @@ extension SwiftNativeChatOrchestrationClient {
                 try await engine.executeTurnWithStreamingToolLoop(surface: surface, userMessage: text(last),
                     toolSessionId: ChatToolSessionContext.verifiedSessionId, llm: client,
                     tools: tools, preBuiltContext: context, fileAccess: ChatToolSessionContext.fileAccess ?? "auto")
-            } } } } } } } } }
-            produced = result.reply
+            } } } } } } } } } }
+            produced = result
             guard result.completionState == .completed else {
                 throw EphemeralToolTurnIncomplete(output: result.reply, reason: "The part thought did not complete.")
             }
             try Task.checkCancellation()
-            let answer = produced
-            await settle {
-                await Self.recordAnswer(id: Experience.answer(run: thought), heardID: thought,
-                    evidence: nil, state: .completed, dataRoot: root) {
-                    Experience(id: Experience.answer(run: thought), kind: .answer, cause: [thought], face: Self.face(answer, []))
-                }
-            }
+            await Self.settleEphemeralAnswer(runID: thought, output: result.reply,
+                dispatches: result.toolDispatches, state: .completed, dataRoot: root)
             return result.reply
             } catch {
-                let answer = produced
-                let state: TurnEngineResult.TerminalState = Task.isCancelled || error is CancellationError ? .stopped : .failed
-                await settle {
-                    await Self.recordAnswer(id: Experience.answer(run: thought), heardID: thought,
-                        evidence: nil, state: state, dataRoot: root) {
-                        Experience(id: Experience.answer(run: thought), kind: .answer, cause: [thought], face: Self.face(answer, []))
-                    }
-                }
-                throw error
+                let failure = Self.ephemeralFailure(error, produced: produced, observation: observation)
+                await Self.settleEphemeralAnswer(runID: thought, output: failure.output,
+                    dispatches: produced?.toolDispatches ?? observation.toolDispatches,
+                    state: failure.state, dataRoot: root)
+                throw failure.error
             }
         }
         if requestedSurface == nil, LLMCallContext.admittedModel != nil { return try await run() }
         // An explicit surface owns its saved route; a parent's per-turn pick
         // applies only when this thought did not select a surface of its own.
         let route = try await ProviderTurnChoice.$current.withValue(requestedSurface == nil ? ProviderTurnChoice.current : nil) {
-            try await engine.checkedRouteAdmission(for: surface)
+            try await engine.router.checkedRouteAdmission(for: surface)
         }
         return try await withModelContext(route, surface: surface, run)
     }
@@ -127,8 +120,7 @@ extension SwiftNativeChatOrchestrationClient {
         surface: String,
         providerAdmission: (@Sendable () async throws -> Void)? = nil
     ) async throws -> ChatResponse {
-        // P2-3: fold before anything derives from it (projection session id,
-        // autonomy resolution, the provider-facing surface).
+        // Fold the surface before deriving identity, authority or provider routing.
         let surface = WorkshopSurfaceVocabulary.foldLegacySpelling(surface)
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty && attachments.isEmpty {
@@ -136,9 +128,7 @@ extension SwiftNativeChatOrchestrationClient {
         }
 
         let runId = UUID().uuidString
-        // 2026-09-06: the Trust ▸ Multimodal gates apply on every lane that can
-        // carry an attachment, not just the chat ones — otherwise "Allow vision
-        // API calls" off is defeated by an execution turn.
+        // Trust's multimodal gates apply to every surface that carries attachments.
         let attachmentInput = try Self.turnAttachmentInput(
             message: message, attachments: attachments, dataRoot: dataRoot)
         let imageBlocks = attachmentInput.imageBlocks
@@ -170,16 +160,11 @@ extension SwiftNativeChatOrchestrationClient {
                 sessionId: projectionSessionId,
                 runId: runId
             )
-            let (contextWithCognition, pendingProjectionCommit) = await Self.contextByAppendingCognitiveCapsule(
+            let contextWithCognition = await Self.contextByAppendingCognitiveCapsule(
                 to: context,
-                surface: surface,
-                userMessage: message,
-                runId: runId,
-                sessionId: projectionSessionId,
-                fileAccess: fileAccess,
-                projection: cognitiveProjection
+                projection: cognitiveProjection?.projection
             )
-            return (contextWithCognition ?? context, pendingProjectionCommit)
+            return (contextWithCognition, cognitiveProjection)
         }
         // A caller that supplies any part of its route has that whole route
         // admitted once, before anything sizes against it (context, packet
@@ -188,7 +173,7 @@ extension SwiftNativeChatOrchestrationClient {
         // route it was called under, as it always has.
         var route: TurnRouteAdmission?
         if !modelOverride.isEmpty || !effortOverride.isEmpty || !providerOverride.isEmpty || serviceTierOverride != nil {
-            let surfaceRoute = try await engine.checkedRouteAdmission(for: surface, suppliedModel: modelOverride)
+            let surfaceRoute = try await engine.router.checkedRouteAdmission(for: surface, suppliedModel: modelOverride)
             route = TurnRouteAdmission(
                 routingSurface: surfaceRoute.routingSurface,
                 modelId: modelOverride.isEmpty ? surfaceRoute.modelId : modelOverride,
@@ -203,9 +188,7 @@ extension SwiftNativeChatOrchestrationClient {
             try await prepare()
         }
         let requestTools = Set(projectedContext.toolSchemas.map(\.name))
-        // 2026-09-18: restricted non-chat surfaces keep their narrower trust
-        // source and no first-conversation exemption (Sol P0-1); default
-        // ephemeral callers retain the ordinary chat chain's exemption.
+        // Restricted non-chat surfaces retain narrower trust without the first-conversation exemption; default callers keep it.
         let gated = makeGatedToolDispatchClient(
             tools: tools,
             fileAccess: fileAccess,
@@ -224,23 +207,18 @@ extension SwiftNativeChatOrchestrationClient {
         let heard = Experience(id: runId, kind: .heard, cause: TurnTraceContext.turnId.map { [$0] } ?? [],
                                face: Self.face(message, []), addressedTo: ["her"],
                                owes: ["answer": .init(to: "caller")])
-        ExperienceStore.record(dataRoot, runId) { store in
+        let began = ExperienceStore.record(dataRoot, runId) { store in
             try await store.begin(heard)
             try await store.append([.evidence(.init(source: "runtime", id: ExperienceStore.processID))], to: runId)
         }
-        var answered = false
-        defer {
-            if !answered {
-                ExperienceStore.record(dataRoot, runId) { store in
-                    try await store.append([.letGo(key: "answer", reason: .failed)], to: runId)
-                }
-            }
-        }
+        await began.value
+        let observation = ToolLoopTraceObservation()
         let result: TurnEngineResult
         do {
             // Images and pending tool state belong to this worker's context,
             // never the parent turn or another worker that inherited it.
-            result = try await ChatTurnExecution.$current.withValue(ChatTurnExecution()) {
+            result = try await ToolLoopTraceObservation.$current.withValue(observation) {
+            try await ChatTurnExecution.$current.withValue(ChatTurnExecution()) {
             try await PeerDataTaint.withScope {
             try await TurnTraceContext.$bus.withValue(turnTraceBus) {
             try await TurnTraceContext.$turnId.withValue(runId) {
@@ -256,6 +234,7 @@ extension SwiftNativeChatOrchestrationClient {
                     llm: llm,
                     tools: gated,
                     preBuiltContext: projectedContext,
+                    onDelivery: { await self.commitDeliveredCognitiveTurnProjection(pendingProjectionCommit, turnId: runId) },
                     providerAdmission: providerAdmission,
                     fileAccess: fileAccess
                 )
@@ -265,44 +244,27 @@ extension SwiftNativeChatOrchestrationClient {
             }
             }
             }
-        } catch TurnEngineError.streamCancelled {
-            // No one watched this turn stream and it has no transcript to keep
-            // a partial in, so a stop is a plain cancellation to its caller.
-            throw CancellationError()
-        } catch TurnEngineError.streamInterrupted(_, let underlying) {
-            // Likewise: the caller gets the provider failure itself.
-            throw underlying
+            }
+        } catch {
+            let failure = Self.ephemeralFailure(error, produced: nil, observation: observation)
+            await Self.settleEphemeralAnswer(runID: runId, output: failure.output,
+                dispatches: observation.toolDispatches, state: failure.state, dataRoot: dataRoot)
+            throw failure.error
         }
-        // R-F1: commit the projection only after the provider accepted the turn
-        // (a throw above skips this, leaving the suppress window unconsumed).
-        await commitDeliveredCognitiveTurnProjection(
-            pendingProjectionCommit,
-            surface: surface,
-            userMessage: message,
-            sessionId: projectionSessionId,
-            turnId: runId
-        )
+        let state = Task.isCancelled ? TurnEngineResult.TerminalState.stopped
+            : result.resolvedTerminalReason(dataRoot: dataRoot).state
+        let generatedAttachments = await Self.settleEphemeralAnswer(runID: runId, output: result.reply,
+            dispatches: result.toolDispatches, state: state, dataRoot: dataRoot)
+        if state == .stopped {
+            throw TurnEngineError.streamCancelled(partial: result.reply, underlying: CancellationError())
+        }
         if requireCompleted, result.completionState != .completed {
             throw EphemeralToolTurnIncomplete(
                 output: result.reply,
                 reason: "worker tool turn ended without a completed final reply; retained output is partial and attempted effects remain unverified"
             )
         }
-        // The worker lane has no transcript row to settle, so its own promotion
-        // starts here and runs on its own; the answer never waits for it. By
-        // ticket, so a concurrent chat turn's pending capture is never adopted.
-        await engine.startDeferredMemoryPromotion(ticket: result.memoryPromotionTicket)
-        result.afterReply?.start()
-        let generatedAttachments = ChatGeneratedImageArtifacts.attachments(
-            from: result.toolDispatches,
-            dataRoot: dataRoot
-        )
-        // Its answer goes back to its caller; it has no transcript row to stand on.
-        await Self.recordAnswer(id: Experience.answer(run: runId), heardID: runId, evidence: nil,
-                          state: result.resolvedTerminalReason(dataRoot: dataRoot).state, dataRoot: dataRoot) { [reply = result.reply] in
-            Experience(id: Experience.answer(run: runId), kind: .answer, cause: [runId], face: Self.face(reply, generatedAttachments))
-        }
-        answered = true
+        await result.afterReply?.start()
         return ChatResponse(
             runId: runId,
             model: result.modelUsed,
@@ -317,4 +279,42 @@ extension SwiftNativeChatOrchestrationClient {
             terminalState: result.resolvedTerminalReason(dataRoot: dataRoot).state
         )
     }
+
+    /// Keep the canonical partial-output error carriers instead of translating
+    /// them into errors that have no place for the produced answer.
+    private static func ephemeralFailure(_ error: any Error, produced: TurnEngineResult?,
+        observation: ToolLoopTraceObservation
+    ) -> (output: String, state: TurnEngineResult.TerminalState, error: any Error) {
+        let partial: String
+        let underlying: any Error
+        let stopped: Bool
+        switch error {
+        case TurnEngineError.streamCancelled(let text, let cause):
+            partial = text; underlying = cause; stopped = true
+        case TurnEngineError.streamInterrupted(let text, let cause):
+            partial = text; underlying = cause; stopped = Task.isCancelled
+        default:
+            partial = (error as? EphemeralToolTurnIncomplete)?.output ?? observation.partialReply
+            underlying = error; stopped = Task.isCancelled || error is CancellationError
+        }
+        let output = produced?.reply ?? partial
+        let retained: any Error
+        if stopped { retained = TurnEngineError.streamCancelled(partial: output, underlying: underlying) }
+        else if let incomplete = error as? EphemeralToolTurnIncomplete { retained = incomplete }
+        else { retained = TurnEngineError.streamInterrupted(partial: output, underlying: underlying) }
+        return (output, stopped ? .stopped : .failed, retained)
+    }
+
+    @discardableResult
+    private static func settleEphemeralAnswer(runID: String, output: String,
+        dispatches: [TurnEngineResult.ToolDispatchRecord], state: TurnEngineResult.TerminalState, dataRoot: URL
+    ) async -> [MultimodalAttachment] {
+        let attachments = ChatGeneratedImageArtifacts.attachments(from: dispatches, dataRoot: dataRoot)
+        await settle {
+            await recordAnswer(runID: runID, heardID: runID, evidence: nil, state: state,
+                dataRoot: dataRoot, words: output, attachments: attachments)
+        }
+        return attachments
+    }
+
 }

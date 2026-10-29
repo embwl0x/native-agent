@@ -1,5 +1,6 @@
 import AgentWorkspace
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `SwiftToolDispatcher+OMPBridgeTools.swift` | `SwiftToolDispatcher`: `runOMPMessage`, `ompSessionSaved` |
@@ -82,9 +83,7 @@ extension SwiftToolDispatcher {
         case .failure(let error): return error.envelope
         }
         let topic = conversation.topic
-        // The wake refuses a continuation whose saved session is gone
-        // (continuation_unavailable) a moment after this returned "queued"
-        // (walk 09-25). Its own rule, checked here first: failed now, nothing written.
+        // Refuse a continuation with no saved session before admitting its message.
         if Self.builderConversationReferenceSupplied(in: input),
            !Self.ompSessionSaved(topic: topic, directory: directory) {
             return .object([
@@ -112,32 +111,17 @@ extension SwiftToolDispatcher {
         case .failed(let reason, let detail):
             return Self.builderWorktreeFailureEnvelope(reason: reason, detail: detail)
         }
-        let queuedAt = ISO8601DateFormatter().string(from: Date())
-        let originSessionId = Self.extractSessionId(from: input)
+        let queuedAt = NativeTimestampFormat.plainZulu(Date())
+        let originSessionId = ChatToolSessionInjection.explicitSessionId(in: input)
         let origin = Self.agentBridgeReplyOrigin(surface: surface, route: ChatToolSessionContext.replyRoute)
-        var row: [String: JSONValue] = [
-            "id": .string(messageId),
-            "messageId": .string(messageId),
-            "createdAt": .string(queuedAt),
-            "from": .string("assistant"),
-            "priority": .string(priority),
-            "text": .string(text),
-            "timeoutSeconds": .int(Int64(timeoutSeconds)),
-            "read": .bool(false),
-        ]
-        if let topic { row["topic"] = .string(topic) }
-        if let conversationId = conversation.conversationId {
-            row["conversationId"] = .string(conversationId)
-        }
+        var row = conversation.inboxFields(messageId: messageId, queuedAt: queuedAt,
+            priority: priority, text: text, sessionId: originSessionId, origin: origin,
+            workingDirectory: workingDirectory, deskHandle: deskHandle)
+        row["timeoutSeconds"] = .int(Int64(timeoutSeconds))
         let requireExistingConversation = Self.builderConversationReferenceSupplied(in: input)
         if requireExistingConversation { row["requireExistingConversation"] = .bool(true) }
-        if let workingDirectory { row["workingDirectory"] = .string(workingDirectory) }
-        if let deskHandle { row["deskHandle"] = .string(deskHandle) }
-        if !originSessionId.isEmpty { row["sessionId"] = .string(originSessionId) }
-        row["origin"] = origin
         let inboxEntry = row
 
-        let persistence = SwiftNativePersistenceCore()
         let quarantineNote = Self.BuilderInboxQuarantineNote()
         let appendResult: (status: String, retryWake: Bool, queuedAt: String)
         do {
@@ -145,7 +129,7 @@ extension SwiftToolDispatcher {
                 messageId, entry: inboxEntry, to: inboxURL, queuedAt: queuedAt,
                 comparePairReviewer: false, maxLines: JSONLLineCaps.ompBridgeInbox,
                 logLabel: "SwiftToolDispatcher.ompMessage",
-                persistence: persistence, quarantine: quarantineNote
+                quarantine: quarantineNote
             )
         } catch {
             var fields = Self.builderFailureFields(error,
@@ -166,30 +150,18 @@ extension SwiftToolDispatcher {
             ])
         }
 
-        var response: [String: JSONValue] = [
-            "status": .string("queued"),
-            "messageId": .string(messageId),
-            "deduplicated": .bool(appendResult.status == "duplicate"),
-            "filePath": .string(inboxURL.path),
-            "priority": .string(priority),
-            "queuedAt": .string(appendResult.queuedAt),
-            "timeoutSeconds": .int(Int64(timeoutSeconds)),
-            "note": .string("OMP's final reply returns as a separate bridge event. For a contextual follow-up, call omp_message with conversation_mode=resume and this conversationId. For unrelated work, use conversation_mode=new and omit conversation_id."),
-        ]
+        var response = conversation.queuedReceipt(entry: row, filePath: inboxURL.path,
+            queuedAt: appendResult.queuedAt, deduplicated: appendResult.status == "duplicate",
+            replyWith: "omp_message")
+        response["timeoutSeconds"] = .int(Int64(timeoutSeconds))
+        response["note"] = .string("OMP's final reply returns as a separate bridge event. For a contextual follow-up, call omp_message with conversation_mode=resume and this conversationId. For unrelated work, use conversation_mode=new and omit conversation_id.")
         Self.stampBuilderInboxQuarantine(quarantineNote, on: &response)
         if let topic { response["topic"] = .string(topic) }
-        if let conversationId = conversation.conversationId {
-            response["conversationId"] = .string(conversationId)
-            response["replyWith"] = .string("omp_message")
-        }
-        if let workingDirectory { response["workingDirectory"] = .string(workingDirectory) }
-        // Same receipt promise as the other two lanes; this one discarded the
-        // ignored input entirely (astra-comb-3 lane3 #4 / lane1 #4).
+        // Keep the ignored directory notice independent of the Desk-binding note.
         if let ignoredRequestedDirectory {
             response["workingDirectoryIgnored"] = .string(ignoredRequestedDirectory)
             response["directoryNote"] = .string(BuilderWorktreeAllocator.ignoredDirectoryNote)
         }
-        if let deskHandle { response["deskHandle"] = .string(deskHandle) }
         if let droppedDeskItem {
             response["deskItemIgnored"] = .string(droppedDeskItem)
             response["note"] = .string("desk_item '\(droppedDeskItem)' is not a live Desk item; the message was queued without a Desk binding. Omit desk_item unless you have a live handle from app desk.read.")
@@ -198,52 +170,22 @@ extension SwiftToolDispatcher {
             response["wakeup"] = .object(["status": .string("deduplicated")])
         } else {
             if appendResult.status == "duplicate" { response["wakeupRetried"] = .bool(true) }
-            response["wakeup"] = await postOMPThreadWakeup(
-                messageId: messageId,
-                text: text,
-                priority: priority,
-                topic: topic,
-                requireExistingConversation: requireExistingConversation,
-                queuedAt: appendResult.queuedAt,
-                inboxPath: inboxURL.path,
-                originSessionId: originSessionId,
-                origin: origin,
-                timeoutSeconds: timeoutSeconds,
-                workingDirectory: workingDirectory,
-                deskHandle: deskHandle
+            response["wakeup"] = await postBuilderThreadWakeup(
+                name: "OMP", surface: surface,
+                payload: conversation.wakeFields(entry: inboxEntry, agent: .omp,
+                    queuedAt: appendResult.queuedAt, inboxPath: inboxURL.path)
             )
-        }
-        // A wake that failed admitted nothing to act on the row; "queued" would
-        // tell her the answer is coming (the Claude lane already says so).
-        if Self.claudeReceiptStatus(response["wakeup"]) == "failed" {
-            response["status"] = .string("failed")
-            // The wake's own reason is the failure's, not the queued receipt's promise.
-            let wakeup = response["wakeup"] ?? .null
-            if let why = Self.stringField("fix", in: wakeup) ?? Self.stringField("message", in: wakeup) ?? Self.stringField("detail", in: wakeup) {
-                response["detail"] = .string(why)
-            }
         }
         Self.markWakeStartedNothing(&response, agent: "OMP", dataRoot: dataRoot)
         return .object(response)
     }
 
-    /// omp_thread_wakeup.js's resume rule: a saved session pointer with an id
-    /// under wake-sessions/<topicSlug(topic)>.json or, with no pointer file,
+    /// The selected canonical topic names a saved session pointer with an id
+    /// under wake-sessions/<slug>.json or, with no pointer file,
     /// a retained wake-unanswered/<slug>.json identity naming the session OMP
     /// kept, with failed deliveries as a legacy fallback.
     static func ompSessionSaved(topic: String?, directory: URL) -> Bool {
-        // topicSlug exactly: lowercase, every run of non-[a-z0-9] (per code
-        // point, so "İ" → "i" + a separator) is one "-", trimmed, 64 long.
-        var joined = ""
-        var gap = false
-        for scalar in (topic ?? "").lowercased().unicodeScalars {
-            guard (97...122).contains(scalar.value) || (48...57).contains(scalar.value) else { gap = true; continue }
-            if gap, !joined.isEmpty { joined += "-" }
-            gap = false
-            joined.unicodeScalars.append(scalar)
-        }
-        joined = String(joined.prefix(64))
-        let slug = joined.isEmpty ? "general" : joined
+        let slug = topic ?? "general"
         func session(_ row: Any?) -> Bool {
             ((row as? [String: Any])?["sessionId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
         }
@@ -258,84 +200,4 @@ extension SwiftToolDispatcher {
         }
     }
 
-    private func postOMPThreadWakeup(
-        messageId: String,
-        text: String,
-        priority: String,
-        topic: String?,
-        requireExistingConversation: Bool,
-        queuedAt: String,
-        inboxPath: String,
-        originSessionId: String,
-        origin: JSONValue,
-        timeoutSeconds: Int,
-        workingDirectory: String?,
-        deskHandle: String?
-    ) async -> JSONValue {
-        var payload: [String: JSONValue] = [
-            "messageId": .string(messageId),
-            "text": .string(text),
-            "priority": .string(priority),
-            "queuedAt": .string(queuedAt),
-            "inboxPath": .string(inboxPath),
-            "source": .string("omp_message"),
-            "timeoutSeconds": .int(Int64(timeoutSeconds)),
-        ]
-        if let topic { payload["topic"] = .string(topic) }
-        if requireExistingConversation { payload["requireExistingConversation"] = .bool(true) }
-        if !originSessionId.isEmpty { payload["sessionId"] = .string(originSessionId) }
-        payload["origin"] = origin
-        if let workingDirectory { payload["cwd"] = .string(workingDirectory) }
-        if let deskHandle { payload["deskHandle"] = .string(deskHandle) }
-        Self.stampDelegationProducer(on: &payload)
-        // L1#14 replay guard — see postClaudeThreadWakeup for the four
-        // conditions and why a lost/failed prior run is never suppressed.
-        if !WakeupReplayGuard.isDisabled(),
-           let match = WakeupReplayGuard.terminalDuplicate(
-               store: .omp,
-               jobsDirectory: WakeupReplayGuard.jobsDirectory(
-                   for: .omp, configRoot: agentBridgeConfigRoot),
-               dataRoot: dataRoot,
-               topic: topic,
-               text: text,
-               now: Date()
-           ) {
-            return WakeupReplayGuard.receipt(match)
-        }
-
-        let disabled = ProcessInfo.processInfo.environment["NATIVE_AGENT_OMP_WAKEUP_DISABLED"]?.lowercased()
-        if ["1", "true", "yes"].contains(disabled ?? "") {
-            return .object([
-                "status": .string("skipped"),
-                "reason": .string("disabled_by_environment"),
-                "env": .string("NATIVE_AGENT_OMP_WAKEUP_DISABLED"),
-            ])
-        }
-        guard let helper = AgentBridgeRuntime.ompHelperURL(
-            dataRoot: dataRoot
-        ) else {
-            return .object([
-                "status": .string("skipped"),
-                "reason": .string("helper_not_found"),
-                "expected": .string(AgentBridgeRuntime.expectedHelperPath(
-                    named: "omp_thread_wakeup.js",
-                    dataRoot: dataRoot
-                ).path),
-                "remedy": Self.builderFailureRemedy(owner: "NativeAgent app bundle / omp_thread_wakeup.js", instruction: "The bundled OMP wake helper is missing."),
-            ])
-        }
-        let inputData: Data
-        do {
-            inputData = try JSONValue.object(payload).serializedData(pretty: false)
-        } catch {
-            return .object(Self.builderFailureFields(error,
-                tool: "omp_message", reason: "wakeup_payload_encode_failed", effects: .none,
-                owner: "OMP wake payload encoding",
-                instruction: "Repair the reported payload encoding error. The inbox message is saved; this wake did not launch."))
-        }
-        let cwd = Self.builderSourceRepoRoot(dataRoot: dataRoot)
-            ?? NativeAgentWorkspaceRoot.resolve(dataRoot: dataRoot)
-        return await runAgentWakeupHelper(helper: helper, inputData: inputData, cwd: cwd,
-                                         cli: "omp", variable: "NATIVE_AGENT_OMP_WAKE_BIN", timeout: 30)
-    }
 }

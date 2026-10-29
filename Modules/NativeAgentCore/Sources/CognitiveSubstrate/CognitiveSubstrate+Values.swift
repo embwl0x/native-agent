@@ -11,14 +11,7 @@ extension CognitiveSubstrate {
     }
 
 
-    // Task-tracking is OUT of Agent's cognition — the Desk owns explicit tracking, only when
-    // User asks (User, 2026-06-30: "I don't want her subconscious tied up following around me
-    // [with] 'I'll'… her subconscious is for her feelings, emotions, her views, her
-    // continuity"). The commitment/prediction extractors and their entire downstream —
-    // model types, actor state, resolution/lifecycle, capsule cue builders, store paths,
-    // Observatory panels — were fully removed on 2026-07-01, and the vestigial assimilate()
-    // seam followed on 2026-07-02. Nothing in cognition manufactures commitments/predictions
-    // from conversation any longer.
+    // The Desk owns task tracking when User asks; cognition does not extract commitments from conversation.
 
     func isConversationalPresenceStatement(_ lower: String) -> Bool {
         containsAny(lower, [
@@ -86,11 +79,8 @@ extension CognitiveSubstrate {
         ])
     }
 
-    /// Nonisolated: a pure substring scan over its arguments, touching no
-    /// actor state. Marked so the pure text appraisals that build on it
-    /// (`conversationalAppraisal`, `relationalWarmthBoost`, `caringEventKind`)
-    /// can be nonisolated too, which is what lets the DEBUG tenderness replay
-    /// read them off a store-less instance without entering the actor.
+    /// Pure substring matching lets studio valence and relational warmth read
+    /// text without entering the actor.
     nonisolated func containsAny(_ text: String, _ needles: [String]) -> Bool {
         needles.contains { text.contains($0) }
     }
@@ -103,13 +93,7 @@ extension CognitiveSubstrate {
     }
 
     func stableArtifactID(_ key: String) -> UUID {
-        var hash: UInt64 = 1_469_598_103_934_665_603
-        for byte in key.utf8 {
-            hash ^= UInt64(byte)
-            hash &*= 1_099_511_628_211
-        }
-        let suffix = hash % 1_000_000_000_000
-        return UUID(uuidString: "00000000-0000-0000-0000-\(String(format: "%012llu", suffix))") ?? dependencies.makeUUID()
+        UUID(uuidString: "00000000-0000-0000-0000-\(stableDigest(key))") ?? dependencies.makeUUID()
     }
 
     func stableDigest(_ text: String) -> String {
@@ -121,51 +105,14 @@ extension CognitiveSubstrate {
         return String(format: "%012llu", hash % 1_000_000_000_000)
     }
 
-    func stringValue(_ value: JSONValue?) -> String? {
-        guard case .string(let string)? = value else { return nil }
-        return string
-    }
-
-    func boolValue(_ value: JSONValue?) -> Bool? {
-        guard case .bool(let bool)? = value else { return nil }
-        return bool
-    }
-
-    func intValue(_ value: JSONValue?) -> Int? {
-        switch value {
-        case .int(let int)?:
-            return Int(exactly: int)
-        case .double(let double)?:
-            return Int(exactly: double.rounded(.towardZero))
-        default:
-            return nil
-        }
-    }
-
-    func doubleValue(_ value: JSONValue?) -> Double? {
-        switch value {
-        case .double(let double)?:
-            return double
-        case .int(let int)?:
-            return Double(int)
-        default:
-            return nil
-        }
-    }
-
     func dateValue(_ value: JSONValue?) -> Date? {
-        guard let seconds = doubleValue(value) else { return nil }
+        guard let seconds = value?.numberValue(coercingStrings: false, finiteOnly: false) else { return nil }
         return Date(timeIntervalSince1970: seconds)
     }
 
     func uuidValue(_ value: JSONValue?) -> UUID? {
-        guard let raw = stringValue(value) else { return nil }
+        guard let raw = value?.stringValue else { return nil }
         return UUID(uuidString: raw)
-    }
-
-    func uuidArrayValue(_ value: JSONValue?) -> [UUID] {
-        guard case .array(let values)? = value else { return [] }
-        return values.compactMap(uuidValue)
     }
 
     func unique(_ ids: [UUID]) -> [UUID] {

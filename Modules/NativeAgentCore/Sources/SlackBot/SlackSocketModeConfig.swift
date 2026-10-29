@@ -37,16 +37,16 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
     public static func loadIngressPolicy(
         dataRoot: URL = PersistenceCore.defaultDataRoot()
     ) throws -> SlackIngressPolicy {
-        try parseIngressPolicy(TransportAllowlist.slackPolicyObjects(dataRoot: dataRoot))
+        try parseIngressPolicy(TransportAllowlist.slackPolicy(dataRoot: dataRoot))
     }
 
-    private static func parseIngressPolicy(_ objects: [[String: JSONValue]]) throws -> SlackIngressPolicy {
-        let allowed = try TransportAllowlist.slack(objects: objects)
+    private static func parseIngressPolicy(_ object: [String: JSONValue]) throws -> SlackIngressPolicy {
+        let allowed = try TransportAllowlist.slack(fields: object)
         return SlackIngressPolicy(
             allowedChannelIds: allowed.chatIds,
             allowedUserIds: allowed.userIds,
-            requireMention: firstBool(keys: ["require_mention", "requireMention"], in: objects) ?? true,
-            botUserId: firstString(keys: ["user_id", "bot_user_id", "bot_id"], in: objects)
+            requireMention: firstBool(keys: ["require_mention", "requireMention"], in: object) ?? true,
+            botUserId: firstString(keys: ["user_id", "bot_user_id", "bot_id"], in: object)
         )
     }
 
@@ -59,8 +59,8 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
     }
 
     private static func loadSnapshot(dataRoot: URL) throws -> SlackSocketModeConfig? {
-        let objects = try TransportAllowlist.slackPolicyObjects(dataRoot: dataRoot)
-        let ingress = try parseIngressPolicy(objects)
+        let object = try TransportAllowlist.slackPolicy(dataRoot: dataRoot)
+        let ingress = try parseIngressPolicy(object)
         // The tokens are Keychain's (SlackCredentials); the files say the rest.
         let botToken = try SlackCredentials.read(.bot, dataRoot: dataRoot)
         let appToken = try SlackCredentials.read(.app, dataRoot: dataRoot)
@@ -68,27 +68,27 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
               let appToken, !appToken.isEmpty else {
             return nil
         }
-        let enabled = firstBool(keys: socketModeKeys, in: objects) ?? true
+        let enabled = firstBool(keys: socketModeKeys, in: object) ?? true
         let historyPollEnabled = firstBool(
             keys: ["history_poll_enabled", "socket_mode_history_poll_enabled"],
-            in: objects
+            in: object
         ) ?? true
         let historyPollInterval = max(
             30,
-            firstDouble(keys: ["history_poll_interval", "socket_mode_history_poll_interval"], in: objects) ?? 60
+            try firstDuration(keys: ["history_poll_interval", "socket_mode_history_poll_interval"], in: object, projection: 10) ?? 60
         )
         let historyConversationRefreshInterval = max(
             historyPollInterval,
-            firstDouble(
+            try firstDuration(
                 keys: ["history_conversation_refresh_interval", "socket_mode_history_conversation_refresh_interval"],
-                in: objects
+                in: object
             ) ?? 600
         )
         return SlackSocketModeConfig(
             botToken: botToken,
             appToken: appToken,
             botUserId: ingress.botUserId,
-            teamId: firstString(keys: ["team_id"], in: objects),
+            teamId: firstString(keys: ["team_id"], in: object),
             enabled: enabled,
             historyPollEnabled: historyPollEnabled,
             historyPollInterval: historyPollInterval,
@@ -103,50 +103,53 @@ public struct SlackSocketModeConfig: Sendable, Equatable {
 
     /// Switched off in the saved Slack config, whatever the tokens say.
     public static func socketModeSwitchedOff(dataRoot: URL) throws -> Bool {
-        firstBool(keys: socketModeKeys, in: try TransportAllowlist.slackPolicyObjects(dataRoot: dataRoot)) == false
+        firstBool(keys: socketModeKeys, in: try TransportAllowlist.slackPolicy(dataRoot: dataRoot)) == false
     }
 
-    private static func firstString(keys: [String], in objects: [[String: JSONValue]]) -> String? {
-        for object in objects {
-            for key in keys {
-                guard case .string(let value)? = object[key] else { continue }
-                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { return trimmed }
-            }
+    private static func firstString(keys: [String], in object: [String: JSONValue]) -> String? {
+        for key in keys {
+            guard case .string(let value)? = object[key] else { continue }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
         }
         return nil
     }
 
-    private static func firstBool(keys: [String], in objects: [[String: JSONValue]]) -> Bool? {
-        for object in objects {
-            for key in keys {
-                if case .bool(let value)? = object[key] { return value }
-                // Preserve the saved Foundation scalar semantics of this reader.
-                if case .int(let value)? = object[key], let flag = NSNumber(value: value) as? Bool { return flag }
-                if case .double(let value)? = object[key], let flag = NSNumber(value: value) as? Bool { return flag }
-                if case .string(let value)? = object[key] {
-                    switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-                    case "1", "true", "yes", "on": return true
-                    case "0", "false", "no", "off": return false
-                    default: continue
-                    }
+    private static func firstBool(keys: [String], in object: [String: JSONValue]) -> Bool? {
+        for key in keys {
+            if case .bool(let value)? = object[key] { return value }
+            // Preserve the saved Foundation scalar semantics of this reader.
+            if case .int(let value)? = object[key], let flag = NSNumber(value: value) as? Bool { return flag }
+            if case .double(let value)? = object[key], let flag = NSNumber(value: value) as? Bool { return flag }
+            if case .string(let value)? = object[key] {
+                switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+                case "1", "true", "yes", "on": return true
+                case "0", "false", "no", "off": return false
+                default: continue
                 }
             }
         }
         return nil
     }
 
-    private static func firstDouble(keys: [String], in objects: [[String: JSONValue]]) -> Double? {
-        for object in objects {
-            for key in keys {
-                if case .bool(let value)? = object[key] { return value ? 1 : 0 }
-                if case .double(let value)? = object[key] { return value }
-                if case .int(let value)? = object[key] { return Double(value) }
-                if case .string(let value)? = object[key],
-                   let parsed = Double(value.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                    return parsed
-                }
+    /// Every saved duration, including its largest timer projection, must fit
+    /// the nanosecond sleep owner. Invalid bytes remain on disk for repair.
+    private static func firstDuration(keys: [String], in object: [String: JSONValue], projection: Double = 1) throws -> Double? {
+        for key in keys {
+            guard let raw = object[key] else { continue }
+            let value: Double?
+            switch raw {
+            case .double(let number): value = number
+            case .int(let number): value = Double(number)
+            case .string(let text): value = Double(text.trimmingCharacters(in: .whitespacesAndNewlines))
+            default: value = nil
             }
+            guard let value, value.isFinite, value > 0,
+                  UInt64(exactly: (value * projection * 1_000_000_000).rounded(.up)) != nil else {
+                throw NSError(domain: "SlackConfiguration", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Slack \(key) must be a positive finite duration representable by its timers."])
+            }
+            return value
         }
         return nil
     }

@@ -1,5 +1,6 @@
 import AgentWorkspace
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `AgentConversationExchange.swift` | `AgentConversationExchange`: `started`, `absorb`, `validate`; partial text is retained separately from a finished reply; each exchange retains its receipt's shelf result UUID across subsequent sends |
@@ -31,43 +32,45 @@ extension AgentConversationExchange {
         phase = Self.state(row.phase)
         let root: [String: JSONValue]
         if case .object(let fields)? = row.receipt { root = fields } else { root = [:] }
-        var value = root
-        if case .array(let jobs)? = root["jobs"], jobs.count == 1, case .object(let job) = jobs[0] { value = job }
+        let value = row.sendEvidence
         resultID = Self.string(value["entry_id"]).flatMap(UUID.init(uuidString:))
-        status = Self.state(Self.string(value["run_status"]) ?? Self.string(value["status"])
-            ?? Self.string(value["state"]) ?? "unknown")
+        status = Self.state(row.sendStatus)
         if let card = Self.string(root["approvalId"]) { approvalId = card }
-        let answer: String?
-        let ownerTruncated: Bool
-        if root["jobs"] != nil {
-            let original = AgentConversationView.codingReply(value)
-            answer = original.text
-            ownerTruncated = original.truncated
-        } else {
-            let original = AgentConversationView.codingReply(value)
-            answer = Self.string(value["reply"]) ?? Self.string(value["answer"])
-                ?? original.text ?? Self.string(value["findings"])
-            ownerTruncated = value["reply_truncated"] == .bool(true)
-                || (Self.string(value["reply"]) == nil && Self.string(value["answer"]) == nil
-                    && original.text != nil && original.truncated)
-        }
+        let answer = row.sendFailed ? (text: nil as String?, truncated: false) : Self.answer(root)
         // Replace, never carry an older answer through a failed/unknown read.
-        let text = answer.map { Self.clipped($0, limit: Self.textLimit) }
+        let text = answer.text.map { Self.clipped($0, limit: Self.textLimit) }
         reply = text?.text
         partialReply = Self.string(value["partial_reply"]).map { Self.clipped($0, limit: Self.textLimit).text }
-        replyTruncated = text.map { ownerTruncated || $0.truncated } ?? false
+        replyTruncated = text.map { answer.truncated || $0.truncated } ?? false
+    }
+
+    /// Extract before making any ledger or receipt excerpt. The canonical
+    /// contact thread receives these words, never the bounded exchange copy.
+    static func answer(_ root: [String: JSONValue]) -> (text: String?, truncated: Bool) {
+        let value = AgentConversationRecord.sendEvidence(.object(root))
+        let original = AgentConversationView.codingReply(value)
+        if root["jobs"] != nil {
+            return original
+        }
+        return (Self.string(value["reply"]) ?? Self.string(value["answer"])
+                ?? original.text ?? Self.string(value["findings"]),
+                value["reply_truncated"] == .bool(true)
+                || (Self.string(value["reply"]) == nil && Self.string(value["answer"]) == nil
+                    && original.text != nil && original.truncated))
     }
 
     /// sent_at, first_activity_at, replied_at (or ended_at with no reply) and
     /// elapsed_ms between sending and that moment: measured, never inferred.
     var timing: [String: JSONValue] {
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        var fields: [String: JSONValue] = ["sent_at": .string(iso.string(from: sentAt))]
-        if let firstActivityAt { fields["first_activity_at"] = .string(iso.string(from: firstActivityAt)) }
+        var fields: [String: JSONValue] = ["sent_at": .string(NativeTimestampFormat.fractionalZulu(sentAt))]
+        if let firstActivityAt { fields["first_activity_at"] = .string(NativeTimestampFormat.fractionalZulu(firstActivityAt)) }
         if let settledAt {
-            fields[reply != nil ? "replied_at" : "ended_at"] = .string(iso.string(from: settledAt))
-            fields["elapsed_ms"] = .int(Int64(max(0, settledAt.timeIntervalSince(sentAt)) * 1000))
+            fields[reply != nil ? "replied_at" : "ended_at"] = .string(NativeTimestampFormat.fractionalZulu(settledAt))
+            if let elapsed = Int64(exactly: (max(0, settledAt.timeIntervalSince(sentAt)) * 1000).rounded(.towardZero)) {
+                fields["elapsed_ms"] = .int(elapsed)
+            } else {
+                fields["timing_error"] = .string("Conversation interval is not representable; preserve and repair its saved dates.")
+            }
         }
         return fields
     }
@@ -76,7 +79,11 @@ extension AgentConversationExchange {
         guard let history else { return }
         guard history.count <= countLimit, Set(history.map(\.id)).count == history.count,
               history.allSatisfy({ entry in
-                  UUID(uuidString: entry.id) != nil && entry.sentAt.timeIntervalSince1970.isFinite
+                  UUID(uuidString: entry.id) != nil
+                    && [entry.sentAt, entry.firstActivityAt, entry.settledAt].compactMap { $0 }.allSatisfy {
+                        $0.timeIntervalSince1970.isFinite && $0 >= Date.distantPast && $0 <= Date.distantFuture
+                    }
+                    && entry.settledAt.map { Int64(exactly: (max(0, $0.timeIntervalSince(entry.sentAt)) * 1000).rounded(.towardZero)) != nil } != false
                     && [entry.phase, entry.status].allSatisfy { !$0.isEmpty && $0.utf8.count <= 256 && !$0.contains("\0") }
                     && [entry.prompt, entry.reply, entry.partialReply].compactMap { $0 }.allSatisfy { $0.utf8.count <= textLimit }
                     && (entry.prompt != nil || !entry.promptTruncated)
@@ -122,7 +129,7 @@ extension AgentConversationExchange {
     private static func historyFailure(_ message: String, code: String, file: URL) -> ToolFailureError {
         ToolFailureError(message, effects: .unknown, owner: file.path,
             code: code, instruction: ToolFailureError.fileRepairInstruction(file,
-                shape: "Preserve conversation records and queued messages. Each exchange history has at most 32 unique UUID entries and 65536 encoded bytes; prompt, reply and partialReply are at most 8192 UTF-8 bytes each.") + " Repair the saved history from retained evidence without discarding queued messages.")
+                shape: "Preserve conversation records and queued messages. Each exchange history has at most 32 unique UUID entries and 65536 encoded bytes; prompt, reply and partialReply are at most 8192 UTF-8 bytes each. Dates must be finite, between Date.distantPast and Date.distantFuture, with elapsed milliseconds representable as Int64.") + " Repair the saved history from retained evidence without discarding queued messages.")
     }
 
     static func clipped(_ text: String, limit: Int) -> (text: String, truncated: Bool) {
@@ -137,9 +144,8 @@ extension AgentConversationExchange {
 
     private static func repliedAt(_ receipt: JSONValue?, after sent: Date, key: String) -> Date? {
         guard case .object(let fields)? = receipt, let text = string(fields[key]) else { return nil }
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = key == "ended_at" ? [.withInternetDateTime] : [.withInternetDateTime, .withFractionalSeconds]
-        guard let at = iso.date(from: text), at >= sent, at <= Date() else { return nil }
+        let at = key == "ended_at" ? NativeTimestampFormat.parseISO8601(text) : NativeTimestampFormat.parseISO8601FractionalFirst(text)
+        guard let at, at >= sent, at <= Date() else { return nil }
         return at
     }
 

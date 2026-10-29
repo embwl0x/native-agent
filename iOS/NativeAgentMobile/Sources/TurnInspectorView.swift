@@ -1,10 +1,6 @@
-// Turn Inspector W4 — iOS read-only inspector.
-//
-// Renders the per-turn SUMMARY records the Mac writes into the iCloud snapshot
-// (`turn_summaries.json`). Read-only by design: no event stream, no content —
-// only time, surface, event count, tokens, ttft, duration, and the per-kind mix.
-// Functional-first (W5 is the pizzazz wave). Newest turn on top (the Mac lane
-// already orders newest-started-first; we render as-given).
+// Read-only `turn_summaries.json` summaries: times, surface, event/kind counts,
+// tokens and latency metrics; no event stream or content previews.
+// Render the writer's newest-started-first order unchanged.
 import SwiftUI
 import NativeAgentShared
 // Blueprint: | `TurnInspectorView.swift` | Turn summary presentation reads the shared sync projection directly |
@@ -58,31 +54,6 @@ enum TurnInspectorPresentation {
         return AliveWords.count(Int((Double(seconds) / 60).rounded()), "minute")
     }
 
-    static func durationText(wallMs: Int) -> String {
-        guard wallMs >= 0 else { return "Unknown" }
-        let seconds = Double(wallMs) / 1000.0
-        return seconds < 1 ? "\(wallMs) ms" : String(format: "%.1f s", seconds)
-    }
-
-    private static func nonnegativeText(_ value: Int?) -> String {
-        guard let value, value >= 0 else { return "Unknown" }
-        return String(value)
-    }
-
-    private static func millisecondsText(_ value: Int?) -> String {
-        guard let value, value >= 0 else { return "Unknown" }
-        return "\(value) ms"
-    }
-
-    static func metrics(for summary: TurnSummaryRecord) -> [(value: String, label: String)] {
-        var result: [(value: String, label: String)] = [
-            (value: nonnegativeText(summary.eventCount), label: "events"),
-            (value: durationText(wallMs: summary.wallMs), label: "wall"),
-        ]
-        result.append((value: nonnegativeText(summary.llmTokens), label: "tok"))
-        result.append((value: millisecondsText(summary.ttftMs), label: "ttft"))
-        return result
-    }
 
 }
 
@@ -134,10 +105,16 @@ private struct TurnSummaryRow: View {
         let took = TurnInspectorPresentation.plainDuration(wallMs: summary.wallMs)
         // Kinds arrive as "reply" or "chat.reply", "tool" or "tool.call".
         let replied = summary.kinds.contains { $0.key.contains("reply") && $0.value > 0 }
-        let tools = summary.kinds.filter { $0.key.hasPrefix("tool") }.values.reduce(0, +)
+        let tools = summary.kinds.filter { $0.key.hasPrefix("tool") }.values.reduce(Optional(0)) { total, count in
+            guard let total, count >= 0 else { return nil }
+            let (sum, overflow) = total.addingReportingOverflow(count)
+            return overflow ? nil : sum
+        }
         var line = took.map { replied ? "Replied in \($0)" : "Took \($0)" } ?? (replied ? "Replied" : "Worked")
-        if tools > 0 {
+        if let tools, tools > 0 {
             line += ", with \(AliveWords.count(tools, "tool event", spelled: true))"
+        } else if tools == nil {
+            line += ", with an invalid tool event count"
         }
         return line + "."
     }
@@ -194,23 +171,28 @@ extension TurnInspectorView {
     private var file: TurnSummaryFile? {
         #if DEBUG
         if MobileDesignSamples.screen != nil {
-            var sample = try! JSONDecoder().decode(TurnSummaryFile.self, from: Data("{}".utf8))
-            sample.summaries = MobileDesignSamples.rows([TurnSummaryRecord]()) + Self.moreDesignTurns
-            sample.totalTurnsSeen = sample.summaries.count
-            return sample
+            do {
+                let summaries = MobileDesignSamples.rows([TurnSummaryRecord]()) + (try Self.moreDesignTurns())
+                return TurnSummaryFile(summaries: summaries, totalTurnsSeen: summaries.count)
+            } catch {
+                SystemToastCenter.shared.push(error: "Turn sample is unavailable: \(error.localizedDescription)")
+                return nil
+            }
         }
         #endif
         return iCloudSyncEngine.shared.turnSummaries
     }
 
     #if DEBUG
-    private static let moreDesignTurns: [TurnSummaryRecord] = try! JSONDecoder().decode(
+    private static func moreDesignTurns() throws -> [TurnSummaryRecord] {
+        try JSONDecoder().decode(
         [TurnSummaryRecord].self,
         from: Data(#"""
         [{"id":"design-turn-2","surface":"Mac chat","startedAt":809998200,"lastAt":809998224,"eventCount":31,"wallMs":24100,"llmTokens":5820,"ttftMs":610,"kinds":{"reply":1,"tool":9,"thinking":3}},
          {"id":"design-turn-3","surface":"Desk task","startedAt":809994600,"lastAt":809994603,"eventCount":5,"wallMs":2900,"llmTokens":380,"ttftMs":290,"kinds":{"reply":1}}]
         """#.utf8)
-    )
+        )
+    }
     #endif
 
 }

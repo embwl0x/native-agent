@@ -4,13 +4,7 @@ import Darwin
 
 // Blueprint: | `PersistenceCore+FileLock.swift` | `FileLockScope`, `CredentialFileLock` and persistence lock support: current-task lock ownership, bounded acquisition and sidecar identity checks |
 
-/// Lock paths the CURRENT TASK already holds. User, 2026-09-06: `flock` is not
-/// recursive across descriptors, so a `CredentialFileLock.withLock` nested
-/// inside a `withFileLock` on the SAME path — which is what every credential
-/// write through `writeJSONObject` does from inside a `withFileLock` body —
-/// sat out the full acquire timeout and then threw. Both acquirers record
-/// their lock path here, and the synchronous one (always the inner
-/// acquisition) skips the `flock` when this task already holds that path.
+/// Task-local held paths let nested acquisitions reuse the same nonrecursive flock.
 public enum FileLockScope {
     @TaskLocal public static var heldLockPaths: Set<String> = []
 }
@@ -24,46 +18,51 @@ private func tryAcquireSidecar(_ fd: Int32) throws -> Int32 {
     return error
 }
 
+/// Enter a locked body only if the descriptor still names the sidecar at its path.
 private func sidecarIsCurrent(_ fd: Int32, at path: String) -> Bool {
     var held = stat()
     var atPath = stat()
-    return fstat(fd, &held) == 0 && stat(path, &atPath) == 0
+    return fstat(fd, &held) == 0 && lstat(path, &atPath) == 0
         && held.st_dev == atPath.st_dev && held.st_ino == atPath.st_ino
 }
 
-/// User, 2026-09-06: an OAuth credential file has THREE writers — an adapter's
-/// token refresh, the app's sign-in, and the app's sign-out — and none of them
-/// shared a lock. Every writer therefore compared the file's bytes and then
-/// wrote, with the whole race window between the two: a sign-out that landed
-/// in that gap was undone by the refresh it was meant to cancel. This is the
-/// SAME `flock` on the SAME `<path>.lock` sidecar that `withFileLock` below
-/// takes, in a synchronous shape so the compare and the write it guards sit in
-/// one critical section on every path — including the app's, which is not
-/// async.
-///
-/// The body must stay short: it reads and rewrites one small credential file
-/// and never performs I/O of its own. Nothing inside it may await.
+/// Serialize synchronous file transactions on the same sidecar as async acquisition.
 public enum CredentialFileLock {
-    /// Longest a caller waits for the holder before giving up. The critical
-    /// sections are a read plus an atomic rename; a wait this long means the
-    /// lock is held by something wedged, and failing beats hanging a turn.
+    /// Bound acquisition so a stalled holder produces a timeout.
     private static let acquireTimeout: TimeInterval = 10
+
+    /// One attempt; contention or a replaced sidecar defers the transaction.
+    public static func tryWithLock<T>(_ targetPath: URL, _ body: () throws -> T) throws -> T? {
+        let lockPath = targetPath.path + ".lock"
+        if FileLockScope.heldLockPaths.contains(lockPath) { return try body() }
+        try? FileManager.default.createDirectory(
+            atPath: (lockPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true
+        )
+        let fd = Darwin.open(lockPath, O_CREAT | O_WRONLY, 0o600)
+        guard fd >= 0 else {
+            throw NSError(domain: "FileLock", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "open lock failed: \(String(cString: strerror(errno)))"])
+        }
+        defer { Darwin.close(fd) }
+        guard try tryAcquireSidecar(fd) == 0 else { return nil }
+        defer { _ = flock(fd, LOCK_UN) }
+        guard sidecarIsCurrent(fd, at: lockPath) else { return nil }
+        return try FileLockScope.$heldLockPaths.withValue(FileLockScope.heldLockPaths.union([lockPath])) {
+            try body()
+        }
+    }
 
     public static func withLock<T>(_ targetPath: URL, _ body: () throws -> T) throws -> T {
         let lockPath = targetPath.path + ".lock"
-        // Already held by this task (an enclosing `withFileLock` on the same
-        // path): the critical section is ours, and a second `flock` on a second
-        // descriptor would only block until the timeout.
         if FileLockScope.heldLockPaths.contains(lockPath) {
             return try body()
         }
         let parent = (lockPath as NSString).deletingLastPathComponent
-        try? FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
         let deadline = ProcessInfo.processInfo.systemUptime + acquireTimeout
         var attempts = 0
         while true {
             attempts += 1
-            let fd = Darwin.open(lockPath, O_CREAT | O_WRONLY, 0o600)
+            let fd = Darwin.open(lockPath, O_CREAT | O_RDWR | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC, 0o600)
             if fd < 0 {
                 throw NSError(domain: "FileLock", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "open lock failed: \(String(cString: strerror(errno)))"])
             }
@@ -72,18 +71,13 @@ public enum CredentialFileLock {
                 do { e = try tryAcquireSidecar(fd) }
                 catch { Darwin.close(fd); throw error }
                 if e == 0 { break }
-                // Interrupted attempts share the same monotonic acquisition
-                // deadline and wait as contention; signals cannot spin forever.
+                // Interruptions and contention share one monotonic deadline.
                 if ProcessInfo.processInfo.systemUptime >= deadline {
                     Darwin.close(fd)
                     throw NSError(domain: "FileLock", code: Int(ETIMEDOUT), userInfo: [NSLocalizedDescriptionKey: "lock at \(lockPath) is still held after \(Int(acquireTimeout))s"])
                 }
                 usleep(5_000)
             }
-            // Same acquire-then-validate-inode rule as `withFileLock`: the
-            // orphan sweep may unlink a lock sidecar, and a waiter that opened
-            // it before the unlink would otherwise hold a detached inode while
-            // a newcomer creates a fresh one — two writers, no exclusion.
             if !sidecarIsCurrent(fd, at: lockPath) {
                 _ = flock(fd, LOCK_UN)
                 Darwin.close(fd)
@@ -97,6 +91,13 @@ public enum CredentialFileLock {
                 _ = flock(fd, LOCK_UN)
                 Darwin.close(fd)
             }
+            var info = stat()
+            guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG else {
+                throw NSError(domain: "FileLock", code: Int(EINVAL), userInfo: [NSLocalizedDescriptionKey: "lock at \(lockPath) is not a regular file"])
+            }
+            guard fchmod(fd, 0o600) == 0 else {
+                throw NSError(domain: "FileLock", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "secure lock permissions failed: \(String(cString: strerror(errno)))"])
+            }
             return try FileLockScope.$heldLockPaths.withValue(
                 FileLockScope.heldLockPaths.union([lockPath])
             ) {
@@ -105,21 +106,7 @@ public enum CredentialFileLock {
         }
     }
 
-    /// User, 2026-09-06: the generation of an OAuth credential file — a digest
-    /// of ONLY the token-bearing keys. The whole file's bytes used to be the
-    /// generation, but provider settings share the file with the credential
-    /// (`configureProvider` writes `default_model` into
-    /// `providers/<id>.json`, which is exactly where the Anthropic and xAI
-    /// credentials live). Saving a model while a refresh was in flight moved
-    /// the bytes, the refresh read that as "another writer replaced the
-    /// credential", and it dropped the token it had just minted — leaving the
-    /// already-rotated, single-use refresh_token on disk to fail next time.
-    /// Only a change to the tokens themselves counts as a new generation.
-    /// The digest never contains a credential, so it is safe to carry around.
-    public static func credentialGeneration(ofFileAt path: URL) -> String {
-        credentialGeneration(ofFileContents: try? Data(contentsOf: path))
-    }
-
+    /// Credential generation hashes only token and account-identity fields, excluding provider settings.
     public static func credentialGeneration(ofFileContents data: Data?) -> String {
         guard let data,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -140,69 +127,31 @@ public enum CredentialFileLock {
 
 /// How long an async file-lock acquire waits before it gives up and says so.
 public enum PersistenceFileLockWait {
-    /// Far above any legitimate hold (the longest is a retention pass, capped
-    /// at ~2 s) and far below any caller's own budget, so this only ever fires
-    /// on a pathological convoy. Before it existed the wait was UNBOUNDED: on
-    /// 2026-09-13 a nested bot turn and its parent chat turn queued on the
-    /// process-global `chat/sessions.json` lock and the whole app went dark for
-    /// six minutes — no heartbeat, no background loops, no provider call — and
-    /// only unwedged when the inner task was cancelled. A bounded, named
-    /// failure is strictly better than a process that stops answering.
+    /// Bound acquisition so a stalled holder cannot hang the caller.
     public static let defaultSeconds: TimeInterval = 60
 }
 
-public extension PersistenceCoreProtocol {
-    /// - Parameter waitSeconds: how long to wait for a contended lock. `0`
-    ///   means try once and throw if busy — housekeeping passes use it so they
-    ///   can never stall a live writer (a `try?` at the call site turns that
-    ///   throw into "skip this one, next pass gets it").
-    func withFileLock<T: Sendable>(
+public extension SwiftNativePersistenceCore {
+    /// Contended acquisition yields cooperatively; release completes synchronously with the body.
+    /// - Parameter waitSeconds: maximum contention wait; `0` tries once and throws if busy.
+    static func withFileLock<T: Sendable>(
         _ targetPath: URL,
         waitingAtMost waitSeconds: TimeInterval = PersistenceFileLockWait.defaultSeconds,
         _ body: @Sendable () async throws -> T
     ) async throws -> T {
         let lockPath = targetPath.path + ".lock"
-        // Already held by this task tree. flock is not recursive, so without
-        // this the re-entering frame waits for a lock its own ancestor holds
-        // and NOTHING can release it — an unbreakable hang. The synchronous
-        // `CredentialFileLock` has always checked this; the async side only
-        // ever WROTE the set (below) and never read it.
         if FileLockScope.heldLockPaths.contains(lockPath) {
             return try await body()
         }
         let waitDeadline = ProcessInfo.processInfo.systemUptime + max(0, waitSeconds)
         let parent = (lockPath as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: parent, withIntermediateDirectories: true)
-        // Acquire WITHOUT pinning a cooperative-pool thread. The old shape —
-        // blocking flock(LOCK_EX) inside Task.detached, unlock in ANOTHER
-        // detached task fired from defer — could freeze the whole app: N
-        // concurrent waiters (N = core count) occupy every pool thread in
-        // flock() while the holder's detached unlock task waits for a free
-        // thread that never comes (audit 2026-06-09, both auditors).
-        // LOCK_NB + cancellable async sleep keeps threads free, and the
-        // synchronous release means the lock drops the instant body ends —
-        // cross-process flock semantics are unchanged (same lock file, same
-        // LOCK_EX).
-        // Acquire-then-validate-inode (2026-07-25). Lock sidecars are now
-        // REAPABLE (the orphan sweep unlinks them), and unlinking a lock file
-        // is only safe if acquirers notice they locked a detached inode:
-        // otherwise a waiter that opened the file before the unlink wakes up
-        // holding a dead inode while a newcomer O_CREATs a fresh one — two
-        // writers, mutual exclusion silently gone (Agent, 2026-07-25). After
-        // flock succeeds we compare our fd's inode against whatever is at
-        // lockPath now; a mismatch means we hold a corpse, so we drop it and
-        // retry against the live file. This is the standard resolution of the
-        // unlink-a-lockfile race and is what makes the sweep safe.
         var attempts = 0
         while true {
             attempts += 1
             var fd = Darwin.open(lockPath, O_CREAT | O_WRONLY, 0o600)
             if fd < 0, errno == ENOENT {
-                // 2026-09-06: the parent directory went away between the
-                // createDirectory above and this open — an orphan sweep can
-                // unlink a per-session directory a writer is about to use
-                // (TurnVolatileArchive). Recreate it and try once more; a
-                // second ENOENT is a real failure and throws below.
+                // Recreate a parent removed during acquisition; a second failure throws.
                 try? FileManager.default.createDirectory(
                     atPath: parent,
                     withIntermediateDirectories: true
@@ -225,10 +174,7 @@ public extension PersistenceCoreProtocol {
                     acquired = true
                     break
                 }
-                // Contended: yield the thread and retry. Cancellation propagates
-                // (Task.sleep throws), releasing the fd via the defer above.
-                // Bounded, so a convoy surfaces as one loud failure instead of
-                // a process that waits forever.
+                // Cancellation releases the descriptor through the iteration's defer.
                 guard ProcessInfo.processInfo.systemUptime < waitDeadline else {
                     throw NSError(
                         domain: "FileLock", code: Int(ETIMEDOUT),
@@ -237,12 +183,8 @@ public extension PersistenceCoreProtocol {
                 }
                 try await Task.sleep(nanoseconds: 20_000_000)
             }
-            // Do we hold the file that is CURRENTLY at lockPath?
             if !sidecarIsCurrent(fd, at: lockPath) {
-                // Reaped or replaced under us. Bounded retry: a live sweep can
-                // legitimately unlink once, but repeated misses mean something
-                // pathological, and spinning forever would be worse than
-                // failing loudly.
+                // Bound retries when a sidecar is repeatedly replaced.
                 if attempts >= 8 {
                     throw NSError(domain: "FileLock", code: Int(EAGAIN), userInfo: [NSLocalizedDescriptionKey: "lock file at \(lockPath) replaced repeatedly; giving up after \(attempts) attempts"])
                 }
@@ -254,8 +196,6 @@ public extension PersistenceCoreProtocol {
                 _ = flock(fd, LOCK_UN)
                 Darwin.close(fd)
             }
-            // Record the held path so a synchronous `CredentialFileLock` inside
-            // the body does not try to take the same non-recursive flock again.
             return try await FileLockScope.$heldLockPaths.withValue(
                 FileLockScope.heldLockPaths.union([lockPath])
             ) {

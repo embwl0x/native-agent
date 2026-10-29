@@ -1,5 +1,4 @@
 import AppToolRuntime
-// PATCH-2026-05-08: polish-wave — primary sidebar coach-mark onboarding tour
 import SwiftUI
 import NativeAgentShared
 // Blueprint: | `OnboardingTourOverlay.swift` | Tour progress uses stable stop identity and reconciles rail changes from the engine layout passed by ContentView; only in-overlay progress is local |
@@ -7,11 +6,10 @@ import NativeAgentShared
 // MARK: - Tour Step Model
 
 struct OnboardingTourStep: Identifiable, Equatable, Sendable {
-    let id: Int
+    var id: SidebarItem { item }
     let item: SidebarItem
-    let title: String
+    var title: String { item.shellRailTitle }
     let body: String
-    let buttonLabel: String
 }
 
 // One stop per word on the rail, in rail order, each with one plain sentence.
@@ -19,95 +17,56 @@ struct OnboardingTourStep: Identifiable, Equatable, Sendable {
 // never name a page that is no longer there.
 private let onboardingTourStops: [OnboardingTourStep] = [
     OnboardingTourStep(
-        id: 0,
         item: .chat,
-        title: SidebarItem.chat.shellRailTitle,
-        body: "This is where we talk, and the row under the field sets the model, the thinking and what I'm allowed to do.",
-        buttonLabel: "Continue"
+        body: "This is where we talk, and the row under the field sets the model, the thinking and what I'm allowed to do."
     ),
     OnboardingTourStep(
-        id: 1,
         item: .activity,
-        title: SidebarItem.activity.shellRailTitle,
-        body: "I show you what I did today, what's ahead, and anything waiting on you.",
-        buttonLabel: "Continue"
+        body: "I show you what I did today, what's ahead, and anything waiting on you."
     ),
     OnboardingTourStep(
-        id: 2,
         item: .memories,
-        title: SidebarItem.memories.shellRailTitle,
-        body: "I keep everything I've learned here, so you can read it, correct it or throw it out.",
-        buttonLabel: "Continue"
+        body: "I keep everything I've learned here, so you can read it, correct it or throw it out."
     ),
     OnboardingTourStep(
-        id: 3,
         item: .desk,
-        title: SidebarItem.desk.shellRailTitle,
-        body: "I line up the projects and tasks here, and I show you what came of them.",
-        buttonLabel: "Continue"
+        body: "I line up the projects and tasks here, and I show you what came of them."
     ),
     OnboardingTourStep(
-        id: 4,
         item: .inboxPolicy,
-        title: SidebarItem.inboxPolicy.shellRailTitle,
-        body: "I decide here what to bring you and what to keep quiet.",
-        buttonLabel: "Continue"
+        body: "I decide here what to bring you and what to keep quiet."
     ),
     OnboardingTourStep(
-        id: 5,
         item: .bots,
-        title: SidebarItem.bots.shellRailTitle,
-        body: "I run small jobs on my own here, on a schedule you set.",
-        buttonLabel: "Continue"
+        body: "I run small jobs on my own here, on a schedule you set."
     ),
     OnboardingTourStep(
-        id: 6,
         item: .personality,
-        title: SidebarItem.personality.shellRailTitle,
-        body: "This is who I am here — my name, my voice, and the documents behind them.",
-        buttonLabel: "Continue"
+        body: "This is who I am here — my name, my voice, and the documents behind them."
     ),
     OnboardingTourStep(
-        id: 7,
         item: .providers,
-        title: SidebarItem.providers.shellRailTitle,
-        body: "I think with the model accounts you connect here, and you pick which one does which job.",
-        buttonLabel: "Continue"
+        body: "I think with the model accounts you connect here, and you pick which one does which job."
     ),
     OnboardingTourStep(
-        id: 8,
         item: .trust,
-        title: SidebarItem.trust.shellRailTitle,
-        body: "This is what I'm allowed to do on this Mac without asking you first.",
-        buttonLabel: "Continue"
+        body: "This is what I'm allowed to do on this Mac without asking you first."
     ),
     OnboardingTourStep(
-        id: 9,
         item: .connectors,
-        title: SidebarItem.connectors.shellRailTitle,
-        body: "I reach your other apps and services here, including your iPhone and Telegram.",
-        buttonLabel: "Continue"
+        body: "I reach your other apps and services here, including your iPhone and Telegram."
     ),
     OnboardingTourStep(
-        id: 10,
         item: .capabilities,
-        title: SidebarItem.capabilities.shellRailTitle,
-        body: "This is what I can do and what's installed.",
-        buttonLabel: "Continue"
+        body: "This is what I can do and what's installed."
     ),
     OnboardingTourStep(
-        id: 11,
         item: .diagnostics,
-        title: SidebarItem.diagnostics.shellRailTitle,
-        body: "This is how I'm running, with my skills, my tools and the logs when something looks wrong.",
-        buttonLabel: "Continue"
+        body: "This is how I'm running, with my skills, my tools and the logs when something looks wrong."
     ),
     OnboardingTourStep(
-        id: 12,
         item: .settings,
-        title: SidebarItem.settings.shellRailTitle,
-        body: "You set the appearance, the shortcut that opens me and updates here, and you can take this tour again.",
-        buttonLabel: "Got it"
+        body: "You set the appearance, the shortcut that opens me and updates here, and you can take this tour again."
     ),
 ]
 
@@ -119,7 +78,7 @@ private let onboardingTourStops: [OnboardingTourStep] = [
 enum OnboardingTourAction: Equatable, Sendable {
     case advance
     case retreat
-    case select(stepID: Int)
+    case select(stepID: SidebarItem)
     case skip
 }
 
@@ -131,7 +90,7 @@ enum OnboardingTourEffect: Equatable, Sendable {
 
 @MainActor struct OnboardingTourState: Equatable, Sendable {
     private(set) var steps: [OnboardingTourStep]
-    private(set) var currentStopID: Int?
+    private(set) var currentStopID: SidebarItem?
     init(layout: SurfaceLayout) {
         steps = Self.steps(in: layout)
         currentStopID = steps.first?.id
@@ -142,9 +101,7 @@ enum OnboardingTourEffect: Equatable, Sendable {
     var stepIndex: Int { steps.firstIndex { $0.id == currentStopID } ?? 0 }
     private(set) var didComplete = false
 
-    var step: OnboardingTourStep { steps[stepIndex] }
-    var isLast: Bool { stepIndex == steps.count - 1 }
-    var route: SidebarItem { step.item }
+    var step: OnboardingTourStep? { steps.first { $0.id == currentStopID } ?? steps.first }
 
     /// Applies one visible control action. Completion is idempotent so a
     /// duplicate Skip/Return event cannot ask ContentView to persist a second
@@ -153,22 +110,22 @@ enum OnboardingTourEffect: Equatable, Sendable {
         guard !didComplete else { return .none }
         switch action {
         case .advance:
-            guard !isLast else {
+            guard let next = steps.dropFirst(stepIndex + 1).first else {
                 didComplete = true
                 return .complete
             }
-            currentStopID = steps[stepIndex + 1].id
-            return .route(route)
+            currentStopID = next.id
+            return .route(next.item)
         case .retreat:
-            guard stepIndex > 0 else { return .none }
-            currentStopID = steps[stepIndex - 1].id
-            return .route(route)
+            guard let previous = steps.prefix(stepIndex).last else { return .none }
+            currentStopID = previous.id
+            return .route(previous.item)
         case let .select(stepID):
-            guard let index = steps.firstIndex(where: { $0.id == stepID }) else {
+            guard let selected = steps.first(where: { $0.id == stepID }) else {
                 return .none
             }
-            currentStopID = steps[index].id
-            return .route(route)
+            currentStopID = selected.id
+            return .route(selected.item)
         case .skip:
             didComplete = true
             return .complete
@@ -177,9 +134,9 @@ enum OnboardingTourEffect: Equatable, Sendable {
 
     mutating func reconcile(layout: SurfaceLayout) -> OnboardingTourEffect {
         steps = Self.steps(in: layout)
-        if steps.isEmpty { return apply(.skip) }
+        guard let step else { return apply(.skip) }
         currentStopID = step.id
-        return .route(route)
+        return .route(step.item)
     }
 }
 
@@ -188,16 +145,13 @@ enum OnboardingTourEffect: Equatable, Sendable {
 /// state, and action target from drifting into separate SwiftUI branches.
 @MainActor struct OnboardingTourPresentation: Equatable, Sendable {
     let progressText: String
-    let title: String
-    let sidebarItem: SidebarItem
     let advanceLabel: String
     let backEnabled: Bool
 
-    init(state: OnboardingTourState) {
+    init?(state: OnboardingTourState) {
+        guard state.step != nil else { return nil }
         progressText = "Step \(state.stepIndex + 1) of \(state.steps.count)"
-        title = state.step.title
-        sidebarItem = state.step.item
-        advanceLabel = state.step.buttonLabel
+        advanceLabel = state.stepIndex == state.steps.count - 1 ? "Got it" : "Continue"
         backEnabled = state.stepIndex > 0
     }
 }
@@ -220,15 +174,10 @@ struct OnboardingTourOverlay: View {
     @State private var previousViewMode: String?
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
-    private var step: OnboardingTourStep { tour.step }
-    private var presentation: OnboardingTourPresentation { .init(state: tour) }
-
     /// A rail the layout left empty has no stop to show: the tour ends.
     var body: some View {
-        if tour.steps.isEmpty {
-            Color.clear.onAppear(perform: onComplete)
-        } else {
-            tourBody
+        if let step = tour.step, let presentation = OnboardingTourPresentation(state: tour) {
+            tourBody(step: step, presentation: presentation)
                 .onChange(of: layout) { _, _ in
                     switch tour.reconcile(layout: layout) {
                     case .route(let item): onSelectTab(item)
@@ -236,10 +185,12 @@ struct OnboardingTourOverlay: View {
                     case .none: break
                     }
                 }
+        } else {
+            Color.clear.onAppear(perform: onComplete)
         }
     }
 
-    private var tourBody: some View {
+    private func tourBody(step: OnboardingTourStep, presentation: OnboardingTourPresentation) -> some View {
         ZStack {
             // Dimmed background
             Color.black.opacity(0.55)
@@ -272,7 +223,7 @@ struct OnboardingTourOverlay: View {
                             .frame(maxWidth: 420)
                     }
                     .motionArrival()
-                    .id(tour.stepIndex)
+                    .id(step.id)
 
                     HStack(spacing: NativeAgentSpacing.md) {
                         Button("Skip") {
@@ -313,12 +264,12 @@ struct OnboardingTourOverlay: View {
         .onAppear {
             if previousViewMode == nil { previousViewMode = viewMode }
             viewMode = SimpleViewMode.advanced
-            onSelectTab(tour.route)
+            onSelectTab(step.item)
         }
         .onDisappear {
             if let previousViewMode { viewMode = previousViewMode }
         }
-        // S.4: mark overlay as accessibility modal so VoiceOver focuses only overlay content
+        // Keep VoiceOver focused on the overlay.
         .accessibilityAddTraits(.isModal)
         .accessibilityIdentifier("onboarding-tour.overlay")
     }
@@ -328,7 +279,7 @@ struct OnboardingTourOverlay: View {
     private var tabRail: some View {
         VStack(alignment: .leading, spacing: 2) {
             ForEach(tour.steps) { tabStep in
-                let isSelected = tabStep.id == step.id
+                let isSelected = tabStep.id == tour.currentStopID
                 Button {
                     apply(.select(stepID: tabStep.id))
                 } label: {

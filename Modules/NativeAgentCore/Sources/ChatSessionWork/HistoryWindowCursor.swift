@@ -1,7 +1,8 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `HistoryWindowCursor.swift` | `HistoryWindowCursor`, `HistoryWindowCursorStore`; locked advancement persists only changed boundaries |
+// Blueprint: | `HistoryWindowCursor.swift` | `HistoryWindowCursor`, `HistoryWindowCursorStore`; locked reads validate nonnegative representable counters; checked advances preserve stored bytes on failure; row/character hysteresis persists only changed boundaries |
 
 // Per-session replayed-prefix window cursor (v2Prefix conversation shape).
 //
@@ -16,21 +17,18 @@ import PersistenceCore
 // and only at a turn boundary:
 //
 //   - ADVANCE ONLY on real pressure: the admitted rows must exceed
-//     `budget.historyChars * advanceTriggerRatio` (1.15). Under that, the head
-//     does not move at all, even as the tail grows.
+//     either rendered-byte or row budget * advanceTriggerRatio (1.15). Under
+//     both, the head does not move at all, even as the tail grows.
 //   - When it does advance, drop OLDEST-FIRST in complete user/assistant PAIRS
-//     until the remainder is at or under `budget.historyChars *
-//     advanceTargetRatio` (0.70). Overshooting on purpose is what buys the
+//     until the remainder is at or under BOTH budgets * advanceTargetRatio
+//     (0.70). Overshooting on purpose is what buys the
 //     next several turns of stability — trimming to exactly the ceiling would
 //     re-trigger on the very next turn.
 //   - NEVER mid-turn. A tool loop's iteration N+1 must read iteration N's
 //     prefix; moving the head between them is a guaranteed cache kill.
-//   - ANCHORS ARE EXEMPT. The first `anchorLimit` user/assistant rows of the
-//     session are the opening that makes everything after it legible.
-//   - NEVER in the same turn a compaction ran. `ChatSessionAutocompactor`
-//     stays the rare rewrite owner; two rewrites of the same prefix in one
-//     turn is one rewrite too many, and the compaction already reclaimed the
-//     bytes this cursor would be reclaiming.
+//   - Only compaction recollections survive ahead of the boundary.
+//   - After compaction, only advance if the remaining history still exceeds
+//     either budget. Compaction owns the rewrite; the cursor bounds its result.
 //
 // The boundary is stored as a row IDENTITY (`ChatMessage.historyIdentity`),
 // not an index: indices shift under the tail limit every turn, identities do
@@ -40,8 +38,8 @@ import PersistenceCore
 public struct HistoryWindowCursor: Codable, Sendable, Equatable {
     public var sessionId: String
     /// `historyIdentity` of the NEWEST row that is outside the window. Every
-    /// admitted row at or before it is dropped (anchors and the compaction
-    /// summary excepted). nil → nothing dropped; the full admitted set rides.
+    /// admitted row at or before it is dropped (compaction summaries excepted).
+    /// nil → nothing dropped; the full admitted set rides.
     public var dropBoundaryIdentity: String?
     /// How many times this session's window has ever advanced. Read by the
     /// turn trace (`windowCursorAdvanceCount`); not authority for anything.
@@ -70,27 +68,23 @@ public struct HistoryWindowCursor: Codable, Sendable, Equatable {
 /// Storage: prefix cursors are local replay state, excluded from local backup,
 /// data export and phone sync; included in off-disk backup and PrivacyMap/chat.
 public actor HistoryWindowCursorStore {
-    /// Pressure threshold. Below `historyChars * 1.15` the head does not move.
+    /// Pressure threshold. Below both budgets * 1.15 the head does not move.
     static let advanceTriggerRatio = 1.15
     /// Post-advance target. Trimming well under the ceiling is what makes the
     /// next several turns cache-stable.
     static let advanceTargetRatio = 0.70
 
-    private let persistence = SwiftNativePersistenceCore()
     private let dataRootOverride: URL?
 
     public init(dataRoot: URL? = nil) {
         self.dataRootOverride = dataRoot
     }
 
-    private func dataRoot() -> URL {
-        if let dataRootOverride { return dataRootOverride }
-        return PersistenceCore.defaultDataRoot()
-    }
+    private var dataRoot: URL { dataRootOverride ?? PersistenceCore.defaultDataRoot() }
 
     private func pathFor(sessionId: String) -> URL {
         let safe = NativeAgentChatSessionID.normalizedPathComponent(sessionId) ?? "invalid"
-        return dataRoot()
+        return dataRoot
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("prefix_window", isDirectory: true)
             .appendingPathComponent("\(safe).json")
@@ -98,11 +92,24 @@ public actor HistoryWindowCursorStore {
 
     // MARK: - The one advance boundary
 
+    /// Read before selecting transcript rows. The reader retains this boundary
+    /// even beyond its ordinary tail, so only this owner can move the head.
+    public func current(sessionId: String) async throws -> HistoryWindowCursor {
+        guard let safe = NativeAgentChatSessionID.normalizedPathComponent(sessionId) else {
+            return HistoryWindowCursor(sessionId: sessionId)
+        }
+        let path = pathFor(sessionId: safe)
+        return try await SwiftNativePersistenceCore.withFileLock(path) {
+            try await self.loadLocked(path: path, sessionId: safe)
+        }
+    }
+
     /// Decide and persist this turn's window head. Call ONCE per turn, at turn
     /// start, before the prefix is projected — never per tool-loop iteration.
     ///
     /// `admitted` is the projection's `admittedIdentities` (oldest→newest),
-    /// `rowLengths` the matching per-row rendered lengths, `roles` the matching
+    /// `rowLengths` the matching per-row rendered byte lengths (including sent
+    /// context), `roles` the matching
     /// per-row roles (so pairs can be cut whole). Returns the cursor to project
     /// with; `didAdvance` says whether the head actually moved.
     @discardableResult
@@ -120,7 +127,7 @@ public actor HistoryWindowCursorStore {
         }
         let path = pathFor(sessionId: trimmed)
         do {
-            return try await persistence.withFileLock(path) {
+            return try await SwiftNativePersistenceCore.withFileLock(path) {
                 let state = try await self.loadLocked(path: path, sessionId: trimmed)
                 // NEVER twice within one turn: a tool loop's later iterations
                 // must read the same prefix iteration 1 wrote.
@@ -129,8 +136,9 @@ public actor HistoryWindowCursorStore {
                 }
                 // Compaction already owns this turn's rewrite, while what it
                 // leaves fits; past that, whole older turns still go first.
-                let over = budgetChars > 0
-                    && Self.replayed(admitted, currentBoundary: state.dropBoundaryIdentity).chars > budgetChars
+                let replay = Self.replayed(admitted, currentBoundary: state.dropBoundaryIdentity)
+                let over = (budgetChars > 0 && replay.chars > budgetChars)
+                    || (rowCap > 0 && replay.rows > rowCap)
                 guard !compactionRanThisTurn || over else { return (state, false) }
                 guard let boundary = Self.nextBoundary(
                     admitted: admitted,
@@ -151,7 +159,11 @@ public actor HistoryWindowCursorStore {
                 // this request and report no advance.
                 var advanced = state
                 advanced.dropBoundaryIdentity = boundary
-                advanced.advanceCount += 1
+                let (count, overflow) = state.advanceCount.addingReportingOverflow(1)
+                guard !overflow else {
+                    throw PersistenceCoreError.ioFailure("History window advance counter is exhausted for \(trimmed); cursor left unchanged.")
+                }
+                advanced.advanceCount = count
                 advanced.lastAdvanceTurnId = turnId
                 advanced.updatedAt = NativeTimestampFormat.fractionalZulu(Date())
                 do {
@@ -202,7 +214,7 @@ public actor HistoryWindowCursorStore {
         let charPressure = budgetChars > 0
             && Double(used) > Double(budgetChars) * (pressed ? 1 : advanceTriggerRatio)
         let rowPressure = rowCap > 0
-            && Double(rowCount) > Double(rowCap) * advanceTriggerRatio
+            && Double(rowCount) > Double(rowCap) * (pressed ? 1 : advanceTriggerRatio)
         guard charPressure || rowPressure else { return nil }
 
         let target = budgetChars > 0
@@ -257,16 +269,9 @@ public actor HistoryWindowCursorStore {
         return candidate
     }
 
-    /// What the window replays past `currentBoundary`: its characters, its rows,
-    /// and where the live rows start. Anchors and the recollection sit BEFORE
-    /// the boundary and are replayed anyway, so they are part of what the model
-    /// actually reads and must be counted. Leaving them out would under-report
-    /// the prefix and let it run over the ceiling by exactly the bytes that can
-    /// never be reclaimed. Only the compaction recollection survives ahead of
-    /// the boundary now. Anchors are no longer pinned at the head: pinning them
-    /// put a moving joint between them and the first live row (see the
-    /// projection's cursor-drop note), and the session's opening already rides
-    /// the volatile block's continuity state.
+    /// What the window replays past `currentBoundary`: its UTF-8 bytes, its rows,
+    /// and where the live rows start. Compaction recollections survive ahead
+    /// of the boundary and count toward the bytes the model reads.
     nonisolated static func replayed(_ admitted: [HistoryWindowRow], currentBoundary: String?)
         -> (chars: Int, rows: Int, liveStart: Int) {
         let currentIndex = currentBoundary.flatMap { boundary in admitted.firstIndex { $0.identity == boundary } }
@@ -310,7 +315,7 @@ public actor HistoryWindowCursorStore {
     // MARK: - Helpers (must be called while holding the file lock)
 
     private func loadLocked(path: URL, sessionId: String) async throws -> HistoryWindowCursor {
-        let json = try await persistence.readJSON(path, ifMissing: .null)
+        let json = try await SwiftNativePersistenceCore.readJSON(path, ifMissing: .null)
         guard case .object(let obj) = json else {
             return HistoryWindowCursor(sessionId: sessionId)
         }
@@ -318,8 +323,10 @@ public actor HistoryWindowCursorStore {
             if case .string(let s) = obj[key] ?? .null, !s.isEmpty { return s }
             return nil
         }
-        var advanceCount = 0
-        if case .int(let n) = obj["advanceCount"] ?? .null { advanceCount = Int(n) }
+        guard case .int(let n)? = obj["advanceCount"], n >= 0,
+              let advanceCount = Int(exactly: n) else {
+            throw PersistenceCoreError.ioFailure("History window advance counter is invalid for \(sessionId); cursor left unchanged.")
+        }
         return HistoryWindowCursor(
             sessionId: sessionId,
             dropBoundaryIdentity: string("dropBoundaryIdentity"),
@@ -342,7 +349,7 @@ public actor HistoryWindowCursorStore {
         if let turnId = state.lastAdvanceTurnId {
             body["lastAdvanceTurnId"] = .string(turnId)
         }
-        try await persistence.writeJSON(.object(body), to: path)
+        try await SwiftNativePersistenceCore.writeJSON(.object(body), to: path)
     }
 }
 
@@ -365,26 +372,24 @@ public struct HistoryWindowReceipt: Sendable, Equatable {
 }
 
 /// One admitted history row, reduced to what the window rule needs. Keeping
-/// this payload-free (identity + length + role + two flags, never content) is
+/// this payload-free (identity + length + role + summary flag, never content) is
 /// what lets the cursor be persisted and traced without carrying transcript.
 public struct HistoryWindowRow: Sendable, Equatable {
     public let identity: String
     public let role: String
+    /// Rendered UTF-8 bytes, including exact user-leading delivery metadata.
     public let length: Int
-    public let isAnchor: Bool
     public let isCompactionSummary: Bool
 
     public init(
         identity: String,
         role: String,
         length: Int,
-        isAnchor: Bool,
         isCompactionSummary: Bool
     ) {
         self.identity = identity
         self.role = role
         self.length = length
-        self.isAnchor = isAnchor
         self.isCompactionSummary = isCompactionSummary
     }
 }
@@ -393,9 +398,9 @@ public struct HistoryWindowRow: Sendable, Equatable {
 ///
 /// `compactionRanThisTurn` is bound by the chat lanes from the autocompactor's
 /// own outcome. `ChatSessionAutocompactor` stays the rare rewrite owner: when
-/// it fired, the prefix was already rewritten and reclaimed this turn, and a
-/// second rewrite from the window cursor in the same turn would pay the cache
-/// write premium twice for one turn's worth of savings.
+/// it fired and its result fits both budgets, the cursor leaves the head alone.
+/// A result still over either budget drops whole older turns through the same
+/// cursor decision.
 public enum HistoryWindowTurnFacts {
     @TaskLocal public static var compactionRanThisTurn: Bool = false
 }

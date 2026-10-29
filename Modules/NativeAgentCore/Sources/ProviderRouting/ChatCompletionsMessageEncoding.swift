@@ -10,7 +10,7 @@ func chatCompletionsMessages(
     from message: LLMMessage,
     reasoning: String? = nil
 ) -> [[String: Any]] {
-    let role = message.role == .user ? "user" : "assistant"
+    let role = message.role.rawValue
     var textParts: [String] = []
     var contentParts: [[String: Any]] = []
     var toolCalls: [[String: Any]] = []

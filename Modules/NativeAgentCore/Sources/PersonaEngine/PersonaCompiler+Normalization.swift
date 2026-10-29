@@ -1,16 +1,17 @@
 import Foundation
+import NativeAgentShared
+import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `PersonaCompiler+Normalization.swift` | `PersonaCompiler`: `normalize` |
 
 extension PersonaCompiler {
-    // MARK: - normalize_personality mirror
+    // MARK: - Profile normalization
 
-    /// Mirrors Python `normalize_personality(raw)` at L35035-35079.
+    /// Normalize current fields, consume the gender alias and preserve unknown keys.
     public static func normalize(
         raw: [String: Any],
         defaults: CompiledPersonalityProfile
     ) -> CompiledPersonalityProfile {
-        // personaKind canonicalisation (L35042-35051).
         var personaKind = stringOr(raw["personaKind"], or: nil)
             ?? stringOr(raw["gender"], or: nil)
             ?? defaults.personaKind
@@ -22,8 +23,7 @@ extension PersonaCompiler {
         let personaCanonical: String =
             (personaKind.lowercased() == "ai") ? "AI" : personaKind.capitalized
 
-        // Traits (L35038-35041): clamp_float on every defaults key; ignore
-        // raw extras.
+        // Trait values are defaulted and clamped; unknown trait names are ignored.
         let rawTraits = raw["traits"] as? [String: Any] ?? [:]
         let traits = CompiledPersonalityTraits(
             warmth: clampFloat(rawTraits["warmth"], fallback: defaults.traits.warmth),
@@ -36,14 +36,11 @@ extension PersonaCompiler {
             brevity: clampFloat(rawTraits["brevity"], fallback: defaults.traits.brevity)
         )
 
-        // Scalar strings with caps + trim (L35057-35061).
         let name = capString(raw["name"], fallback: defaults.name, cap: 80)
         let essence = capString(raw["essence"], fallback: defaults.essence, cap: 1000)
         let voice = capString(raw["voice"], fallback: defaults.voice, cap: 1000)
         let customDirective = capString(raw["customDirective"], fallback: "", cap: 2000)
 
-        // List fields: list-typed-or-default, then per-item trim/cap/limit
-        // (L35063-35073).
         let examples = trimList(
             raw["examples"] as? [Any] ?? defaults.examples.map { $0 as Any },
             itemCap: 500, listCap: 12
@@ -61,8 +58,6 @@ extension PersonaCompiler {
             itemCap: 500, listCap: 16
         )
 
-        // surfaceOverrides: dict-typed-or-default, then per-pair sanitize
-        // (L35067, L35074-35078).
         let rawOverrides = (raw["surfaceOverrides"] as? [String: Any])
             ?? defaults.surfaceOverrides.mapValues { $0 as Any }
         var surfaceOverrides: [String: String] = [:]
@@ -85,15 +80,9 @@ extension PersonaCompiler {
         }
 
         // updatedAt: raw value if present, else now ISO8601.
-        let updatedAt = stringOr(raw["updatedAt"], or: nil) ?? Self.nowISO()
+        let updatedAt = stringOr(raw["updatedAt"], or: nil) ?? NativeTimestampFormat.fractionalZulu(Date())
 
-        // Lossless extras (Python `{**raw items if k not in {"traits","gender"}}`,
-        // L35259). Every KNOWN key the normalize sets above is re-stamped from
-        // the explicit fields, so the only `raw` keys that survive the splat are
-        // those OUTSIDE the fixed set. We compute that set here: any raw key not
-        // in `normalizedKeys` AND not in `{traits, gender}` is carried verbatim
-        // as a JSONValue. (`gender` is folded into personaKind; `traits` is
-        // rebuilt — both are excluded by Python and here.)
+        // Carry unknown keys verbatim; traits are rebuilt and gender is consumed.
         var extras: [String: JSONValue] = [:]
         for (key, value) in raw {
             if Self.normalizedKeys.contains(key) { continue }
@@ -120,10 +109,7 @@ extension PersonaCompiler {
         )
     }
 
-    /// The KNOWN profile keys `normalize_personality` re-stamps explicitly
-    ///. Any raw key NOT in this set (and not
-    /// `traits`/`gender`, which are consumed) is an "extra" preserved verbatim
-    /// per Python's `{**raw}` splat. Keep in lockstep with the explicit fields.
+    /// Keep this set aligned with explicit profile fields so only unknown keys become extras.
     static let normalizedKeys: Set<String> = [
         "schemaVersion", "personaEngineVersion", "name", "personaKind",
         "essence", "voice", "customDirective", "traits", "examples",
@@ -142,8 +128,7 @@ extension PersonaCompiler {
         return String(trimmed.prefix(cap))
     }
 
-    /// Mirrors Python `clamp_float(value, fallback)` — accept ints, floats,
-    /// numeric strings, clamp to [0, 1], else fallback.
+    /// Accept numeric values and strings, clamp to [0, 1], otherwise use the supplied default.
     private static func clampFloat(_ value: Any?, fallback: Double) -> Double {
         let candidate: Double?
         if let d = value as? Double { candidate = d }
@@ -168,10 +153,6 @@ extension PersonaCompiler {
         return out
     }
 
-    private static func nowISO() -> String {
-        let f = ISO8601DateFormatter()
-        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return f.string(from: Date())
-    }
+
 
 }

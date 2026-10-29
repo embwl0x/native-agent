@@ -1,7 +1,7 @@
 import Foundation
 import NativeAgentCore
 
-// Blueprint: | `RepairOwed.swift` | `RepairOwed`: experience-backed repair claims and settlement; retries, restarts and unrelated successes cannot settle another operation's debt |
+// Blueprint: | `RepairOwed.swift` | `RepairOwed`: experience-backed repair claims and settlement; `isOwed` omits effect-free agent probes and explicit pre-effect refusals without rewriting history; retries, restarts and unrelated successes cannot settle another operation's debt |
 
 /// Repair owed (User 10-18: "No fallbacks: it works and it works right, and
 /// never can the agent say I can't fix it"). A no whose cause lies outside the
@@ -13,6 +13,16 @@ import NativeAgentCore
 /// tool's act and for a no met anywhere else (a Doctor check, a part's wake, a
 /// background job), so one projection (her home's OWED lines) shows them all.
 public enum RepairOwed {
+    /// Saved probe failures remain evidence, not work she owes. Readers
+    /// derive this for older records too; no experience is rewritten.
+    public static func isOwed(_ experience: Experience) -> Bool {
+        guard experience.owes["repair"]?.phase.isSettled == false else { return false }
+        if experience.kind == .act, experience.outcome?.effects == Experience.Effects.none {
+            if experience.outcome?.domain == "agent.verify" { return false }
+            if ["refused", "not_run", "invalid_arguments", "unknown_contact"].contains(experience.outcome?.status ?? "") { return false }
+        }
+        return true
+    }
     /// What an owed repair carries: who decided, which operation failed, and the lever.
     /// The one reader of a claim the builder below wrote ("key: value").
     public static func claim(_ experience: Experience, _ key: String) -> String? {
@@ -33,7 +43,7 @@ public enum RepairOwed {
     /// one; once it settled, meeting it again is a new debt.
     public static func openDebt(_ store: ExperienceStore, operation: String, owner: String) async throws -> Experience? {
         try await store.open().first { owed in
-            owed.owes["repair"]?.phase.isSettled == false
+            isOwed(owed)
                 && owed.claims.contains { $0.claim == "operation: " + operation }
                 && owed.claims.contains { $0.claim == "owner: " + owner }
         }

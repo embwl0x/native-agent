@@ -17,7 +17,7 @@ enum TelegramUpdateClaimPhase: String, Sendable, Equatable, Codable {
     case stopped
 }
 
-struct TelegramUpdateClaim: Sendable, Equatable {
+struct TelegramUpdateClaim: Sendable, Codable, Equatable {
     var lifeID: String? = nil
     let updateId: Int
     let update: TelegramUpdate
@@ -39,6 +39,72 @@ struct TelegramUpdateClaim: Sendable, Equatable {
     var updatedAt: String
 }
 
+extension TelegramUpdateClaim {
+    enum CodingKeys: String, CodingKey {
+        case schemaVersion, lifeID, updateId, update, phase, assistantDelivery, assistantRunId, assistantSessionId, assistantOriginRunId, settledAssistantRuns, noRecoverableAnswer, failedBeforeAnswer, quarantineReason, queueAcknowledgementMessageId, resolvedRetryText, resolvedRetryMessage, resolvedSessionId, claimedAt, updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        guard try values.decode(JSONValue.self, forKey: .schemaVersion) == .int(1),
+              case .int(let rawId) = try values.decode(JSONValue.self, forKey: .updateId),
+              let id = Int(exactly: rawId) else {
+            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Invalid claim schema or ID"))
+        }
+        updateId = id
+        update = try values.decode(TelegramUpdate.self, forKey: .update)
+        phase = try values.decode(TelegramUpdateClaimPhase.self, forKey: .phase)
+        claimedAt = try values.decode(String.self, forKey: .claimedAt)
+        updatedAt = try values.decode(String.self, forKey: .updatedAt)
+        let string: (CodingKeys) -> String? = { key in
+            guard let raw = try? values.decode(String.self, forKey: key), !raw.isEmpty else { return nil }
+            return raw
+        }
+        lifeID = string(.lifeID)
+        assistantRunId = string(.assistantRunId)
+        assistantSessionId = string(.assistantSessionId)
+        assistantOriginRunId = string(.assistantOriginRunId)
+        quarantineReason = string(.quarantineReason)
+        resolvedRetryText = string(.resolvedRetryText)
+        resolvedSessionId = string(.resolvedSessionId)
+        switch try? values.decode(JSONValue.self, forKey: .queueAcknowledgementMessageId) {
+        case .int(let raw)?: queueAcknowledgementMessageId = Int(exactly: raw)
+        case .double(let raw)?: queueAcknowledgementMessageId = Int(exactly: raw)
+        case .string(let raw)?: queueAcknowledgementMessageId = Int(raw)
+        default: queueAcknowledgementMessageId = nil
+        }
+        resolvedRetryMessage = try values.decodeIfPresent(TelegramMessage.self, forKey: .resolvedRetryMessage)
+        assistantDelivery = try values.decodeIfPresent(TelegramAssistantDeliveryState.self, forKey: .assistantDelivery)
+        settledAssistantRuns = values.contains(.settledAssistantRuns)
+            ? try values.decode([String: String].self, forKey: .settledAssistantRuns) : [:]
+        noRecoverableAnswer = (try? values.decode(JSONValue.self, forKey: .noRecoverableAnswer)) == .bool(true)
+        failedBeforeAnswer = (try? values.decode(JSONValue.self, forKey: .failedBeforeAnswer)) == .bool(true)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(1, forKey: .schemaVersion)
+        try values.encode(lifeID, forKey: .lifeID)
+        try values.encode(updateId, forKey: .updateId)
+        try values.encode(update, forKey: .update)
+        try values.encode(phase, forKey: .phase)
+        try values.encode(assistantDelivery, forKey: .assistantDelivery)
+        try values.encode(assistantRunId, forKey: .assistantRunId)
+        try values.encode(assistantSessionId, forKey: .assistantSessionId)
+        try values.encode(assistantOriginRunId, forKey: .assistantOriginRunId)
+        try values.encode(settledAssistantRuns, forKey: .settledAssistantRuns)
+        try values.encode(noRecoverableAnswer, forKey: .noRecoverableAnswer)
+        try values.encode(failedBeforeAnswer, forKey: .failedBeforeAnswer)
+        try values.encode(quarantineReason, forKey: .quarantineReason)
+        try values.encode(queueAcknowledgementMessageId, forKey: .queueAcknowledgementMessageId)
+        try values.encode(resolvedRetryText, forKey: .resolvedRetryText)
+        try values.encode(resolvedRetryMessage, forKey: .resolvedRetryMessage)
+        try values.encode(resolvedSessionId, forKey: .resolvedSessionId)
+        try values.encode(claimedAt, forKey: .claimedAt)
+        try values.encode(updatedAt, forKey: .updatedAt)
+    }
+}
+
 enum TelegramUpdateInboxError: Error, LocalizedError, Equatable {
     case malformedClaim(String)
     case mismatchedUpdateId(expected: Int, actual: Int)
@@ -58,15 +124,6 @@ enum TelegramUpdateInboxError: Error, LocalizedError, Equatable {
 public struct TelegramUpdateInbox: Sendable {
     let directory: URL
     private let dataRoot: URL
-    private let persistence = SwiftNativePersistenceCore()
-
-    enum ClaimReadKind: Sendable, Equatable, Hashable {
-        case recovery
-        case mutation
-        case diagnosticSnapshot
-    }
-
-    @TaskLocal static var claimReadObserver: (@Sendable (ClaimReadKind) -> Void)?
 
     init(offsetURL: URL, dataRoot: URL) {
         self.dataRoot = dataRoot
@@ -87,7 +144,7 @@ public struct TelegramUpdateInbox: Sendable {
     public static func repair(dataRoot: URL, inbox: String) async throws -> JSONValue {
         let root = dataRoot.appendingPathComponent("telegram", isDirectory: true).resolvingSymlinksInPath()
         let directory = dataRoot.appendingPathComponent(inbox, isDirectory: true).standardizedFileURL
-        guard directory.resolvingSymlinksInPath().path.hasPrefix(root.path + "/"),
+        guard let tail = NativeAgentWorkspaceRoot.relativePath(directory.resolvingSymlinksInPath().path, under: root.path), !tail.isEmpty,
               directory.lastPathComponent == "update_inbox" || directory.lastPathComponent.hasSuffix(".inbox"),
               FileManager.default.fileExists(atPath: directory.path) else {
             throw ToolFailureError("Pass the existing Telegram inbox path named by the failure.",
@@ -95,11 +152,11 @@ public struct TelegramUpdateInbox: Sendable {
         }
         let store = Self(directory: directory, dataRoot: dataRoot)
         do {
-            return try await store.persistence.withFileLock(store.indexPath) {
+            return try await SwiftNativePersistenceCore.withFileLock(store.indexPath) {
                 let claims = try await store.snapshots()
                 let preserved = store.indexPath.appendingPathExtension("preserved-" + UUID().uuidString)
                 if FileManager.default.fileExists(atPath: store.indexPath.path) {
-                    try await store.persistence.writeDataAtomicDurable(Data(contentsOf: store.indexPath), to: preserved)
+                    try await SwiftNativePersistenceCore.writeDataAtomicDurableAsync(Data(contentsOf: store.indexPath), to: preserved)
                 }
                 try await store.writeIndex(InboxClaimIndex(claims: claims))
                 _ = try await store.recoverableClaimsLocked()
@@ -119,7 +176,7 @@ public struct TelegramUpdateInbox: Sendable {
         default: name = indexPath.lastPathComponent
         }
         let owner = directory.appendingPathComponent(name).path
-        let inbox = String(directory.path.dropFirst(dataRoot.path.count + 1))
+        let inbox = NativeAgentWorkspaceRoot.relativePath(directory.path, under: dataRoot.path) ?? directory.path
         let next = name == indexPath.lastPathComponent
             ? ToolFailureError.call("app", ["action": .string("telegram.repair"), "args": .object(["inbox": .string(inbox)])])
             : ToolFailureError.call("app", ["action": .string("files.read"), "args": .object(["path": .string(owner)])])
@@ -144,11 +201,11 @@ public struct TelegramUpdateInbox: Sendable {
         var claims: [(path: URL, at: String)] = []
         for directory in directories where FileManager.default.fileExists(atPath: directory.path) {
             let inbox = Self(directory: directory, dataRoot: dataRoot)
-            claims += try await inbox.persistence.withFileLock(inbox.indexPath) {
+            claims += try await SwiftNativePersistenceCore.withFileLock(inbox.indexPath) {
                 try await inbox.loadIndex().entries.values.filter { $0.phase == .failedBeforeAnswer }
                     .map {
                         let path = inbox.claimPath(updateId: $0.updateId)
-                        return (path: path, at: try inbox.decodeClaim(at: path, kind: .diagnosticSnapshot).updatedAt)
+                        return (path: path, at: try inbox.decodeClaim(at: path).updatedAt)
                     }
             }
         }
@@ -170,7 +227,7 @@ public struct TelegramUpdateInbox: Sendable {
             guard values.isRegularFile == true, values.isSymbolicLink != true else {
                 throw TelegramUpdateInboxError.malformedClaim(url.lastPathComponent)
             }
-            let claim = try decodeClaim(at: url, kind: .diagnosticSnapshot)
+            let claim = try decodeClaim(at: url)
             guard url.deletingPathExtension().lastPathComponent == String(claim.updateId),
                   seenUpdateIDs.insert(claim.updateId).inserted else {
                 throw TelegramUpdateInboxError.malformedClaim(url.lastPathComponent)
@@ -187,7 +244,7 @@ public struct TelegramUpdateInbox: Sendable {
         let path = claimPath(updateId: updateId)
         return try await withClaimMutationLock(path) {
             if FileManager.default.fileExists(atPath: path.path) {
-                let claim = try decodeClaim(at: path, kind: .mutation)
+                let claim = try decodeClaim(at: path)
                 guard claim.assistantRunId == runId, claim.assistantSessionId == sessionId,
                       claim.update.message?.destination == destination,
                       claim.assistantDelivery?.reply == delivery.reply else { throw TelegramUpdateInboxError.malformedClaim(path.lastPathComponent) }
@@ -213,10 +270,13 @@ public struct TelegramUpdateInbox: Sendable {
 
     @discardableResult
     func ensurePending(_ update: TelegramUpdate) async throws -> TelegramUpdateClaim {
+        guard update.updateId >= 0, update.hasValidInboxID else {
+            throw TelegramUpdateInboxError.malformedClaim("\(update.updateId).json")
+        }
         let path = claimPath(updateId: update.updateId)
         return try await withClaimMutationLock(path) {
             if FileManager.default.fileExists(atPath: path.path) {
-                let existing = try decodeClaim(at: path, kind: .mutation)
+                let existing = try decodeClaim(at: path)
                 try await upsertIndex(existing)
                 return existing
             }
@@ -254,7 +314,7 @@ public struct TelegramUpdateInbox: Sendable {
     ) async throws -> TelegramUpdateClaim {
         let path = claimPath(updateId: updateId)
         return try await withClaimMutationLock(path) {
-            let current = try decodeClaim(at: path, kind: .mutation)
+            let current = try decodeClaim(at: path)
             guard allowed.contains(current.phase) else { return current }
             if let resolvedSessionId {
                 guard NativeAgentChatSessionID.normalizedPathComponent(resolvedSessionId) != nil,
@@ -285,8 +345,9 @@ public struct TelegramUpdateInbox: Sendable {
     ) async throws -> TelegramUpdateClaim {
         let path = claimPath(updateId: updateId)
         return try await withClaimMutationLock(path) {
-            let current = try decodeClaim(at: path, kind: .mutation)
-            guard current.phase == .queued else { return current }
+            let current = try decodeClaim(at: path)
+            // A send can settle after the queued turn starts or is consumed.
+            // Preserve the returned message identity in every phase.
             var next = current
             next.queueAcknowledgementMessageId = messageId
             next.updatedAt = _tgNowString()
@@ -297,7 +358,7 @@ public struct TelegramUpdateInbox: Sendable {
     }
 
     func claim(updateId: Int) throws -> TelegramUpdateClaim {
-        try decodeClaim(at: claimPath(updateId: updateId), kind: .mutation)
+        try decodeClaim(at: claimPath(updateId: updateId))
     }
 
     @discardableResult
@@ -309,7 +370,7 @@ public struct TelegramUpdateInbox: Sendable {
     ) async throws -> TelegramAssistantDeliveryState? {
         let path = claimPath(updateId: updateId)
         return try await withClaimMutationLock(path) {
-            var current = try decodeClaim(at: path, kind: .mutation)
+            var current = try decodeClaim(at: path)
             let previous = current
             if failedBeforeAnswer { current.failedBeforeAnswer = true }
             if recovering, var retained = current.assistantDelivery {
@@ -338,13 +399,13 @@ public struct TelegramUpdateInbox: Sendable {
         updateId: Int,
         _ body: @Sendable () async throws -> T
     ) async throws -> T {
-        try await persistence.withFileLock(claimPath(updateId: updateId).appendingPathExtension("delivery"), body)
+        try await SwiftNativePersistenceCore.withFileLock(claimPath(updateId: updateId).appendingPathExtension("delivery"), body)
     }
 
     func prepareSuccessor(updateId: Int, runId: String, sessionId: String, delivery: TelegramAssistantDeliveryState) async throws {
         let path = claimPath(updateId: updateId)
         try await withClaimMutationLock(path) {
-            var claim = try decodeClaim(at: path, kind: .mutation)
+            var claim = try decodeClaim(at: path)
             guard claim.assistantRunId != runId else { return }
             guard claim.settledAssistantRuns[runId] == nil,
                   let priorRun = claim.assistantRunId, let prior = claim.assistantDelivery,
@@ -365,7 +426,7 @@ public struct TelegramUpdateInbox: Sendable {
     /// processing, queued, or permission-blocked claim files. Terminal retention never makes an idle Telegram
     /// tick reread hundreds of historical update payloads.
     func recoverableClaims() async throws -> [TelegramUpdateClaim] {
-        try await persistence.withFileLock(indexPath) {
+        try await SwiftNativePersistenceCore.withFileLock(indexPath) {
             try await recoverableClaimsLocked()
         }
     }
@@ -377,7 +438,7 @@ public struct TelegramUpdateInbox: Sendable {
         for entry in index.entries.values.sorted(by: { $0.updateId < $1.updateId })
         where entry.phase == .pending || entry.phase == .processing || entry.phase == .queued
             || entry.phase == .awaitingSpeechPermission || entry.phase == .outcomeUnknown {
-            let claim = try decodeClaim(at: claimPath(updateId: entry.updateId), kind: .recovery)
+            let claim = try decodeClaim(at: claimPath(updateId: entry.updateId))
             if claim.phase != .stopped { recovered.append(claim) }
             if claim.phase != entry.phase {
                 index.entries[entry.updateId] = InboxClaimIndex.Entry(
@@ -392,8 +453,8 @@ public struct TelegramUpdateInbox: Sendable {
     }
 
     func pruneTerminalClaims(dataRoot: URL, keepingNewest keep: Int = 256) async {
-        try? await persistence.withFileLock(indexPath) {
-            guard let referenced = try? CodexCompletionLifecycleProjection.unsettledAnswerRuns(
+        try? await SwiftNativePersistenceCore.withFileLock(indexPath) {
+            guard let referenced = try? CodexCompletionReadout.unsettledAnswerRuns(
                 configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot), dataRoot: dataRoot) else { return }
             await pruneTerminalClaimsLocked(keepingNewest: keep, referenced: referenced)
         }
@@ -405,7 +466,7 @@ public struct TelegramUpdateInbox: Sendable {
             .filter { $0.phase == .completed || $0.phase == .failedBeforeAnswer }
         guard terminal.count > keep else { return }
         let eligible = terminal.compactMap { entry -> TelegramUpdateClaim? in
-            guard let claim = try? decodeClaim(at: claimPath(updateId: entry.updateId), kind: .mutation),
+            guard let claim = try? decodeClaim(at: claimPath(updateId: entry.updateId)),
                   Set(claim.settledAssistantRuns.keys).union([claim.assistantRunId, claim.assistantOriginRunId].compactMap { $0 })
                     .isDisjoint(with: referenced) else { return nil }
             return claim
@@ -441,147 +502,45 @@ public struct TelegramUpdateInbox: Sendable {
         _ path: URL,
         _ body: @Sendable () async throws -> T
     ) async throws -> T {
-        try await persistence.withFileLock(indexPath) {
-            try await persistence.withFileLock(path, body)
+        try await SwiftNativePersistenceCore.withFileLock(indexPath) {
+            try await SwiftNativePersistenceCore.withFileLock(path, body)
         }
     }
 
-    private func decodeClaim(at path: URL, kind: ClaimReadKind) throws -> TelegramUpdateClaim {
-        Self.claimReadObserver?(kind)
-        let data: Data
+    private func decodeClaim(at path: URL) throws -> TelegramUpdateClaim {
+        var claim: TelegramUpdateClaim
         do {
-            data = try Data(contentsOf: path)
+            claim = try JSONDecoder().decode(TelegramUpdateClaim.self, from: Data(contentsOf: path))
         } catch {
             throw TelegramUpdateInboxError.malformedClaim(path.lastPathComponent)
         }
-        guard case .object(let object) = try? JSONValue.parse(data),
-              case .int(let schema)? = object["schemaVersion"], schema == 1,
-              case .int(let rawUpdateId)? = object["updateId"],
-              let updateId = Int(exactly: rawUpdateId),
-              case .string(let rawPhase)? = object["phase"],
-              let phase = TelegramUpdateClaimPhase(rawValue: rawPhase),
-              case .string(let claimedAt)? = object["claimedAt"], !claimedAt.isEmpty,
-              case .string(let updatedAt)? = object["updatedAt"], !updatedAt.isEmpty,
-              let updateValue = object["update"],
-              let updateData = try? updateValue.serializedData(pretty: false),
-              let update = try? JSONDecoder().decode(TelegramUpdate.self, from: updateData) else {
+        guard claim.update.hasValidInboxID, !claim.claimedAt.isEmpty, !claim.updatedAt.isEmpty,
+              claim.phase != .quarantined || claim.quarantineReason != nil,
+              claim.settledAssistantRuns.allSatisfy({ !$0.key.isEmpty && ["completed", "sent_unconfirmed"].contains($0.value) }) else {
             throw TelegramUpdateInboxError.malformedClaim(path.lastPathComponent)
         }
-        guard update.updateId == updateId else {
-            throw TelegramUpdateInboxError.mismatchedUpdateId(expected: updateId, actual: update.updateId)
+        guard claim.update.updateId == claim.updateId else {
+            throw TelegramUpdateInboxError.mismatchedUpdateId(expected: claim.updateId, actual: claim.update.updateId)
         }
-        guard phase != .quarantined || Self.optionalString(object["quarantineReason"]) != nil else {
-            throw TelegramUpdateInboxError.malformedClaim(path.lastPathComponent)
-        }
-        let retryMessage: TelegramMessage?
-        if let value = object["resolvedRetryMessage"], value != .null {
-            do {
-                retryMessage = try JSONDecoder().decode(TelegramMessage.self, from: value.serializedData(pretty: false))
-            } catch {
+        if let delivery = claim.assistantDelivery {
+            guard !delivery.reply.isEmpty || !(delivery.imagePaths ?? []).isEmpty,
+                  delivery.confirmedMessageIds.count <= TelegramRichMessageRenderer.render(delivery.reply).count,
+                  (0...(delivery.imagePaths?.count ?? 0)).contains(delivery.confirmedImageCount ?? 0) else {
                 throw TelegramUpdateInboxError.malformedClaim(path.lastPathComponent)
             }
-        } else {
-            retryMessage = nil
         }
-        let delivery: TelegramAssistantDeliveryState?
-        if let value = object["assistantDelivery"], value != .null {
-            do {
-                delivery = try JSONDecoder().decode(TelegramAssistantDeliveryState.self, from: value.serializedData(pretty: false))
-                guard let delivery, !delivery.reply.isEmpty || !(delivery.imagePaths ?? []).isEmpty,
-                      delivery.confirmedMessageIds.count <= TelegramRichMessageRenderer.render(delivery.reply).count,
-                      (0...(delivery.imagePaths?.count ?? 0)).contains(delivery.confirmedImageCount ?? 0) else {
-                    throw TelegramUpdateInboxError.malformedClaim(path.lastPathComponent)
-                }
-            } catch {
-                throw TelegramUpdateInboxError.malformedClaim(path.lastPathComponent)
-            }
-        } else {
-            delivery = nil
+        if try !DataRootLife.isCurrent(claim.lifeID, in: dataRoot)
+            && (claim.phase != .completed || claim.assistantDelivery?.isDelivered == false) {
+            claim.phase = .stopped
+            claim.quarantineReason = DataRootLife.stoppedReason
         }
-        var settledRuns: [String: String] = [:]
-        if let value = object["settledAssistantRuns"] {
-            guard case .object(let saved) = value else { throw TelegramUpdateInboxError.malformedClaim(path.lastPathComponent) }
-            for (run, verdict) in saved {
-                guard !run.isEmpty, case .string(let status) = verdict,
-                      ["completed", "sent_unconfirmed"].contains(status) else { throw TelegramUpdateInboxError.malformedClaim(path.lastPathComponent) }
-                settledRuns[run] = status
-            }
-        }
-        let lifeID = Self.optionalString(object["lifeID"])
-        let stopped = try !DataRootLife.isCurrent(lifeID, in: dataRoot) && (phase != .completed || delivery?.isDelivered == false)
-        return TelegramUpdateClaim(
-            lifeID: lifeID,
-            updateId: updateId,
-            update: update,
-            phase: stopped ? .stopped : phase,
-            assistantDelivery: delivery,
-            assistantRunId: Self.optionalString(object["assistantRunId"]),
-            assistantSessionId: Self.optionalString(object["assistantSessionId"]),
-            assistantOriginRunId: Self.optionalString(object["assistantOriginRunId"]),
-            settledAssistantRuns: settledRuns,
-            noRecoverableAnswer: object["noRecoverableAnswer"] == .bool(true),
-            failedBeforeAnswer: object["failedBeforeAnswer"] == .bool(true),
-            quarantineReason: stopped ? DataRootLife.stoppedReason : Self.optionalString(object["quarantineReason"]),
-            queueAcknowledgementMessageId: Self.optionalInt(
-                object["queueAcknowledgementMessageId"]
-            ),
-            resolvedRetryText: Self.optionalString(object["resolvedRetryText"]),
-            resolvedRetryMessage: retryMessage,
-            resolvedSessionId: Self.optionalString(object["resolvedSessionId"]),
-            claimedAt: claimedAt,
-            updatedAt: updatedAt
-        )
+        return claim
     }
 
     private func write(_ claim: TelegramUpdateClaim, to path: URL) async throws {
-        let updateData = try JSONEncoder().encode(claim.update)
-        let updateValue = try JSONValue.parse(updateData)
-        let retryMessageValue: JSONValue = try claim.resolvedRetryMessage.map {
-            try JSONValue.parse(JSONEncoder().encode($0))
-        } ?? .null
-        let deliveryValue = try claim.assistantDelivery.map {
-            try JSONValue.parse(JSONEncoder().encode($0))
-        } ?? .null
-        let value: JSONValue = .object([
-            "schemaVersion": .int(1),
-            "lifeID": claim.lifeID.map(JSONValue.string) ?? .null,
-            "updateId": .int(Int64(claim.updateId)),
-            "phase": .string(claim.phase.rawValue),
-            "claimedAt": .string(claim.claimedAt),
-            "updatedAt": .string(claim.updatedAt),
-            "queueAcknowledgementMessageId": claim.queueAcknowledgementMessageId
-                .map { .int(Int64($0)) } ?? .null,
-            "resolvedRetryText": claim.resolvedRetryText.map { .string($0) } ?? .null,
-            "resolvedRetryMessage": retryMessageValue,
-            "resolvedSessionId": claim.resolvedSessionId.map(JSONValue.string) ?? .null,
-            "assistantDelivery": deliveryValue,
-            "assistantRunId": claim.assistantRunId.map { .string($0) } ?? .null,
-            "assistantSessionId": claim.assistantSessionId.map { .string($0) } ?? .null,
-            "assistantOriginRunId": claim.assistantOriginRunId.map(JSONValue.string) ?? .null,
-            "settledAssistantRuns": .object(claim.settledAssistantRuns.mapValues(JSONValue.string)),
-            "noRecoverableAnswer": .bool(claim.noRecoverableAnswer),
-            "failedBeforeAnswer": .bool(claim.failedBeforeAnswer),
-            "quarantineReason": claim.quarantineReason.map(JSONValue.string) ?? .null,
-            "update": updateValue,
-        ])
-        try await persistence.writeDataAtomicDurable(
-            value.serializedData(pretty: true),
-            to: path
-        )
-    }
-
-    private static func optionalString(_ value: JSONValue?) -> String? {
-        guard case .string(let raw)? = value else { return nil }
-        return raw.isEmpty ? nil : raw
-    }
-
-    private static func optionalInt(_ value: JSONValue?) -> Int? {
-        switch value {
-        case .int(let raw)?: return Int(exactly: raw)
-        case .double(let raw)?: return Int(exactly: raw)
-        case .string(let raw)?: return Int(raw)
-        default: return nil
-        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        try await SwiftNativePersistenceCore.writeDataAtomicDurableAsync(encoder.encode(claim), to: path)
     }
 
     private func loadIndex() async throws -> InboxClaimIndex {
@@ -607,7 +566,7 @@ public struct TelegramUpdateInbox: Sendable {
 
     private func writeIndex(_ index: InboxClaimIndex) async throws {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try await persistence.writeDataAtomicDurable(
+        try await SwiftNativePersistenceCore.writeDataAtomicDurableAsync(
             JSONEncoder().encode(index),
             to: indexPath
         )

@@ -14,31 +14,6 @@ import Transcripts
 /// type's own.
 public typealias DeviceSyncSnapshotRows = any Encodable & Sendable
 
-/// One transcript row as the phone reads it. The app's chat model supplies the
-/// bytes; transport budgets can trim content and omit optional previews.
-public protocol DeviceSyncTranscriptMessage: Encodable {
-    var id: String { get }
-    var createdAt: String { get }
-    var content: String { get set }
-    mutating func omitAttachmentPreviews()
-    /// False for a row that is hers alone (her wake inputs): the phone's view
-    /// of the conversation omits it, though it still anchors history paging.
-    var isPersonVisible: Bool { get }
-}
-
-extension DeviceSyncTranscriptMessage {
-    public var isPersonVisible: Bool { true }
-}
-
-/// A transcript row in a published chat snapshot: the app's own encoding.
-struct DeviceSyncTranscriptRow: Encodable, Sendable {
-    var message: any DeviceSyncTranscriptMessage & Sendable
-
-    func encode(to encoder: Encoder) throws {
-        try message.encode(to: encoder)
-    }
-}
-
 /// What a Workshop submission hands back to the phone.
 public struct DeviceSyncWorkshopSubmission: Sendable {
     public var executionId: String?
@@ -61,30 +36,31 @@ public protocol DeviceSyncHost: Sendable {
     func helperAction(action: String, payload: [String: String]) async throws -> [String: String]
     func agentThreadAction(action: String, payload: [String: String]) async throws -> [String: String]
     // Snapshot reads.
-    func getWorkshopExecutions() async throws -> DeviceSyncSnapshotRows
     /// One Desk/authority read per pass; failed lanes keep their own errors.
     func workOverview() async -> (
         overview: WorkOverview, deskItems: [DeskItem]?,
-        approvals: Result<[ApprovalRequest], Error>, inbox: Result<[InboxItemRecord], Error>
+        approvals: Result<[ApprovalRequest], Error>, inbox: Result<[InboxItemRecord], Error>,
+        executions: Result<[WorkshopTaskRecord], Error>
     )
     func getChatSessions() async throws -> [NativeAgentShared.ChatSession]
+    func getChatTranscriptGenerations() async throws -> [String: Int?]
     @MainActor func sessionNavigation(for sessions: [NativeAgentShared.ChatSession]) -> ChatSessionNavigation
     @MainActor func surfaceLayout() -> SurfaceLayout
-    func getChatMessages(sessionId: String) async throws -> [any DeviceSyncTranscriptMessage & Sendable]
+    func getChatMessages(sessionId: String) async throws -> [ChatMessageRecord]
     func getOtherRoomExchanges() async throws -> [OtherRoomExchange]
     func getHealth() async throws -> RuntimeHealth
     func turnSummariesSnapshotData() async -> Data?
     func pendingMemoryProposals() async throws -> DeviceSyncSnapshotRows
     func getSkills() async throws -> DeviceSyncSnapshotRows
     func activeMemories() async throws -> [MemoryV2.MemoryRecord]
-    func getConnectors() async throws -> DeviceSyncSnapshotRows
+    func getConnectors() async throws -> [MobileConnectorSnapshot]
     func mobileToolCatalog() async throws -> [MobileToolCatalogRecord]
-    func providers() async throws -> DeviceSyncSnapshotRows
+    func providers() async throws -> (providers: DeviceSyncSnapshotRows, routing: ProviderRoutingSnapshot)
     func providerCatalogSnapshot() async throws -> (providers: [NAProviderCatalogProvider], routing: ProviderRoutingSnapshot)
     func trustSnapshotData() async throws -> Data
     func macIntegrationPermissionsSnapshot() async throws -> [String: [String: Bool]]
     func telegramSnapshot() async throws -> MobileTelegramSnapshot
-    func changeTelegram(_ change: MobileTelegramChange) async throws -> MobileTelegramSnapshot
+    func disconnectTelegram() async throws -> MobileTelegramSnapshot
     func getPersonality() async throws -> PersonalityProfile
     func knowledgeGraphSnapshotData() async throws -> Data
     func getRunsStrict() async -> [RunRecord]?
@@ -98,8 +74,7 @@ public protocol DeviceSyncHost: Sendable {
     func setConnectorEnabled(id: String, enabled: Bool) async throws -> DeviceSyncSnapshotRows
     func disconnectConnector(id: String) async throws -> DeviceSyncSnapshotRows
     func submitWorkshopExecution(title: String, objective: String) async throws -> DeviceSyncWorkshopSubmission
-    func approveStep(executionId: String, stepId: String, provenance: ApprovalResolutionProvenance) async throws
-    func rejectStep(executionId: String, stepId: String, provenance: ApprovalResolutionProvenance) async throws
+    func resolveWorkshopStep(executionId: String, stepId: String, decision: String, provenance: ApprovalResolutionProvenance) async throws
     func acceptMemoryProposal(proposalID: String) async throws -> MemoryV2.MemoryRecord
     func rejectMemoryProposal(proposalID: String, reason: String) async throws
     func deleteMemory(id: String) async throws
@@ -113,9 +88,7 @@ public protocol DeviceSyncHost: Sendable {
     func testProvider(_ id: String) async throws -> NativeAgentShared.ProviderTestResult
     func clearProvider(_ id: String) async throws
     func setActiveProvider(surface: String, providerId: String) async throws
-    func configureModel(surface: String, model: String, reasoningEffort: String, serviceTier: String?, inferProvider: Bool) async throws
-    func setSurfaceModel(surface: String, model: String, inferProvider: Bool) async throws
-    func configureSurfaceSelection(surface: String, providerID: String, model: String, reasoningEffort: String, serviceTier: String?) async throws
+    func saveSurfaceSelection(surface: String, model: String, reasoningEffort: String?, serviceTier: String?, providerID: String?) async throws -> ProviderRoutingSnapshot
     /// The Mac's own pinned chats, in order, and their one mutation seam.
     @MainActor func pinnedChatSessionIDs() -> [String]
     @MainActor func savePinnedChatSessionIDs(_ ids: [String]) throws

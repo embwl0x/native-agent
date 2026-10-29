@@ -12,7 +12,7 @@ extension SwiftNativeMacControl {
     func waitForTextInput(
         pid: Int32, target: MacAXActTarget? = nil, clickPoint: CGPoint? = nil,
         selectedAll: Bool = false, value: String? = nil,
-        changedFrom before: MacAXTextInput? = nil, requiresFrontmost: Bool = true
+        changedFrom before: MacAXTextInput? = nil
     ) async -> MacAXTextInput? {
         func containsClick(_ element: MacAXActTarget, point: CGPoint) -> Bool {
             guard let frame = element.frame, frame.w > 0, frame.h > 0 else { return false }
@@ -32,7 +32,7 @@ extension SwiftNativeMacControl {
         let deadline = ContinuousClock.now.advanced(by: .milliseconds(750))
         repeat {
             guard !Task.isCancelled,
-                  !requiresFrontmost || accessibilitySource.frontmostApp()?.processIdentifier == pid else { return nil }
+                  accessibilitySource.frontmostApp()?.processIdentifier == pid else { return nil }
             if let focused = accessibilityActSource.focusedElement(pid: pid),
                target.map({ accessibilityActSource.matchesTextInputTarget(focused, target: $0) }) ?? true,
                matchesClick(focused),
@@ -48,7 +48,7 @@ extension SwiftNativeMacControl {
         return nil
     }
 
-    // MARK: act — the CLOSED LOOP (native-look item 3)
+    // MARK: act — closed loop
 
     /// The physical tier behind the model-facing `act`. The caller already
     /// resolved a fresh named/ordinal target; this owner validates a bounded
@@ -58,13 +58,13 @@ extension SwiftNativeMacControl {
         let started = now()
         if let refusal = injectionPreconditions(action: "hand", requiresSink: true) { return refusal }
         if let refusal = await attentionActionRefusal(action: "hand", body: body) { return refusal }
-        guard let gesture = body.stringValue("gesture")?.lowercased(), !gesture.isEmpty else {
+        guard let gesture = body["gesture"]?.stringValue?.lowercased(), !gesture.isEmpty else {
             return injectionRefusal(action: "hand", error: "missing required field: gesture", status: 400)
         }
-        let button: MacHandButton
+        let button: MacMouseButton
         if body["button"] != nil {
-            guard let raw = body.stringValue("button")?.lowercased(),
-                  let parsed = MacHandButton(rawValue: raw), parsed != .middle,
+            guard let raw = body["button"]?.stringValue?.lowercased(),
+                  let parsed = MacMouseButton(rawValue: raw),
                   ["click", "double_click", "hold", "drag"].contains(gesture) else {
                 return injectionRefusal(action: "hand", error: "invalid mouse button for gesture", status: 400)
             }
@@ -74,11 +74,11 @@ extension SwiftNativeMacControl {
         }
 
         func point(_ xKey: String = "x", _ yKey: String = "y") -> CGPoint? {
-            guard let x = Self.doubleValue(body, xKey), let y = Self.doubleValue(body, yKey),
+            guard let x = body[xKey]?.numberValue(coercingStrings: false, finiteOnly: true), let y = body[yKey]?.numberValue(coercingStrings: false, finiteOnly: true),
                   x.isFinite, y.isFinite, abs(x) <= 100_000, abs(y) <= 100_000 else { return nil }
             return CGPoint(x: x, y: y)
         }
-        let waitMs = Self.handWaitMilliseconds(seconds: Self.doubleValue(body, "seconds"))
+        let waitMs = Self.handWaitMilliseconds(seconds: body["seconds"]?.numberValue(coercingStrings: false, finiteOnly: true))
         var dragTravelMs: Int?
         var plan: [MacHandStep]
         do {
@@ -88,9 +88,9 @@ extension SwiftNativeMacControl {
                     return injectionRefusal(action: "hand", error: "gesture needs finite x/y", status: 400)
                 }
                 let count = gesture == "double_click" ? 2 : 1
-                var steps = try MacHandRepertoire.click(button: button, at: at, count: count)
+                var steps = MacHandRepertoire.click(button: button, at: at, count: count)
                 if gesture == "click_type" {
-                    guard let text = body.stringValue("text"), !text.isEmpty else {
+                    guard let text = body["text"]?.stringValue, !text.isEmpty else {
                         return injectionRefusal(action: "hand", error: "click_type needs text", status: 400)
                     }
                     _ = try MacKeySyntax.validateText(text)
@@ -99,7 +99,7 @@ extension SwiftNativeMacControl {
                 plan = steps
             case "type":
                 // Keystrokes to whatever has focus, as a person types: no click first.
-                guard let text = body.stringValue("text"), !text.isEmpty else {
+                guard let text = body["text"]?.stringValue, !text.isEmpty else {
                     return injectionRefusal(action: "hand", error: "type needs text", status: 400)
                 }
                 _ = try MacKeySyntax.validateText(text)
@@ -118,15 +118,14 @@ extension SwiftNativeMacControl {
                 guard let at = point() else {
                     return injectionRefusal(action: "hand", error: "hold needs finite x/y", status: 400)
                 }
-                plan = try MacHandRepertoire.pressAndHold(button: button, at: at, holdMs: waitMs)
+                plan = MacHandRepertoire.pressAndHold(button: button, at: at, holdMs: waitMs)
             case "drag":
                 guard let start = point(), let end = point("to_x", "to_y") else {
                     return injectionRefusal(action: "hand", error: "drag needs finite x/y and to_x/to_y", status: 400)
                 }
-                // Named four-verb drags publish travel_seconds. Preserve the
-                // legacy low-level seconds-as-endpoint-dwell contract otherwise.
+                // Named drags use travel_seconds; low-level seconds remains endpoint dwell.
                 if body["travel_seconds"] != nil {
-                    dragTravelMs = Self.handDragMilliseconds(seconds: Self.doubleValue(body, "travel_seconds"))
+                    dragTravelMs = Self.handDragMilliseconds(seconds: body["travel_seconds"]?.numberValue(coercingStrings: false, finiteOnly: true))
                 }
                 plan = try MacHandRepertoire.drag(
                     button: button,
@@ -140,24 +139,25 @@ extension SwiftNativeMacControl {
                 guard let at = point() else {
                     return injectionRefusal(action: "hand", error: "scroll needs finite x/y", status: 400)
                 }
-                let dy = max(-120, min(Self.intValue(body, "dy") ?? -6, 120))
-                let dx = max(-120, min(Self.intValue(body, "dx") ?? 0, 120))
+                let dy = max(-120, min(body["dy"]?.integerValue.flatMap(Int.init(exactly:)) ?? -6, 120))
+                let dx = max(-120, min(body["dx"]?.integerValue.flatMap(Int.init(exactly:)) ?? 0, 120))
                 plan = MacHandRepertoire.move(to: at)
                     + MacHandRepertoire.scroll(dx: Int32(dx), dy: Int32(dy), unit: .line)
             case "key":
-                guard let keys = body.stringValue("keys") else {
+                guard let keys = body["keys"]?.stringValue else {
                     return injectionRefusal(action: "hand", error: "key needs keys", status: 400)
                 }
                 plan = try MacKeySyntax.parseChords(keys).flatMap(MacHandRepertoire.chord)
             case "hold_key", "key_down", "key_up":
-                guard let keys = body.stringValue("keys") else {
+                guard let keys = body["keys"]?.stringValue else {
                     return injectionRefusal(action: "hand", error: "\(gesture) needs a held key set", status: 400)
                 }
                 let held = try MacKeySyntax.parseHeldKeys(keys)
-                plan = try MacHandRepertoire.hold(
+                plan = MacHandRepertoire.hold(
                     modifiers: held.modifiers,
-                    keys: held.keys
-                ) { gesture == "hold_key" ? [.wait(milliseconds: waitMs)] : [] }
+                    keys: held.keys,
+                    whileDoing: gesture == "hold_key" ? [.wait(.milliseconds(waitMs))] : []
+                )
                 // Half a hold: only a watch's binding keeps the key down past this call.
                 if gesture != "hold_key" {
                     guard MacDriverContext.holdsAcrossCalls else {
@@ -173,7 +173,7 @@ extension SwiftNativeMacControl {
                 )
             }
 
-            if let rawHolding = body.stringValue("holding")?
+            if let rawHolding = body["holding"]?.stringValue?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
                !rawHolding.isEmpty {
                 // Pointer hold + held keys is one balanced coordinated gesture.
@@ -186,8 +186,7 @@ extension SwiftNativeMacControl {
                     )
                 }
                 let held = try MacKeySyntax.parseHeldKeys(rawHolding)
-                let inner = plan
-                plan = try MacHandRepertoire.hold(modifiers: held.modifiers, keys: held.keys) { inner }
+                plan = MacHandRepertoire.hold(modifiers: held.modifiers, keys: held.keys, whileDoing: plan)
             }
         } catch {
             return injectionRefusal(action: "hand", error: "invalid gesture: \(error)", status: 400)
@@ -223,83 +222,31 @@ extension SwiftNativeMacControl {
                 "image": output["image"] ?? .null,
             ]
         }
-        var heldKeys: [UInt16] = []
-        var heldButtons: [MacMouseButton] = []
-        var lastPoint = CGPoint.zero
         var emittedEvents = 0
-        @discardableResult func recoverNeutral() -> Int {
-            let released = heldKeys.count + heldButtons.count
-            if MacDriverContext.binding?.allowsEmission != true {
-                MacDriverContext.binding?.releaseHeldInputs()
-                heldKeys.removeAll()
-                heldButtons.removeAll()
-                return released
-            }
-            for key in heldKeys.reversed() {
-                eventSink.post(key: MacKeyEvent(keyCode: key, down: false))
-            }
-            for button in heldButtons.reversed() {
-                eventSink.post(mouse: MacMouseEvent(
-                    phase: .up, button: button, x: lastPoint.x, y: lastPoint.y
-                ))
-            }
-            heldKeys.removeAll()
-            heldButtons.removeAll()
-            return released
-        }
-        func handback(_ refusal: MacControlResult) -> MacControlResult {
-            let released = recoverNeutral()
+        func handback(_ execution: (emitted: Int, recovery: Int, refusal: MacControlResult?)) -> MacControlResult? {
+            emittedEvents += execution.emitted
+            guard let refusal = execution.refusal else { return nil }
             var output: [String: JSONValue] = [:]
             if case .object(let existing) = refusal.output { output = existing }
             output["gesture"] = .string(gesture)
+            output["steps"] = .int(Int64(plan.count))
             output["requested_events_emitted"] = .int(Int64(emittedEvents))
-            output["recovery_events_emitted"] = .int(Int64(released))
+            output["recovery_events_emitted"] = .int(Int64(execution.recovery))
             output["effects_may_have_occurred"] = .bool(emittedEvents > 0)
             return MacControlResult(ok: false, action: "hand", output: .object(output),
                                     error: refusal.error, durationMs: Int(now().timeIntervalSince(started) * 1000),
                                     httpStatus: 409, verification: .unverified)
         }
-        func interruptedResult() -> MacControlResult {
-            let recoveryEvents = recoverNeutral()
-            return MacControlResult(
-                ok: false,
-                action: "hand",
-                output: .object([
-                    "status": .string("interrupted"),
-                    "gesture": .string(gesture),
-                    "steps": .int(Int64(plan.count)),
-                    "requested_events_emitted": .int(Int64(emittedEvents)),
-                    "recovery_events_emitted": .int(Int64(recoveryEvents)),
-                    "effects_may_have_occurred": .bool(emittedEvents > 0),
-                    "verified": .bool(false),
-                    "hand_neutral": .bool(heldKeys.isEmpty && heldButtons.isEmpty),
-                    "guidance": .string("Cancellation stopped further input. Already emitted input was not undone; observe the current screen before any further action."),
-                ]),
-                error: "gesture_cancelled",
-                durationMs: Int(now().timeIntervalSince(started) * 1000),
-                verification: .unverified
-            )
-        }
-        if Task.isCancelled { return interruptedResult() }
-
         // A targeted wheel gesture first moves the pointer into the named
         // region. That hover can change pixels by itself; it is positioning,
         // not proof that the subsequent scroll moved anything. Establish the
         // evidence baseline only after that leading move so a hover highlight
         // can never turn an inert scroll into a verified one.
         var executionPlan = plan
-        if gesture == "scroll", case .mouse(let event)? = executionPlan.first {
-            if let refusal = await attentionActionRefusal(action: "hand", body: body) {
-                return refusal
-            }
-            if Task.isCancelled { return interruptedResult() }
-            lastPoint = CGPoint(x: event.x, y: event.y)
-            eventSink.post(mouse: event)
-            emittedEvents += 1
+        if gesture == "scroll", let step = executionPlan.first, case .mouse = step {
+            if let refusal = handback(await executeHand([step], action: "hand", body: body)) { return refusal }
             executionPlan.removeFirst()
         }
-
-        if Task.isCancelled { return interruptedResult() }
 
         let beforeView = defersVisualVerification ? nil : visibleEvidence(await handleView([
             "max_marks": .int(60),
@@ -308,13 +255,13 @@ extension SwiftNativeMacControl {
 
         // A front:true act: every event is posted only while that app is in
         // front — User switching mid-act stops the hand before it reaches his app.
-        let requiredFront = Self.intValue(body, "require_front_pid").map { Int32(clamping: $0) }
+        let requiredFront = body["require_front_pid"]?.integerValue.flatMap(Int.init(exactly:)).map { Int32(clamping: $0) }
         let surfacePid = ["click", "double_click", "key"].contains(gesture)
             ? requiredFront ?? accessibilitySource.frontmostApp()?.processIdentifier : nil
         let surfaceWindowBefore = surfacePid.flatMap { accessibilityActSource.focusedWindow(pid: $0) }
         // A watch's hand: every event lands on that exact window, read at the event.
-        let requiredWindow = Self.intValue(body, "require_front_window")
-        let chords = gesture == "key" ? body.stringValue("keys").flatMap { try? MacKeySyntax.parseChords($0) } : nil
+        let requiredWindow = body["require_front_window"]?.integerValue.flatMap(Int.init(exactly:))
+        let chords = gesture == "key" ? body["keys"]?.stringValue.flatMap { try? MacKeySyntax.parseChords($0) } : nil
         let selectsAll = chords?.count == 1 && chords?.first?.keyCode == 0x00 && chords?.first?.modifiers == .command
         let selectionTarget = selectsAll ? accessibilitySource.frontmostApp().flatMap {
             accessibilityActSource.focusedElement(pid: $0.processIdentifier)
@@ -330,42 +277,32 @@ extension SwiftNativeMacControl {
         var textInput: MacAXTextInput?
         var checkedTextInput = false
         var clickTarget: (pid: Int32, element: MacAXActTarget, point: CGPoint)?
-        for step in executionPlan {
-            if Task.isCancelled { return interruptedResult() }
-            if let refusal = await attentionActionRefusal(action: "hand", body: body) {
-                return handback(refusal)
-            }
+        let execution = await executeHand(executionPlan, action: "hand", body: body) { step in
             let posts: Bool = if case .wait = step { false } else { true }
             if let requiredFront, posts, accessibilitySource.frontmostApp()?.processIdentifier != requiredFront {
-                let released = recoverNeutral()
                 return injectionRefusal(action: "hand", error: "front_changed", extra: [
                     "requested_events_emitted": .int(Int64(emittedEvents)),
-                    "recovery_events_emitted": .int(Int64(released)),
                     "effects_may_have_occurred": .bool(emittedEvents > 0),
                 ])
             }
             if let requiredFront, let requiredWindow, posts,
                let missed = watchedWindowMiss(step, window: requiredWindow, pid: requiredFront) {
-                let released = recoverNeutral()
                 return injectionRefusal(action: "hand", error: missed, extra: [
                     "requested_events_emitted": .int(Int64(emittedEvents)),
-                    "recovery_events_emitted": .int(Int64(released)),
                     "effects_may_have_occurred": .bool(emittedEvents > 0),
                 ])
             }
-            if Task.isCancelled { return interruptedResult() }
+            if Task.isCancelled { return injectionRefusal(action: "hand", error: "gesture_cancelled") }
             switch step {
             case .key(let event):
                 if event.unicodeText != nil, !checkedTextInput {
                     checkedTextInput = true
                     guard let pid = requiredFront ?? accessibilitySource.frontmostApp()?.processIdentifier else {
-                        recoverNeutral()
                         return injectionRefusal(action: "hand", error: "front_unknown")
                     }
                     // Bind click typing to the hit-tested target, even if it
                     // already had focus. Unrelated ready editors cannot pass.
                     if gesture == "click_type", clickTarget?.pid != pid {
-                        recoverNeutral()
                         return injectionRefusal(action: "hand", error: "front_changed")
                     }
                     let editorBefore = gesture == "click_type" ? clickTarget?.element
@@ -376,41 +313,32 @@ extension SwiftNativeMacControl {
                         pid: pid, target: editorBefore, clickPoint: clickTarget?.point
                     )
                     guard textInput != nil else {
-                        recoverNeutral()
                         return injectionRefusal(action: "hand", error: "text_editor_not_ready", extra: [
                             "requested_events_emitted": .int(Int64(emittedEvents)),
                             "text_events_emitted": .int(0),
                         ])
                     }
-                    if Task.isCancelled { return interruptedResult() }
+                    if Task.isCancelled { return injectionRefusal(action: "hand", error: "gesture_cancelled") }
                     if let refusal = await attentionActionRefusal(action: "hand", body: body) {
-                        return handback(refusal)
+                        return refusal
                     }
                     guard accessibilitySource.frontmostApp()?.processIdentifier == pid else {
-                        recoverNeutral()
                         return injectionRefusal(action: "hand", error: "front_changed")
                     }
                 }
                 if let input = textInput, event.down,
                    let pid = requiredFront ?? accessibilitySource.frontmostApp()?.processIdentifier,
                    !accessibilityActSource.isFocusedElement(input.target, pid: pid) {
-                    recoverNeutral()
                     return injectionRefusal(action: "hand", error: "focus_moved", extra: [
                         "requested_events_emitted": .int(Int64(emittedEvents)),
                     ])
                 }
-                eventSink.post(key: event)
-                emittedEvents += 1
-                if event.down { heldKeys.append(event.keyCode) }
-                else { heldKeys.removeAll { $0 == event.keyCode } }
             case .mouse(let event):
                 if gesture == "click_type", event.phase == .down {
                     guard let pid = requiredFront ?? accessibilitySource.frontmostApp()?.processIdentifier else {
-                        recoverNeutral()
                         return injectionRefusal(action: "hand", error: "front_unknown")
                     }
                     guard let target = accessibilityActSource.elementAtPosition(x: event.x, y: event.y, pid: pid) else {
-                        recoverNeutral()
                         return injectionRefusal(action: "hand", error: "text_editor_not_ready", extra: [
                             "requested_events_emitted": .int(Int64(emittedEvents)),
                             "text_events_emitted": .int(0),
@@ -418,41 +346,13 @@ extension SwiftNativeMacControl {
                     }
                     clickTarget = (pid, target, CGPoint(x: event.x, y: event.y))
                 }
-                lastPoint = CGPoint(x: event.x, y: event.y)
-                eventSink.post(mouse: event)
-                emittedEvents += 1
-                if event.phase == .down { heldButtons.append(event.button) }
-                else if event.phase == .up { heldButtons.removeAll { $0 == event.button } }
-            case .scroll(let event):
-                eventSink.post(scroll: event)
-                emittedEvents += 1
-            case .wait(let milliseconds):
-                if milliseconds > 0 {
-                    let binding = MacDriverContext.binding
-                    let store = attentionStore
-                    do {
-                        try await withThrowingTaskGroup(of: Void.self) { group in
-                            group.addTask { try await Task.sleep(nanoseconds: UInt64(milliseconds) * 1_000_000) }
-                            group.addTask {
-                                for await _ in await store.driverChanges() {
-                                    if binding?.allowsEmission != true { return }
-                                }
-                            }
-                            _ = try await group.next()
-                            group.cancelAll()
-                        }
-                    } catch { return interruptedResult() }
-                    if let refusal = await attentionActionRefusal(action: "hand", body: body) {
-                        return handback(refusal)
-                    }
-                }
+            default: break
             }
+            return nil
         }
+        if let refusal = handback(execution) { return refusal }
 
-        if Task.isCancelled { return interruptedResult() }
-
-        var textAfter: MacAXTextInput?
-        if let input = textInput, let text = body.stringValue("text"),
+        if let input = textInput, let text = body["text"]?.stringValue,
            let pid = requiredFront ?? accessibilitySource.frontmostApp()?.processIdentifier {
             // Existing bounded acknowledgement, followed by the complete read
             // the declared-effect judge consumes.
@@ -464,20 +364,19 @@ extension SwiftNativeMacControl {
             "max_marks": .int(60),
             "max_text_items": .int(80),
         ]))
-        if Task.isCancelled { return interruptedResult() }
+        if Task.isCancelled {
+            if let refusal = handback(await executeHand([], action: "hand", body: body)) { return refusal }
+        }
         let visibleChanged = beforeView != nil && afterView != nil && beforeView != afterView
-        let declaration: MacActClosedLoop.DeclaredEffect = selectsAll ? .selectAll : .text(textInput.flatMap { input in
-            body.stringValue("text").map { input.inserting($0) }
-        })
-        if let target = selectionTarget ?? textInput?.target { textAfter = accessibilityActSource.textInput(target) }
-        // This readback has no canonical caption/group redaction context.
-        // Compare complete values, but never publish their text excerpts.
+        let declaration: MacActClosedLoop.DeclaredEffect = selectsAll ? .selectAll : checkedTextInput ? .text(textInput.flatMap { input in
+            body["text"]?.stringValue.map { input.inserting($0) }
+        }) : .surface(nil)
+        // Compare complete values; excerpts lack caption/group context and stay redacted.
         let verdict = MacActClosedLoop.verify(declaration,
             value: (selectionTarget ?? textInput?.target).flatMap { accessibilityActSource.reread($0)?.value },
-            selection: textAfter?.selection, redactingText: true)
-        let surfaceVerdict = MacActClosedLoop.verify(.surface(nil),
+            selection: selectionTarget.flatMap { accessibilityActSource.textInput($0)?.selection },
             dismissed: surfaceWindowBefore.flatMap { accessibilityActSource.windowPresence($0) }.map { !$0 },
-            processGone: surfacePid.map { accessibilitySource.appInfo(pid: $0) == nil } ?? false)
+            processGone: surfacePid.map { accessibilitySource.appInfo(pid: $0) == nil } ?? false, redactingText: true)
 
         return MacControlResult(
             ok: true,
@@ -493,11 +392,76 @@ extension SwiftNativeMacControl {
                 "drag_travel_ms": dragTravelMs.map { .int(Int64($0)) } ?? .null,
                 "holding": body["holding"] ?? .null,
                 "button": body["button"] ?? .null,
-                "hand_neutral": .bool(heldKeys.isEmpty && heldButtons.isEmpty),
-            ].merging(checkedTextInput || selectsAll ? verdict.receipt : surfaceVerdict.receipt) { _, new in new }),
+                "hand_neutral": .bool(MacHandRepertoire.isBalanced(plan)),
+            ].merging(verdict.receipt) { _, new in new }),
             error: nil,
             durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
+    }
+
+    /// One physical executor. Callers admit targets and judge effects; raw input needs no readable editor.
+    func executeHand(
+        _ plan: [MacHandStep], action: String, body: [String: JSONValue] = [:], toPid: Int32? = nil,
+        prepare: (inout MacHandStep) async -> MacControlResult? = { _ in nil }
+    ) async -> (emitted: Int, recovery: Int, refusal: MacControlResult?) {
+        var heldKeys: [UInt16] = []
+        var heldButtons: [MacMouseButton] = []
+        var emitted = 0
+        func stopped(_ refusal: MacControlResult) -> (Int, Int, MacControlResult?) {
+            let released = heldKeys.count + heldButtons.count
+            MacDriverContext.binding?.releaseHeldInputs()
+            return (emitted, released, refusal)
+        }
+        func cancelled() -> MacControlResult {
+            injectionRefusal(action: action, error: action == "hand" ? "gesture_cancelled" : "cancelled", extra: [
+                "status": .string(action == "hand" ? "interrupted" : "cancelled"),
+                "verified": .bool(false), "hand_neutral": .bool(true),
+                "guidance": .string("Cancellation stopped further input. Already emitted input was not undone; observe the current screen before any further action."),
+            ])
+        }
+        for var step in plan {
+            if Task.isCancelled { return stopped(cancelled()) }
+            if let refusal = await attentionActionRefusal(action: action, body: body) { return stopped(refusal) }
+            if let refusal = await prepare(&step) { return stopped(refusal) }
+            if Task.isCancelled { return stopped(cancelled()) }
+            switch step {
+            case .key(let event):
+                if let toPid {
+                    guard eventSink.post(key: event, toPid: toPid) else {
+                        return stopped(injectionRefusal(action: action, error: "needs_front"))
+                    }
+                } else { eventSink.post(key: event) }
+                emitted += 1
+                if event.down { heldKeys.append(event.keyCode) }
+                else { heldKeys.removeAll { $0 == event.keyCode } }
+            case .mouse(let event):
+                eventSink.post(mouse: event)
+                emitted += 1
+                if event.phase == .down { heldButtons.append(event.button) }
+                else if event.phase == .up { heldButtons.removeAll { $0 == event.button } }
+            case .scroll(let event):
+                eventSink.post(scroll: event)
+                emitted += 1
+            case .wait(let duration):
+                guard duration > .zero else { continue }
+                let binding = MacDriverContext.binding
+                let store = attentionStore
+                do {
+                    try await withThrowingTaskGroup(of: Void.self) { group in
+                        group.addTask { try await Task.sleep(for: duration) }
+                        group.addTask {
+                            for await _ in await store.driverChanges() {
+                                if binding?.allowsAction != true { return }
+                            }
+                        }
+                        _ = try await group.next()
+                        group.cancelAll()
+                    }
+                } catch { return stopped(cancelled()) }
+                if let refusal = await attentionActionRefusal(action: action, body: body) { return stopped(refusal) }
+            }
+        }
+        return Task.isCancelled ? stopped(cancelled()) : (emitted, 0, nil)
     }
 
     /// Whether a watch's event would miss its window, read at the event: a
@@ -528,7 +492,7 @@ extension SwiftNativeMacControl {
         }
     }
 
-    // MARK: nudge (W7)
+    // MARK: nudge
 
     /// How far the cursor moves, in points. One point: enough for the window
     /// server to see a HID move event, small enough that it cannot drag
@@ -543,27 +507,8 @@ extension SwiftNativeMacControl {
     /// the saver instead of the screen. A human fixes that by bumping the
     /// mouse. This is that bump, and nothing else.
     ///
-    /// THE STRUCTURAL GUARANTEE, and the only invariant this handler has: it
-    /// emits `MacMouseEvent(phase: .move, …)` and NOTHING else. There is no
-    /// `.down`, no `.up`, no `.drag`, no `post(key:)`, no `post(scroll:)` and
-    /// no AX mutation anywhere on this path — a single call site, no body, no
-    /// branch a caller can steer. `MacNudgeMoveOnlyTests` greps the events the
-    /// sink actually received and fails on anything that is not a move.
-    ///
-    /// WHY IT NEEDS NO APPROVAL, when `mac_click` (which posts a move too) does:
-    /// a bare move cannot click, cannot type, cannot activate whatever sits
-    /// under the cursor, and cannot bypass a lock — on a locked screen the most
-    /// it achieves is showing the login field, exactly like a human bumping the
-    /// mouse, which is why it also needs no lock probe. It changes no app
-    /// state, so there is nothing for a human to approve. It is NOT a bypass
-    /// for `click` / `keystroke` / `ax_act` / `wake`: those keep their three
-    /// gates in full, and `nudge` cannot do any part of what they do.
-    ///
-    /// It is still gated: the accessibility category plus an ACTIVE Full Mac
-    /// window (`gatePreflightOutcome`), the macOS Accessibility TCC grant and a
-    /// live event sink — the same floor `mac_ax_status` clears, plus the sink,
-    /// because reporting "nudged" with the grant missing would be a lie: the
-    /// window server silently swallows CGEventPost without it.
+    /// Emits only a pointer move: no click, typing, scroll, AX mutation or lock bypass.
+    /// Ordinary policy, Full Mac, category, driver, Accessibility grant and sink gates apply.
     func handleNudge(_ body: [String: JSONValue]) async -> MacControlResult {
         let started = now()
 
@@ -577,16 +522,17 @@ extension SwiftNativeMacControl {
             return refusal
         }
 
-        // THE WHOLE FEATURE: one move event. The destination is the current
-        // cursor position plus one point, so nothing about it depends on caller
-        // input — `nudge` takes no parameters at all.
-        let origin = Self.currentCursorPoint()
-        eventSink.post(mouse: MacMouseEvent(
+        // Read only the cursor, without probing login-session state.
+        guard let origin = pointerPositionSource.currentPosition() else {
+            return injectionRefusal(action: "nudge", error: "cursor_unreadable: no pointer move was posted", status: 503)
+        }
+        let emission = await executeHand([.mouse(MacMouseEvent(
             phase: .move,
             button: .left,
             x: origin.x + Self.nudgeOffsetPoints,
             y: origin.y
-        ))
+        ))], action: "nudge", body: body)
+        if let refusal = emission.refusal { return refusal }
         await screenViewStore.invalidate()
 
         return MacControlResult(
@@ -601,273 +547,6 @@ extension SwiftNativeMacControl {
                 ),
             ]),
             error: nil,
-            durationMs: Int(now().timeIntervalSince(started) * 1000)
-        )
-    }
-
-    /// Current cursor location in the CGEvent coordinate space. Read straight
-    /// from CoreGraphics rather than through `sessionStateSource`: this tool
-    /// does not probe the login session, and where the cursor is is not session
-    /// state. `(0, 0)` off-macOS / when the read fails — the move still posts,
-    /// which is the honest outcome for a tool whose only job is to emit one.
-    private static func currentCursorPoint() -> (x: Double, y: Double) {
-        #if canImport(CoreGraphics) && os(macOS)
-        if let location = CGEvent(source: nil)?.location {
-            return (Double(location.x), Double(location.y))
-        }
-        #endif
-        return (0, 0)
-    }
-
-    // MARK: wake (W6)
-
-    /// The default settle wait between the nudge and the re-capture. The window
-    /// server needs a beat to tear the saver down; capturing at zero would
-    /// photograph the thing we just dismissed and report it as the screen.
-    static let wakeDefaultSettleMs = 700
-    static let wakeMaxSettleMs = 3000
-    /// US virtual keycode for LEFT SHIFT (0x38). A modifier on its own inserts
-    /// no character in any app, which is why it is the only key this tool will
-    /// press. Kept here rather than in `MacKeySyntax` on purpose: it is not part
-    /// of the chord grammar and must not become spellable by a model.
-    static let wakeShiftKeyCode: UInt16 = 56
-
-    /// `wake` — dismiss a screensaver / wake a sleeping display with
-    /// the smallest possible HID nudge, then hand back the fresh fused view.
-    ///
-    /// THE SAFETY LINE, and the reason this is one tool rather than "call
-    /// mac_click then mac_view": the session is probed BEFORE anything is posted,
-    /// and an unreadable/off-console session returns a refusal with the sink
-    /// untouched. It is probed AGAIN after the settle wait and before capture.
-    /// The ambiguous CoreGraphics obstruction flag never blocks the inert
-    /// nudge; it only prevents capture while the saver/login layer remains.
-    ///
-    /// The result is the `view` output SHAPE (flattened, not nested) plus a
-    /// `wake` block. That is deliberate: every downstream sink that already
-    /// knows how to strip a base64 `image` and read a redacted legend keys off
-    /// the top level, so flattening inherits mac_view's redaction and image
-    /// stripping wholesale instead of opening a second, un-covered channel.
-    func handleWake(_ body: [String: JSONValue]) async -> MacControlResult {
-        let started = now()
-
-        // 1. CAN WE EVEN SEE THE SESSION? An unreadable session is not an
-        //    unlocked one.
-        guard sessionStateSource.isAvailable else {
-            return injectionRefusal(
-                action: "wake",
-                error: "session_state_unavailable: this build or this Mac would not report the "
-                    + "login session, and an unreadable session is not an unlocked one, so it "
-                    + "will not nudge blind",
-                status: 503
-            )
-        }
-        let before = sessionStateSource.currentState()
-
-        // 2. THE REFUSAL. Nothing has been posted at this point and nothing
-        //    will be: this returns before the sink is touched.
-        if let reason = MacWakeGuard.nudgeRefusalReason(for: before) {
-            return injectionRefusal(
-                action: "wake",
-                error: reason,
-                status: 403,
-                extra: ["session_before": before.toJSON()]
-            )
-        }
-
-        // 3. The same TCC + sink preconditions every injection handler applies.
-        //    Without the Accessibility grant CGEventPost is swallowed by the
-        //    window server, and reporting "woken" would be a lie.
-        if let refusal = injectionPreconditions(action: "wake", requiresSink: true) {
-            return refusal
-        }
-        if let refusal = await attentionActionRefusal(action: "wake", body: body) {
-            return refusal
-        }
-
-        // 4. THE NUDGE. A one-point mouse move and back is the smallest input
-        //    that reaches the HID tap: it cannot type, cannot click, cannot
-        //    activate anything under the cursor, and it leaves the pointer
-        //    exactly where it was.
-        // NEVER FABRICATE THE ORIGIN. `?? 0` used to mean "unreadable cursor ⇒
-        // move the pointer to (0,0)" — the TOP-LEFT HOT CORNER, which is a
-        // configurable trigger (Lock Screen, Mission Control, Quick Note). A
-        // nudge is supposed to be the smallest inert input there is; teleporting
-        // the pointer into a corner is neither small nor inert. An unreadable
-        // cursor now REFUSES rather than guessing a coordinate, and the same
-        // rule is what makes the relaxed nudge guard honest: the only thing we
-        // ever post is a one-pixel move from where the pointer ALREADY is.
-        guard let cursorX = before.cursorX, let cursorY = before.cursorY else {
-            return injectionRefusal(
-                action: "wake",
-                error: "cursor_position_unreadable: this Mac would not report where the pointer "
-                    + "is, and a nudge posted at a guessed origin could land in a hot corner "
-                    + "instead of nowhere, so it refuses rather than move the pointer somewhere "
-                    + "it was not",
-                status: 503,
-                extra: ["session_before": before.toJSON()]
-            )
-        }
-        let origin = (cursorX, cursorY)
-        var mouseEvents = 0
-        for point in [(origin.0 + 1, origin.1), origin] {
-            if let refusal = await attentionActionRefusal(action: "wake", body: body) {
-                await screenViewStore.invalidate()
-                return refusal
-            }
-            eventSink.post(mouse: MacMouseEvent(
-                phase: .move,
-                button: .left,
-                x: point.0,
-                y: point.1
-            ))
-            mouseEvents += 1
-        }
-        // ON BY DEFAULT (User, 2026-08-22; opt out with key_tap:false). Live
-        // runs C3F445B2/B94F9DCF proved a bare one-pixel move resets the idle
-        // clock and dismisses NOTHING — the saver layer wants a real gesture.
-        // Left-shift alone types nothing in any app and cannot authenticate.
-        var keyEvents = 0
-        if body["key_tap"] != .bool(false) {
-            for down in [true, false] {
-                if let refusal = await attentionActionRefusal(action: "wake", body: body) {
-                    await screenViewStore.invalidate()
-                    return refusal
-                }
-                eventSink.post(key: MacKeyEvent(
-                    keyCode: Self.wakeShiftKeyCode,
-                    down: down,
-                    modifiers: down ? .shift : []
-                ))
-                keyEvents += 1
-            }
-        }
-        await screenViewStore.invalidate()
-
-        // 5. Let the window server tear the saver down before we photograph it.
-        let settleMs = max(0, min(
-            Self.intValue(body, "settle_ms") ?? Self.wakeDefaultSettleMs,
-            Self.wakeMaxSettleMs
-        ))
-        if settleMs > 0 {
-            try? await Task.sleep(nanoseconds: UInt64(settleMs) * 1_000_000)
-        }
-
-        // 6. RE-READ, then RE-GUARD, then re-capture. The verdict comes from what
-        //    the session says afterwards — never from "I posted two events".
-        let after = sessionStateSource.currentState()
-
-        // THE SECOND HALF OF THE SAFETY LINE. The first guard proved the screen
-        // was not locked BEFORE the nudge; a settle wait later that is a stale
-        // fact. User can hit Ctrl-Cmd-Q, the idle timer can fire, or the display
-        // can lock inside the window we just slept through — and the capture
-        // below is a screenshot. So the same guard runs again on the fresh read,
-        // and a screen that locked mid-call is neither photographed nor
-        // described: no image, no marks, no legend, no view id.
-        if let reason = MacWakeGuard.captureRefusalReason(for: after) {
-            return injectionRefusal(
-                action: "wake",
-                error: reason,
-                status: 403,
-                extra: [
-                    "session_before": before.toJSON(),
-                    "session_after": after.toJSON(),
-                    "wake": .object([
-                        "nudged": .bool(true),
-                        "mouse_events": .int(Int64(mouseEvents)),
-                        "key_events": .int(Int64(keyEvents)),
-                        "settle_ms": .int(Int64(settleMs)),
-                        "was_obstructed": .bool(before.obstructed),
-                        "dismissed": .bool(false),
-                        "still_obstructed": .bool(true),
-                        // THE POINTER CLAIM, MADE CHECKABLE (Agent F0D81308).
-                        // The nudge posts (x+1, y) then (x, y), so restoration
-                        // is true by construction — but "by construction" is an
-                        // argument, not evidence, and she was right that the
-                        // receipt could not prove it. These are the two READ
-                        // positions; `pointer_restored` is their COMPARISON,
-                        // not a restatement of intent, and it is null when
-                        // either read failed rather than optimistically true.
-                        "nudge_origin": .object([
-                            "x": before.cursorX.map { .double(($0 * 10).rounded() / 10) } ?? .null,
-                            "y": before.cursorY.map { .double(($0 * 10).rounded() / 10) } ?? .null,
-                        ]),
-                        "pointer_restored": Self.pointerRestoredJSON(before: before, after: after),
-                        "note": .string(
-                            "The nudge was delivered and the saver/login layer is still covering "
-                                + "the screen, so nothing was photographed or read back. Retrying "
-                                + "can help; a screen that never clears needs a human at the "
-                                + "keyboard."
-                        ),
-                    ]),
-                ]
-            )
-        }
-        if let refusal = await attentionActionRefusal(action: "wake", body: body) {
-            return refusal
-        }
-
-        let dismissed = !after.obstructed
-        let view = await handleView(body)
-        if let refusal = await attentionActionRefusal(action: "wake", body: body) {
-            await screenViewStore.invalidate()
-            return refusal
-        }
-
-        var output: [String: JSONValue]
-        if case .object(let viewOutput) = view.output {
-            output = viewOutput
-        } else {
-            output = [:]
-        }
-        // BUILT IN STEPS, not as one literal. Adding two more keys to the big
-        // dictionary literal here tipped the Swift type checker past its budget
-        // ("unable to type-check this expression in reasonable time") and hung
-        // the build for ten minutes before it was killed. Incremental
-        // construction is not a style choice; the literal form does not compile.
-        var wake: [String: JSONValue] = [:]
-        wake["nudged"] = .bool(true)
-        wake["mouse_events"] = .int(Int64(mouseEvents))
-        wake["key_events"] = .int(Int64(keyEvents))
-        wake["settle_ms"] = .int(Int64(settleMs))
-        wake["was_obstructed"] = .bool(before.obstructed)
-        wake["dismissed"] = .bool(dismissed)
-        // The pointer claim rides on EVERY wake receipt, not just refusals —
-        // the nudge moves the mouse whether or not the screen clears, so "it
-        // was put back" needs proving on the success path too.
-        wake["nudge_origin"] = .object([
-            "x": before.cursorX.map { JSONValue.double(($0 * 10).rounded() / 10) } ?? .null,
-            "y": before.cursorY.map { JSONValue.double(($0 * 10).rounded() / 10) } ?? .null,
-        ])
-        wake["pointer_restored"] = Self.pointerRestoredJSON(before: before, after: after)
-        wake["session_before"] = before.toJSON()
-        wake["session_after"] = after.toJSON()
-        let wakeTail: [String: JSONValue] = [
-            // The orthogonal evidence that the nudge actually LANDED: a HID
-            // post resets the system idle timer. Falling idle time across the
-            // nudge is proof; a flat one means the events went nowhere (almost
-            // always a missing Accessibility grant).
-            "idle_reset": .bool({
-                guard let b = before.idleSeconds, let a = after.idleSeconds else { return false }
-                return a < b
-            }()),
-            "note": .string(
-                dismissed
-                    ? "The screen is awake and showing the real desktop — the view below is it."
-                    : "The nudge (pointer move + shift tap) was posted but the screen still "
-                        + "reports a sleeping display or the saver layer. Retry, or try a larger "
-                        + "settle_ms."
-            ),
-        ]
-        for (k, v) in wakeTail { wake[k] = v }
-        output["wake"] = .object(wake)
-        // `verified` is OBSERVED, not asserted: it is the post-nudge session
-        // re-read, which is what `verificationState` picks up.
-        output["verified"] = .bool(dismissed)
-        return MacControlResult(
-            ok: view.ok,
-            action: "wake",
-            output: .object(output),
-            error: view.error,
             durationMs: Int(now().timeIntervalSince(started) * 1000)
         )
     }

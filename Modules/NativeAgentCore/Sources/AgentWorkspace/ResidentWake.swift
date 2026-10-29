@@ -1,11 +1,13 @@
 import Desk
 import Experiences
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `ResidentWake.swift` | `ResidentWake`; arrival queue/claims stamp their beginning DataRootLife; pending work from another life (no stamp is the first life) reads stopped/restored and cannot wake, hand back or accept; retained original arrival content/evidence remains visible |
+import Transcripts
+// Blueprint: | `ResidentWake.swift` | `ResidentWake`; declares its own session builder before its next turn; arrival queue/claims stamp their beginning DataRootLife; pending work from another life (no stamp is the first life) reads stopped/restored and cannot wake, hand back or accept; retained original arrival content/evidence remains visible |
 
-/// Her one way to be woken between turns (Wave 2 #9, Agent 10-02). Something
+/// Her one way to be woken between turns. Something
 /// resolves (a reply lands with no turn of hers carrying it, a wake to another
 /// agent fails, an agent's local health goes bad or comes back) and becomes an
 /// arrival: kept here and on home at once. Only the wake is bounded:
@@ -23,6 +25,11 @@ package final class ResidentWake: @unchecked Sendable {
     package static let shared = ResidentWake()
     /// Her own conversation for these wakes, never one of the person's chats.
     package static let session = "resident-wake"
+
+    /// This owner corrects the older app/direct row before its next turn.
+    package static func openSession(dataRoot: URL) async throws {
+        try await SessionConversation.declare(session, kind: .builder, title: "My work", source: "app", dataRoot: dataRoot)
+    }
     static let window: TimeInterval = 60
     static let spacing: TimeInterval = 600
     static let maxHops = 3
@@ -58,7 +65,7 @@ package final class ResidentWake: @unchecked Sendable {
         /// The carried item's material state when offered; notes are not material.
         package var materialFingerprint: String?
 
-        /// Phase 5 E1: something she might share with the person. It wakes
+        /// Something she might share with the person. It wakes
         /// her alone, never rides a live turn, and its reply is her message.
         package var isReach: Bool { id.hasPrefix("reach:") }
 
@@ -287,30 +294,29 @@ package final class ResidentWake: @unchecked Sendable {
         update(dataRoot) { if $0.waitingForTurn == true { $0.waitingForTurn = nil } }
     }
 
-    package static func routeRevision(dataRoot: URL, session: String?) throws -> JSONValue {
-        let row = try HumanConversationIndex.rows(dataRoot: dataRoot).first { HumanConversationIndex.string($0["id"]) == session } ?? [:]
+    package static func routeRevision(rows: [[String: JSONValue]], session: String?) -> JSONValue {
+        let row = rows.first { $0["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) == session } ?? [:]
         return .object(row.filter { ["id", "source", "archived", "lastConversationGeneration"].contains($0.key) })
     }
 
     package func waitForRoute(dataRoot: URL, key: String, revision: JSONValue) throws {
         guard kept(dataRoot, { ledger in
             guard let index = ledger.pending.firstIndex(where: { $0.key == key }),
-                  ((try? Self.routeRevision(dataRoot: dataRoot, session: ledger.pending[index].session)) ?? .null) == revision else { return }
+                  ((try? Self.routeRevision(rows: HumanConversationIndex.rows(dataRoot: dataRoot), session: ledger.pending[index].session)) ?? .null) == revision else { return }
             ledger.pending[index].routeWait = revision
         })?.saved == true else { throw PersistenceCoreError.ioFailure("The promise's route wait could not be saved.") }
     }
 
     /// Called only by the conversation index event, plus its registration read.
     package func routesChanged(dataRoot: URL) async {
-        guard let ledger = Self.read(dataRoot) else { return }
-        let waiting = ledger.pending.filter { $0.routeWait != nil }
-        guard !waiting.isEmpty else { return }
+        guard let ledger = Self.read(dataRoot), ledger.pending.contains(where: { $0.routeWait != nil }) else { return }
         let legacy = Set(((try? await SwiftNativeDeskStore(dataRoot: dataRoot).liveState())?.items ?? [])
             .filter { $0.step != nil && $0.step?.replyRoute == nil }.map { "carry." + $0.handle })
         update(dataRoot) { ledger in
+            let rows = try? HumanConversationIndex.rows(dataRoot: dataRoot)
             for index in ledger.pending.indices {
                 guard let waited = ledger.pending[index].routeWait else { continue }
-                let revision = try? Self.routeRevision(dataRoot: dataRoot, session: ledger.pending[index].session)
+                let revision = rows.map { Self.routeRevision(rows: $0, session: ledger.pending[index].session) }
                 guard ledger.pending[index].key.map(legacy.contains) == true || revision.map({ $0 != waited }) == true else { continue }
                 ledger.pending[index].routeWait = nil
             }

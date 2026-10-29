@@ -1,3 +1,4 @@
+import Transcripts
 import MultimodalTTS
 import ChatTurnRuntime
 import ChatTurnContracts
@@ -27,7 +28,6 @@ public protocol QuietComposerCommandPort: QuietChatSessionCommandPort {
     var chatReasoningEffort: String { get set }
     var chatFastMode: Bool { get set }
     var isSavingChatBrain: Bool { get }
-    var quietChatBrainSavePending: Bool { get }
     var quietComposerProviderGroups: [(id: String, provider: String, models: [ComposerModel])] { get }
     var quietComposerEfforts: [ComposerEffort] { get }
     var quietComposerSupportsFast: Bool { get }
@@ -212,7 +212,7 @@ public enum QuietComposerCommands {
                 : setDraft(value, sessionID: sessionID, files: files, appModel: appModel)
         case "set_model", "set_think", "set_fast":
             // Bot conversations use their own route, so the global tuple cannot change it.
-            if appModel.activeChatSessionId.hasPrefix("bot-") {
+            if SessionConversation.isHelper(appModel.activeChatSessionId) {
                 return .refuse(
                     verb == "set_think" ? "think card" : "model card",
                     "bot_conversation",
@@ -337,9 +337,6 @@ public enum QuietComposerCommands {
                 "\(appModel.chatModel) has no Fast mode. Pick a model that has it with set_model first."
             )
         }
-        guard !appModel.isSavingChatBrain || appModel.quietChatBrainSavePending else {
-            return .refuse("model card Fast toggle", "model_saving", "A model change is still saving.")
-        }
         let changed = appModel.chatFastMode != on
         appModel.chatFastMode = on
         let result = await appModel.saveQuietChatBrain()
@@ -409,9 +406,6 @@ public enum QuietComposerCommands {
                 "think card", "unknown_think_level",
                 "This model's thinking levels are: " + efforts.map(\.id).joined(separator: ", ")
             )
-        }
-        guard !appModel.isSavingChatBrain || appModel.quietChatBrainSavePending else {
-            return .refuse("think card", "model_saving", "A model change is still saving.")
         }
         let before = appModel.chatReasoningEffort
         appModel.chatReasoningEffort = effort

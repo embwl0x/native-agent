@@ -36,16 +36,15 @@ private actor TelegramTypingHeartbeat {
 extension TelegramPollLoop {
     private func startTypingHeartbeat(destination: TelegramDestination) async -> TelegramTypingHeartbeat {
         let token = self.token
-        let sendChatAction = self.sendChatAction
         // Presence must never delay starting the actual conversation.
         let heartbeat = TelegramTypingHeartbeat { Task {
             while !Task.isCancelled {
                 do {
-                    try await sendChatAction(token, destination, "typing")
+                    try await Self.defaultSendChatAction(token, destination, "typing")
                 } catch {
                     guard !Task.isCancelled else { break }
                     FileHandle.standardError.write(
-                        Data("TelegramPollLoop: sendChatAction failed: \(Self._tgRedactToken(String(describing: error)))\n".utf8)
+                        Data("TelegramPollLoop: sendChatAction failed: \(TurnSecretRedactor.redactText(String(describing: error)))\n".utf8)
                     )
                 }
                 do { try await Task.sleep(nanoseconds: 4_000_000_000) }
@@ -70,17 +69,9 @@ extension TelegramPollLoop {
             face: face,
             destination: destination,
             turnId: turnId,
-            sendCard: sendMessageWithReplyMarkupReturningId,
-            editCard: { token, chatId, messageId, text, replyMarkup in
-                try await editMessageTextWithReplyMarkup(
-                    token,
-                    chatId,
-                    messageId,
-                    text,
-                    replyMarkup
-                )
-            },
-            deleteCard: deleteMessage,
+            sendCard: Self.defaultSendMessageWithReplyMarkupReturningId,
+            editCard: Self.defaultEditMessageTextWithReplyMarkup,
+            deleteCard: Self.defaultDeleteMessage,
             recordFailure: { redactedError in
                 await recordError(
                     context: errorContext,
@@ -113,8 +104,8 @@ extension TelegramPollLoop {
             token: token,
             destination: destination,
             turnId: turnId,
-            sendRichDraft: sendRichMessageDraft,
-            sendRichFinal: silent ? Self.defaultSendSilentRichMessage : sendRichMessage,
+            sendRichDraft: Self.defaultSendRichMessageDraft,
+            sendRichFinal: silent ? Self.defaultSendSilentRichMessage : Self.defaultSendRichMessage,
             recordFailure: { redactedError in
                 await recordError(
                     context: errorContext,
@@ -156,16 +147,16 @@ extension TelegramPollLoop {
                         from: raw.serializedData(pretty: false)).sessionId
                     run = nil
                 } else { throw TelegramBotError.underlying("Assistant answer has no durable delivery owner.") }
-                return try !CodexCompletionLifecycleProjection.permitsDelivery(sessionId: session, runId: run,
+                return try !CodexCompletionReadout.permitsDelivery(sessionId: session, runId: run,
                     configRoot: InstallPaths.current.bridgeConfigRoot(dataRoot: dataRoot), dataRoot: dataRoot)
                     || TurnQuietHoursWindow.holdsResidentWake(session: session, dataRoot: dataRoot)
             },
             sendGeneratedImage: { path, bytes in
-                do { try await sendChatAction(token, destination, "upload_photo") }
+                do { try await Self.defaultSendChatAction(token, destination, "upload_photo") }
                 catch {
-                    FileHandle.standardError.write(Data("TelegramPollLoop: upload_photo action failed: \(Self._tgRedactToken(String(describing: error)))\n".utf8))
+                    FileHandle.standardError.write(Data("TelegramPollLoop: upload_photo action failed: \(TurnSecretRedactor.redactText(String(describing: error)))\n".utf8))
                 }
-                try await sendPhoto(token, destination, path, bytes, nil)
+                try await Self.defaultSendPhoto(token, destination, path, bytes, nil)
             }
         )
     }
@@ -175,8 +166,8 @@ extension TelegramPollLoop {
         card: TelegramTurnProgressCardDriver
     ) -> TelegramChatProgressSink {
         return { event in
-            if case .textDelta(let accumulated) = event {
-                await delivery?.onDelta(accumulated)
+            if case .delta(let chunk) = event {
+                await delivery?.onDelta(chunk)
             }
             await card.record(progress: event)
         }
@@ -208,8 +199,8 @@ extension TelegramPollLoop {
     func repairInterruptedTurnCardsIfNeeded() async {
         let result = await turnCardRestartRepairer.repairOnce(
             token: token,
-            editCard: editMessageTextWithReplyMarkup,
-            deleteCard: deleteMessage,
+            editCard: Self.defaultEditMessageTextWithReplyMarkup,
+            deleteCard: Self.defaultDeleteMessage,
             isActive: { await turnCoordinator.activeTurnIDs().contains($0) }
         )
         for failure in result.failures {
@@ -217,19 +208,16 @@ extension TelegramPollLoop {
         }
     }
 
-    static func progressMessage(for event: TelegramChatProgressEvent) -> String? {
+    static func progressMessage(for event: TurnStreamEvent) -> String? {
         switch event {
         case .replyTextSettled:
             return nil
-        case .status(let text):
-            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
         case .notice(_, let text):
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
         case .toolResult:
             return nil
-        case .textDelta:
+        case .delta, .final, .error:
             return nil  // native draft preview, never a discrete message
         case .toolUse(let name, let input):
             let lower = name.lowercased()
@@ -240,7 +228,7 @@ extension TelegramPollLoop {
                 }
                 return "Loading skill"
             default:
-                return ToolActivityPresentation.progress(name, args: input?.stringFields ?? [:])
+                return ToolActivityPresentation.progress(name, args: input.stringFields)
             }
         }
     }
@@ -261,11 +249,7 @@ extension TelegramPollLoop {
         text: String,
         attachments: [TelegramMediaAttachment] = [],
         progress: @escaping TelegramChatProgressSink,
-        replyTo: TelegramReplyContext? = nil,
-        fromUserId: Int? = nil,
-        suppressUserAppend: Bool = false,
-        sessionId: String? = nil,
-        runId: String? = nil
+        context: TelegramChatAttemptContext
     ) async throws -> (reply: String, imagePaths: [String]) {
         let typing = await startTypingHeartbeat(destination: destination)
         let displayProgress: TelegramChatProgressSink = { event in
@@ -280,8 +264,7 @@ extension TelegramPollLoop {
             do {
                 let reply = try await invokeChatHandler(
                     destination: destination, text: text, attachments: attachments,
-                    progress: displayProgress, replyTo: replyTo, fromUserId: fromUserId,
-                    suppressUserAppend: suppressUserAppend, sessionId: sessionId, runId: runId
+                    progress: displayProgress, context: context
                 )
                 await typing.stop()
                 return reply
@@ -299,20 +282,8 @@ extension TelegramPollLoop {
         text: String,
         attachments: [TelegramMediaAttachment],
         progress: @escaping TelegramChatProgressSink,
-        replyTo: TelegramReplyContext?,
-        fromUserId: Int?,
-        suppressUserAppend: Bool,
-        sessionId: String?,
-        runId: String?
+        context: TelegramChatAttemptContext
     ) async throws -> (reply: String, imagePaths: [String]) {
-        let context = TelegramChatAttemptContext(
-            replyTo: replyTo,
-            fromUserId: fromUserId,
-            suppressUserAppend: suppressUserAppend,
-            sessionId: sessionId,
-            runId: runId,
-            threadId: destination.threadId
-        )
         if let attachmentChatHandler {
             return try await attachmentChatHandler(destination.chatId, text, attachments, progress, context)
         }

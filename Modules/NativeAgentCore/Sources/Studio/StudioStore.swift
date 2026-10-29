@@ -1,796 +1,11 @@
 import NativeAgentCore
 import Foundation
+import NativeAgentShared
 import PersistenceCore
 import CryptoKit
 // Blueprint: | `StudioStore.swift` | Append-only journal and corrections, consult and honest-encounter truth; timestamps use NativeTimestampFormat directly; `encounterIntakePage` exposes bounded neutral consult/corrected-history facts with a shared content digest, refuses unreadable/incomplete history and changed pages; `namedEncounterIntake` validates editable `Resources/abilities/studio-intake.js` selection against native encounter truth, retaining no Swift ordering or invitation prose |
 
-// MARK: - Studio store (desk 903 phases 1–2)
-//
-// The durable side of the agent's aesthetic life: a JOURNAL of encounters she
-// wrote herself, and the CONSULTS filed against her taste. Both live under
-// <dataRoot>/studio/ and are deliberately separate from MemoryV2 — taste is not
-// facts and must not compete with recall budgets.
-//
-// STORE:
-//   • <dataRoot>/studio/journal/journal.jsonl — append-only encounter entries.
-//     ADDITIVE ONLY: there is no update and no delete. A judgment that changes
-//     is a NEW entry linked to the old one (`relations`), so the contradiction
-//     is preserved rather than flattened.
-//   • <dataRoot>/studio/journal/amendments.jsonl — append-only CORRECTIONS
-//     (0.4.14). A wrong fact in an entry is corrected by appending one
-//     amendment record here, projected onto the entry on every read. No line of
-//     journal.jsonl is ever rewritten, and a superseded passage stays visible,
-//     struck through, with the correction's date and reason.
-//   • <dataRoot>/studio/consults/<id>.json — one envelope per consult, keyed by
-//     a stable id the caller can hand back later.
-//
-// THE VETOES THIS FILE ENFORCES (design spec, binding):
-//   1. HONEST ENCOUNTERS ONLY. A consult with no artifact refs is
-//      description-only, and a description-only consult can NEVER become a
-//      journal encounter. Enforced at BOTH ends: the consult must declare
-//      itself description-only when it carries no refs, and a journal entry
-//      whose origin is such a consult is refused.
-//   2. AN ENCOUNTER DOESN'T OWE A VERDICT. `stance: abstained` is fully valid,
-//      and it is the one case where `response` may be absent.
-//   3. NO SCORES. There is no rating, score, confidence, or sentiment field
-//      anywhere in the entry shape — not optional, not ignored: absent. The
-//      tool layer refuses unknown fields rather than dropping them, so a
-//      caller cannot smuggle one in and believe it was recorded.
-//   4. NOTHING AUTO-APPENDS. Filing a consult writes NOTHING to the journal;
-//      turning one into an entry is a separate, deliberate act.
-//
-// This store is generic engine: no persona-specific content lives here.
-
-// MARK: - Errors
-
-public enum StudioError: Error, LocalizedError, Sendable, Equatable {
-    /// A consult with no artifact refs that did not declare itself
-    /// description-only. Veto 1: the agent never claims an encounter she did
-    /// not actually have.
-    case consultMissingDescriptionOnlyFlag
-    /// A consult with neither refs nor a description — nothing to judge.
-    case consultHasNothingToJudge
-    case consultQuestionMissing
-    case unknownConsult(String)
-    case malformedConsult(String)
-    case invalidIdentifier(String)
-    /// Veto 1, the journal end: a description-only consult can never become an
-    /// encounter.
-    case descriptionOnlyConsultCannotBecomeEncounter(String)
-    case journalOriginConsultRequiresRef
-    case journalWorkTitleMissing
-    case journalResponseMissing
-    case unknownOriginKind(String)
-    case unknownStanceKind(String)
-    case unknownRelationKind(String)
-    case relationMissingEntryId
-    case unknownJournalEntry(String)
-    case amendmentReasonMissing
-    case amendmentCorrectionMissing
-    /// The passage to supersede is not in the entry's original response — a
-    /// correction must name text that is actually there, or it is rewriting
-    /// something the entry never said.
-    case amendmentPassageNotFound(String)
-    /// The passage appears more than once, so which one is being corrected is
-    /// not knowable. Quote more of the sentence.
-    case amendmentPassageNotUnique(String)
-    /// An abstained entry with no response has no passage to supersede.
-    case amendmentEntryHasNoResponse(String)
-    /// The passage this correction names overlaps one an earlier amendment
-    /// already superseded. Two corrections over the same words would nest one
-    /// strike-through inside another and neither would read as written.
-    case amendmentPassageOverlaps(passage: String, existingAmendmentID: String, existingPassage: String)
-
-    public var errorDescription: String? {
-        switch self {
-        case .consultMissingDescriptionOnlyFlag:
-            return "studio_consult: no artifact_refs were given, so this consult is description-only — set description_only=true. A description-only consult can be critiqued, but it can never become a journal encounter."
-        case .consultHasNothingToJudge:
-            return "studio_consult: give artifact_refs, a description, or both — there is nothing to look at otherwise."
-        case .consultQuestionMissing:
-            return "studio_consult: question is required — say what is actually being asked."
-        case .unknownConsult(let id):
-            return "studio: no consult with id '\(id)'."
-        case .malformedConsult(let id):
-            return "studio: the consult envelope for '\(id)' exists but does not decode."
-        case .invalidIdentifier(let raw):
-            return "studio: '\(raw)' is not a valid studio id (letters, digits and underscores only)."
-        case .descriptionOnlyConsultCannotBecomeEncounter(let id):
-            return "studio_journal: consult '\(id)' was description-only — a concept or brief with no work in front of you. It can be critiqued, but it is not an encounter and can never enter the journal as one. Journal the work itself when you actually receive it."
-        case .journalOriginConsultRequiresRef:
-            return "studio_journal: origin.kind=consult needs origin.ref — the consult id this entry came from."
-        case .journalWorkTitleMissing:
-            return "studio_journal: work.title is required — name what you encountered."
-        case .journalResponseMissing:
-            return "studio_journal: response is required unless stance.kind=abstained (an encounter doesn't owe a verdict, but a formed or open stance owes its judgment)."
-        case .unknownOriginKind(let raw):
-            return "studio_journal: unknown origin.kind '\(raw)' (expected wandering | consult | project)."
-        case .unknownStanceKind(let raw):
-            return "studio_journal: unknown stance.kind '\(raw)' (expected open | formed | abstained)."
-        case .unknownRelationKind(let raw):
-            return "studio_journal: unknown relation kind '\(raw)' (expected deepens | contradicts | revises | echoes)."
-        case .relationMissingEntryId:
-            return "studio_journal: every relation needs an entry_id — the entry it deepens/contradicts/revises/echoes."
-        case .unknownJournalEntry(let id):
-            return "studio_journal_amend: no journal entry with id '\(id)'."
-        case .amendmentReasonMissing:
-            return "studio_journal_amend: reason is required — say why the entry is wrong. A correction with no reason is a rewrite wearing a date."
-        case .amendmentCorrectionMissing:
-            return "studio_journal_amend: correction is required — the text that now stands."
-        case .amendmentPassageNotFound(let passage):
-            return "studio_journal_amend: supersedes text is not in that entry's response, verbatim: \"\(passage)\". Quote the passage exactly as written, or omit supersedes to append a dated correction instead."
-        case .amendmentPassageNotUnique(let passage):
-            return "studio_journal_amend: \"\(passage)\" appears more than once in that entry's response, so which one is being corrected is not knowable. Quote more of the sentence."
-        case .amendmentEntryHasNoResponse(let id):
-            return "studio_journal_amend: entry '\(id)' has no response text, so there is no passage to supersede. Omit supersedes to append a dated correction."
-        case .amendmentPassageOverlaps(let passage, let existing, let existingPassage):
-            return "studio_journal_amend: \"\(passage)\" overlaps a passage amendment '\(existing)' already corrected (\"\(existingPassage)\"). Correcting the same words twice would nest one correction inside another. Quote a passage that does not overlap it, or omit supersedes to append a dated correction that stands on its own."
-        }
-    }
-}
-
-// MARK: - Consult envelope
-
-/// One filed consult. The envelope is written ONCE and read back verbatim; the
-/// store never edits it, never scores it, and never suggests a verdict.
-public struct StudioConsult: Sendable, Equatable {
-    public var id: String
-    public var filedAt: String
-    /// What the agent can actually look at — file paths or URLs. Empty means
-    /// description-only.
-    public var artifactRefs: [String]
-    public var description: String?
-    /// What portion of the work is available (a spread, a rough cut, one screen).
-    public var portionAvailable: String?
-    public var question: String
-    public var projectContext: String?
-    public var stage: String?
-    public var constraints: String?
-    public var priorDiscussion: String?
-    /// Declared, never inferred after the fact: this consult carries no work,
-    /// only a description of one.
-    public var descriptionOnly: Bool
-
-    public init(
-        id: String,
-        filedAt: String,
-        artifactRefs: [String],
-        description: String? = nil,
-        portionAvailable: String? = nil,
-        question: String,
-        projectContext: String? = nil,
-        stage: String? = nil,
-        constraints: String? = nil,
-        priorDiscussion: String? = nil,
-        descriptionOnly: Bool
-    ) {
-        self.id = id
-        self.filedAt = filedAt
-        self.artifactRefs = artifactRefs
-        self.description = description
-        self.portionAvailable = portionAvailable
-        self.question = question
-        self.projectContext = projectContext
-        self.stage = stage
-        self.constraints = constraints
-        self.priorDiscussion = priorDiscussion
-        self.descriptionOnly = descriptionOnly
-    }
-
-    public func toJSON() -> JSONValue {
-        var obj: [String: JSONValue] = [
-            "id": .string(id),
-            "filed_at": .string(filedAt),
-            "question": .string(question),
-            "description_only": .bool(descriptionOnly),
-            "artifact_refs": .array(artifactRefs.map { .string($0) }),
-        ]
-        func put(_ key: String, _ value: String?) {
-            if let value, !value.isEmpty { obj[key] = .string(value) }
-        }
-        put("description", description)
-        put("portion_available", portionAvailable)
-        put("project_context", projectContext)
-        put("stage", stage)
-        put("constraints", constraints)
-        put("prior_discussion", priorDiscussion)
-        return .object(obj)
-    }
-
-    public static func fromJSON(_ value: JSONValue) -> StudioConsult? {
-        guard case .object(let obj) = value,
-              case .string(let id)? = obj["id"],
-              case .string(let filedAt)? = obj["filed_at"],
-              case .string(let question)? = obj["question"] else { return nil }
-        // A missing description_only flag decodes as FALSE only when refs are
-        // present. An envelope with no refs is description-only by definition,
-        // whatever the bytes say — the honest reading is the restrictive one.
-        var refs: [String] = []
-        if case .array(let arr)? = obj["artifact_refs"] {
-            refs = arr.compactMap { if case .string(let s) = $0 { return s } else { return nil } }
-        }
-        var descriptionOnly = refs.isEmpty
-        if case .bool(let flag)? = obj["description_only"], flag { descriptionOnly = true }
-        func str(_ key: String) -> String? {
-            if case .string(let s)? = obj[key], !s.isEmpty { return s }
-            return nil
-        }
-        return StudioConsult(
-            id: id,
-            filedAt: filedAt,
-            artifactRefs: refs,
-            description: str("description"),
-            portionAvailable: str("portion_available"),
-            question: question,
-            projectContext: str("project_context"),
-            stage: str("stage"),
-            constraints: str("constraints"),
-            priorDiscussion: str("prior_discussion"),
-            descriptionOnly: descriptionOnly
-        )
-    }
-}
-
-// MARK: - Journal entry
-
-public enum StudioOriginKind: String, Sendable, CaseIterable, Equatable {
-    case wandering, consult, project
-}
-
-public enum StudioStance: String, Sendable, CaseIterable, Equatable {
-    case open, formed, abstained
-}
-
-public enum StudioRelationKind: String, Sendable, CaseIterable, Equatable {
-    case deepens, contradicts, revises, echoes
-}
-
-/// What was encountered. `title` is the only required part — the rest is
-/// whatever is actually known, never invented to fill a field.
-public struct StudioWork: Sendable, Equatable {
-    public var title: String
-    public var creator: String?
-    public var medium: String?
-    public var date: String?
-    public var version: String?
-    public var edition: String?
-
-    public init(
-        title: String,
-        creator: String? = nil,
-        medium: String? = nil,
-        date: String? = nil,
-        version: String? = nil,
-        edition: String? = nil
-    ) {
-        self.title = title
-        self.creator = creator
-        self.medium = medium
-        self.date = date
-        self.version = version
-        self.edition = edition
-    }
-
-    public func toJSON() -> JSONValue {
-        var obj: [String: JSONValue] = ["title": .string(title)]
-        func put(_ key: String, _ value: String?) {
-            if let value, !value.isEmpty { obj[key] = .string(value) }
-        }
-        put("creator", creator)
-        put("medium", medium)
-        put("date", date)
-        put("version", version)
-        put("edition", edition)
-        return .object(obj)
-    }
-
-    public static func fromJSON(_ value: JSONValue) -> StudioWork? {
-        guard case .object(let obj) = value, case .string(let title)? = obj["title"] else { return nil }
-        func str(_ key: String) -> String? {
-            if case .string(let s)? = obj[key], !s.isEmpty { return s }
-            return nil
-        }
-        return StudioWork(
-            title: title, creator: str("creator"), medium: str("medium"),
-            date: str("date"), version: str("version"), edition: str("edition")
-        )
-    }
-}
-
-/// HOW the work was received. Both fields are free text on purpose: the design
-/// names examples ("original, reproduction, screening, playthrough, excerpt"),
-/// not a closed set, and a closed enum would force a caller to misdescribe a
-/// reception the vocabulary does not cover — the exact dishonesty the
-/// honest-encounter rule exists to prevent.
-public struct StudioReception: Sendable, Equatable {
-    public var how: String?
-    public var wholeOrPart: String?
-
-    public init(how: String? = nil, wholeOrPart: String? = nil) {
-        self.how = how
-        self.wholeOrPart = wholeOrPart
-    }
-
-    public var isEmpty: Bool { (how ?? "").isEmpty && (wholeOrPart ?? "").isEmpty }
-
-    public func toJSON() -> JSONValue {
-        var obj: [String: JSONValue] = [:]
-        if let how, !how.isEmpty { obj["how"] = .string(how) }
-        if let wholeOrPart, !wholeOrPart.isEmpty { obj["whole_or_part"] = .string(wholeOrPart) }
-        return .object(obj)
-    }
-
-    public static func fromJSON(_ value: JSONValue) -> StudioReception {
-        guard case .object(let obj) = value else { return StudioReception() }
-        func str(_ key: String) -> String? {
-            if case .string(let s)? = obj[key], !s.isEmpty { return s }
-            return nil
-        }
-        return StudioReception(how: str("how"), wholeOrPart: str("whole_or_part"))
-    }
-}
-
-public struct StudioOrigin: Sendable, Equatable {
-    public var kind: StudioOriginKind
-    public var ref: String?
-
-    public init(kind: StudioOriginKind, ref: String? = nil) {
-        self.kind = kind
-        self.ref = ref
-    }
-
-    public func toJSON() -> JSONValue {
-        var obj: [String: JSONValue] = ["kind": .string(kind.rawValue)]
-        if let ref, !ref.isEmpty { obj["ref"] = .string(ref) }
-        return .object(obj)
-    }
-
-    public static func fromJSON(_ value: JSONValue) -> StudioOrigin? {
-        guard case .object(let obj) = value,
-              case .string(let kindRaw)? = obj["kind"],
-              let kind = StudioOriginKind(rawValue: kindRaw) else { return nil }
-        var ref: String?
-        if case .string(let r)? = obj["ref"], !r.isEmpty { ref = r }
-        return StudioOrigin(kind: kind, ref: ref)
-    }
-}
-
-/// Where the judgment stands. `abstained` is a first-class outcome, not a
-/// failure — and it carries an optional reason, never a penalty.
-public struct StudioStanceValue: Sendable, Equatable {
-    public var kind: StudioStance
-    public var reason: String?
-
-    public init(kind: StudioStance, reason: String? = nil) {
-        self.kind = kind
-        self.reason = reason
-    }
-
-    public func toJSON() -> JSONValue {
-        var obj: [String: JSONValue] = ["kind": .string(kind.rawValue)]
-        if let reason, !reason.isEmpty { obj["reason"] = .string(reason) }
-        return .object(obj)
-    }
-
-    public static func fromJSON(_ value: JSONValue) -> StudioStanceValue? {
-        guard case .object(let obj) = value,
-              case .string(let kindRaw)? = obj["kind"],
-              let kind = StudioStance(rawValue: kindRaw) else { return nil }
-        var reason: String?
-        if case .string(let r)? = obj["reason"], !r.isEmpty { reason = r }
-        return StudioStanceValue(kind: kind, reason: reason)
-    }
-}
-
-/// A typed link to an earlier entry. This is the ONLY revision mechanism: an
-/// entry is never rewritten, so changing her mind shows up as a later entry
-/// that `revises` or `contradicts` the first, and both survive.
-///
-/// ── RELATIONS ARE PROVENANCE NOW, NOT A GRAPH (desk 903 phase 3) ─────────────
-/// The queryable graph moved to the knowledge graph: works and creators are
-/// entities there, and each of these links becomes a real typed edge naming this
-/// entry as its source (`KnowledgeGraph+StudioRelations.swift`). What stays on
-/// the entry is the PROVENANCE record — the line the edge cites back to.
-///
-/// The choice was "provenance-only" versus "dropped from new writes", and this
-/// is the smaller honest change of the two. The journal is an append-only life
-/// record and its promise is that an entry never ceases to exist and never needs
-/// a second file to explain itself; an entry that says it revises an earlier one
-/// has to keep saying so, or the record stops being self-describing and the
-/// graph's own provenance points at a claim nobody can read. Dropping the field
-/// would also silently break `studio_recall`'s two relation filters for every
-/// future entry — a lossy change dressed as a smaller one.
-///
-/// This is not a dual write: the JSONL is not queried as a graph and never was.
-/// `recall` only ever asked "does THIS entry carry such a link", which is a
-/// property of the entry, not a traversal. Traversal is the graph's, exclusively.
-public struct StudioRelation: Sendable, Equatable {
-    public var kind: StudioRelationKind
-    public var entryId: String
-
-    public init(kind: StudioRelationKind, entryId: String) {
-        self.kind = kind
-        self.entryId = entryId
-    }
-
-    public func toJSON() -> JSONValue {
-        .object(["kind": .string(kind.rawValue), "entry_id": .string(entryId)])
-    }
-
-    public static func fromJSON(_ value: JSONValue) -> StudioRelation? {
-        guard case .object(let obj) = value,
-              case .string(let kindRaw)? = obj["kind"],
-              let kind = StudioRelationKind(rawValue: kindRaw),
-              case .string(let entryId)? = obj["entry_id"],
-              !entryId.isEmpty else { return nil }
-        return StudioRelation(kind: kind, entryId: entryId)
-    }
-}
-
-/// One encounter, one written judgment. The freeform `response` is the heart of
-/// it; every other field exists to say what was encountered and how.
-///
-/// There is no rating, score, confidence, sentiment, or canon-status field, and
-/// there never will be one here — canon membership is a separate deliberate act.
-public struct StudioJournalEntry: Sendable, Equatable {
-    public var id: String
-    public var encounteredAt: String
-    public var recordedAt: String
-    public var work: StudioWork
-    public var reception: StudioReception
-    public var artifactRefs: [String]
-    public var origin: StudioOrigin
-    public var response: String?
-    public var stance: StudioStanceValue
-    public var relations: [StudioRelation]
-    public var tags: [String]
-    /// Corrections filed against this entry, oldest first. NEVER written into
-    /// `journal.jsonl` — they live in `journal/amendments.jsonl` and are
-    /// projected onto the entry on every read, so the entry reads as corrected
-    /// without the line it was written on ever changing. See `StudioAmendment`.
-    public var amendments: [StudioAmendment]
-    /// TRUE when `journal/amendments.jsonl` could not be read whole on the read
-    /// that produced this entry — a malformed row, a row this build cannot
-    /// decode, or a file-level read failure. Which entry lost a correction is
-    /// not knowable from a damaged file, so every entry in that read says so,
-    /// and nothing may present the response as healthy. Never written to disk.
-    public var correctionsUnreadable: Bool = false
-
-    public init(
-        id: String,
-        encounteredAt: String,
-        recordedAt: String,
-        work: StudioWork,
-        reception: StudioReception = StudioReception(),
-        artifactRefs: [String] = [],
-        origin: StudioOrigin,
-        response: String? = nil,
-        stance: StudioStanceValue,
-        relations: [StudioRelation] = [],
-        tags: [String] = [],
-        amendments: [StudioAmendment] = [],
-        correctionsUnreadable: Bool = false
-    ) {
-        self.id = id
-        self.encounteredAt = encounteredAt
-        self.recordedAt = recordedAt
-        self.work = work
-        self.reception = reception
-        self.artifactRefs = artifactRefs
-        self.origin = origin
-        self.response = response
-        self.stance = stance
-        self.relations = relations
-        self.tags = tags
-        self.amendments = amendments
-        self.correctionsUnreadable = correctionsUnreadable
-    }
-
-    /// The response as it now READS: the original text with every correction
-    /// shown in place. A superseded passage is kept and struck through, the
-    /// correction stands beside it with its date and reason, and an appended
-    /// correction becomes a dated block at the end. Nothing here removes a word
-    /// she wrote — a reader can always see what the entry used to say.
-    public var responseAsCorrected: String? {
-        guard !amendments.isEmpty else { return response }
-        var text = response ?? ""
-        if !text.isEmpty {
-            // ONE pass over the ORIGINAL response. Replacing inside text that
-            // already carries a strike-through is how a second amendment on an
-            // overlapping passage produced nested, half-marked Markdown; every
-            // range is resolved against the text as written, and an amendment
-            // overlapping one already applied is skipped here (the write path
-            // refuses to file one, so this only guards older files).
-            var applied: [(range: Range<String.Index>, amendment: StudioAmendment)] = []
-            for amendment in amendments where amendment.supersedes != nil {
-                guard let passage = amendment.supersedes,
-                      let range = text.range(of: passage),
-                      !applied.contains(where: { $0.range.overlaps(range) }) else { continue }
-                applied.append((range, amendment))
-            }
-            applied.sort { $0.range.lowerBound < $1.range.lowerBound }
-            var rebuilt = ""
-            var cursor = text.startIndex
-            for (range, amendment) in applied {
-                rebuilt += text[cursor..<range.lowerBound]
-                rebuilt += "~~\(text[range])~~ \(amendment.correction) [corrected \(amendment.amendedOn) — \(amendment.reason)]"
-                cursor = range.upperBound
-            }
-            rebuilt += text[cursor...]
-            text = rebuilt
-        }
-        for amendment in amendments where amendment.supersedes == nil {
-            let block = "[Correction \(amendment.amendedOn) — \(amendment.reason)] \(amendment.correction)"
-            text = text.isEmpty ? block : text + "\n\n" + block
-        }
-        return text.isEmpty ? nil : text
-    }
-
-    public func toJSON() -> JSONValue {
-        var obj: [String: JSONValue] = [
-            "id": .string(id),
-            "encountered_at": .string(encounteredAt),
-            "recorded_at": .string(recordedAt),
-            "work": work.toJSON(),
-            "origin": origin.toJSON(),
-            "stance": stance.toJSON(),
-        ]
-        if !reception.isEmpty { obj["reception"] = reception.toJSON() }
-        if !artifactRefs.isEmpty { obj["artifact_refs"] = .array(artifactRefs.map { .string($0) }) }
-        if let response, !response.isEmpty { obj["response"] = .string(response) }
-        if !relations.isEmpty { obj["relations"] = .array(relations.map { $0.toJSON() }) }
-        if !tags.isEmpty { obj["tags"] = .array(tags.map { .string($0) }) }
-        // Only ever present on a READ (the append path writes a fresh entry
-        // with none). `response` above stays exactly as it was written; this
-        // pair is what makes the correction visible wherever the entry is shown.
-        if !amendments.isEmpty {
-            obj["amendments"] = .array(amendments.map { $0.toJSON() })
-            if let corrected = responseAsCorrected { obj["response_as_corrected"] = .string(corrected) }
-        }
-        // Damage is louder than silence: a reader that cannot see this entry's
-        // corrections must not be shown the response as if it still stands.
-        if correctionsUnreadable {
-            obj["corrections_unreadable"] = .bool(true)
-            obj["corrections_note"] = .string(
-                "corrections unreadable — journal/amendments.jsonl is damaged, so this response may have been corrected in ways not shown here")
-        }
-        return .object(obj)
-    }
-
-    public static func fromJSON(_ value: JSONValue) -> StudioJournalEntry? {
-        guard case .object(let obj) = value,
-              case .string(let id)? = obj["id"],
-              case .string(let recordedAt)? = obj["recorded_at"],
-              let work = obj["work"].flatMap(StudioWork.fromJSON),
-              let origin = obj["origin"].flatMap(StudioOrigin.fromJSON),
-              let stance = obj["stance"].flatMap(StudioStanceValue.fromJSON) else { return nil }
-        var encounteredAt = recordedAt
-        if case .string(let e)? = obj["encountered_at"], !e.isEmpty { encounteredAt = e }
-        let reception = obj["reception"].map(StudioReception.fromJSON) ?? StudioReception()
-        var refs: [String] = []
-        if case .array(let arr)? = obj["artifact_refs"] {
-            refs = arr.compactMap { if case .string(let s) = $0 { return s } else { return nil } }
-        }
-        var response: String?
-        if case .string(let r)? = obj["response"], !r.isEmpty { response = r }
-        var relations: [StudioRelation] = []
-        if case .array(let arr)? = obj["relations"] {
-            relations = arr.compactMap { StudioRelation.fromJSON($0) }
-        }
-        var tags: [String] = []
-        if case .array(let arr)? = obj["tags"] {
-            tags = arr.compactMap { if case .string(let s) = $0 { return s } else { return nil } }
-        }
-        var amendments: [StudioAmendment] = []
-        if case .array(let arr)? = obj["amendments"] {
-            amendments = arr.compactMap { StudioAmendment.fromJSON($0) }
-        }
-        return StudioJournalEntry(
-            id: id, encounteredAt: encounteredAt, recordedAt: recordedAt,
-            work: work, reception: reception, artifactRefs: refs, origin: origin,
-            response: response, stance: stance, relations: relations, tags: tags,
-            amendments: amendments
-        )
-    }
-}
-
-// MARK: - Amendment (0.4.14)
-
-/// ONE CORRECTION TO AN ENTRY ALREADY WRITTEN.
-///
-/// The journal stays append-only: nothing here edits or deletes a line of
-/// `journal.jsonl`. An amendment is its OWN durable record in
-/// `journal/amendments.jsonl`, and every read projects it back onto the entry it
-/// names — so the entry reads as corrected without the line it was written on
-/// ever changing.
-///
-/// This does NOT replace `relations`, and it is deliberately narrower. A
-/// relation is a NEW ENCOUNTER that revises an earlier judgment: she looked
-/// again and thinks something different, and both entries stand. An amendment is
-/// the case relations cannot honestly cover — the entry states a FACT that was
-/// wrong (the desk faces the wall; it does not), with no new encounter to write.
-/// Correcting that by filing a fresh encounter would claim one that never
-/// happened, which is exactly the dishonesty the studio vetoes exist to prevent.
-///
-/// Two shapes, one record:
-///   • `supersedes == nil` — a dated correction block appended to the entry.
-///   • `supersedes != nil` — a named passage of the original response is
-///     superseded. The original passage is KEPT and rendered struck through with
-///     the correction, its date, and its reason beside it. Nothing is silently
-///     rewritten: the record shows that it was corrected.
-public struct StudioAmendment: Sendable, Equatable {
-    public var id: String
-    public var entryId: String
-    public var amendedAt: String
-    /// Why it is being corrected, in her words. Required — a correction with no
-    /// reason is a rewrite wearing a date.
-    public var reason: String
-    /// The exact passage of the original `response` this supersedes, or nil for
-    /// an appended correction.
-    public var supersedes: String?
-    public var correction: String
-
-    public init(
-        id: String,
-        entryId: String,
-        amendedAt: String,
-        reason: String,
-        supersedes: String? = nil,
-        correction: String
-    ) {
-        self.id = id
-        self.entryId = entryId
-        self.amendedAt = amendedAt
-        self.reason = reason
-        self.supersedes = supersedes
-        self.correction = correction
-    }
-
-    /// The date a reader sees on the correction — day precision, which is what a
-    /// corrected record needs to say.
-    public var amendedOn: String { String(amendedAt.prefix(10)) }
-
-    public func toJSON() -> JSONValue {
-        var obj: [String: JSONValue] = [
-            "id": .string(id),
-            "entry_id": .string(entryId),
-            "amended_at": .string(amendedAt),
-            "reason": .string(reason),
-            "correction": .string(correction),
-        ]
-        if let supersedes, !supersedes.isEmpty { obj["supersedes"] = .string(supersedes) }
-        return .object(obj)
-    }
-
-    public static func fromJSON(_ value: JSONValue) -> StudioAmendment? {
-        guard case .object(let obj) = value,
-              case .string(let id)? = obj["id"],
-              case .string(let entryId)? = obj["entry_id"],
-              case .string(let amendedAt)? = obj["amended_at"],
-              case .string(let reason)? = obj["reason"],
-              case .string(let correction)? = obj["correction"],
-              !correction.isEmpty else { return nil }
-        var supersedes: String?
-        if case .string(let s)? = obj["supersedes"], !s.isEmpty { supersedes = s }
-        return StudioAmendment(
-            id: id, entryId: entryId, amendedAt: amendedAt,
-            reason: reason, supersedes: supersedes, correction: correction
-        )
-    }
-}
-
-// MARK: - Recall query
-
-/// A read-only query over the journal. Every supplied field narrows the result
-/// (AND); an empty query matches everything. There is NO relevance score — the
-/// only ordering is newest-first, because the response text is the point and
-/// ranking it would be the taste-score this store refuses to keep.
-public struct StudioRecallQuery: Sendable, Equatable {
-    public var text: String?
-    public var title: String?
-    public var creator: String?
-    public var medium: String?
-    public var tag: String?
-    public var relationKind: StudioRelationKind?
-    public var relatedTo: String?
-    public var limit: Int
-
-    public static let defaultLimit = 10
-    public static let maximumLimit = 50
-
-    public init(
-        text: String? = nil,
-        title: String? = nil,
-        creator: String? = nil,
-        medium: String? = nil,
-        tag: String? = nil,
-        relationKind: StudioRelationKind? = nil,
-        relatedTo: String? = nil,
-        limit: Int = StudioRecallQuery.defaultLimit
-    ) {
-        self.text = text
-        self.title = title
-        self.creator = creator
-        self.medium = medium
-        self.tag = tag
-        self.relationKind = relationKind
-        self.relatedTo = relatedTo
-        self.limit = min(max(1, limit), StudioRecallQuery.maximumLimit)
-    }
-}
-
-/// Matches, newest-first, plus an HONEST statement of what was left out.
-public struct StudioRecallResult: Sendable, Equatable {
-    public var entries: [StudioJournalEntry]
-    public var matchedCount: Int
-    public var hasMore: Bool
-    /// The corrections file was damaged on this read, so an entry here may be
-    /// showing a claim that has already been corrected. Never false by omission.
-    public var correctionsUnreadable: Bool = false
-    /// Journal history this read could not see (unreadable archives, damaged
-    /// or undecodable lines). Matches and counts cover only what was read.
-    public var historyUnreadable: [String] = []
-}
-
-// MARK: - Encounter intake
-
-/// ONE UNATTENDED ARTIFACT ALREADY IN REACH — desk 903 phase 1.
-///
-/// "Pressure decides WHEN, intake decides WHAT. A seed mints only when an
-/// unattended artifact is already in reach. No intake, no encounter." This type
-/// is the WHAT: a thing that actually exists, that she has not written about,
-/// and that she could receive right now. It is deliberately not a suggestion, a
-/// recommendation, or a generated prompt — nothing here is invented.
-///
-/// It lives in PersistenceCore because it is the only vocabulary the studio
-/// store, the knowledge graph, and the cognitive substrate all share.
-public struct StudioEncounterCandidate: Sendable, Equatable, Hashable {
-    public enum Source: String, Sendable, CaseIterable, Equatable {
-        /// User named it: a consult filed with real artifact refs. His nudges are
-        /// "invitations left on a table, never assignments", which is exactly
-        /// what an intake row is.
-        case named
-        /// A work the knowledge graph holds that the journal never answered.
-        case unjournaledWork
-        /// SEAM ONLY. Nothing produces this yet and nothing in this build may:
-        /// "crossed the screen" needs screen capture, which is a separate
-        /// consent surface and a separate build. The case exists so the ranking
-        /// and the honest-encounter rules are already written for it, not so a
-        /// stub can pretend to watch a screen.
-        case crossedTheScreen
-    }
-
-    public var source: Source
-    /// What it is called, when anything actually knows. A consult carries refs,
-    /// not a title, and inventing one would be the dishonesty the whole design
-    /// exists to prevent — so this stays optional.
-    public var title: String?
-    public var creator: String?
-    /// The path or URL she would receive it through. TEXT: nothing in the
-    /// intake path opens it. An honest encounter happens in front of the work,
-    /// through the vision/browser organs, never by a queue quietly reading a file.
-    public var reference: String?
-    /// What names this candidate for dedup — a consult id, an entity id.
-    public var originID: String
-    public var noticedAt: String
-
-    public init(
-        source: Source,
-        title: String? = nil,
-        creator: String? = nil,
-        reference: String? = nil,
-        originID: String,
-        noticedAt: String
-    ) {
-        self.source = source
-        self.title = title
-        self.creator = creator
-        self.reference = reference
-        self.originID = originID
-        self.noticedAt = noticedAt
-    }
-
-}
+// Studio owns aesthetic history and consults under studio/, separately from factual MemoryV2. Storage is persona-independent; the agent supplies her own judgments.
 
 // MARK: - Store
 
@@ -799,11 +14,9 @@ public struct SwiftNativeStudioStore: Sendable {
     public static let logLabel = "StudioStore"
 
     public let dataRoot: URL
-    public let persistence: SwiftNativePersistenceCore
 
-    public init(dataRoot: URL, persistence: SwiftNativePersistenceCore = SwiftNativePersistenceCore()) {
+    public init(dataRoot: URL) {
         self.dataRoot = dataRoot
-        self.persistence = persistence
     }
 
     /// `<dataRoot>/studio/`.
@@ -823,19 +36,7 @@ public struct SwiftNativeStudioStore: Sendable {
         studioRoot.appendingPathComponent("consults", isDirectory: true)
     }
 
-    /// `<dataRoot>/studio/journal/journal_archive_<stamp>.jsonl` — where the
-    /// lines a cap trim would otherwise DESTROY are moved to first.
-    ///
-    /// The line cap on `journal.jsonl` trims by keeping the newest N lines and
-    /// discarding the rest. For telemetry that is retention; for a life record
-    /// it is deletion, and it would break the one promise the journal makes —
-    /// no entry ever ceases to exist (gpt-5.5 review). So before any trim can
-    /// run, the doomed lines are moved HERE, byte for byte. This file is never
-    /// capped or registered in the path-owned registry. Recall, encounter
-    /// intake and work history read it together with the live journal through
-    /// `journalEntriesIncludingArchive`.
-    ///
-    /// One file per trim event, stamped, so each event is self-describing.
+    /// `<dataRoot>/studio/journal/journal_archive_<stamp>.jsonl` — uncapped, byte-exact overflow per trim. Archive before trimming; journalHistory reads this shelf together with the hot journal.
     public func journalArchivePath(now: Date = Date()) -> URL {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
@@ -846,9 +47,7 @@ public struct SwiftNativeStudioStore: Sendable {
             .appendingPathComponent("journal_archive_\(f.string(from: now)).jsonl")
     }
 
-    /// Every overflow archive on the shelf, oldest stamp first. The combined
-    /// journal reader uses this inventory for recall, encounter intake and
-    /// work history.
+    /// Every overflow archive on the shelf, oldest stamp first. The combined journal reader uses this inventory for recall, encounter intake and work history.
     public func journalArchivePaths() throws -> [URL] {
         let directory = studioRoot.appendingPathComponent("journal", isDirectory: true)
         guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
@@ -858,17 +57,14 @@ public struct SwiftNativeStudioStore: Sendable {
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
-    /// `<dataRoot>/studio/consults/<id>.json`, for an id that has already been
-    /// validated by `validatedIdentifier`.
+    /// `<dataRoot>/studio/consults/<id>.json`, for an id that has already been validated by `validatedIdentifier`.
     public func consultPath(id: String) throws -> URL {
         consultsDirectory.appendingPathComponent("\(try Self.validatedIdentifier(id)).json")
     }
 
     // MARK: Identifiers
 
-    /// Studio ids are `<prefix>_<stamp>_<random>` and contain nothing that could
-    /// escape the consults directory. Validated on the way in AND on the way
-    /// out, because the read side takes an id straight from a model.
+    /// Studio ids are `<prefix>_<stamp>_<random>` and contain nothing that could escape the consults directory. Validated on the way in AND on the way out, because the read side takes an id straight from a model.
     static func validatedIdentifier(_ raw: String) throws -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_"))
@@ -894,9 +90,7 @@ public struct SwiftNativeStudioStore: Sendable {
 
     // MARK: Consults
 
-    /// File a consult. Writes the envelope and NOTHING else: no journal entry,
-    /// no retrieval, no suggested verdict. Returns the stored envelope so the
-    /// caller sees exactly what was persisted, including its id.
+    /// File a consult. Writes the envelope and NOTHING else: no journal entry, no retrieval, no suggested verdict. Returns the stored envelope so the caller sees exactly what was persisted, including its id.
     @discardableResult
     public func fileConsult(
         artifactRefs: [String],
@@ -916,9 +110,7 @@ public struct SwiftNativeStudioStore: Sendable {
         let trimmedQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedQuestion.isEmpty else { throw StudioError.consultQuestionMissing }
         let trimmedDescription = description?.trimmingCharacters(in: .whitespacesAndNewlines)
-        // VETO 1, the consult end. No refs means there is no work in front of
-        // her, and the caller has to SAY so — a consult that quietly omits its
-        // refs must never look like an encounter later.
+        // Without artifact refs, require an explicit description-only consult with a description.
         if refs.isEmpty {
             guard descriptionOnly else { throw StudioError.consultMissingDescriptionOnlyFlag }
             guard let trimmedDescription, !trimmedDescription.isEmpty else {
@@ -936,11 +128,10 @@ public struct SwiftNativeStudioStore: Sendable {
             stage: stage?.trimmingCharacters(in: .whitespacesAndNewlines),
             constraints: constraints?.trimmingCharacters(in: .whitespacesAndNewlines),
             priorDiscussion: priorDiscussion?.trimmingCharacters(in: .whitespacesAndNewlines),
-            // Refs present but declared description-only is honest and allowed:
-            // it can only make the consult LESS eligible, never more.
+            // Refs present but declared description-only is honest and allowed: it can only make the consult LESS eligible, never more.
             descriptionOnly: descriptionOnly || refs.isEmpty
         )
-        try await persistence.writeJSON(consult.toJSON(), to: try consultPath(id: consult.id))
+        try await SwiftNativePersistenceCore.writeJSON(consult.toJSON(), to: try consultPath(id: consult.id))
         return consult
     }
 
@@ -964,16 +155,12 @@ public struct SwiftNativeStudioStore: Sendable {
         return consult
     }
 
-    /// The consult an arbitrary reference NAMES, or nil when it names no consult
-    /// at all — an origin ref is "whatever identifies the source", so a desk
-    /// handle, a URL, or a project name is a legitimate ref that simply is not a
-    /// consult id. A ref that DOES resolve is returned whatever the entry claims
-    /// its origin kind to be; a stored envelope that no longer decodes throws
-    /// rather than passing as "not a consult".
+    /// The consult an arbitrary reference NAMES, or nil when it names no consult at all — an origin ref is "whatever identifies the source", so a desk handle, a URL, or a project name is a legitimate ref that simply is not a consult id. A
+    /// ref that DOES resolve is returned whatever the entry claims its origin kind to be; a stored envelope that no longer decodes throws rather than passing as "not a consult".
     public func consultIfExists(id: String) async throws -> StudioConsult? {
         guard let path = try? consultPath(id: id),
               FileManager.default.fileExists(atPath: path.path) else { return nil }
-        let raw = try await persistence.readJSON(path, ifMissing: .null)
+        let raw = try await SwiftNativePersistenceCore.readJSON(path, ifMissing: .null)
         guard let consult = StudioConsult.fromJSON(raw) else {
             throw StudioError.malformedConsult(id)
         }
@@ -982,12 +169,8 @@ public struct SwiftNativeStudioStore: Sendable {
 
     // MARK: Journal
 
-    /// Append ONE entry. There is deliberately no counterpart: no update, no
-    /// delete, no rewrite. Revision happens through a later linked entry.
-    ///
-    /// The append is DURABLE (F_FULLFSYNC before the descriptor closes) and runs
-    /// through the path-owned cap registry, so the journal cannot be grown by a
-    /// writer that skipped retention — see `jsonlPathOwnedCapPolicy`.
+    /// Append ONE entry. There is deliberately no counterpart: no update, no delete, no rewrite. Revision happens through a later linked entry.  The append is DURABLE (F_FULLFSYNC before the descriptor closes) and runs through the path-
+    /// owned cap registry, so the journal cannot be grown by a writer that skipped retention — see `jsonlPathOwnedCapPolicy`.
     @discardableResult
     public func appendJournalEntry(
         encounteredAt: String?,
@@ -1005,35 +188,31 @@ public struct SwiftNativeStudioStore: Sendable {
             throw StudioError.journalWorkTitleMissing
         }
         let trimmedResponse = response?.trimmingCharacters(in: .whitespacesAndNewlines)
-        // VETO 2: an encounter doesn't owe a verdict. `abstained` is the one
-        // stance that may stand without a response; open/formed owe theirs.
+        // Only an abstained stance may omit its response.
         if stance.kind != .abstained, (trimmedResponse ?? "").isEmpty {
             throw StudioError.journalResponseMissing
         }
-        // VETO 1, the journal end. A consult-origin entry must name its consult.
+        // A consult-origin entry must name its consult.
         if origin.kind == .consult, (origin.ref ?? "").isEmpty {
             throw StudioError.journalOriginConsultRequiresRef
         }
-        // The description-only check keys on WHAT THE REF RESOLVES TO, never on
-        // the kind the caller declared. Gating it on `kind == .consult` left the
-        // veto one relabel away from useless: {kind: wandering, ref: <a
-        // description-only consult>} walked straight past it (gpt-5.5 review).
-        // A ref that resolves to no consult stays fine — an origin ref is
-        // "whatever identifies the source".
+        // Refuse a description-only consult by the resolved reference, regardless of declared origin kind.
         if let ref = origin.ref, !ref.isEmpty,
            let consult = try await consultIfExists(id: ref) {
             if consult.descriptionOnly {
                 throw StudioError.descriptionOnlyConsultCannotBecomeEncounter(consult.id)
             }
         } else if origin.kind == .consult, let ref = origin.ref {
-            // kind=consult promises a consult; an unresolvable one is a claim we
-            // cannot check, so it fails rather than passing unverified.
+            // kind=consult promises a consult; an unresolvable one is a claim we cannot check, so it fails rather than passing unverified.
             throw StudioError.unknownConsult(ref)
         }
         let recordedAt = NativeTimestampFormat.sixDigitUTCOffset(now)
+        let encounterStamp: String
+        if let encounteredAt, !encounteredAt.isEmpty { encounterStamp = encounteredAt }
+        else { encounterStamp = recordedAt }
         let entry = StudioJournalEntry(
             id: Self.newIdentifier(prefix: "entry", now: now),
-            encounteredAt: (encounteredAt?.isEmpty == false) ? encounteredAt! : recordedAt,
+            encounteredAt: encounterStamp,
             recordedAt: recordedAt,
             work: work,
             reception: reception,
@@ -1051,43 +230,27 @@ public struct SwiftNativeStudioStore: Sendable {
         try await appendPathOwnedJSONL(
             entry.toJSON(),
             to: journalPath,
-            using: persistence,
             logLabel: Self.logLabel,
             durable: true,
-            // ARCHIVE BEFORE TRIM. This hook runs inside the feed's flock and
-            // BEFORE the append, so a throw here means no append and no trim —
-            // a shelf that cannot be written is a reason to stop, never a reason
-            // to drop the oldest entries quietly.
-            beforePotentialLineCap: { try await archiveJournalOverflowIfNeeded() }
+            // ARCHIVE BEFORE TRIM. This hook runs inside the feed's flock and BEFORE the append, so a throw here means no append and no trim — a shelf that cannot be written is a reason to stop, never a reason to drop the oldest entries
+            // quietly.
+            beforePotentialLineCap: { try archiveJournalOverflowIfNeeded($0) }
         )
         return entry
     }
 
-    /// Move the lines a cap trim is about to discard onto the overflow shelf,
-    /// durably — before the append that would trigger the
-    /// trim, and before the trim itself.
-    ///
-    /// `incoming` is how many lines the pending append adds (1 on the live
-    /// path), so the count matches exactly what `enforceJSONLLineCap` will drop
-    /// afterwards. `maxLines` is the journal's registered budget; it is a
-    /// parameter only so a test can exercise the overflow without writing a
-    /// hundred thousand entries.
-    ///
-    /// Throws rather than skipping on anything it cannot handle — an unreadable
-    /// journal is the one case where trimming must NOT proceed.
-    func archiveJournalOverflowIfNeeded(
-        maxLines: Int = JSONLLineCaps.studioJournal,
-        incoming: Int = 1,
-        now: Date = Date()
-    ) async throws {
-        let doomed = try journalOverflowLines(maxLines: maxLines, incoming: incoming)
+    /// Archive the cap owner's selected original rows before append or trim.
+    private func archiveJournalOverflowIfNeeded(_ doomed: [Substring]?, now: Date = Date()) throws {
+        guard let doomed else {
+            throw PersistenceCoreError.ioFailure(
+                "studio journal at \(journalPath.path) is not valid UTF-8 — refusing to trim it")
+        }
         guard !doomed.isEmpty else { return }
 
         let directory = journalPath.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let archive = journalArchivePath(now: now)
-        // Raw BYTES, not re-serialized rows: the shelf has to hold exactly what
-        // the journal held, including a line this build could not decode.
+        // Raw BYTES, not re-serialized rows: the shelf has to hold exactly what the journal held, including a line this build could not decode.
         var payload = Data()
         for line in doomed {
             payload.append(contentsOf: line.utf8)
@@ -1098,44 +261,14 @@ public struct SwiftNativeStudioStore: Sendable {
               Self.logLabel, doomed.count, archive.lastPathComponent)
     }
 
-    /// The exact lines `enforceJSONLLineCap` would drop after `incoming` more
-    /// are appended: the OLDEST `count + incoming - maxLines` of them.
-    private func journalOverflowLines(maxLines: Int, incoming: Int) throws -> [String] {
-        guard maxLines > 0, FileManager.default.fileExists(atPath: journalPath.path) else { return [] }
-        // A file of n bytes holds at most n lines, so below the budget in BYTES
-        // it cannot be over it in lines. This is what keeps the check free on
-        // the ordinary append — the same sound bound `enforceJSONLLineCap` uses.
-        if let size = ((try? FileManager.default.attributesOfItem(
-            atPath: journalPath.path
-        ))?[.size] as? NSNumber)?.intValue, size + incoming <= maxLines {
-            return []
-        }
-        let data = try Data(contentsOf: journalPath)
-        guard let text = String(data: data, encoding: .utf8) else {
-            // Never trim what we cannot read: skipping here is how entries would
-            // vanish without ever reaching the shelf.
-            throw PersistenceCoreError.ioFailure(
-                "studio journal at \(journalPath.path) is not valid UTF-8 — refusing to trim it"
-            )
-        }
-        var lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-        if lines.last?.isEmpty == true { lines.removeLast() }
-        let overflow = lines.count + incoming - maxLines
-        guard overflow > 0 else { return [] }
-        return lines.prefix(overflow).map(String.init)
-    }
-
-    /// Every entry in file (append) order. The journal is a curated life record
-    /// — a few entries a week, not telemetry — so reading it whole is honest and
-    /// cheap; `recall` is what bounds what a caller sees.
+    /// Every entry in file (append) order. The journal is a curated life record — a few entries a week, not telemetry — so reading it whole is honest and cheap; `recall` is what bounds what a caller sees.
     public func readJournal() async throws -> [StudioJournalEntry] {
         await applyAmendments(try await rawJournalEntries(path: journalPath).entries)
     }
 
-    /// Usable entries and the holes beside them: damaged lines and rows this
-    /// build cannot decode are counted, never silently absent.
+    /// Usable entries and the holes beside them: damaged lines and rows this build cannot decode are counted, never silently absent.
     private func rawJournalEntries(path: URL) async throws -> (entries: [StudioJournalEntry], holes: [String]) {
-        let (rows, report) = try await persistence.readJSONLReporting(path)
+        let (rows, report) = try await SwiftNativePersistenceCore.readJSONLReporting(path)
         let entries = rows.compactMap { StudioJournalEntry.fromJSON($0) }
         let lost = report.malformedLineCount + rows.count - entries.count
         var holes = lost > 0 ? ["\(path.lastPathComponent): \(lost) line(s) could not be read as entries"] : []
@@ -1145,13 +278,8 @@ public struct SwiftNativeStudioStore: Sendable {
 
     // MARK: Amendments (0.4.14)
 
-    /// `<dataRoot>/studio/journal/amendments.jsonl` — one row per correction.
-    ///
-    /// NOT in the path-owned cap registry, and deliberately so: a cap trims the
-    /// oldest rows, and trimming a correction would restore a claim she has
-    /// already admitted is wrong. Like the trim receipts beside it, this file is
-    /// written durably and never capped. It is tiny by construction — a
-    /// correction is a rare deliberate act, not telemetry.
+    /// `<dataRoot>/studio/journal/amendments.jsonl` — one row per correction.  NOT in the path-owned cap registry, and deliberately so: a cap trims the oldest rows, and trimming a correction would restore a claim she has already admitted
+    /// is wrong. Like the trim receipts beside it, this file is written durably and never capped. It is tiny by construction — a correction is a rare deliberate act, not telemetry.
     public var journalAmendmentsPath: URL {
         studioRoot
             .appendingPathComponent("journal", isDirectory: true)
@@ -1161,10 +289,7 @@ public struct SwiftNativeStudioStore: Sendable {
     /// What a read of `amendments.jsonl` got, and whether it got all of it.
     public struct AmendmentsRead: Sendable, Equatable {
         public var amendments: [StudioAmendment]
-        /// The file exists and could NOT be read whole: a malformed line, or a
-        /// row this build cannot decode, or the read itself failed. Which
-        /// entry's correction was lost is unknowable, so this is a property of
-        /// the read, not of one row.
+        /// The file exists and could NOT be read whole: a malformed line, or a row this build cannot decode, or the read itself failed. Which entry's correction was lost is unknowable, so this is a property of the read, not of one row.
         public var unreadable: Bool
         public init(amendments: [StudioAmendment], unreadable: Bool) {
             self.amendments = amendments
@@ -1172,19 +297,15 @@ public struct SwiftNativeStudioStore: Sendable {
         }
     }
 
-    /// Every correction on file, append order, PLUS whether anything was lost.
-    /// A row this build cannot decode is still skipped rather than thrown — an
-    /// unreadable correction must not take the whole journal read down with it —
-    /// but it is REPORTED, because a dropped correction silently resurrects the
-    /// claim she has already admitted is wrong.
+    /// Every correction on file, append order, PLUS whether anything was lost. A row this build cannot decode is still skipped rather than thrown — an unreadable correction must not take the whole journal read down with it — but it is
+    /// REPORTED, because a dropped correction silently resurrects the claim she has already admitted is wrong.
     public func readAmendmentsReporting() async throws -> AmendmentsRead {
         guard FileManager.default.fileExists(atPath: journalAmendmentsPath.path) else {
             return AmendmentsRead(amendments: [], unreadable: false)
         }
-        let (rows, report) = try await persistence.readJSONLReporting(journalAmendmentsPath)
+        let (rows, report) = try await SwiftNativePersistenceCore.readJSONLReporting(journalAmendmentsPath)
         let amendments = rows.compactMap { StudioAmendment.fromJSON($0) }
-        // Malformed bytes, a torn trailing line, and a row that parsed as JSON
-        // but is not an amendment this build understands are all the same loss.
+        // Malformed bytes, a torn trailing line, and a row that parsed as JSON but is not an amendment this build understands are all the same loss.
         let unreadable = !report.isClean || amendments.count != rows.count
         if unreadable {
             nativeLog("%@: journal/amendments.jsonl is damaged (%d malformed, %d undecodable rows) - entries will read as corrections-unreadable",
@@ -1193,17 +314,11 @@ public struct SwiftNativeStudioStore: Sendable {
         return AmendmentsRead(amendments: amendments, unreadable: unreadable)
     }
 
-    /// Project the corrections onto the entries they name. This is what makes
-    /// "append-only on disk, corrected everywhere it is read" true at once: the
-    /// journal line is untouched, and every consumer that reads through the
-    /// store sees the amendment attached to the entry.
-    ///
-    /// An amendment naming an entry that is not in this slice is simply not
-    /// attached here — it stays on file and attaches wherever that entry is read.
+    /// Project the corrections onto the entries they name. This is what makes "append-only on disk, corrected everywhere it is read" true at once: the journal line is untouched, and every consumer that reads through the store sees the
+    /// amendment attached to the entry.  An amendment naming an entry that is not in this slice is simply not attached here — it stays on file and attaches wherever that entry is read.
     func applyAmendments(_ entries: [StudioJournalEntry]) async -> [StudioJournalEntry] {
         guard !entries.isEmpty else { return entries }
-        // A read failure is NOT "no corrections". Swallowing it here is what let
-        // a damaged amendments file serve a corrected claim as if it stood.
+        // A read failure is NOT "no corrections". Swallowing it here is what let a damaged amendments file serve a corrected claim as if it stood.
         let read: AmendmentsRead
         do { read = try await readAmendmentsReporting() }
         catch {
@@ -1218,19 +333,14 @@ public struct SwiftNativeStudioStore: Sendable {
             if let found = byEntry[entry.id], !found.isEmpty {
                 corrected.amendments = found.sorted { $0.amendedAt < $1.amendedAt }
             }
-            // A damaged file could have lost a correction for ANY entry in this
-            // slice, so every one of them carries the warning.
+            // A damaged file could have lost a correction for ANY entry in this slice, so every one of them carries the warning.
             corrected.correctionsUnreadable = read.unreadable
             return corrected
         }
     }
 
-    /// File ONE correction against an entry that already exists.
-    ///
-    /// Nothing in `journal.jsonl` is read-modify-written: the entry is read to
-    /// VALIDATE the correction (the entry exists; a superseded passage really is
-    /// in its response, exactly once), and then the amendment is appended to its
-    /// own durable log. Returns the amendment and the entry as it now reads.
+    /// File ONE correction against an entry that already exists.  Nothing in `journal.jsonl` is read-modify-written: the entry is read to VALIDATE the correction (the entry exists; a superseded passage really is in its response, exactly
+    /// once), and then the amendment is appended to its own durable log. Returns the amendment and the entry as it now reads.
     @discardableResult
     public func appendJournalAmendment(
         entryId: String,
@@ -1256,9 +366,7 @@ public struct SwiftNativeStudioStore: Sendable {
                 guard let response = entry.response, !response.isEmpty else {
                     throw StudioError.amendmentEntryHasNoResponse(id)
                 }
-                // Verbatim, and unambiguous. A passage that is not there, or is
-                // there twice, would have the correction land somewhere she did
-                // not name — silent rewriting by another route.
+                // Verbatim, and unambiguous. A passage that is not there, or is there twice, would have the correction land somewhere she did not name — silent rewriting by another route.
                 let occurrences = response.components(separatedBy: trimmed).count - 1
                 guard occurrences > 0 else { throw StudioError.amendmentPassageNotFound(trimmed) }
                 guard occurrences == 1 else { throw StudioError.amendmentPassageNotUnique(trimmed) }
@@ -1278,14 +386,13 @@ public struct SwiftNativeStudioStore: Sendable {
             at: journalAmendmentsPath.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        return try await persistence.withFileLock(journalAmendmentsPath) {
+        return try await SwiftNativePersistenceCore.withFileLock(journalAmendmentsPath) {
             let read = try await readAmendmentsReporting()
             guard !read.unreadable else {
                 throw PersistenceCoreError.ioFailure("Journal corrections are unreadable; correction was not appended.")
             }
             let existing = read.amendments.filter { $0.entryId == id }
-            // Recheck overlap under the append lock: another caller may have
-            // corrected this passage since the journal entry was read.
+            // Recheck overlap under the append lock: another caller may have corrected this passage since the journal entry was read.
             if let passage = amendment.supersedes, let response = entry.response,
                let range = response.range(of: passage) {
                 for correction in existing {
@@ -1296,22 +403,14 @@ public struct SwiftNativeStudioStore: Sendable {
                         passage: passage, existingAmendmentID: correction.id, existingPassage: taken)
                 }
             }
-            try await persistence.appendJSONLDurable(amendment.toJSON(), to: journalAmendmentsPath)
+            try await SwiftNativePersistenceCore.appendJSONLDurable(amendment.toJSON(), to: journalAmendmentsPath)
             var corrected = entry
             corrected.amendments = (existing + [amendment]).sorted { $0.amendedAt < $1.amendedAt }
             return (amendment, corrected)
         }
     }
 
-    /// 2026-09-06: the overflow shelf's entries, oldest archive first.
-    ///
-    /// Archived entries remain available to recall, encounter intake and work
-    /// history: each still answered its consult, still named its refs, still
-    /// happened. The combined reader projects corrections after deduplication.
-    ///
-    /// A shelf file this build cannot read is skipped rather than thrown: the
-    /// shelf deliberately holds bytes a future build may not decode. Skipping
-    /// is named as a hole, so the read never claims history it did not see.
+    /// Read oldest archives first, reporting unreadable or undecodable history as holes.
     private func archivedJournalEntries() async -> (entries: [StudioJournalEntry], holes: [String]) {
         let paths: [URL]
         do { paths = try journalArchivePaths() } catch {
@@ -1330,29 +429,17 @@ public struct SwiftNativeStudioStore: Sendable {
         return (out, holes)
     }
 
-    /// Every journal entry that still exists — the shelf in age order, then the
-    /// hot file. What anything asking "has this already been journaled" must
-    /// read, and therefore the store's public read: `readJournal` alone answers
-    /// only for the hot file, and a caller that uses it to decide whether
-    /// something already happened gets "no" for everything the cap archived.
-    ///
-    /// 2026-09-06: taken under the journal's own flock, across BOTH reads. The
-    /// shelf was enumerated and the hot file read outside it, so an append that
-    /// archived and trimmed in the gap could hand back a list holding the
-    /// trimmed lines in neither half — the exact entries the shelf exists to
-    /// keep readable.
+    /// All journal entries, including archives; history holes throw and correction-read warnings remain visible.
     public func journalEntriesIncludingArchive() async throws -> [StudioJournalEntry] {
         try await completeJournalHistory(for: "Journal entry lookup")
     }
 
-    /// The whole history with its holes. Anything that concludes absence
-    /// ("never answered", "no match") reads this, not the entries alone.
+    /// Read archives and the hot journal under one flock, deduplicate, then project corrections. Report holes so callers cannot infer absence from incomplete history.
     public func journalHistory() async throws -> (entries: [StudioJournalEntry], holes: [String]) {
-        try await persistence.withFileLock(journalPath) {
+        try await SwiftNativePersistenceCore.withFileLock(journalPath) {
             let archive = await self.archivedJournalEntries()
             let hot = try await self.rawJournalEntries(path: self.journalPath)
-            // A crash after archiving but before trimming leaves the same entry
-            // in both files. It is still one encounter, with one correction view.
+            // A crash after archiving but before trimming leaves the same entry in both files. It is still one encounter, with one correction view.
             var seen = Set<String>()
             let entries = await self.applyAmendments((archive.entries + hot.entries).filter { seen.insert($0.id).inserted })
             return (entries, archive.holes + hot.holes)
@@ -1371,22 +458,15 @@ public struct SwiftNativeStudioStore: Sendable {
 
     // MARK: Encounter intake
 
-    /// Every consult User left on the table that the journal never answered.
-    ///
-    /// A candidate is a consult that (1) carries real artifact refs — so there
-    /// IS a work to receive, the honest-encounter rule's whole point — and (2)
-    /// has no journal entry naming it, either by origin ref or by sharing one
-    /// of its refs. Description-only consults are excluded outright: they can
-    /// never become an encounter, so they can never become an invitation to one.
-    ///
-    /// Read-only. Nothing here opens a ref, and nothing here writes.
+    /// Every consult User left on the table that the journal never answered.  A candidate is a consult that (1) carries real artifact refs — so there IS a work to receive, the honest-encounter rule's whole point — and (2) has no journal
+    /// entry naming it, either by origin ref or by sharing one of its refs. Description-only consults are excluded outright: they can never become an encounter, so they can never become an invitation to one.  Read-only. Nothing here opens
+    /// a ref, and nothing here writes.
     public func namedEncounterIntake(limit: Int = 20,
         decide: @Sendable (JSONValue) async throws -> JSONValue) async throws -> [StudioEncounterCandidate] {
         let decision = try await decide(.object(["operation": .string("named"), "limit": .int(Int64(max(0, limit)))]))
         struct Selection: Decodable { let ids: [String] }
         let ids = try JSONDecoder().decode(Selection.self, from: decision.serializedData(pretty: false)).ids
-        // Editable selection cannot turn a description or an answered consult
-        // into an honest encounter. Recheck truth after the part returns.
+        // Editable selection cannot turn a description or an answered consult into an honest encounter. Recheck truth after the part returns.
         let history = try await completeJournalHistory(for: "Which consults were never answered")
         let answered = Set(history.compactMap { $0.origin.ref })
         let refs = Set(history.flatMap(\.artifactRefs))
@@ -1404,10 +484,8 @@ public struct SwiftNativeStudioStore: Sendable {
         }
     }
 
-    /// Neutral, corrected history facts and consult facts, paged from one
-    /// content epoch. A changed epoch refuses continuation; no mixed-history
-    /// absence claim and no retained second store. Missing is empty; corrupt
-    /// consults and incomplete archive history throw, never disappear.
+    /// Neutral, corrected history facts and consult facts, paged from one content epoch. A changed epoch refuses continuation; no mixed-history absence claim and no retained second store. Missing is empty; corrupt consults and incomplete
+    /// archive history throw, never disappear.
     public func encounterIntakePage(kind: String, offset: Int, snapshot: String?) async throws -> JSONValue {
         let history = try await completeJournalHistory(for: "Which consults were never answered")
         let consults = try await listConsults()
@@ -1438,19 +516,14 @@ public struct SwiftNativeStudioStore: Sendable {
             "next_offset": next < rows.count ? .int(Int64(next)) : .null])
     }
 
-    /// User, 2026-09-06: what the journal has answered, identified the way the
-    /// graph identifies a work — title BY SOMEONE. Filtering the graph half of
-    /// the intake on the folded title alone suppressed an unjournaled work
-    /// because a DIFFERENT work by a different creator happened to share its
-    /// title, so the encounter she had never had was never offered.
+    /// Identities answered anywhere in the complete journal history, including archives.
     public func journaledWorkIdentities() async throws -> Set<String> {
         Set(try await completeJournalHistory(for: "Which works were never journaled").map {
             Self.journaledWorkIdentity(title: $0.work.title, creator: $0.work.creator)
         })
     }
 
-    /// The one spelling of that identity, so the journal side and the graph side
-    /// cannot drift apart.
+    /// Shared creator-sensitive work identity for journal and graph intake.
     public static func journaledWorkIdentity(title: String, creator: String?) -> String {
         func fold(_ value: String) -> String {
             value.folding(
@@ -1461,23 +534,14 @@ public struct SwiftNativeStudioStore: Sendable {
             .joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        // User, 2026-09-06: length-prefixed, not delimited. A bare "|" join
-        // makes ("a|b", "") and ("a", "b|") the same identity, so one work
-        // suppresses another's encounter — the exact wrong-identity failure
-        // this key exists to prevent. Ephemeral comparison key, computed the
-        // same way on both sides, so nothing stored has to migrate.
+        // Length-prefix both folded components to prevent delimiter collisions; this key is not persisted.
         let foldedTitle = fold(title)
         let foldedCreator = fold(creator ?? "")
         return "\(foldedTitle.count)|\(foldedTitle)|\(foldedCreator.count)|\(foldedCreator)"
     }
 
-    /// Read-only search. Returns matching entries VERBATIM, newest first, capped
-    /// by `query.limit`, with an explicit `hasMore`. No scoring, no ranking, and
-    /// nothing calls this on the agent's behalf.
+    /// Read-only search. Returns matching entries VERBATIM, newest first, capped by `query.limit`, with an explicit `hasMore`. No scoring, no ranking, and nothing calls this on the agent's behalf.
     public func recall(_ query: StudioRecallQuery) async throws -> StudioRecallResult {
-        // 2026-09-06: the shelf is read too. `query.limit` still bounds what
-        // comes back, and the hot entries are newer so they still come first —
-        // an entry that overflowed simply stops being unfindable.
         let (entries, holes) = try await journalHistory()
         let matches = entries.reversed().filter { Self.matches($0, query) }
         let bounded = Array(matches.prefix(query.limit))
@@ -1515,16 +579,14 @@ public struct SwiftNativeStudioStore: Sendable {
             guard entry.relations.contains(where: { $0.entryId == relatedTo }) else { return false }
         }
         if let text = query.text, !text.isEmpty {
-            // Free text reads the whole entry, response included — the response
-            // is the point, so it must be searchable in its own words.
+            // Free text reads the whole entry, response included — the response is the point, so it must be searchable in its own words.
             let haystack = [
                 entry.id, entry.work.title, entry.work.creator ?? "", entry.work.medium ?? "",
                 entry.response ?? "", entry.stance.reason ?? "",
                 entry.reception.how ?? "", entry.reception.wholeOrPart ?? "",
                 entry.tags.joined(separator: " "),
                 entry.artifactRefs.joined(separator: " "),
-                // Corrections are part of what the entry now says, so they are
-                // searchable in their own words too.
+                // Corrections are part of what the entry now says, so they are searchable in their own words too.
                 entry.amendments.map { "\($0.reason) \($0.correction)" }.joined(separator: " "),
             ].joined(separator: " ")
             guard fold(haystack).contains(fold(text)) else { return false }

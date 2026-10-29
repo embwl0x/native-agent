@@ -1,11 +1,11 @@
 import Foundation
 import TrustCenter
+import Connectors
 // Blueprint: | `ConnectorRecord.swift` | `ConnectorRecord`, `ConnectorActionRecord` and descriptor readiness projection |
 
 public struct ConnectorRecord: Identifiable, Codable, Hashable, Sendable {
     public var id: String
-    // FIX: non-identifying fields defaulted so one omitted key doesn't drop the
-    // whole connector record (getConnectors is also lossy now). Only id required.
+    // Only identity is required; missing presentation fields keep their defaults.
     public var name: String = ""
     public var kind: String = ""
     public var description: String = ""
@@ -24,9 +24,13 @@ public struct ConnectorRecord: Identifiable, Codable, Hashable, Sendable {
     public var runtimeDetail: String?
     public var runtimeUpdatedAt: String?
 
-    // FIX-2026-05-28: synthesized Decodable throws keyNotFound on a missing
-    // non-optional key even with a Swift default, so the defaults above were
-    // dead for decoding. Use decodeIfPresent ?? default; keep id required.
+    public var canToggle: Bool {
+        let id = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return id != "browser" && id != "telegram"
+            && (id == "local_files" || ConnectorWizardSetupRoute.resolve(provider: id) != .unavailable)
+    }
+
+    // Only id is required; missing fields decode to their defaults.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.id = try c.decode(String.self, forKey: .id)
@@ -65,14 +69,14 @@ extension ConnectorActionRecord {
     public static func records(connectors: [ConnectorRecord]) -> [ConnectorActionRecord] {
         var byID: [String: ConnectorRecord] = [:]
         for connector in connectors {
-            byID[ConnectorStatusProjection.normalizedConnectorID(connector.id)] = connector
+            byID[ConnectorReadiness.normalizedConnectorID(connector.id)] = connector
         }
         let nativeConnectors: Set<String> = [
             "mobile", "scheduler", "mac", "mac_assistant",
             "local_files", "codex_work", "codex_handoff",
         ]
         return connectorActionDescriptors().map { descriptor in
-            let key = ConnectorStatusProjection.normalizedConnectorID(descriptor.connectorId)
+            let key = ConnectorReadiness.normalizedConnectorID(descriptor.connectorId)
             let connector = byID[key]
             let enabled = connector?.enabled ?? nativeConnectors.contains(key)
             let connectorStatus = connector?.healthStatus ?? (enabled ? "active" : "needs_setup")

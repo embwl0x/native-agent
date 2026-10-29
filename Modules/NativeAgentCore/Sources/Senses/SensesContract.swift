@@ -5,13 +5,9 @@ import CryptoKit
 import Darwin
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `SensesContract.swift` | sense records/contracts and SenseWire page/news/view validators and notebook byte bounds shared at both process boundaries, SensesHub registry projection and exact view-event admission, native catalog, memory provenance and durable unread news |
+// Blueprint: | `SensesContract.swift` | Shared sense records, wire validators, notebook bounds, native catalog, memory provenance and crossing contracts; built-in origins retain legacy spelling and provenance age formatting rejects invalid times |
 
-// The Native World (User, 2026-10-05; design: docs/SENSES.md). NativeAgent makes
-// the whole world native to its agent: every app, file kind, site and stream
-// reaches her in ONE form — a page, named things, an address for everything,
-// news when it changes. This file is the shared contract every
-// part builds against; behaviour lives in the owners named in docs/SENSES.md.
+// Shared sense contract: pages, named things, addresses and change news; behavior owners are in docs/SENSES.md.
 
 // MARK: - Corners
 
@@ -178,7 +174,18 @@ public enum SenseLanguage: String, Codable, Sendable { case javascript, swift, n
 /// follow or maintain its corner, supervised and restarted from its state.
 public enum SenseMode: String, Codable, Sendable { case onCall = "on_call", live }
 
-public enum SenseOrigin: String, Codable, Sendable { case builtIn = "built_in", grown, shared }
+public enum SenseOrigin: String, Codable, Sendable {
+    case builtIn = "built in", grown, shared
+
+    public init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        if value == "built_in" { self = .builtIn; return }
+        guard let origin = Self(rawValue: value) else {
+            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Unknown sense origin: \(value)"))
+        }
+        self = origin
+    }
+}
 
 /// What a sense may reach, enforced by its sandbox profile. Secrets,
 /// credentials, Trust, approvals and persona are never
@@ -215,7 +222,8 @@ public struct SenseRecord: Codable, Sendable, Hashable {
     public var disabledBy: String?
     /// The verbs it offers on its things, for door discovery.
     public var verbs: [String]
-    public var createdAt: Date
+    /// Built-in senses ship with the app; they have no invented birth date.
+    public var createdAt: Date?
     public var enabledAt: Date?
     public var lastUsedAt: Date?
     public var uses: Int
@@ -232,13 +240,71 @@ public struct SenseRecord: Codable, Sendable, Hashable {
     public init(id: String, corner: SenseCorner, version: Int = 1, status: SenseStatus = .on,
                 language: SenseLanguage, mode: SenseMode = .onCall, origin: SenseOrigin,
                 reach: SenseReach = SenseReach(), entry: String?, verbs: [String] = [],
-                createdAt: Date, enabledAt: Date? = nil, lastUsedAt: Date? = nil, uses: Int = 0, corrections: Int = 0,
+                createdAt: Date? = nil, enabledAt: Date? = nil, lastUsedAt: Date? = nil, uses: Int = 0, corrections: Int = 0,
                 growthCostUSD: Double? = nil) {
         self.id = id; self.corner = corner; self.version = version; self.status = status
         self.language = language; self.mode = mode; self.origin = origin; self.reach = reach
-        self.entry = entry; self.verbs = verbs; self.createdAt = createdAt; self.enabledAt = enabledAt
+        self.entry = entry; self.verbs = verbs; self.createdAt = origin == .builtIn ? nil : createdAt; self.enabledAt = enabledAt
         self.lastUsedAt = lastUsedAt; self.uses = uses; self.corrections = corrections
         self.growthCostUSD = growthCostUSD
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, corner, version, status, unavailableReason, language, mode, origin, reach, entry
+        case candidateDigest, disabledBy, verbs, createdAt, enabledAt, lastUsedAt, uses, corrections, growthCostUSD, grownBecause
+    }
+
+    public init(from decoder: Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        id = try fields.decode(String.self, forKey: .id)
+        corner = try fields.decode(SenseCorner.self, forKey: .corner)
+        version = try fields.decode(Int.self, forKey: .version)
+        status = try fields.decode(SenseStatus.self, forKey: .status)
+        unavailableReason = try fields.decodeIfPresent(String.self, forKey: .unavailableReason)
+        language = try fields.decode(SenseLanguage.self, forKey: .language)
+        mode = try fields.decode(SenseMode.self, forKey: .mode)
+        origin = try fields.decode(SenseOrigin.self, forKey: .origin)
+        reach = try fields.decode(SenseReach.self, forKey: .reach)
+        entry = try fields.decodeIfPresent(String.self, forKey: .entry)
+        candidateDigest = try fields.decodeIfPresent(String.self, forKey: .candidateDigest)
+        disabledBy = try fields.decodeIfPresent(String.self, forKey: .disabledBy)
+        verbs = try fields.decode([String].self, forKey: .verbs)
+        let created = try fields.decodeIfPresent(Date.self, forKey: .createdAt)
+        createdAt = origin == .builtIn ? nil : created
+        enabledAt = try fields.decodeIfPresent(Date.self, forKey: .enabledAt)
+        // Older bundles used Unix zero as both dates. It was never an event.
+        if origin == .builtIn, enabledAt == Date(timeIntervalSince1970: 0) { enabledAt = nil }
+        lastUsedAt = try fields.decodeIfPresent(Date.self, forKey: .lastUsedAt)
+        uses = try fields.decode(Int.self, forKey: .uses)
+        corrections = try fields.decode(Int.self, forKey: .corrections)
+        growthCostUSD = try fields.decodeIfPresent(Double.self, forKey: .growthCostUSD)
+        grownBecause = try fields.decodeIfPresent(String.self, forKey: .grownBecause)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var fields = encoder.container(keyedBy: CodingKeys.self)
+        try fields.encode(id, forKey: .id)
+        try fields.encode(corner, forKey: .corner)
+        try fields.encode(version, forKey: .version)
+        try fields.encode(status, forKey: .status)
+        try fields.encodeIfPresent(unavailableReason, forKey: .unavailableReason)
+        try fields.encode(language, forKey: .language)
+        try fields.encode(mode, forKey: .mode)
+        try fields.encode(origin, forKey: .origin)
+        try fields.encode(reach, forKey: .reach)
+        try fields.encodeIfPresent(entry, forKey: .entry)
+        try fields.encodeIfPresent(candidateDigest, forKey: .candidateDigest)
+        try fields.encodeIfPresent(disabledBy, forKey: .disabledBy)
+        try fields.encode(verbs, forKey: .verbs)
+        if origin != .builtIn { try fields.encodeIfPresent(createdAt, forKey: .createdAt) }
+        if origin != .builtIn || enabledAt != Date(timeIntervalSince1970: 0) {
+            try fields.encodeIfPresent(enabledAt, forKey: .enabledAt)
+        }
+        try fields.encodeIfPresent(lastUsedAt, forKey: .lastUsedAt)
+        try fields.encode(uses, forKey: .uses)
+        try fields.encode(corrections, forKey: .corrections)
+        try fields.encodeIfPresent(growthCostUSD, forKey: .growthCostUSD)
+        try fields.encodeIfPresent(grownBecause, forKey: .grownBecause)
     }
 }
 
@@ -246,7 +312,7 @@ public struct SenseRecord: Codable, Sendable, Hashable {
 public struct SenseProvenance: Codable, Sendable, Hashable {
     public var senseID: String
     public var version: Int
-    public var grownAt: Date
+    public var grownAt: Date?
     public var uses: Int
     public var corrections: Int
     /// Optional for previously persisted provenance; current reads always stamp it.
@@ -260,9 +326,17 @@ public struct SenseProvenance: Codable, Sendable, Hashable {
 
     /// e.g. "via sense numbers-file v3 · grown 2h ago · used 41× · corrected 1×"
     public func line(now: Date) -> String {
-        let age = Int(max(0, now.timeIntervalSince(grownAt)))
-        let ago: String = age < 3600 ? "\(max(1, age / 60))m" : age < 86_400 ? "\(age / 3600)h" : "\(age / 86_400)d"
-        let source = origin == .builtIn ? "built in" : "grown \(ago) ago"
+        // Imported provenance may predate registry validation. Invalid dates
+        // remain visible evidence rather than trapping or becoming a fresh age.
+        let seconds = grownAt.map { now.timeIntervalSince($0) } ?? .nan
+        let whole = seconds.isFinite ? Int(exactly: seconds.rounded(.towardZero)) : nil
+        let ago = whole.map { value in
+            let age = max(0, value)
+            return age < 3600 ? "\(max(1, age / 60))m" : age < 86_400 ? "\(age / 3600)h" : "\(age / 86_400)d"
+        }
+        let validDate = grownAt.map { $0 >= .distantPast && $0 <= .distantFuture } ?? true
+        let source = origin == .builtIn ? "built in" : validDate
+            ? ago.map { "grown \($0) ago" } ?? "creation time unavailable" : "invalid creation time"
         let line = "via sense \(senseID) v\(version) · \(source) · used \(uses)× · corrected \(corrections)×"
         OwnedProgramRunner.ReadContent.current?.record(.string(line),
             content: .string("via sense \(senseID) v\(version) · \(origin?.rawValue ?? "")"))
@@ -280,6 +354,8 @@ public enum SenseRequest: Sendable, Equatable {
     case act(verb: String, address: String, args: JSONValue)
     /// Start following the corner (live senses only).
     case watch
+    /// Handle an interactive view or part wake without authorizing door actions.
+    case event(JSONValue)
 }
 
 /// Bound only while the door answers her act, never for reads or background work.
@@ -299,6 +375,25 @@ public struct SenseFailure: Codable, Sendable, Hashable, Error {
     public var provenance: SenseProvenance?
     public var remedy: JSONValue?
 
+    public var status: String { code == "cancelled" ? "cancelled" : ["timeout", "fetch_timeout"].contains(code) ? "timeout" : "failed" }
+
+    public func failureEvidence(render: (String) -> String = { $0 }) -> [String: JSONValue] {
+        var fields: [String: JSONValue] = ["status": .string(status), "failure_code": .string(code),
+            "reason": .string(code), "detail": .string(render(message))]
+        fields["remedy"] = remedy
+        if let inputExcerpt { fields["input_excerpt"] = .string(render(inputExcerpt)) }
+        if let provenance {
+            var value: [String: JSONValue] = ["senseID": .string(provenance.senseID), "version": .int(Int64(provenance.version)),
+                "uses": .int(Int64(provenance.uses)), "corrections": .int(Int64(provenance.corrections))]
+            if provenance.origin != .builtIn, let grownAt = provenance.grownAt {
+                value["grownAt"] = .double(grownAt.timeIntervalSinceReferenceDate)
+            }
+            if let origin = provenance.origin { value["origin"] = .string(origin.rawValue) }
+            fields["provenance"] = .object(value)
+        }
+        return fields
+    }
+
     public init(code: String, message: String, inputExcerpt: String? = nil, provenance: SenseProvenance? = nil, remedy: JSONValue? = nil) {
         self.code = code; self.message = message; self.inputExcerpt = inputExcerpt
         self.provenance = provenance
@@ -310,15 +405,7 @@ public struct SenseFailure: Codable, Sendable, Hashable, Error {
         let failure = error as? ToolFailureError
         self.init(code: code, message: error.localizedDescription)
         guard let failure else { return }
-        let call = failure.nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) }
-        if let owner = failure.owner {
-            remedy = if failure.personDecides, let tap = failure.tap {
-                Repair.why(owner: owner, tap: tap)
-            } else { Repair.remedy(owner: owner, nextCall: call, tap: failure.tap) }
-        } else if let call {
-            remedy = .object(["kind": .string(failure.argumentPath == nil ? "inspect" : "correct_arguments"),
-                              "instruction": .string(failure.message), "next_call": call])
-        }
+        remedy = failure.remedy()
     }
 
     public func hash(into hasher: inout Hasher) {
@@ -391,9 +478,22 @@ public struct SenseEntryProgress: Sendable {
     }
 }
 
-/// Runs JavaScript senses in the shared helper; fixed native adapters stay in-process.
-public protocol SenseRunner: Sendable {
-    func run(_ record: SenseRecord, request: SenseRequest, source: SenseSourceProvider) async -> SenseOutcome
+/// A subscription actually held by a source or helper, independent of the
+/// sense's declared on-call/live mode. It ends with that owner's subscription.
+public struct SenseLiveWatch: Sendable, Hashable {
+    public let address: String
+    public let senseID: String
+    public let version: Int
+    public let corner: SenseCorner
+
+    public init(address: String, senseID: String, version: Int, corner: SenseCorner) {
+        self.address = ContextSecretContentPolicy.redactedFragment(address)
+        self.senseID = senseID; self.version = version; self.corner = corner
+    }
+}
+
+public protocol SenseWatchReporting: Sendable {
+    func liveWatches() async -> [SenseLiveWatch]
 }
 
 /// An offline interactive view. HTML is handed over as bytes, never a file
@@ -411,36 +511,6 @@ public struct SenseInteractiveView: Codable, Sendable, Hashable {
     public init(senseID: String, version: Int, title: String, html: String) {
         self.senseID = senseID; self.version = version; self.title = title; self.html = html
     }
-}
-
-/// Optional runner capability. View events may update the sense's view or
-/// notebook; they are not SenseRequest.act and must never execute door actions.
-public protocol SenseViewEventReceiver: Sendable {
-    func receiveViewEvent(_ event: JSONValue, for record: SenseRecord,
-                          source: SenseSourceProvider) async throws
-}
-
-/// The registry: one lookup the door consults first.
-public protocol SenseRegistry: Sendable {
-    func sense(for corner: SenseCorner) async throws -> SenseRecord?
-    func all() async throws -> [SenseRecord]
-    func upsert(_ record: SenseRecord) async throws
-    func recordUse(senseID: String, version: Int) async throws
-}
-
-/// Optional management surface for lifecycle, versioned code and portable sharing.
-/// Consumers reach this through the registry installed in SensesHub.
-public protocol SenseRegistryManaging: SenseRegistry {
-    func allChecked() async throws -> [SenseRecord]
-    func upsert(_ record: SenseRecord, codeFiles: [String: Data]) async throws -> SenseRecord
-    func versions(id: String) async throws -> [SenseRecord]
-    func rollback(id: String, version: Int, preview: Bool) async throws -> SenseRecord
-    func drop(id: String, version: Int, preview: Bool, ownerAuthorized: Bool) async throws -> SenseRecord
-    func setStatus(id: String, version: Int, status: SenseStatus, preview: Bool, ownerAuthorized: Bool) async throws -> SenseRecord
-    /// Only the same selected helper lifetime may change availability.
-    /// True only when the selected lifetime accepted the availability report.
-    func markUnavailable(id: String, selection: String, reason: String) async throws -> Bool
-    func exportBundle(id: String, to destination: URL, userApproved: Bool) async throws -> SenseExportResult
 }
 
 public enum SenseExportResult: Sendable, Equatable {
@@ -517,361 +587,26 @@ public protocol SenseMemoryProvenanceSink: Sendable {
     func markVersionWrong(senseID: String, version: Int) async throws
 }
 
-// MARK: - The hub
-
-/// Process-wide wiring, set once at launch by the app, so Core call sites
-/// (the door and the readers) reach the senses without
-/// depending on the app. Every member is optional: nil = senses not wired.
-public final class SensesHub: @unchecked Sendable {
-    public static let shared = SensesHub()
-    private let lock = NSLock()
-    private var _registry: SenseRegistry?
-    private var _runner: SenseRunner?
-    private var _source: SenseSourceProvider?
-    private var _memoryProvenanceSink: (any SenseMemoryProvenanceSink)?
-
-    public func installMemoryProvenanceSink(_ sink: any SenseMemoryProvenanceSink) {
-        lock.lock(); defer { lock.unlock() }
-        _memoryProvenanceSink = sink
-    }
-
-    /// Call after a page is actually served in her turn, before returning it.
-    public func didServe(_ provenance: SenseProvenance) {
-        SenseTurnReads.current?.record(provenance)
-    }
-
-    /// Call for viewWrong and for the version being withdrawn on rollback.
-    public func markVersionWrong(senseID: String, version: Int) async throws {
-        let sink = memoryProvenanceSink
-        guard let sink else {
-            throw SenseFailure(code: "memory_unavailable", message: "Cannot flag memories: sense memory provenance is not wired.")
-        }
-        try await sink.markVersionWrong(senseID: senseID, version: version)
-    }
-
-    private var memoryProvenanceSink: (any SenseMemoryProvenanceSink)? {
-        lock.lock(); defer { lock.unlock() }; return _memoryProvenanceSink
-    }
-
-    public func install(registry: SenseRegistry?, runner: SenseRunner?, source: SenseSourceProvider?) {
-        lock.lock(); defer { lock.unlock() }
-        _registry = registry; _runner = runner; _source = source
-    }
-
-    public var registry: SenseRegistry? { lock.lock(); defer { lock.unlock() }; return _registry }
-    public var runner: SenseRunner? { lock.lock(); defer { lock.unlock() }; return _runner }
-    public var source: SenseSourceProvider? { lock.lock(); defer { lock.unlock() }; return _source }
-
-    @MainActor
-    public func presentationRecords() async throws -> ([SenseRecord], [SenseCorner: String]) {
-        let records: [SenseRecord]
-        if let registry = registry as? any SenseRegistryManaging { records = try await registry.allChecked() }
-        else { records = try await registry?.all() ?? [] }
-        return await Task.detached(priority: .utility) {
-            (records.sorted { $0.corner.key < $1.corner.key },
-             Dictionary(uniqueKeysWithValues: Set(records.map(\.corner)).map { ($0, $0.surfaceName) }))
-        }.value
-    }
-
-    @MainActor
-    public func receiveViewEvent(_ event: JSONValue, presentation: SenseInteractiveView) async -> String? {
-        guard let registry, let source, let receiver = runner as? any SenseViewEventReceiver else {
-            return "This sense cannot receive view events yet."
-        }
-        do {
-            guard let record = try await registry.all().first(where: {
-                $0.id == presentation.senseID && $0.version == presentation.version && $0.status == .on
-            }), !Task.isCancelled else {
-                return "This sense is off or its view has changed."
-            }
-            try await Self.$passiveObservation.withValue(false) {
-                try await receiver.receiveViewEvent(event, for: record, source: source)
-            }
-            return nil
-        } catch {
-            return "This sense could not handle the event: \(error.localizedDescription)"
-        }
-    }
-
-    /// Watch entries, source callbacks, restarts and unattended part wakes are
-    /// observations, independently of the turn that started the live sense.
-    /// On-call admission retains this origin so retirement stops unattended
-    /// work while an accepted human interaction settles with its caller.
-    @TaskLocal public static var passiveObservation = false
-
+/// What crosses from a watch into her mind (docs/SUBCONSCIOUS.md, Cares): a
+/// line weighed on CPU against her live cares. Her cognition installs it.
+public protocol SenseCrossing: Sendable {
+    /// When `line` touches a care, asks for one wake on the watch's thread
+    /// whose arrival `id` says `says`, and whose reason names the care.
+    func cross(_ line: String, watch: String, reason: String, id: String, says: String, agent: String?) async -> SenseCrossed
 }
 
-// MARK: - Native senses and news
-
-/// A built-in sense implemented in Swift, in-process (`SenseLanguage.native`):
-/// our existing corners wrapped unchanged on day one. The runner calls it
-/// instead of the helper.
-public protocol NativeSense: Sendable {
-    var id: String { get }
-    var corner: SenseCorner { get }
-    func run(_ request: SenseRequest, source: SenseSourceProvider) async -> SenseOutcome
+/// What a watch's line touched (a care, by its about) and what came of it.
+public enum SenseCrossed: Sendable, Equatable {
+    case woke(care: String)
+    case untouched
+    /// Nothing could judge it (no inner life, no cares, a cold embedder): the
+    /// line crosses as it would with no crossing at all.
+    case unweighed
+    /// This watch already woke her about it and the care has not rested since.
+    case resting(care: String)
+    /// The wake could not be kept.
+    case notKept(care: String)
 }
-
-/// Built-in senses by id, registered at launch.
-public final class NativeSenseCatalog: @unchecked Sendable {
-    public static let shared = NativeSenseCatalog()
-    private let lock = NSLock()
-    private var senses: [String: NativeSense] = [:]
-
-    public func register(_ sense: NativeSense) {
-        lock.lock(); defer { lock.unlock() }
-        senses[sense.id] = sense
-    }
-
-    public func sense(id: String) -> NativeSense? {
-        lock.lock(); defer { lock.unlock() }
-        return senses[id]
-    }
-
-    public var all: [NativeSense] {
-        lock.lock(); defer { lock.unlock() }
-        return Array(senses.values)
-    }
-}
-
-/// The latest news from live senses. The runner posts; her context and the
-/// surfaces read. Bounded: older news falls off.
-public actor SenseNewsBoard {
-    public static let shared = SenseNewsBoard()
-    public static let capacity = 200
-    /// News retention, not a reader/execution deadline. No timer or polling.
-    public static let maximumAge: TimeInterval = 60 * 60
-    private var items: [SenseNews] = []
-    private var recent: [SenseNews] = []
-    private struct History: Codable {
-        var count: Int
-        var deltas: [String]
-    }
-    private struct Saved: Codable {
-        var schema = 1
-        var items: [SenseNews]
-        // Includes acknowledged notices: delivery must not renew their unread
-        // status when a restored watcher sends the same source change again.
-        var recent: [SenseNews]
-        var histories: [UUID: History]
-    }
-    private static let maximumStorageBytes = 8 * 1_024 * 1_024
-    private static let maximumSummaryBytes = 2_048
-    private static let maximumUpdateBytes = 240
-    private var histories: [UUID: History] = [:]
-    private var view: SenseInteractiveView?
-    private var storageURL: URL?
-    private var storageBlocked = false
-    private var storageNotice: SenseNews?
-    public private(set) var storageFailure: String?
-
-    /// Bind before live readers start. Only a missing file means an empty
-    /// board; damaged bytes are preserved and the failure remains visible.
-    public func configure(dataRoot: URL) {
-        guard storageURL == nil else { return }
-        let directory = dataRoot.appendingPathComponent("senses/news", isDirectory: true)
-        storageURL = directory.appendingPathComponent("unread.json")
-        do {
-            let fm = FileManager.default
-            for folder in [directory.deletingLastPathComponent(), directory] {
-                var info = stat()
-                if lstat(folder.path, &info) == 0 {
-                    guard info.st_mode & S_IFMT == S_IFDIR else {
-                        throw storageError("Private news folder is not a directory.")
-                    }
-                } else {
-                    guard errno == ENOENT else { throw storageError("Private news folder is unreadable.") }
-                    try fm.createDirectory(at: folder, withIntermediateDirectories: true,
-                        attributes: [.posixPermissions: 0o700])
-                }
-            }
-            try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
-            var excluded = directory
-            var values = URLResourceValues()
-            values.isExcludedFromBackup = true
-            try excluded.setResourceValues(values)
-            let url = storageURL!
-            var info = stat()
-            if lstat(url.path, &info) == 0 {
-                guard info.st_mode & S_IFMT == S_IFREG,
-                      info.st_size >= 0, info.st_size <= Self.maximumStorageBytes else {
-                    throw storageError("Private news store must be a bounded regular file.")
-                }
-                let saved = try JSONDecoder().decode(Saved.self, from: Data(contentsOf: url))
-                guard saved.schema == 1, saved.items.count <= Self.capacity,
-                      saved.recent.count <= Self.capacity, saved.histories.count <= Self.capacity,
-                      Set(saved.items.map(\.id)).count == saved.items.count,
-                      saved.histories.values.allSatisfy({ $0.count >= $0.deltas.count && $0.deltas.count <= 3 }) else {
-                    throw storageError("Private news store has invalid bounds or schema.")
-                }
-                try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-                // Installation owns the binding before watches start. Preserve
-                // any startup notice already buffered by a source owner.
-                let buffered = items
-                items = saved.items
-                recent = saved.recent
-                histories = saved.histories
-                for item in buffered where !items.contains(where: { $0.id == item.id }) {
-                    items.append(item)
-                    recent.append(item)
-                }
-                items = Array(items.suffix(Self.capacity))
-                recent = Array(recent.suffix(Self.capacity))
-            } else if errno != ENOENT {
-                throw storageError("Private news store is unreadable.")
-            }
-            prune(save: false)
-            try persist()
-        } catch {
-            storageBlocked = true
-            fail(error)
-        }
-    }
-
-    public func present(_ view: SenseInteractiveView?) {
-        self.view = view
-    }
-    public func interactiveView() -> SenseInteractiveView? { view }
-
-    public func post(_ news: SenseNews) async {
-        guard !Task.isCancelled else { return }
-        postCurrent(news)
-        await DerivedStateInvalidationCenter.shared.publish(DerivedSourceChange(
-            namespace: "sense-news", stableID: news.senseID, operation: .changed,
-            reason: "sense_news_posted", occurredAt: news.at))
-    }
-
-    private func postCurrent(_ news: SenseNews) {
-        // Sanitize every visible field before history prefixes or clipping.
-        // Source-owned observation/change identities remain exact and private.
-        var news = news
-        // Exact source identities are private hashes, not clipped addresses or
-        // summaries. This keeps both deduplication and storage bounded.
-        news.observationID = Self.identity(news.observationID ?? news.address)
-        news.changeID = Self.identity(news.changeID ?? news.summary)
-        news.senseID = ContextSecretContentPolicy.redactedFragment(news.senseID)
-        news.address = ContextSecretContentPolicy.redactedFragment(news.address)
-        news.summary = Self.bounded(ContextSecretContentPolicy.redactedFragment(news.summary), bytes: Self.maximumSummaryBytes)
-        prune()
-        guard news.at >= Date().addingTimeInterval(-Self.maximumAge) else { return }
-        let sameCorner: (SenseNews) -> Bool = {
-            $0.senseID == news.senseID && $0.version == news.version
-                && ($0.observationID ?? $0.address) == (news.observationID ?? news.address)
-        }
-        // Repeated notices do not renew an old notice's age or unread status.
-        guard !recent.contains(where: { sameCorner($0) && ($0.changeID ?? $0.summary) == (news.changeID ?? news.summary) }) else { return }
-        recent.removeAll(where: sameCorner)
-        recent.append(news)
-        if recent.count > Self.capacity { recent.removeFirst(recent.count - Self.capacity) }
-        var combined = news
-        if let previous = items.first(where: sameCorner) {
-            let history = histories.removeValue(forKey: previous.id) ?? History(count: 1, deltas: [Self.updateLine(previous.summary)])
-            let deltas = Array(([Self.updateLine(news.summary)] + history.deltas).prefix(3))
-            let count = history.count + 1
-            histories[news.id] = History(count: count, deltas: deltas)
-            let omitted = count - deltas.count
-            combined.summary = "\(count) updates (newest first):\n" + deltas.map { "• " + $0 }.joined(separator: "\n")
-                + (omitted > 0 ? "\n\(omitted) older updates omitted." : "")
-        }
-        combined.summary = ContextSecretContentPolicy.redactedFragment(combined.summary)
-        // Keep the latest notice per corner; individual DOM/file edges cannot
-        // occupy the board or starve another corner.
-        items.removeAll(where: sameCorner)
-        items.append(combined)
-        if items.count > Self.capacity { items.removeFirst(items.count - Self.capacity) }
-        retainHistories()
-        saveVisible()
-    }
-
-    public func latest(limit: Int = 20) -> [SenseNews] {
-        prune()
-        let ordered = items.sorted { $0.at > $1.at }
-        return Array(((storageNotice.map { [$0] } ?? []) + ordered).prefix(max(0, limit)))
-    }
-
-    /// Acknowledge immutable notices only after provider output proves the
-    /// packet was served. A newer event at the same address survives this ack.
-    public func acknowledge(_ ids: Set<UUID>) async {
-        let previousItems = items
-        let previousHistories = histories
-        items.removeAll { ids.contains($0.id) }
-        retainHistories()
-        // Publish removal only after its durable receipt. Failed delivery
-        // bookkeeping is shown explicitly instead of promising restart safety.
-        do { try persist() } catch {
-            items = previousItems
-            histories = previousHistories
-            fail(error)
-        }
-        await DerivedStateInvalidationCenter.shared.publish(DerivedSourceChange(
-            namespace: "sense-news", stableID: "served", operation: .changed,
-            reason: "sense_news_seen", occurredAt: Date()))
-    }
-
-    private func prune(save: Bool = true) {
-        let previousCount = items.count + recent.count
-        let cutoff = Date().addingTimeInterval(-Self.maximumAge)
-        items.removeAll { $0.at < cutoff }
-        recent.removeAll { $0.at < cutoff }
-        retainHistories()
-        if save, previousCount != items.count + recent.count { saveVisible() }
-    }
-
-    private func retainHistories() {
-        let ids = Set(items.map(\.id))
-        histories = histories.filter { ids.contains($0.key) }
-    }
-
-    private static func identity(_ text: String) -> String {
-        SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined()
-    }
-
-    private static func bounded(_ text: String, bytes: Int) -> String {
-        guard text.utf8.count > bytes else { return text }
-        var result = ""
-        var used = 0
-        for character in text {
-            let size = String(character).utf8.count
-            guard used + size <= bytes - "…".utf8.count else { break }
-            result.append(character)
-            used += size
-        }
-        return result + "…"
-    }
-
-    private static func updateLine(_ text: String) -> String {
-        bounded(text.split(whereSeparator: \.isNewline).joined(separator: " · "), bytes: maximumUpdateBytes)
-    }
-
-    private func persist() throws {
-        guard let storageURL else { return }
-        guard !storageBlocked else { throw storageError(storageFailure ?? "Private news storage is unavailable.") }
-        let bytes = try JSONEncoder().encode(Saved(items: items, recent: recent, histories: histories))
-        guard bytes.count <= Self.maximumStorageBytes else { throw storageError("Private news storage exceeded its byte bound.") }
-        guard NativePrivateFile.write(bytes, to: storageURL) else { throw storageError("Cannot durably write private unread news.") }
-        storageFailure = nil
-        storageNotice = nil
-    }
-
-    private func saveVisible() {
-        do { try persist() } catch { fail(error) }
-    }
-
-    private func storageError(_ message: String) -> NSError {
-        NSError(domain: "SenseNewsBoard", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
-    }
-
-    private func fail(_ error: Error) {
-        let message = ContextSecretContentPolicy.redactedFragment(error.localizedDescription)
-        if storageFailure != message {
-            FileHandle.standardError.write(Data("SenseNewsBoard: \(message)\n".utf8))
-        }
-        storageFailure = message
-        storageNotice = SenseNews(senseID: "sense-news", version: 1, address: "senses:news",
-            summary: "Unread news persistence unavailable: \(message) Pending news may be lost after restart. raw view · private news storage is unavailable.", at: Date())
-    }
-}
-
 
 /// Errors surface their own words wherever they are shown, never
 /// "SenseFailure error 1".
@@ -883,13 +618,22 @@ extension SenseCorner {
     public var surfaceName: String {
         switch self {
         case .app(let id):
+            if id == "*" { return "Mac apps" }
             if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) {
                 return url.deletingPathExtension().lastPathComponent
             }
             return id
-        case .fileKind(let kind): return ".\(kind) files"
-        case .site(let host): return host
-        case .stream(let id), .need(let id): return id
+        case .fileKind(let kind): return kind == "*" ? "Files" : ".\(kind) files"
+        case .site(let host): return host == "*" ? "Chrome sites" : host
+        case .stream(let id):
+            switch id {
+            case "web": return "Web pages (read_page / web.read)"
+            case "browser": return "Visible browser pages"
+            case "mac.read": return "Mac documents"
+            case "connectors": return "Connected services"
+            default: return id
+            }
+        case .need(let id): return id
         }
     }
 }

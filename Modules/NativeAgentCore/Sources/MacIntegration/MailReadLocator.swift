@@ -14,12 +14,11 @@ public struct MailReadLocator {
     public static let fields: Set<String> = ["message_id", "expected_message_id", "expected_account", "expected_account_id", "position", "scope"]
 
     public static func parse(_ input: [String: JSONValue], allowMissingMessageID: Bool = false) -> Self? {
-        let text = MacAppleScriptBridge.inputString
-        guard let id = text(input["message_id"]).flatMap({ Int64($0.trimmingCharacters(in: .whitespaces)) }), id > 0,
-              let messageID = text(input["expected_message_id"]), messageID.count < 4096 else { return nil }
-        let account = text(input["expected_account"]).flatMap { $0.isEmpty || $0.count > 512 ? nil : $0 }
-        let accountID = text(input["expected_account_id"]).flatMap { $0.isEmpty || $0.count > 512 ? nil : $0 }
-        let position = text(input["position"]).flatMap { Int($0.trimmingCharacters(in: .whitespaces)) }.flatMap { $0 > 0 && $0 < 10_000_000 ? $0 : nil }
+        guard let id = input["message_id"]?.scalarText.flatMap({ Int64($0.trimmingCharacters(in: .whitespaces)) }), id > 0,
+              let messageID = input["expected_message_id"]?.scalarText, messageID.count < 4096 else { return nil }
+        let account = input["expected_account"]?.scalarText.flatMap { $0.isEmpty || $0.count > 512 ? nil : $0 }
+        let accountID = input["expected_account_id"]?.scalarText.flatMap { $0.isEmpty || $0.count > 512 ? nil : $0 }
+        let position = input["position"]?.scalarText.flatMap { Int($0.trimmingCharacters(in: .whitespaces)) }.flatMap { $0 > 0 && $0 < 10_000_000 ? $0 : nil }
         guard !messageID.isEmpty || (allowMissingMessageID && (account != nil || position != nil)) else { return nil }
         return Self(id: id, messageID: messageID, account: account, accountID: accountID, position: position)
     }

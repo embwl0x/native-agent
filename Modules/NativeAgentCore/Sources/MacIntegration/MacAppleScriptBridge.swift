@@ -1,6 +1,6 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `MacAppleScriptBridge.swift` | integration executor namespace; OSA remains in SystemAppleScriptAdapter |
+// Blueprint: | `MacAppleScriptBridge.swift` | integration executor namespace; OSA remains in AppleScriptExecution |
 
 // MARK: - MacAppleScriptBridge
 //

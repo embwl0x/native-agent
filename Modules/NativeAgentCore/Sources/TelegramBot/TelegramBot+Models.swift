@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
@@ -8,6 +9,19 @@ import ProviderRouting
 // Blueprint: | `TelegramBot+Models.swift` | Telegram wire models: typed API failures/results, sender/update/message/reply context and callback number decoding |
 
 // MARK: - TelegramStatus
+
+public struct TelegramVoiceTranscriptionStatus: Codable, Hashable, Sendable {
+    public var enabled: Bool
+    public var backend: String
+    public var model: String
+    public var maxBytes: Int
+    public init(enabled: Bool, backend: String, model: String, maxBytes: Int) {
+        self.enabled = enabled
+        self.backend = backend
+        self.model = model
+        self.maxBytes = maxBytes
+    }
+}
 
 public struct TelegramStatus: Sendable, Codable, Equatable {
     public var enabled: Bool?
@@ -46,22 +60,18 @@ public struct TelegramStatus: Sendable, Codable, Equatable {
     ]
 
     public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: _TGAnyKey.self)
+        let c = try decoder.container(keyedBy: JSONKey.self)
         func bool(_ k: String) throws -> Bool? {
-            guard let key = _TGAnyKey(stringValue: k) else { return nil }
-            return try c.decodeIfPresent(Bool.self, forKey: key)
+            return try c.decodeIfPresent(Bool.self, forKey: JSONKey(k))
         }
         func str(_ k: String) throws -> String? {
-            guard let key = _TGAnyKey(stringValue: k) else { return nil }
-            return try c.decodeIfPresent(String.self, forKey: key)
+            return try c.decodeIfPresent(String.self, forKey: JSONKey(k))
         }
         func int(_ k: String) throws -> Int? {
-            guard let key = _TGAnyKey(stringValue: k) else { return nil }
-            return try c.decodeIfPresent(Int.self, forKey: key)
+            return try c.decodeIfPresent(Int.self, forKey: JSONKey(k))
         }
         func jv(_ k: String) throws -> JSONValue? {
-            guard let key = _TGAnyKey(stringValue: k) else { return nil }
-            return try c.decodeIfPresent(JSONValue.self, forKey: key)
+            return try c.decodeIfPresent(JSONValue.self, forKey: JSONKey(k))
         }
         self.enabled = try bool("enabled")
         self.tokenConfigured = try bool("tokenConfigured")
@@ -71,12 +81,7 @@ public struct TelegramStatus: Sendable, Codable, Equatable {
         self.lastReplyAt = try str("lastReplyAt")
         self.lastError = try str("lastError")
 
-        var unknown: [String: JSONValue] = [:]
-        for key in c.allKeys where !Self.knownKeys.contains(key.stringValue) {
-            if let v = try? c.decode(JSONValue.self, forKey: key) {
-                unknown[key.stringValue] = v
-            }
-        }
+        var unknown = c.unknownFields(excluding: Self.knownKeys)
         if let explicit = try jv("extras") {
             if case .object(let obj) = explicit {
                 for (k, v) in obj { unknown[k] = v }
@@ -88,31 +93,33 @@ public struct TelegramStatus: Sendable, Codable, Equatable {
     }
 
     public func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: _TGAnyKey.self)
-        try c.encodeIfPresent(enabled, forKey: _TGAnyKey("enabled"))
-        try c.encodeIfPresent(tokenConfigured, forKey: _TGAnyKey("tokenConfigured"))
-        try c.encodeIfPresent(pollerEnabled, forKey: _TGAnyKey("pollerEnabled"))
-        try c.encodeIfPresent(lastSeenUpdateId, forKey: _TGAnyKey("lastSeenUpdateId"))
-        try c.encodeIfPresent(lastSeenAt, forKey: _TGAnyKey("lastSeenAt"))
-        try c.encodeIfPresent(lastReplyAt, forKey: _TGAnyKey("lastReplyAt"))
-        try c.encodeIfPresent(lastError, forKey: _TGAnyKey("lastError"))
-        if case .object(let obj)? = extras {
-            for (k, v) in obj where !Self.knownKeys.contains(k) {
-                try c.encode(v, forKey: _TGAnyKey(k))
-            }
-        }
+        var c = encoder.container(keyedBy: JSONKey.self)
+        try c.encodeIfPresent(enabled, forKey: JSONKey("enabled"))
+        try c.encodeIfPresent(tokenConfigured, forKey: JSONKey("tokenConfigured"))
+        try c.encodeIfPresent(pollerEnabled, forKey: JSONKey("pollerEnabled"))
+        try c.encodeIfPresent(lastSeenUpdateId, forKey: JSONKey("lastSeenUpdateId"))
+        try c.encodeIfPresent(lastSeenAt, forKey: JSONKey("lastSeenAt"))
+        try c.encodeIfPresent(lastReplyAt, forKey: JSONKey("lastReplyAt"))
+        try c.encodeIfPresent(lastError, forKey: JSONKey("lastError"))
+        try c.encodeUnknownFields(extras, excluding: Self.knownKeys)
     }
 }
 
 // MARK: - TelegramTestResult
 
-/// Body of POST /v1/telegram/test. The native Bot API call returns
-/// {ok, chatId, messageId, receipt}-style data; preserve verbatim.
-public struct TelegramTestResult: Sendable, Codable, Equatable {
-    public var rawResponse: JSONValue
-    public init(rawResponse: JSONValue) { self.rawResponse = rawResponse }
+/// Required identifiers from the validated sendMessage result.
+public struct TelegramTestResult: Sendable, Decodable, Equatable {
+    public let chatId: Int
+    public let messageId: Int
 
-    enum CodingKeys: String, CodingKey { case rawResponse = "raw_response" }
+    enum CodingKeys: String, CodingKey { case chat, id, messageId = "message_id" }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        messageId = try values.decode(Int.self, forKey: .messageId)
+        chatId = try values.nestedContainer(keyedBy: CodingKeys.self, forKey: .chat)
+            .decode(Int.self, forKey: .id)
+    }
 }
 
 // MARK: - Errors
@@ -134,11 +141,10 @@ public struct TelegramAPIResponseParameters: Sendable, Codable, Equatable {
     }
 }
 
-/// The common Telegram Bot API response envelope. `result` stays as a typed
-/// JSON value until the transport validates it for the method being called.
-public struct TelegramAPIResponse: Sendable, Codable, Equatable {
+/// The envelope retains error evidence even when the method result is malformed.
+public struct TelegramAPIResponse<Result: Decodable & Sendable>: Sendable, Decodable {
     public let ok: Bool
-    public let result: JSONValue?
+    public let result: Result?
     public let description: String?
     public let errorCode: Int?
     public let parameters: TelegramAPIResponseParameters?
@@ -147,11 +153,18 @@ public struct TelegramAPIResponse: Sendable, Codable, Equatable {
         case ok, result, description, parameters
         case errorCode = "error_code"
     }
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        ok = try values.decode(Bool.self, forKey: .ok)
+        description = try values.decodeIfPresent(String.self, forKey: .description)
+        errorCode = try values.decodeIfPresent(Int.self, forKey: .errorCode)
+        parameters = try values.decodeIfPresent(TelegramAPIResponseParameters.self, forKey: .parameters)
+        result = try? values.decode(Result.self, forKey: .result)
+    }
+
 }
 
-/// 2026-09-06: the `getMe` result, for one field only — this bot's username,
-/// so a slash command addressed to a DIFFERENT bot in a group is ignored
-/// instead of executed here.
+/// The bot username used to admit commands addressed to this bot.
 public struct TelegramAPIBotIdentity: Sendable, Codable, Equatable {
     public let username: String
 }
@@ -172,6 +185,7 @@ public struct TelegramAPIFailure: Error, LocalizedError, CustomStringConvertible
         case rejected
         case malformedResponse
         case malformedResult
+        case invalidDuration
     }
 
     public let kind: Kind
@@ -253,55 +267,19 @@ public enum TelegramBotError: Error, LocalizedError {
     }
 }
 
-// MARK: - Protocol
-
-public protocol TelegramBotProtocol: Sendable {
-    func getStatus() async throws -> TelegramStatus
-    /// Send a test reply. `chatId`, when supplied, targets a specific chat
-    /// (legacy body key `chat_id`); when nil the native path falls back to the
-    /// configured default chat. Defaulted so existing callers compile unchanged.
-    func sendTestMessage(message: String?, chatId: String?) async throws -> TelegramTestResult
-    func clearLogs() async throws
-}
-
 // MARK: - TelegramMessage / TelegramUpdate / TelegramPollResult
 
-private struct _TGAnyKey: CodingKey, Hashable {
-    var stringValue: String
-    var intValue: Int? { nil }
-    init(_ s: String) { self.stringValue = s }
-    init?(stringValue: String) { self.stringValue = stringValue }
-    init?(intValue: Int) { return nil }
-}
-
-private func _tgExtractInt(_ obj: [String: JSONValue]?, _ key: String) -> Int? {
-    _tgInt(obj?[key])
-}
-
-private func _tgInt(_ value: JSONValue?) -> Int? {
-    switch value {
-    case .int(let i)?: return Int(i)
-    case .double(let d)?: return Int(exactly: d.rounded(.towardZero))
-    default: return nil
-    }
-}
-
-private extension KeyedDecodingContainer where Key == _TGAnyKey {
+private extension KeyedDecodingContainer where Key == JSONKey {
     func jsonValue(for key: String) -> JSONValue? {
-        (try? decodeIfPresent(JSONValue.self, forKey: _TGAnyKey(key))) ?? nil
+        (try? decodeIfPresent(JSONValue.self, forKey: JSONKey(key))) ?? nil
     }
 
     func integer(for key: String) -> Int? {
-        _tgInt(jsonValue(for: key))
+        jsonValue(for: key)?.integerValue.flatMap(Int.init(exactly:))
     }
 
     func extras(excluding knownKeys: Set<String>) -> JSONValue? {
-        var unknown: [String: JSONValue] = [:]
-        for key in allKeys where !knownKeys.contains(key.stringValue) {
-            if let value = try? decode(JSONValue.self, forKey: key) {
-                unknown[key.stringValue] = value
-            }
-        }
+        var unknown = unknownFields(excluding: knownKeys)
         if case .object(let explicit)? = jsonValue(for: "extras") {
             for (key, value) in explicit { unknown[key] = value }
         }
@@ -309,34 +287,11 @@ private extension KeyedDecodingContainer where Key == _TGAnyKey {
     }
 }
 
-private func _tgExtractBool(_ obj: [String: JSONValue]?, _ key: String) -> Bool? {
-    guard let obj = obj, let v = obj[key] else { return nil }
-    switch v {
-    case .bool(let b): return b
-    default: return nil
-    }
-}
-
-func _tgJSONInt(_ value: JSONValue?) -> Int? {
-    switch value {
-    case .some(.int(let i)): return Int(i)
-    case .some(.double(let d)): return Int(exactly: d.rounded(.towardZero))
-    case .some(.string(let s)): return Int(s)
-    default: return nil
-    }
-}
-
-func _tgJSONString(_ value: JSONValue?) -> String? {
-    guard case .string(let s)? = value else { return nil }
-    return s
-}
-
 func _tgNowString(_ date: Date = Date()) -> String {
     NativeTimestampFormat.fractionalZulu(date)
 }
 
-/// 2026-09-06: the inverse of `_tgNowString`, for state stamps that expire.
-/// Accepts the fractional-seconds form this file writes and the plain one.
+/// Parse expiring state stamps with or without fractional seconds.
 func _tgParseDate(_ value: String?) -> Date? {
     guard let value, !value.isEmpty else { return nil }
     return NativeTimestampFormat.parseISO8601FractionalFirst(value)
@@ -344,8 +299,7 @@ func _tgParseDate(_ value: String?) -> Date? {
 
 func _tgPreview(_ text: String?, limit: Int = 240) -> String? {
     guard let text else { return nil }
-    // 2026-09-22: previews land in receipts.jsonl; scrub before the cut so a
-    // pasted token can't survive by being truncated out of its pattern.
+    // Redact receipts.jsonl previews before truncation so partial tokens cannot escape.
     let trimmed = TurnTraceRedactor.redactText(text.trimmingCharacters(in: .whitespacesAndNewlines))
     guard !trimmed.isEmpty else { return nil }
     if trimmed.count <= limit { return trimmed }
@@ -393,8 +347,8 @@ public struct TelegramReplyContext: Sendable, Codable, Equatable {
 
     static func fromTelegramJSON(_ value: JSONValue?) -> TelegramReplyContext? {
         guard case .object(let obj)? = value else { return nil }
-        let messageId = _tgExtractInt(obj, "message_id")
-            ?? _tgExtractInt(obj, "messageId")
+        let messageId = obj["message_id"]?.integerValue.flatMap(Int.init(exactly:))
+            ?? obj["messageId"]?.integerValue.flatMap(Int.init(exactly:))
             ?? 0
         guard messageId > 0 else { return nil }
 
@@ -413,13 +367,13 @@ public struct TelegramReplyContext: Sendable, Codable, Equatable {
 
         return TelegramReplyContext(
             messageId: messageId,
-            chatId: _tgExtractInt(chatObj, "id") ?? _tgExtractInt(obj, "chatId"),
-            chatType: _tgJSONString(chatObj?["type"]) ?? _tgJSONString(obj["chatType"]),
-            fromUserId: _tgExtractInt(fromObj, "id") ?? _tgExtractInt(obj, "fromUserId"),
-            fromIsBot: _tgExtractBool(fromObj, "is_bot") ?? _tgExtractBool(obj, "fromIsBot"),
-            text: _tgJSONString(obj["text"]),
-            caption: _tgJSONString(obj["caption"]),
-            date: _tgExtractInt(obj, "date")
+            chatId: chatObj?["id"]?.integerValue.flatMap(Int.init(exactly:)) ?? obj["chatId"]?.integerValue.flatMap(Int.init(exactly:)),
+            chatType: chatObj?["type"]?.stringValue ?? obj["chatType"]?.stringValue,
+            fromUserId: fromObj?["id"]?.integerValue.flatMap(Int.init(exactly:)) ?? obj["fromUserId"]?.integerValue.flatMap(Int.init(exactly:)),
+            fromIsBot: fromObj?["is_bot"]?.boolValue ?? obj["fromIsBot"]?.boolValue,
+            text: obj["text"]?.stringValue,
+            caption: obj["caption"]?.stringValue,
+            date: obj["date"]?.integerValue.flatMap(Int.init(exactly:))
         )
     }
 }
@@ -460,12 +414,7 @@ public enum TelegramReplyPromptRenderer {
     }
 }
 
-/// 2026-09-06: a chat plus, when the message lives in a forum topic, that
-/// topic's thread. Telegram forum topics are separate conversations: the
-/// session key is this pair, and every outbound call for a turn answers into
-/// the topic the inbound arrived in. `threadId` is nil for DMs, ordinary
-/// groups, and a forum's General topic — all of which Telegram addresses with
-/// `chat_id` alone.
+/// Chat and optional forum topic identify the conversation; nil means a chat-only destination.
 public struct TelegramDestination: Sendable, Hashable {
     public var chatId: Int
     public var threadId: Int?
@@ -489,7 +438,7 @@ public struct TelegramDestination: Sendable, Hashable {
     public static func topicThreadId(inMessageObject obj: [String: JSONValue]?) -> Int? {
         guard let obj else { return nil }
         guard case .bool(true)? = obj["is_topic_message"] else { return nil }
-        return _tgExtractInt(obj, "message_thread_id")
+        return obj["message_thread_id"]?.integerValue.flatMap(Int.init(exactly:))
     }
 }
 
@@ -501,10 +450,7 @@ public struct TelegramMessage: Sendable, Codable, Equatable {
     /// "private" — an allowlisted group chat must never widen who can fire
     /// them. nil for legacy/synthetic shapes that never carried it.
     public var chatType: String?
-    /// 2026-09-06: `message_thread_id`, kept ONLY when the wire also said
-    /// `is_topic_message`. A linked-discussion comment thread carries a
-    /// message_thread_id too, and treating that as a separate conversation
-    /// would split a group that works today.
+    /// Retain `message_thread_id` only for `is_topic_message`, excluding linked-discussion threads.
     public var messageThreadId: Int?
     public var fromUserId: Int?
     public var text: String?
@@ -549,14 +495,14 @@ public struct TelegramMessage: Sendable, Codable, Equatable {
     ]
 
     public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: _TGAnyKey.self)
+        let c = try decoder.container(keyedBy: JSONKey.self)
         // message_id (wire) or messageId (Swift-encoded round-trip)
         self.messageId = c.integer(for: "message_id") ?? c.integer(for: "messageId") ?? 0
 
         // chat.id / chat.type (nested) or chatId/chatType (Swift-encoded
         // round-trip)
         if let chat = c.jsonValue(for: "chat"), case .object(let obj) = chat {
-            self.chatId = _tgExtractInt(obj, "id") ?? 0
+            self.chatId = obj["id"]?.integerValue.flatMap(Int.init(exactly:)) ?? 0
             if case .string(let t)? = obj["type"] {
                 self.chatType = t
             } else {
@@ -582,7 +528,7 @@ public struct TelegramMessage: Sendable, Codable, Equatable {
             self.messageThreadId = c.integer(for: "messageThreadId")
         }
         if let from = c.jsonValue(for: "from"), case .object(let obj) = from {
-            self.fromUserId = _tgExtractInt(obj, "id")
+            self.fromUserId = obj["id"]?.integerValue.flatMap(Int.init(exactly:))
         } else {
             self.fromUserId = c.integer(for: "fromUserId")
         }
@@ -598,25 +544,28 @@ public struct TelegramMessage: Sendable, Codable, Equatable {
     }
 
     public func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: _TGAnyKey.self)
-        try c.encode(messageId, forKey: _TGAnyKey("messageId"))
-        try c.encode(chatId, forKey: _TGAnyKey("chatId"))
-        try c.encodeIfPresent(chatType, forKey: _TGAnyKey("chatType"))
-        try c.encodeIfPresent(messageThreadId, forKey: _TGAnyKey("messageThreadId"))
-        try c.encodeIfPresent(fromUserId, forKey: _TGAnyKey("fromUserId"))
-        try c.encodeIfPresent(text, forKey: _TGAnyKey("text"))
-        try c.encodeIfPresent(replyTo, forKey: _TGAnyKey("replyTo"))
-        try c.encode(date, forKey: _TGAnyKey("date"))
-        if case .object(let obj)? = extras {
-            for (k, v) in obj where !Self.knownKeys.contains(k) {
-                try c.encode(v, forKey: _TGAnyKey(k))
-            }
-        }
+        var c = encoder.container(keyedBy: JSONKey.self)
+        try c.encode(messageId, forKey: JSONKey("messageId"))
+        try c.encode(chatId, forKey: JSONKey("chatId"))
+        try c.encodeIfPresent(chatType, forKey: JSONKey("chatType"))
+        try c.encodeIfPresent(messageThreadId, forKey: JSONKey("messageThreadId"))
+        try c.encodeIfPresent(fromUserId, forKey: JSONKey("fromUserId"))
+        try c.encodeIfPresent(text, forKey: JSONKey("text"))
+        try c.encodeIfPresent(replyTo, forKey: JSONKey("replyTo"))
+        try c.encode(date, forKey: JSONKey("date"))
+        try c.encodeUnknownFields(extras, excluding: Self.knownKeys)
     }
 }
 
 public struct TelegramUpdate: Sendable, Codable, Equatable {
     public var updateId: Int
+    // Synthetic replies use exactly the negative 56-bit namespace; only
+    // upstream IDs advance getUpdates, and each must have a representable successor.
+    var hasValidInboxID: Bool { updateId >= -(1 << 56) && nextOffset != nil }
+    var nextOffset: Int? {
+        let (next, overflow) = updateId.addingReportingOverflow(1)
+        return overflow ? nil : next
+    }
     public var message: TelegramMessage?
     public var callbackQuery: JSONValue?
     public var extras: JSONValue?
@@ -641,29 +590,24 @@ public struct TelegramUpdate: Sendable, Codable, Equatable {
     ]
 
     public init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: _TGAnyKey.self)
-        self.updateId = c.integer(for: "update_id") ?? c.integer(for: "updateId") ?? 0
-        if let msgKey = _TGAnyKey(stringValue: "message"),
-           let msg = try? c.decodeIfPresent(TelegramMessage.self, forKey: msgKey) {
-            self.message = msg
-        } else {
-            self.message = nil
+        let c = try decoder.container(keyedBy: JSONKey.self)
+        guard let id = c.integer(for: "update_id") ?? c.integer(for: "updateId"),
+              id >= -(1 << 56), id < Int.max else {
+            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "Invalid Telegram update ID"))
         }
+        self.updateId = id
+        self.message = try? c.decodeIfPresent(TelegramMessage.self, forKey: JSONKey("message"))
         self.callbackQuery = c.jsonValue(for: "callback_query") ?? c.jsonValue(for: "callbackQuery")
 
         self.extras = c.extras(excluding: Self.knownKeys)
     }
 
     public func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: _TGAnyKey.self)
-        try c.encode(updateId, forKey: _TGAnyKey("updateId"))
-        try c.encodeIfPresent(message, forKey: _TGAnyKey("message"))
-        try c.encodeIfPresent(callbackQuery, forKey: _TGAnyKey("callbackQuery"))
-        if case .object(let obj)? = extras {
-            for (k, v) in obj where !Self.knownKeys.contains(k) {
-                try c.encode(v, forKey: _TGAnyKey(k))
-            }
-        }
+        var c = encoder.container(keyedBy: JSONKey.self)
+        try c.encode(updateId, forKey: JSONKey("updateId"))
+        try c.encodeIfPresent(message, forKey: JSONKey("message"))
+        try c.encodeIfPresent(callbackQuery, forKey: JSONKey("callbackQuery"))
+        try c.encodeUnknownFields(extras, excluding: Self.knownKeys)
     }
 }
 
@@ -676,7 +620,7 @@ public struct TelegramPollResult: Sendable, Equatable {
     }
 }
 
-/// The message envelope shared by approval, active-turn and queued-turn buttons.
+/// Every callback family shares transport identity decoding.
 /// Command parsing stays with each caller and runs before envelope decoding.
 struct TelegramCallbackPayload<Command> {
     let callbackId: String
@@ -693,9 +637,9 @@ struct TelegramCallbackPayload<Command> {
               let command = parseData(data),
               case .object(let message)? = object["message"],
               case .object(let chat)? = message["chat"],
-              let chatId = TelegramCallbackNumbers.int(chat["id"]),
-              let messageId = TelegramCallbackNumbers.int(message["message_id"])
-                ?? TelegramCallbackNumbers.int(message["messageId"]) else {
+              let chatId = (chat["id"]?.integerValue.flatMap(Int.init(exactly:)) ?? chat["id"]?.stringValue.flatMap(Int.init)),
+              let messageId = (message["message_id"]?.integerValue.flatMap(Int.init(exactly:)) ?? message["message_id"]?.stringValue.flatMap(Int.init))
+                ?? (message["messageId"]?.integerValue.flatMap(Int.init(exactly:)) ?? message["messageId"]?.stringValue.flatMap(Int.init)) else {
             return nil
         }
         self.callbackId = callbackId
@@ -704,22 +648,9 @@ struct TelegramCallbackPayload<Command> {
         self.threadId = TelegramDestination.topicThreadId(inMessageObject: message)
         self.messageId = messageId
         if case .object(let from)? = object["from"] {
-            self.fromUserId = TelegramCallbackNumbers.int(from["id"])
+            self.fromUserId = (from["id"]?.integerValue.flatMap(Int.init(exactly:)) ?? from["id"]?.stringValue.flatMap(Int.init))
         } else {
             self.fromUserId = nil
-        }
-    }
-}
-
-enum TelegramCallbackNumbers {
-    static func int(_ value: JSONValue?) -> Int? {
-        switch value {
-        case .int(let value)?: return Int(exactly: value)
-        // Preserve truncation for representable values; malformed or oversized
-        // remote IDs must fail decoding rather than trap the poll process.
-        case .double(let value)?: return Int(exactly: value.rounded(.towardZero))
-        case .string(let value)?: return Int(value)
-        default: return nil
         }
     }
 }

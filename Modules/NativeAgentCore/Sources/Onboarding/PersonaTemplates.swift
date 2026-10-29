@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 // Blueprint: | `PersonaTemplates.swift` | `PersonaTemplates` enum; `generate` |
 

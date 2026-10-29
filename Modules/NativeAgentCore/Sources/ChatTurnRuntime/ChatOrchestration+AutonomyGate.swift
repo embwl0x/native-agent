@@ -21,16 +21,6 @@ import MacControl
 //     does not need to know which app/core component staged the durable
 //     approval record. NativeAgent.app wires the real Swift approval queue and
 //     follow-up executor; tests use mocks.
-//   * AutonomyResolver protocol lets tests substitute a mock for
-//     SwiftNativeTrustCenter; the concrete actor conforms via an extension.
-
-// MARK: - AutonomyResolver
-
-public typealias AutonomyResolver = ChatTurnContracts.AutonomyResolver
-
-/// The law's answer by name; the input-aware answer is SecurityCenter's.
-extension SwiftNativeTrustCenter: AutonomyResolver {}
-
 // MARK: - AutonomyGate
 
 public actor AutonomyGate {
@@ -44,9 +34,7 @@ public actor AutonomyGate {
     /// decision (allow on approved, deny on denied/canceled). On timeout,
     /// returns .deny (NOT throws). Also returns the approval record ID.
     ///
-    /// W2/W3-FIX 1/2 need it: a `MacInjectionCapability` is minted from a
-    /// specific resolved approval, and "which approval authorized this
-    /// keystroke" has to be answerable from the capability itself, not inferred.
+    /// A `MacInjectionCapability` names the resolved approval that authorized it.
     public func resolveWithApprovalDetailed(
         toolName: String,
         surface: String,
@@ -54,14 +42,14 @@ public actor AutonomyGate {
         timeoutSeconds: Double = 300,
         reason: String? = nil
     ) async throws -> (decision: AutonomyDecision, approvalID: String?, notRunStatus: ToolNotRunStatus?) {
+        guard timeoutSeconds.isFinite, timeoutSeconds >= 0,
+              let nanos = UInt64(exactly: (timeoutSeconds * 1_000_000_000).rounded(.towardZero)) else {
+            throw AutonomyGateError.invalidApprovalTimeout
+        }
         guard let filer else {
             throw AutonomyGateError.noApprovalInboxWired
         }
-        // Carry the caller's specific safety reason; only the permission-level
-        // fallback needs a plain description of the action.
-        // 2026-07-21 gpt-5.5 review: carry the CALLER's reason (a security
-        // .ask's injection-shield reason, a PersonaWriteGuard reason) into
-        // the filed record — composing "autonomy=\(level)" here erased it.
+        // Preserve the caller's safety reason; describe the action only when no specific reason is supplied.
         let resolvedReason = ApprovalActionText.reason(reason, tool: toolName)
         let id: String
         do {
@@ -76,7 +64,6 @@ public actor AutonomyGate {
             throw AutonomyGateError.approvalFilingFailed(String(describing: error))
         }
 
-        let nanos = UInt64(max(0, timeoutSeconds) * 1_000_000_000)
         let outcome = await withTaskGroup(of: (AutonomyDecision, ToolNotRunStatus?)?.self) { group in
             group.addTask {
                 do {

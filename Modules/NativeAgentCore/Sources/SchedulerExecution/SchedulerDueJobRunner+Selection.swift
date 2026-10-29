@@ -5,7 +5,8 @@ import PersistenceCore
 import TelegramBot
 import TriggerScheduler
 import DeviceSync
-// Blueprint: | `SchedulerDueJobRunner+Selection.swift` | `SchedulerDueJobRunner`: `nextMeaningfulDeadline`, `claimDueJob`, `dueJobs`, `ensureDefaultCycleJobs`; default cycle jobs and one `part` job per part and `schedule:` wake |
+import DreamREMCycle
+// Blueprint: | `SchedulerDueJobRunner+Selection.swift` | `SchedulerDueJobRunner`: `nextMeaningfulDeadline`, `claimDueJob`, `dueJobs`, `ensureDefaultCycleJobs`; default cycle jobs and one `part` job per part and `schedule:` wake; saved built-in reader watches moved to their door reads |
 
 extension SchedulerDueJobRunner {
     /// Earliest future `SchedulerJobRuntime.scheduledEpoch` crossing: unclaimed
@@ -27,7 +28,7 @@ extension SchedulerDueJobRunner {
                   SchedulerJobRuntime.bool(obj["enabled"], default: true) else { continue }
             guard let epoch = SchedulerJobRuntime.scheduledEpoch(for: obj),
                   epoch.isFinite else { continue }
-            if epoch > nowEpoch, earliestFuture == nil || epoch < earliestFuture! {
+            if epoch > nowEpoch, earliestFuture.map({ epoch < $0 }) ?? true {
                 earliestFuture = epoch
             }
         }
@@ -37,11 +38,11 @@ extension SchedulerDueJobRunner {
     /// Only a cap-exhausted, healthy pass reaches this projection. Selection is
     /// the same as claiming, so malformed rows cannot create continuation churn.
     func requestRemainingBatch(excludingJobIds: Set<String>) async {
-        guard !Task.isCancelled, activityFeedError == nil, inFlightJobBodies == 0 else { return }
+        guard !Task.isCancelled, activityFeedError == nil else { return }
         do {
             let rows = try await schedulerJobs.jobRows()
             guard !Task.isCancelled, activityFeedError == nil,
-                  !Self.dueJobs(in: rows, nowEpoch: Date().timeIntervalSince1970,
+                  try !Self.dueJobs(in: rows, nowEpoch: Date().timeIntervalSince1970,
                                 excludingJobIds: excludingJobIds).isEmpty else { return }
             NotificationCenter.default.post(name: SwiftNativeTriggerScheduler.dueWorkRemaining, object: nil)
         } catch {
@@ -51,7 +52,7 @@ extension SchedulerDueJobRunner {
 
     func claimDueJob(now: Date, excludingJobIds: Set<String> = []) async throws -> ClaimedDueJobs {
         try await schedulerJobs.claimDueJobs(now: now) { rows in
-            Self.dueJobs(in: rows, nowEpoch: now.timeIntervalSince1970,
+            try Self.dueJobs(in: rows, nowEpoch: now.timeIntervalSince1970,
                          excludingJobIds: excludingJobIds)
         }
     }
@@ -60,14 +61,16 @@ extension SchedulerDueJobRunner {
         in rows: [JSONValue],
         nowEpoch: Double,
         excludingJobIds: Set<String> = []
-    ) -> [DueJob] {
+    ) throws -> [DueJob] {
         // Claim only the earliest due occurrence; ties retain file order.
         var earliest: (row: JSONValue, fields: [String: JSONValue], id: String, epoch: Double)?
         for row in rows {
             guard case .object(let obj) = row else { continue }
-            guard SchedulerJobRuntime.bool(obj["enabled"], default: true) else { continue }
+            let active = obj["activeOccurrence"] != nil
+            // A retained claim owes reconciliation even when future runs were cancelled.
+            guard active || SchedulerJobRuntime.bool(obj["enabled"], default: true) else { continue }
             let nextEpoch = SchedulerJobRuntime.scheduledEpoch(for: obj)
-            guard let nextEpoch, nextEpoch <= nowEpoch else { continue }
+            guard let nextEpoch, active || nextEpoch <= nowEpoch else { continue }
             // A scheduled effect without durable job identity cannot acquire a
             // stable occurrence claim or be settled safely. Job creation owns
             // IDs; malformed legacy rows remain untouched for repair.
@@ -75,7 +78,7 @@ extension SchedulerDueJobRunner {
             // Excluded BEFORE the cap, so a deferred row cannot consume the
             // one-at-a-time claim slot that a later due job needs.
             guard !excludingJobIds.contains(id) else { continue }
-            if earliest == nil || nextEpoch < earliest!.epoch {
+            if earliest.map({ nextEpoch < $0.epoch }) ?? true {
                 earliest = (row, obj, id, nextEpoch)
             }
         }
@@ -84,7 +87,7 @@ extension SchedulerDueJobRunner {
         let kind = (SchedulerJobRuntime.string(earliest.fields["kind"]) ?? "notify").lowercased()
         let payload: [String: JSONValue]
         if case .object(let p)? = earliest.fields["payload"] { payload = p } else { payload = [:] }
-        return [DueJob(id: earliest.id, name: name, kind: kind, payload: payload,
+        return [try DueJob(id: earliest.id, name: name, kind: kind, payload: payload,
                        row: earliest.row, dueEpoch: earliest.epoch)]
     }
 
@@ -97,7 +100,8 @@ extension SchedulerDueJobRunner {
     public func ensureDefaultCycleJobs(now: Date, reactivateCancelled: Bool = false) async throws -> (repaired: [String], nightlyDream: JSONValue) {
         let runDateKey = NativeAgentDreamCycleSchedule.runDateKey(now)
         let dreamDateKey = NativeAgentDreamCycleSchedule.dreamEntryDateKey(now)
-        let dreamAlreadyHasEntry = Self.hasDreamEntry(dataRoot: root, dateKey: dreamDateKey)
+        let dreamAlreadyHasEntry = ((try? FileBackedDreamDiary(dataRoot: root).discover(in: .active, matching: .markdown)) ?? [])
+            .contains { $0.name == "\(dreamDateKey).md" || $0.name.hasPrefix("\(dreamDateKey)_") }
         let scheduledDreamTimePassed = NativeAgentDreamCycleSchedule.clockHasReached(
             now,
             hour: NativeAgentDreamCycleSchedule.dreamHour,
@@ -194,6 +198,7 @@ extension SchedulerDueJobRunner {
                 repaired.append(remCatchUp ? "\(remJobName) (catch-up due now)" : remJobName)
             }
 
+            repaired += SwiftNativeTriggerScheduler.moveReaderWatchesToDoor(&rows)
             return (repaired, unscheduled, dream.job)
         }
         let unscheduled = wakeFaults + (inventoryFault.map { [$0] } ?? [])

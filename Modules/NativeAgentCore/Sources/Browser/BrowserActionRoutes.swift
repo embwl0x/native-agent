@@ -3,6 +3,7 @@ import NativeAgentCore
 import PersistenceCore
 import Privacy
 import ApprovalInbox
+import NativeAgentShared
 // Blueprint: | `BrowserActionRoutes.swift` | `BrowserActionRoutes` struct; `observeBrowserMotorAction`, `runBrowser`, direct dry-run/cancel commands to the canonical operation store, task-local `retainRead` delivery of the exact visible read capture |
 
 /// Browser operation orchestration. The canonical reducer remains the sole
@@ -39,17 +40,14 @@ public struct BrowserActionRoutes: Sendable {
         // receipt. The app owns only the visible WKWebView effect adapter.
         if dryRun {
             let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard let components = URLComponents(string: trimmed),
-                  let scheme = components.scheme?.lowercased(),
-                  scheme == "http" || scheme == "https",
-                  let host = components.host, !host.isEmpty else {
+            guard let parsed = try? ValidBrowserURL(trimmed) else {
                 throw NSError(domain: "NativeAgentSwiftOnly", code: -410, userInfo: [
                     NSLocalizedDescriptionKey: "Browser dry-run body was not handled by the Swift browser writer."
                 ])
             }
             let browser = SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
             let result = try await browser.executeBrowserOperation(.start(.init(
-                id: UUID().uuidString, url: trimmed, domain: host.lowercased(),
+                id: UUID().uuidString, url: trimmed, domain: parsed.domain,
                 initialState: .dryRun
             )))
             guard let run = result.run else {
@@ -61,7 +59,7 @@ public struct BrowserActionRoutes: Sendable {
         }
         let runID = UUID().uuidString.lowercased()
         let run = try await executeVisibleBrowserRun(
-            parsed: try validBrowserURL(url),
+            parsed: try ValidBrowserURL(url),
             runID: runID,
             approvalId: nil,
             captureSource: captureSource,
@@ -80,13 +78,13 @@ public struct BrowserActionRoutes: Sendable {
                     NSLocalizedDescriptionKey: "Browser cancel body was not handled by the Swift browser writer."
                 ])
             }
-            if SwiftNativeBrowserClient.objectString(envelope, "status") == "canceled",
-               let runID = SwiftNativeBrowserClient.objectString(envelope, "id") {
+            if envelope.objectValue?["status"]?.stringValue == "canceled",
+               let runID = envelope.objectValue?["id"]?.stringValue {
                 await effects.cancelNavigation(runID: runID)
             }
             return try BrowserRun(row: envelope)
         } catch let error as BrowserCancellationProjectionError {
-            if let runID = SwiftNativeBrowserClient.objectString(error.run, "id") {
+            if let runID = error.run.objectValue?["id"]?.stringValue {
                 await effects.cancelNavigation(runID: runID)
             }
             throw error
@@ -103,8 +101,6 @@ public struct BrowserActionRoutes: Sendable {
     ) async throws -> JSONValue {
         try Task.checkCancellation()
         var status = "succeeded"
-        var opened = false
-        var screenshotReceipt: JSONValue = .null
         var sourceReceipt: [String: JSONValue] = [
             "url": .string(parsed.url.absoluteString),
             "captureSource": .bool(captureSource),
@@ -136,88 +132,91 @@ public struct BrowserActionRoutes: Sendable {
             dataRoot: dataRoot
         )
         let captureTask = navigation.task
-        defer {
-            Task { @MainActor in
-                effects.finishNavigation(runID: runID, token: navigation.token)
-            }
-        }
+        var capture: BrowserVisibleCapture?
         do {
-            let result = try await withTaskCancellationHandler {
+            // Adopt the returned capture before observing cancellation. Produced
+            // material belongs to settlement even when Stop won the outcome.
+            capture = try await withTaskCancellationHandler {
                 try await captureTask.value
-            } onCancel: {
-                captureTask.cancel()
-            }
+            } onCancel: { captureTask.cancel() }
             try Task.checkCancellation()
-            opened = true
-            status = "succeeded"
-            sourceReceipt["ipcUrl"] = .string(result.nav.url)
-            sourceReceipt["ipcTitle"] = .string(result.nav.title)
-            if let code = result.nav.httpStatus {
-                sourceReceipt["httpStatus"] = .int(Int64(code))
-            }
-            if let chars = result.textChars {
-                sourceReceipt["textChars"] = .int(Int64(chars))
-            }
-            if !result.readFailures.isEmpty {
-                sourceReceipt["readFailures"] = .object(result.readFailures.mapValues(JSONValue.string))
-            }
-            if captureSource, let text = result.text {
-                try Task.checkCancellation()
-                let persisted = try await persistBrowserTextCapture(
-                    id: runID,
-                    url: parsed.url,
-                    text: text,
-                    links: result.links,
-                    dataRoot: dataRoot
-                )
-                for (key, value) in persisted {
-                    sourceReceipt[key] = value
-                }
-            }
-            if captureScreenshot, let png = result.screenshot {
-                try Task.checkCancellation()
-                screenshotReceipt = .object(try await persistBrowserScreenshotCapture(
-                    id: runID,
-                    url: parsed.url,
-                    png: png,
-                    dataRoot: dataRoot
-                ))
-            }
-            try Task.checkCancellation()
-        } catch is CancellationError {
-            status = "canceled"
-            sourceReceipt["canceled"] = .bool(true)
-        } catch {
+            if capture?.readFailures["canceled"] != nil { status = "canceled" }
+            else if capture?.readFailures["capture"] != nil { status = "failed" }
+        } catch is CancellationError { status = "canceled" }
+        catch {
             status = "failed"
             sourceReceipt["openError"] = .string(error.localizedDescription)
             if (error as? BrowserError)?.hasUnknownOutcome == true {
                 sourceReceipt["outcomeKind"] = .string("outcome_unknown")
             }
         }
-
-        let terminalState: BrowserOperationTerminalState
-        switch status {
-        case "succeeded": terminalState = .succeeded
-        case "canceled": terminalState = .canceled
-        default: terminalState = .failed
+        let outcome = await settle { [capture, status, sourceReceipt] () -> Result<JSONValue, Error> in
+            var status = status
+            var sourceReceipt = sourceReceipt
+            var screenshotReceipt: JSONValue = .null
+            let opened = capture != nil
+            if let result = capture {
+                sourceReceipt["ipcUrl"] = .string(result.nav.url)
+                sourceReceipt["ipcTitle"] = .string(result.nav.title)
+                if let code = result.nav.httpStatus { sourceReceipt["httpStatus"] = .int(Int64(code)) }
+                if let chars = result.textChars { sourceReceipt["textChars"] = .int(Int64(chars)) }
+                if !result.readFailures.isEmpty {
+                    sourceReceipt["readFailures"] = .object(result.readFailures.mapValues(JSONValue.string))
+                }
+                if captureSource, let text = result.text {
+                    do {
+                        let saved = try await persistBrowserTextCapture(id: runID, url: parsed.url,
+                            text: text, links: result.links, dataRoot: dataRoot)
+                        sourceReceipt.merge(saved) { _, new in new }
+                    } catch {
+                        sourceReceipt["textPersistenceError"] = .string(error.localizedDescription)
+                        if status != "canceled" { status = "failed" }
+                    }
+                }
+                if captureScreenshot, let png = result.screenshot {
+                    do {
+                        screenshotReceipt = .object(try await persistBrowserScreenshotCapture(
+                            id: runID, url: parsed.url, png: png, dataRoot: dataRoot, showToModel: false))
+                    } catch {
+                        sourceReceipt["screenshotPersistenceError"] = .string(error.localizedDescription)
+                        if status != "canceled" { status = "failed" }
+                    }
+                }
+            }
+            if status == "canceled" {
+                sourceReceipt["canceled"] = .bool(true)
+                if capture == nil { sourceReceipt["outcomeKind"] = .string("outcome_unknown") }
+            }
+            let terminal: BrowserOperationTerminalState = status == "canceled" ? .canceled
+                : status == "succeeded" ? .succeeded : .failed
+            do {
+                let completion = BrowserOperationCompletion(id: runID, requestDigest: requestDigest,
+                    state: terminal, opened: opened, sourceReceipt: .object(sourceReceipt),
+                    screenshotReceipt: screenshotReceipt)
+                guard let committed = try await browser.executeBrowserOperation(.complete(completion)).run else {
+                    throw BrowserOperationStoreError.runNotFound
+                }
+                await effects.finishNavigation(runID: runID, token: navigation.token)
+                await observeBrowserMotorAction(runID: runID, dataRoot: dataRoot)
+                return .success(committed)
+            } catch {
+                await effects.finishNavigation(runID: runID, token: navigation.token)
+                return .failure(error)
+            }
         }
-        let completion = BrowserOperationCompletion(
-            id: runID,
-            requestDigest: requestDigest,
-            state: terminalState,
-            opened: opened,
-            sourceReceipt: .object(sourceReceipt),
-            screenshotReceipt: screenshotReceipt
-        )
-        // Settlement outlives the caller's cancellation: a retired connection never leaves its run running.
-        guard let committed = try await Task { try await browser.executeBrowserOperation(.complete(completion)) }.value.run else {
-            throw NSError(domain: "NativeAgentBrowser", code: 500, userInfo: [
-                NSLocalizedDescriptionKey: "Browser canonical completion returned no run"
-            ])
+        let committed = try outcome.get()
+        // Inline pixels belong to this caller's admitted turn context, which
+        // settle deliberately does not inherit. The canonical receipt already
+        // owns the artifact; delivery metadata is this response's projection.
+        if case .object(var fields) = committed,
+           case .object(var screenshot)? = fields["screenshotReceipt"],
+           case .string(let path)? = screenshot["pngPath"] {
+            let shown = effects.showProducedImage(at: URL(fileURLWithPath: path), name: "\(runID).png")
+            screenshot["shownToModel"] = .bool(shown.shown)
+            screenshot["visionNote"] = .string(shown.note)
+            fields["screenshotReceipt"] = .object(screenshot)
+            return .object(fields)
         }
-        // The Core reducer makes terminal state absorbing, so an explicit
-        // cancel committed during WebKit/capture always defeats late success.
-        await observeBrowserMotorAction(runID: runID, dataRoot: dataRoot)
         return committed
     }
 
@@ -233,7 +232,7 @@ public struct BrowserActionRoutes: Sendable {
         _ effect: @escaping @MainActor () async throws -> Void
     ) async throws -> JSONValue {
         let page = effects.currentURL() ?? ""
-        let parsed = try validBrowserURL(page)
+        let parsed = try ValidBrowserURL(page)
         let runID = "page-\(UUID().uuidString.lowercased())"
         try effects.acquireBrowser(runID: runID)
         defer { effects.releaseBrowser(runID: runID) }
@@ -261,6 +260,7 @@ public struct BrowserActionRoutes: Sendable {
         // The caller's cancel reaches the effect the way navigation's does.
         do {
             try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+            if Task.isCancelled || task.isCancelled { state = .canceled }
         } catch is CancellationError { state = .canceled } catch {
             state = .failed
             receipt["error"] = .string(error.localizedDescription)
@@ -272,41 +272,45 @@ public struct BrowserActionRoutes: Sendable {
         let completion = BrowserOperationCompletion(
             id: runID, requestDigest: SwiftNativeBrowserClient.browserRequestDigest(for: start),
             state: state, opened: false, sourceReceipt: .object(receipt))
-        guard let committed = try await Task { try await browser.executeBrowserOperation(.complete(completion)) }.value.run else {
-            throw NSError(domain: "NativeAgentBrowser", code: 500, userInfo: [
-                NSLocalizedDescriptionKey: "Browser canonical completion returned no run"
-            ])
+        let settled = await settle { () -> Result<JSONValue, Error> in
+            do {
+                guard let committed = try await browser.executeBrowserOperation(.complete(completion)).run else {
+                    throw BrowserOperationStoreError.runNotFound
+                }
+                await observeBrowserMotorAction(runID: runID, dataRoot: dataRoot)
+                return .success(committed)
+            } catch { return .failure(error) }
         }
-        await observeBrowserMotorAction(runID: runID, dataRoot: dataRoot)
-        return committed
+        return try settled.get()
     }
 
     public struct ValidBrowserURL: Sendable {
         public var url: URL
         public var domain: String
-    }
-
-    public func validBrowserURL(_ raw: String) throws -> ValidBrowserURL {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            throw NSError(domain: "NativeAgentBrowser", code: 400, userInfo: [
-                NSLocalizedDescriptionKey: "Browser URL is required"
-            ])
+        public init(_ raw: String) throws {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                throw NSError(domain: "NativeAgentBrowser", code: 400, userInfo: [
+                    NSLocalizedDescriptionKey: "Browser URL is required"
+                ])
+            }
+            let parsedURL = URL(string: trimmed)
+            let scheme = parsedURL?.scheme?.lowercased() ?? ""
+            guard let url = parsedURL,
+                  let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+                  scheme == "http" || scheme == "https" else {
+                throw NSError(domain: "NativeAgentBrowser", code: 400, userInfo: [
+                    NSLocalizedDescriptionKey: "Only http/https browser URLs are allowed",
+                    "scheme": scheme, "url_parse_failed": parsedURL == nil
+                ])
+            }
+            guard let host = comps.host?.lowercased(), !host.isEmpty else {
+                throw NSError(domain: "NativeAgentBrowser", code: 400, userInfo: [
+                    NSLocalizedDescriptionKey: "Browser URL must include a host"
+                ])
+            }
+            self.url = url; domain = host
         }
-        guard let url = URL(string: trimmed),
-              let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              let scheme = comps.scheme?.lowercased(),
-              scheme == "http" || scheme == "https" else {
-            throw NSError(domain: "NativeAgentBrowser", code: 400, userInfo: [
-                NSLocalizedDescriptionKey: "Only http/https browser URLs are allowed"
-            ])
-        }
-        guard let host = comps.host?.lowercased(), !host.isEmpty else {
-            throw NSError(domain: "NativeAgentBrowser", code: 400, userInfo: [
-                NSLocalizedDescriptionKey: "Browser URL must include a host"
-            ])
-        }
-        return ValidBrowserURL(url: url, domain: host)
     }
 
     public func executeApprovedBrowserRun(from approval: ApprovalRecord, dataRoot: URL) async throws {
@@ -334,14 +338,14 @@ public struct BrowserActionRoutes: Sendable {
                 default: false
             )
             let run = try await executeVisibleBrowserRun(
-                parsed: try validBrowserURL(rawURL),
+                parsed: try ValidBrowserURL(rawURL),
                 runID: runID,
                 approvalId: approval.id,
                 captureSource: captureSource,
                 captureScreenshot: captureScreenshot,
                 dataRoot: dataRoot
             )
-            let status = SwiftNativeBrowserClient.objectString(run, "status") ?? "succeeded"
+            let status = run.objectValue?["status"]?.stringValue ?? "succeeded"
             try await effects.annotateApprovalExecution(id: approval.id, executedAction: run,
                                                         detail: "Browser navigation \(status)", dataRoot: dataRoot)
         } catch {
@@ -363,7 +367,7 @@ public struct BrowserActionRoutes: Sendable {
         guard case .object(let payload) = approval.payload,
               case .string(let rawURL)? = payload["url"],
               case .string(let runID)? = payload["runId"] ?? payload["run_id"],
-              let parsed = try? validBrowserURL(rawURL) else {
+              let parsed = try? ValidBrowserURL(rawURL) else {
             return
         }
         let browser = SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
@@ -392,7 +396,7 @@ public struct BrowserActionRoutes: Sendable {
                 NSLocalizedDescriptionKey: "Browser rejection returned no canonical run"
             ])
         }
-        let committedStatus = SwiftNativeBrowserClient.objectString(committed, "status") ?? status
+        let committedStatus = committed.objectValue?["status"]?.stringValue ?? status
         try await effects.annotateApprovalExecution(
             id: approval.id,
             executedAction: committed,
@@ -421,21 +425,29 @@ public struct BrowserActionRoutes: Sendable {
         try effects.acquireBrowser(runID: runID)
         defer { effects.releaseBrowser(runID: runID) }
         let nav = try await effects.navigate(url, runID: runID)
-        try Task.checkCancellation()
-        let text = captureSource ? (try await effects.readText()) : nil
-        try Task.checkCancellation()
-        var readFailures: [String: String] = [:]
+        var text: String?
+        var textChars: Int?
         var links: [BrowserLink]?
-        if captureSource {
-            do { links = try await effects.readLinks() } catch { readFailures["links"] = error.localizedDescription }
-        }
-        try Task.checkCancellation()
-        var textChars = text?.count
-        if text == nil {
-            do { textChars = try await effects.readText().count } catch { readFailures["textChars"] = error.localizedDescription }
-        }
-        let screenshot = captureScreenshot ? (try await effects.screenshot()) : nil
-        try Task.checkCancellation()
+        var screenshot: Data?
+        var readFailures: [String: String] = [:]
+        do {
+            try Task.checkCancellation()
+            if captureSource { text = try await effects.readText(); textChars = text?.count }
+            try Task.checkCancellation()
+            if captureSource {
+                do { links = try await effects.readLinks() }
+                catch { readFailures["links"] = error.localizedDescription }
+            }
+            try Task.checkCancellation()
+            if text == nil {
+                do { textChars = try await effects.readText().count }
+                catch { readFailures["textChars"] = error.localizedDescription }
+            }
+            try Task.checkCancellation()
+            if captureScreenshot { screenshot = try await effects.screenshot() }
+        } catch is CancellationError { readFailures["canceled"] = "Capture stopped after navigation." }
+        catch { readFailures["capture"] = error.localizedDescription }
+        if Task.isCancelled { readFailures["canceled"] = "Capture stopped after navigation." }
         return BrowserVisibleCapture(
             url: url,
             nav: nav,
@@ -552,26 +564,26 @@ public struct BrowserActionRoutes: Sendable {
         id: String,
         url: URL,
         png: Data,
-        dataRoot: URL = PersistenceCore.defaultDataRoot()
+        dataRoot: URL = PersistenceCore.defaultDataRoot(),
+        showToModel: Bool = true
     ) async throws -> [String: JSONValue] {
         let browser = SwiftNativeBrowserClient.defaultClient(dataRoot: dataRoot)
         let paths = try await BrowserCaptureCache.shared.store(
             id: id, artifacts: [.screenshot: png], browserRoot: browser.screenshotsDir.deletingLastPathComponent())
         guard let path = paths[.screenshot] else { throw CocoaError(.fileWriteUnknown) }
-        // A screenshot exists to be LOOKED at. 2026-09-13: it came back as a
-        // path, so seeing it cost a second turn with read_file — the same
-        // complaint Agent raised about image_generate. The thumbnail rides
-        // back on this result; the full-size PNG stays at pngPath. Outside a
-        // model turn (the wander lane) there is no sink and `shown` is false.
-        let shown = effects.showProducedImage(at: path, name: "\(id).png")
-        return [
+        // The turn image sink shows the thumbnail (no sink means shown is false); the full-size PNG stays at pngPath.
+        var receipt: [String: JSONValue] = [
             "url": .string(url.absoluteString),
             "pngPath": .string(path.path),
             "bytes": .int(Int64(png.count)),
-            "shownToModel": .bool(shown.shown),
-            "visionNote": .string(shown.note),
             "captureRetention": BrowserCaptureCache.shared.policy.receipt,
         ]
+        if showToModel {
+            let shown = effects.showProducedImage(at: path, name: "\(id).png")
+            receipt["shownToModel"] = .bool(shown.shown)
+            receipt["visionNote"] = .string(shown.note)
+        }
+        return receipt
     }
 
     private func connectorInputBool(_ raw: JSONValue?, default defaultValue: Bool) -> Bool {

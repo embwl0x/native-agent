@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 // Blueprint: | `BotRunner.swift` | `BotRunner` actor; `run`, `ask` |
 
 /// The app supplies the helper's own turn runner; StandingBots owns its
@@ -113,8 +114,10 @@ public actor BotRunner {
         let sessionID: String
         private let lock = NSLock()
         private var verdict: Bool?
+        private var malformed: String?
         init(sessionID: String) { self.sessionID = sessionID }
         var met: Bool? { lock.lock(); defer { lock.unlock() }; return verdict }
+        var problem: String? { lock.lock(); defer { lock.unlock() }; return malformed }
 
         func consume(_ reply: String) -> String {
             var lines = reply.components(separatedBy: "\n")
@@ -122,9 +125,17 @@ public actor BotRunner {
             let decoration = CharacterSet(charactersIn: " \t*_`")
             let line = lines.last?.trimmingCharacters(in: decoration).uppercased() ?? ""
             guard line.hasPrefix(BotRunner.conditionMarker) else { return reply }
+            let value = line.dropFirst(BotRunner.conditionMarker.count).trimmingCharacters(in: decoration)
             lock.lock()
-            verdict = line.dropFirst(BotRunner.conditionMarker.count).trimmingCharacters(in: decoration).hasPrefix("YES")
+            switch value {
+            case "YES": verdict = true; malformed = nil
+            case "NO": verdict = false; malformed = nil
+            default:
+                verdict = nil
+                malformed = "Tell me if: the run returned an invalid verdict (expected TELL: yes or TELL: no), so no notification was sent."
+            }
             lock.unlock()
+            guard value == "YES" || value == "NO" else { return reply }
             lines.removeLast()
             return lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
         }
@@ -164,8 +175,7 @@ public actor BotRunner {
         let ask = condition.flatMap { $0.isEmpty ? nil : $0 }.map {
             "\n\nTell me if: \($0)\nEnd your reply with one last line on its own: \(Self.conditionMarker) yes if this run's result meets that condition, otherwise \(Self.conditionMarker) no. The app reads that line to decide whether to notify the person, and removes it."
         } ?? ""
-        let message = "You are \(bot.name), executing this standing job now. Complete the work and return its result in this turn; do not invoke or wait on your own Run control.\n\n"
-            + bot.brief + woke + (bot.outputFormat.map { "\n\n" + $0 } ?? "") + ask
+        let message = "Execute your standing job now. Complete the work and return its result in this turn; do not invoke or wait on your own Run control." + woke + ask
         // This run is now on the task's stack: anything it reaches that asks
         // for THIS bot again is refused rather than parked on its own claim.
         return try await BotRunQueue.$ancestry.withValue(BotRunQueue.ancestry.union([id])) {
@@ -248,7 +258,8 @@ public actor BotRunner {
         }
         let met = outcome.status == .completed && verdict?.met == true
         if judgesCondition, outcome.status == .completed, verdict?.met == nil {
-            outcome.detail = outcome.detail ?? "Tell me if: the run did not say whether its condition was met, so no notification was sent."
+            let problem = verdict?.problem ?? "Tell me if: the run did not say whether its condition was met, so no notification was sent."
+            outcome.detail = [outcome.detail, problem].compactMap { $0 }.joined(separator: "\n")
         }
         let elapsed = clock.duration(to: .now)
         let seconds = Double(elapsed.components.seconds) + Double(elapsed.components.attoseconds) / 1e18

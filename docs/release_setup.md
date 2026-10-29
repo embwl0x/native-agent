@@ -102,7 +102,9 @@ NATIVEAGENT_EMBEDDING_DOWNLOAD_MANIFEST=/path/to/NativeAgent-X.Y.Z.embedding.jso
 ```
 
 Replace the manifest path with the actual descriptor. Bundled development
-installs remain the default and remove any staged download descriptor.
+installs remain the default. Assembly finishes model resources, the optional
+descriptor and documentation before the builder signs; installation verifies
+and transfers that signed bundle.
 
 For delta updates in separate-download mode, retain the previous **shipped,
 signed** DMG locally outside the appcast output directory. Set
@@ -146,9 +148,13 @@ artifacts. From a private maintainer checkout, create the public export:
 ```
 
 The exporter archives tracked source, removes private material, scrubs
-identities, verifies resources, creates fresh single-commit history and builds
-the exported source. It does not push. Review the export before publishing its
-source commit.
+identities, verifies resources and creates fresh single-commit history. Its
+`swift build` is the privacy gate compiling the **exported source** to prove
+the public tree builds and to check the linked executable for private identity
+strings. This is the release owner's check of the exported artifact, distinct
+from a lane's compile; lane build rules remain in [AGENTS.md](../AGENTS.md).
+The exporter does not push. Review the export before publishing its source
+commit.
 
 A published-mirror checkout already contains the tracked
 `.nativeagent-public-source` marker. Do not copy that marker into a private
@@ -182,7 +188,8 @@ signed, notarized and stapled.
 Production releases write an artifact-only receipt with
 `canonical_gate: "script/release.sh --artifact-only"`,
 `ios_required: false` and `ios_result: "not_run"`. The compatibility filename
-still ends in `.test-receipt.json`; it does not claim tests ran.
+still ends in `.test-receipt.json`; it does not claim tests ran. `--artifact-only`
+is an accepted spelling for this same path, with no separate release mode.
 Build, install and check the actual release app's requested behavior.
 
 ### Verify an existing artifact

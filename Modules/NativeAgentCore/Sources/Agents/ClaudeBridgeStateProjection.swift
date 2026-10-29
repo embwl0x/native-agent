@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import Cognition
 import NativeAgentCore
 import ProviderRouting
@@ -8,7 +9,9 @@ import ContextFlow
 import PersistenceCore
 import Procedures
 import PersonaEngine
-// Blueprint: | `ClaudeBridgeStateProjection.swift` | `ClaudeBridgeStateProjection` enum; `procedureStatusJSON`, `microcycleTelemetryJSON` |
+import NotificationInbox
+import Transcripts
+// Blueprint: | `ClaudeBridgeStateProjection.swift` | `ClaudeBridgeReadout` enum; `procedureStatusJSON`, `microcycleTelemetryJSON` |
 
 /// App-owned preferences and transport activity, plus the existing runtime owners.
 /// Core chooses state fields; the app encodes and writes the resulting payload.
@@ -22,7 +25,7 @@ public protocol ClaudeBridgeStatePort: Sendable {
 }
 
 /// Semantic bridge state projection shared with the Core conversation owner.
-public enum ClaudeBridgeStateProjection {
+public enum ClaudeBridgeReadout {
     static func procedureStatusJSON(_ status: ProcedureArtifactStatusSnapshot) -> [String: Any] {
         [
             "schema": "compiled.procedure.status.v1",
@@ -44,21 +47,20 @@ public enum ClaudeBridgeStateProjection {
     }
 
     static func microcycleTelemetryJSON(_ telemetry: CognitiveMicrocycleTelemetry) -> [String: Any] {
-        let iso = ISO8601DateFormatter()
         return [
             "schema": "cognition.microcycle.telemetry.v1",
             "runtimeInstanceId": telemetry.runtimeInstanceId,
             "processIdentifier": Int(telemetry.processIdentifier),
-            "runtimeInitializedAt": iso.string(from: telemetry.runtimeInitializedAt),
+            "runtimeInitializedAt": NativeTimestampFormat.plainZulu(telemetry.runtimeInitializedAt),
             "scheduledSignals": telemetry.scheduledSignalCount,
             "coalescedReplacements": telemetry.coalescedReplacementCount,
             "executed": telemetry.executedCount,
             "completed": telemetry.completedCount,
             "skipped": telemetry.skippedCount,
             "failed": telemetry.failedCount,
-            "lastScheduledAt": telemetry.lastScheduledAt.map { iso.string(from: $0) } ?? NSNull(),
-            "lastStartedAt": telemetry.lastStartedAt.map { iso.string(from: $0) } ?? NSNull(),
-            "lastFinishedAt": telemetry.lastFinishedAt.map { iso.string(from: $0) } ?? NSNull(),
+            "lastScheduledAt": telemetry.lastScheduledAt.map { NativeTimestampFormat.plainZulu($0) } ?? NSNull(),
+            "lastStartedAt": telemetry.lastStartedAt.map { NativeTimestampFormat.plainZulu($0) } ?? NSNull(),
+            "lastFinishedAt": telemetry.lastFinishedAt.map { NativeTimestampFormat.plainZulu($0) } ?? NSNull(),
             "lastReason": telemetry.lastReason ?? NSNull(),
             "lastOutcome": telemetry.lastOutcome ?? NSNull(),
             "lastDurationMilliseconds": telemetry.lastDurationMilliseconds ?? NSNull(),
@@ -86,7 +88,6 @@ public enum ClaudeBridgeStateProjection {
                 "lastError": NSNull(),
             ]
         }
-        let iso = ISO8601DateFormatter()
         return [
             "mode": health.mode.rawValue,
             "started": health.started,
@@ -98,23 +99,22 @@ public enum ClaudeBridgeStateProjection {
             "activeLeases": health.arenaMetrics.activeLeaseCount,
             "pressure": health.arenaMetrics.pressure.rawValue,
             "prewarmingAllowed": health.arenaMetrics.prewarmingAllowed,
-            "lastReconciledAt": health.lastReconciledAt.map { iso.string(from: $0) as Any }
+            "lastReconciledAt": health.lastReconciledAt.map { NativeTimestampFormat.plainZulu($0) as Any }
                 ?? NSNull(),
             "lastError": health.lastError.map { $0 as Any } ?? NSNull(),
         ]
     }
 
     public static func organismSnapshotJSON(_ snapshot: OrganismSnapshot) -> [String: Any] {
-        let iso = ISO8601DateFormatter()
-        let lastSignalAt: Any = snapshot.lastSignalAt.map { iso.string(from: $0) } ?? NSNull()
+        let lastSignalAt: Any = snapshot.lastSignalAt.map { NativeTimestampFormat.plainZulu($0) } ?? NSNull()
         return [
-            "generatedAt": iso.string(from: snapshot.generatedAt),
+            "generatedAt": NativeTimestampFormat.plainZulu(snapshot.generatedAt),
             "enabled": snapshot.enabled,
             "promptVisibleBodyLine": snapshot.projectedBodyLine ?? NSNull(),
             "hasPromptVisibleBodyLine": snapshot.projectedBodyLine != nil,
             "signalCount": snapshot.signalCount,
             "lastSignalAt": lastSignalAt,
-            "bodySchema": Self.organismBodySchemaJSON(snapshot.bodySchema, iso: iso),
+            "bodySchema": Self.organismBodySchemaJSON(snapshot.bodySchema),
             "chemicalState": [
                 "warmth": snapshot.chemicalState.warmth,
                 "vigilance": snapshot.chemicalState.vigilance,
@@ -139,15 +139,15 @@ public enum ClaudeBridgeStateProjection {
             "dreamRepair": Self.dreamRepairSummaryJSON(snapshot.dreamRepairSummary),
             "residualRepair": [
                 "pressure": snapshot.residualRepairOpportunity.pressure,
-                "predictionResidual": snapshot.residualRepairOpportunity.predictionResidual,
-                "fieldChargeResidual": snapshot.residualRepairOpportunity.fieldChargeResidual,
+                "predictionResidual": snapshot.residualRepairOpportunity.components.predictionResidual,
+                "fieldChargeResidual": snapshot.residualRepairOpportunity.components.fieldChargeResidual,
                 "fieldUncertaintyResidual": snapshot.residualRepairOpportunity.fieldUncertaintyResidual,
                 "evidenceCount": snapshot.residualRepairOpportunity.evidenceCount,
                 "chargedTargetCount": snapshot.residualRepairOpportunity.chargedNodeIDs.count,
                 "noisyTargetCount": snapshot.residualRepairOpportunity.noisyEdgeIDs.count,
                 "ready": snapshot.residualRepairOpportunity.ready,
-                "quietUntil": snapshot.residualRepairOpportunity.quietUntil.map { iso.string(from: $0) } ?? NSNull(),
-                "nextRepairAt": snapshot.residualRepairOpportunity.nextRepairAt.map { iso.string(from: $0) } ?? NSNull(),
+                "quietUntil": snapshot.residualRepairOpportunity.quietUntil.map { NativeTimestampFormat.plainZulu($0) } ?? NSNull(),
+                "nextRepairAt": snapshot.residualRepairOpportunity.nextRepairAt.map { NativeTimestampFormat.plainZulu($0) } ?? NSNull(),
             ],
             "capabilityBeliefs": snapshot.capabilityBeliefs.map { belief in
                 [
@@ -158,7 +158,7 @@ public enum ClaudeBridgeStateProjection {
                     "resolvedEvidenceCount": belief.resolvedEvidenceCount,
                     "expiredEvidenceCount": belief.expiredEvidenceCount,
                     "freshness": belief.freshness,
-                    "lastEvidenceAt": belief.lastEvidenceAt.map { iso.string(from: $0) } ?? NSNull(),
+                    "lastEvidenceAt": belief.lastEvidenceAt.map { NativeTimestampFormat.plainZulu($0) } ?? NSNull(),
                     "evidenceBasis": belief.evidenceBasis.rawValue,
                 ] as [String: Any]
             },
@@ -166,10 +166,7 @@ public enum ClaudeBridgeStateProjection {
         ]
     }
 
-    static func organismBodySchemaJSON(
-        _ body: BodySchema,
-        iso: ISO8601DateFormatter = ISO8601DateFormatter()
-    ) -> [String: Any] {
+    static func organismBodySchemaJSON(_ body: BodySchema) -> [String: Any] {
         [
             "macAwake": body.macAwake,
             "iPhoneReachable": body.iPhoneReachable,
@@ -181,22 +178,20 @@ public enum ClaudeBridgeStateProjection {
                     "freshness": belief.freshness,
                     "uncertainty": belief.uncertainty,
                     "evidenceCount": belief.evidenceCount,
-                    "newestEvidenceAt": belief.newestEvidenceAt.map { iso.string(from: $0) } ?? NSNull(),
+                    "newestEvidenceAt": belief.newestEvidenceAt.map { NativeTimestampFormat.plainZulu($0) } ?? NSNull(),
                     "state": belief.state.rawValue,
                 ] as [String: Any]
             } ?? NSNull(),
             "peerPresenceBelief": body.peerPresenceBelief.map { belief -> Any in
                 Self.bodyBeliefJSON(
                     category: belief.category.rawValue,
-                    metrics: belief.metrics,
-                    iso: iso
+                    metrics: belief.metrics
                 )
             } ?? NSNull(),
             "notificationDeliveryBelief": body.notificationDeliveryBelief.map { belief -> Any in
                 Self.bodyBeliefJSON(
                     category: belief.category.rawValue,
                     metrics: belief.metrics,
-                    iso: iso,
                     details: [
                         "transportConfigured": belief.transportConfigured,
                         "transportAccepted": belief.transportAccepted,
@@ -210,15 +205,13 @@ public enum ClaudeBridgeStateProjection {
             "memoryIntegrityReading": body.memoryIntegrityReading.map { reading -> Any in
                 Self.bodyBeliefJSON(
                     category: reading.category.rawValue,
-                    metrics: reading.metrics,
-                    iso: iso
+                    metrics: reading.metrics
                 )
             } ?? NSNull(),
             "dreamIntegrityReading": body.dreamIntegrityReading.map { reading -> Any in
                 Self.bodyBeliefJSON(
                     category: reading.category.rawValue,
                     metrics: reading.metrics,
-                    iso: iso,
                     details: ["storeAvailable": reading.storeAvailable]
                 )
             } ?? NSNull(),
@@ -226,7 +219,6 @@ public enum ClaudeBridgeStateProjection {
                 Self.bodyBeliefJSON(
                     category: reading.category.rawValue,
                     metrics: reading.metrics,
-                    iso: iso,
                     details: [
                         "configured": reading.configured,
                         "liveCapabilityObserved": reading.liveCapabilityObserved,
@@ -237,7 +229,6 @@ public enum ClaudeBridgeStateProjection {
                 Self.bodyBeliefJSON(
                     category: reading.category.rawValue,
                     metrics: reading.metrics,
-                    iso: iso,
                     details: ["writable": reading.writable]
                 )
             } ?? NSNull(),
@@ -245,7 +236,6 @@ public enum ClaudeBridgeStateProjection {
                 Self.bodyBeliefJSON(
                     category: reading.category.rawValue,
                     metrics: reading.metrics,
-                    iso: iso,
                     details: [
                         "thermalPressure": reading.thermalPressure.rawValue,
                     ]
@@ -263,7 +253,6 @@ public enum ClaudeBridgeStateProjection {
     private static func bodyBeliefJSON(
         category: String,
         metrics: BodyBeliefMetrics,
-        iso: ISO8601DateFormatter,
         details: [String: Any] = [:]
     ) -> [String: Any] {
         var result: [String: Any] = [
@@ -273,9 +262,9 @@ public enum ClaudeBridgeStateProjection {
             "freshness": metrics.freshness,
             "evidenceCount": metrics.evidence.count,
             "evidenceClasses": Array(Set(metrics.evidence.map { $0.evidenceClass.rawValue })).sorted(),
-            "observedAt": metrics.observedAt.map { iso.string(from: $0) } ?? NSNull(),
-            "receivedAt": metrics.receivedAt.map { iso.string(from: $0) } ?? NSNull(),
-            "nextMeaningfulExpiry": metrics.nextMeaningfulExpiry.map { iso.string(from: $0) } ?? NSNull(),
+            "observedAt": metrics.observedAt.map { NativeTimestampFormat.plainZulu($0) } ?? NSNull(),
+            "receivedAt": metrics.receivedAt.map { NativeTimestampFormat.plainZulu($0) } ?? NSNull(),
+            "nextMeaningfulExpiry": metrics.nextMeaningfulExpiry.map { NativeTimestampFormat.plainZulu($0) } ?? NSNull(),
         ]
         for (key, value) in details { result[key] = value }
         return result
@@ -295,7 +284,6 @@ public enum ClaudeBridgeStateProjection {
     }
 
     private static func predictionSummaryJSON(_ summary: OrganismPredictionSummary) -> [String: Any] {
-        let iso = ISO8601DateFormatter()
         return [
             "pendingCount": summary.pendingCount,
             "satisfiedCount": summary.satisfiedCount,
@@ -305,7 +293,7 @@ public enum ClaudeBridgeStateProjection {
             "averagePendingUncertainty": summary.averagePendingUncertainty,
             "peripheralUncertainty": summary.peripheralUncertainty,
             "strategyCaution": summary.strategyCaution,
-            "lastViolationAt": summary.lastViolationAt.map { iso.string(from: $0) } ?? NSNull(),
+            "lastViolationAt": summary.lastViolationAt.map { NativeTimestampFormat.plainZulu($0) } ?? NSNull(),
             "bodyConfidence": [
                 "providerPath": summary.bodyConfidence.providerPath,
                 "toolPath": summary.bodyConfidence.toolPath,
@@ -317,10 +305,9 @@ public enum ClaudeBridgeStateProjection {
     }
 
     private static func dreamRepairSummaryJSON(_ summary: OrganismDreamRepairSummary) -> [String: Any] {
-        let iso = ISO8601DateFormatter()
         return [
             "receiptCount": summary.receiptCount,
-            "lastRepairAt": summary.lastRepairAt.map { iso.string(from: $0) } ?? NSNull(),
+            "lastRepairAt": summary.lastRepairAt.map { NativeTimestampFormat.plainZulu($0) } ?? NSNull(),
             "lastReason": summary.lastReason ?? NSNull(),
             "lastOperationCount": summary.lastOperationCount,
             "softenedNodes": summary.softenedNodes,
@@ -339,7 +326,7 @@ public enum ClaudeBridgeStateProjection {
     }
 }
 
-extension ClaudeBridgeStateProjection {
+extension ClaudeBridgeReadout {
     public static func statePayload(dataRoot: URL, port: any ClaudeBridgeStatePort) async -> [String: Any] {
         let readErrors = BridgeReadErrors()
         let routing: ProviderRoutingSnapshot?
@@ -402,10 +389,9 @@ extension ClaudeBridgeStateProjection {
     }
 
     private static func capsuleSummaryJSON(_ summary: CognitiveBridgeCapsuleSummary) -> [String: Any] {
-        let iso = ISO8601DateFormatter()
         return [
             "source": summary.source,
-            "generatedAt": summary.generatedAt.map { iso.string(from: $0) } ?? NSNull(),
+            "generatedAt": summary.generatedAt.map { NativeTimestampFormat.plainZulu($0) } ?? NSNull(),
             "hasBodyLine": summary.hasBodyLine,
             "bodyLine": summary.bodyLine ?? NSNull(),
             "dynamicContextCharacters": summary.dynamicContextCharacters,
@@ -413,12 +399,8 @@ extension ClaudeBridgeStateProjection {
         ]
     }
 
-    /// Collector for `/claude/state` read failures. The state helpers all fail
-    /// soft (an absent file is a legitimate "nothing here yet"), which used to
-    /// make "no providers / no session / no inbox" indistinguishable from a
-    /// permissions error or a half-written JSON file. Absent stays silent;
-    /// unreadable or undecodable gets a row here and is published as
-    /// `readErrors` so the caller can tell the two apart.
+    /// Absent state stays silent; unreadable or undecodable state is published
+    /// in `/claude/state`'s `readErrors`.
     final class BridgeReadErrors {
         private(set) var messages: [String] = []
         func note(_ url: URL, _ reason: String) {
@@ -426,21 +408,9 @@ extension ClaudeBridgeStateProjection {
         }
     }
 
-    /// Returns nil for BOTH absent (silent) and unreadable (noted).
-    private static func readStateFile(_ url: URL, errors: BridgeReadErrors?) -> Data? {
-        do {
-            return try Data(contentsOf: url)
-        } catch let error as NSError {
-            let absent = error.domain == NSCocoaErrorDomain
-                && (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError)
-            if !absent { errors?.note(url, "read failed: \(error.localizedDescription)") }
-            return nil
-        }
-    }
-
     public static func readActivePersona(dataRoot: URL, preferred: String?) -> String? {
         if let s = preferred, !s.isEmpty { return s }
-        let root = PersonaRootResolver.resolve(dataRootProvider: { dataRoot })
+        let root = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
         return try? PersonaCompiler.selectedPersonaID(root: root, personaOverride: nil)
     }
 
@@ -457,15 +427,13 @@ extension ClaudeBridgeStateProjection {
         errors: BridgeReadErrors?
     ) -> (id: String?, updatedAt: String?) {
         let url = dataRoot.appendingPathComponent("chat/sessions.json")
-        guard let data = readStateFile(url, errors: errors) else { return (nil, nil) }
-        guard let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-            errors?.note(url, "decode failed: not a JSON array of objects")
+        do {
+            let rows = try ChatSessionIndexFile.loadObjectRowsForMutation(at: url)
+            return Self.bridgeActiveSession(preferred: preferred(), rows: rows.map { $0.mapValues(\.foundationObject) })
+        } catch {
+            errors?.note(url, error.localizedDescription)
             return (nil, nil)
         }
-        return Self.bridgeActiveSession(
-            preferred: preferred(),
-            rows: arr
-        )
     }
 
     static func bridgeActiveSession(
@@ -492,33 +460,23 @@ extension ClaudeBridgeStateProjection {
         limit: Int,
         errors: BridgeReadErrors? = nil
     ) -> [[String: Any]] {
-        // A5.2 (2026-07-23): read the LIVE inbox the UI/getInboxItems/iOS read,
-        // not the retired `inbox/items.jsonl` silo (last written Jun 12, dead).
-        let url = dataRoot
-            .appendingPathComponent("notifications", isDirectory: true)
-            .appendingPathComponent("inbox.jsonl")
-        guard let data = readStateFile(url, errors: errors) else { return [] }
-        guard let raw = String(data: data, encoding: .utf8) else {
-            errors?.note(url, "decode failed: not UTF-8")
+        let url = LiveNotificationInbox.livePath(dataRoot: dataRoot)
+        let lines: [LiveNotificationInbox.Line]
+        do { lines = try LiveNotificationInbox.readLines(url) }
+        catch {
+            errors?.note(url, "read failed: \(error.localizedDescription)")
             return []
         }
-        var items: [[String: Any]] = []
-        var malformedLines = 0
-        let lines = raw.split(separator: "\n", omittingEmptySubsequences: true)
-        for line in lines.suffix(limit * 2) {
-            guard let lineData = String(line).data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else {
-                malformedLines += 1
-                continue
-            }
-            items.append([
-                "id": obj["id"] ?? NSNull(),
-                "kind": obj["source"] ?? NSNull(),
-                "title": obj["title"] ?? NSNull(),
-                "body": obj["summary"] ?? NSNull(),
-                "createdAt": obj["created_at"] ?? NSNull(),
-            ])
+        let selected = lines.filter { !$0.raw.isEmpty }.suffix(limit * 2)
+        let items: [[String: Any]] = selected.compactMap { line in
+            guard let obj = line.row?.objectValue else { return nil }
+            return ["id": obj["id"]?.foundationObject ?? NSNull(),
+                "kind": obj["source"]?.foundationObject ?? NSNull(),
+                "title": obj["title"]?.foundationObject ?? NSNull(),
+                "body": obj["summary"]?.foundationObject ?? NSNull(),
+                "createdAt": obj["created_at"]?.foundationObject ?? NSNull()]
         }
+        let malformedLines = selected.count - items.count
         if malformedLines > 0 {
             errors?.note(url, "decode failed: \(malformedLines) undecodable JSONL line(s)")
         }

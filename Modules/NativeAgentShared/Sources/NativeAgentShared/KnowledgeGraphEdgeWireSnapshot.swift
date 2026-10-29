@@ -2,8 +2,19 @@ import Foundation
 
 // Blueprint: | `KnowledgeGraphEdgeWireSnapshot.swift` | `KnowledgeGraphEdgeWireSnapshot`: shared immutable edge decoding; platform wrappers retain UI identity and extra fields |
 
-/// Common edge snapshot decoding; platform wrappers retain UI identity and extra fields.
-public struct KnowledgeGraphEdgeWireSnapshot: Decodable {
+public let knowledgeGraphTypeSymbols: [String: String] = [
+    "person": "person.circle",
+    "organization": "building.2",
+    "project": "folder",
+    "concept": "lightbulb",
+    "place": "mappin.circle",
+    "event": "calendar",
+    "tool": "wrench.and.screwdriver",
+    "fact": "text.quote",
+]
+
+/// Common edge snapshot decoding; platform presentation supplies UI identity.
+public struct KnowledgeGraphEdgeWireSnapshot: Decodable, Equatable, Sendable {
     public let from: String
     public let to: String
     public let kind: String

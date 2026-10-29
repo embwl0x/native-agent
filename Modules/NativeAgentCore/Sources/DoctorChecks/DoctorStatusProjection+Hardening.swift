@@ -1,7 +1,7 @@
 import Foundation
-// Blueprint: | `DoctorStatusProjection+Hardening.swift` | `DoctorStatusProjection`: `getProductionHardening` |
+// Blueprint: | `DoctorStatusProjection+Hardening.swift` | `DoctorReadout`: `getProductionHardening` |
 
-extension DoctorStatusProjection {
+extension DoctorReadout {
     public static func getProductionHardening(dataRoot: URL) async throws -> ProductionHardeningSummary {
         // The hardening report is an operator-produced authority. A missing
         // report means no report has been recorded; an existing unreadable or

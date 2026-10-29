@@ -17,7 +17,7 @@ public struct ModelCompensationsCheck: DoctorCheck {
     /// Census IDs with shim.fired sites in this build. Off-turn-only lanes and
     /// the deleted mechanisms are excluded; silence here means zero receipts.
     private static let censusIDs = [
-        "P10", "P11", "P15", "P16",
+        "P10", "P11",
         "C02", "C04", "C06", "C07", "C09",
         "L01", "L10", "L12", "L13",
         "L22", "L23", "L24",
@@ -51,10 +51,11 @@ public struct ModelCompensationsCheck: DoctorCheck {
             floor: window.floor,
             kinds: ["llm.call", "shim.fired"]
         ) { row in
+            let payload = row.payload.objectValue ?? [:]
             guard !row.turnId.isEmpty else { return }
-            if row.kind == "llm.call", row.payload["shapeVersion"]?.stringValue == "v2Prefix" {
+            if row.kind == "llm.call", payload["shapeVersion"]?.stringValue == "v2Prefix" {
                 turns.insert(row.turnId)
-            } else if row.kind == "shim.fired", let id = row.payload["id"]?.stringValue {
+            } else if row.kind == "shim.fired", let id = payload["id"]?.stringValue {
                 counts[id, default: 0] += 1
             }
         }

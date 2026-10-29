@@ -4,23 +4,17 @@ import Desk
 
 // Blueprint: | `DeskNagsPanel.swift` | `DeskNagsPanel`: current nag configuration reads and explicit owner controls through Desk quick actions |
 
-// MARK: - DeskNagsPanel — User's nag switch, in the UI (C6)
+// MARK: - Desk nag controls
 //
-// Sweep R4 W5. NagConfig/NagEvaluator shipped with control ONLY via the
-// `desk_nag_control` chat tool: User had to ASK Agent to turn his own pressure
-// on. This popover is the switch itself.
-//
-// READS come straight off `DeskNagConfigStore.load()` — the same file the tool
-// reads, no cache. WRITES go through `DeskQuickAction.nag*`, which dispatches
-// `desk_nag_control` and therefore lands in `impl_desk_nag_control`: same
-// flock, same window-bump semantics, same unmute drift digest. Nothing here
-// touches DeskNagConfig directly.
+// Reads use the supplied Desk revision from DeskFacade.readRevision().
+// DeskQuickAction.nag* dispatches desk_nag_control; its store owns locked
+// mutations, window bumps and unmute drift summaries.
 
 struct DeskNagsPanel: View {
     let items: [DeskItem]
     let selectedHandle: String?
     let selectedTitle: String?
-    /// Fires the action and, when it lands, hands back the refreshed config.
+    /// Dispatches the action; Desk refresh supplies the resulting configuration.
     let perform: (DeskQuickAction) -> Void
     let config: DeskNagConfig
     let isBusy: Bool
@@ -53,9 +47,7 @@ struct DeskNagsPanel: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 3) {
             Text("Nagging").font(.headline)
-            // The honest state line, including the "armed but silent" case —
-            // a lane switched on under a global OFF pings nothing, and letting
-            // User believe otherwise is the one failure this panel must not have.
+            // An enabled lane stays silent while the global switch is off.
             Text(DeskNagPanelModel.summary(config, items: items, now: Date()))
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

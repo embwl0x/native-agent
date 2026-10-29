@@ -6,11 +6,10 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="release"
-ARTIFACT_ONLY=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --preflight) MODE="preflight" ;;
-    --artifact-only) ARTIFACT_ONLY=true ;;
+    --artifact-only) ;;
     *) echo "usage: $0 [--preflight] [--artifact-only]" >&2; exit 2 ;;
   esac
   shift
@@ -167,6 +166,4 @@ export NATIVEAGENT_PROVISIONING_PROFILE="$PROVISIONING_PROFILE"
 export NATIVEAGENT_ICLOUD_BUILD="$PUBLIC_DEVICE_SYNC"
 export NATIVEAGENT_SKIP_DMG_SIGN=1
 
-RELEASE_ARGS=( --publish-appcast )
-[[ "$ARTIFACT_ONLY" == "true" ]] && RELEASE_ARGS+=( --artifact-only )
-exec "$ROOT/script/release.sh" "${RELEASE_ARGS[@]}"
+exec "$ROOT/script/release.sh" --publish-appcast

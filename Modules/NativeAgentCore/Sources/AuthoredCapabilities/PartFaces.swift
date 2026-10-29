@@ -84,9 +84,9 @@ public final class PartFaces {
             let version: String
             do {
                 guard let file = try AbilityStore(dataRoot: dataRoot).read(id: id),
-                      file.record?["status"] == .string("active"),
+                      file.record["status"] == .string("active"),
                       file.part["face"]?.objectValue?["projection"] == .bool(true),
-                      let selected = file.record?["codeFingerprint"]?.stringValue else {
+                      let selected = file.record["codeFingerprint"]?.stringValue else {
                     throw PartCallError(code: "unavailable", message: "The part has no selected projection face.")
                 }
                 version = selected
@@ -99,7 +99,7 @@ public final class PartFaces {
                     error: .init(code: "unavailable", message: unavailable), owed: owed)
             }
             if let cached = snapshots[id], cached.version == version, cached.sourceEpoch == epoch,
-               cached.status != .unavailable, cached.error?.code != "cancelled" {
+               cached.status == .ready {
                 return .init(part: id, version: version, sourceEpoch: epoch, status: cached.status,
                     face: cached.face, error: cached.error, owed: owed)
             }

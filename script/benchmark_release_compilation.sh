@@ -36,7 +36,7 @@ cleanup_benchmark() {
 }
 trap cleanup_benchmark EXIT
 
-START_DIGEST="$(nativeagent_source_state_digest "$ROOT")"
+START_DIGEST="$(nativeagent_source_content_id "$ROOT")"
 run_build() {
   local name="$1"; shift
   local scratch="$SCRATCH/$name" log="$SCRATCH/$name.log"
@@ -62,12 +62,12 @@ run_build() {
 }
 
 run_build default
-[[ "$(nativeagent_source_state_digest "$ROOT")" == "$START_DIGEST" ]] || {
+[[ "$(nativeagent_source_content_id "$ROOT")" == "$START_DIGEST" ]] || {
   echo "[compile-benchmark] ERROR: source changed during default build; results invalid" >&2
   exit 1
 }
 run_build no_wmo -Xswiftc -no-whole-module-optimization
-[[ "$(nativeagent_source_state_digest "$ROOT")" == "$START_DIGEST" ]] || {
+[[ "$(nativeagent_source_content_id "$ROOT")" == "$START_DIGEST" ]] || {
   echo "[compile-benchmark] ERROR: source changed during no-WMO build; results invalid" >&2
   exit 1
 }

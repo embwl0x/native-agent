@@ -1,75 +1,32 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `MacControl+OperationSupport.swift` | `SwiftNativeMacControl`: `attachingOperation`, `replayResult`, `unknownResult` |
 
-final class MacControlOneShot<Value: Sendable>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value: Value?
-    private var didResolve = false
-    private var continuation: CheckedContinuation<Value, Never>?
-
-    func resolve(_ value: Value) {
-        let waiter: CheckedContinuation<Value, Never>?
-        lock.lock()
-        guard !didResolve else {
-            lock.unlock()
-            return
-        }
-        didResolve = true
-        waiter = continuation
-        continuation = nil
-        if waiter == nil {
-            self.value = value
-        }
-        lock.unlock()
-        waiter?.resume(returning: value)
-    }
-
-    func wait() async -> Value {
-        await withCheckedContinuation { continuation in
-            lock.lock()
-            if didResolve, let value {
-                lock.unlock()
-                continuation.resume(returning: value)
-            } else {
-                self.continuation = continuation
-                lock.unlock()
-            }
-        }
-    }
-}
-
-enum MacControlExecutionSignal: @unchecked Sendable {
+enum MacControlExecutionSignal: Sendable {
     case result(Result<MacControlResult, Error>)
     case deadline
     case cancellationRequested
 }
 
-enum MacControlBoundedResult: @unchecked Sendable {
-    case result(Result<MacControlResult, Error>)
-    case elapsed
-}
-
-final class MacControlInFlightExecution: @unchecked Sendable {
+final class MacControlInFlightExecution: Sendable {
     let task: Task<MacControlResult, Error>
-    private let signal = MacControlOneShot<MacControlExecutionSignal>()
+    private let signal = ContinuationOnce<MacControlExecutionSignal>()
 
     init(task: Task<MacControlResult, Error>) {
         self.task = task
     }
 
     func wait() async -> MacControlExecutionSignal { await signal.wait() }
-    func finish(_ result: Result<MacControlResult, Error>) { signal.resolve(.result(result)) }
+    func finish(_ result: Result<MacControlResult, Error>) { signal.resume(.result(result)) }
 
     func requestCancellation() {
-        signal.resolve(.cancellationRequested)
-        task.cancel()
+        signal.resume(.cancellationRequested) { task.cancel() }
     }
 
     func reachDeadline() {
-        signal.resolve(.deadline)
-        task.cancel()
+        signal.resume(.deadline) { task.cancel() }
     }
 }
 
@@ -97,12 +54,7 @@ final class MacControlInFlightRegistry: @unchecked Sendable {
     }
 }
 
-/// What a receipt may claim about a Mac action, projected from the operation
-/// record's OWN state and verification rather than from the transport booleans
-/// that carry it back. `unknownResult` below deliberately returns `ok:false`
-/// for an action whose external effect could not be verified - the effect may
-/// well have happened - and every reader that classified that `false` as
-/// "Failed" invited a repeat of an action that already landed.
+/// The operation's state and verification own its verdict; transport errors are evidence.
 public enum MacControlReceiptOutcome: String, Sendable, Equatable {
     case running
     case succeeded
@@ -295,9 +247,8 @@ extension SwiftNativeMacControl {
         action: String,
         result: MacControlResult
     ) -> MotorVerificationState {
+        if let verification = result.verification { return verification }
         if resultTimedOut(result) || !result.ok { return .failed }
-        if case .object(let object) = result.output,
-           object["status"] == .string("acted_mismatch") { return .failed }
         if case .object(let object) = result.output,
            case .bool(let verified)? = object["verified"] {
             return verified ? .satisfied : .unverified

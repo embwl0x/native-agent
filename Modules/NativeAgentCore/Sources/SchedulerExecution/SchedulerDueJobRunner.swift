@@ -7,7 +7,6 @@ import TriggerScheduler
 // Blueprint: | `SchedulerDueJobRunner.swift` | `SchedulerDueJobRunner` actor; `runDueJobs`; reads canonical job rows through `SchedulerJobs`; resumable work obeys the originating DataRootLife, reads stopped/restored across lives and resumes fresh only on explicit request |
 
 public actor SchedulerDueJobRunner {
-    typealias CycleNotificationDelivery = @Sendable (String, String, String, String, String?) async -> JSONValue
     enum JobKind: String, CaseIterable, Sendable {
         case notify
         case connectorAction = "connector_action"
@@ -18,6 +17,9 @@ public actor SchedulerDueJobRunner {
         case workshop
         /// A part's `schedule:<cron>` wake: one job per part and schedule.
         case part
+        /// A turn of hers on a schedule: the job's prompt runs as one tool turn with her
+        /// full tools on her Chat route; the reply lands in the inbox under the job's name.
+        case turn
     }
 
     typealias DueJob = SwiftNativeTriggerScheduler.DueJob
@@ -27,6 +29,8 @@ public actor SchedulerDueJobRunner {
         let status: String
         let detail: String
         let output: JSONValue
+        /// The row keys a watch's read saw, kept on the job; nil keeps the last ones.
+        var seen: [String]? = nil
     }
 
     struct DreamDiarySnippet: Sendable {
@@ -37,19 +41,15 @@ public actor SchedulerDueJobRunner {
 
     let root: URL
     let platform: any SchedulerExecutionPlatform
-    let persistence = SwiftNativePersistenceCore()
     let schedulerJobs: SwiftNativeTriggerScheduler
-    let cycleNotificationDelivery: CycleNotificationDelivery
     /// The pass's first fault: unwritable activity evidence, unreadable or
     /// unrepairable job state, or a result that could not be settled. The loop
     /// owner reads it after a pass and publishes a failed loop receipt, so an
     /// unknown inventory never reads as "nothing due". Only a new pass clears it.
     public internal(set) var activityFeedError: String?
     var running = false
-    /// Bodies that crossed their caller-facing deadline but have not actually
-    /// exited yet. A new scheduler pass must not overlap them.
-    var inFlightJobBodies = 0
-    var jobBodyExitWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Channel receipts settled by the body, retained until its terminal result.
+    var notificationOutcomes: [String: JSONValue] = [:]
     /// A part's schedule that does not parse, said once rather than every pass.
     var reportedWakes: Set<String> = []
 
@@ -74,12 +74,6 @@ public actor SchedulerDueJobRunner {
         self.root = root
         self.schedulerJobs = SwiftNativeTriggerScheduler(root: root)
         self.platform = platform
-        self.cycleNotificationDelivery = { title, body, jobId, source, itemId in
-            await SchedulerDueJobRunner.deliverCycleNotification(
-                title: title, body: body, jobId: jobId, source: source, itemId: itemId,
-                platform: platform
-            )
-        }
     }
 
     var isLiveDataRoot: Bool {
@@ -87,7 +81,7 @@ public actor SchedulerDueJobRunner {
     }
 
     public func runDueJobs(maxJobs: Int = 5) async -> [String] {
-        if running || inFlightJobBodies > 0 { return [] }
+        if running { return [] }
         running = true
         defer { running = false }
         activityFeedError = nil
@@ -98,7 +92,6 @@ public actor SchedulerDueJobRunner {
             if !repaired.isEmpty {
                 try await appendActivity(
                     jobId: nil,
-                    kind: "scheduler",
                     title: "Default cycle schedules repaired",
                     detail: repaired.joined(separator: ", "),
                     status: "ok",
@@ -108,19 +101,16 @@ public actor SchedulerDueJobRunner {
             if let backfilled = try await backfillDreamReceiptIfNeeded(now: now) {
                 try await appendActivity(
                     jobId: "nativeagent-nightly-dream",
-                    kind: "dream",
                     title: "Dream cycle receipt backfilled",
                     detail: "Backfilled inbox item \(backfilled)",
                     status: "ok",
                     payload: .object(["inboxItemId": .string(backfilled)])
                 )
             }
-            let liveActions = platform.connectorActionIDs
-            let retiredJobs = try await schedulerJobs.pruneJobs { Self.pruneRetiredRows($0, liveActions: liveActions, now: now) }
+            let retiredJobs = try await schedulerJobs.pruneJobs { Self.pruneRetiredRows($0, now: now) }
             if retiredJobs > 0 {
                 try await appendActivity(
                     jobId: nil,
-                    kind: "scheduler",
                     title: "Scheduled Desk tasks retired",
                     detail: "Retired \(retiredJobs) job row(s); reasons recorded in scheduler/retired.jsonl",
                     status: "ok",
@@ -133,7 +123,6 @@ public actor SchedulerDueJobRunner {
             do {
                 try await appendActivity(
                     jobId: nil,
-                    kind: "scheduler",
                     title: "Default cycle schedule repair failed",
                     detail: error.localizedDescription,
                     status: "warn",
@@ -144,25 +133,22 @@ public actor SchedulerDueJobRunner {
         }
 
         var settled: [String] = []
-        // 2026-09-06: rows this pass cannot make progress on — a recovered
-        // claim whose notice would not write, or whose release failed. They are
-        // excluded from selection so the pass keeps reaching the other due jobs
-        // instead of re-detecting the same stuck row on every iteration.
+        // Defer stuck recovered claims for this pass so other due jobs can run.
         var deferredJobIds: Set<String> = []
         var exhaustedBatch = true
         // Claim exactly one occurrence immediately before its effect. Claiming
         // a whole batch would make later untouched rows look ambiguous if the
         // process crashed while executing the first row.
         for _ in 0..<max(1, maxJobs) {
+            guard !Task.isCancelled else { exhaustedBatch = false; break }
             let claimed: ClaimedDueJobs
             do {
-                claimed = try await claimDueJob(now: now, excludingJobIds: deferredJobIds)
+                claimed = try await claimDueJob(now: Date(), excludingJobIds: deferredJobIds)
             } catch {
                 noteFault("Scheduled Desk tasks could not be read: \(error.localizedDescription)")
                 do {
                     try await appendActivity(
                         jobId: nil,
-                        kind: "scheduler",
                         title: "Scheduled Desk task scan failed",
                         detail: error.localizedDescription,
                         status: "error",
@@ -201,14 +187,14 @@ public actor SchedulerDueJobRunner {
             // A blown deadline yields a loud failed(timeout) receipt, then this
             // pass stops. The timed-out body remains lifecycle-quarantined until
             // it actually exits, so no later scheduled effect can overlap it.
-            let rawResult = await executeWithTimeout(job: job, now: now)
+            let rawResult = await executeWithTimeout(job: job)
             let result = Self.attachingOccurrence(rawResult, key: job.occurrenceKey)
 
-            do {
+            let settlementRecorded = await settle { [self] in
+              do {
                 try await update(job: job, result: result, at: Date())
                 try await appendActivity(
                     jobId: job.id,
-                    kind: job.kind,
                     title: "Scheduled Desk task \(result.status)",
                     detail: "\(job.name): \(result.detail)",
                     status: result.status == "error" ? "error" : (result.status == "skipped" ? "warn" : "ok"),
@@ -223,13 +209,12 @@ public actor SchedulerDueJobRunner {
                 )
                 // Every settled occurrence is work this pass did, whatever its
                 // outcome; a failed job is never "nothing due".
-                settled.append("\(job.name) (\(result.status))")
+                return true
             } catch {
-                noteFault("\(job.name) ran (\(result.status)) but its result could not be settled: \(error.localizedDescription)")
+                await noteFault("\(job.name) ran (\(result.status)) but its result could not be settled: \(error.localizedDescription)")
                 do {
                     try await appendActivity(
                         jobId: job.id,
-                        kind: job.kind,
                         title: "Scheduled Desk task update failed",
                         detail: "scheduler_settlement_unconfirmed: \(job.name): result \(result.status); settlement is unconfirmed: \(error.localizedDescription). Inspect this occurrence's retained output and delivery receipts before resuming it.",
                         status: "error",
@@ -241,23 +226,14 @@ public actor SchedulerDueJobRunner {
                         ])
                     )
                 } catch {
-                    return settled
+                    return false
                 }
+                return false
+              }
             }
-            // Parent-cancel propagation (W3b Finding 2): if the scheduler loop was
-            // stopped mid-job, executeWithTimeout returned the loud .cancelled
-            // receipt (persisted just above). Stop here rather than starting the
-            // remaining due rows — each would only mint its own cancelled receipt.
-            if Task.isCancelled {
-                exhaustedBatch = false
-                break
-            }
-            if Self.isQuarantiningResult(result) {
-                // Keep the TriggerScheduler loop's actual tick alive until the
-                // timed-out effect body is gone. BackgroundLoopsManager may
-                // bound its caller at the outer deadline, but its registration
-                // then remains quarantined on this same child lifecycle.
-                await waitForInFlightJobBodies()
+            if settlementRecorded { settled.append("\(job.name) (\(result.status))") }
+            // The body has exited and settled; cancellation or timeout ends the batch.
+            if Task.isCancelled || Self.isQuarantiningResult(result) {
                 exhaustedBatch = false
                 break
             }
@@ -274,7 +250,6 @@ public actor SchedulerDueJobRunner {
         do {
             try await appendActivity(
                 jobId: recovery.jobId,
-                kind: recovery.kind,
                 title: recovery.reason == nil ? "Scheduled Desk task outcome needs reconciliation" : "Scheduled Desk task stopped",
                 detail: recovery.detail,
                 status: recovery.reason == nil ? "warn" : "stopped",
@@ -322,11 +297,7 @@ public actor SchedulerDueJobRunner {
             output = ["value": result.output]
         }
         output["occurrenceKey"] = .string(key)
-        return JobResult(status: result.status, detail: result.detail, output: .object(output))
+        return JobResult(status: result.status, detail: result.detail, output: .object(output), seen: result.seen)
     }
 
-    private func waitForInFlightJobBodies() async {
-        guard inFlightJobBodies > 0 else { return }
-        await withCheckedContinuation { jobBodyExitWaiters.append($0) }
-    }
 }

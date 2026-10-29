@@ -1,96 +1,6 @@
-import SwiftUI
-// Blueprint: | `MacToolsPresentation.swift` | `MacSystemQuickAction` enum |
-
-enum MacSystemQuickAction: String, CaseIterable, Sendable {
-    case lockScreen = "lock_screen"
-    case sleepDisplay = "sleep_display"
-}
-
-/// A system action may only claim completion after the matching Mac call has
-/// been issued successfully. Unknown strings are a failed completion and do
-/// not invoke the send closure.
-@MainActor
-enum MacSystemQuickActionExecution {
-    struct Completion: Equatable {
-        let state: RemoteActionState
-        let status: String
-        let detail: String
-        var approvalID: String? = nil
-    }
-
-    static func unsupported(named action: String) -> Completion {
-        let message = "Unsupported Mac system action: \(action)"
-        return Completion(state: .failed, status: message, detail: message)
-    }
-
-    static func execute(
-        named action: String,
-        send: @MainActor @Sendable (MacSystemQuickAction) async throws -> Void
-    ) async -> Completion {
-        guard let quickAction = MacSystemQuickAction(rawValue: action) else {
-            return unsupported(named: action)
-        }
-        return await execute(quickAction, send: send)
-    }
-
-    static func execute(
-        _ action: MacSystemQuickAction,
-        send: @MainActor @Sendable (MacSystemQuickAction) async throws -> Void
-    ) async -> Completion {
-        do {
-            try await send(action)
-            return Completion(
-                state: .ranOnMac,
-                status: "Done.",
-                detail: "Ran on Mac through iCloud"
-            )
-        } catch {
-            return Completion(
-                state: RemoteActionState.forError(error),
-                status: error.localizedDescription,
-                detail: error.localizedDescription,
-                approvalID: (error as? SyncError)?.approvalID
-            )
-        }
-    }
-}
-
-/// The Mac router has distinct remedies for an absent Shortcut and a policy
-/// refusal. Preserve that distinction instead of showing both as opaque raw
-/// transport errors on the phone.
-enum MacShortcutRunnerPresentation {
-    struct Failure: Equatable {
-        let status: String
-        let detail: String
-    }
-
-    static func failure(for error: Error, shortcutName: String) -> Failure {
-        let detail = error.localizedDescription
-        let normalized = detail.lowercased()
-
-        if normalized.contains("shortcut_not_found") || normalized.contains("shortcut not found") {
-            return Failure(
-                status: "Shortcut \"\(shortcutName)\" was not found on the Mac.",
-                detail: "Check the exact Shortcut name in the Mac Shortcuts app."
-            )
-        }
-
-        if normalized.contains("policy")
-            || normalized.contains("denied")
-            || normalized.contains("not allowed")
-            || normalized.contains("shortcuts_allowed") {
-            return Failure(
-                status: "Mac Control policy refused this Shortcut.",
-                detail: "Enable Shortcuts in the Mac app's Trust settings, then try again."
-            )
-        }
-
-        return Failure(
-            status: "Shortcut \"\(shortcutName)\" could not run.",
-            detail: detail
-        )
-    }
-}
+import Foundation
+import NativeAgentShared
+// Blueprint: | `MacToolsPresentation.swift` | Policy hints for shared executable phone actions, volume target wording, notification feedback and Spotlight results |
 
 /// The iPhone must not treat a missing Mac trust projection as evidence that
 /// Mac Control was intentionally disabled. The two cases have different owner
@@ -103,13 +13,13 @@ enum MacToolsPolicyGatePresentation {
         case enabled
     }
 
-    static func state(for policy: TrustMacControlPolicy?) -> State {
+    static func state(for policy: MacControlPolicyWireSnapshot?) -> State {
         guard let policy else { return .snapshotUnavailable }
         guard policy.enabled else { return .macControlDisabled }
         return policy.remoteFromIosAllowed ? .enabled : .iosRemoteDisabled
     }
 
-    static func disabledDescription(for policy: TrustMacControlPolicy?) -> String {
+    static func disabledDescription(for policy: MacControlPolicyWireSnapshot?) -> String {
         switch state(for: policy) {
         case .snapshotUnavailable:
             "No Mac Control policy snapshot yet. Keep the Mac app open until it publishes Trust settings."
@@ -127,40 +37,31 @@ enum MacToolsPolicyGatePresentation {
 /// the enclosing Mac Control policy has enabled this screen. Keeping their
 /// decision and owner-facing explanation together prevents a dimmed control
 /// from losing the reason it is unavailable.
-enum MacToolsPrivilege: CaseIterable {
-    case shortcuts
-    case notifications
-    case systemControl
-    case spotlight
-}
-
 enum MacToolsPrivilegePresentation {
-    static func isAllowed(_ privilege: MacToolsPrivilege, policy: TrustMacControlPolicy?) -> Bool {
+    static func isAllowed(_ privilege: PhoneMacControlAction, policy: MacControlPolicyWireSnapshot?) -> Bool {
         guard let policy else { return false }
         return switch privilege {
-        case .shortcuts: policy.shortcutsAllowed
-        case .notifications: policy.notificationsAllowed
-        case .systemControl: policy.systemControlAllowed
+        case .notification: policy.notificationsAllowed
+        case .volume: policy.systemControlAllowed
         case .spotlight: policy.spotlightAllowed
+        default: false
         }
     }
 
-    static func disabledDescription(for privilege: MacToolsPrivilege) -> String {
+    static func disabledDescription(for privilege: PhoneMacControlAction) -> String {
         switch privilege {
-        case .shortcuts: "Shortcuts are disabled by Mac Control policy."
-        case .notifications: "Notifications are disabled by Mac Control policy."
-        case .systemControl: "System controls are disabled by Mac Control policy."
+        case .notification: "Notifications are disabled by Mac Control policy."
+        case .volume: "System controls are disabled by Mac Control policy."
         case .spotlight: "Spotlight is disabled by Mac Control policy."
+        default: "This action is unavailable in Mac Tools."
         }
     }
 }
 
-/// The iPhone can request a volume target, but the Mac control response does
-/// not include a current output-volume readback. Keep the control's local
-/// target and its post-action wording separate from an observed Mac state.
+/// The slider is a requested target, rather than a live Mac volume monitor.
 enum MacVolumeControlPresentation {
     static let defaultTargetFraction = 0.5
-    static let currentVolumeDisclosure = "Your Mac doesn\u{2019}t share its current volume with this iPhone, so none shows here. Pick a level to send; it\u{2019}s a target, not a readback."
+    static let currentVolumeDisclosure = "Pick a volume target to send to your Mac. The slider doesn’t track later changes on the Mac."
 
     static func targetPercent(for fraction: Double) -> Int {
         guard fraction.isFinite else { return 50 }
@@ -172,7 +73,7 @@ enum MacVolumeControlPresentation {
     }
 
     static func acknowledgement(percent: Int) -> String {
-        "The Mac accepted the request to set volume to \(percent)%. Its current output volume is not read back to iPhone."
+        "The Mac completed the request to set volume to \(percent)%."
     }
 }
 
@@ -188,20 +89,6 @@ enum MacNotificationSendPresentation {
             switch self {
             case .sent: "Notification sent to the Mac."
             case .failed(let detail): "Couldn’t send notification: \(detail)"
-            }
-        }
-
-        var systemImage: String {
-            switch self {
-            case .sent: "checkmark.circle.fill"
-            case .failed: "exclamationmark.triangle.fill"
-            }
-        }
-
-        var tint: Color {
-            switch self {
-            case .sent: .green
-            case .failed: .red
             }
         }
     }

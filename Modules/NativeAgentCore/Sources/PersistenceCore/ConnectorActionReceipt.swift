@@ -19,7 +19,7 @@ public struct ConnectorActionReceipt: Identifiable, Codable, Hashable, Sendable 
     }
 
     public static func append(
-        actionId: String, connectorId: String, name: String?, status: String,
+        actionId: String, connectorId: String, name: String?, status: String, ok: Bool?,
         dryRun: Bool, approvalId: String?, createdAt: String, output: JSONValue, dataRoot: URL
     ) async throws -> ConnectorActionReceipt {
         let receipt = ConnectorActionReceipt(
@@ -32,11 +32,11 @@ public struct ConnectorActionReceipt: Identifiable, Codable, Hashable, Sendable 
             "connectorId": .string(connectorId), "name": .string(name ?? actionId),
             "status": .string(status), "dryRun": .bool(dryRun),
             "approvalId": approvalId.map(JSONValue.string) ?? .null,
-            "createdAt": .string(createdAt), "ok": .bool(status != "failed"),
+            "createdAt": .string(createdAt), "ok": ok.map(JSONValue.bool) ?? .null,
             "output": output,
         ])
         try await appendJSONLCapped(record, to: receiptsPath(root: dataRoot),
-            using: SwiftNativePersistenceCore(), maxLines: JSONLLineCaps.actionReceipts,
+            maxLines: JSONLLineCaps.actionReceipts,
             logLabel: "NativeClient.connectorAction")
         return receipt
     }

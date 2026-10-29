@@ -16,6 +16,45 @@ private struct SessionProviderUsageReceipt: Decodable {
     let turnInputDeltaTokens: Int?
 }
 
+/// Mac-local activity rows; historical missionId remains readable permanently.
+public struct ActivityEvent: Identifiable, Codable, Hashable, Sendable {
+    public var id: String
+    public var kind: String
+    public var title: String
+    public var detail: String?
+    public var status: String
+    public var executionId: String?
+    public var createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, kind, title, detail, status, createdAt, executionId
+        case legacyExecutionId = "missionId"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(String.self, forKey: .id)
+        self.kind = try c.decode(String.self, forKey: .kind)
+        self.title = try c.decode(String.self, forKey: .title)
+        self.detail = try c.decodeIfPresent(String.self, forKey: .detail)
+        self.status = try c.decode(String.self, forKey: .status)
+        self.createdAt = try c.decode(String.self, forKey: .createdAt)
+        self.executionId = try c.decodeIfPresent(String.self, forKey: .executionId)
+            ?? c.decodeIfPresent(String.self, forKey: .legacyExecutionId)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(kind, forKey: .kind)
+        try c.encode(title, forKey: .title)
+        try c.encodeIfPresent(detail, forKey: .detail)
+        try c.encode(status, forKey: .status)
+        try c.encode(createdAt, forKey: .createdAt)
+        try c.encodeIfPresent(executionId, forKey: .executionId)
+    }
+}
+
 public struct ActivityTailRecord: Sendable {
     public let event: ActivityEvent
     public let subject: String?
@@ -27,9 +66,8 @@ public struct ActivityTailReadout: Sendable {
     public let malformedRowCount: Int
 }
 
-
 /// Runtime read decisions shared by local and remote surfaces.
-public enum RuntimeReadProjection {
+public enum RuntimeReadouts {
     public static func getSessionContext(
         sessionId: String,
         model: String? = nil,
@@ -37,17 +75,9 @@ public enum RuntimeReadProjection {
         dataRoot: URL,
         configuredThresholdTokens: Int?
     ) async throws -> SessionContextStatus {
-        // gpt-5.5 review #1 (BLOCKING): The legacy context.json on disk could
-        // be stale, and the Swift compactSession() writer below still recorded
-        // `auto_compact_threshold: 75` (intended as a percent in the old
-        // schema) and a fixed `budget: 200_000`. Honoring that file produced
-        // permanently stale data — wrong budget, percent-as-token-threshold,
-        // and a model field that read "swift-native-compactor". Live values
-        // are now the only source of truth.
-        let root = dataRoot
-
+        // Saved context.json is not authoritative; derive status from current transcript, provider receipts and routing.
         // Live estimate from messages on disk.
-        let messagesPath = root
+        let messagesPath = dataRoot
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("messages", isDirectory: true)
             .appendingPathComponent("\(sessionId).jsonl")
@@ -56,13 +86,7 @@ public enum RuntimeReadProjection {
         let messageCount = statistics.messageCount
 
         let resolvedModel = (model?.isEmpty == false ? model! : "")
-        // gpt-5.5 review #3 (NEEDS_FIX): chars/4 systematically
-        // underestimates Anthropic tokenization by ~10–15%. Use ~3.5 for
-        // claude-* and 4 for everyone else so the displayed percent is closer
-        // to what the provider actually charges. Rounded conservatively
-        // (higher token count → bar fills faster → user compacts sooner).
-        let divisor: Double = resolvedModel.lowercased().contains("claude") ? 3.5 : 4.0
-        let transcriptTokens = max(0, Int((Double(totalChars) / divisor).rounded()))
+        let transcriptTokens = max(0, Int((Double(totalChars) / ContextBudgetPolicy.transcriptCharactersPerToken).rounded()))
 
         // Her window (`effectiveWindowTokens`): 60% of the selected model's on
         // this session's effective route, capped by a Custom size; an injected size is Custom.
@@ -73,9 +97,10 @@ public enum RuntimeReadProjection {
             windowConfig.thresholdTokens = configuredThresholdTokens
             windowConfig.contextWindowMode = .custom
         }
-        let budget = windowConfig.effectiveWindowTokens(forModel: resolvedModel, providerID: providerID, dataRoot: root) ?? 0
+        let window = windowConfig.effectiveWindowTokens(forModel: resolvedModel, providerID: providerID, dataRoot: dataRoot)
+        let budget = window ?? 0
 
-        let providerUsagePath = root
+        let providerUsagePath = dataRoot
             .appendingPathComponent("chat", isDirectory: true)
             .appendingPathComponent("session_state", isDirectory: true)
             .appendingPathComponent(sessionId, isDirectory: true)
@@ -104,7 +129,7 @@ public enum RuntimeReadProjection {
         let usedTokens = providerReceipt?.lastRequestInputTokens ?? transcriptTokens
         let promptTokens = max(0, usedTokens - transcriptTokens)
 
-        let threshold = windowConfig.effectiveThresholdTokens(forModel: resolvedModel, providerID: providerID, dataRoot: root)
+        let threshold = window ?? windowConfig.thresholdTokens
 
         // A carried-over receipt counts tokens against the PREVIOUS model's
         // window, so an 800k figure over a fresh 128k budget would read 600%.
@@ -112,11 +137,6 @@ public enum RuntimeReadProjection {
         // at full, which is what "the window is full" means on the new model.
         let rawPercent: Double = budget > 0 ? (Double(usedTokens) / Double(budget)) * 100.0 : 0.0
         let percent: Double = receiptMatchesModel ? rawPercent : min(rawPercent, 100.0)
-        // gpt-5.5 review #2 (NEEDS_FIX): dropping the `messageCount > 20`
-        // gate. compactSession(force: true) bypasses its own >20 guard, and
-        // short-but-huge transcripts (heavy tool output across <20 turns)
-        // were previously denied the button despite being over budget.
-        let compactable = transcriptTokens >= threshold
 
         return SessionContextStatus(
             session_id: sessionId,
@@ -131,7 +151,8 @@ public enum RuntimeReadProjection {
             budget: budget,
             percent: percent,
             message_count: messageCount,
-            compactable: compactable,
+            // A short transcript can still exceed its window.
+            compactable: transcriptTokens >= threshold,
             auto_compact_threshold: threshold,
             model: resolvedModel,
             context_loaded: providerReceipt != nil,
@@ -160,11 +181,9 @@ public enum RuntimeReadProjection {
     }
 
     public static func getActivityReadout(root: URL) async throws -> ActivityTailReadout {
-        let (data, startsMidFile) = try SwiftNativePersistenceCore.activityTail(dataRoot: root)
-        var lines = data.split(separator: 0x0A, omittingEmptySubsequences: false)
-        if lines.last?.isEmpty == true { lines.removeLast() }
-        if startsMidFile && !lines.isEmpty { lines.removeFirst() }
-        let tail = lines.filter { bytes in
+        let read = try SwiftNativePersistenceCore.tailPhysicalLines(
+            SwiftNativePersistenceCore.activityEventsPath(dataRoot: root), limit: .max, maxBytes: 1_048_576)
+        let tail = (read?.lines ?? []).dropFirst(read?.leadingFragment == true ? 1 : 0).filter { bytes in
             guard let line = String(data: Data(bytes), encoding: .utf8) else { return true }
             return !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }.suffix(200)

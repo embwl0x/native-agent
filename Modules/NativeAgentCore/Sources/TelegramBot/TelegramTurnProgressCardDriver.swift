@@ -2,8 +2,9 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import TurnTrace
+import ChatTurnRuntime
 
-// Blueprint: | `TelegramTurnProgressCardDriver.swift` | `TelegramTurnProgressCardDriver`: one acknowledged lifecycle message per accepted turn; terminal repair belongs to the delivery ledger |
+// Blueprint: | `TelegramTurnProgressCardDriver.swift` | `TelegramTurnProgressCardDriver`: one acknowledged lifecycle message per accepted turn; terminal waiters resolve only after identity persistence; terminal repair belongs to the delivery ledger |
 
 struct TelegramTurnProgressCardDriverSnapshot: Sendable, Equatable {
     let state: TelegramTurnPresentationState
@@ -48,6 +49,7 @@ actor TelegramTurnProgressCardDriver {
 
     private var state: TelegramTurnPresentationState
     private var replyTextSettled = false
+    private var accumulatedUTF16Length = 0
     private var messageId: Int?
     private var initialSendAttempted = false
     private var transportFailed = false
@@ -58,12 +60,12 @@ actor TelegramTurnProgressCardDriver {
     private var progressFlushRequested = false
     private var progressForcedFlush = false
     private var progressBypassThrottle = false
-    private var editInFlight = false
-    private var pendingFlush = false
-    private var pendingForcedFlush = false
+    private var untrackedCardSettlementRequested = false
     private var terminalLedgerRowRemoved = false
     private var detailsVisible = false
     private var terminalProjection: Task<String, Never>?
+    /// Nil while terminal identity is unsettled; false records persistence failure.
+    private var terminalIdentityPersisted: Bool?
     private var terminalWaiters: [
         UUID: CheckedContinuation<TelegramTurnPresentationPhase?, Never>
     ] = [:]
@@ -90,7 +92,7 @@ actor TelegramTurnProgressCardDriver {
         self.recordFailure = recordFailure
         self.persistCard = persistCard
         self.removePersistedCard = removePersistedCard
-        self.state = TelegramTurnPresentationReducer.initialState(at: Date())
+        self.state = TurnPresentationReducer.initialState(at: Date())
     }
 
     /// Sends the acknowledged card exactly once. A failed first send is final
@@ -113,7 +115,9 @@ actor TelegramTurnProgressCardDriver {
             lastEditAt = now
             guard await persistIdentity(at: now, terminalText: nil) else {
                 transportFailed = true
-                await settleUntrackedCard()
+                untrackedCardSettlementRequested = true
+                scheduleProgressFlush(force: true, bypassThrottle: true)
+                await progressFlushTask?.value
                 return
             }
             startHeartbeatIfNeeded()
@@ -123,13 +127,13 @@ actor TelegramTurnProgressCardDriver {
         }
     }
 
-    func record(progress event: TelegramChatProgressEvent) {
+    func record(progress event: TurnStreamEvent) {
         guard !closed, !state.isTerminal else { return }
         if case .replyTextSettled(let settled) = event {
             guard replyTextSettled != settled else { return }
             replyTextSettled = settled
             if !settled {
-                state = TelegramTurnPresentationReducer.reduce(
+                state = TurnPresentationReducer.reduce(
                     state, lifecycle: .working(action: nil), at: Date()
                 )
             }
@@ -137,9 +141,11 @@ actor TelegramTurnProgressCardDriver {
             return
         }
         replyTextSettled = false
+        if case .delta(let chunk) = event { accumulatedUTF16Length += chunk.utf16.count }
         let next = TelegramTurnPresentationReducer.reduce(
             state,
             progress: event,
+            accumulatedUTF16Length: accumulatedUTF16Length,
             at: Date()
         )
         guard next != state else { return }
@@ -159,14 +165,20 @@ actor TelegramTurnProgressCardDriver {
     }
 
     private func flushRecordedProgress() async {
-        while progressFlushRequested, !state.isTerminal, !transportFailed {
+        while progressFlushRequested {
             let force = progressForcedFlush
             let bypassThrottle = progressBypassThrottle
             progressFlushRequested = false
             progressForcedFlush = false
             progressBypassThrottle = false
-            _ = await persistIdentity(at: Date(), terminalText: nil)
-            guard !state.isTerminal else { break }
+            if untrackedCardSettlementRequested {
+                untrackedCardSettlementRequested = false
+                await flushUntrackedCard()
+                continue
+            }
+            guard !transportFailed else { break }
+            if !state.isTerminal { _ = await persistIdentity(at: Date(), terminalText: nil) }
+            guard !state.isTerminal || terminalIdentityPersisted == true else { break }
             await flushIfDue(force: force, bypassThrottle: bypassThrottle)
         }
         progressFlushTask = nil
@@ -175,7 +187,7 @@ actor TelegramTurnProgressCardDriver {
     func transition(_ event: TelegramTurnPresentationLifecycleEvent) async {
         guard !closed, !state.isTerminal else { return }
         replyTextSettled = false
-        let next = TelegramTurnPresentationReducer.reduce(
+        let next = TurnPresentationReducer.reduce(
             state,
             lifecycle: event,
             at: Date()
@@ -187,7 +199,6 @@ actor TelegramTurnProgressCardDriver {
             // Let an edit already on the wire finish; terminal repair belongs
             // to the ledger after this turn releases its driver.
             let terminal = terminalTextTask(at: Date())
-            resolveTerminalWaiters(state.phase)
             let now = Date()
             let terminalText = await settle { await terminal.value }
             guard await persistIdentity(at: now, terminalText: terminalText) else {
@@ -195,21 +206,19 @@ actor TelegramTurnProgressCardDriver {
                 // to settle the old active identity as outcome-unknown. Do not
                 // paint an unrepairable terminal card over that evidence.
                 transportFailed = true
-                await settleUntrackedCard()
+                resolveTerminalWaiters(nil)
+                untrackedCardSettlementRequested = true
+                scheduleProgressFlush(force: true, bypassThrottle: true)
+                await progressFlushTask?.value
                 return
             }
-            // 2026-09-06: the ledger row is this card's only restart-repair
-            // evidence, and it is dropped by the flush that actually sends the
-            // terminal edit — never here. `flushIfDue` returns immediately
-            // while another edit is in flight, so removing the row on return
-            // deleted the evidence for an edit that had not happened yet and
-            // might still fail.
-            await flushIfDue(force: true, bypassThrottle: true)
+            resolveTerminalWaiters(state.phase)
+            scheduleProgressFlush(force: true, bypassThrottle: true)
         } else {
             guard !transportFailed else { return }
-            _ = await persistIdentity(at: Date(), terminalText: nil)
-            await flushIfDue(force: false)
+            scheduleProgressFlush(force: false)
         }
+        await progressFlushTask?.value
     }
 
     /// Refresh elapsed/stall presentation while the turn is active.
@@ -218,7 +227,8 @@ actor TelegramTurnProgressCardDriver {
         guard !closed, !state.isTerminal, !transportFailed, messageId != nil else {
             return false
         }
-        await flushIfDue(force: false)
+        scheduleProgressFlush(force: false)
+        await progressFlushTask?.value
         return !state.isTerminal && !transportFailed
     }
 
@@ -232,17 +242,20 @@ actor TelegramTurnProgressCardDriver {
     func showStatus() async {
         guard !closed, !state.isTerminal else { return }
         detailsVisible = false
-        await flushIfDue(force: true)
+        scheduleProgressFlush(force: true)
+        await progressFlushTask?.value
     }
 
     func showDetails() async {
         guard !closed, !state.isTerminal else { return }
         detailsVisible = true
-        await flushIfDue(force: true)
+        scheduleProgressFlush(force: true)
+        await progressFlushTask?.value
     }
 
     func waitForTerminal() async -> TelegramTurnPresentationPhase? {
-        if state.isTerminal { return state.phase }
+        if let terminalIdentityPersisted { return terminalIdentityPersisted ? state.phase : nil }
+        guard !closed, !Task.isCancelled else { return nil }
         let waiterId = UUID()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -281,11 +294,13 @@ actor TelegramTurnProgressCardDriver {
     /// work settles. Closing the derived face also drains version refreshes.
     func close() async {
         closed = true
+        if terminalIdentityPersisted == nil { resolveTerminalWaiters(nil) }
         let pending = [heartbeatTask, progressFlushTask].compactMap { $0 }
         heartbeatTask = nil
-        progressFlushTask = nil
-        progressFlushRequested = false
-        if !state.isTerminal { for task in pending { task.cancel() } }
+        if !state.isTerminal {
+            progressFlushRequested = false
+            for task in pending { task.cancel() }
+        }
         let face = self.face
         let terminal = terminalProjection
         await settle {
@@ -297,20 +312,11 @@ actor TelegramTurnProgressCardDriver {
 
     private func flushIfDue(force: Bool, bypassThrottle: Bool = false) async {
         guard !transportFailed, let messageId else { return }
-        if editInFlight {
-            pendingFlush = true
-            pendingForcedFlush = pendingForcedFlush || force
-            return
-        }
         var now = Date()
         if !force, let lastEditAt,
            now.timeIntervalSince(lastEditAt) < minimumEditInterval {
             return
         }
-        // Claim the edit lane before any throttle suspension. Actor methods
-        // are reentrant across `await`; without this, a progress event could
-        // start a second edit while a control refresh was sleeping.
-        editInFlight = true
         if force, !bypassThrottle, let lastEditAt {
             let remaining = minimumEditInterval - now.timeIntervalSince(lastEditAt)
             if remaining > 0 {
@@ -321,6 +327,7 @@ actor TelegramTurnProgressCardDriver {
                 now = Date()
             }
         }
+        guard !transportFailed, !state.isTerminal || terminalIdentityPersisted == true else { return }
         let renderedState = state
         let renderedReplySettled = replyTextSettled
         // Whether THIS text is the terminal card, captured with the render:
@@ -330,15 +337,8 @@ actor TelegramTurnProgressCardDriver {
         let rendered = await renderedText(at: now)
         guard rendered != lastRenderedText
                 || (renderedIsTerminal && renderedState.phase == .completed) else {
-            editInFlight = false
             // The card already shows this text, terminal text included.
             await removeTerminalLedgerRow(ifSentTerminal: renderedIsTerminal)
-            if pendingFlush {
-                let forcePending = pendingForcedFlush || state.isTerminal
-                pendingFlush = false
-                pendingForcedFlush = false
-                await flushIfDue(force: forcePending, bypassThrottle: state.isTerminal)
-            }
             return
         }
 
@@ -364,24 +364,13 @@ actor TelegramTurnProgressCardDriver {
                 transportFailed = true
                 stopHeartbeat()
             }
-            editInFlight = false
-            pendingFlush = false
-            pendingForcedFlush = false
             await reportFailure(step: deleting ? "delete" : "edit", error: error)
             return
         }
-        editInFlight = false
         await removeTerminalLedgerRow(ifSentTerminal: renderedIsTerminal)
-        guard pendingFlush else { return }
-        let forcePending = pendingForcedFlush || state.isTerminal
-        pendingFlush = false
-        pendingForcedFlush = false
-        await flushIfDue(force: forcePending, bypassThrottle: state.isTerminal)
     }
 
-    /// 2026-09-06: drop the restart-repair ledger row only once the terminal
-    /// card text has actually been sent. A failed terminal edit keeps the row,
-    /// so a restart can still repair the card it left behind.
+    /// Keep restart-repair evidence until the terminal card update succeeds.
     private func removeTerminalLedgerRow(ifSentTerminal sentTerminal: Bool) async {
         guard sentTerminal,
               !terminalLedgerRowRemoved,
@@ -414,8 +403,9 @@ actor TelegramTurnProgressCardDriver {
         return task
     }
 
-    private func resolveTerminalWaiters(_ phase: TelegramTurnPresentationPhase) {
-        let waiters = terminalWaiters.values
+    private func resolveTerminalWaiters(_ phase: TelegramTurnPresentationPhase?) {
+        terminalIdentityPersisted = phase != nil
+        let waiters = Array(terminalWaiters.values)
         terminalWaiters.removeAll()
         for waiter in waiters { waiter.resume(returning: phase) }
     }
@@ -436,9 +426,7 @@ actor TelegramTurnProgressCardDriver {
     }
 
     private func reportFailure(step: String, error: Error) async {
-        let safe = TelegramPollLoop._tgRedactToken(
-            TurnTraceRedactor.redactText(String(describing: error))
-        )
+        let safe = TurnTraceRedactor.redactText(String(describing: error))
         let detail = "Telegram turn card \(step) failed for chat \(destination.chatId): \(safe)"
         FileHandle.standardError.write(Data("\(detail)\n".utf8))
         await recordFailure(detail)
@@ -447,7 +435,7 @@ actor TelegramTurnProgressCardDriver {
     private func persistIdentity(at instant: Date, terminalText: String?) async -> Bool {
         guard let messageId else { return true }
         let safeTerminalText = terminalText.flatMap {
-            TelegramTurnPresentationReducer.sanitized($0)
+            TurnPresentationReducer.sanitized($0)
         }
         do {
             try await persistCard(TelegramPersistedTurnCard(
@@ -465,7 +453,7 @@ actor TelegramTurnProgressCardDriver {
         }
     }
 
-    private func settleUntrackedCard() async {
+    private func flushUntrackedCard() async {
         guard let messageId else { return }
         let notice = """
         Outcome unknown · status persistence unavailable

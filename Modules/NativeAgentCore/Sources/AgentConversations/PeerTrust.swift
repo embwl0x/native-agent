@@ -1,3 +1,4 @@
+import StandingBots
 import Foundation
 import NativeAgentCore
 import ChatTurnContracts
@@ -31,12 +32,12 @@ public enum PeerTrust {
     /// stands; a lane or a contact's exact name that the address book resolves
     /// to exactly one contact becomes `peer:<id>`; anything else stands as
     /// written and so carries no grant.
-    public static func principal(_ source: String, dataRoot: URL) -> String {
+    public static func principal(_ source: String, dataRoot: URL, peers: [AgentPeerContact]? = nil) -> String {
         let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
         var key = trimmed.lowercased()
         guard !key.isEmpty, !key.hasPrefix("peer:"),
               !["another agent", "a remote peer", PeerDataTaint.unrecorded].contains(key),
-              let peers = try? AgentPeerStore(dataRoot: dataRoot).list() else { return trimmed }
+              let peers = peers ?? (try? AgentPeerStore(dataRoot: dataRoot).list()) else { return trimmed }
         if ConversationSurfaceProfile(key).isAgentBridge {
             for suffix in ["-bridge", "_bridge"] where key.hasSuffix(suffix) { key = String(key.dropLast(suffix.count)) }
         }
@@ -51,7 +52,7 @@ public enum PeerTrust {
         let key = principal.hasPrefix("peer:") ? String(principal.dropFirst(5)) : principal
         // A helper of this install, made by the person or by her, carries the
         // person's grant: it is part of the household, not an outside agent.
-        if key.hasPrefix("bot-"), let id = UUID(uuidString: String(key.dropFirst(4))) {
+        if let id = BotDefinition.id(forSession: key) {
             let file = dataRoot.appendingPathComponent("bots/definitions/\(id.uuidString).json")
             guard let data = try? Data(contentsOf: file),
                   let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

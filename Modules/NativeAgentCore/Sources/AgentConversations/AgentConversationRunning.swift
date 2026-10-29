@@ -4,19 +4,6 @@ import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `AgentConversationRunning.swift` | `AgentConversationRunning` class; `begin`, `end`; retains sends by row and operation through their matching exit, including Stop waiters when a follow-up begins; retains queued senders and background conclusions through actual exit; a response timeout does not release an accepted send's owner; withdrawing queued work wakes its sender to exit; Stop joins local send settlement before retiring and joining exchange-owned desktop readers; the continuation lifecycle closes reader admission and drains settlement before closing live publication |
 
-/// The app's startup pass over queued follow-ups left without a sender by a
-/// restart (see `AgentConversationSession.resumeQueued`).
-public enum AgentConversationQueues {
-    public static func orphaned(dataRoot: URL) -> [AgentConversationRecord] {
-        AgentConversationSession.orphanedQueues(dataRoot: dataRoot)
-    }
-
-    public static func resume(_ row: AgentConversationRecord, dataRoot: URL,
-                              perform: @escaping @Sendable (String, [String: JSONValue]) async throws -> JSONValue) {
-        AgentConversationSession.resumeQueued(row, dataRoot: dataRoot, perform: perform)
-    }
-}
-
 /// A route that returned "waiting" and watches for the answer itself (Grok's
 /// desktop chat): the exchange is in flight only while this process still
 /// runs that watch, so a restart never leaves the thread waiting on nothing.
@@ -60,8 +47,7 @@ final class AgentConversationRunning: @unchecked Sendable {
     private var closed = false
     private var watches: [String: Int] = [:]
     private var generation = 0
-    private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
-    private var abandoned: Set<UUID> = []
+    private var changeWaiter = ScopedWaiter()
 
     private init() {}
     func openWatches() { lock.withLock { closed = false } }
@@ -187,41 +173,22 @@ final class AgentConversationRunning: @unchecked Sendable {
     var seen: Int { lock.withLock { generation } }
 
     func changed() {
-        let woken: [CheckedContinuation<Void, Never>] = lock.withLock {
+        let woken = lock.withLock {
             generation += 1
-            defer { waiters.removeAll() }
-            return Array(waiters.values)
+            defer { changeWaiter = ScopedWaiter() }
+            return changeWaiter
         }
-        woken.forEach { $0.resume() }
+        woken.resume()
     }
 
     /// Returns at the first store write after `seen`, or at `deadline`.
     func change(after seen: Int, until deadline: Date) async {
-        let id = UUID()
+        guard let waiter = lock.withLock({ generation == seen ? changeWaiter : nil }) else { return }
         await withTaskGroup(of: Void.self) { group in
-            group.addTask {
-                await withTaskCancellationHandler {
-                    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                        let now: Bool = self.lock.withLock {
-                            if self.generation != seen || self.abandoned.remove(id) != nil { return true }
-                            self.waiters[id] = continuation
-                            return false
-                        }
-                        if now { continuation.resume() }
-                    }
-                } onCancel: {
-                    let waiting: CheckedContinuation<Void, Never>? = self.lock.withLock {
-                        if let continuation = self.waiters.removeValue(forKey: id) { return continuation }
-                        self.abandoned.insert(id)
-                        return nil
-                    }
-                    waiting?.resume()
-                }
-            }
+            group.addTask { await waiter.park() }
             group.addTask { try? await Task.sleep(for: .seconds(max(0, deadline.timeIntervalSinceNow))) }
             await group.next()
             group.cancelAll()
         }
-        lock.withLock { _ = abandoned.remove(id) }
     }
 }

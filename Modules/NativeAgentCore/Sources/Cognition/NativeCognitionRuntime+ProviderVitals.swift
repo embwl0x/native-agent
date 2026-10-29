@@ -4,6 +4,7 @@ import NativeAgentCore
 import NotificationInbox
 import PersistenceCore
 import ProviderRouting
+import NativeAgentShared
 
 // Blueprint: | `NativeCognitionRuntime+ProviderVitals.swift` | `NativeCognitionRuntime` provider interoception: passive vitals persistence, health-band transitions and graded somatic ingestion |
 
@@ -13,21 +14,18 @@ import ProviderRouting
 // lifecycle event to `providerVitalsSensor`. When a provider crosses a health
 // band, the sensor returns a transition; here we mint the graded
 // `.providerVitalsShift` CognitiveEvent, run it through the SAME
-// `CognitiveSomaticSignalAdapter` the design specifies, and ingest the resulting
+// `CognitiveSomaticSignals` the design specifies, and ingest the resulting
 // graded somatic signal — so sluggishness is FELT on the existing provider axis
 // (chemistry → mood → capsule), no new capsule slot.
 //
-// NO INBOX CARD (User, 2026-10-07): the card asked User to switch providers by
-// hand and flapped ~150 times in two weeks. The band is felt, not paged.
+// Provider health bands affect the body without posting inbox cards.
 
 extension NativeCognitionRuntime {
     /// Bootstrap-owned restore. Snapshot age and row validity are enforced by
     /// the sensor; a missing or stale file is a normal cold start. First
     /// outputs come from the retained traces, which grow with her history, so
-    /// they are read behind her: launch and her first turn never wait on them
-    /// (two weeks of retained traces, 77 MB, held the bootstrap every turn
-    /// awaits). A stream that starts before the read lands runs unmeasured,
-    /// as on a fresh install.
+    /// launch and her first turn never wait on that read.
+    /// A stream that starts before the read lands runs unmeasured.
     func restoreProviderVitalsSnapshot() async {
         do {
             _ = try await providerVitalsSensor.restoreSnapshot(dataRoot: dataRoot, now: now())
@@ -76,9 +74,7 @@ extension NativeCognitionRuntime {
         }
     }
 
-    /// Builds before 2026-10-07 posted a "degraded" inbox card per flap and
-    /// cleared it with a "recovered" row. The card is gone (the band is felt,
-    /// not paged), so bootstrap archives any card those builds left active.
+    /// Bootstrap archives any active provider-vitals inbox cards.
     func retireProviderVitalsNotices() async {
         let inbox = LiveNotificationInbox.live(dataRoot: dataRoot)
         do {
@@ -114,14 +110,14 @@ extension NativeCognitionRuntime {
             "providerId": .string(transition.providerId),
             "band": .string(transition.to.label),
             "fromBand": .string(transition.from.label),
-            CognitiveSomaticSignalAdapter.vitalsDirectionMetadataKey: .string(transition.direction.rawValue),
+            CognitiveSomaticSignals.vitalsDirectionMetadataKey: .string(transition.direction.rawValue),
             "emaErrorRate": .double(transition.emaErrorRate),
             "consecutiveFailures": .int(Int64(transition.consecutiveFailures)),
         ]
         if let ratio = transition.latencyRatio { metadata["latencyRatio"] = .double(ratio) }
 
         let event = CognitiveEvent(
-            id: "provider-vitals-\(transition.providerId)-\(transition.to.label)-\(Int(transition.occurredAt.timeIntervalSince1970))",
+            id: "provider-vitals-\(transition.providerId)-\(transition.to.label)-\(String(format: "%.0f", transition.occurredAt.timeIntervalSince1970.rounded(.towardZero) + 0))",
             kind: .providerVitalsShift,
             subject: CognitiveSubjectReference(
                 type: "provider",
@@ -135,7 +131,7 @@ extension NativeCognitionRuntime {
             metadata: metadata
         )
 
-        guard let signal = CognitiveSomaticSignalAdapter.signal(from: event, id: UUID()) else { return }
+        guard let signal = CognitiveSomaticSignals.signal(from: event, id: UUID()) else { return }
         // Provider lifecycle is body evidence, not new semantic context — mirror
         // the raw provider path: coalesced persistence.
         await ingestPreparedOrganismSignal(

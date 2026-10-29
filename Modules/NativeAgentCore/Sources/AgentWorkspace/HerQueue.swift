@@ -62,14 +62,14 @@ public enum MyQueueReady {
 
     /// Carried work whose unattended condition is met. A peer-steered step
     /// retains its recorded peers when the wake admits it.
-    package static func ready(items: [DeskItem], context: MyQueue.Context) -> [DeskItem] {
+    package static func ready(items: [DeskItem], context: MyQueue.Context, dataRoot: URL) -> [DeskItem] {
         let plan = DeskSequencing.compute(DeskState(items: items, generatedTs: ""), now: context.now)
         return items.filter { item in
             guard !item.isPursuit, plan.byHandle[item.handle]?.isReady == true,
                   item.project == MyQueue.project || item.assignee == "agent" else { return false }
             guard let entry = MyQueue.entry(item) else { return true }
             switch MyQueue.when(entry) {
-            case .nextTurn: return !entry.owedToPerson && context.ownTurn
+            case .nextTurn: return !entry.owedToPerson(dataRoot: dataRoot) && context.ownTurn
             case .userWrites: return false
             default: return MyQueue.isReady(entry, context)
             }
@@ -78,10 +78,10 @@ public enum MyQueueReady {
 
     /// Offered into the recorded conversation's next matching turn, including
     /// one that answers without tools. Its caller restores every recorded peer.
-    package static func forTurn(items: [DeskItem], session: String, door: String, personTurn: Bool, at: Date) -> [MyQueue.Entry] {
+    package static func forTurn(items: [DeskItem], session: String, door: String, personTurn: Bool, at: Date, dataRoot: URL) -> [MyQueue.Entry] {
         let plan = DeskSequencing.compute(DeskState(items: items, generatedTs: ""), now: at)
         return items.compactMap(MyQueue.entry).filter { entry in
-            guard entry.owedToPerson == personTurn, entry.step.session == session, plan.byHandle[entry.item.handle]?.isReady == true,
+            guard entry.owedToPerson(dataRoot: dataRoot) == personTurn, entry.step.session == session, plan.byHandle[entry.item.handle]?.isReady == true,
                   let filed = DeskClock.parseISO(entry.step.filedAt ?? entry.item.openedAt), at > filed else { return false }
             switch MyQueue.when(entry) {
             case .nextTurn: return true
@@ -118,8 +118,8 @@ extension HerScreen {
             observation.withLock { observation in
                 if observation.rows == nil {
                     observation.rows = ((try? HumanConversationIndex.rows(dataRoot: dataRoot)) ?? []).map { row in
-                        (HumanConversationIndex.string(row["id"]), HumanConversationIndex.string(row["source"]) ?? "app",
-                         HumanConversationIndex.string(row["updatedAt"]).flatMap(date) ?? .distantPast)
+                        (row["id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }), row["source"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }) ?? "app",
+                         row["updatedAt"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }).flatMap(date) ?? .distantPast)
                     }
                 }
                 let wanted = door.map { queueDoors[$0] ?? [$0] }

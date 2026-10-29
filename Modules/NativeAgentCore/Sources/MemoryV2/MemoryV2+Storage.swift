@@ -3,9 +3,10 @@
 
 import Foundation
 import GRDB
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `MemoryV2+Storage.swift` | `MemoryStorage` actor; ordered USER.md, Spotlight and graph tails retained through actual exit; close/drain projections without cancelling canonical writes, retire replaced USER.md generators; scalar `statusCounts`, checked `curationPage` |
+// Blueprint: | `MemoryV2+Storage.swift` | `MemoryStorage` actor, shared database pool and canonical mutations; bounded admission and eviction, transactional duplicate/supersession writes, scalar `statusCounts` and checked `curationPage` |
 
 // MARK: - MemoryStorage actor
 
@@ -18,220 +19,33 @@ public actor MemoryStorage {
     let dbPool: DatabasePool
     public let path: URL
     let memoryLimit: Int
-    private var startupBoundEvictions: [StoredMemory]
-    private var replayedStartupUserProjection = false
-    private var replayedStartupSpotlightProjection = false
-    private var replayedStartupKnowledgeGraphProjection = false
-    private var userMDGenerator: UserMDGenerator?
-    private var spotlightHook: (@Sendable (StoredMemory, Bool) async -> Void)?
-    private var knowledgeGraphHook: (@Sendable (StoredMemory, Bool) async -> Void)?
+    var startupBoundEvictions: [StoredMemory]
+    var replayedStartupUserProjection = false
+    var replayedStartupSpotlightProjection = false
+    var replayedStartupKnowledgeGraphProjection = false
+    var userMDGenerator: UserMDGenerator?
+    var spotlightHook: (@Sendable (StoredMemory, Bool) async -> Void)?
+    public private(set) var spotlightProjectionFailure: String?
+
+    func recordSpotlightProjectionFailure(_ message: String?) {
+        spotlightProjectionFailure = message
+        if let message { nativeLog("MemoryV2 Spotlight: %@", message) }
+    }
+    var knowledgeGraphHook: (@Sendable (String) async -> Void)?
     /// Ordered projection lanes resolve canonical eligibility when they run.
     /// A hook queued after suspension carries identity, never stale intent.
-    private var spotlightProjectionTail: Task<Void, Never>?
-    private var knowledgeGraphProjectionTail: Task<Void, Never>?
-    private var userMDProjectionTail: Task<Void, Never>?
-    private var spotlightProjectionID: UUID?
-    private var knowledgeGraphProjectionID: UUID?
-    private var userMDProjectionID: UUID?
-    private var projectionsClosed = false
+    var spotlightProjectionTail: Task<Void, Never>?
+    var knowledgeGraphProjectionTail: Task<Void, Never>?
+    var userMDProjectionTail: Task<Void, Never>?
+    var spotlightProjectionID: UUID?
+    var knowledgeGraphProjectionID: UUID?
+    var userMDProjectionID: UUID?
+    var projectionsClosed = false
 
     // MARK: - Recall candidate cache
     // Canonical recall_generation excludes usage and graph-only writes.
     var recallCache: RecallCache?
-    var recallGeneration: Int = 0
-
-    /// Attach a USER.md generator so mutations debounce-regenerate the file.
-    public func attachUserMDGenerator(_ generator: UserMDGenerator) async {
-        guard !projectionsClosed else { await generator.shutdown(); return }
-        guard userMDGenerator !== generator else { return }
-        let previous = self.userMDGenerator
-        self.userMDGenerator = generator
-        // Replacement retires the old generator's deadline and accepted work.
-        if let previous {
-            let retirement = enqueueUserMDProjection { await previous.shutdown() }
-            await retirement?.value
-        }
-        guard !projectionsClosed, self.userMDGenerator === generator else { return }
-        if !replayedStartupUserProjection {
-            replayedStartupUserProjection = true
-            for persona in Set(startupBoundEvictions.map(\.personaId)) {
-                pokeUserMDRegen(persona: persona)
-            }
-        }
-    }
-
-    /// Install a Spotlight-index hook. Fires for every insert/update/
-    /// acceptProposal/archive/delete with `deleted` derived from final row
-    /// projection eligibility.
-    public func attachSpotlightHook(
-        _ hook: @escaping @Sendable (StoredMemory, Bool) async -> Void
-    ) {
-        guard !projectionsClosed else { return }
-        self.spotlightHook = hook
-        if !replayedStartupSpotlightProjection {
-            replayedStartupSpotlightProjection = true
-            for evicted in startupBoundEvictions { pokeSpotlight(evicted, deleted: true) }
-        }
-    }
-
-    /// Install a Knowledge Graph indexing hook. Fires for every insert/update/
-    /// acceptProposal/archive/delete with `deleted` derived from final row
-    /// projection eligibility.
-    public func attachKnowledgeGraphHook(
-        _ hook: @escaping @Sendable (StoredMemory, Bool) async -> Void
-    ) {
-        guard !projectionsClosed else { return }
-        self.knowledgeGraphHook = hook
-        if !replayedStartupKnowledgeGraphProjection {
-            replayedStartupKnowledgeGraphProjection = true
-            for evicted in startupBoundEvictions { pokeKnowledgeGraph(evicted, deleted: true) }
-        }
-    }
-
-    func pokeUserMDRegen(persona: String) {
-        guard !projectionsClosed, let gen = userMDGenerator else { return }
-        _ = enqueueUserMDProjection { _ = try? await gen.requestRegeneration(persona: persona) }
-    }
-
-    private func enqueueUserMDProjection(_ operation: @escaping @Sendable () async -> Void) -> Task<Void, Never>? {
-        guard !projectionsClosed else { return nil }
-        let prior = userMDProjectionTail
-        let id = UUID()
-        userMDProjectionID = id
-        let task = Task {
-            defer {
-                if userMDProjectionID == id { userMDProjectionTail = nil; userMDProjectionID = nil }
-            }
-            await prior?.value
-            await operation()
-        }
-        userMDProjectionTail = task
-        return task
-    }
-
-    private func pokeSpotlight(_ stored: StoredMemory, deleted: Bool) {
-        guard let hook = spotlightHook else { return }
-        _ = enqueueSpotlightProjection {
-            guard let (current, removed) = await self.currentProjection(stored) else { return }
-            await hook(current, removed)
-        }
-    }
-
-    func enqueueSpotlightProjection<Result: Sendable>(
-        _ operation: @escaping @Sendable () async throws -> Result
-    ) -> Task<Result, Error> {
-        guard !projectionsClosed else { return Task { throw CancellationError() } }
-        let prior = spotlightProjectionTail
-        let id = UUID()
-        spotlightProjectionID = id
-        let task = Task {
-            await prior?.value
-            return try await operation()
-        }
-        spotlightProjectionTail = Task {
-            defer {
-                if spotlightProjectionID == id { spotlightProjectionTail = nil; spotlightProjectionID = nil }
-            }
-            _ = try? await task.value
-        }
-        return task
-    }
-
-    private func pokeKnowledgeGraph(_ stored: StoredMemory, deleted: Bool) {
-        guard let hook = knowledgeGraphHook else { return }
-        enqueueKnowledgeGraphProjection {
-            guard let (current, removed) = await self.currentProjection(stored) else { return }
-            await hook(current, removed)
-        }
-    }
-
-    private func currentProjection(_ hint: StoredMemory) -> (StoredMemory, Bool)? {
-        do {
-            let current = try dbPool.read { db in
-                try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [hint.id])
-                    .map(Self.decodeMemory)
-            }
-            return current.map { ($0, !Self.projectionEligible($0)) } ?? (hint, true)
-        } catch {
-            nativeLog("[memory] projection read failed for \(hint.id): \(error)")
-            return nil
-        }
-    }
-
-    func enqueueKnowledgeGraphProjection(_ operation: @escaping @Sendable () async -> Void) {
-        guard !projectionsClosed else { return }
-        let prior = knowledgeGraphProjectionTail
-        let id = UUID()
-        knowledgeGraphProjectionID = id
-        knowledgeGraphProjectionTail = Task {
-            defer {
-                if knowledgeGraphProjectionID == id { knowledgeGraphProjectionTail = nil; knowledgeGraphProjectionID = nil }
-            }
-            await prior?.value
-            await operation()
-        }
-    }
-
-    /// Close only derived-work admission. Canonical writes remain accepted;
-    /// already-enqueued projections drain in order without blanket cancellation.
-    /// Writes arriving after closure are reconciled from SQLite at next launch.
-    public func shutdownProjections() async {
-        projectionsClosed = true
-        spotlightHook = nil
-        knowledgeGraphHook = nil
-        await userMDProjectionTail?.value
-        await userMDGenerator?.shutdown()
-        userMDGenerator = nil
-        await spotlightProjectionTail?.value
-        await knowledgeGraphProjectionTail?.value
-    }
-
-    private func pokeDerivedState(_ stored: StoredMemory, deleted: Bool) async {
-        let change = DerivedSourceChange(
-            namespace: "memory-v2",
-            stableID: stored.id,
-            operation: deleted ? .removed : .changed,
-            canonicalLocator: path.standardizedFileURL.path,
-            reason: deleted ? "memory_projection_removed" : "memory_projection_changed"
-        )
-        await DerivedStateInvalidationCenter.shared.publish(change)
-    }
-
-    /// A cold write awaiting admission is not projected until its vector lands.
-    private static func projectionEligible(_ stored: StoredMemory) -> Bool {
-        stored.status == "active" && MemoryLifecycle.isRecallEligible(stored.lifecycle)
-            && !metadataFlag(stored.metadata, pendingAdmissionKey)
-    }
-
-    func pokeProjectionHooks(_ stored: StoredMemory) async {
-        let deleted = !Self.projectionEligible(stored)
-        pokeSpotlight(stored, deleted: deleted)
-        pokeKnowledgeGraph(stored, deleted: deleted)
-        await pokeDerivedState(stored, deleted: deleted)
-    }
-
-    /// Re-read and enqueue the complete batch without an actor suspension.
-    /// A deleted row must not be reinserted by an older captured warning update.
-    func refreshProjectionHooks(ids: [String]) async throws {
-        let current = try enqueueCurrentProjectionHooks(ids: ids)
-        for row in current {
-            await pokeDerivedState(row, deleted: !Self.projectionEligible(row))
-        }
-    }
-
-    private func enqueueCurrentProjectionHooks(ids: [String]) throws -> [StoredMemory] {
-        let current = try dbPool.read { db in
-            try ids.compactMap { id in
-                try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id]).map(Self.decodeMemory)
-            }
-        }
-        for row in current {
-            let deleted = !Self.projectionEligible(row)
-            pokeSpotlight(row, deleted: deleted)
-            pokeKnowledgeGraph(row, deleted: deleted)
-        }
-        return current
-    }
+    let recallRead = LatestRead()
 
     public init(dataRoot: URL, memoryLimit: Int = memoryStoredRowCap) throws {
         let dir = dataRoot.appendingPathComponent("memory", isDirectory: true)
@@ -241,11 +55,7 @@ public actor MemoryStorage {
         var config = Configuration()
         config.foreignKeysEnabled = true
         config.busyMode = .timeout(2)
-        // Bound the WAL: without a journal_size_limit the -wal file persists
-        // at its high-water mark after checkpoints (observed 2026-07-02: 3 MB
-        // WAL against a 1.5 MB database). 4 MB never truncates mid-burst at
-        // Agent-scale but stops unbounded high-water growth. Set via
-        // prepareDatabase so every pool connection carries it.
+        // Limit retained WAL size to 4 MB on every pool connection.
         config.prepareDatabase { db in
             try db.execute(sql: "PRAGMA journal_size_limit = 4194304")
             // Match Swift's cursor comparisons, including Unicode identifiers.
@@ -286,12 +96,13 @@ public actor MemoryStorage {
         let count = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM memories") ?? 0
         let overflow = count - boundedLimit
         guard overflow > 0 else { return [] }
-        // Supersession is history, never capacity eviction, and so is a memory
+        // Correction and supersession are history, never capacity eviction, and so is a memory
         // a pending replacement will demote once admitted. Refuse admission
         // when retaining them leaves too few disposable rows.
         let rows = try Row.fetchAll(db, sql: """
             SELECT * FROM memories
             WHERE json_extract(metadata_json, '$.superseded_by') IS NULL
+              AND json_extract(metadata_json, '$.corrected_by') IS NULL
               AND id NOT IN (SELECT json_extract(owed.value, '$.id')
                              FROM memories p, json_each(p.metadata_json, '$.\(pendingSupersedesKey)') owed
                              WHERE json_extract(owed.value, '$.id') IS NOT NULL)
@@ -351,33 +162,13 @@ public actor MemoryStorage {
         return 3
     }
 
-    private static func publishStartupBoundEvictions(
-        _ evicted: [StoredMemory],
-        memoryPath: URL
-    ) {
-        guard !evicted.isEmpty else { return }
-        nativeLog("MemoryV2 bound: pruned %d overflow row(s) while opening %@",
-              evicted.count, memoryPath.lastPathComponent)
-        Task {
-            for memory in evicted {
-                await DerivedStateInvalidationCenter.shared.publish(DerivedSourceChange(
-                    namespace: "memory-v2",
-                    stableID: memory.id,
-                    operation: .removed,
-                    canonicalLocator: memoryPath.standardizedFileURL.path,
-                    reason: "memory_capacity_evicted_on_open"
-                ))
-            }
-        }
-    }
-
     func handleBoundEvictions(_ evicted: [StoredMemory]) async {
         guard !evicted.isEmpty else { return }
         invalidateRecallCache()
         for persona in Set(evicted.map(\.personaId)) { pokeUserMDRegen(persona: persona) }
         for memory in evicted {
-            pokeSpotlight(memory, deleted: true)
-            pokeKnowledgeGraph(memory, deleted: true)
+            pokeSpotlight(memory)
+            pokeKnowledgeGraph(memory.id)
             await pokeDerivedState(memory, deleted: true)
         }
     }
@@ -387,12 +178,13 @@ public actor MemoryStorage {
     /// Duplicate matching and evidence accumulation share the insertion write
     /// transaction, so simultaneous stores cannot lose counts or provenance.
     public func admitMemory(
-        _ memory: StoredMemory, insertIfMissing: Bool, preserveID: Bool
+        _ memory: StoredMemory, insertIfMissing: Bool, preserveID: Bool,
+        superseding: [SupersedingAcceptance] = []
     ) async throws -> StoredMemory? {
         var stamped = memory
         stamped.metadata = try MemorySenseProvenance.stamping(stamped.metadata)
         let memory = stamped
-        let result = try await dbPool.write { db -> (StoredMemory?, [StoredMemory]) in
+        let result = try await dbPool.write { db -> (StoredMemory?, [StoredMemory], [StoredMemory]) in
             try Self.requireNotTombstoned(memory, in: db)
             let rows = try Row.fetchAll(db, sql: """
                 SELECT * FROM memories WHERE status = 'active'
@@ -401,23 +193,28 @@ public actor MemoryStorage {
                 ORDER BY rowid
             """, arguments: [preserveID, memory.id]).map(Self.decodeMemory)
             if let row = try Self.admissionDuplicate(of: memory, among: rows, in: db) {
-                return (try Self.foldDuplicate(memory, into: row, in: db), [])
+                let saved = try Self.foldDuplicate(memory, into: row, in: db)
+                let demoted = try superseding.filter { $0.targetId != saved.id }
+                    .map { try Self.demoteSuperseded($0, by: saved, in: db) }
+                return (saved, [], demoted)
             }
-            guard insertIfMissing else { return (nil, []) }
+            guard insertIfMissing else { return (nil, [], []) }
             try Self.validateTemporalEvidence(memory)
             try Self.requireWritableEpoch(in: db, vector: memory.embedding, epoch: memory.embeddingEpoch)
             try Self.executeMemoryInsert(memory, in: db)
+            let demoted = try superseding.map { try Self.demoteSuperseded($0, by: memory, in: db) }
             let evicted = try Self.pruneMemoriesToBound(in: db, limit: memoryLimit, preservingIDs: [memory.id])
             guard let saved = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [memory.id]).map(Self.decodeMemory) else {
                 throw MemoryStorageError.databaseUnavailable("committed memory is missing")
             }
-            return (saved, evicted)
+            return (saved, evicted, demoted)
         }
         if let row = result.0 {
             invalidateRecallCache()
             pokeUserMDRegen(persona: row.personaId)
             await pokeProjectionHooks(row)
         }
+        for row in result.2 { await pokeProjectionHooks(row) }
         await handleBoundEvictions(result.1)
         return result.0
     }
@@ -427,6 +224,8 @@ public actor MemoryStorage {
     /// near-paraphrase in the same scope that is not a correction.
     static func admissionDuplicate(of memory: StoredMemory, among rows: [StoredMemory],
                                    in db: Database) throws -> StoredMemory? {
+        let now = Date()
+        let rows = rows.filter { MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: $0.validTo, at: now) }
         let incoming = MemoryRecord(stored: memory)
         let scope = MemoryRecordDisclosurePolicy.classify(incoming)
         let scopeKey = Self.disclosureScopeKey(personaId: memory.personaId, metadata: memory.metadata)
@@ -442,12 +241,12 @@ public actor MemoryStorage {
                 let nearest = rows.filter { Self.comparableEpochs($0.embeddingEpoch, epoch) && $0.embedding != nil }
                     .map { (row: $0, cosine: VectorMath.cosine(vector, $0.embedding)) }
                     .max { $0.cosine < $1.cosine }
-                if let nearest, Self.semanticDuplicate(nearest.row.content, memory.content, similarity: nearest.cosine, mode: .admission),
+                if let nearest, Self.semanticDuplicate(nearest.row.content, memory.content, similarity: nearest.cosine),
                    !MemoryRecallScoring.isExplicitCorrection(nearest.row.metadata),
                    scope != nil,
                    Self.disclosureScopeKey(personaId: nearest.row.personaId, metadata: nearest.row.metadata) == scopeKey,
                    let created = MemoryRecallScoring.parseTimestamp(nearest.row.createdAt),
-                   Date().timeIntervalSince(created) < 24 * 3600 {
+                   now.timeIntervalSince(created) < 24 * 3600 {
                     duplicate = nearest.row
                 }
             }
@@ -477,7 +276,7 @@ public actor MemoryStorage {
         return .object(object)
     }
 
-    static func owedSupersessions(_ metadata: JSONValue?) -> [SupersedingAcceptance] {
+    public static func owedSupersessions(_ metadata: JSONValue?) -> [SupersedingAcceptance] {
         guard case .object(let object)? = metadata, case .array(let rows)? = object[pendingSupersedesKey] else { return [] }
         return rows.compactMap { row in
             guard case .object(let fields) = row, case .string(let id)? = fields["id"],
@@ -593,7 +392,7 @@ public actor MemoryStorage {
     }
 
     /// Runs inside the caller's write transaction.
-    private static func executeMemoryInsert(_ memory: StoredMemory, in db: Database) throws {
+    static func executeMemoryInsert(_ memory: StoredMemory, in db: Database) throws {
         try db.execute(sql: """
             INSERT INTO memories
               (id, content, persona_id, source, confidence,
@@ -666,10 +465,12 @@ public actor MemoryStorage {
             // as its warm write would have; one that changed or left meanwhile
             // refuses it, as a warm write is refused.
             let supersessions = Self.owedSupersessions(owed.metadata)
-            if reason == nil, !supersessions.isEmpty {
+            if reason == nil || folded != nil, !supersessions.isEmpty {
+                let replacement = folded ?? owed
                 do {
                     try db.inSavepoint {
-                        demoted = try supersessions.map { try Self.demoteSuperseded($0, by: owed, in: db) }
+                        demoted = try supersessions.filter { $0.targetId != replacement.id }
+                            .map { try Self.demoteSuperseded($0, by: replacement, in: db) }
                         return .commit
                     }
                 } catch {
@@ -696,7 +497,7 @@ public actor MemoryStorage {
                 """, arguments: [Self.nowISO8601(), Self.encodeMetadata(.object(metadata)), id])
             let archived = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id])
                 .map(Self.decodeMemory)
-            return (.archived(reason: reason), [archived, folded].compactMap { $0 })
+            return (.archived(reason: reason), [archived, folded].compactMap { $0 } + demoted)
         }
         invalidateRecallCache()
         for row in changed {
@@ -738,7 +539,8 @@ public actor MemoryStorage {
             if let expectedContent, existing.content != expectedContent { return (nil, []) }
             if let onlyIf, !onlyIf(existing) { return (nil, []) }
             let priorMetadata = existing.metadata
-            let owesVector = patch.content.map { $0 != existing.content } == true && patch.embedding == nil
+            let contentChanged = patch.content.map { $0 != existing.content } == true
+            let owesVector = contentChanged && patch.embedding == nil
             if let c = patch.content { existing.content = c }
             if let s = patch.source { existing.source = s }
             if let conf = patch.confidence { existing.confidence = conf }
@@ -747,6 +549,11 @@ public actor MemoryStorage {
             if let st = patch.status { existing.status = st }
             if let lifecycle = patch.lifecycle { existing.lifecycle = MemoryLifecycle.normalized(lifecycle) }
             if let validFrom = patch.validFrom { existing.validFrom = validFrom }
+            // Reactivating a record reopens its truth interval. Correction
+            // lineage stays in metadata; a closed interval cannot stay current.
+            if patch.status == "active", MemoryLifecycle.isRecallEligible(existing.lifecycle) {
+                existing.validTo = nil
+            }
             if let validTo = patch.validTo { existing.validTo = validTo }
             if let observedAt = patch.observedAt { existing.observedAt = observedAt }
             if let evidence = patch.evidence { existing.evidence = evidence }
@@ -769,6 +576,7 @@ public actor MemoryStorage {
                 for (key, value) in merge { metadata[key] = value }
                 existing.metadata = .object(metadata)
             }
+            // A content edit keeps the writer's named date; words cannot move it.
             existing.metadata = try MemorySenseProvenance.preserving(existing: priorMetadata, incoming: existing.metadata)
             existing.metadata = MemoryDataProvenance.preserving(existing: priorMetadata, incoming: existing.metadata)
             existing.metadata = MemoryDataProvenance.preserving(existing: turnDataProvenance, incoming: existing.metadata)
@@ -788,14 +596,14 @@ public actor MemoryStorage {
                 existing.metadata = Self.owingAdmission(existing.metadata, preservingID: true)
             }
             var demoted: [StoredMemory] = []
-            if existing.status == "active", let vector = existing.embedding,
-               Self.metadataFlag(priorMetadata, Self.pendingAdmissionKey) {
+            let admittingOwedVector = existing.status == "active" && existing.embedding != nil
+                && Self.metadataFlag(priorMetadata, Self.pendingAdmissionKey)
+            if patch.content != nil || patch.embedding != nil || admittingOwedVector {
+                try Self.requireNotTombstoned(existing, in: db)
+            }
+            if admittingOwedVector {
                 // An active row awaiting admission that now has its vector is
                 // admitted here, with its landing's checks, so it never stays withheld.
-                if try Self.tombstoneMatch(db: db, query: vector, queryEpoch: existing.embeddingEpoch,
-                                           threshold: memoryTombstoneMatchThreshold) {
-                    throw MemoryV2Error.forgottenContent("Updated content paraphrases a forgotten or rejected memory.")
-                }
                 demoted = try Self.owedSupersessions(priorMetadata).map { try Self.demoteSuperseded($0, by: existing, in: db) }
                 if case .object(var metadata)? = existing.metadata {
                     for key in [Self.pendingAdmissionKey, Self.preservesIDKey, Self.pendingSupersedesKey] { metadata[key] = nil }
@@ -803,9 +611,6 @@ public actor MemoryStorage {
                 }
             }
             existing.updatedAt = Self.nowISO8601()
-            if patch.content != nil || patch.embedding != nil {
-                try Self.requireNotTombstoned(existing, in: db)
-            }
             try Self.validateTemporalEvidence(existing)
             try Self.requireWritableEpoch(
                 in: db,
@@ -852,8 +657,7 @@ public actor MemoryStorage {
             try db.execute(sql: "DELETE FROM memories WHERE id = ?", arguments: [id])
             let deleted = db.changesCount > 0
             if deleted, let row {
-                // Carry the deleted memory's own embedding into the tombstone so
-                // the semantic gate can block paraphrased resurrections (wave1 T2).
+                // Preserve the deleted memory's embedding so the tombstone blocks paraphrases.
                 try Self.upsertTombstone(
                     db: db, content: row.content, reason: "deleted_memory",
                     embedding: row.embedding,
@@ -865,8 +669,8 @@ public actor MemoryStorage {
         if result.deleted, let row = result.row {
             invalidateRecallCache()
             pokeUserMDRegen(persona: row.personaId)
-            pokeSpotlight(row, deleted: true)
-            pokeKnowledgeGraph(row, deleted: true)
+            pokeSpotlight(row)
+            pokeKnowledgeGraph(row.id)
             await pokeDerivedState(row, deleted: true)
         }
         return result.deleted
@@ -913,7 +717,7 @@ public actor MemoryStorage {
             let direction = newestFirst ? "DESC" : "ASC"
             let order = "created_at COLLATE memory_curation_order \(direction), id COLLATE memory_curation_order \(direction)"
             let cursor = try Row.fetchCursor(db, sql: """
-                SELECT id, persona_id, created_at, status, lifecycle, metadata_json
+                SELECT id, persona_id, created_at, status, lifecycle, metadata_json, valid_to
                 FROM memories ORDER BY \(order)
                 """)
             var ids: [String] = []
@@ -927,11 +731,13 @@ public actor MemoryStorage {
                     createdAt: row.decode(forColumn: "created_at"),
                     status: row.decode(forColumn: "status"),
                     lifecycle: row.decode(forColumn: "lifecycle") ?? MemoryLifecycle.confirmed,
+                    validTo: row.decode(forColumn: "valid_to"),
                     metadata: Self.decodeMetadata(row.decode(forColumn: "metadata_json"))
                 ))
                 guard archived ? Self.isRecoverable(record)
                     : record.status == "active" && MemoryLifecycle.isRecallEligible(record.lifecycle)
-                        && !Self.metadataFlag(record.extras, Self.pendingAdmissionKey),
+                        && !Self.metadataFlag(record.extras, Self.pendingAdmissionKey)
+                        && MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: record.validTo, at: Date()),
                     kind == nil || record.memoryKind == kind,
                     MemoryRecordDisclosurePolicy.classify(
                         personaID: record.personaId, status: archived ? "active" : record.status,
@@ -963,99 +769,29 @@ public actor MemoryStorage {
     /// Scalar status counts keep lifecycle and JSON boolean pin semantics.
     public func statusCounts() async throws -> (memories: Int, active: Int, pinned: Int, pendingProposals: Int) {
         try await dbPool.read { db in
-            let row = try Row.fetchOne(db, sql: """
+            guard let row = try Row.fetchOne(db, sql: """
                 SELECT COUNT(*) AS memories,
                     COUNT(CASE WHEN status = 'active'
                         AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL) THEN 1 END) AS active,
                     COUNT(CASE WHEN json_type(metadata_json, '$.pinned') = 'true' THEN 1 END) AS pinned,
                     (SELECT COUNT(*) FROM proposals WHERE status = 'pending') AS pending
                 FROM memories
-                """)!
+                """) else { throw MemoryStorageError.databaseUnavailable("Memory status aggregate is missing") }
             return (row["memories"], row["active"], row["pinned"], row["pending"])
         }
     }
 
-    /// Read pinned facts about User in chosen order, or disclosure-filtered user
-    /// facts before the first pin. Both admit only `userIdentityKinds`. An
-    /// empty result never restores unfiltered USER.md.
-    public func userPromptCore(surface: String) async throws -> [String]? {
-        try await dbPool.read { db in
-            let chosen = try Bool.fetchOne(db, sql: """
-                SELECT EXISTS(SELECT 1 FROM memory_metadata
-                    WHERE key = 'user_core_chosen' AND value = 1)
-            """) ?? false
-            if !chosen {
-                let rows = try Row.fetchAll(db, sql: """
-                    SELECT * FROM memories WHERE status = 'active' AND persona_id = ?
-                        AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
-                    ORDER BY created_at DESC
-                """, arguments: [MemoryV2Defaults.personaID]).map(Self.decodeMemory).filter {
-                    MemoryRecordDisclosurePolicy.classify(MemoryRecord(stored: $0))?
-                        .permits(surface: surface, personaID: nil) == true
-                }
-                return UserMDGenerator.userFacts(memories: rows)
-            }
-            return try Row.fetchAll(db, sql: """
-                SELECT * FROM memories WHERE status = 'active'
-                    AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
-                    AND json_extract(metadata_json, '$.pinned') = 1
-                    AND json_extract(metadata_json, '$.\(Self.pendingAdmissionKey)') IS NOT 1
-                ORDER BY COALESCE(json_extract(metadata_json, '$.pinned_order'), 0), created_at, id
-            """).map(Self.decodeMemory).map(MemoryRecord.init(stored:)).filter {
-                $0.memoryKind.map(UserMDGenerator.userIdentityKinds.contains) == true
-                    && MemoryRecordDisclosurePolicy.classify($0)?.permits(surface: surface, personaID: nil) == true
-            }.map { record in
-                (MemorySenseProvenance.warning(in: record.extras).map { "[\($0)]\n" } ?? "") + record.text
-            }
-        }
-    }
-
-    /// Archive only while the row remains stale, unused and uncorroborated
-    /// inside the write transaction.
-    /// A concurrent pin also vetoes eviction.
-    /// Returns true when the row was actually archived.
-    @discardableResult
-    public func archiveIfStillUnused(id: String, updatedBefore cutoff: Date) async throws -> Bool {
-        let archivedRow = try await dbPool.write { db -> StoredMemory? in
-            guard let row = try Row.fetchOne(db, sql: """
-                SELECT * FROM memories WHERE id = ? AND status = 'active' AND use_count = 0
-                    AND COALESCE(json_extract(metadata_json, '$.recall_count'), 0) = 0
-                """, arguments: [id]).map(Self.decodeMemory),
-                  let updated = MemoryRecallScoring.parseTimestamp(row.updatedAt),
-                  updated < cutoff else { return nil }
-            try db.execute(
-                sql: """
-                    UPDATE memories SET status = 'archived', updated_at = ?
-                    WHERE id = ? AND status = 'active' AND use_count = 0
-                      AND COALESCE(json_extract(metadata_json, '$.pinned'), 0) != 1
-                """,
-                arguments: [Self.nowISO8601(), id]
-            )
-            guard db.changesCount > 0 else { return nil }
-            return try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id])
-                .map(Self.decodeMemory)
-        }
-        // Same side-effect hooks updateMemory fires — without these the
-        // archived memory would stay in Spotlight/KG/USER.md as if active.
-        if let row = archivedRow {
-            invalidateRecallCache()
-            pokeUserMDRegen(persona: row.personaId)
-            await pokeProjectionHooks(row)
-        }
-        return archivedRow != nil
-    }
-
-    /// Record that these memories were just returned by recall — bump
-    /// `use_count` and stamp `last_used_at`. ONE atomic UPDATE so concurrent
-    /// recalls can't lose increments. Called fire-and-forget AFTER recall
-    /// returns its hits, so it adds nothing to read latency (Agent's zero-read-
-    /// cost constraint). No-op on empty input. Does NOT touch updated_at — a
-    /// recall is access, not a content mutation, and bumping updated_at would
-    /// corrupt recency ranking and reset the stale-age clock.
+    /// Atomically increment use_count and stamp last_used_at for returned recall hits.
+    /// Usage is access, not content: updated_at and recall_generation stay unchanged.
     public func recordRecallHits(ids: [String], at when: String = MemoryStorage.nowISO8601()) async throws {
         guard !ids.isEmpty else { return }
         try await dbPool.write { db in
             let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ", ")
+            if let id = try String.fetchOne(db, sql:
+                "SELECT id FROM memories WHERE id IN (\(placeholders)) AND (typeof(use_count) != 'integer' OR use_count = ?) LIMIT 1",
+                arguments: StatementArguments(ids.map { $0.databaseValue } + [Int64.max.databaseValue])) {
+                throw MemoryStorageError.databaseUnavailable("memories use_count overflow or invalid counter for row \(id)")
+            }
             var args: [DatabaseValueConvertible] = [when]
             args.append(contentsOf: ids)
             try db.execute(
@@ -1063,132 +799,7 @@ public actor MemoryStorage {
                 arguments: StatementArguments(args)
             )
         }
-        // Usage does not advance recall_generation; recall refreshes these
-        // columns without rebuilding decoded text and vectors.
+        // Candidate reuse returns its cached snapshot without refreshing usage columns.
     }
 
-    /// Wave1 S-lane: archive an older single-valued fact superseded by a newer
-    /// one. ARCHIVE, never delete — supersession is demotion, not erasure
-    /// (Agent's canon). Provenance {superseded_by, superseded_at} lands in
-    /// metadata. Both endpoints must remain eligible with the snapshot content.
-    @discardableResult
-    public func archiveSuperseded(
-        id: String, by newerId: String,
-        expectedContentHash: String, expectedReplacementContentHash: String
-    ) async throws -> Bool {
-        guard id != newerId else { return false }
-        let archivedRow = try await dbPool.write { db -> StoredMemory? in
-            guard let replacement = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [newerId]).map(Self.decodeMemory),
-                  Self.projectionEligible(replacement),
-                  Self.contentFingerprint(replacement.content) == expectedReplacementContentHash,
-                  var row = try Row.fetchOne(db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [id]).map(Self.decodeMemory),
-                  Self.projectionEligible(row),
-                  Self.contentFingerprint(row.content) == expectedContentHash else {
-                return nil
-            }
-            if case .object(let meta)? = replacement.metadata, meta["owner_restored"] != nil { return nil }
-            if case .object(let meta)? = row.metadata, meta["owner_restored"] != nil { return nil }
-            var meta: [String: JSONValue] = [:]
-            if case .object(let existing)? = row.metadata { meta = existing }
-            meta["superseded_by"] = .string(newerId)
-            meta["superseded_at"] = .string(Self.nowISO8601())
-            row.metadata = .object(meta)
-            row.status = "archived"
-            row.updatedAt = Self.nowISO8601()
-            try db.execute(sql: """
-                UPDATE memories SET status = 'archived', updated_at = ?, metadata_json = ?
-                WHERE id = ? AND status = 'active'
-            """, arguments: [row.updatedAt, Self.encodeMetadata(row.metadata), id])
-            return db.changesCount > 0 ? row : nil
-        }
-        if let row = archivedRow {
-            invalidateRecallCache()
-            pokeUserMDRegen(persona: row.personaId)
-            await pokeProjectionHooks(row)
-        }
-        return archivedRow != nil
-    }
-
-    /// R13: first-class correction lineage. Marks `id` CORRECTED by `newerId`
-    /// in ONE transaction: lifecycle → 'corrected' (recall-excluded via
-    /// MemoryLifecycle.recallExcluded), queryable corrected_by/corrected_at
-    /// (+ optional reason) in metadata, and an append-only correction_history
-    /// entry so repeated corrections keep their full chain. Status is left
-    /// untouched — lifecycle is the single source of correction state, and
-    /// correction is demotion, not erasure (same canon as supersession).
-    /// Conditional on the row being active and not already lifecycle-terminal;
-    /// returns false when either endpoint is no longer eligible.
-    ///
-    /// `supersededBy` rides the SAME transaction for callers (the supersession
-    /// lint) whose provenance is a retirement record rather than a replacement
-    /// fact. Writing it separately could leave a demoted row with no pointer to
-    /// what demoted it, and nothing rereads a corrected row to repair that.
-    @discardableResult
-    public func markCorrected(
-        id: String,
-        by newerId: String,
-        reason: String? = nil,
-        supersededBy: String? = nil,
-        expectedContentHash: String? = nil,
-        expectedReplacementContentHash: String? = nil
-    ) async throws -> Bool {
-        // A deduplicated reassertion can resolve to the original record. It
-        // must not retire that sole fact or create a self-referential lineage.
-        guard id != newerId else { return false }
-        let correctedRow = try await dbPool.write { db -> StoredMemory? in
-            // The replacement may have changed after store/dedup returned.
-            // Check it inside this same transaction so retiring the old fact
-            // cannot leave lineage pointing to a missing or retired record.
-            guard let replacement = try Row.fetchOne(
-                db, sql: "SELECT * FROM memories WHERE id = ?", arguments: [newerId]
-            ).map(Self.decodeMemory), Self.projectionEligible(replacement) else {
-                return nil
-            }
-            guard var row = try Row.fetchOne(db, sql: """
-                SELECT * FROM memories
-                WHERE id = ? AND status = 'active'
-                  AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
-            """, arguments: [id]).map(Self.decodeMemory) else {
-                return nil
-            }
-            if let expectedContentHash,
-               Self.contentFingerprint(row.content) != expectedContentHash { return nil }
-            if let expectedReplacementContentHash,
-               Self.contentFingerprint(replacement.content) != expectedReplacementContentHash { return nil }
-            if supersededBy != nil,
-               !MemorySupersessionLint.sameDisclosureScope(row, replacement) { return nil }
-            let now = Self.nowISO8601()
-            var meta: [String: JSONValue] = [:]
-            if case .object(let existing)? = row.metadata { meta = existing }
-            meta["corrected_by"] = .string(newerId)
-            meta["corrected_at"] = .string(now)
-            if let reason, !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                meta["correction_reason"] = .string(reason)
-            }
-            var history: [JSONValue] = []
-            if case .array(let existing)? = meta["correction_history"] { history = existing }
-            history.append(.object([
-                "by": .string(newerId),
-                "at": .string(now),
-                "reason": reason.map { JSONValue.string($0) } ?? .null,
-            ]))
-            meta["correction_history"] = .array(history)
-            if let supersededBy { meta["superseded_by"] = .string(supersededBy) }
-            row.metadata = .object(meta)
-            row.lifecycle = MemoryLifecycle.corrected
-            row.updatedAt = now
-            try db.execute(sql: """
-                UPDATE memories SET lifecycle = ?, updated_at = ?, metadata_json = ?
-                WHERE id = ? AND status = 'active'
-                  AND lifecycle NOT IN \(MemoryLifecycle.recallExcludedSQL)
-            """, arguments: [row.lifecycle, row.updatedAt, Self.encodeMetadata(row.metadata), id])
-            return db.changesCount > 0 ? row : nil
-        }
-        if let row = correctedRow {
-            invalidateRecallCache()
-            pokeUserMDRegen(persona: row.personaId)
-            await pokeProjectionHooks(row)
-        }
-        return correctedRow != nil
-    }
 }

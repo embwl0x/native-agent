@@ -4,7 +4,9 @@
 
 import CryptoKit
 import Foundation
+import NativeAgentShared
 import GRDB
+import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `KnowledgeGraph+MemoryIndexing.swift` | `KnowledgeGraphMemoryFact`; ID-only canonical indexing and generation/mode-fenced projection reconciliation |
 
@@ -16,6 +18,8 @@ public struct KnowledgeGraphMemoryFact: Sendable, Equatable {
     public var createdAt: String
     public var updatedAt: String
     public var metadata: JSONValue?
+    public var validFrom: String?
+    public var validTo: String?
 
     public init(
         id: String,
@@ -24,7 +28,9 @@ public struct KnowledgeGraphMemoryFact: Sendable, Equatable {
         status: String = "active",
         createdAt: String,
         updatedAt: String,
-        metadata: JSONValue? = nil
+        metadata: JSONValue? = nil,
+        validFrom: String? = nil,
+        validTo: String? = nil
     ) {
         self.id = id
         self.content = content
@@ -33,6 +39,24 @@ public struct KnowledgeGraphMemoryFact: Sendable, Equatable {
         self.createdAt = createdAt
         self.updatedAt = updatedAt
         self.metadata = metadata
+        self.validFrom = validFrom
+        self.validTo = validTo
+    }
+
+    init?(row: Row) throws {
+        let validTo = try row.decode(String?.self, forColumn: "valid_to")
+        guard MemoryRecordDisclosurePolicy.isTemporallyEligible(validTo: validTo, at: Date()) else { return nil }
+        let metadata = try row.decode(String?.self, forColumn: "metadata_json")
+        self.init(
+            id: try row.decode(String.self, forColumn: "id"),
+            content: try row.decode(String.self, forColumn: "content"),
+            source: try row.decode(String?.self, forColumn: "source"),
+            status: try row.decode(String?.self, forColumn: "status") ?? "active",
+            createdAt: try row.decode(String?.self, forColumn: "created_at") ?? "",
+            updatedAt: try row.decode(String?.self, forColumn: "updated_at") ?? "",
+            metadata: metadata.flatMap { try? JSONValue.parse(Data($0.utf8)) },
+            validFrom: try row.decode(String?.self, forColumn: "valid_from"), validTo: validTo
+        )
     }
 }
 
@@ -71,14 +95,9 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     private enum IndexingControl: Error {
         case requiresCanonicalRebuild
     }
-    // v5, 2026-09-05: names come from the on-device name tagger, not from
-    // capitalisation. Every row re-indexes on its next touch or a rebuild.
+    // v5 uses the on-device name tagger; rows re-index on their next touch or rebuild.
     static let indexVersion = "swift-memory-kg-v5"
-    /// U5 W-C: stamped into metadata_json ON INSERT ONLY (never by touch
-    /// updates) so GC can PROVE an entity was created by this indexer from a
-    /// MemoryV2 memory. Entities lacking the stamp (daemon-era JSON imports,
-    /// pre-stamp indexer rows) have unknowable source memories against the
-    /// live schema and are never swept.
+    /// Insert-only metadata_json provenance proves indexer ownership for GC; unstamped entities are never swept.
     static let createdByKey = "created_by_indexer"
 
     /// Internal (not private): the GC extension lives in KnowledgeGraph+GC.swift.
@@ -88,11 +107,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     /// and profile renames take effect without restarting, never once per fact.
     private let explicitPrimaryUserName: String?
     private let primaryUserProfileURL: URL
-    /// The primary user's name, resolved once at init so the synchronous
-    /// extractor inside the database closures can name them as a person.
-    /// Internal, not private: GC (KnowledgeGraph+GC.swift) must extract with
-    /// the SAME list the indexer wrote with, from this one resolver
-    /// (2026-09-06 — see `collectGarbage`).
+    /// Resolve known people once at init; indexing and GC share this list for synchronous extraction.
     nonisolated let knownPeople: [String]
 
     private var projectionGeneration = 0
@@ -121,12 +136,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         }
     }
 
-    /// The pool resolves lazily through KnowledgeGraphPoolCache to the owning
-    /// MemoryStorage's pool; that storage's migrator owns the kg_* schema.
-    /// NOTE: unlike the
-    /// pre-U5 eager open, an unopenable database throws at first USE, not at
-    /// init — callers that `try?` the init and swallow per-call errors see the
-    /// same net behavior, one open later.
+    /// Resolve MemoryStorage's pool lazily; an unreadable database throws on first use, not initialization.
     public init(memorySQLitePath: URL, primaryUserName: String? = nil) throws {
         try FileManager.default.createDirectory(
             at: memorySQLitePath.deletingLastPathComponent(),
@@ -142,9 +152,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         } else {
             profileNames.user ?? "the user"
         }
-        // The agent is a person in her own graph. Without her name here the
-        // tagger filed "Agent" as a concept in one row and a person in the
-        // next, and every rebuild kept both.
+        // The agent's own name always identifies a person in her graph.
         let agent = profileNames.agent
         var people: [String] = []
         if !resolved.isEmpty, resolved.lowercased() != "the user" { people.append(resolved) }
@@ -161,19 +169,13 @@ public actor SwiftNativeKnowledgeGraphIndexer {
 
     private static let builtInPeerAgents = ["Claude", "Codex"]
 
-    /// Resolve the owning MemoryStorage's pool. The indexer never opens or
-    /// creates memory.sqlite: a bare DatabasePool open here once minted a
-    /// store with an EMPTY grdb_migrations ledger, and MemoryStorage's next
-    /// init replayed its migrations against the existing kg tables and
-    /// bricked the chain (stable-failure #4 / Desk 751.7). A missing file
-    /// means there is nothing to index yet and the caller fails loud with
-    /// `.databaseMissing`.
+    /// Resolve the owner's pool without creating memory.sqlite; a missing file throws `.databaseMissing`.
     func pool() async throws -> DatabasePool {
         try await KnowledgeGraphPoolCache.shared.pool(at: sqlitePath)
     }
 
     public func indexMemory(
-        _ id: String, deleted: Bool = false, producing: Bool = true
+        _ id: String, producing: Bool = true
     ) async throws {
         let memoryID = id.trimmingCharacters(in: .whitespacesAndNewlines)
         // MemoryStorage orders the hooks; reconciliation owns retirement when
@@ -187,55 +189,18 @@ public actor SwiftNativeKnowledgeGraphIndexer {
                 // database MemoryV2 and KG share this exact transaction domain,
                 // so re-read the canonical row now. A delayed update task that
                 // arrives after a delete can no longer resurrect stale entities.
-                let canonicalFact: KnowledgeGraphMemoryFact?
-                do {
-                    let columns = Set(try Row.fetchAll(
-                        db, sql: "PRAGMA table_info(memories)"
-                    ).compactMap { row -> String? in row["name"] })
-                    let requiredColumns: Set<String> = ["id", "content", "status"]
-                    guard requiredColumns.isSubset(of: columns) else {
-                        let missing = requiredColumns.subtracting(columns).sorted()
-                        throw KnowledgeGraphReadError.storeUnreadable(
-                            "memories table is missing required columns: \(missing.joined(separator: ", "))"
-                        )
+                let canonicalFact = try Row.fetchOne(db, sql: """
+                    SELECT id, content, source, status, lifecycle, created_at, updated_at,
+                           metadata_json, valid_from, valid_to
+                    FROM memories WHERE id = ? AND status = 'active'
+                      AND json_extract(metadata_json, '$.admission_pending') IS NOT 1
+                    """, arguments: [memoryID])
+                    .flatMap { row -> KnowledgeGraphMemoryFact? in
+                        guard MemoryLifecycle.isRecallEligible(try row.decode(String?.self, forColumn: "lifecycle")),
+                              let fact = try KnowledgeGraphMemoryFact(row: row),
+                              !fact.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+                        return fact
                     }
-                    canonicalFact = try Row.fetchOne(
-                        db,
-                        sql: """
-                            SELECT id, content, source, status, created_at, updated_at,
-                                   lifecycle, metadata_json
-                            FROM memories WHERE id = ?
-                              AND json_extract(metadata_json, '$.admission_pending') IS NOT 1
-                            """,
-                        arguments: [memoryID]
-                    ).flatMap { row -> KnowledgeGraphMemoryFact? in
-                            let content: String = row["content"] ?? ""
-                            let status: String = row["status"] ?? ""
-                            let lifecycle: String = row["lifecycle"] ?? "confirmed"
-                            let recallExcludedLifecycle: Set<String> = [
-                                "corrected", "contradicted", "deleted", "graduated",
-                            ]
-                            guard status == "active",
-                                  !recallExcludedLifecycle.contains(
-                                    lifecycle.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                                  ),
-                                  !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                                return nil
-                            }
-                            let metadata = (row["metadata_json"] as String?).flatMap {
-                                try? JSONValue.parse(Data($0.utf8))
-                            }
-                            return KnowledgeGraphMemoryFact(
-                                id: row["id"] ?? memoryID,
-                                content: content,
-                                source: row["source"],
-                                status: status,
-                                createdAt: row["created_at"] ?? "",
-                                updatedAt: row["updated_at"] ?? "",
-                                metadata: metadata
-                            )
-                        }
-                }
 
                 guard let canonicalFact else {
                     throw IndexingControl.requiresCanonicalRebuild
@@ -384,17 +349,22 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         ]
         if let source = fact.source { metadata["last_memory_source"] = .string(source) }
 
-        if try Row.fetchOne(db, sql: "SELECT id FROM kg_entities WHERE id = ?", arguments: [id]) != nil {
+        if let row = try Row.fetchOne(db, sql: "SELECT id, mention_count FROM kg_entities WHERE id = ?", arguments: [id]) {
+            let count: Int64? = try row.decode(forColumn: "mention_count")
+            let (nextCount, overflow) = (count ?? 0).addingReportingOverflow(1)
+            guard !overflow else {
+                throw MemoryStorageError.databaseUnavailable("kg_entities mention_count overflow for row \(id)")
+            }
             try db.execute(sql: """
                 UPDATE kg_entities SET
                   name = ?,
                   type = 'fact',
                   summary = ?,
-                  mention_count = COALESCE(mention_count, 0) + 1,
+                  mention_count = ?,
                   last_seen = ?,
                   metadata_json = ?
                 WHERE id = ?
-                """, arguments: [title, summary, now, metadataJSON(metadata), id])
+                """, arguments: [title, summary, nextCount, now, metadataJSON(metadata), id])
             return id
         }
 
@@ -480,25 +450,30 @@ public actor SwiftNativeKnowledgeGraphIndexer {
         fact: KnowledgeGraphMemoryFact
     ) throws -> String {
         if let row = try Row.fetchOne(db, sql: """
-            SELECT id, metadata_json FROM kg_entities
+            SELECT id, metadata_json, mention_count FROM kg_entities
             WHERE lower(name) = lower(?) AND lower(type) = lower(?)
             ORDER BY mention_count DESC, last_seen DESC
             LIMIT 1
             """, arguments: [name, type]) {
-            let id: String = row["id"]
-            var metadata = metadataObject(row["metadata_json"])
+            let id: String = try row.decode(forColumn: "id")
+            let count: Int64? = try row.decode(forColumn: "mention_count")
+            let (nextCount, overflow) = (count ?? 0).addingReportingOverflow(1)
+            guard !overflow else {
+                throw MemoryStorageError.databaseUnavailable("kg_entities mention_count overflow for row \(id)")
+            }
+            var metadata = metadataObject(try row.decode(forColumn: "metadata_json"))
             metadata["embedding_text"] = .string("\(type): \(name)")
             metadata["last_memory_id"] = .string(fact.id)
             if let source = fact.source { metadata["last_memory_source"] = .string(source) }
             metadata["indexer"] = .string(indexVersion)
             try db.execute(sql: """
                 UPDATE kg_entities SET
-                  mention_count = COALESCE(mention_count, 0) + 1,
+                  mention_count = ?,
                   last_seen = ?,
                   summary = ?,
                   metadata_json = ?
                 WHERE id = ?
-                """, arguments: [now, summary, metadataJSON(metadata), id])
+                """, arguments: [nextCount, now, summary, metadataJSON(metadata), id])
             return id
         }
 
@@ -508,8 +483,7 @@ public actor SwiftNativeKnowledgeGraphIndexer {
             "last_memory_id": .string(fact.id),
             "last_memory_source": fact.source.map(JSONValue.string) ?? .null,
             "indexer": .string(indexVersion),
-            // U5 W-C: creation provenance — INSERT-only, never re-stamped by
-            // the touch/update path above. GC's orphan definition requires it.
+            // Stamp creation provenance only on insert; GC relies on its ownership claim.
             createdByKey: .string(indexVersion),
         ]
         try db.execute(sql: """
@@ -535,11 +509,16 @@ public actor SwiftNativeKnowledgeGraphIndexer {
     ) throws {
         guard fromID != toID else { return }
         if let row = try Row.fetchOne(db, sql: """
-            SELECT id, weight, metadata_json FROM kg_relationships
+            SELECT id, weight, metadata_json, mention_count FROM kg_relationships
             WHERE from_id = ? AND to_id = ? AND type = ?
             LIMIT 1
             """, arguments: [fromID, toID, type]) {
-            let id: Int64 = row["id"]
+            let id: Int64 = try row.decode(forColumn: "id")
+            let count: Int64? = try row.decode(forColumn: "mention_count")
+            let (nextCount, overflow) = (count ?? 0).addingReportingOverflow(1)
+            guard !overflow else {
+                throw MemoryStorageError.databaseUnavailable("kg_relationships mention_count overflow for row \(id)")
+            }
             let oldWeight: Double = row["weight"] ?? 0.5
             var metadata = metadataObject(row["metadata_json"])
             if metadata["first_seen"] == nil { metadata["first_seen"] = .string(now) }
@@ -549,12 +528,13 @@ public actor SwiftNativeKnowledgeGraphIndexer {
             try db.execute(sql: """
                 UPDATE kg_relationships SET
                   weight = ?,
-                  mention_count = COALESCE(mention_count, 0) + 1,
+                  mention_count = ?,
                   provenance = COALESCE(provenance, ?),
                   metadata_json = ?
                 WHERE id = ?
                 """, arguments: [
                     min(1.0, oldWeight + 0.05),
+                    nextCount,
                     type == "mentions" ? "default-mentions" : nil,
                     metadataJSON(metadata),
                     id,
@@ -611,13 +591,12 @@ public actor SwiftNativeKnowledgeGraphIndexer {
 
     static func factFingerprint(_ fact: KnowledgeGraphMemoryFact, content: String) -> String {
         let kind = metadataString(fact.metadata, "kind") ?? "fact"
-        return contentHash("\(indexVersion):\(kind.utf8.count):\(kind):\(content)")
+        let fields = [indexVersion, kind, fact.validFrom ?? "", fact.validTo ?? "", content]
+        return contentHash(fields.map { "\($0.utf8.count):\($0)" }.joined())
     }
 
     static func nowISO8601() -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: Date())
+        NativeTimestampFormat.fractionalZulu(Date())
     }
 
     static func clip(_ text: String, limit: Int) -> String {

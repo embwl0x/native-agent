@@ -9,10 +9,9 @@ import Foundation
 ///
 /// This is the contract between three parties that never talk to each other
 /// directly: the dispatch boundary that raises the need, the transcript that
-/// persists it across relaunch, and the card that renders it. Everything here
-/// is display/identity state. It carries no credentials, no OAuth material,
-/// no executable action, and no authority: the resolver asks the canonical
-/// owner (Connectors / Trust / Providers) whether the thing is actually done.
+/// persists it across relaunch, and the card that renders it. Display state
+/// grants no authority; the resolver checks the canonical owner. Runtime
+/// replay state follows the `Continuation` contract below.
 ///
 /// Old transcripts decode: every field added after v1 is optional or has a
 /// default, and an unknown `kind` or `state` decodes to `.unknown` rather
@@ -66,8 +65,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
 
     // MARK: Scope
 
-    /// How far a resolution reaches. Agent's one-image seam: choosing a model
-    /// for THIS image must not silently rewrite the Work group forever.
+    /// A request-only model choice never changes the Work group's stored choice.
     public enum Scope: String, Codable, Sendable, Equatable {
         /// Bind the choice to the resumed request only; no stored change.
         case thisRequestOnly = "this_request_only"
@@ -191,10 +189,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         case declined
         case failed(reason: String)
         case stopped(reason: String)
-        /// A newer, identical ask replaced this one before anybody answered
-        /// it. Terminal, and nobody's fault: the card goes quiet rather than
-        /// leaving four live copies of the same question in scrollback
-        /// (Agent, 2026-09-13 — one live card per ask).
+        /// Terminal replacement by a newer identical ask preserves one live card per ask.
         case superseded
         /// A state this build does not know (forward compatibility).
         case unknown(String)
@@ -249,16 +244,15 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
 
     // MARK: Continuation
 
-    /// Runtime-owned record of the request this need suspended. Assigned by
-    /// the runtime, never by the model. Nonsecret by construction: identifiers
-    /// only — the exact replay arguments live in the private continuation
-    /// record, never here, and are never reconstructed from redacted input.
+    /// Runtime-owned durable record of a suspended request, including captured
+    /// replay input. The mobile card projection omits it; resolution still
+    /// checks canonical owners and signature provenance.
     public struct Continuation: Codable, Sendable, Equatable {
         public enum Mode: String, Codable, Sendable, Equatable {
             /// Replay the captured tool call through the ordinary gated
             /// dispatcher once setup is verified.
             case retryBlockedTool = "retry_blocked_tool"
-            /// Agent asked directly; there is no tool to replay.
+            /// A direct request resumes the turn without replaying a tool.
             case continueTurn = "continue_turn"
 
             public init(from decoder: any Decoder) throws {
@@ -300,25 +294,13 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         public var reason: String?
         public var toolCallId: String?
         public var toolName: String?
-        /// The blocked call's EXACT arguments, as the model wrote them.
-        ///
-        /// Present only when the transcript's redactor left the receipt
-        /// untouched — a redacted or truncated argument set cannot be replayed
-        /// faithfully, and replaying a redacted one would make a DIFFERENT
-        /// call than the person agreed to. When this is nil the resume falls
-        /// back to telling the model the call may now run, which is the only
-        /// honest option left; when it is present the runtime replays it
-        /// verbatim through the ordinary gate and the model is never asked to
-        /// reconstruct arguments from memory.
+        /// Exact unredacted blocked-call arguments, replayed through the ordinary
+        /// gate. Nil continues the conversation without a captured-call replay.
         public var toolArgumentsJSON: String?
         public var mode: Mode
         public var state: ResumeState
-        /// The person's own message, held ONLY for the one case where the
-        /// request never reached a turn at all: no provider is connected, so
-        /// there is no tool to replay, no assistant row, and — deliberately —
-        /// no persisted user row to resume from. Every other need leaves the
-        /// conversation on disk and resumes from it, and leaves this nil.
-        /// It is the person's own text, echoed back into their own session.
+        /// The person's text when no provider accepted the request and no user
+        /// row was persisted; other needs resume from the saved conversation.
         public var resumeText: String?
         /// Stable ID for the continuation turn, so a duplicate resolve from a
         /// second surface lands on the same claim instead of a second turn.
@@ -408,7 +390,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
     /// and on transcripts written before this field existed.
     public var mode: AccessMode?
     public var title: String
-    /// Agent's one sentence: why this is being asked, here, now.
+    /// One sentence explaining why this is being asked here and now.
     public var why: String
     public var primaryActionLabel: String
     public var secondaryActionLabel: String?
@@ -418,10 +400,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
     /// Permissions say how long they last: "Stays on until you turn it off in
     /// Trust."
     public var persistenceNote: String?
-    /// The ONE sentence Agent says on a surface that draws the card. The card
-    /// is the handle; the reply above it is her voice, not a second copy of
-    /// the card's own rows. Nil on transcripts written before this existed,
-    /// where `textLaneProse` is the only wording there was.
+    /// One sentence above the card without repeating its rows; nil uses `textLaneProse`.
     public var cardProse: String?
     public var options: [Option]
     /// Scope the PRIMARY action applies at; the secondary applies the other.
@@ -503,9 +482,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         guard !action.isEmpty else { return line }
         if !line.isEmpty { line += " " }
         line += "\(action) in the app, or say \u{201C}not now\u{201D}"
-        // The consequence is joined MID-SENTENCE, after a dash, so it is
-        // lowercased where lowercasing it is correct English (Agent,
-        // 2026-09-13: "\u{2014} Without Notion" read as a new sentence).
+        // Lowercase the consequence's lead when joining it mid-sentence.
         var consequence = InlineInteraction.lowercasedLead(
             declineConsequence.trimmingCharacters(in: .whitespacesAndNewlines)
         )
@@ -514,9 +491,7 @@ public struct InlineInteraction: Codable, Sendable, Equatable, Identifiable {
         return line + " \u{2014} " + consequence
     }
 
-    /// The same need on a surface that DRAWS the card: one sentence in her
-    /// voice, because the card underneath already carries the rows. The long
-    /// text-lane wording here would be the card said twice (Agent).
+    /// Card surfaces use one sentence because the card already carries the details.
     public var cardLaneProse: String {
         let written = (cardProse ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         return written.isEmpty ? textLaneProse : written

@@ -165,7 +165,7 @@ extension SwiftToolDispatcher {
             "sort": .string("newest"), "limit": .int(5), "since": .string(since)]
         let outcome = await raceAgainstTimeout(seconds: 1.5) { [self] in
             let readiness = try await macIntegrationPermissionStore.readinessChecked()
-            let admitted = await fullMacYoloAdmitted(tool: "mail_search", surface: surface)
+            let admitted = await fullMacYoloAdmitted(surface: surface)
             guard await macIntegrationPermissionStore.allows(MacIntegrationID.mail, mode: .read, fullMacAdmitted: admitted) else {
                 return JSONValue.object(["status": .string("unavailable"), "message": .string(
                     readiness.refusal(integration: MacIntegrationID.mail, mode: .read)
@@ -200,7 +200,7 @@ extension SwiftToolDispatcher {
         var out: [String: JSONValue] = [
             "handle": .string(item.handle), "alias": .string(item.alias), "title": .string(String(item.title.prefix(300))),
             "project": .string(String(item.project.prefix(200))),
-            "status": .string(item.status.rawValue), "updated_at": .string(item.updatedAt),
+            "status": .string(item.statusDescription), "display_status": .string(HerScreen.deskState(item)), "updated_at": .string(item.updatedAt),
             "is_open": .bool(!item.status.isTerminal),
             "read_locator": workContextRead("desk_read", ["handle": .string(item.handle)]),
             "latest_recorded_notes": .array(item.notes.suffix(3).map {
@@ -232,16 +232,18 @@ extension SwiftToolDispatcher {
         }
         let children = state.children(of: item.handle)
         out["children"] = .array(children.prefix(5).map {
-            .object(["alias": .string($0.alias), "title": .string(String($0.title.prefix(300))), "status": .string($0.status.rawValue),
+            .object(["handle": .string($0.handle), "alias": .string($0.alias), "title": .string(String($0.title.prefix(300))), "status": .string($0.statusDescription),
                      "read_locator": workContextRead("desk_read", ["handle": .string($0.handle)])])
         })
         out["additional_children"] = .bool(children.count > 5)
-        if let attempt = item.workAttempts.last, case .object(var row) = attempt.toJSON() {
+        if let attempt = item.workAttempts.last(where: { $0.lane == .ownerCadence }), case .object(var row) = attempt.toJSON() {
             row.removeValue(forKey: "receiptHandedOff")
             out["last_recorded_attempt"] = boundedWorkContextValue(.object(row))
         }
-        if let reservation = item.pursuit?.reservations.last, case .object(var row) = reservation.toJSON() {
+        if let reservation = item.workAttempts.last(where: { $0.lane == .pursuit }), case .object(var row) = reservation.toJSON() {
             row.removeValue(forKey: "receiptHandedOff")
+            row["reservationId"] = row.removeValue(forKey: "attemptId")
+            row.removeValue(forKey: "lane")
             out["last_recorded_work_session"] = boundedWorkContextValue(.object(row))
         }
         return .object(out)

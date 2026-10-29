@@ -1,9 +1,10 @@
 import EngineRuntime
 import Transcripts
 import Foundation
+import NativeAgentShared
 import SwiftUI
 import MultimodalTTS
-// Blueprint: | `ChatView+SessionActions.swift` | `ChatView`: `showToast`, `rename`, `renameActiveChatTitle` |
+// Blueprint: | `ChatView+SessionActions.swift` | `ChatView`: toast publication, committed session rename and voice/export actions |
 
 extension VoiceOutputController {
     static func forChat() -> VoiceOutputController {
@@ -19,30 +20,18 @@ extension VoiceOutputController {
 
 extension ChatView {
     func showToast(_ s: String) {
-        ChatComposerBottomToastPresentation.show(s, in: toasts)
-    }
-
-    func rename() {
-        renameActiveChatTitle(renameTitle)
-    }
-
-    func renameActiveChatTitle(_ title: String) {
-        renameSession(appModel.activeChatSessionId, title)
+        toasts.show(s)
     }
 
     func renameSession(_ sessionId: String, _ title: String) {
         let cleanTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !sessionId.isEmpty, !cleanTitle.isEmpty else { return }
-        if sessionId == appModel.activeChatSessionId {
-            renameTitle = cleanTitle
-        }
         Task {
             await appModel.renameChatSession(id: sessionId, title: cleanTitle)
         }
     }
 
-    /// 2026-09-22 WHY: a reconnect waits up to 30s (the backoff cap); 6s left
-    /// most of the wait silent. Each try replaces the last.
+    /// Retry notices cover the reconnect backoff and replace the previous attempt.
     func pushChatTopNotice(_ text: String, kind: String) {
         guard kind == "provider_retry" else {
             turnNoticeToasts.push(info: text, autoDismissAfter: 6)
@@ -67,36 +56,38 @@ extension ChatView {
 
     func speakLatestAssistantIfReady() {
         let sessionID = appModel.activeChatSessionId.trimmingCharacters(in: .whitespacesAndNewlines)
-        let decision = VoiceOutputModeSelection.autoReadDecision(
+        guard let request = VoiceOutputModeSelection.autoReadDecision(
             enabled: voiceAutoRead,
             sessionID: sessionID,
             isSessionPrimed: autoReadPrimedSessionIds.contains(sessionID),
             lastMessage: appModel.chatMessages.last.map { ($0.id, $0.sessionId, $0.role, $0.content) },
             lastReadMessageID: lastAutoReadMessageIds[sessionID]
-        )
-        guard case .speak(let messageID, let text) = decision else { return }
+        ) else { return }
         // Consume before dispatching the asynchronous voice request: a count,
         // content, and busy-state update may all re-render this same reply.
-        lastAutoReadMessageIds[sessionID] = messageID
+        lastAutoReadMessageIds[sessionID] = request.messageID
         Task {
             await voiceOutput.speak(
-                text: text,
+                text: request.text,
                 policy: appModel.engine.trust.policy,
                 loadPolicy: { try await appModel.engine.trust.load() }
             )
         }
     }
 
-    // PATCH-2026-06-06: chat-upgrades — dump current session messages as
-    // Markdown into ~/Downloads/NativeAgent-chat-<sid>-<ts>.md
+    // Export session messages to ~/Downloads/NativeAgent-chat-<sid>-<ts>.md.
     func exportCurrentChatToDownloads() {
         let session = activeSession
         let sessionId = appModel.activeChatSessionId
         let messages = appModel.chatMessages
         Task {
             do {
-                _ = try await ChatExportService.export(session: session, sessionId: sessionId, messages: messages)
-                appModel.systemToasts.push(success: "Chat exported to Downloads")
+                let result = try await ChatExport.export(session: session, sessionId: sessionId, messages: messages)
+                if result.unavailableImages.isEmpty {
+                    appModel.systemToasts.push(success: "Chat exported to Downloads")
+                } else {
+                    appModel.systemToasts.push(warn: "Chat exported to Downloads; images unavailable: \(result.unavailableImages.joined(separator: "; "))")
+                }
             } catch let error as ChatExportError {
                 switch error {
                 case .noActiveSession, .noMessages:
@@ -111,7 +102,7 @@ extension ChatView {
     }
 }
 
-// 2026-09-22: read only by ChatTurnCardInset, never by ChatView.body.
+// Only ChatTurnCardInset reads this state; ChatView.body does not.
 extension ChatTurnCardInset {
     // chat-smoothness phase 4: one visibility truth for the floating live-turn
     // card — the overlay, its animation, and the "Latest" button lift all key
@@ -126,23 +117,11 @@ extension ChatTurnCardInset {
     // while its approval is still pending (or ended unproven) keeps the card,
     // because that question has no other home in the transcript.
     var showThinkingRow: Bool {
-        MacChatTurnCardProjection.isVisible(
+        TurnCardReadout.isVisible(
             appModel.engine.turns.lifecycle(for: appModel.activeChatSessionId),
             sessionId: appModel.activeChatSessionId,
             approvals: appModel.engine.approvals.records,
-            parseTimestamp: UserDisplayFormatters.parseFoundationISOTimestamp
-        )
-    }
-}
-
-extension ChatView {
-    func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool, delay: TimeInterval, force: Bool = false) {
-        scrollCoordinator.scrollToBottom(
-            proxy,
-            bottomAnchor: bottomAnchor,
-            animated: animated,
-            delay: delay,
-            force: force
+            parseTimestamp: NativeTimestampFormat.parseISO8601FractionalFirst
         )
     }
 }

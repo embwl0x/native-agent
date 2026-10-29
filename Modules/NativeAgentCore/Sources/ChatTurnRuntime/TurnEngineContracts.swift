@@ -1,4 +1,5 @@
 import ChatTurnContracts
+import ChatSessionWork
 import ApprovalInbox
 import Foundation
 import NativeAgentShared
@@ -13,7 +14,7 @@ import Context
 import CognitiveSubstrate
 import ToolRegistry
 import TurnTrace
-// Blueprint: | `TurnEngineContracts.swift` | `TurnContext` value projections with module-scoped setters and immutable admitted routing; `TurnEngineResult` aliases TurnTraceEvent's terminal status vocabulary; `SharedAdaptiveMemoryPromoter`: full turn evidence and telemetry |
+// Blueprint: | `TurnEngineContracts.swift` | `TurnContext` value projections with module-scoped setters, immutable admitted routing and retained sent-context/window metadata; `TurnEngineResult` aliases TurnTraceEvent's terminal status vocabulary |
 
 // MARK: - TurnEngineError
 
@@ -26,15 +27,9 @@ public enum TurnEngineError: Error, LocalizedError {
     /// running the model with no or partial tools.
     case toolCatalogLoadFailed(underlying: Error)
     case emptyMessage
-    /// A provider stream failed mid-turn. `partial` carries the visible prose the
-    /// user already watched render so the orchestration layer can persist it
-    /// instead of silently dropping it (audit #5, 2026-06-14).
+    /// A failed provider stream carries visible partial prose for persistence.
     case streamInterrupted(partial: String, underlying: Error)
-    /// 2026-07-21 audit fix: a USER STOP mid-stream. Same partial-carry as
-    /// streamInterrupted but the orchestration layer persists it with
-    /// cancelled:true and rethrows CancellationError (cancel is not a
-    /// failure); previously the structured lanes discarded the visible
-    /// partial entirely on cancel while text-compat persisted it.
+    /// User Stop preserves partial prose with cancelled:true and rethrows CancellationError.
     case streamCancelled(partial: String, underlying: Error)
     /// Her turn part failed with no clean version left to swap in.
     case turnPartFailed(String)
@@ -70,197 +65,9 @@ public enum TurnEngineError: Error, LocalizedError {
     }
 }
 
-/// Bounded, payload-free result of the memory-promotion side channel.
-public struct MemoryPromotionTelemetry: Sendable, Equatable {
-    public let stagedProposalCount: Int64
-    /// The moment pass's one-word outcome (see AdaptiveMemoryObservation).
-    public var momentOutcome: String = "unreported"
-    public var savedCorrectionCount: Int = 0
-    public var pendingCorrectionCount: Int = 0
-    public var failedCorrectionCount: Int = 0
-    /// Phase 5A novelty gate: why the after-turn memory call was skipped.
-    public var noveltySkipReason: String?
-    public var failure: AfterTurnMemoryFailure?
-    public var interpretationFailure: AfterTurnInterpretationFailure? { failure?.interpretationFailure }
-    public let semanticStatus: MemorySemanticExtractionStatus
-    public let semanticCandidateCount: Int64
-    public let candidateCount: Int64
-
-    public init(stagedProposalCount: Int, semanticStatus: MemorySemanticExtractionStatus = .unreported,
-                semanticCandidateCount: Int = 0, candidateCount: Int = 0) {
-        self.stagedProposalCount = Int64(max(0, stagedProposalCount))
-        self.semanticStatus = semanticStatus
-        self.semanticCandidateCount = Int64(max(0, semanticCandidateCount))
-        self.candidateCount = Int64(max(0, candidateCount))
-    }
-}
-
-public struct SharedAdaptiveMemoryPromoter: Sendable {
-    public init() {}
-
-    /// Throws when the count cannot be read: an unread count is not zero.
-    public func pendingMomentCount() async throws -> Int {
-        try await AdaptiveMemoryPromoter.shared.pendingMomentCount()
-    }
-
-    public func observeTurnWithTelemetry(
-        userMessage: String,
-        assistantMessage: String,
-        sessionId: String,
-        surface: String
-    ) async -> MemoryPromotionTelemetry {
-        let observation = await AdaptiveMemoryPromoter.shared.observeTurnWithReport(
-            userMessage: userMessage,
-            assistantMessage: assistantMessage,
-            sessionId: sessionId,
-            surface: surface,
-            standingAgentName: StandingBotContinuity.currentBot?.name,
-            turnId: TurnTraceContext.turnId
-        )
-        var telemetry = MemoryPromotionTelemetry(
-            stagedProposalCount: observation.proposals.count,
-            semanticStatus: observation.extraction.semanticStatus,
-            semanticCandidateCount: observation.extraction.semanticCandidateCount,
-            candidateCount: observation.extraction.candidates.count
-        )
-        telemetry.momentOutcome = observation.momentOutcome
-        telemetry.savedCorrectionCount = observation.savedCorrectionCount
-        telemetry.pendingCorrectionCount = observation.pendingCorrectionCount
-        telemetry.failedCorrectionCount = observation.failedCorrectionCount
-        telemetry.noveltySkipReason = observation.noveltySkipReason
-        telemetry.failure = observation.extraction.failure
-        return telemetry
-    }
-}
-
-// MARK: - Turn tool-evidence projection (sweep item 35)
-
-/// Telemetry count only: these lines do not reach the memory promoter.
-/// Preserve eligibility and deduplication over the exact bounded, redacted
-/// evidence line. Once `maxDispatches` distinct lines exist, no later result
-/// can change the capped count, so it need not be serialized or projected.
-enum TurnToolEvidenceProjection {
-    static let maxDispatches = 6
-    static let maxLineChars = 240
-    private static let maxInputEntries = 2
-    private static let maxInputValueChars = 80
-
-    /// Tools whose success proves nothing durable: the reading is true for a
-    /// moment and stale by the next turn. A path-shaped token inside one of
-    /// these envelopes is incidental, not a fact worth proposing. (Recall and
-    /// history tools are here for a second reason — promoting what memory
-    /// returned would feed the store its own output.)
-    private static let transientReaders: Set<String> = [
-        "battery", "clock", "context_expand", "current_time", "date",
-        "get_time", "get_weather", "list_notifications", "look", "observe",
-        "ping", "random", "recall_memory", "roll", "screen", "screenshot",
-        "search_chat_history", "search_memory", "memory_search",
-        "session_search", "system_status", "time", "view", "weather",
-    ]
-
-    /// A path (`/a/b`), a reverse-DNS identifier (`com.apple.Notes`), or a
-    /// named source file (`Auth.swift`). Anything else is prose.
-    private static let stableFactShape = #"(?:/[A-Za-z0-9._~@%+-]+){2,}|\b[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_.-]+\b|\b[A-Za-z0-9_-]+\.(?:swift|ts|tsx|js|jsx|py|rb|rs|go|java|kt|json|md|ya?ml|toml|sh|zsh|[hmc]|cpp|plist|sql|txt|log|csv)\b"#
-
-    static func count(_ dispatches: [TurnEngineResult.ToolDispatchRecord]) -> Int {
-        var seen = Set<String>()
-        for dispatch in dispatches {
-            guard let line = evidenceLine(for: dispatch) else { continue }
-            seen.insert(line)
-            if seen.count == maxDispatches { break }
-        }
-        return seen.count
-    }
-
-    /// The rendered evidence for one dispatch, or nil when it is not eligible.
-    static func evidenceLine(
-        for dispatch: TurnEngineResult.ToolDispatchRecord
-    ) -> String? {
-        guard ChatToolOutcome.exactResultClass(dispatch.result) == .succeeded else { return nil }
-        // A successful enqueue is a receipt for the queue write, not evidence
-        // that the requested effect happened at the supplied path or target.
-        if case .object(let fields) = dispatch.result,
-           case .string(let status)? = fields["status"],
-           ["queued", "scheduled"].contains(status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) {
-            return nil
-        }
-        // An app call of a folded action is the tool it ran, over its args.
-        let name = dispatch.ranCall.tool.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty, !transientReaders.contains(name.lowercased()) else { return nil }
-
-        let arguments = inputSummary(dispatch.ranCall.input)
-        let result = SessionHistoryPromptRenderer.toolEvidenceProjection(resultText(dispatch.result))
-        guard hasStableFactShape(arguments) || hasStableFactShape(result) else { return nil }
-
-        var line = arguments.isEmpty ? "\(name) ok" : "\(name)(\(arguments)) ok"
-        if !result.isEmpty { line += ": \(result)" }
-        return hardCap(line, maxLineChars)
-    }
-
-    /// Scalar input arguments only, fact-shaped ones first, at most
-    /// `maxInputEntries`. Nested objects/arrays are tool plumbing, not facts.
-    private static func inputSummary(_ input: [String: JSONValue]) -> String {
-        let scalars: [(String, String)] = input.keys.sorted().compactMap { key in
-            guard let raw = scalarText(input[key]) else { return nil }
-            let redacted = ChatSecretRedactor.redactText(raw)
-                .split(whereSeparator: { $0.isWhitespace })
-                .joined(separator: " ")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !redacted.isEmpty else { return nil }
-            return (key, String(redacted.prefix(maxInputValueChars)))
-        }
-        let ordered = scalars.enumerated().sorted { lhs, rhs in
-            let l = hasStableFactShape(lhs.element.1)
-            let r = hasStableFactShape(rhs.element.1)
-            if l != r { return l }
-            return lhs.offset < rhs.offset
-        }.map(\.element)
-        return ordered.prefix(maxInputEntries)
-            .map { "\($0.0)=\($0.1)" }
-            .joined(separator: ", ")
-    }
-
-    private static func scalarText(_ value: JSONValue?) -> String? {
-        switch value {
-        case .string(let s)?: return s
-        case .int(let i)?: return String(i)
-        case .double(let d)?: return String(d)
-        case .bool(let b)?: return b ? "true" : "false"
-        default: return nil
-        }
-    }
-
-    private static func resultText(_ value: JSONValue) -> String {
-        if case .string(let s) = value { return s }
-        return (try? value.serialize(pretty: false)) ?? ""
-    }
-
-    private static func hasStableFactShape(_ text: String) -> Bool {
-        guard !text.isEmpty else { return false }
-        return text.range(of: stableFactShape, options: .regularExpression) != nil
-    }
-
-    private static func hardCap(_ text: String, _ maxCount: Int) -> String {
-        guard text.count > maxCount else { return text }
-        return String(text.prefix(max(0, maxCount - 3))) + "..."
-    }
-}
-
 // MARK: - ToolDispatchClient
 
 public typealias ToolDispatchClient = ChatTurnContracts.ToolDispatchClient
-
-/// One immutable provider-routing generation admitted before a chat facade
-/// chooses its execution branch. This is execution context only; the
-/// ProviderRouting store remains the sole authority and adapters still use a
-/// checked reread to detect corrupt/revoked authority.
-struct TurnRouteAdmission: Sendable, Equatable {
-    let routingSurface: String
-    let modelId: String
-    let reasoningEffort: String
-    let providerId: String?
-    let serviceTier: String?
-}
 
 // MARK: - TurnContext
 
@@ -310,18 +117,8 @@ public struct TurnContext: Sendable {
     public internal(set) var toolSchemas: [LLMToolSchema]
     public internal(set) var systemPrompt: String?
     public let userMessage: String
-    /// U1 step 2b/3b (2026-06-10) — ADDITIVE stable/dynamic split of
-    /// `systemPrompt` for provider prompt caching. When present:
-    ///   INVARIANT: systemPrompt == systemSegments.combined
-    ///              (== stable + "\n\n" + dynamic, empty segments collapse
-    ///               the separator)
-    /// `systemPrompt` stays the canonical model-visible content — every
-    /// existing consumer keeps reading it unchanged. The segments are a
-    /// layout hint the Anthropic adapters use to place the sys
-    /// cache_control breakpoint at the end of the STABLE mass
-    /// (persona + pins + the current lazy tool contract) instead of the end
-    /// of the churning combined string.
-    /// nil → legacy behavior everywhere.
+    /// When present, systemSegments.combined equals systemPrompt, joining nonempty segments with "\n\n".
+    /// Segments place Anthropic's cache breakpoint after stable content; nil uses the unsplit prompt.
     public internal(set) var systemSegments: SystemPromptSegments?
     /// Per-turn DYNAMIC image content blocks for the CURRENT user message.
     /// CACHE INVARIANT: image blocks live ONLY on the in-flight user message —
@@ -333,10 +130,7 @@ public struct TurnContext: Sendable {
     /// Pins one immutable ContextFlow generation through the complete
     /// provider/tool loop. nil keeps the legacy/off path unchanged.
     public let fluidContextTurn: ContextPreparedTurn?
-    /// v2Prefix (2026-09-01): prior turns replayed as REAL messages, oldest →
-    /// newest, so a provider cache can match them byte-for-byte across turns.
-    /// Empty on non-history callers. Produced by
-    /// `SessionHistoryMessageProjection` from bounded transcript rows.
+    /// SessionHistoryMessages replays bounded prior turns oldest first for byte-stable caching; other callers leave this empty.
     public internal(set) var historyMessages: [LLMMessage]
     /// v2Prefix: the per-turn volatile mass (packet, recall, digest, derived
     /// history blocks, clock/runtime, plan hint, capsule) AFTER it has been
@@ -344,16 +138,21 @@ public struct TurnContext: Sendable {
     /// nil until that split runs.
     public internal(set) var turnVolatileBlock: String?
     /// What the replayed-prefix window cursor did for this turn. Set by
-    /// `buildTurnContextWithHistory` — the one place that runs the cursor — so
+    /// history assembly (resident or helper) from the shared cursor, so
     /// every downstream receipt reports the same decision instead of re-reading
     /// it from disk or guessing zero. nil on non-history callers.
     public internal(set) var historyWindowReceipt: HistoryWindowReceipt?
+    /// Only metadata attached to user turns that the projection actually replays.
+    package var replayedTurnContexts: [SentTurnContext] = []
+    /// Cursor boundary and retained recollection identities, not turn-varying text.
+    package var historyContextWindow = "0:"
     /// Frozen duration from the context preparation summary, absent if unmeasured.
     public var preparationMs: Int64?
     /// The memory records this context delivers (packet provenance, or the
     /// legacy lane's rendered rows). Their usage credit is written once the
     /// provider accepts the context, never at assembly.
     public internal(set) var usageCreditMemoryIDs: [String] = []
+    var cognitiveRuntimeContext: String? = nil
     public internal(set) var turnReach: TurnReach
     /// Recall provenance for stamping: untrimmed Off-mode hits, then packet IDs,
     /// deduplicated and capped at 32. Delivery credit uses usageCreditMemoryIDs.
@@ -424,15 +223,16 @@ public struct TurnContext: Sendable {
         return copy
     }
 
-    /// v2Prefix relocation, run ONCE per turn at the message-seeding boundary
+    /// Lift the full built block at the message-seeding boundary
     /// (the two lanes) after every dynamic contributor has appended.
     ///
-    /// Model-visible content is UNCHANGED — the returned `turnVolatileBlock` is
+    /// Before paragraph delta selection, `turnVolatileBlock` is
     /// literally the same string `systemSegments.dynamic` held, in the same
     /// order, byte for byte. All that moves is WHERE it is delivered: out of
-    /// the churning tail of the system prompt (which no provider cache can
-    /// match twice) and into a message that sits AFTER the cached transcript
-    /// prefix. `systemPrompt` is rebuilt from the emptied segments so the
+    /// the churning tail of the system prompt into the current user turn,
+    /// after replayed history. Seeding selects its keyframe/delta and stores
+    /// the delivered bytes as metadata on that user row. `systemPrompt` is
+    /// rebuilt from the emptied segments so the
     /// adapter-verified `systemPrompt == segments.combined` invariant still
     /// holds by construction.
     ///
@@ -454,7 +254,6 @@ public struct TurnContext: Sendable {
         guard !volatileBlock.isEmpty else { return self }
         let lifted = SystemPromptSegments(
             stable: segments.stable,
-            stableSuffix: segments.stableSuffix,
             dynamic: ""
         )
         var copy = self
@@ -552,31 +351,16 @@ public struct TurnEngineResult: Sendable {
     public let recalledIds: [String]
     public let toolDispatches: [ToolDispatchRecord]
     public let elapsedMs: Int
-    public let rawLLMResponse: String
     /// Exact number of provider completions issued by this engine invocation.
     /// A default keeps non-loop/legacy construction source-compatible; owners
     /// that cannot prove the count leave it nil rather than inventing zero.
     public let providerCallCount: Int?
-    /// Exact provider-bound context facts captured by the engine. This is
-    /// needed by paths (notably Anthropic text compatibility) whose caller does
-    /// not own the final iteration's rebuilt TurnContext.
-    public let terminalObservation: TerminalObservation?
     /// Engine-owned terminal truth, independent of any nonempty fallback prose.
     /// Legacy paths that do not report this evidence leave it unknown.
     public let completionState: CompletionState?
     public let terminalReason: TerminalReason?
     public let loopCounters: LoopCounters?
-    /// THIS turn's claim on the deferred memory promotion it captured (Astra
-    /// comb 3 review, finding 1, 2026-09-12). The engine used to hold ONE
-    /// replaceable pending slot, so while turn A awaited its assistant append
-    /// turn B could overwrite it: A then started B's promotion before B's row
-    /// was durable, and A's promotion vanished. The ticket is the turn's own
-    /// handle — `startDeferredMemoryPromotion(ticket:)` starts exactly the work
-    /// this result's turn captured and nothing else. nil for paths that never
-    /// deferred (they promote inline, or not at all).
-    public let memoryPromotionTicket: UUID?
-    /// Her part's work after the reply (the keep moment): the caller starts
-    /// it once the answer is saved, beside the memory promotion.
+    /// Memory recording and private work released by the saved answer.
     public internal(set) var afterReply: AfterReply?
     /// How many LEADING characters of `reply` are working commentary — the
     /// narration the model spoke before each tool round — rather than the
@@ -592,11 +376,9 @@ public struct TurnEngineResult: Sendable {
         recalledIds: [String],
         toolDispatches: [ToolDispatchRecord],
         elapsedMs: Int,
-        rawLLMResponse: String,
         providerCallCount: Int? = nil,
-        terminalObservation: TerminalObservation? = nil,
         completionState: CompletionState? = nil,
-        memoryPromotionTicket: UUID? = nil,
+        afterReply: AfterReply? = nil,
         workingCommentaryCharacters: Int? = nil,
         terminalReason: TerminalReason? = nil,
         loopCounters: LoopCounters? = nil
@@ -606,13 +388,11 @@ public struct TurnEngineResult: Sendable {
         self.recalledIds = recalledIds
         self.toolDispatches = toolDispatches
         self.elapsedMs = elapsedMs
-        self.rawLLMResponse = rawLLMResponse
         self.providerCallCount = providerCallCount
-        self.terminalObservation = terminalObservation
         self.completionState = completionState
         self.terminalReason = terminalReason
         self.loopCounters = loopCounters
-        self.memoryPromotionTicket = memoryPromotionTicket
+        self.afterReply = afterReply
         self.workingCommentaryCharacters = workingCommentaryCharacters
     }
 
@@ -643,9 +423,9 @@ public struct TurnEngineResult: Sendable {
     func observingTerminal(reason: TerminalReason, counters: LoopCounters) -> Self {
         Self(
             reply: reply, modelUsed: modelUsed, recalledIds: recalledIds,
-            toolDispatches: toolDispatches, elapsedMs: elapsedMs, rawLLMResponse: rawLLMResponse,
-            providerCallCount: providerCallCount, terminalObservation: terminalObservation,
-            completionState: completionState, memoryPromotionTicket: memoryPromotionTicket,
+            toolDispatches: toolDispatches, elapsedMs: elapsedMs,
+            providerCallCount: providerCallCount,
+            completionState: completionState, afterReply: afterReply,
             workingCommentaryCharacters: workingCommentaryCharacters,
             terminalReason: reason, loopCounters: counters
         )

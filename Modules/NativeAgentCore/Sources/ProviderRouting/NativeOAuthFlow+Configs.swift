@@ -1,34 +1,29 @@
 import Foundation
+import NativeAgentShared
+import NativeAgentCore
 // Blueprint: | `NativeOAuthFlow+Configs.swift` | ProviderOAuthConfig owns provider client identities and token endpoints; buildAuthURL, exchangeCode |
 
 // MARK: - Provider config
 
-public struct ProviderOAuthConfig: @unchecked Sendable {
-    let providerId: String
+public struct ProviderOAuthConfig: Sendable {
     public let clientId: String
     let authorizationEndpoint: String
     public let tokenEndpoint: String
     let scope: String
     /// Pre-registered custom-scheme redirect URI (nativeagent://oauth/<name>).
     let redirectURI: String
-    /// Anthropic uses the PKCE verifier as state (pi-ai convention).
-    let stateEqualsVerifier: Bool
     /// Extra query params appended to the authorization URL.
     let extraAuthParams: [String: String]
     /// Token exchange body — form vs JSON varies per provider.
     let tokenBodyFormat: TokenBodyFormat
-    /// Function that takes the parsed token response dict and writes it to
-    /// the right on-disk shape for `LLMCredentialResolver` / the adapter.
-    /// User, 2026-09-06: takes the selected data root. It used to write to the
-    /// DEFAULT root unconditionally, so a sign-in under an override root landed
-    /// in the wrong install and the status read that followed found nothing.
-    let persistTokens: ([String: Any], URL) throws -> Void
+    /// Token responses are persisted in the selected data root's resolver/adapter format.
+    let persistTokens: @Sendable ([String: Any], URL) throws -> Void
     /// Function building the token-exchange body params (extras vary).
-    let extraTokenParams: (_ state: String) -> [String: String]
+    let extraTokenParams: @Sendable (_ state: String) -> [String: String]
 
-    enum TokenBodyFormat { case form, json }
+    enum TokenBodyFormat: Sendable { case form, json }
 
-    func buildAuthURL(redirectURI: String, state: String, challenge: String) -> URL {
+    func buildAuthURL(redirectURI: String, state: String, challenge: String) throws -> URL {
         var params: [(String, String)] = [
             ("client_id",             clientId),
             ("response_type",         "code"),
@@ -39,9 +34,12 @@ public struct ProviderOAuthConfig: @unchecked Sendable {
             ("state",                 state),
         ]
         for (k, v) in extraAuthParams { params.append((k, v)) }
-        var comps = URLComponents(string: authorizationEndpoint)!
+        guard var comps = URLComponents(string: authorizationEndpoint) else {
+            throw URLError(.badURL)
+        }
         comps.queryItems = params.map { URLQueryItem(name: $0.0, value: $0.1) }
-        return comps.url!
+        guard let url = comps.url else { throw URLError(.badURL) }
+        return url
     }
 
     func exchangeCode(code: String, verifier: String, state: String,
@@ -54,13 +52,12 @@ public struct ProviderOAuthConfig: @unchecked Sendable {
             "code_verifier": verifier,
         ]
         for (k, v) in extraTokenParams(state) { body[k] = v }
-        return try await NativeOAuthSupport.postToken(tokenEndpoint, body, json: tokenBodyFormat == .json)
+        return try await OAuthGrantOperations.postToken(tokenEndpoint, body, json: tokenBodyFormat == .json)
     }
 
     // MARK: Provider catalog
 
     public static let openai = ProviderOAuthConfig(
-        providerId:            "openai_oauth_direct",
         clientId:              "app_EMoamEEZ73f0CkXaXp7hrann",
         authorizationEndpoint: "https://auth.openai.com/oauth/authorize",
         tokenEndpoint:         "https://auth.openai.com/oauth/token",
@@ -69,11 +66,10 @@ public struct ProviderOAuthConfig: @unchecked Sendable {
         // http://localhost:1455/auth/callback. The loopback flow passes this
         // explicitly (see NativeOAuthFlow+Loopback); this field mirrors it.
         redirectURI:           "http://localhost:1455/auth/callback",
-        stateEqualsVerifier:   false,
         extraAuthParams: [
             "id_token_add_organizations": "true",
             "codex_cli_simplified_flow":  "true",
-            "originator":                 OpenAIOAuthDirectAdapter.codexBackendOriginator,
+            "originator":                 ChatGPTTransport.codexBackendOriginator,
         ],
         tokenBodyFormat: .form,
         persistTokens: { tokens, dataRoot in
@@ -84,25 +80,19 @@ public struct ProviderOAuthConfig: @unchecked Sendable {
                     userInfo: [NSLocalizedDescriptionKey: "Token endpoint did not return an access token."]
                 )
             }
-            // Persist to the APP-OWNED auth path, never the resolved active
-            // path: with CLI-session adoption allowed, the resolved path is
-            // ~/.codex/auth.json, and an in-app re-auth must not overwrite
-            // the Codex CLI's own session file (gpt-5.5 review 2026-08-06).
-            // The app-owned candidate precedes the shared one in resolution,
-            // so freshly written tokens win on the next turn.
+            // Sign-in writes the app-owned path, which precedes the shared CLI session in resolution.
             let authPath = NativeOAuthFlow.openAIAppOwnedAuthPath(dataRoot: dataRoot)
-            guard !OpenAIOAuthDirectAdapter.isUserCodexPath(authPath) else {
+            guard !ChatGPTTransport.isUserCodexPath(authPath) else {
                 throw NSError(
                     domain: "NativeOAuthFlow", code: 1,
                     userInfo: [NSLocalizedDescriptionKey: "ChatGPT sign-in cannot write to the shared Codex CLI folder."]
                 )
             }
             try ProviderStateValidation.credential(tokens)
-            try NativeOAuthSupport.updateProviderCredential(at: authPath) { existing in
+            try OAuthGrantOperations.updateProviderCredential(at: authPath) { existing in
                 if existing["auth_mode"] == nil { existing["auth_mode"] = "chatgpt" }
                 if existing["OPENAI_API_KEY"] == nil { existing["OPENAI_API_KEY"] = NSNull() }
-                // 2026-09-06: a sign-in replaces identity; missing response fields
-                // must not borrow refresh tokens or account IDs from the last account.
+                // Sign-in replaces identity without borrowing missing fields from the previous account.
                 var merged: [String: Any] = [:]
                 for key in ["access_token", "refresh_token", "id_token"] {
                     if let v = tokens[key] { merged[key] = v }
@@ -115,13 +105,8 @@ public struct ProviderOAuthConfig: @unchecked Sendable {
                 }
                 OAuthRefreshBinding.bindSignIn(&merged, provider: "openai_oauth_direct")
                 existing["tokens"] = merged
-                existing["last_refresh"] = NativeOAuthSupport.isoNow()
-                // User, 2026-09-06: this merge kept the PREVIOUS credential's
-                // top-level `expires_at`, and the adapter takes the EARLIER of the
-                // persisted stamp and the JWT's own `exp` — so a fresh sign-in
-                // could read as already expired and force a refresh on its very
-                // first call. A new sign-in replaces the stamp, and drops it
-                // entirely when the response carries no expiry at all.
+                existing["last_refresh"] = NativeTimestampFormat.plainZulu(Date())
+                // Sign-in replaces expires_at, removing it when the response has no expiry.
                 if let seconds = (tokens["expires_in"] as? Int)
                     ?? (tokens["expires_in"] as? Double).flatMap({ Int(exactly: $0.rounded(.towardZero)) }) {
                     let formatter = ISO8601DateFormatter()
@@ -142,7 +127,7 @@ public struct ProviderOAuthConfig: @unchecked Sendable {
             // The sign-in is saved; a failed child copy is re-synced (and
             // reported) by the next Codex spawn.
             do {
-                try OpenAIOAuthDirectAdapter.syncCodexChildCopy(from: authPath)
+                try ChatGPTTransport.syncCodexChildCopy(from: authPath)
             } catch {
                 FileHandle.standardError.write(Data(
                     "NativeOAuthFlow: Codex child credential copy failed: \(error)\n".utf8
@@ -153,15 +138,13 @@ public struct ProviderOAuthConfig: @unchecked Sendable {
     )
 
     public static let anthropic = ProviderOAuthConfig(
-        providerId:            "anthropic_oauth_direct",
         clientId:              "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
         authorizationEndpoint: "https://claude.ai/oauth/authorize",
         tokenEndpoint:         "https://platform.claude.com/v1/oauth/token",
         scope:                 "org:create_api_key user:profile user:inference "
                              + "user:sessions:claude_code user:mcp_servers user:file_upload",
         redirectURI:           "nativeagent://oauth/anthropic",
-        stateEqualsVerifier:   true,
-        extraAuthParams: ["code": "true"],   // pi-ai-required extra
+        extraAuthParams: ["code": "true"],
         tokenBodyFormat: .json,
         persistTokens: { tokens, dataRoot in
             try NativeOAuthFlow.persistAnthropicOAuthTokens(tokens, dataRoot: dataRoot)

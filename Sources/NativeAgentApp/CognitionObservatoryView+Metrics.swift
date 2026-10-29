@@ -1,5 +1,4 @@
-// Move-only extraction (tightness Wave C) from CognitionObservatoryView.swift
-
+import NativeAgentShared
 import Cognition
 import SwiftUI
 import CognitiveSubstrate

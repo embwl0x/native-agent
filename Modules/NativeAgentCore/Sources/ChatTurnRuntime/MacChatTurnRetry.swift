@@ -1,6 +1,6 @@
 import Foundation
 import TurnTrace
-// Blueprint: | `MacChatTurnRetry.swift` | `MacChatTurnPresentationPort`: `admitMacChatRetry`, `runAdmittedMacChatRetry`, `settleMacChatRetry` |
+// Blueprint: | `MacChatTurnRetry.swift` | `MacChatTurnPresentationPort`: `admitMacChatRetry`, `runAdmittedMacChatRetry` |
 
 public struct MacChatRetryAdmission: Sendable {
     public let identity: MacChatTurnIdentity
@@ -21,7 +21,7 @@ public extension MacChatTurnPresentationPort {
         defer {
             if !admitted { _ = macChatTurns.finishRuntime(sessionId: sessionId, generation: generation) }
         }
-        // FIX 4: same Stop-then-quick-restart ordering barrier as sendChat.
+        // Stop's flag write precedes this turn's flag-clear.
         await awaitPendingCancelFlagWrite(for: sessionId)
         let repairAvailable = await repairChatTurnLifecyclesIfNeeded(
             knownSessionIds: knownChatSessionIDs
@@ -35,7 +35,6 @@ public extension MacChatTurnPresentationPort {
                 : "Regenerate failed: lifecycle recovery is unavailable"))
             return nil
         }
-        // PATCH-2026-05-13: parallel-sessions — guard per-session, not global
         guard macChatTurns.taskGenerations[sessionId] == generation else {
             presentMacChatTurn(.status("Chat is already running in that session"))
             return nil
@@ -46,27 +45,19 @@ public extension MacChatTurnPresentationPort {
             sessionId: sessionId,
             turnId: TurnTraceContext.mintTurnId()
         )
-        _ = beginChatTurnLifecycle(
-            sessionId: lifecycleIdentity.sessionId,
-            turnId: lifecycleIdentity.turnId,
+        let lifecycle = await beginChatTurnLifecycle(
+            identity: lifecycleIdentity,
+            generation: generation,
             at: Date()
         )
-        let lifecyclePersisted = await persistChatTurnLifecycleBegin(
-            identity: lifecycleIdentity
-        )
         let canonicalMatches = await matchesCanonical()
-        let admissionStillCurrent = macChatTurns.lifecycle(for: sessionId)?.identity
-            == lifecycleIdentity
-            && macChatTurns.lifecycle(for: sessionId)?.cancellationRequestedAt == nil
-            && macChatTurns.taskGenerations[sessionId] == generation
+        let admissionStillCurrent = chatTurnAdmissionIsCurrent(identity: lifecycleIdentity, generation: generation)
             && canonicalMatches
             && stillMatchesLocal()
             && knownChatSessionIDs.contains(sessionId)
-            && !Task.isCancelled
-        guard lifecyclePersisted, admissionStillCurrent else {
-            _ = macChatTurns.finishRuntime(sessionId: sessionId, generation: generation)
-            await abandonChatTurnLifecycleBeforeAdmission(identity: lifecycleIdentity)
-            presentMacChatTurn(.status(lifecyclePersisted
+        guard lifecycle.persisted, lifecycle.isCurrent, admissionStillCurrent else {
+            await abandonChatTurnLifecycleBeforeAdmission(identity: lifecycleIdentity, generation: generation)
+            presentMacChatTurn(.status(lifecycle.persisted
                 ? "Regenerate failed: the conversation changed before retry began"
                 : "Regenerate failed: the turn could not be durably admitted"))
             await drainNextQueuedChatTurnIfPossible(sessionId: sessionId)
@@ -114,34 +105,5 @@ public extension MacChatTurnPresentationPort {
         await drainNextQueuedChatTurnIfPossible(sessionId: sessionId)
     }
 
-    func settleMacChatRetry(
-        identity: MacChatTurnIdentity,
-        error: Error? = nil
-    ) async -> MacChatStreamSettlement {
-        let signal: MacChatTurnObservedTerminalSignal
-        if let error {
-            if error is CancellationError {
-                // The compatibility API can throw cancellation-shaped text.
-                // Only this task's actual cancellation supplies typed evidence.
-                signal = Task.isCancelled ? .cancellationAcknowledged : .ambiguousTermination
-            } else if Task.isCancelled {
-                signal = .none
-            } else {
-                // A compatibility throw can follow an effect/persistence write;
-                // canonical transcript evidence must decide its outcome.
-                signal = .none
-            }
-        } else {
-            signal = .finalResponse
-        }
-        let proof = await readCanonicalChatTurnTerminalProof(identity: identity)
-        let state = await settleChatTurnLifecycle(
-            identity: identity,
-            kind: MacChatTurnLifecycleTerminalResolver.resolve(
-                transcriptProof: proof, observedSignal: signal
-            ),
-            at: Date()
-        )
-        return MacChatStreamSettlement(proof: proof, state: state, signal: signal)
-    }
+
 }

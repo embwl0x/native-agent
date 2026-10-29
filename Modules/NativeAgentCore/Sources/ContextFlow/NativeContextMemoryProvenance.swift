@@ -21,8 +21,7 @@ enum NativeContextMemoryProvenance {
     /// generation early; packet bytes and its receipt intentionally do not
     /// change here.
     static func attach(
-        to prepared: ContextPreparedTurn,
-        index: MemoryAtomRecordIndex
+        to prepared: ContextPreparedTurn
     ) -> NativeContextMemoryProvenanceResolution {
         let packet = prepared.packet
         let memoryAtomIDs = packet.selectedItems.compactMap { item -> ContextAtomID? in
@@ -35,10 +34,17 @@ enum NativeContextMemoryProvenance {
         }
         // The why receipt names every scored candidate's record; only the
         // selected ones count as use.
-        let mapping = index.recordMap(
-            for: memoryAtomIDs + packet.receipt.candidateScores.map(\.atomID),
-            generationID: packet.generationID
-        )
+        let requested = Set(memoryAtomIDs + packet.receipt.candidateScores.map(\.atomID))
+        let records = Dictionary(prepared.generation.sources.compactMap { source -> (ContextSourceID, String)? in
+            guard source.descriptor.owner == MemoryContext.owner,
+                  let recordID = MemoryContext.recordID(inLocator: source.descriptor.canonicalLocator) else { return nil }
+            return (source.descriptor.id, recordID)
+        }, uniquingKeysWith: { first, _ in first })
+        let mapping = Dictionary(prepared.generation.atoms.compactMap { atom -> (ContextAtomID, String)? in
+            guard atom.validToGeneration == nil, requested.contains(atom.draft.id),
+                  let recordID = records[atom.draft.sourceID] else { return nil }
+            return (atom.draft.id, recordID)
+        }, uniquingKeysWith: { first, _ in first })
         let selected = mapping.filter { memoryAtomIDs.contains($0.key) }
         if !mapping.isEmpty {
             prepared.attachMemoryRecordProvenance(Array(selected.values), atomRecords: mapping)

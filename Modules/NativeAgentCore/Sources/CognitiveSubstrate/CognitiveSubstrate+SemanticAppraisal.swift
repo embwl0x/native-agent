@@ -45,27 +45,17 @@ extension CognitiveSubstrate {
     /// Appraise `event` against her current state. `post` is the affect state the
     /// event just produced (the same one being stamped). Reads only actor state
     /// that is synchronously available.
-    /// `precomputedAppraisal`, when supplied, is the SAME gated
-    /// `conversationalAppraisal(in: event.summary)` the caller already computed
-    /// for the emotion-tag stamp — threaded through so the ~10-pass lexicon scan
-    /// runs ONCE per ingested event instead of twice (hot-path dedup). It is a
-    /// pure function of `event.summary`, so passing it is byte-identical to
-    /// recomputing here. Nil callers (tests, non-ingest paths) still compute it.
+    /// Consumes the admitted event's supplied appraisal and warmth boost.
     func semanticAppraisal(
         for event: CognitiveEvent,
         post: CognitiveAffectState,
-        precomputedAppraisal: AffectAppraisal? = nil,
-        precomputedWarmthBoost: Double? = nil,
+        precomputedAppraisal: AffectAppraisal,
+        precomputedWarmthBoost: Double,
         precomputedCares touchedCares: [CognitiveCare]
     ) -> SemanticAppraisal {
         let now = dependencies.now()
-        // Audit C3 (2026-07-09): text-derived dims read USER-authored words only —
-        // her own replies and tool output must not congratulate or wound her
-        // through the goalCongruence/relationship/lexical-resolution terms.
+        // Text-derived appraisal reads only user-authored words, never her replies or tool output.
         let text = precomputedAppraisal
-            ?? (Self.isUserAuthored(event.kind)
-                ? conversationalAppraisal(in: event.summary)
-                : AffectAppraisal())
         let nodes = field.peekNodes()
         let recent = nodes.filter {
             let age = now.timeIntervalSince($0.lastActivatedAt)
@@ -76,11 +66,7 @@ extension CognitiveSubstrate {
 
         // -- outcome sign + evidence reads shared by several dims --------------
         let outcomeSign = Double(event.terminalOutcomePolarity)
-        // Recent tool life. Outcome polarity reads WHAT HAPPENED (the machine-generated
-        // status text), never the stamped valence — a success that landed mid-bad-mood
-        // stamps muted/negative, and reading THAT as "the tool failed" made her own
-        // gloom self-confirming (R2-F finding, 2026-07-09: "Build passed" stamped −0.14
-        // and the next praise turn appraised as unresolved-failure).
+        // Tool outcome polarity reads status text, never mood-colored stamped valence.
         let toolObs = recent.filter { $0.kind == .toolObservation }
             .sorted { $0.lastActivatedAt < $1.lastActivatedAt }
         func outcome(_ node: CognitiveNode) -> Int {
@@ -149,17 +135,7 @@ extension CognitiveSubstrate {
         case .organismResolutionFelt: kindBase = 0.55
         }
         let subjectKey = "\(event.subject.type):\(event.subject.id)"
-        // The event was ingested into the field BEFORE this appraisal runs, so its own
-        // just-touched node is already in peekNodes — a same-subject node at age ≈ 0 is
-        // the event itself, not evidence. Excluding it keeps continuity meaning "this
-        // subject was around BEFORE now" and lets novelty actually register
-        // (gpt-5.5 review MED, 2026-07-09).
-        // createdAt, not lastActivatedAt (M15/gpt-5.5, 2026-07-09): ingest re-stamps
-        // lastActivatedAt = now on the touched node, so the old check excluded the
-        // very node that proves the subject was around BEFORE — continuity was
-        // structurally zero. A node CREATED just now is self-evidence; a re-activated
-        // old node is genuine continuity. (Post-C2, user turns carry per-turn
-        // subjects, so their session continuity flows through the sameSession term.)
+        // Exclude newly created self-evidence; reactivated older nodes still establish subject continuity.
         let isSelfEvidence: (CognitiveNode) -> Bool = { node in
             "\(node.subjectReference.type):\(node.subjectReference.id)" == subjectKey
                 && now.timeIntervalSince(node.createdAt) < 1.0
@@ -210,8 +186,7 @@ extension CognitiveSubstrate {
         // -- relationship -------------------------------------------------------
         let isLiveChat = event.kind == .userMessageReceived || event.kind == .userCorrection
         let userRecent = lastUserPresenceAt.map { now.timeIntervalSince($0) < 30 * 60 } ?? false
-        let warmthBoost = precomputedWarmthBoost ?? relationalWarmthBoost(in: event.summary)
-        let lexicalRelational = text.warmth != 0 || warmthBoost > 0
+        let lexicalRelational = text.warmth != 0 || precomputedWarmthBoost > 0
         a.relationshipStake = ((isLiveChat ? 0.6 : 0)
             + (lexicalRelational ? 0.3 : 0)
             + (userRecent && event.kind == .assistantTurnCompleted ? 0.1 : 0)
@@ -260,15 +235,16 @@ extension CognitiveSubstrate {
     // MARK: - Cares as appraisal substrate
 
     /// Read matching once before the await-free event transition. The four
-    /// seed cares participate in the same match as every grown live care.
+    /// seed cares participate in the same match as every grown live care: the
+    /// care cue's law (`caresStandingOut`), so a turn touches a care only when
+    /// one stands out for its words.
     func appraisalCares(in text: String) async -> [CognitiveCare] {
         let live = cares.values.filter { $0.fadedAt == nil }
         guard let cosines = await careCosines(to: text, among: live) else { return [] }
-        return live.compactMap { care -> (CognitiveCare, Double)? in
-            guard let cosine = cosines[care.id], cosine >= Self.careTouchCosineFloor,
-                  let current = cares[care.id], current.fadedAt == nil,
-                  current.updatedAt == care.updatedAt else { return nil }
-            return (current, cosine)
+        return Self.caresStandingOut(cosines, among: live).compactMap { touched -> (CognitiveCare, Double)? in
+            guard let current = cares[touched.care.id], current.fadedAt == nil,
+                  current.updatedAt == touched.care.updatedAt else { return nil }
+            return (current, touched.cosine)
         }
         .sorted { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0.id.uuidString < $1.0.id.uuidString }
         .map(\.0)
@@ -277,70 +253,6 @@ extension CognitiveSubstrate {
 }
 
 extension CognitiveSubstrate {
-
-    /// The metadata the somatic signal for `event` should carry so the
-    /// organism's semantic prediction lane can mint and resolve. Empty for every
-    /// event that carries neither — the overwhelming majority.
-    ///
-    /// Reads state but mutates only the single-use reaction stash (consumed
-    /// here, exactly as `pendingCompletion` is consumed at ingest), so a second
-    /// call for the same turn cannot double-resolve.
-    public func semanticExpectationMetadata(for event: CognitiveEvent) async -> [String: JSONValue] {
-        var out: [String: JSONValue] = [:]
-        let touched = event.kind == .assistantTurnCompleted ? await appraisalCares(in: event.summary) : []
-        let scope = event.kind == .assistantTurnCompleted ? mintScope(for: event) : nil
-        if let care = touched.first,
-           let scope, pendingCompletion?.nodeKey == scope.turnID,
-           pendingCompletion?.sessionId == scope.sessionID {
-            out[OrganismSemanticExpectation.mintMetadataKey] = .object([
-                OrganismSemanticExpectation.concernField: .string("care:" + care.id.uuidString),
-                OrganismSemanticExpectation.sessionField: .string(scope.sessionID),
-                OrganismSemanticExpectation.turnField: .string(scope.turnID),
-            ])
-        }
-        if let stash = consumeSemanticReaction(for: event) {
-            out[OrganismSemanticExpectation.reactionMetadataKey] = .object([
-                OrganismSemanticExpectation.reactionField: .string(stash.reaction),
-                OrganismSemanticExpectation.sessionField: .string(stash.sessionID),
-                OrganismSemanticExpectation.turnField: .string(stash.turnID),
-            ])
-        }
-        return out
-    }
-
-    /// Session + completion-turn identity for an expectation being minted.
-    /// Taken from the `pendingCompletion` slot ingest has just OPENED for this
-    /// very turn, so the mint scope and the later reaction scope are the same
-    /// two strings by construction.
-    func mintScope(for event: CognitiveEvent) -> (sessionID: String, turnID: String)? {
-        guard let pending = pendingCompletion,
-              let session = pending.sessionId,
-              let eventSession = event.sessionId,
-              session == eventSession,
-              !pending.nodeKey.isEmpty else { return nil }
-        let age = dependencies.now().timeIntervalSince(pending.recordedAt)
-        guard age >= 0, age <= Self.pendingCompletionMaxAge else { return nil }
-        return (session, pending.nodeKey)
-    }
-
-    /// The stashed verdict for this user turn, consumed on read. Nil when this
-    /// turn is not answering a completion — past the window "the next message is
-    /// a new beginning, not a verdict on the last thing she said", and an
-    /// expectation left unanswered expires on the organism's 24h backstop rather
-    /// than collecting a verdict from an unrelated turn.
-    func consumeSemanticReaction(for event: CognitiveEvent) -> SemanticReactionStash? {
-        guard Self.isUserAuthored(event.kind),
-              let stash = lastSemanticReaction,
-              let eventSession = event.sessionId,
-              eventSession == stash.sessionID else { return nil }
-        let age = dependencies.now().timeIntervalSince(stash.recordedAt)
-        guard age >= 0, age <= Self.pendingCompletionMaxAge else {
-            lastSemanticReaction = nil
-            return nil
-        }
-        lastSemanticReaction = nil
-        return stash
-    }
 
     /// Valence sign → the organism's reaction vocabulary. Negative is the only
     /// violating read; everything else is "he did not push back".

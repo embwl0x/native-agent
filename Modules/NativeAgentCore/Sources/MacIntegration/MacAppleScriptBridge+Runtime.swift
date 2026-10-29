@@ -1,16 +1,18 @@
 import AuthoredCapabilities
 import Foundation
+import NativeAgentShared
 import MacControl
 import PersistenceCore
+import NativeAgentCore
 // Blueprint: | `MacAppleScriptBridge+Runtime.swift` | `MacAppleScriptBridge`: delegates `runAppleScript` to MacControl, skill hand-back and integration envelopes; `deniedEnvelope`; Music recipe/parsers live in the editable `Resources/abilities/music-library.js` and `music.js` seeds, called through L0 `Parts.call` by MacIntegrationDeliveryActions; the playback receipt and effects survive failed readback as a separate `now_playing` fact, and exact title/artist selection uses Unicode full case folding |
 
 extension MacAppleScriptBridge {
     // MARK: - AppleScript invocation
 
-    typealias AppleScriptError = SystemAppleScriptAdapter.AppleScriptError
+    typealias AppleScriptError = AppleScriptExecution.AppleScriptError
 
     static func runAppleScript(_ source: String, bundleID: String) async throws -> String {
-        do { return try await SystemAppleScriptAdapter.runIntegrationScript(source, bundleID: bundleID) }
+        do { return try await AppleScriptExecution.runIntegrationScript(source, bundleID: bundleID) }
         catch let AppleScriptError.permissionDenied(app) {
             if SkillRunContext.handsBack { throw SkillRunContext.HandBack("Automation of \(app)") }
             throw AppleScriptError.permissionDenied(app: app)
@@ -25,16 +27,17 @@ extension MacAppleScriptBridge {
             "reason": .string("os_automation_denied"),
             "integration": .string(integration),
             "app": .string(app),
-            "remedy": SystemAppleScriptAdapter.automationTargetBundleIDs[app].flatMap { SystemPermissionPreflight.remedy("applescript:" + $0) } ?? .null,
+            "remedy": AppleScriptExecution.automationTargetBundleIDs[app].flatMap { SystemPermissionPreflight.remedy("applescript:" + $0) } ?? .null,
         ])
     }
 
     static func failedEnvelope(integration: String, error: Error) -> JSONValue {
         if let back = error as? SkillRunContext.HandBack { return SkillRunContext.handBack(back.why) }
         let ns = error as NSError
-        if ns.domain == "NativeAgentAppleScript", ns.code == SystemAppleScriptAdapter.appleScriptOutcomeUnknownCode {
+        if ns.domain == "NativeAgentAppleScript", ns.code == AppleScriptExecution.appleScriptOutcomeUnknownCode {
             return .object([
                 "status": .string("unknown"),
+                "receipt_owner": .string("applescript"), "result_class": .string("unknown"), "effects": .string("unknown"),
                 "reason": .string(ns.userInfo["state"] as? String ?? "outcome_unknown"),
                 "integration": .string(integration),
                 "error_code": .int(Int64(ns.code)),
@@ -51,12 +54,13 @@ extension MacAppleScriptBridge {
         return .object(envelope)
     }
 
-    static func failedEnvelope(integration: String, reason: String) -> JSONValue {
+    static func failedEnvelope(integration: String, reason: String, message: String? = nil) -> JSONValue {
         var envelope: [String: JSONValue] = [
             "status": .string("failed"),
             "integration": .string(integration),
             "reason": .string(reason),
         ]
+        if let message { envelope["message"] = .string(message) }
         // A refusal or a miss before the change; a send Mail declined may still sit in its Outbox.
         if reason != "mail_refused_send" { envelope["effects"] = .string("none") }
         return .object(envelope)
@@ -73,8 +77,7 @@ extension MacAppleScriptBridge {
 
     static let mailNotConfiguredSentinel = "__NATIVEAGENT_MAIL_NOT_CONFIGURED__"
     static let notesNotConfiguredSentinel = "__NATIVEAGENT_NOTES_NOT_CONFIGURED__"
-    /// 2026-09-06: `notes_create` answering that the folder the caller asked
-    /// for does not exist, followed by the folder names that do.
+    /// Missing requested Notes folder, followed by the available folder names.
     static let notesFolderMissingSentinel = "__NATIVEAGENT_NOTES_FOLDER_MISSING__"
 
     /// Converts only explicit setup sentinels. An empty script result remains
@@ -100,7 +103,7 @@ extension MacAppleScriptBridge {
 
     // MARK: - Input helpers
 
-    static func clampedInt(_ raw: JSONValue?, defaultValue: Int, min: Int, max: Int) -> Int {
+    package static func clampedInt(_ raw: JSONValue?, defaultValue: Int, min: Int, max: Int) -> Int {
         let value: Int
         switch raw {
         case .int(let i):
@@ -115,22 +118,12 @@ extension MacAppleScriptBridge {
         return Swift.max(min, Swift.min(max, value))
     }
 
-    static func inputString(_ raw: JSONValue?) -> String? {
-        switch raw {
-        case .string(let s): return s
-        case .int(let i): return String(i)
-        case .double(let d): return String(d)
-        case .bool(let b): return b ? "true" : "false"
-        default: return nil
-        }
-    }
-
     static func inputStringArray(_ raw: JSONValue?) -> [String] {
         switch raw {
         case .string(let s) where !s.isEmpty:
             return [s]
         case .array(let arr):
-            return arr.compactMap { inputString($0) }.filter { !$0.isEmpty }
+            return arr.compactMap { $0.scalarText }.filter { !$0.isEmpty }
         default:
             return []
         }
@@ -138,16 +131,7 @@ extension MacAppleScriptBridge {
 
     // MARK: - AppleScript string escaping
 
-    /// Escape a user-supplied string for safe injection into an AppleScript
-    /// string literal. Backslashes first (so we don't double-escape our own
-    /// inserted backslashes), then double quotes, then the line breaks.
-    ///
-    /// 2026-09-06: CR/LF used to be replaced with a SPACE, so an approved
-    /// multiline body — a mail send, a Messages send, a note — went out
-    /// reflowed onto one line, which is not what the operator approved. An
-    /// AppleScript string literal cannot span source lines, but it does accept
-    /// `\n` and `\r` escapes inside itself, so the break survives as a break
-    /// and the literal still cannot be terminated early.
+    /// Escapes backslashes, then quotes, then CR/LF so approved line breaks survive safely.
     static func escapeForAppleScript(_ s: String) -> String {
         var out = s.replacingOccurrences(of: "\\", with: "\\\\")
         out = out.replacingOccurrences(of: "\"", with: "\\\"")
@@ -159,9 +143,7 @@ extension MacAppleScriptBridge {
 
     // MARK: - Output record parsers
 
-    /// Convert AppleScript's localized date string ("Saturday, June 7, 2026
-    /// at 10:42:00 AM") to ISO-8601 ("2026-06-07T10:42:00Z"). On parse failure
-    /// returns the raw input — better than dropping the field.
+    /// Converts localized AppleScript dates to ISO-8601, retaining unparseable dates as text.
     static func normalizeAppleScriptDate(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return "" }
@@ -177,9 +159,7 @@ extension MacAppleScriptBridge {
         for f in formats {
             fmt.dateFormat = f
             if let d = fmt.date(from: trimmed) {
-                let iso = ISO8601DateFormatter()
-                iso.formatOptions = [.withInternetDateTime]
-                return iso.string(from: d)
+                return NativeTimestampFormat.plainZulu(d)
             }
         }
         // Fall back to raw; downstream just gets the locale string.
@@ -196,6 +176,7 @@ extension MacAppleScriptBridge {
             guard case .object(var row) = record, case .string(let id)? = row["id"], !id.isEmpty,
                   case .string(let modified)? = row["modified_at"],
                   case .string? = row["body"] ?? row["body_preview"],
+                  case .bool? = row["title_line_elided"],
                   case .bool? = row["truncated"] else {
                 throw NSError(domain: "NativeAgentNotes", code: -1, userInfo: [NSLocalizedDescriptionKey: "Notes returned an incomplete JSON record."])
             }

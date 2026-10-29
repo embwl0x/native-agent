@@ -17,7 +17,7 @@ public extension SwiftNativeProviderRouting {
                 detail: "no native probe for \(id)", error: nil
             )
         }
-        guard let apiKey = draftKey ?? LLMCredentialResolver.resolveAPIKey(
+        guard let apiKey = try draftKey ?? LLMCredentialResolver.checkedAPIKey(
             providerConfigFile: configFile, dataRoot: dataRoot
         ), !apiKey.isEmpty else {
             return NativeAgentShared.ProviderTestResult(
@@ -60,7 +60,8 @@ public extension SwiftNativeProviderRouting {
             // /models, so spend one token on a minimal Messages call. Proves
             // key validity + endpoint reachability, and its 200 also confirms
             // the Anthropic-compat body shape end to end.
-            var req = URLRequest(url: URL(string: "https://api.kimi.com/coding/v1/messages")!)
+            guard let endpoint = URL(string: "https://api.kimi.com/coding/v1/messages") else { throw URLError(.badURL) }
+            var req = URLRequest(url: endpoint)
             req.httpMethod = "POST"
             req.setValue(apiKey, forHTTPHeaderField: "x-api-key")
             req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
@@ -85,6 +86,8 @@ public extension SwiftNativeProviderRouting {
                 }
                 return refused(code, body, model: probeModel, ms: ms)
             } catch {
+                try Task.checkCancellation()
+                if error is CancellationError { throw error }
                 return failed(ProviderFailure.classify(error) ?? .network, model: nil,
                               evidence: error.localizedDescription.replacingOccurrences(of: apiKey, with: "[redacted]"))
             }
@@ -93,12 +96,13 @@ public extension SwiftNativeProviderRouting {
         // Free authenticated GETs: a models list, or OpenRouter's own key
         // endpoint. The key rides only in a header, never the URL, so no
         // error or log line below can carry it.
-        let modelsEndpoint: URL = switch id {
+        let modelsEndpoint: URL? = switch id {
         case "moonshot": MoonshotModelCatalog.endpoint
-        case "anthropic": URL(string: "https://api.anthropic.com/v1/models")!
-        case "openrouter": URL(string: "https://openrouter.ai/api/v1/key")!
-        default: URL(string: "https://api.openai.com/v1/models")!
+        case "anthropic": URL(string: "https://api.anthropic.com/v1/models")
+        case "openrouter": URL(string: "https://openrouter.ai/api/v1/key")
+        default: URL(string: "https://api.openai.com/v1/models")
         }
+        guard let modelsEndpoint else { throw URLError(.badURL) }
         var req = URLRequest(url: modelsEndpoint)
         req.httpMethod = "GET"
         if id == "anthropic" {
@@ -114,17 +118,26 @@ public extension SwiftNativeProviderRouting {
             let ms = Int(Date().timeIntervalSince(start) * 1000)
             let code = (response as? HTTPURLResponse)?.statusCode ?? 0
             if (200..<300).contains(code) {
+                var catalogDetail = ""
                 if id == "moonshot" {
-                    _ = await MoonshotModelCatalog.models(dataRoot: dataRoot, refresh: true)
+                    let models = try MoonshotModelCatalog.parseModelsResponse(body)
+                    guard !models.isEmpty else { throw LLMError.invalidResponse(status: code) }
+                    let result = await MoonshotModelCatalog.ttlCache.publish(
+                        ModelCatalogFetch(models: models, isComplete: true), credential: apiKey, dataRoot: dataRoot)
+                    if case .failure(let failure) = result, !failure.superseded {
+                        catalogDetail = "; catalog not saved: \(failure.reason)"
+                    }
                 }
                 return NativeAgentShared.ProviderTestResult(
                     provider_id: id, status: "ok", tested: true,
                     response: nil, model_used: nil,
-                    detail: "latency=\(ms)ms", error: nil, credential: credential
+                    detail: "latency=\(ms)ms" + catalogDetail, error: nil, credential: credential
                 )
             }
             return refused(code, body, model: nil, ms: ms)
         } catch {
+            try Task.checkCancellation()
+            if error is CancellationError { throw error }
             return failed(ProviderFailure.classify(error) ?? .network, model: nil,
                           evidence: error.localizedDescription.replacingOccurrences(of: apiKey, with: "[redacted]"))
         }

@@ -10,17 +10,7 @@ import MemoryV2
 
 // Blueprint: | `NativeCognitionRuntime+Notify.swift` | `NativeCognitionRuntime.innerStateReading`: one reading across mind/body owners and pending stake-bearing expectations |
 
-// NativeCognitionRuntime+Notify.swift
-// Personality depth item 3 (2026-09-02) — she is asked how she feels, so she
-// READS the record. `InnerStateProviding` — the app runtime is the one object
-// that owns both the substrate (mind) and the organism kernel (body), which is
-// exactly what one honest answer needs. See CognitiveSubstrate+InnerState.swift.
-//
-// Item 12, the shoulder tap (a fixed push about a loud seed; two taps ever),
-// was folded into her one initiative path in Phase 5 E1 (2026-10-03): see
-// NativeCognitionRuntime+Reach.swift, which keeps its trigger and its knock.
-
-// MARK: - Item 3: the runtime answers for the whole mind
+// The runtime reads substrate and organism together for one inner-state answer.
 
 extension NativeCognitionRuntime: InnerStateProviding {
 
@@ -33,15 +23,7 @@ extension NativeCognitionRuntime: InnerStateProviding {
         detail: CognitiveInnerStateReading.Detail,
         surface: String = "chat"
     ) async -> CognitiveInnerStateReading {
-        // A READ MUST NEVER BOOTSTRAP (2026-09-02, reviewer HIGH). `bootstrap()`
-        // restores persistent state, installs the process-global studio sink,
-        // ingests an `appWake` event, arms two deadlines and publishes a runtime
-        // change. Asking her how she feels must not START her — a question is
-        // not a launch, and a tool call that silently boots the mind would make
-        // "did she wake up?" depend on whether anyone asked.
-        //
-        // Refuse before the owner has started, and merely WAIT on a start the
-        // owner has already begun.
+        // A read never bootstraps; it only waits for a bootstrap the owner has started.
         guard let bootstrapTask else {
             return .unavailable(at: now(), windowHours: windowHours, detail: detail)
         }
@@ -51,9 +33,7 @@ extension NativeCognitionRuntime: InnerStateProviding {
         }
         let at = now()
         let frozen = await organismKernel.frozenRead(at: at)
-        // ABSENCE READS AS ABSENCE (W4/P2's rule): with the organism off there
-        // is no chemistry and no fatigue to report, and a zero would be a
-        // fabricated calm rather than an honest silence.
+        // A disabled organism reports absence, never fabricated zeroes.
         let organism = CognitiveInnerStateOrganismReads(
             projection: frozen.snapshot.enabled ? frozen.projection : nil,
             fatigue: frozen.snapshot.enabled ? frozen.snapshot.chemicalState.fatigue : nil,
@@ -62,7 +42,7 @@ extension NativeCognitionRuntime: InnerStateProviding {
             // she reads and the chemistry she is running on came from the same
             // moment.
             diurnal: frozen.snapshot.enabled ? frozen.projection.diurnal : nil,
-            toward: await towardRead(),
+            toward: frozen.toward,
             expectations: await pendingStakeBearingExpectations(at: at)
         )
         return await substrate.innerStateReading(
@@ -74,18 +54,7 @@ extension NativeCognitionRuntime: InnerStateProviding {
         )
     }
 
-    /// What she is still waiting to find out — and ONLY the kinds whose subject
-    /// is a person or a promise.
-    ///
-    /// D-2's allowlist, applied to expectations rather than resolutions:
-    /// `approvalResolution` (a gate a PERSON has to walk through),
-    /// `workflowAdvance` (a commitment moving) and `semanticExpectation` (how
-    /// the work she just did will LAND). The five plumbing paths are excluded
-    /// for exactly D-2's reason — "will the provider call complete" is not
-    /// something a person is carrying, and reporting it as one is how the felt
-    /// layer became noise the first time.
-    ///
-    /// Pure: a ledger dictionary read, no settle.
+    /// Read only person- or promise-bearing expectations, without settling the ledger.
     private func pendingStakeBearingExpectations(
         at instant: Date
     ) async -> [CognitiveInnerStateReading.Expectation] {
@@ -99,8 +68,7 @@ extension NativeCognitionRuntime: InnerStateProviding {
                   prediction.dueAt >= instant
             else { continue }
             out.append(CognitiveInnerStateReading.Expectation(
-                // The substrate's own word for the kind, never the case name
-                // (Agent read "semanticExpectation" on 2026-09-14).
+                // Use the substrate's human label, never the case name.
                 label: kind.humanLabel,
                 due: prediction.dueAt,
                 // The SIGN only, never the magnitude: a confident expectation is

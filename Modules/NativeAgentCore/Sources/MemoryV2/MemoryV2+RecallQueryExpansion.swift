@@ -1,16 +1,12 @@
 import Foundation
+import Synchronization
+import ChatTurnContracts
 
 // Blueprint: | `MemoryV2+RecallQueryExpansion.swift` | `MemoryRecallQueryExpansion`: persona/user name-aware first-person recall rewrites |
 
-/// The agent asks her memory in the first person ("what does User call me")
-/// while many rows name her in the third ("User uses different names for
-/// Agent…"), and she says "you" where a row says the user's name. The MiniLM
-/// vector for "me" is nowhere near the vector for a name, so the best row
-/// for the question never surfaced (2026-09-05: the pet-names row ranked
-/// outside the top ten for "what User calls me when he is being affectionate"
-/// and first for "pet names User uses for Agent"). Recall now also asks the
-/// question with the names substituted and keeps the better score per row,
-/// so a memory written in either voice answers a question asked in either.
+/// English pronoun expansion with explicit conversational roles. Stored facts
+/// name people in third person; recall keeps both the words and their named
+/// reading. This is an English retrieval aid, not language-independent parsing.
 public enum MemoryRecallQueryExpansion {
     public struct Names: Sendable, Equatable {
         public var agent: String?
@@ -18,10 +14,25 @@ public enum MemoryRecallQueryExpansion {
         public var isEmpty: Bool { agent == nil && user == nil }
     }
 
-    /// The question with first-person words replaced by the agent's name and
-    /// second-person words by the user's, or nil when nothing changed.
+    /// Explicit recall is authored by the resident agent, addressing the user.
     public static func rewrite(_ text: String, names: Names) -> String? {
-        guard !names.isEmpty else { return nil }
+        rewrite(text, speaker: names.agent, addressee: names.user)
+    }
+
+    /// The same recorded origin stamped on the incoming turn distinguishes a
+    /// human's words (including a relay) from another agent's own words. Route
+    /// labels never make a relay's speaker the transporting agent.
+    public static func rewriteIncoming(_ text: String, names: Names) -> String? {
+        let origin = ChatPersistenceContext.originProvenance
+        let recordedAgent = origin?.agent
+        let speaker = origin?.authored == .agent
+            ? recordedAgent.flatMap { $0 == "self" ? names.agent : $0 }
+            : names.user
+        return rewrite(text, speaker: speaker, addressee: names.agent)
+    }
+
+    public static func rewrite(_ text: String, speaker: String?, addressee: String?) -> String? {
+        guard speaker != nil || addressee != nil else { return nil }
         var out = text
         func swap(_ pattern: String, _ replacement: String, caseInsensitive: Bool = true) {
             let options: NSRegularExpression.Options = caseInsensitive ? [.caseInsensitive] : []
@@ -32,15 +43,15 @@ public enum MemoryRecallQueryExpansion {
                 withTemplate: NSRegularExpression.escapedTemplate(for: replacement)
             )
         }
-        if let agent = names.agent {
+        if let agent = speaker {
             swap("\\b(?:me|myself)\\b", agent)
             swap("\\b(?:my|mine)\\b", agent + "'s")
             // "I'm" before "I": the word boundary after I sits before the
-            // apostrophe, so the bare rule would leave "Agent'm".
+            // apostrophe, so the bare rule would leave a name followed by 'm.
             swap("\\bI'm\\b", agent + " is", caseInsensitive: false)
             swap("\\bI\\b", agent, caseInsensitive: false)
         }
-        if let user = names.user {
+        if let user = addressee {
             swap("\\b(?:you|yourself)\\b", user)
             swap("\\b(?:your|yours)\\b", user + "'s")
         }
@@ -53,7 +64,7 @@ public enum MemoryRecallQueryExpansion {
     public static func names(storeDirectory: URL) -> Names {
         let url = storeDirectory.appendingPathComponent("profile.json")
         let modified = (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date)
-        return cacheLock.withLock {
+        return cache.withLock { cache in
             if let cached = cache[url.path], cached.modified == modified { return cached.names }
             let profile = SwiftNativeKnowledgeGraphIndexer.profileNames(profileURL: url)
             let names = Names(agent: profile.agent, user: profile.user)
@@ -62,6 +73,5 @@ public enum MemoryRecallQueryExpansion {
         }
     }
 
-    private static let cacheLock = NSLock()
-    nonisolated(unsafe) private static var cache: [String: (modified: Date?, names: Names)] = [:]
+    private static let cache = Mutex<[String: (modified: Date?, names: Names)]>([:])
 }

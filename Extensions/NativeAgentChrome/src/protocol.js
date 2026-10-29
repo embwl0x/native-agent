@@ -7,6 +7,7 @@ export const ACTIONS = Object.freeze([
   "tab.close",
   "navigate",
   "page.snapshot.read",
+  "page.look",
   "page.element.click",
   "page.element.fill",
   "page.element.type",
@@ -69,10 +70,17 @@ export function successResponse(request, result) {
   };
 }
 
+export function tabStripLockError(error) {
+  // Chrome supplies no code for its global tab-strip drag lock.
+  return String(error?.message ?? error).includes("Tabs cannot be edited right now (user may be dragging a tab)")
+    ? new ProtocolError("tab_strip_locked", "Chrome's tab strip is locked in some window: a tab drag that has not ended. None of your tabs is involved. It clears when the drag ends or Chrome is restarted.")
+    : undefined;
+}
+
 export function errorResponse(request, error) {
-  const normalized = error instanceof ProtocolError
+  const normalized = tabStripLockError(error) ?? (error instanceof ProtocolError
     ? error
-    : new ProtocolError("internal_error", `The extension could not complete the request: ${String(error?.message ?? error).slice(0, 300)}`);
+    : new ProtocolError("internal_error", `The extension could not complete the request: ${String(error?.message ?? error).slice(0, 300)}`));
   return {
     version: PROTOCOL_VERSION,
     type: "response",
@@ -116,6 +124,29 @@ export function requireHttpURL(value, field = "url") {
   return parsed.href;
 }
 
+// Navigation authority is wider than content-script access. Validate before
+// creating a tab: rejected URLs must leave even the tab inventory untouched.
+function requireNavigationURL(value, allowViewSource = true) {
+  if (typeof value !== "string" || value.length > 8192) {
+    throw new ProtocolError("invalid_url", "url must be a bounded URL string; nothing was dispatched.");
+  }
+  let parsed;
+  try { parsed = new URL(value); }
+  catch { throw new ProtocolError("invalid_url", "url is not a valid URL; nothing was dispatched."); }
+  if (parsed.protocol === "view-source:" && allowViewSource) {
+    return requireNavigationURL(value.slice("view-source:".length), false);
+  }
+  if (!["http:", "https:", "chrome:", "about:", "file:"].includes(parsed.protocol)) {
+    throw new ProtocolError("url_scheme_not_allowed", `Navigation does not support ${parsed.protocol}; nothing was dispatched.`);
+  }
+  // These are browser process commands, not pages a tab can display.
+  const command = parsed.protocol === "about:" ? parsed.pathname.split(/[/?#]/)[0].toLowerCase() : parsed.hostname;
+  if (["chrome:", "about:"].includes(parsed.protocol) && ["crash", "crashdump", "kill", "hang", "shorthang", "quit", "restart", "inducebrowsercrashforrealz", "memory-exhaust"].includes(command)) {
+    throw new ProtocolError("navigation_url_blocked", `${parsed.href} is a browser process command, not a readable page; nothing was dispatched.`);
+  }
+  return parsed.href;
+}
+
 function validatePayload(action, payload) {
   switch (action) {
     case "attach":
@@ -126,6 +157,7 @@ function validatePayload(action, payload) {
       requireId(payload.reloadId, "reloadId");
       return;
     case "tab.close":
+    case "page.look":
       requireInteger(payload.tabId, "tabId", 0);
       optionalInteger(payload.expectedUserSequence, "expectedUserSequence", 0, Number.MAX_SAFE_INTEGER);
       return;
@@ -133,7 +165,7 @@ function validatePayload(action, payload) {
       optionalInteger(payload.tabId, "tabId", 0, Number.MAX_SAFE_INTEGER);
       optionalInteger(payload.expectedUserSequence, "expectedUserSequence", 0, Number.MAX_SAFE_INTEGER);
       // "back" / "forward" walk the owned tab's own history.
-      if (payload.url !== "back" && payload.url !== "forward") requireHttpURL(payload.url);
+      if (payload.url !== "back" && payload.url !== "forward") requireNavigationURL(payload.url);
       return;
     case "page.snapshot.read":
       requireInteger(payload.tabId, "tabId", 0);
@@ -143,19 +175,25 @@ function validatePayload(action, payload) {
         requireHttpURL(cursor.url);
         optionalString(cursor.frameURL, "frameURL", 8192);
         requireInteger(cursor.frameId, "frameId", 0);
-        optionalString(cursor.elementPath, "elementPath", 32768);
-        optionalString(cursor.addressFragment, "addressFragment", 256);
+        if (cursor.position !== undefined) {
+          const position = requireObject(cursor.position, "position");
+          for (const key of ["scrollX", "scrollY", "x", "y"]) {
+            requireFiniteNumber(position[key], `position.${key}`, -Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
+          }
+          requireFiniteNumber(position.distance, "position.distance", 0, Number.MAX_SAFE_INTEGER);
+          requireInteger(position.ordinal, "position.ordinal", 0);
+        }
         optionalInteger(cursor.textOffset, "textOffset", 0, Number.MAX_SAFE_INTEGER);
         optionalInteger(cursor.optionOffset, "optionOffset", 0, Number.MAX_SAFE_INTEGER);
         optionalBoolean(cursor.elementOnly, "elementOnly");
         if (cursor.viewportObservationId !== undefined) {
           requireId(cursor.viewportObservationId, "viewportObservationId");
-          if (cursor.elementPath !== undefined || cursor.elementOnly !== undefined || cursor.textOffset !== undefined || cursor.optionOffset !== undefined) {
-            throw new ProtocolError("invalid_payload", "A scroll viewport address cannot also be a folded continuation.");
-          }
         }
-        if ((cursor.elementOnly === true || cursor.optionOffset !== undefined) && !cursor.elementPath) {
-          throw new ProtocolError("invalid_payload", "A control continuation requires its element path.");
+        if ((cursor.elementOnly === true || cursor.optionOffset !== undefined || cursor.textOffset !== undefined) && !cursor.position) {
+          throw new ProtocolError("invalid_payload", "A folded continuation requires its page position.");
+        }
+        if (cursor.elementPath !== undefined || cursor.addressFragment !== undefined) {
+          throw new ProtocolError("invalid_payload", "Read continuations use page positions; read the current viewport to get a new continuation.");
         }
       }
       optionalInteger(payload.maxNodes, "maxNodes", 1, 500);
@@ -264,8 +302,7 @@ function requireKeySpec(value) {
     "Enter", "Tab", "Escape", "ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight",
     "Home", "End", "PageUp", "PageDown", "Backspace", "Delete", "Space", "A",
   ]);
-  // 2026-09-24: one printable character too (X's j/k, GitHub's "/"): sites
-  // read those in their own handlers, which synthetic events do reach.
+  // Accept one printable character for site handlers reached by synthetic key events.
   const printable = typeof base === "string" && [...base].length === 1 && base.trim().length === 1;
   if ((!bases.has(base) && !printable) || parts.some((part, index) => !modifiers.has(part) || parts.indexOf(part) !== index)) {
     throw new ProtocolError("invalid_payload", "key uses an unsupported key or modifier combination.");
@@ -289,12 +326,6 @@ function requireId(value, field) {
 
 function optionalId(value, field) {
   if (value !== undefined) requireId(value, field);
-}
-
-function requireString(value, field, maximumLength) {
-  if (typeof value !== "string" || value.length === 0 || value.length > maximumLength) {
-    throw new ProtocolError("invalid_payload", `${field} must be a non-empty bounded string.`);
-  }
 }
 
 function optionalString(value, field, maximumLength) {

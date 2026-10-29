@@ -2,14 +2,16 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import ProviderRouting
+import TurnTrace
 
 // Blueprint: | `PromptPrefixHealthCheck.swift` | `PromptPrefixHealthCheck`: measured prefix/cache-shape health from real turn observations and provider token receipts |
 
 // MARK: - Prompt prefix health (Runtime)
 //
-// The v2Prefix shape (a08a8814 and the commits around it) makes the identity
-// block a strict prefix of the stable block so ONE breakpoint covers both and
-// every turn after the first reads the transcript out of the provider's cache.
+// The v2Prefix shape keeps stable system material ahead of a transcript whose
+// head moves only through the cursor's row/character hysteresis (1.15 / 0.70).
+// Changing turn context rides after that prefix. Anthropic breakpoints and
+// OpenAI routing mark this same layout; provider limits still govern cache hits.
 // That property is invisible from the UI: a regression does not throw, it just
 // quietly stops reading cache and starts paying full price on every turn. It
 // drifted silently once already, which is why this row exists.
@@ -33,9 +35,7 @@ import ProviderRouting
 public struct PromptPrefixHealthCheck: DoctorCheck {
     public let id: String = "prompt_prefix_health"
     public let title: String = "Prompt Prefix Cache"
-    /// Doctor's eyes only. This row grades a measurement window, and an
-    /// unattended sweep that turns a window verdict into a 3am push is how
-    /// 2026-09-02 happened. See `DoctorCheck.heartbeatEligible`.
+    /// Measurement-window verdicts stay Doctor-only and never trigger unattended pushes.
     public let heartbeatEligible: Bool = false
 
     private let root: URL
@@ -94,6 +94,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         var stableFingerprint: String?
         var provider: String = "unknown"
         var inputTokens: Int = 0
+        var additiveInputCounters: Bool = false
     }
 
     private static func stringArray(_ value: JSONValue?) -> [String] {
@@ -144,32 +145,35 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
             floor: window.floor,
             kinds: ["llm.call", "context.snapshot"]
         ) { row in
+            let payload = row.payload.objectValue ?? [:]
             switch row.kind {
             case "context.snapshot":
-                if let sha = row.payload["toolSchemaFingerprintSHA256"]?.stringValue,
+                if let sha = payload["toolSchemaFingerprintSHA256"]?.stringValue,
                    !row.turnId.isEmpty {
                     toolFingerprints[row.turnId] = sha
                 }
             case "llm.call":
                 // The payload identifies the actual call; the envelope may
                 // still identify the chat turn hosting a helper request.
-                let surface = row.payload["surface"]?.stringValue ?? row.surface
+                let surface = payload["surface"]?.stringValue ?? row.surface
                 guard surface == "chat" else {
                     ignoredSurfaces += 1
                     return
                 }
-                let provider = row.payload["provider"]?.stringValue ?? "unknown"
+                let provider = payload["provider"]?.stringValue ?? "unknown"
+                let additive = LLMUsage.persistedAdditiveInputCounters(payload["additiveInputCounters"], provider: provider)
                 let usage = LLMUsage(
-                    inputTokens: row.payload["inputTokens"]?.intValue,
-                    cacheReadInputTokens: row.payload["cacheReadInputTokens"]?.intValue,
-                    cacheCreationInputTokens: row.payload["cacheCreationInputTokens"]?.intValue
+                    inputTokens: payload["inputTokens"]?.intValue,
+                    cacheReadInputTokens: payload["cacheReadInputTokens"]?.intValue,
+                    cacheCreationInputTokens: payload["cacheCreationInputTokens"]?.intValue,
+                    additiveInputCounters: additive
                 )
                 if let input = usage.logicalInputTokens(provider: provider),
                    input < minimumCacheInputTokens {
                     ignoredSmallCalls += 1
                     return
                 }
-                let shape = row.payload["shapeVersion"]?.stringValue
+                let shape = payload["shapeVersion"]?.stringValue
                 switch shape {
                 case "v2Prefix":
                     v2CallCount += 1
@@ -187,16 +191,17 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     sessionId: row.sessionId ?? "unknown",
                     turnId: row.turnId,
                     at: row.ts,
-                    cacheRead: row.payload["cacheReadInputTokens"]?.intValue,
-                    cacheCreation: row.payload["cacheCreationInputTokens"]?.intValue,
-                    windowSlid: row.payload["windowSlid"]?.boolValue ?? false,
-                    fingerprint: row.payload["prefixFingerprintSHA256"]?.stringValue,
-                    prefixDigests: Self.stringArray(row.payload["prefixMessageDigests"]),
-                    volatileChars: row.payload["volatileBlockChars"]?.intValue,
-                    toolFingerprint: row.payload["component.toolsSHA256"]?.stringValue,
-                    stableFingerprint: row.payload["component.stablePrefixSHA256"]?.stringValue,
+                    cacheRead: payload["cacheReadInputTokens"]?.intValue,
+                    cacheCreation: payload["cacheCreationInputTokens"]?.intValue,
+                    windowSlid: payload["windowSlid"]?.boolValue ?? false,
+                    fingerprint: payload["prefixFingerprintSHA256"]?.stringValue,
+                    prefixDigests: Self.stringArray(payload["prefixMessageDigests"]),
+                    volatileChars: payload["volatileBlockChars"]?.intValue,
+                    toolFingerprint: payload["component.toolsSHA256"]?.stringValue,
+                    stableFingerprint: payload["component.stablePrefixSHA256"]?.stringValue,
                     provider: provider,
-                    inputTokens: row.payload["inputTokens"]?.intValue ?? 0
+                    inputTokens: payload["inputTokens"]?.intValue ?? 0,
+                    additiveInputCounters: additive
                 )
                 callsByTurn[row.turnId, default: []].append(observation)
                 if let existing = v2FirstCalls[row.turnId], existing.at <= observation.at { return }
@@ -218,18 +223,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     shape: "This day file holds one persisted TurnTraceEvent JSON object per line, with its original event identity, timestamp and payload."))
         }
 
-        var coverageParts: [String] = []
-        if !summary.truncatedDays.isEmpty {
-            coverageParts.append(
-                "\(summary.truncatedDays.count) day file(s) were tailed to the read budget"
-                    + " (\(summary.truncatedDays.joined(separator: ", "))), so earlier turns"
-                    + " that day were not scanned"
-            )
-        }
-        if summary.malformedLines > 0 {
-            coverageParts.append("\(summary.malformedLines) trace line(s) did not parse")
-        }
-        let coverageDetail = coverageParts.isEmpty ? "" : "; " + coverageParts.joined(separator: "; ")
+        let coverageDetail = summary.coverageDetail
 
         let shapeLine = shapeMixLine(
             v2: v2CallCount, v1: v1CallCount, unshaped: unshapedCallCount
@@ -283,10 +277,18 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     continue
                 }
                 var tokens = providerTokens[call.provider] ?? ProviderTokens()
-                if let read = call.cacheRead { tokens.read = (tokens.read ?? 0) + read }
-                tokens.total += LLMUsage(inputTokens: call.inputTokens,
+                let logical = LLMUsage(inputTokens: call.inputTokens,
                     cacheReadInputTokens: call.cacheRead,
-                    cacheCreationInputTokens: call.cacheCreation).logicalInputTokens(provider: call.provider) ?? 0
+                    cacheCreationInputTokens: call.cacheCreation,
+                    additiveInputCounters: call.additiveInputCounters).logicalInputTokens(provider: call.provider) ?? 0
+                let total = tokens.total.addingReportingOverflow(logical)
+                let read = (tokens.read ?? 0).addingReportingOverflow(call.cacheRead ?? 0)
+                guard !total.overflow, !read.overflow else {
+                    return CheckResult(source: "turn_traces/", id: id, title: title, status: "fail",
+                        detail: "UNMEASURED \(window.describedAs) — provider \(call.provider) token totals exceed the supported integer range at turn \(call.turnId), session \(call.sessionId), timestamp \(call.at). Inspect the retained llm.call usage receipts.")
+                }
+                tokens.total = total.partialValue
+                if call.cacheRead != nil { tokens.read = read.partialValue }
                 providerTokens[call.provider] = tokens
             }
         }
@@ -307,18 +309,11 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
         var unjudgedFirstCalls = 0
         var exemptSlid = 0
         var exemptToolChange = 0
-        // 2026-09-24 (desk walk): cold turns after the cache had expired (her
-        // live 05652ED6 read 0 after 14h away) or after the previous turn
-        // shipped a different stable system block were graded as drift.
+        // Cache expiry and changed stable blocks exempt rebuilt turns from drift.
         var exemptExpired = 0
         var exemptStableChange = 0
         // (sessionId, calendar day) → violations, for the tolerance.
         var violationsPerSessionDay: [String: Int] = [:]
-        let dayFormatter = DateFormatter()
-        dayFormatter.calendar = Calendar(identifier: .gregorian)
-        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
-        dayFormatter.timeZone = TimeZone.current
-        dayFormatter.dateFormat = "yyyy-MM-dd"
 
         var volatileSamples: [Int] = []
 
@@ -336,7 +331,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     else { return false }
                     return now != before
                 }()
-                let bucket = "\(sessionId)|\(dayFormatter.string(from: turn.at))"
+                let bucket = "\(sessionId)|\(TurnTracePersistLane.dayString(from: turn.at))"
                 var violated = false
                 // The previous turn's LAST request is what this one could read.
                 let previousLast = (callsByTurn[previous.turnId] ?? [previous]).max { $0.at < $1.at } ?? previous
@@ -475,7 +470,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     + " and were UNJUDGED rather than counted as zero"
             )
         }
-        parts.append(contentsOf: coverageParts)
+        parts.append(contentsOf: summary.coverageParts)
 
         var status = "ok"
         var repair: String? = nil
@@ -493,7 +488,7 @@ public struct PromptPrefixHealthCheck: DoctorCheck {
                     + " \(anthropicBelowFloor.joined(separator: ", "))"
             )
             repair = "Review NativeAgent's prompt assembly using volatileBlockChars and the stable mass for the affected Anthropic sessions to correct repeated prefix rebuilds."
-        } else if !coverageParts.isEmpty || unjudgedFirstCalls > 0 {
+        } else if !summary.coverageParts.isEmpty || unjudgedFirstCalls > 0 {
             // Incomplete coverage or missing metrics cannot certify health.
             status = "unmeasured"
         }

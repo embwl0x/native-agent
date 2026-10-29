@@ -21,18 +21,16 @@ extension SlackSocketModeLoop {
     /// that fires once each turn settles or throws, and the bot-event intake.
     public static func ifConfigured(
         dataRoot: URL,
-        chatClient makeChatClient: () -> any ChatOrchestrationClient,
+        chatClient makeChatClient: () -> SwiftNativeChatOrchestrationClient,
         turnCompleted: @escaping @Sendable (_ sessionID: String) -> Void,
         botEventIntake: @escaping SlackBotEventIntake
     ) throws -> SlackSocketModeLoop? {
         guard let cfg = try SlackSocketModeConfig.load(dataRoot: dataRoot), cfg.enabled else {
             return nil
         }
-        let slackSessions = SlackSessionStore(dataRoot: dataRoot)
         let client = makeChatClient()
-        let handler: SlackSocketModeProgressChatHandler = { inbound, progress in
+        let handler: SlackProgressChat = { inbound, sessionId, progress in
             let takeover = await MacWorkContinuation.admit(inbound.text)
-            let sessionId = try await slackSessions.activeSessionId(for: inbound)
             let prompt = """
             [from: slack, user: \(inbound.userId), channel: \(inbound.channelId)]
             \(inbound.text)
@@ -43,10 +41,7 @@ extension SlackSocketModeLoop {
                 threadId: inbound.replyThreadTs,
                 requesterUserId: inbound.userId
             )
-            // 2026-07-21 audit fix: the forged commandSignatureVerified=true
-            // binding is REMOVED. Socket mode carries no request signature;
-            // slack origin trust now comes from the explicit slack allowlist
-            // in SecurityCenter.assessOrigin (mirroring telegram).
+            // Socket mode has no request signature; SecurityCenter.assessOrigin checks the Slack allowlist.
             let request = TurnRequest(
                 message: prompt,
                 sessionID: sessionId,
@@ -63,10 +58,7 @@ extension SlackSocketModeLoop {
             let response: ChatResponse
             do {
                 defer { turnCompleted(sessionId) }
-                // 2026-09-06: Slack supplied no progress callback at all, so
-                // reconnect and compaction notices died here. Only notices are
-                // forwarded — tool events would be channel noise; the sink
-                // posts one line per kind.
+                // Forward only notices, one line per kind, to keep tool events out of the channel.
                 response = try await MacWorkContinuation.$current.withValue(takeover) {
                 try await TurnAdmission.shared.run(sessionID: sessionId) {
                     try await request.chat(on: client, progress: { event in

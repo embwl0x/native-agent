@@ -1,244 +1,19 @@
-// InboxView.swift — iOS proactive agent inbox surface.
-//
-// Reads the iCloud inbox snapshot while visible; pull-to-refresh also works.
-// Dismiss and supported action operations are signed iCloud bridge messages
-// that the Mac app applies through the in-process Swift runtime.
-// UNUserNotificationCenter fires a local notification when a new card arrives
-// in the foreground while the user is NOT on this tab.
-//
-// Inbox snapshot shape:
-//   id, created_at, source, severity (info|important|actionable),
-//   title, summary, detail?, related_mission_id?, related_approval_id?,
-//   related_paths?, related_groups?, actions[], status, read_at?
-//
-// Severity → tint:
-//   info        → NativeAgentPalette.agentAccent
-//   important   → .blue (matches Mac InboxView)
-//   actionable  → .orange
-
 import SwiftUI
-import UserNotifications
 import NativeAgentShared
-// Blueprint: | `InboxView.swift` | Inbox presentation, notifications and submission state; rows and ID-selected details read the shared sync projection |
-
-
-// MARK: - Store
-
-@MainActor
-final class InboxStore: ObservableObject {
-    var items: [InboxItemRecord] { iCloudSyncEngine.shared.inboxItems }
-    var hasLoadedSnapshot: Bool { iCloudSyncEngine.shared.inboxSnapshotLoaded }
-    @Published var isLoading = false
-    @Published var bannerError: String? = nil
-
-    // Known IDs from previous fetch — used for new-card detection
-    private var knownIDs: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "NativeAgentMobile.inboxKnownIDs") ?? [])
-    // Whether we are currently on the Inbox tab (caller sets this)
-    var isVisible: Bool = false
-    private let notificationScheduler: ((InboxLocalNotificationPlan) -> Void)?
-
-    init(notificationScheduler: ((InboxLocalNotificationPlan) -> Void)? = nil) {
-        self.notificationScheduler = notificationScheduler
-    }
-
-    // MARK: - Fetch
-
-    func refresh(client: MacBridgeClient, pairingStore: PairingStore) async {
-        isLoading = true
-        defer { isLoading = false }
-        guard pairingStore.usesICloudTransport else {
-            bannerError = "Pair to view"
-            return
-        }
-        await iCloudSyncEngine.shared.refreshInboxSnapshot()
-        applySyncedInboxFromSnapshot()
-    }
-
-    func applySyncedInboxFromSnapshot(animated: Bool = true, notifyNewArrivals: Bool = true) {
-        let fetched = iCloudSyncEngine.shared.inboxItems
-        NSLog("[InboxStore] refresh via iCloud fetched=%d", fetched.count)
-        applyFetchedItems(fetched, animated: animated, notifyNewArrivals: notifyNewArrivals)
-        bannerError = iCloudSyncEngine.shared.syncError
-    }
-
-    // MARK: - Actions
-
-    func dismiss(id: String, client: MacBridgeClient, pairingStore: PairingStore) async {
-        guard pairingStore.usesICloudTransport else { bannerError = "Pair to view"; return }
-        do {
-            _ = try await iCloudSyncEngine.shared.inboxAction(itemId: id, actionId: "dismiss")
-            applySyncedInboxFromSnapshot()
-        } catch {
-            bannerError = "Failed to dismiss: \(error.localizedDescription)"
-        }
-    }
-
-    func act(id: String, client: MacBridgeClient, pairingStore: PairingStore) async {
-        guard pairingStore.usesICloudTransport else { bannerError = "Pair to view"; return }
-        do {
-            let response = try await iCloudSyncEngine.shared.inboxAction(itemId: id, actionId: "act")
-            openInteraction(response, id: id, actionID: "act")
-            applySyncedInboxFromSnapshot()
-        } catch {
-            bannerError = "Failed to act: \(error.localizedDescription)"
-        }
-    }
-
-    func performAction(id: String, actionID: String, client: MacBridgeClient, pairingStore: PairingStore) async {
-        guard pairingStore.usesICloudTransport else { bannerError = "Pair to view"; return }
-        do {
-            let response = try await iCloudSyncEngine.shared.inboxAction(itemId: id, actionId: actionID)
-            openInteraction(response, id: id, actionID: actionID)
-            applySyncedInboxFromSnapshot()
-        } catch {
-            bannerError = "Failed: \(error.localizedDescription)"
-        }
-    }
-
-    private func openInteraction(_ response: [String: String]?, id: String, actionID: String) {
-        guard id.hasPrefix("interaction:"), actionID == "act", let session = response?["sessionID"] else { return }
-        MobileNotifiedChatSessionIntent.stage(session)
-        NativeAgentNotificationLaunchIntent.markOpenActivityPending(screen: "chat")
-        NotificationCenter.default.post(name: .nativeagentOpenActivity, object: nil, userInfo: ["screen": "chat"])
-    }
-
-    func applyFetchedItems(
-        _ fetched: [InboxItemRecord],
-        animated: Bool = true,
-        notifyNewArrivals: Bool = true
-    ) {
-        let fetchedUnread = fetched.filter { $0.isUnread }
-
-        // Detect new arrivals for local notifications.
-        //
-        // 2026-05-09 fix: defense-in-depth against SpringBoard storms.
-        // The first-poll guard (!knownIDs.isEmpty) prevents the obvious
-        // case where every existing card looks "new" on cold launch.
-        // But a Mac-side burst (e.g. Auto-Doctor batch-publishing 50
-        // cards in one tick) would still fire 50 simultaneous local
-        // notifications, which can wedge SpringBoard's notification UI.
-        // Cap individual fires per refresh. A larger batch becomes one
-        // summary notification, preserving the safety limit without making a
-        // batch-only Mac publisher invisible to the person using the phone.
-        let fetchedIDs = Set(fetchedUnread.map { $0.id })
-        let newIDs = fetchedIDs.subtracting(knownIDs)
-        NSLog("[InboxStore] apply fetched=%d unread=%d known=%d new=%d visible=%@", fetched.count, fetchedUnread.count, knownIDs.count, newIDs.count, isVisible ? "true" : "false")
-        let notificationPlan: InboxLocalNotificationPlan
-        if notifyNewArrivals && !knownIDs.isEmpty && !newIDs.isEmpty {
-            notificationPlan = InboxNotificationBurstPresentation.plan(
-                newUnreadItems: fetchedUnread.filter { newIDs.contains($0.id) },
-                isInboxVisible: isVisible
-            )
-        } else {
-            notificationPlan = .none
-        }
-        knownIDs = fetchedIDs
-        UserDefaults.standard.set(Array(Array(fetchedIDs).sorted().suffix(500)), forKey: "NativeAgentMobile.inboxKnownIDs")
-
-        scheduleLocalNotifications(notificationPlan)
-    }
-
-    // MARK: - Local notifications
-
-    func requestNotificationAuthorization() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .badge, .sound]) { granted, error in
-            if let error {
-                NSLog("[InboxStore] notification authorization error: %@", error.localizedDescription)
-            }
-            NSLog("[InboxStore] notification authorization granted=%@", granted ? "true" : "false")
-        }
-    }
-
-    private func scheduleLocalNotifications(_ plan: InboxLocalNotificationPlan) {
-        if let notificationScheduler {
-            guard plan != .none else { return }
-            notificationScheduler(plan)
-            return
-        }
-        switch plan {
-        case .none:
-            return
-        case .items(let items):
-            for item in items {
-                Self.fireLocalNotification(for: item)
-            }
-        case .summary(let newUnreadCount):
-            Self.fireBatchNotification(newUnreadCount: newUnreadCount)
-        }
-    }
-
-    private static func fireLocalNotification(for item: InboxItemRecord) {
-        var userInfo = [
-            "itemId": item.id,
-            "source": item.source,
-            "screen": "activity"
-        ]
-        if let approvalID = item.related_approval_id, !approvalID.isEmpty {
-            userInfo.removeValue(forKey: "itemId")
-            userInfo["approvalId"] = approvalID
-        }
-        let eventID = NativeAgentDeviceEventIdentity.notification(userInfo: userInfo)
-        userInfo["eventId"] = eventID
-
-        Task.detached {
-            let content = UNMutableNotificationContent()
-            content.title = item.title
-            content.body = item.summary
-            content.sound = .default
-            content.userInfo = userInfo
-            do {
-                let added = try await NativeAgentNotificationEventGate.add(
-                    content: content,
-                    eventID: eventID,
-                    trigger: UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
-                )
-                NSLog("[InboxStore] notification %@ for %@ event=%@",
-                      added ? "scheduled" : "deduplicated", item.id, eventID)
-            } catch {
-                NSLog("[InboxStore] notification add failed for %@: %@", item.id, error.localizedDescription)
-            }
-        }
-    }
-
-    private static func fireBatchNotification(newUnreadCount: Int) {
-        Task.detached {
-            let content = UNMutableNotificationContent()
-            content.title = "NativeAgent Inbox"
-            content.body = "\(newUnreadCount) new Inbox items are ready to review."
-            content.sound = .default
-            content.userInfo = ["screen": "activity", "source": "inbox_batch"]
-            do {
-                let request = UNNotificationRequest(
-                    identifier: "nativeagent.inbox.batch.\(UUID().uuidString)",
-                    content: try await CommunicationNotification.decorate(content),
-                    trigger: UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
-                )
-                try await UNUserNotificationCenter.current().add(request)
-                NSLog("[InboxStore] scheduled batch notification for %d cards", newUnreadCount)
-            } catch {
-                NSLog("[InboxStore] batch notification add failed: %@", error.localizedDescription)
-            }
-        }
-    }
-}
+import UserNotifications
+// Blueprint: | `InboxView.swift` | Inbox list, card rows and reading navigation use the shared sync projection |
 
 // MARK: - Top-level view
 
 struct InboxView: View {
     @EnvironmentObject private var pairingStore: PairingStore
-    @EnvironmentObject private var bridgeClient: MacBridgeClient
     @EnvironmentObject private var store: InboxStore
     private let sync = iCloudSyncEngine.shared
     @State private var groupFilter: InboxRelatedGroup?
     @State private var selectedDetailItemID: String?
     @State private var showsAllEarlier = false
 
-    /// When `true` (the default — used by tab roots), wraps the content in a
-    /// NavigationStack. When `false`, returns just the inner content so the
-    /// caller's NavigationStack provides the navigation context. Required
-    /// when this view is pushed as a `navigationDestination` from another
-    /// NavigationStack — nesting them causes the destination to render and
-    /// immediately pop back, leaving the user staring at a blank slide-out.
+    /// Tab roots own navigation; pushed destinations use the caller’s stack.
     let embedInNavigationStack: Bool
 
     init(embedInNavigationStack: Bool = true, initialGroup: InboxRelatedGroup? = nil) {
@@ -257,10 +32,6 @@ struct InboxView: View {
 
     private var read: [InboxItemRecord] {
         visibleItems.filter { !$0.isUnread && $0.status != "dismissed" && $0.status != "archived" }
-    }
-
-    private var earlierSection: InboxListPresentation.EarlierSection {
-        InboxListPresentation.earlierSection(items: read, showsAll: showsAllEarlier)
     }
 
     private var headerLine: String {
@@ -297,18 +68,18 @@ struct InboxView: View {
         .animation(AppMotion.snappy, value: store.bannerError)
         .macSyncErrorBanner()
         .refreshable {
-            await store.refresh(client: bridgeClient, pairingStore: pairingStore)
+            await store.refresh(pairingStore: pairingStore)
         }
         .task {
             if MobileDesignSamples.screen == nil {
                 store.requestNotificationAuthorization()
             }
             store.isVisible = true
-            await store.refresh(client: bridgeClient, pairingStore: pairingStore)
+            await store.refresh(pairingStore: pairingStore)
         }
         .onChange(of: sync.inboxItems, initial: true) { _, _ in
             guard pairingStore.usesICloudTransport, store.isVisible else { return }
-            store.applySyncedInboxFromSnapshot(animated: false, notifyNewArrivals: false)
+            store.applySyncedInboxFromSnapshot(notifyNewArrivals: false)
         }
         .onDisappear { store.isVisible = false }
         .onAppear    { store.isVisible = true  }
@@ -333,7 +104,6 @@ struct InboxView: View {
                 await store.performAction(
                     id: item.id,
                     actionID: action,
-                    client: bridgeClient,
                     pairingStore: pairingStore
                 )
             }
@@ -344,7 +114,7 @@ struct InboxView: View {
             Button("Dismiss") {
                 Task {
                     await store.performAction(id: item.id, actionID: "dismiss",
-                                              client: bridgeClient, pairingStore: pairingStore)
+                                              pairingStore: pairingStore)
                 }
             }
             .tint(.gray)
@@ -369,7 +139,7 @@ struct InboxView: View {
                     .foregroundStyle(AlivePalette.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 Button("Check again") {
-                    Task { await store.refresh(client: bridgeClient, pairingStore: pairingStore) }
+                    Task { await store.refresh(pairingStore: pairingStore) }
                 }
                 .aliveSecondaryButton()
                 .font(.subheadline.weight(.semibold))
@@ -378,8 +148,8 @@ struct InboxView: View {
             .padding(20)
             .aliveCard()
         } else {
-            // One native row per card, in New and Earlier sections (User 09-27:
-            // all native); swipe to dismiss.
+            // One native row per card in New and Earlier; swipe to dismiss.
+            let earlierRows = read
             if let groupFilter {
                 Section {
                     HStack(spacing: 12) {
@@ -387,7 +157,7 @@ struct InboxView: View {
                             Text(groupFilter.title)
                                 .font(.body.weight(.medium))
                                 .foregroundStyle(AlivePalette.text)
-                            Text("\(active.count) unread, \(read.count) earlier")
+                            Text("\(active.count) unread, \(earlierRows.count) earlier")
                                 .font(.footnote)
                                 .foregroundStyle(AlivePalette.secondary)
                         }
@@ -410,19 +180,21 @@ struct InboxView: View {
                 }
             }
 
-            let earlier = earlierSection
-            if !earlier.visibleItems.isEmpty {
+            let earlierPreviewLimit = 10
+            let earlier = showsAllEarlier ? earlierRows : Array(earlierRows.prefix(earlierPreviewLimit))
+            let hiddenCount = max(0, earlierRows.count - earlier.count)
+            if !earlier.isEmpty {
                 Section("Earlier") {
-                    ForEach(earlier.visibleItems) { item in card(item) }
+                    ForEach(earlier) { item in card(item) }
 
-                    if earlier.hiddenCount > 0 {
-                        Button("Show \(earlier.hiddenCount) more") {
+                    if hiddenCount > 0 {
+                        Button("Show \(hiddenCount) more") {
                             withAnimation(AppMotion.snappy) {
                                 showsAllEarlier = true
                             }
                         }
                     } else if showsAllEarlier,
-                              earlier.totalCount > InboxListPresentation.earlierPreviewLimit {
+                              earlierRows.count > earlierPreviewLimit {
                         Button("Show fewer") {
                             withAnimation(AppMotion.snappy) {
                                 showsAllEarlier = false
@@ -432,31 +204,6 @@ struct InboxView: View {
                 }
             }
         }
-    }
-}
-
-/// Presentation projection for the read-history section. The section title
-/// always carries the complete count, while a capped preview exposes an
-/// explicit path to every remaining card.
-enum InboxListPresentation {
-    static let earlierPreviewLimit = 10
-
-    struct EarlierSection {
-        let visibleItems: [InboxItemRecord]
-        let totalCount: Int
-        let hiddenCount: Int
-    }
-
-    static func earlierSection(
-        items: [InboxItemRecord],
-        showsAll: Bool
-    ) -> EarlierSection {
-        let visibleItems = showsAll ? items : Array(items.prefix(earlierPreviewLimit))
-        return EarlierSection(
-            visibleItems: visibleItems,
-            totalCount: items.count,
-            hiddenCount: max(0, items.count - visibleItems.count)
-        )
     }
 }
 
@@ -554,7 +301,7 @@ struct InboxCardRow: View {
                     }
 
                     if let action = item.presentableActions.first(where: { $0.id == "act" }) {
-                        Button(item.presentation?.act_label ?? action.label) {
+                        Button(item.presentation?.actLabel ?? action.label) {
                             onAction("act")
                         }
                         .aliveSecondaryButton()
@@ -580,111 +327,6 @@ struct InboxCardRow: View {
         }
         .aliveRow()
         .aliveCard()
-    }
-}
-
-struct InboxDetailSheet: View {
-    let itemID: String
-    let onOpenGroup: (InboxRelatedGroup) -> Void
-    let onDone: () -> Void
-
-    var body: some View {
-        NavigationStack {
-            Group {
-            if let item = iCloudSyncEngine.shared.inboxItems.first(where: { $0.id == itemID }) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(item.relativeCreatedAt.isEmpty ? item.sourceWords : "\(item.sourceWords) · \(item.relativeCreatedAt)")
-                            .font(.caption)
-                            .foregroundStyle(AlivePalette.secondary)
-                        Text(item.title)
-                            .font(.system(.title2, design: .serif))
-                            .foregroundStyle(AlivePalette.text)
-                            .fixedSize(horizontal: false, vertical: true)
-                        if !item.summary.isEmpty {
-                            Text(item.summary)
-                                .font(.body)
-                                .foregroundStyle(AlivePalette.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                    .padding(.horizontal, 4)
-
-                    if let detail = item.detail, !detail.isEmpty {
-                        Text(detail)
-                            .font(.system(.footnote, design: .monospaced))
-                            .foregroundStyle(AlivePalette.text)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(AliveMetrics.rowInsetH)
-                            .aliveCard()
-                    }
-
-                    let relatedGroups = InboxDetailGroupProjection.groups(item: item, allItems: iCloudSyncEngine.shared.inboxItems)
-                    if !relatedGroups.isEmpty {
-                        VStack(alignment: .leading, spacing: 10) {
-                            AliveEyebrow("Related")
-                            AliveCard {
-                                ForEach(Array(relatedGroups.enumerated()), id: \.element.id) { index, group in
-                                    if index > 0 { AliveDivider() }
-                                    Button {
-                                        onOpenGroup(group)
-                                    } label: {
-                                        HStack(spacing: 12) {
-                                            VStack(alignment: .leading, spacing: 3) {
-                                                Text(group.title)
-                                                    .font(.body)
-                                                    .foregroundStyle(AlivePalette.text)
-                                                    .multilineTextAlignment(.leading)
-                                                Text(AliveWords.count(group.displayCount, "item"))
-                                                    .font(.footnote)
-                                                    .foregroundStyle(AlivePalette.secondary)
-                                            }
-                                            Spacer()
-                                            AliveChevron()
-                                        }
-                                        .aliveRow()
-                                        .contentShape(Rectangle())
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                        }
-                    }
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-            }
-            } else {
-                ContentUnavailableView("Item unavailable", systemImage: "tray")
-            }
-            }
-            .alivePageChrome(title: "Inbox Item", root: false)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { onDone() }
-                }
-            }
-        }
-        .presentationDetents([.medium, .large])
-    }
-
-}
-
-/// The only route from a persisted digest card to the detail sheet's Review
-/// Groups controls. Current Mac cards carry structured groups; the bounded
-/// prose parser keeps existing JSONL digest cards useful after the migration.
-extension InboxItemRecord: InboxDigestItem {}
-extension InboxRelatedGroup: @retroactive InboxDigestGroup {}
-
-enum InboxDetailGroupProjection {
-    static func groups(item: InboxItemRecord, allItems: [InboxItemRecord]) -> [InboxRelatedGroup] {
-        InboxDigestGroupProjection.groups(item: item, allItems: allItems)
-    }
-
-    static func legacyGroups(item: InboxItemRecord, allItems: [InboxItemRecord]) -> [InboxRelatedGroup] {
-        InboxDigestGroupProjection.legacyGroups(item: item, allItems: allItems)
     }
 }
 

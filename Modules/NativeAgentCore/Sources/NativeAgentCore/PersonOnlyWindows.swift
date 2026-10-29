@@ -1,15 +1,12 @@
 import Foundation
 import CoreGraphics
+import Synchronization
 
 // Blueprint: | `PersonOnlyWindows.swift` | `PersonOnlyWindows`: registered person-only window exclusion, input/pointer coordination and step-aside hooks without app dependencies |
 
-/// Windows that belong to the person alone — Shotgun, the small chat the app
-/// steps aside into while the agent drives the Mac (User, 10-04). The agent
-/// never sees one (her screen captures leave it out), never clicks one (her
-/// own pointer events pass through it), and never types into one (her
-/// keystrokes wait while its composer has the keyboard); the person's own
-/// input there is not a takeover. The app registers the window and the one
-/// pointer effect; Core reads them here, so nothing in Core depends on the app.
+/// Person-only windows are excluded from agent captures, pass agent pointer events
+/// through, and hold agent typing while their composer has the keyboard; person
+/// input there is not a takeover. The app registers windows and effects here without Core depending on it.
 public enum PersonOnlyWindows {
     public struct Window: Sendable, Equatable {
         public let number: Int
@@ -27,20 +24,21 @@ public enum PersonOnlyWindows {
     /// event she just posted, short enough that the person's own click lands.
     public static let pointerPassThroughSeconds: TimeInterval = 0.1
 
-    private static let lock = NSLock()
-    private nonisolated(unsafe) static var windows: [Window] = []
-    private nonisolated(unsafe) static var keyHeld = false
-    private nonisolated(unsafe) static var passing = false
-    private nonisolated(unsafe) static var passUntil = -Double.infinity
-    private nonisolated(unsafe) static var lastPersonInputUptime = -Double.infinity
-    private nonisolated(unsafe) static var passPointerThrough: (@Sendable () -> Void)?
-    /// Windows shown only as decoration over her work (her pointer): left out
-    /// of her captures like the rest, but never a hand-back or a click target.
-    private nonisolated(unsafe) static var overlays: Set<Int> = []
-    private nonisolated(unsafe) static var motorObserver: (@Sendable () -> Void)?
-    private nonisolated(unsafe) static var lastMotorSignal = -Double.infinity
-    private nonisolated(unsafe) static var pointerObserver: (@Sendable (CGPoint, Bool) -> Void)?
-    private nonisolated(unsafe) static var stepAside: (@Sendable (Driver?) async -> Void)?
+    private struct State {
+        var windows: [Window] = []
+        var keyHeld = false
+        var passing = false
+        var passUntil = -Double.infinity
+        var lastPersonInputUptime = -Double.infinity
+        var passPointerThrough: (@Sendable () -> Void)?
+        /// Decoration is excluded from captures, never a hand-back or click target.
+        var overlays: Set<Int> = []
+        var motorObserver: (@Sendable () -> Void)?
+        var lastMotorSignal = -Double.infinity
+        var pointerObserver: (@Sendable (CGPoint, Bool) -> Void)?
+        var stepAside: (@Sendable (Driver?) async -> Void)?
+    }
+    private static let state = Mutex(State())
 
     /// The session and turn whose tool call is running, set by the dispatch
     /// chain around every tool: her windows step aside for that turn, and
@@ -54,26 +52,20 @@ public enum PersonOnlyWindows {
 
     /// The app's way of getting its own windows out of her sight (Shotgun), installed once.
     public static func installStepAside(_ handler: @escaping @Sendable (Driver?) async -> Void) {
-        lock.lock()
-        stepAside = handler
-        lock.unlock()
+        state.withLock { $0.stepAside = handler }
     }
 
-    /// Her own windows step out of the way of a screen she is about to look at
-    /// or act on, from any surface's turn; returns once they are out of the
-    /// picture (User 10-16: she looked at WoW through her own full-screen window
-    /// and saw herself; a desktop picture was her own window, masked gray).
+    /// From any surface's turn, wait for her own windows to step aside before
+    /// she looks at or acts on the screen.
     public static func stepAsideForScreen() async {
-        let handler = lock.withLock { stepAside }
+        let handler = state.withLock { $0.stepAside }
         await handler?(driver)
     }
 
     /// The app's pointer effect, installed once. It runs synchronously before
     /// her event is posted, on whatever thread posts it.
     public static func install(passPointerThrough: @escaping @Sendable () -> Void) {
-        lock.lock()
-        self.passPointerThrough = passPointerThrough
-        lock.unlock()
+        state.withLock { $0.passPointerThrough = passPointerThrough }
     }
 
     /// The app's watchers of her hands: `motor` on her motor output (at most
@@ -84,73 +76,55 @@ public enum PersonOnlyWindows {
         motor: @escaping @Sendable () -> Void,
         pointer: @escaping @Sendable (CGPoint, Bool) -> Void
     ) {
-        lock.lock()
-        motorObserver = motor
-        pointerObserver = pointer
-        lock.unlock()
+        state.withLock { $0.motorObserver = motor; $0.pointerObserver = pointer }
     }
 
     /// Her hands moved: a posted key or pointer event, or an accessibility press.
     public static func noteAgentMotor() {
         let uptime = ProcessInfo.processInfo.systemUptime
-        lock.lock()
-        guard uptime - lastMotorSignal >= 0.5, let observer = motorObserver else { lock.unlock(); return }
-        lastMotorSignal = uptime
-        lock.unlock()
-        observer()
+        let observer = state.withLock { state -> (@Sendable () -> Void)? in
+            guard uptime - state.lastMotorSignal >= 0.5, let observer = state.motorObserver else { return nil }
+            state.lastMotorSignal = uptime
+            return observer
+        }
+        observer?()
     }
 
     /// Age of her last motor signal (to within half a second), `.infinity` when none.
     public static func secondsSinceAgentHands() -> TimeInterval {
         let uptime = ProcessInfo.processInfo.systemUptime
-        lock.lock()
-        let last = lastMotorSignal
-        lock.unlock()
+        let last = state.withLock { $0.lastMotorSignal }
         return last.isFinite ? uptime - last : .infinity
     }
 
     /// Her pointer acted at `point` (CGEvent space); `pressed` for a click or drag.
     public static func noteAgentPointer(at point: CGPoint, pressed: Bool) {
-        lock.lock()
-        let observer = pointerObserver
-        lock.unlock()
+        let observer = state.withLock { $0.pointerObserver }
         observer?(point, pressed)
     }
 
     /// The decoration window, nil when there is none.
     public static func setOverlay(number: Int?) {
-        lock.lock()
-        overlays = number.map { [$0] } ?? []
-        lock.unlock()
+        state.withLock { $0.overlays = number.map { [$0] } ?? [] }
     }
 
     /// What is on screen now. Empty when nothing of the person's is showing.
     public static func update(_ current: [Window], keyHeld held: Bool) {
-        lock.lock()
-        windows = current
-        keyHeld = held && !current.isEmpty
-        lock.unlock()
+        state.withLock { $0.windows = current; $0.keyHeld = held && !current.isEmpty }
     }
 
-    /// True while a window of the person's is up. User, 10-04: while Shotgun
-    /// is up, Stop is the only hand-back; his input elsewhere never takes the
-    /// Mac from her, so he never interrupts her by accident.
+    /// While a person-only window is up, only Stop hands control back;
+    /// person input elsewhere does not interrupt the agent.
     public static var isShowing: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return !windows.isEmpty
+        state.withLock { !$0.windows.isEmpty }
     }
 
     public static func contains(number: Int) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return windows.contains { $0.number == number } || overlays.contains(number)
+        state.withLock { $0.windows.contains { $0.number == number } || $0.overlays.contains(number) }
     }
 
     public static func contains(point: CGPoint) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return windows.contains { $0.frame.contains(point) }
+        state.withLock { $0.windows.contains { $0.frame.contains(point) } }
     }
 
     /// Before one of her pointer or scroll events at `point` (CGEvent space):
@@ -158,49 +132,44 @@ public enum PersonOnlyWindows {
     /// person's window, that window must let it fall through. Her events
     /// anywhere else change nothing.
     public static func beforeAgentPointer(at point: CGPoint) {
-        lock.lock()
-        guard windows.contains(where: { $0.frame.contains(point) }) else { lock.unlock(); return }
-        passUntil = ProcessInfo.processInfo.systemUptime + pointerPassThroughSeconds
-        let hop = passing ? nil : passPointerThrough
-        passing = true
-        lock.unlock()
+        let hop = state.withLock { state -> (@Sendable () -> Void)? in
+            guard state.windows.contains(where: { $0.frame.contains(point) }) else { return nil }
+            state.passUntil = ProcessInfo.processInfo.systemUptime + pointerPassThroughSeconds
+            let hop = state.passing ? nil : state.passPointerThrough
+            state.passing = true
+            return hop
+        }
         hop?()
     }
 
     /// The app's restore check. Nil: her pointer has been idle long enough,
     /// so the window takes clicks again. Otherwise how long to wait first.
     public static func endPointerPassThroughIfIdle() -> TimeInterval? {
-        lock.lock()
-        defer { lock.unlock() }
-        let left = passUntil - ProcessInfo.processInfo.systemUptime
-        guard left <= 0 else { return left }
-        passing = false
-        return nil
+        state.withLock {
+            let left = $0.passUntil - ProcessInfo.processInfo.systemUptime
+            guard left <= 0 else { return left }
+            $0.passing = false
+            return nil
+        }
     }
 
     /// True while the person's window holds the keyboard (its composer is
     /// focused). A keystroke posted to whatever is key would land in their
     /// message, so hers wait until they send or click away.
     public static var keyboardHeldByPerson: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return keyHeld
+        state.withLock { $0.keyHeld }
     }
 
     /// The person typed or pointed in their own window just now.
     public static func notePersonInput() {
         let uptime = ProcessInfo.processInfo.systemUptime
-        lock.lock()
-        lastPersonInputUptime = uptime
-        lock.unlock()
+        state.withLock { $0.lastPersonInputUptime = uptime }
     }
 
     /// Age of the person's last input in their own window, `.infinity` when none.
     public static func secondsSincePersonInput() -> TimeInterval {
         let uptime = ProcessInfo.processInfo.systemUptime
-        lock.lock()
-        let last = lastPersonInputUptime
-        lock.unlock()
+        let last = state.withLock { $0.lastPersonInputUptime }
         return last.isFinite ? uptime - last : .infinity
     }
 }

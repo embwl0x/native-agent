@@ -6,7 +6,8 @@ import BackgroundLoops
 import TelegramBot
 import AppToolRuntime
 import NativeAgentCore
-// Blueprint: | `EngineTelegram.swift` | Telegram facade and tool status envelope; `TelegramFacade` class; `configuration`, `loadStatus`, `load`; status uses TelegramPollLoop's checked state read, reporting unavailable state in lastError; `refresh` alone publishes status through `LatestRead`, including diagnostic-clear readback; credential badges read TelegramPresentationSnapshot.tokenConfigured directly |
+import NativeAgentShared
+// Blueprint: | `EngineTelegram.swift` | Telegram facade and tool status envelope; `TelegramFacade` class; `loadStatus`, `load`; status uses TelegramPollLoop's checked state read, reporting unavailable state in lastError; `refresh` alone publishes status through `LatestRead`, including diagnostic-clear readback; credential badges read TelegramPresentationSnapshot.tokenConfigured directly |
 
 /// Mounted Telegram management state. The core owns configuration and transport
 /// status; the facade adds bounded diagnostic feeds and the app's routing pick.
@@ -18,7 +19,7 @@ public final class TelegramFacade {
     @ObservationIgnored private let statusRead = LatestRead()
 
     @discardableResult
-    public func refresh(manager: BackgroundLoopsManager = .shared, credentialUnavailable: Bool = false) async throws -> TelegramPresentationSnapshot {
+    public func refresh(manager: BackgroundLoopLifetimes = .shared, credentialUnavailable: Bool = false) async throws -> TelegramPresentationSnapshot {
         try await statusRead.read({ try await load(manager: manager, credentialUnavailable: credentialUnavailable) }, publish: { status = $0 })
     }
 
@@ -26,16 +27,10 @@ public final class TelegramFacade {
 
     public nonisolated func toolStatusEnvelope() async throws -> JSONValue {
         let status = try await load()
-        return AppToolExecutor.telegramStatusEnvelope(status: status, now: Date())
+        return status.toolStatusEnvelope(now: Date())
     }
 
-    public nonisolated func configuration() async -> TelegramConfigurationSummary? {
-        guard let config = try? TelegramBot.TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot) else { return nil }
-        let routing = try? await SwiftNativeProviderRouting(dataRoot: dataRoot).computeModelPreferences()["telegram"]
-        return TelegramConfigurationSummary(config: config, model: routing?.model, reasoningEffort: routing?.reasoningEffort)
-    }
-
-    public nonisolated func load(manager: BackgroundLoopsManager = .shared, credentialUnavailable: Bool = false,
+    public nonisolated func load(manager: BackgroundLoopLifetimes = .shared, credentialUnavailable: Bool = false,
                                  routingSnapshot: ProviderRoutingSnapshot? = nil) async throws -> TelegramPresentationSnapshot {
         var snapshot = try await loadStatus(manager: manager, credentialUnavailable: credentialUnavailable,
                                             routingSnapshot: routingSnapshot)
@@ -61,11 +56,11 @@ public final class TelegramFacade {
         return snapshot
     }
 
-    public nonisolated func loadStatus(manager: BackgroundLoopsManager = .shared, credentialUnavailable: Bool = false,
+    public nonisolated func loadStatus(manager: BackgroundLoopLifetimes = .shared, credentialUnavailable: Bool = false,
                                        routingSnapshot: ProviderRoutingSnapshot? = nil) async throws -> TelegramPresentationSnapshot {
-        // Read config and state once for this projection; retain
-        // only credential-free configuration in observable state.
-        let cfg = try TelegramBot.TelegramConfig.loadSavedConfiguration(dataRoot: dataRoot, resolveCredential: !credentialUnavailable)
+        let read = await SwiftNativeTelegramBot.readTransportStatus(
+            dataRoot: dataRoot, manager: manager, resolveCredential: !credentialUnavailable)
+        let cfg = try read.configuration.get()
         let telegramBrain: SurfacePreference?
         if let routingSnapshot {
             telegramBrain = routingSnapshot.preferences["telegram"]
@@ -73,72 +68,18 @@ public final class TelegramFacade {
             telegramBrain = try? await SwiftNativeProviderRouting(dataRoot: dataRoot)
                 .computeModelPreferences()["telegram"]
         }
-        var lastSeenUpdateId: Int?
-        var lastSeenAt: String?
-        var lastReplyAt: String?
-        var lastError: String?
-        var pollBackoffFailures: Int?
-        var lastPollAt: String?
-        var lastDiagnosticsClearedAt: String?
-        do {
-            let raw = try await TelegramPollLoop.readState(dataRoot: dataRoot)
-            let strings = JSONValue.object(raw).stringFields
-            func integer(_ value: JSONValue?) -> Int? {
-                switch value {
-                case .int(let i)?: return Int(exactly: i)
-                case .double(let d)?: return Int(exactly: d.rounded(.towardZero))
-                case .bool(let b)?: return b ? 1 : 0
-                default: return nil
-                }
-            }
-            // Current key first, legacy key second; an unrepresentable double
-            // is treated as absent so the legacy key still gets its turn.
-            lastSeenUpdateId = integer(raw["lastSeenUpdateId"]) ?? integer(raw["lastUpdateId"])
-            lastSeenAt = strings["lastSeenAt"]
-            lastReplyAt = strings["lastReplyAt"]
-            lastError = strings["lastError"]
-            pollBackoffFailures = integer(raw["pollBackoffFailures"])
-            lastPollAt = strings["lastPollAt"]
-            lastDiagnosticsClearedAt = strings["lastDiagnosticsClearedAt"]
-        } catch { lastError = error.localizedDescription }
-        if let loop = await manager.loopRunner(loopId: "telegram_poll") as? TelegramPollLoop,
-           let polledAt = await loop.lastSuccessfulPollAt {
-            lastPollAt = ISO8601DateFormatter().string(from: polledAt)
-        }
-        let voiceBackend = cfg?.voiceTranscriptionBackend ?? TelegramBot.TelegramConfig.defaultVoiceTranscriptionBackend
-        let voiceModel = cfg?.voiceTranscriptionModel ?? TelegramBot.TelegramConfig.defaultVoiceTranscriptionModel
-        let voiceStatus = TelegramVoiceTranscriptionStatus(
-            enabled: cfg?.voiceTranscriptionEnabled ?? TelegramBot.TelegramConfig.defaultVoiceTranscriptionEnabled,
-            backend: voiceBackend,
-            model: voiceModel,
-            maxBytes: cfg?.voiceMaxBytes ?? TelegramBot.TelegramConfig.defaultVoiceMaxBytes
-        )
-        // F4 fix-6: pollerEnabled reports ACTUAL loop-running state from the
-        // BackgroundLoopsManager — registered AND its runtime is running —
-        // not just config.enabled. Config-says-on / loop-not-running is the
-        // exact regression the UI used to hide (status panel looked healthy
-        // while the poller was dead).
-        let loopStatuses = await manager.status()
-        let pollerRunning = loopStatuses.contains(where: { $0.name == "telegram_poll" && $0.running })
+        var transport = read.status
+        if credentialUnavailable { transport.lastError = DeviceSecretKeychain.Failure.unavailable.localizedDescription }
         return TelegramPresentationSnapshot(
-            transport: TelegramBot.TelegramStatus(
-                enabled: cfg?.enabled ?? false,
-                tokenConfigured: cfg?.tokenConfigured ?? false,
-                pollerEnabled: pollerRunning,
-                lastSeenUpdateId: lastSeenUpdateId,
-                lastSeenAt: lastSeenAt,
-                lastReplyAt: lastReplyAt,
-                lastError: credentialUnavailable ? DeviceSecretKeychain.Failure.unavailable.localizedDescription
-                    : lastError ?? (cfg == nil ? "No bot token saved — paste one to enable." : nil)
-            ),
+            transport: transport,
             configuration: TelegramConfigurationSummary(
                 config: cfg, model: telegramBrain?.model,
                 reasoningEffort: telegramBrain?.reasoningEffort
             ),
-            pollBackoffFailures: pollBackoffFailures,
-            lastPollAt: lastPollAt,
-            lastDiagnosticsClearedAt: lastDiagnosticsClearedAt,
-            voiceTranscription: voiceStatus,
+            pollBackoffFailures: read.pollBackoffFailures,
+            lastPollAt: transport.extras?.stringFields["lastPollAt"],
+            lastDiagnosticsClearedAt: read.lastDiagnosticsClearedAt,
+            voiceTranscription: read.voiceTranscription,
             receipts: [], blocked: [], errors: []
         )
     }
@@ -147,39 +88,23 @@ public final class TelegramFacade {
         path: URL,
         limit: Int
     ) async -> TelegramDiagnosticFeedRead<Row> {
-        do {
-            let receipt = try await SwiftNativePersistenceCore().tailJSONLReadReceipt(
-                path,
-                limit: limit,
-                maxBytes: 1_048_576
-            )
-            let decoder = JSONDecoder.nativeAgent
-            var rows: [Row] = []
-            var undecodableSchemaRows = 0
-            for raw in receipt.rows {
-                guard let data = try? raw.serializedData(pretty: false),
-                      let row = try? decoder.decode(Row.self, from: data) else {
-                    undecodableSchemaRows += 1
-                    continue
-                }
-                rows.append(row)
-            }
-
-            var warnings: [String] = []
-            let unreadableCount = receipt.malformedJSONRowCount + undecodableSchemaRows
-            if unreadableCount > 0 {
-                warnings.append("\(unreadableCount) unreadable diagnostic \(unreadableCount == 1 ? "row was" : "rows were") omitted from this panel.")
-            }
-            if receipt.truncatedToByteWindow {
-                warnings.append("Only the newest bounded portion of this diagnostic feed was read; older entries are not shown.")
-            }
-            return TelegramDiagnosticFeedRead(rows: rows, issue: warnings.isEmpty ? nil : warnings.joined(separator: " "))
-        } catch {
+        let read: (rows: [Row], malformedRows: Int, blankRows: Int, truncated: Bool, readFailed: Bool, failure: String?) =
+            await RuntimeReadouts.tailJSONL(path: path, limit: limit)
+        if read.readFailed {
             return TelegramDiagnosticFeedRead(
                 rows: [],
                 issue: "This diagnostic feed is unavailable and was not treated as empty."
             )
         }
+        var warnings: [String] = []
+        let unreadableCount = read.malformedRows + read.blankRows
+        if unreadableCount > 0 {
+            warnings.append("\(unreadableCount) unreadable diagnostic \(unreadableCount == 1 ? "row was" : "rows were") omitted from this panel.")
+        }
+        if read.truncated {
+            warnings.append("Only the newest bounded portion of this diagnostic feed was read; older entries are not shown.")
+        }
+        return TelegramDiagnosticFeedRead(rows: read.rows, issue: warnings.isEmpty ? nil : warnings.joined(separator: " "))
     }
 }
 

@@ -12,24 +12,15 @@ extension ShelfStore {
     /// never deleted or rewritten. Every revision has its own stable identity.
     public func legacyHistory(bot: UUID, dataRoot: URL) throws -> [BotHistoryImport] {
         var material: [BotHistoryImport] = []
-        var cursor: String?
-        repeat {
+        for entry in try entriesByBot()[bot] ?? [] {
             try Task.checkCancellation()
-            let page = try shelfRead(bot: bot, limit: 100, cursor: cursor)
-            // Shelf cursors remain valid at the end for future appends. An
-            // empty page, not a nil cursor, ends this finite migration read.
-            if page.rows.isEmpty { break }
-            for row in page.rows {
-                let entry = try entry(row.id)
-                guard entry.sessionID == nil else { continue }
-                let text = [entry.headline, entry.findings, entry.changedSinceLastGood,
-                    entry.sourceLinks.map(\.url).joined(separator: "\n"), entry.uncertainties.joined(separator: "\n")]
-                    .filter { !$0.isEmpty }.joined(separator: "\n\n")
-                material.append(BotHistoryImport(id: "legacy-shelf-" + entry.id.uuidString,
-                    text: "Saved reply (\(entry.runAt))\n\n" + text, artifacts: []))
-            }
-            cursor = page.nextCursor
-        } while cursor != nil
+            guard entry.sessionID == nil else { continue }
+            let text = [entry.headline, entry.findings, entry.changedSinceLastGood,
+                entry.sourceLinks.map(\.url).joined(separator: "\n"), entry.uncertainties.joined(separator: "\n")]
+                .filter { !$0.isEmpty }.joined(separator: "\n\n")
+            material.append(BotHistoryImport(id: "legacy-shelf-" + entry.id.uuidString,
+                text: "Saved reply (\(entry.runAt))\n\n" + text, artifacts: []))
+        }
         let disk = StandingBotsDisk(dataRoot: dataRoot)
         try disk.locked {
             let directory = disk.root.appendingPathComponent(bot.uuidString)

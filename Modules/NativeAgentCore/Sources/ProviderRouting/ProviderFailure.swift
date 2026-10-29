@@ -1,11 +1,11 @@
 import Experiences
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `ProviderFailure.swift` | Typed provider failure classification and `Diagnostic` wrapper preserving redacted wire evidence and the owner's `ToolFailureError` repair through normalization; `repair` decides once whether a failed call owes repair (sign-in, account, model choice) or is a correction that owes nothing |
 
-/// 2026-09-18 WHY: adapters translate wire evidence once; recovery and surfaces
-/// consume a failure, never adapter wording. Cancellation is not a failure.
+/// Adapters translate wire evidence once for recovery and surfaces; cancellation is not a failure.
 public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable {
     case authExpired
     case codexCLISessionExpired
@@ -56,12 +56,12 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         case 200..<300, 0: return .malformedResponse
         default:
             if contextOverflow(detail) { return .contextTooLong }
-            // 2026-09-19 WHY: some quota responses use 403 rather than 429.
+            // Quota responses can use 403 as well as 429.
             if rateLimitWording(detail) { return .rateLimited(retryAfter: retryAfter) }
             if quotaExceeded(detail) { return .rateLimited(retryAfter: retryAfter ?? quotaRetryAfter) }
             if modelUnavailable(detail) { return .modelUnavailable }
-            if status == 403 { return .authExpired }
             if modelRefusal(detail) { return .refused }
+            if status == 403 { return .authExpired }
             return .requestRejected
         }
     }
@@ -131,29 +131,7 @@ public enum ProviderFailure: Error, Equatable, Sendable, LocalizedError, Codable
         return ["prompt is too long", "context_length_exceeded", "context length", "exceeds the context window", "input is too long", "input too long", "too many total text bytes", "request_too_large", "exceeds the model's maximum", "max_tokens exceed"].contains(where: text.contains)
     }
 
-    /// The HTTP status an error message names, in whichever shape the adapter
-    /// wrote it: "HTTP 413", "status code 413", "status: 413" in the adapter's
-    /// own prefix, or a bare "413 Request Entity Too Large".
-    ///
-    /// User, 2026-09-06: classification used to depend on adapter wording —
-    /// `isContextOverflow` matched "status 413" but not "HTTP 413", and the
-    /// 408/409/425/5xx codes were only read off `.invalidResponse`'s typed
-    /// payload. Reading the code makes the verdict the same whatever the
-    /// wording and whatever the error case.
-    ///
-    /// User, 2026-09-06 (second pass): the first version read a code out of the
-    /// provider's own BODY. `{"error":{"status":503}}` quoted inside a
-    /// deterministic 400, and prose like "500 error records", both classified
-    /// as retryable 5xx and rode the ladder ten times for the same refusal. A
-    /// number now counts only where it can only mean an HTTP status:
-    ///   1. after explicit HTTP context — "HTTP 503", "HTTP/1.1 503";
-    ///   2. after explicit status-code context — "status code 503";
-    ///   3. as "status 503" / "status: 503" in the adapter's own prefix (the
-    ///      text before any body it quoted), and never immediately after a
-    ///      quote, which is the JSON-field shape;
-    ///   4. followed by that code's own reason phrase — "413 Request Entity
-    ///      Too Large", "503 Service Unavailable".
-    /// The old loose "number then one of a dozen common words" pattern is gone.
+    /// Status numbers require HTTP/status-code context, unquoted adapter-prefix status, or a matching reason phrase.
     static func httpStatusCode(inDescription description: String) -> Int? {
         let haystack = description.lowercased()
         // The adapter prefix: everything before the body it quoted. Adapters
@@ -447,7 +425,7 @@ extension ProviderFailure {
         public var errorDescription: String? {
             (cause.errorDescription ?? "The reply could not be completed.") + " Work: " + work.rawValue + "."
         }
-        /// 2026-09-22 WHY: people get the cause alone; the work tag is for agent peers.
+        /// People receive the cause alone; agent peers also receive the work tag.
         public var personDescription: String {
             (cause.errorDescription ?? "The reply could not be completed.")
                 + (work == .ranPartly ? " Some steps had already run before it stopped." : "")

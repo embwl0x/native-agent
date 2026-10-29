@@ -56,8 +56,7 @@ public enum SignedPeerEvidenceStore {
             peerCreatedAt: peerCreatedAt,
             observedAt: observedAt
         )
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(url) {
+        try await SwiftNativePersistenceCore.withFileLock(url) {
             if let current = load(dataRoot: dataRoot), current.contactAt > candidate.contactAt {
                 return
             }
@@ -65,11 +64,7 @@ public enum SignedPeerEvidenceStore {
             encoder.dateEncodingStrategy = .iso8601
             encoder.outputFormatting = [.sortedKeys]
             let data = try encoder.encode(candidate)
-            try FileManager.default.createDirectory(
-                at: url.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            try data.write(to: url, options: .atomic)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(data, to: url)
         }
     }
 }

@@ -9,7 +9,6 @@ public struct AgentContactRow: Identifiable, Sendable {
     public let name: String
     public let contact: AgentPeerContact?
     public var candidate: AgentDiscoveryCandidate? = nil
-    public var builtIn = false
     /// The canonical contact row; associated doors retain their own grants.
     public var primary = true
     /// The newest retained exchange with this contact, from any chat.
@@ -62,7 +61,7 @@ public struct AgentContactRow: Identifiable, Sendable {
         }
     }
 
-    public static func rows(peers: [AgentPeerContact], candidates: [AgentDiscoveryCandidate], usable: Set<String>, everyDoor: Bool = false) -> [Self] {
+    public static func rows(peers: [AgentPeerContact], candidates: [AgentDiscoveryCandidate], everyDoor: Bool = false) -> [Self] {
         let hosts = candidates.filter(\.connectable).compactMap { candidate in
             candidate.hostID.flatMap { id in AgentHostDirectory.rows.first { $0.id == id } }
         }
@@ -79,33 +78,29 @@ public struct AgentContactRow: Identifiable, Sendable {
         return contacts
     }
 
-    /// The same canonical contact identities as People, preferring a built-in lane.
-    public static func rows(peers: [AgentPeerContact], candidates: [AgentDiscoveryCandidate], usable: Set<String>, dataRoot: URL, everyDoor: Bool = false) -> [Self] {
+    /// The same canonical contact identities as People, retaining each door's grants.
+    public static func rows(peers: [AgentPeerContact], candidates: [AgentDiscoveryCandidate], dataRoot: URL, everyDoor: Bool = false) -> [Self] {
         Task.detached(priority: .utility) { await AgentContactHealth.shared.refresh(dataRoot: dataRoot) }
         let identity = AgentContactIdentity(dataRoot: dataRoot)
         let health = AgentContactHealth.read(dataRoot: dataRoot)
-        let all = rows(peers: peers, candidates: candidates, usable: usable, everyDoor: true).map { row in
+        let all = rows(peers: peers, candidates: candidates, everyDoor: true).map { row in
             var row = row
             row.health = health[row.key]
-            return row
+            return (identity.canonical(row.key), row)
         }
-        func brain(_ row: Self) -> String {
-            identity.canonical(row.key)
+        let folded = Dictionary(grouping: all, by: { $0.0 }).mapValues { doors in
+            (candidate: doors.compactMap { $0.1.candidate }.first { $0.setupFailure != nil },
+             health: doors.compactMap { $0.1.health }.filter { $0.problem != nil }
+                .sorted { $0.isBroken != $1.isBroken ? $0.isBroken : $0.checkedAt > $1.checkedAt }.first)
         }
         var seen: Set<String> = []
-        return all.compactMap { row in
-            // Fold evidence once, retaining each door's own authority verdict.
-            let canonical = brain(row)
+        return all.compactMap { canonical, row in
             var row = row
             row.primary = !(row.contact?.who.map { who in peers.contains { $0.id == who } } ?? false)
                 && seen.insert(canonical).inserted
             guard everyDoor || row.primary else { return nil }
-            row.candidate = all.filter { brain($0) == canonical }.compactMap(\.candidate).first { $0.setupFailure != nil }
-                ?? row.candidate
-            row.health = all.filter { brain($0) == canonical }.compactMap(\.health)
-                .filter { $0.problem != nil }
-                .sorted { $0.isBroken != $1.isBroken ? $0.isBroken : $0.checkedAt > $1.checkedAt }
-                .first ?? health[canonical] ?? row.health
+            row.candidate = folded[canonical]?.candidate ?? row.candidate
+            row.health = folded[canonical]?.health ?? health[canonical] ?? row.health
             return row
         }
     }

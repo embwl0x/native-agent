@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import AppKit
 import Observation
 import AuthoredCapabilities
@@ -50,26 +51,52 @@ public struct MakeStudio: Sendable {
         !ref.isEmpty && ref.count <= 40 && ref.allSatisfy { ("a"..."z").contains($0) || ("0"..."9").contains($0) || $0 == "-" }
     }
 
+    private func checkedDestination(_ ref: String, file: String) throws -> URL {
+        let dir = folder(ref).standardizedFileURL.resolvingSymlinksInPath()
+        let destination = dir.appendingPathComponent(file).standardizedFileURL.resolvingSymlinksInPath()
+        guard Self.isRef(ref), dir.deletingLastPathComponent() == root.standardizedFileURL.resolvingSymlinksInPath(),
+              !file.isEmpty, !file.contains("/"), !file.contains("\\"), file != ".", file != "..",
+              destination.deletingLastPathComponent() == dir else {
+            throw Refusal(reason: "invalid_metadata", message: "Make paths must stay inside their ref folder. Metadata was preserved.")
+        }
+        return destination
+    }
+
     /// Nil only when the ref has no meta.json; unreadable or damaged meta throws.
     public func readMeta(_ ref: String) throws -> Meta? {
         guard Self.isRef(ref) else { return nil }
         let data: Data
         do {
-            data = try Data(contentsOf: folder(ref).appendingPathComponent("meta.json"))
+            data = try Data(contentsOf: checkedDestination(ref, file: "meta.json"))
         } catch CocoaError.fileReadNoSuchFile {
             return nil
         }
-        return try JSONDecoder().decode(Meta.self, from: data)
+        let meta = try JSONDecoder().decode(Meta.self, from: data)
+        guard meta.ref == ref else {
+            throw Refusal(reason: "invalid_metadata", message: "Make metadata names a different ref. Metadata was preserved.")
+        }
+        var previous = 0
+        for version in meta.versions {
+            guard version.n > previous else {
+                throw Refusal(reason: "invalid_metadata", message: "Make versions must have positive, increasing numbers. Metadata was preserved.")
+            }
+            previous = version.n
+            let stem = "v\(version.n)"
+            guard version.file == stem || (version.file.hasPrefix(stem + ".") && !version.file.hasSuffix(".")) else {
+                throw Refusal(reason: "invalid_metadata", message: "Make version filenames must name their version. Metadata was preserved.")
+            }
+            _ = try checkedDestination(ref, file: version.file)
+        }
+        return meta
     }
 
-    /// The ref with the newest version; nil only when Make holds nothing. An
-    /// unreadable folder or meta throws rather than reading as empty.
-    public func newestRef() throws -> String? {
+    /// Metadata with the newest version; nil for an empty store, unreadable folders or metadata throw.
+    public func newestMeta() throws -> Meta? {
         let refs: [String]
         do { refs = try FileManager.default.contentsOfDirectory(atPath: root.path) }
         catch CocoaError.fileReadNoSuchFile { return nil }
         return try refs.filter(Self.isRef).compactMap(readMeta)
-            .max { ($0.versions.last?.created ?? "") < ($1.versions.last?.created ?? "") }?.ref
+            .max { ($0.versions.last?.created ?? "") < ($1.versions.last?.created ?? "") }
     }
 
     /// Copies `file` in as the next version of `ref`, or of a new ref when nil.
@@ -86,17 +113,32 @@ public struct MakeStudio: Sendable {
                 }
                 meta = found
             }
-            let n = (meta.versions.last?.n ?? 0) + 1
+            let (n, exhausted) = (meta.versions.last?.n ?? 0).addingReportingOverflow(1)
+            guard !exhausted else {
+                throw Refusal(reason: "version_exhausted", message: "Make has no version numbers left for this ref. Nothing was written.")
+            }
             let ext = file.pathExtension.lowercased()
             let version = Version(n: n, file: ext.isEmpty ? "v\(n)" : "v\(n).\(ext)", prompt: prompt, model: model,
                                   created: NativeTimestampFormat.sixDigitUTCOffset(Date()))
             let dir = folder(meta.ref)
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            try FileManager.default.copyItem(at: file, to: dir.appendingPathComponent(version.file))
+            let copy = try checkedDestination(meta.ref, file: version.file)
+            try FileManager.default.copyItem(at: file, to: copy)
             meta.versions.append(version)
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(meta), to: dir.appendingPathComponent("meta.json"))
+            do {
+                try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(meta), to: checkedDestination(meta.ref, file: "meta.json"))
+            } catch let writeError {
+                // A directory-sync error can follow the metadata rename. Keep a
+                // referenced copy (or an unreadable commit); remove only a known orphan.
+                do {
+                    if try readMeta(meta.ref)?.versions.contains(version) != true {
+                        try FileManager.default.removeItem(at: copy)
+                    }
+                } catch { nativeLog("Make append cleanup: %@", error.localizedDescription) }
+                throw writeError
+            }
             return (meta.ref, version)
         }
     }

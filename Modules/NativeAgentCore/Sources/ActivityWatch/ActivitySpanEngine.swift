@@ -84,15 +84,7 @@ public struct ActivitySpanEngine: Sendable {
         /// `var`, because a span's first title lands ON the span rather than
         /// splitting it (see `handleTitleChange`).
         public var titleRedacted: String?
-        /// Whether this span's title has been DECIDED yet — tracked separately
-        /// from the title's VALUE (gpt-5.5 BLOCKING, 2026-08-14).
-        ///
-        /// `titleRedacted == nil` cannot carry this, because nil is also a
-        /// legitimate current title: a window with no AX title, or a title the
-        /// redactor dropped entirely. Overloading it lost real window changes —
-        /// "A" → nil → "B" split correctly at the nil, then treated "B" as the
-        /// successor's INITIAL title and stamped it in place, mislabelling the
-        /// whole nil-titled interval as "B" and swallowing the second change.
+        /// Tracks whether the title is decided; nil is a legitimate settled value.
         public var titleSettled: Bool
         public let startedAt: Double
         public var lastSeenAt: Double
@@ -266,26 +258,7 @@ public struct ActivitySpanEngine: Sendable {
         // REDACT AT THE SOURCE. Past this line no un-redacted title exists.
         let redacted = ActivityTitleRedaction.redact(raw)
 
-        // A SPAN'S FIRST TITLE IS ITS INITIAL TITLE, NOT A WINDOW CHANGE
-        // (live-run defect, 2026-08-14).
-        //
-        // A span opens on `.activate` with no title, because the exclusion gate
-        // runs before any AX read. The live watcher then reads the title
-        // MICROSECONDS later and feeds it back as `.titleChange`. Treating that
-        // as a window change closed the just-opened span and opened a successor,
-        // so every single app switch emitted a junk ZERO-LENGTH row: a 2-minute
-        // run with 6 real switches produced 16 spans, 8 of them 0 s.
-        //
-        // The simulation missed it only because its script separated `activate`
-        // from the first `titleChange` by 90 seconds — the split was visible but
-        // looked like a plausible 90 s span rather than obvious garbage.
-        //
-        // The test is `titleSettled`, NOT `titleRedacted == nil` (gpt-5.5
-        // BLOCKING, 2026-08-14): nil is a legitimate title value, so asking the
-        // value whether the title is known confuses "not decided yet" with
-        // "decided, and it is nil" — and silently swallows the next real window
-        // change. Only a title arriving on a span whose title is already SETTLED
-        // is a genuine window change.
+        // An unsettled span learns its initial title in place, including nil.
         if !span.titleSettled {
             let stamp = clamp(at)
             openSpan?.titleRedacted = redacted

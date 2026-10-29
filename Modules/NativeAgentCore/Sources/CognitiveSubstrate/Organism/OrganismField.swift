@@ -178,19 +178,7 @@ public enum OrganismPlasticity {
         bodySchema: BodySchema,
         to field: OrganismField
     ) -> OrganismField {
-        // 2026-07-21 audit fix: NO wall-clock decay here. The kernel's
-        // settleElapsedTime (anchored at lastSettledAt) is now the SINGLE
-        // wall-clock decay path — this function previously ran a SECOND decay
-        // over the same inter-signal interval with a drifted factor table
-        // (0.86/0.94/0.72 vs the kernel's 0.82/0.90/0.65), so activation,
-        // charge, and Hebbian eligibility decayed at roughly double the
-        // intended rate (eligibility half-life ~0.9h vs the designed ~1.7h).
-        // Item 5 (2026-09-02): a horizon refresh trains nothing. The kernel
-        // already routes that kind away from this function; this guard is the
-        // second lock, and it returns the field UNTOUCHED — including
-        // `mutationGeneration`, which downstream readers use as a cheap
-        // "did the field change" stamp and which a bare no-association pass
-        // would still have bumped on every deadline.
+        // The kernel alone owns wall-clock decay; horizon refresh leaves the field and its mutation generation untouched.
         guard signal.kind != .horizonRefresh else { return field }
         var next = field
         next.mutationGeneration &+= 1
@@ -281,7 +269,7 @@ public enum OrganismPlasticity {
         }
 
         edge.eligibility = OrganismNode.clamp01(edge.eligibility + 0.18 * intensity)
-        edge.coActivations += 1
+        edge.coActivations = min(edge.coActivations, Int.max - 1) + 1
         edge.lastUpdatedAt = signal.occurredAt
     }
 
@@ -324,7 +312,7 @@ public enum OrganismPlasticity {
     private static func chargeImpulse(for signal: SomaticSignal) -> Double {
         let intensity = OrganismNode.clamp01(signal.intensity)
         let arousal = signal.arousal.map(OrganismNode.clamp01) ?? defaultArousal(for: signal.kind)
-        let negativeValence = max(0, -(signal.valence ?? defaultValence(for: signal.kind)))
+        let negativeValence = max(0, -(signal.valence ?? signal.kind.canonicalValence))
         let base = 0.03 + (0.12 * arousal) + (0.08 * negativeValence)
         return isRepairSignal(signal.kind)
             ? OrganismNode.clamp01(base * intensity * 0.18)
@@ -344,15 +332,6 @@ public enum OrganismPlasticity {
         default:
             return 0.3
         }
-    }
-
-    // Fallback valence for a signal that reaches the field with nil valence.
-    // Single source of truth: SomaticSignalKind.canonicalValence (audit C10 —
-    // adapter numbers win, so the former −0.50/0.40 defaults now match the
-    // adapter's −0.55/0.45 for the kinds both define; field-fallback-only kinds
-    // keep their historical values inside canonicalValence).
-    private static func defaultValence(for kind: SomaticSignalKind) -> Double {
-        kind.canonicalValence
     }
 
     private static func nodes(for signal: SomaticSignal, bodySchema: BodySchema) -> [OrganismNode] {
@@ -406,7 +385,7 @@ public enum OrganismPlasticity {
         case .appWake, .appSleep:
             return ["body:mac:\(bodySchema.macAwake ? "awake" : "sleeping")"]
         case .resourcePressureChanged:
-            return ["body:resource:\(resourcePressure(from: metadata)?.rawValue ?? bodySchema.resourcePressure.rawValue)"]
+            return ["body:resource:\(OrganismResourcePressure.from(metadata: metadata)?.rawValue ?? bodySchema.resourcePressure.rawValue)"]
         case .userSpoke, .assistantSpoke, .correctionReceived, .deskItemCreated, .deskItemBlocked, .deskItemClosed, .deskItemCancelled:
             return []
         case .horizonRefresh:
@@ -418,22 +397,6 @@ public enum OrganismPlasticity {
             // evidence about nothing; it only moves the rows.
             return []
         }
-    }
-
-    private static func resourcePressure(from metadata: [String: JSONValue]) -> OrganismResourcePressure? {
-        for key in ["resourcePressure", "resource_pressure", "pressure", "level"] {
-            guard case .string(let value)? = metadata[key] else { continue }
-            let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if let pressure = OrganismResourcePressure(rawValue: normalized) {
-                return pressure
-            }
-            if normalized == "normal" || normalized == "low" { return .nominal }
-            if normalized == "medium" { return .elevated }
-            if normalized == "thermal" {
-                return .critical
-            }
-        }
-        return nil
     }
 
     private static func unorderedPairs(_ ids: [String]) -> [(String, String)] {

@@ -1,5 +1,4 @@
 import EngineRuntime
-// PATCH-2026-05-06: wkwebview-browser Real WKWebView browser window + NWListener IPC server on this install's fixed port (8766)
 import SwiftUI
 import WebKit
 import Network
@@ -10,28 +9,19 @@ import AppToolRuntime
 import Browser
 import Dispatcher
 import NativeAgentCore
-// Blueprint: | `BrowserWindow.swift` | `NavResult` struct; `BrowserActionRoutes.app` over the visible window's route effects; actor-owned `BrowserCallbackWait` settles callbacks or cancellation once; physical exclusion remains until late WebKit callbacks exit |
+// Blueprint: | `BrowserWindow.swift` | MainActor-owned `BrowserNavDelegate` and `BrowserCallbackWait`; `BrowserActionRoutes.app` over the visible window's route effects; callbacks or cancellation settle once; physical exclusion remains until late WebKit callbacks exit |
 
 // MARK: - Models
 
-struct NavResult: Codable, Sendable {
-    let url: String
-    let title: String
-    let httpStatus: Int?
-}
-
 typealias BrowserLink = EngineRuntime.BrowserLink
 
-// MARK: - Nav delegate helper (nonisolated, bridges WKWebView callbacks to actor)
+// MARK: - Navigation delegate
 
-final class BrowserNavDelegate: NSObject, WKNavigationDelegate, @unchecked Sendable {
+@MainActor
+final class BrowserNavDelegate: NSObject, WKNavigationDelegate {
     // Continuation is set before navigation begins and consumed on load/fail.
-    var onFinish: ((Result<NavResult, Error>) -> Void)?
-    /// The one navigation whose completion may settle `onFinish`.  A newly
-    /// created WKWebView can finish its implicit about:blank navigation after
-    /// the caller has armed a real load; accepting that callback used to return
-    /// a successful result for about:blank and leave the requested page loading
-    /// invisibly in the background.
+    var onFinish: ((Result<BrowserNavigationResult, Error>) -> Void)?
+    /// Only this navigation may settle `onFinish`, never the implicit about:blank load.
     var expectedNavigation: WKNavigation?
     // Real status captured from the main-frame navigation response. nil when no
     // HTTP response was seen — didFinish must NOT fabricate a 200 (404/500 pages
@@ -47,7 +37,6 @@ final class BrowserNavDelegate: NSObject, WKNavigationDelegate, @unchecked Senda
         lastHTTPStatus = nil
     }
 
-    @MainActor
     func webView(
         _ webView: WKWebView,
         decidePolicyFor navigationAction: WKNavigationAction,
@@ -71,7 +60,6 @@ final class BrowserNavDelegate: NSObject, WKNavigationDelegate, @unchecked Senda
         decisionHandler(.cancel)
     }
 
-    @MainActor
     func webView(
         _ webView: WKWebView,
         decidePolicyFor navigationResponse: WKNavigationResponse,
@@ -89,7 +77,7 @@ final class BrowserNavDelegate: NSObject, WKNavigationDelegate, @unchecked Senda
         let title = webView.title ?? ""
         let scheme = webView.url?.scheme?.lowercased() ?? ""
         if scheme == "http" || scheme == "https" {
-            onFinish?(.success(NavResult(url: url, title: title, httpStatus: lastHTTPStatus)))
+            onFinish?(.success(BrowserNavigationResult(url: url, title: title, httpStatus: lastHTTPStatus)))
         } else {
             onFinish?(.failure(BrowserError.unsafeScheme(scheme.isEmpty ? "unknown" : scheme)))
         }
@@ -213,16 +201,7 @@ final class BrowserWindowController: NSObject, ObservableObject {
         window.makeKeyAndOrderFront(nil)
     }
 
-    /// Load-capable WITHOUT stealing the screen (2026-07-12, User's 3:30am
-    /// incident): agent-lane navigations (dream/trigger/background turns,
-    /// bridge routes) were force-fronting the browser + activating the app
-    /// via showWindow() on every navigate — a Google window popping over
-    /// whatever User was doing, twice a night at dream time. Navigation now
-    /// only ensures the window EXISTS (WKWebView needs a window to render
-    /// for text/screenshot capture); it never orders it front, never
-    /// activates the app, and never yanks it out of miniaturization. The
-    /// explicit show surfaces (UI menu, /browser/show, browser_show tool)
-    /// still call showWindow() — deliberate showing stays deliberate.
+    /// Loading permits rendering without fronting, activating or deminiaturizing the browser window.
     func ensureWindowLoadedQuietly() {
         ensureWindow()
     }
@@ -243,7 +222,7 @@ final class BrowserWindowController: NSObject, ObservableObject {
         if browserOwnerID == runID { browserOwnerID = nil }
     }
 
-    func navigate(_ url: URL, runID: String, ownerID: String) async throws -> NavResult {
+    func navigate(_ url: URL, runID: String, ownerID: String) async throws -> BrowserNavigationResult {
         ensureWindow()
         guard let webView else { throw BrowserError.notReady }
 
@@ -262,15 +241,8 @@ final class BrowserWindowController: NSObject, ObservableObject {
                     } catch {
                         return
                     }
-                    guard !Task.isCancelled,
-                          let self,
-                          self.activeNavigationID == runID,
-                          let finish = self.navDelegate.onFinish else { return }
-                    self.navDelegate.onFinish = nil
-                    self.navDelegate.expectedNavigation = nil
-                    self.activeNavigationID = nil
-                    self.webView?.stopLoading()
-                    finish(.failure(BrowserError.timeout))
+                    guard !Task.isCancelled else { return }
+                    _ = self?.cancelNavigation(runID: runID, error: BrowserError.timeout)
                 }
                 navDelegate.rejectedScheme = nil
                 navDelegate.onFinish = { [weak self] result in
@@ -471,11 +443,9 @@ private struct AppBrowserRouteEffects: BrowserIPCWindowEffects {
     @MainActor
     func navigate(_ url: URL, runID: String) async throws -> BrowserNavigationResult {
         let controller = BrowserWindowController.shared
-        // Navigation must not imply fronting (User's 3:30am dream-time popups):
-        // load quietly; only the explicit show surfaces front the window.
+        // Load quietly; only the explicit show surfaces front the window.
         controller.ensureWindowLoadedQuietly()
-        let nav = try await controller.navigate(url, runID: runID, ownerID: runID)
-        return BrowserNavigationResult(url: nav.url, title: nav.title, httpStatus: nav.httpStatus)
+        return try await controller.navigate(url, runID: runID, ownerID: runID)
     }
 
     @MainActor func currentURL() -> String? { BrowserWindowController.shared.currentURL() }

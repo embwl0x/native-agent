@@ -1,6 +1,8 @@
+import NativeAgentShared
 import SwiftUI
 import AppKit
 import Desk
+import WorkshopExecution
 // Blueprint: | `DeskItemInspector.swift` | `DeskItemInspector` struct |
 
 /// Item-level controls on the primary Desk; all writes use its tool router.
@@ -156,7 +158,7 @@ struct DeskItemInspector: View {
             if let pursuit = item.pursuit {
                 Text(pursuit.why)
                 Text("Done when: \(pursuit.doneLooksLike)")
-                Text("\(pursuit.sessionsUsed)/\(pursuit.maxSessions) sessions · \(pursuit.workSessionsToday) today")
+                Text("\(pursuit.sessionsUsed(in: item.workAttempts))/\(pursuit.maxSessions) sessions · \(pursuit.workSessionsToday) today")
                 if let last = pursuit.lastWorkedAt { Text("Worked \(DeskRelativeTimePresentation.text(forISO: last, now: now))") }
             }
             let rationale = DeskPursuitVetoRationale.row(for: item, now: now)
@@ -315,7 +317,7 @@ extension DeskPursuitVetoRationale {
 
     /// "score 1.83" — nil when the pursuit payload gave no score, so the row
     /// says nothing rather than showing a misleading 0.
-    static func scoreLabel(_ score: WorkshopScoreView?) -> String? {
+    static func scoreLabel(_ score: PursuitChoiceScore?) -> String? {
         guard let score else { return nil }
         return "score \(String(format: "%.2f", score.total))"
     }

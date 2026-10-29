@@ -3,18 +3,19 @@ import Foundation
 import ChatTurnRuntime
 import NativeAgentShared
 import AppKit
+import SwiftUI
 import MacControl
 import NativeAgentCore
 import TrustCenter
 import TurnTrace
-// Blueprint: | `AppModel+MacChatTurnPort.swift` | `AppModel`: `resumeMacChatTurn` reconnects checkpoint progress to the existing stream adapter and lifecycle; `captureMacWorkContinuation`, `chatHasConversationRows`, `cancelICloudChatTurnForControlHandoff` |
+// Blueprint: | `AppModel+MacChatTurnPort.swift` | `AppModel`: `resumeMacChatTurn` reconnects checkpoint progress to the core event stream and lifecycle; `captureMacWorkContinuation`, `chatHasConversationRows`, `cancelICloudChatTurnForControlHandoff` |
 
 extension AppModel: MacChatTurnPresentationPort {
     var macChatTurns: MacChatTurnRuntime { engine.turns.runtime }
     var knownChatSessionIDs: Set<String> { Set(engine.transcripts.sessions.map(\.id)) }
 
     func resumeMacChatTurn(_ checkpoint: TurnCheckpoint,
-        operation: @escaping @Sendable (@escaping ChatOrchestrationProgressHandler) async throws -> Void) async throws {
+        operation: @escaping @Sendable (@escaping TurnEventSink) async throws -> Void) async throws {
         try await engine.resumeMacChatTurn(checkpoint, port: self, operation: operation)
     }
 
@@ -44,19 +45,18 @@ extension AppModel: MacChatTurnPresentationPort {
         try await engine.chatClient(profile: .mac).recordControlHandoff(
             message: text, reply: reply, sessionId: sessionId, surface: "chat"
         )
-        let messages = try await engine.transcripts.loadMessages(sessionId: sessionId)
-        engine.transcripts.setMessages(messages, for: sessionId)
+        try await engine.transcripts.refreshMessages(sessionId: sessionId, cached: false)
     }
 
     func runMacChatTurnBody(
         _ text: String, attachments: [NativeAgentShared.MultimodalAttachment],
-        sessionId: String, generation: Int, ctx: MacChatTurnBodyContext,
+        sessionId: String, generation: Int,
         hideUserBubble: Bool, activityIdentity: MacChatTurnIdentity
     ) async {
         if activeChatSessionId.isEmpty { await loadChatState() }
         await engine.runMacChatTurnBody(
             text, attachments: attachments, sessionId: sessionId,
-            generation: generation, ctx: ctx, hideUserBubble: hideUserBubble,
+            generation: generation, hideUserBubble: hideUserBubble,
             activityIdentity: activityIdentity, port: self, client: macChatClient,
             missingProviderGuidance: missingProviderChatGuidance(),
             errorAdvice: UserFacingError.advice,
@@ -66,44 +66,17 @@ extension AppModel: MacChatTurnPresentationPort {
         )
     }
 
+    func animateMacChatMutation(_ mutation: () -> Void) {
+        withAnimation(NativeAgentMotion.arrive, mutation)
+    }
+
     func presentMacChatTurn(_ event: MacChatTurnPresentationEvent) {
         switch event {
         case .status(let message):
             statusText = message
-        case .dropDraft(let sessionId):
-            composerDraft(for: sessionId).edit("")
-        case .moveDraft(let from, let to):
-            if let draft = chatComposerDrafts[from] {
-                composerDraft(for: to).edit(draft.text)
-                draft.edit("")
-            }
-        case .selectMigratedSession(let sessionId):
-            activeChatSessionId = sessionId
-            UserDefaults.standard.set(activeChatSessionId, forKey: "activeChatSessionId")
-        case .workingCommentary(let sessionId, let bubbleId, let characters):
-            setChatMessageWorkingCommentary(characters, id: bubbleId, in: sessionId)
-        case .clearPreview(let sessionId):
-            engine.turns.screenPreviewBySession.removeValue(forKey: sessionId)
-        case .movePreview(let oldSessionId, let newSessionId):
-            if let carried = engine.turns.screenPreviewBySession.removeValue(forKey: oldSessionId) {
-                engine.turns.screenPreviewBySession[newSessionId] = carried
-            }
-        case .replySettledChanged(let sessionId, let settled):
-            if !settled { engine.turns.replyingSessions.remove(sessionId) }
-        case .moveReplying(let oldSessionId, let newSessionId):
-            if engine.turns.replyingSessions.remove(oldSessionId) != nil {
-                engine.turns.replyingSessions.insert(newSessionId)
-            }
         case .intakeClosed:
             drainPendingResidentRefreshIfTurnsIdle()
-        case .streamFrame(let sessionId, let bubbleId, let snapshot):
-            engine.turns.streamingTexts[sessionId] = snapshot
-            if !snapshot.isEmpty, !engine.turns.replyingSessions.contains(sessionId) {
-                engine.turns.replyingSessions.insert(sessionId)
-            }
-            engine.transcripts.updateMessageContent(id: bubbleId, in: sessionId, content: snapshot)
         case .activity(let activity):
-            if activity.source == .toolResult { placeTurnToolRows(sessionId: activity.identity.sessionId) }
             // Preserve the existing notice/toast contract; tools add no chatter.
             guard case .notice(let kind) = activity.source,
                   let text = activity.userVisibleNoticeText, !text.isEmpty else { return }
@@ -112,20 +85,4 @@ extension AppModel: MacChatTurnPresentationPort {
         }
     }
 
-    /// User, 2026-10-07: her tool rows reached the transcript only at the
-    /// post-turn reload, which slid them in between his message and her
-    /// finished reply — the reply jumped down a row as it landed. Each
-    /// finished tool now places the turn's persisted rows where that reload
-    /// puts them, under the same ids, so the reload moves nothing.
-    func placeTurnToolRows(sessionId: String) {
-        Task { @MainActor in
-            guard let disk = try? await engine.transcripts.loadMessages(sessionId: sessionId, cached: true),
-                  engine.turns.streamingSessions.contains(sessionId),
-                  let bubbleId = engine.turns.streamingBubbleIds[sessionId],
-                  let local = engine.transcripts.messagesBySession[sessionId],
-                  let placed = ChatTurnToolPlacement.placing(disk: disk, into: local, before: bubbleId)
-            else { return }
-            engine.transcripts.setMessages(placed, for: sessionId)
-        }
-    }
 }

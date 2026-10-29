@@ -3,7 +3,7 @@ import CryptoKit
 import Foundation
 import NativeAgentCore
 import PersistenceCore
-// Blueprint: | `OwnedProgramStore.swift` | Retained ability file URLs, candidate identity, sealed rehearsal and publication through AbilityStore headers; rehearsal scopes supplied inputs and reached calls, never behavioral proof from intercepted replies; trusted bundled-seed proofs seal exact bytes without validation receipts or staging; kept proofs seal their Full Mac keeps without rehearsal; source-bound sense reads bind captured-material proof; OwnedProgramFixtures reads live and intercepts tool/routine effects and decisions |
+// Blueprint: | `OwnedProgramStore.swift` | exact authenticated rehearsal reuse with capture-input checks, without treating keep or seed seals as rehearsals; Retained ability file URLs, candidate identity, sealed rehearsal and publication through AbilityStore headers; rehearsal scopes supplied inputs and reached calls, never behavioral proof from intercepted replies; trusted bundled-seed proofs seal exact bytes without validation receipts or staging; kept proofs seal their Full Mac keeps without rehearsal; source-bound sense reads bind captured-material proof; OwnedProgramFixtures reads live and intercepts tool/routine effects and decisions; fixtures written from recorded practice (`tape: true` on every case) replay their calls alone, never captured afresh, each call matched and answered from the tape with complete consumption, and seal their `tape` coverage |
 
 /// Executable metadata and source share the ability's current, previous or next file.
 public struct OwnedProgramStore: Sendable {
@@ -62,13 +62,10 @@ public struct OwnedProgramStore: Sendable {
               digest.allSatisfy({ $0.isHexDigit && !$0.isUppercase }) else {
             throw SenseFailure(code: "bad_input", message: "Invalid owned program identity.")
         }
-        for slot in [AbilityStore.Slot.current, .previous, .next] {
-            if let file = try abilities.read(id: id, slot: slot), file.metadata["candidate"] != nil,
-               try decode(file).digest == digest {
-                return try abilities.path(id: id, slot: slot, pathExtension: file.pathExtension)
-            }
+        guard let retained = try retained(id: id, matching: { $0.digest == digest }) else {
+            throw SenseFailure(code: "integrity", message: "The ability version is no longer retained.")
         }
-        throw SenseFailure(code: "integrity", message: "The ability version is no longer retained.")
+        return try abilities.path(id: id, slot: retained.slot, pathExtension: retained.file.pathExtension)
     }
 
     /// `writing` runs at the write boundary: a refusal before it wrote nothing.
@@ -76,10 +73,7 @@ public struct OwnedProgramStore: Sendable {
         try CapabilityLifecycle.requireWrite()
         try check(candidate)
         try AbilityStore.withLock {
-            for slot in [AbilityStore.Slot.current, .previous, .next] {
-                if let file = try abilities.read(id: candidate.id, slot: slot), file.metadata["candidate"] != nil,
-                   try decode(file) == candidate { return }
-            }
+            if try retained(id: candidate.id, matching: { $0 == candidate }) != nil { return }
             guard let kind = candidate.program.storeKind else {
                 throw SenseFailure(code: "bad_input", message: "This program is not an ability.")
             }
@@ -98,8 +92,9 @@ public struct OwnedProgramStore: Sendable {
         if kind != .sense, try BuiltInSenses.defaults().contains(where: { $0.record.id.caseInsensitiveCompare(id) == .orderedSame }) {
             throw SenseFailure(code: "bad_input", message: "Ability id collision: \(id) is a bundled sense.")
         }
-        var descriptor = try value(candidate).objectValue!
-        var program = descriptor["program"]!.objectValue!
+        guard var descriptor = try value(candidate).objectValue, var program = descriptor["program"]?.objectValue else {
+            throw SenseFailure(code: "integrity", message: "Candidate descriptor has no program object.")
+        }
         program.removeValue(forKey: "source")
         descriptor["program"] = .object(program)
         if var manifest = descriptor["manifest"]?.objectValue, var script = manifest["script"]?.objectValue {
@@ -122,13 +117,10 @@ public struct OwnedProgramStore: Sendable {
     }
 
     public func load(id: String, digest: String) throws -> Candidate {
-        for slot in [AbilityStore.Slot.current, .previous, .next] {
-            if let file = try abilities.read(id: id, slot: slot), file.metadata["candidate"] != nil {
-                let candidate = try decode(file)
-                if candidate.digest == digest { return candidate }
-            }
+        guard let retained = try retained(id: id, matching: { $0.digest == digest }) else {
+            throw SenseFailure(code: "integrity", message: "The ability version is no longer retained.")
         }
-        throw SenseFailure(code: "integrity", message: "The ability version is no longer retained.")
+        return retained.candidate
     }
 
     private func decode(_ file: AbilityStore.File) throws -> Candidate {
@@ -157,7 +149,6 @@ public struct OwnedProgramStore: Sendable {
         var candidate = try Candidate(program: program, manifest: manifest, fixtures: fixtures,
                                       dependencyShapes: dependencies, prior: prior)
         candidate.id = file.id
-        try check(candidate)
         guard decoded.version == candidate.digest else {
             throw SenseFailure(code: "integrity", message: "Candidate source, manifest or fixtures changed. Propose it again.")
         }
@@ -187,10 +178,27 @@ public struct OwnedProgramStore: Sendable {
             evidence["capturedFixtures"] = captured
             evidence["capture"] = .string(OwnedProgramFixtures.summary(captured))
         }
+        // Recorded practice replayed: its coverage is the seal's own claim.
+        if let tape = Self.tape(candidate.fixtures) {
+            let calls = tape.reduce(0) { $0 + ($1.objectValue?["calls"]?.arrayValue?.count ?? 0) }
+            evidence["tape"] = .object(["examples": .int(Int64(tape.count)), "calls": .int(Int64(calls)),
+                                        "consumed": .string("complete"), "effects": .string("none")])
+            evidence["capture"] = .string("Replayed \(tape.count) recorded examples (\(calls) calls): every call intercepted, matched exactly and answered from the tape, all of it consumed, no effect run. It proves those examples; no other input or branch is proven.")
+        }
         return try seal(candidate, evidence: evidence, key: key)
     }
 
-    /// Kept by her under Full Mac, with no rehearsal (User 10-15): a rehearsal
+    /// Fixtures written from recorded practice (`tape: true` on every case):
+    /// each case's calls are what went and came back, and its returned value
+    /// is the candidate's own, so a replay checks the calls alone. Nil when
+    /// they are hand-written; a mix is refused at validation.
+    public static func tape(_ fixtures: JSONValue) -> [JSONValue]? {
+        guard let cases = fixtures.arrayValue, !cases.isEmpty,
+              cases.allSatisfy({ $0.objectValue?["tape"] == .bool(true) }) else { return nil }
+        return cases
+    }
+
+    /// Kept by her under Full Mac, with no rehearsal: a rehearsal
     /// proves no live behavior, so its first real run is its proof, and a
     /// failing run owes repair as any part's does.
     public func kept(_ candidate: Candidate, key: Data) throws {
@@ -201,12 +209,12 @@ public struct OwnedProgramStore: Sendable {
     private func seal(_ candidate: Candidate, evidence: [String: JSONValue], key: Data) throws -> JSONValue {
         let proof = try sealedProof(candidate, evidence: evidence, key: key)
         try AbilityStore.withLock {
-            let slot = try slot(candidate)
-            guard var file = try abilities.read(id: candidate.id, slot: slot), try decode(file) == candidate else {
-                throw SenseFailure(code: "integrity", message: "Candidate changed during validation.")
+            guard let retained = try retained(id: candidate.id, matching: { $0 == candidate }) else {
+                throw SenseFailure(code: "integrity", message: "The ability version is no longer retained.")
             }
+            var file = retained.file
             file.metadata["proof"] = proof
-            try abilities.write(file, slot: slot)
+            try abilities.write(file, slot: retained.slot)
         }
         return proof
     }
@@ -227,8 +235,12 @@ public struct OwnedProgramStore: Sendable {
                          runner: any OwnedProgramRunning, host: @Sendable () -> any OwnedProgramHostProfile,
                          checkInput: @Sendable (JSONValue) throws -> Void) async throws -> JSONValue {
         try CapabilityLifecycle.requireWrite()
+        try Task.checkCancellation()
         var captured: JSONValue?
-        if try abilities.read(id: candidate.id, slot: slot(candidate))?.metadata["proof"] != nil {
+        guard let retained = try retained(id: candidate.id, matching: { $0 == candidate }) else {
+            throw SenseFailure(code: "integrity", message: "The ability version is no longer retained.")
+        }
+        if retained.file.metadata["proof"] != nil {
             let saved = try proof(candidate, key: key)
             if let fixtures = saved.objectValue?["capturedFixtures"] {
                 captured = fixtures
@@ -236,15 +248,28 @@ public struct OwnedProgramStore: Sendable {
                     throw SenseFailure(code: "stale_validation", message: "This candidate already has a sealed capture with another input. Save a new candidate to capture different input.")
                 }
             }
+            // Only a sealed rehearsal is reusable as a rehearsal. A keep or
+            // seed seal makes no claim that these fixtures have been run.
+            // proof() checks the exact candidate, fixtures, host and shapes.
+            if (captured != nil || !capture && input == nil),
+               saved.objectValue?["domain"] == .string("owned-program-validation"),
+               saved.objectValue?["receipts"]?.arrayValue?.isEmpty == false {
+                return saved
+            }
         }
-        let recording = captured == nil && (capture || candidate.fixtures.arrayValue?.isEmpty == true)
+        // Recorded practice is replayed from its tape, never captured afresh.
+        let replaying = Self.tape(candidate.fixtures) != nil
+        if !replaying, candidate.fixtures.arrayValue?.contains(where: { $0.objectValue?["tape"] != nil }) == true {
+            throw SenseFailure(code: "bad_input", message: "Fixtures are all recorded tape or all hand-written; this candidate mixes them. Save it again.")
+        }
+        let recording = !replaying && captured == nil && (capture || candidate.fixtures.arrayValue?.isEmpty == true)
         let fixtures = recording ? [.object(["input": input ?? .object([:])])] : (captured ?? candidate.fixtures).arrayValue ?? []
         guard !fixtures.isEmpty else { throw SenseFailure(code: "bad_input", message: "Supply fixtures or capture input for validation.") }
         var receipts: [JSONValue] = []
         for (index, value) in fixtures.enumerated() {
             try Task.checkCancellation()
             let fields = value.objectValue ?? [:]
-            guard let input = fields["input"], recording || fields["expected"] != nil else {
+            guard let input = fields["input"], recording || replaying || fields["expected"] != nil else {
                 throw SenseFailure(code: "bad_input", message: "Fixture \(index + 1) requires input and expected returned JSON.")
             }
             try checkInput(input)
@@ -272,9 +297,11 @@ public struct OwnedProgramStore: Sendable {
                 replay = OwnedProgramRunner.Replay(journal: journal, answer: answers[pass], recheckReads: false)
             }
             guard final["status"] == .string("ok"), await interceptor.finished,
-                  try (recording || JSONValue.fromEncodable(final["returned"] ?? .null)
+                  try (recording || replaying || JSONValue.fromEncodable(final["returned"] ?? .null)
                       == JSONValue.fromEncodable(fields["expected"] ?? .null)) else {
-                throw SenseFailure(code: "fixture_mismatch", message: "Returned JSON or intercepted calls differ from fixture \(index + 1). No effect ran.")
+                throw SenseFailure(code: "fixture_mismatch", message: replaying
+                    ? "Its calls differ from recorded example \(index + 1): a call the tape does not hold, in another order or with other arguments, or one it holds left unmade. No effect ran."
+                    : "Returned JSON or intercepted calls differ from fixture \(index + 1). No effect ran.")
             }
             if recording {
                 let fixture: JSONValue = .array([.object(["input": input, "calls": .array(await interceptor.recorded),
@@ -300,7 +327,10 @@ public struct OwnedProgramStore: Sendable {
     }
 
     public func proof(_ candidate: Candidate, key: Data) throws -> JSONValue {
-        guard case .object(var fields)? = try abilities.read(id: candidate.id, slot: slot(candidate))?.metadata["proof"],
+        guard let retained = try retained(id: candidate.id, matching: { $0 == candidate }) else {
+            throw SenseFailure(code: "integrity", message: "The ability version is no longer retained.")
+        }
+        guard case .object(var fields)? = retained.file.metadata["proof"],
               case .string(let saved)? = fields.removeValue(forKey: "seal"),
               [JSONValue.string("owned-program-validation"), .string("owned-program-seed"), .string("owned-program-kept")].contains(fields["domain"] ?? .null),
               fields["candidate"] == .string(candidate.digest),
@@ -369,12 +399,15 @@ public struct OwnedProgramStore: Sendable {
         }
     }
 
-    private func slot(_ candidate: Candidate) throws -> AbilityStore.Slot {
+    private func retained(id: String, matching: (Candidate) -> Bool) throws
+        -> (slot: AbilityStore.Slot, file: AbilityStore.File, candidate: Candidate)? {
         for slot in [AbilityStore.Slot.current, .previous, .next] {
-            if let file = try abilities.read(id: candidate.id, slot: slot), file.metadata["candidate"] != nil,
-               try decode(file) == candidate { return slot }
+            if let file = try abilities.read(id: id, slot: slot), file.metadata["candidate"] != nil {
+                let candidate = try decode(file)
+                if matching(candidate) { return (slot, file, candidate) }
+            }
         }
-        throw SenseFailure(code: "integrity", message: "The ability version is no longer retained.")
+        return nil
     }
 
     private static func seal(_ value: JSONValue, key: Data) throws -> String {
@@ -465,11 +498,12 @@ public actor OwnedProgramFixtures: OwnedProgramHostProfile {
     public func reply(_ input: [String: JSONValue]) async -> JSONValue {
         let id = input["action"]?.stringValue
         let operation = id.map { "app." + $0 } ?? (input["find"] == nil ? "read" : "find")
-        let args = id == nil ? JSONValue.object(input.filter { ["page", "item", "find"].contains($0.key) }) : input["args"] ?? .object([:])
+        let args = id == nil ? JSONValue.object(input.filter { !$0.key.hasPrefix("__") && !["preview", "expected_version"].contains($0.key) }) : input["args"] ?? .object([:])
+        let options = JSONValue.object(input.filter { ["preview", "expected_version"].contains($0.key) })
         do {
-            if calls != nil { return try consume(operation, arguments: args) }
+            if calls != nil { return try consume(operation, arguments: args, options: options) }
             let result = reads(input) ? await base.perform(input) : Self.placeholder(operation)
-            record(operation, arguments: args, result: result)
+            record(operation, arguments: args, result: result, options: options)
             return result
         } catch {
             return .object(["status": .string("failed"), "reason": .string("fixture_mismatch"),
@@ -502,8 +536,8 @@ public actor OwnedProgramFixtures: OwnedProgramHostProfile {
         return answer
     }
 
-    private func record(_ operation: String, arguments: JSONValue, result: JSONValue) {
-        recorded.append(.object(["operation": .string(operation), "args": arguments, "result": result]))
+    private func record(_ operation: String, arguments: JSONValue, result: JSONValue, options: JSONValue = .object([:])) {
+        recorded.append(.object(["operation": .string(operation), "args": arguments, "options": options, "result": result]))
     }
 
     /// A page read or find, or a native action whose arguments the host judges
@@ -529,15 +563,19 @@ public actor OwnedProgramFixtures: OwnedProgramHostProfile {
         return "Rehearsed supplied input: \(calls.count - intercepted.count) data reads; \(intercepted.count) intercepted. Intercepted replies are not behavioral evidence; no other input or branch is proven."
     }
 
-    private func consume(_ operation: String, arguments: JSONValue) throws -> JSONValue {
-        try consumeCall(operation, arguments: arguments)["result"] ?? .null
+    private func consume(_ operation: String, arguments: JSONValue, options: JSONValue = .object([:])) throws -> JSONValue {
+        try consumeCall(operation, arguments: arguments, options: options)["result"] ?? .null
     }
 
-    private func consumeCall(_ operation: String, arguments: JSONValue) throws -> [String: JSONValue] {
+    private func consumeCall(_ operation: String, arguments: JSONValue, options: JSONValue = .object([:])) throws -> [String: JSONValue] {
         guard let calls, calls.indices.contains(next), case .object(let call) = calls[next],
               call["operation"] == .string(operation), call["args"] == arguments, call["result"] != nil else {
             faulted = true
             throw SenseFailure(code: "fixture_mismatch", message: "Declare the exact intercepted call and result for \(operation). No effect ran.")
+        }
+        guard (call["options"] ?? .object([:])) == options else {
+            faulted = true
+            throw SenseFailure(code: "fixture_mismatch", message: "The operational options for \(operation) differ from its recorded call. No effect ran.")
         }
         next += 1
         return call
@@ -549,10 +587,4 @@ public enum OwnedProgramInvocation {
     /// A value call pins before it waits at any gate. Presentation must retain
     /// its runner envelope, and dispatch must execute this version or refuse.
     @TaskLocal public static var valueCall: (id: String, version: String)?
-}
-
-private extension JSONValue {
-    var objectValue: [String: JSONValue]? { if case .object(let fields) = self { fields } else { nil } }
-    var arrayValue: [JSONValue]? { if case .array(let values) = self { values } else { nil } }
-    var stringValue: String? { if case .string(let text) = self { text } else { nil } }
 }

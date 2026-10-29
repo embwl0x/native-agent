@@ -4,36 +4,12 @@ import Transcripts
 import SwiftUI
 import UniformTypeIdentifiers
 import DeviceSync
-// Blueprint: | `ChatView+PinnedSessions.swift` | `ChatView`: `humanPinnedSessionIds`, `savePinnedSessionIds`, `prunePinnedSessions` |
+// Blueprint: | `ChatView+PinnedSessions.swift` | `ChatView`: human pin reads and pruning; additive pinning delegates to `TranscriptsFacade` |
 
 extension ChatView {
-    /// The human's pins WITHOUT the anchor — what `savePinnedSessionIds` must
-    /// persist. Writing the merged list back would silently adopt the anchor as
-    /// a real pin, and it would stay pinned after it stopped being the anchor.
+    /// Human pins exclude the anchor, which must not become a persisted pin.
     func humanPinnedSessionIds() -> [String] {
         appModel.engine.transcripts.pinnedSessionIDs
-    }
-
-    /// 2026-09-06: `includeTranscripts` exists because the published transcript
-    /// set is chosen from the pins as they were BEFORE this save. Publishing a
-    /// newly pinned session's tab without its transcript put an empty
-    /// conversation on the phone until some unrelated edge happened to publish
-    /// transcripts again. A pin that ADDS a session asks for them; pruning and
-    /// unpinning still do not — they only ever remove.
-    @discardableResult
-    func savePinnedSessionIds(_ ids: [String], includeTranscripts: Bool = false) -> Bool {
-        let encoded: String
-        do {
-            encoded = try appModel.engine.transcripts.savePinnedSessionIDs(ids)
-        } catch {
-            showToast("Pinned tabs could not be updated")
-            return false
-        }
-        guard appModel.engine.transcripts.publishPins(encoded, includeTranscripts: includeTranscripts) else {
-            showToast("Pinned tabs were saved on this Mac, but could not be shared with your phone")
-            return false
-        }
-        return true
     }
 
     func prunePinnedSessions() {
@@ -43,8 +19,14 @@ extension ChatView {
         // anchor into their pins on the first prune pass.
         let current = humanPinnedSessionIds()
         let pruned = current.filter { liveIds.contains($0) }
-        if pruned != current {
-            savePinnedSessionIds(pruned)
+        guard pruned != current else { return }
+        do {
+            let encoded = try appModel.engine.transcripts.savePinnedSessionIDs(pruned)
+            if !appModel.engine.transcripts.publishPins(encoded, includeTranscripts: false) {
+                showToast("Pinned tabs were saved on this Mac, but could not be shared with your phone")
+            }
+        } catch {
+            showToast("Pinned tabs could not be updated")
         }
     }
 
@@ -52,14 +34,18 @@ extension ChatView {
         guard let session = appModel.engine.transcripts.sessions.first(where: { $0.id == sessionId }) else { return }
         // Explicitly pinning the anchor is allowed and meaningful: it says
         // "keep this one even after it stops being the live conversation".
-        var ids = humanPinnedSessionIds()
-        if !ids.contains(sessionId) {
-            ids.append(sessionId)
-            guard savePinnedSessionIds(ids, includeTranscripts: true) else { return }
-            showToast("Pinned \(session.title)")
+        do {
+            let result = try appModel.engine.transcripts.pinSession(sessionId)
+            guard result.shared else {
+                showToast("Pinned tabs were saved on this Mac, but could not be shared with your phone")
+                return
+            }
+            if result.changed { showToast("Pinned \(session.title)") }
+        } catch {
+            showToast("Pinned tabs could not be updated")
+            return
         }
         if selectAfterPin {
-            renameTitle = session.title
             Task { await appModel.selectChatSession(session) }
         }
     }
@@ -83,11 +69,7 @@ extension ChatView {
         }
     }
 
-    // 2026-07-24 (desktop-icons fix): `chatSessionDragProvider` deleted — the
-    // AppKit SessionDragSource replaced SwiftUI .onDrag as the only drag
-    // source (W1.3), leaving it caller-less, and its plain-text payload is
-    // the exact shape Finder materializes as a .textClipping. The plain-text
-    // PARSER below stays: it's harmless acceptance, not a producer.
+    // Plain-text drops are accepted, but SessionDragSource emits only the custom session type.
     func handlePinnedSessionDrop(providers: [NSItemProvider]) -> Bool {
         var accepted = false
         for provider in providers {

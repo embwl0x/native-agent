@@ -1,71 +1,16 @@
 import Foundation
 import NativeAgentCore
-// SSEEventStream (shared SSE framing — R15) lives in PersistenceCore, same as
-// every other adapter's stream parser in this module.
+// Provider streams share PersistenceCore's SSE framing.
 import PersistenceCore
-// Blueprint: | `LLMClient+AnthropicNativeTools.swift` | `AnthropicAdapter`: buffered JSON and SSE both open through `ProviderWire`; native-tool stream decoding commits explicit object input at content-block close; empty-input candidates and later blocks wait in wire order for the terminal verdict; interruptions discard unconfirmed empty candidates and release explicit calls, retaining thinking replay; shared Anthropic event type, wire errors, usage and stop-reason accumulation |
+// Blueprint: | `LLMClient+AnthropicNativeTools.swift` | `AnthropicTransport`: buffered JSON and SSE both open through `ProviderWire`; native-tool stream decoding commits explicit object input at content-block close; empty-input candidates and later blocks wait in wire order for the terminal verdict; interruptions discard unconfirmed empty candidates and release explicit calls, retaining thinking replay; shared Anthropic event type, wire errors, usage and stop-reason accumulation |
 
-// MARK: - Native tool-use lane for the Anthropic-wire api-key adapter
-//
-// docs/build_plans/kimi-native-tools.md, P1; extended by
-// docs/build_plans/fable51-sweep-2026-09-01.md item 34. This adapter declares
-// `toolWire = .native` (kimi-code and the Anthropic API key). The Claude
-// OAUTH-direct adapter is a different type (AnthropicOAuthDirectAdapter) that
-// declares `.textMarkers`, and dispatch refuses a tools array bound to it.
-//
-// FABLE 5.1 CONTRACT (Anthropic docs, 2026-09-01) — what this lane must and
-// must not put on the wire:
-//   * `tool_choice` of type "any" or "tool" returns 400. This lane emits NO
-//     tool_choice key at all, ever — auto is the default and the only shape
-//     that is valid across the family. (Pinned by a test.)
-//   * `strict: true` is a TOP-LEVEL field on a tool definition and requires a
-//     closed schema. Emitted only for the first-party api-key adapter and only
-//     for tools whose schema already declares `additionalProperties: false`.
-//   * Parallel tool use is the default: one assistant message may carry
-//     several tool_use blocks, and ALL of them must dispatch, with every
-//     tool_result returned in ONE user message (nativeAnthropicMessages keeps
-//     the blocks of a message together, so the loop's single user message
-//     stays single).
-//   * Tool inputs are JSON — parsed with JSONSerialization here and handed on
-//     as bytes. Nothing on this lane string-matches a serialized input.
-//
-// WIRE CONTRACT (live-probed 2026-07-20 against api.kimi.com/coding with the
-// real key — these shapes are ground truth, not documentation):
-//   A. request  → {"tools":[{"name","description","input_schema"}], ...}
-//      response → content:[thinking(+signature), tool_use{id:"tool_…",name,input}],
-//                 stop_reason:"tool_use", HTTP 200.
-//   B. roundtrip → assistant [tool_use] + user [tool_result{tool_use_id,content}]
-//      → 200, model continues. Thinking REPLAY NOT REQUIRED (probe B omitted
-//      it and was accepted) — so we DROP thinking blocks on replay.
-//   C. parallel  → several tool_use blocks in ONE response; all must dispatch.
-//
-// CONTRACT NOTE 1 (the load-bearing one): stop_reason "tool_use" with ZERO
-// text blocks is the HAPPY PATH here. `emptyTextResponseError` was built for
-// the text-compat lane, where a textless 200 really is a dead turn; on this
-// lane a textless 200 that carries tool_use blocks is a perfectly good
-// response. The guard therefore fires only when there is NEITHER text NOR a
-// tool_use block.
+// API-key transports carry native tools; OAuth transports use text markers.
+// Omit tool_choice; strict tool definitions require first-party closed schemas.
+// Dispatch every tool_use block and return its results in one user message.
+// Tool inputs are parsed JSON; a textless response with tool calls is valid.
 
-/// What a native-tools request actually returned. Deliberately a separate
-/// return type rather than an overload of the String-returning
-/// `completeMessages`: every existing caller of that protocol method wants a
-/// reply string, and widening it would either lose tool calls silently or
-/// force an out-of-band side channel. Callers that can act on tool calls opt
-/// in by calling `completeMessagesWithTools` explicitly.
-/// ONE `thinking` / `redacted_thinking` block, held exactly as the provider
-/// sent it so it can be replayed byte-for-byte.
-///
-/// On claude-fable-5-1 extended thinking is ALWAYS on, and the Messages API
-/// requires the assistant turn that made a tool call to carry its ORIGINAL
-/// thinking blocks — signature included, in original order — when the paired
-/// tool_result round comes back. Drop them and the next request 400s. The
-/// signature is an opaque provider attestation over the thinking text: it is
-/// only valid alongside the exact text it was issued for, so text and
-/// signature travel together or not at all.
-///
-/// This is a WIRE artifact, not conversation content: it is never rendered to
-/// the user and never persisted — it lives in the in-memory ledger below for
-/// as long as the turn that produced it may still be replayed.
+/// Exact provider thinking and signature replay, held together in memory for
+/// the tool-calling turn; never rendered or persisted as conversation content.
 struct AnthropicThinkingBlock: Sendable, Equatable {
     /// "thinking" or "redacted_thinking".
     let type: String
@@ -113,38 +58,23 @@ struct AnthropicThinkingBlock: Sendable, Equatable {
     }
 }
 
-/// In-memory ledger of the thinking blocks that accompanied a tool-calling
-/// assistant turn, keyed by the tool_use ids of that same turn.
-///
-/// WHY A LEDGER AND NOT A CONTENT BLOCK: the structured tool loop mints the
-/// replayed assistant message from the parsed tool calls alone, so a thinking
-/// block has no carrier in `LLMMessage` — and the tool_use ids ARE the join
-/// key, unique per response and echoed back on the very message that needs
-/// the replay. Same shape as `MoonshotReasoningLedger`, which solves the
-/// identical "provider requires its reasoning state back" problem on the K3
-/// wire.
-///
-/// Bounded (LRU-ish by insertion order) so a long-lived adapter can't grow
-/// without limit, and never written to disk.
-actor AnthropicThinkingLedger {
-    private var byToolUseID: [String: [AnthropicThinkingBlock]] = [:]
+/// Memory-only replay payloads keyed by every sibling tool-call ID, evicted in insertion order.
+actor ToolCallReplayLedger<Payload: Sendable> {
+    private var byToolUseID: [String: Payload] = [:]
     private var order: [String] = []
     private let limit = 512
 
-    func record(_ blocks: [AnthropicThinkingBlock], toolUseIDs: [String]) {
-        guard !blocks.isEmpty else { return }
-        for id in toolUseIDs where !id.isEmpty {
+    func record(_ payload: Payload, callIDs: [String]) {
+        for id in callIDs where !id.isEmpty {
             if byToolUseID[id] == nil { order.append(id) }
-            byToolUseID[id] = blocks
+            byToolUseID[id] = payload
         }
         while order.count > limit {
             byToolUseID.removeValue(forKey: order.removeFirst())
         }
     }
 
-    /// The blocks recorded for whichever of these ids we know — parallel tool
-    /// use puts SEVERAL ids on one response, all mapped to the same blocks.
-    func blocks(forAny toolUseIDs: [String]) -> [AnthropicThinkingBlock]? {
+    func payload(forAny toolUseIDs: [String]) -> Payload? {
         for id in toolUseIDs {
             if let blocks = byToolUseID[id] { return blocks }
         }
@@ -167,15 +97,62 @@ public struct AnthropicNativeToolResult: Sendable, Equatable {
     }
 }
 
-extension AnthropicAdapter {
-    static func streamEventType(_ object: [String: Any], eventName: String?) -> String {
-        let payloadType = object["type"] as? String ?? ""
-        return payloadType.isEmpty ? (eventName ?? "") : payloadType
+extension AnthropicTransport {
+    /// A delta belongs to its indexed block, even when its own type claims otherwise.
+    static func validateContentBlockEvent(
+        _ object: [String: Any], event: String, blocks: inout [Int: String]
+    ) throws {
+        guard ["content_block_start", "content_block_delta", "content_block_stop"].contains(event) else { return }
+        guard let index = object["index"] as? Int, index >= 0 else {
+            throw LLMError.failure(.malformedResponse)
+        }
+        if event == "content_block_start" {
+            guard blocks.isEmpty, let block = object["content_block"] as? [String: Any],
+                  let type = block["type"] as? String else { throw LLMError.failure(.malformedResponse) }
+            blocks[index] = type
+        } else {
+            guard let type = blocks[index] else { throw LLMError.failure(.malformedResponse) }
+            if event == "content_block_stop" {
+                blocks.removeValue(forKey: index)
+            } else {
+                guard let delta = object["delta"] as? [String: Any] else { throw LLMError.failure(.malformedResponse) }
+                let expected: String?
+                switch delta["type"] as? String {
+                case "text_delta": expected = "text"
+                case "thinking_delta", "signature_delta": expected = "thinking"
+                case "input_json_delta": expected = "tool_use"
+                default: expected = nil
+                }
+                if let expected, type != expected { throw LLMError.failure(.malformedResponse) }
+            }
+        }
     }
 
     static func consumeStreamEvent(
-        _ object: [String: Any], event: String, usage: inout LLMUsage, stopReason: inout String?
-    ) throws {
+        _ sse: SSEEvent, usage: inout LLMUsage, stopReason: inout String?,
+        blocks: inout [Int: String], ttftMs: inout Int?, semanticOutput: inout Bool,
+        runaway: inout RunawayOutputDetector, requestStartNs: UInt64,
+        requestBody: Data?, provider: String, model: String, telemetry: LLMCallTraceRecorder,
+        malformedFrame: String, continuation: AsyncThrowingStream<LLMMessageStreamEvent, Error>.Continuation,
+        substitutedFrom: String? = nil, cacheMarkers: [LLMCacheMarker]? = nil,
+        inspectThinking: ((String, Bool) -> Void)? = nil,
+        payload: (String, [String: Any], String?) async throws -> Bool
+    ) async throws -> Bool {
+        try Task.checkCancellation()
+        if sse.data.isEmpty || sse.data == "[DONE]" { return false }
+        guard let data = sse.data.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            if semanticOutput { throw LLMError.streamTruncated(message: malformedFrame) }
+            return false
+        }
+        let type = object["type"] as? String ?? ""
+        let event = type.isEmpty ? (sse.event ?? "") : type
+        let closingTool = event == "content_block_stop" && blocks.values.first == "tool_use"
+        try validateContentBlockEvent(object, event: event, blocks: &blocks)
+        var boundary = false
+        var thinking: String?
+        var redacted = false
+        var output = false
         switch event {
         case "error":
             throw ProviderFailure.wireError(object["error"] as? [String: Any] ?? [:])
@@ -187,22 +164,80 @@ extension AnthropicAdapter {
             if let delta = object["delta"] as? [String: Any], let stop = delta["stop_reason"] as? String {
                 stopReason = stop
             }
+        case "content_block_start":
+            let block = object["content_block"] as? [String: Any]
+            let type = block?["type"] as? String
+            redacted = type == "redacted_thinking"
+            if redacted { thinking = "[redacted]" }
+            if inspectThinking == nil, type == "thinking" {
+                thinking = (block?["thinking"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+            }
+            output = thinking != nil || (inspectThinking == nil && type == "tool_use")
+        case "content_block_delta":
+            let delta = object["delta"] as? [String: Any] ?? [:]
+            switch delta["type"] as? String {
+            case "text_delta":
+                if let text = delta["text"] as? String, !text.isEmpty {
+                    output = true
+                    semanticOutput = true
+                    boundary = runaway.feed(text)
+                    let kept = runaway.takeCommittedText()
+                    if !kept.isEmpty { continuation.yield(.textDelta(kept)) }
+                    else if inspectThinking != nil { continuation.yield(.keepAlive) }
+                }
+            case "thinking_delta":
+                thinking = (delta["thinking"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                output = thinking != nil
+            case "input_json_delta": output = inspectThinking == nil
+            default: break
+            }
+        case "content_block_stop": output = inspectThinking == nil && closingTool
         default: break
         }
+        if output, ttftMs == nil {
+            ttftMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
+        }
+        if let thinking {
+            inspectThinking?(thinking, redacted)
+            continuation.yield(.keepAlive)
+        }
+        let produced = try await payload(event, object, stopReason)
+        semanticOutput = semanticOutput || produced
+        guard event == "message_stop" || boundary else { return false }
+        if event == "message_stop", inspectThinking != nil {
+            let tail = runaway.finish()
+            if !tail.isEmpty { continuation.yield(.textDelta(tail)) }
+        }
+        let cutoff = !boundary && LLMToolBoundaryReason(stopReason: stopReason) == .outputLimit
+        let emptyError = !boundary && !cutoff && !semanticOutput
+            ? FirstPartyExecutionControls.anthropicEmptyStreamError(
+                providerID: provider, stopReason: stopReason, expectedOutput: "answer text or tool call") : nil
+        await telemetry.record(requestBody: requestBody, provider: provider, model: model,
+            streaming: true, usage: usage.isEmpty ? nil : usage, ttftMs: ttftMs,
+            durationMs: Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000),
+            status: cutoff ? "incomplete" : emptyError == nil ? "ok" : "failed",
+            substitutedFrom: substitutedFrom, cacheMarkers: cacheMarkers,
+            stopReason: boundary ? "client_tool_boundary" : stopReason)
+        if boundary {
+            _ = try await payload("client_tool_boundary", object, stopReason)
+        } else if cutoff {
+            if inspectThinking != nil { AnthropicOAuthTransport.logCutoffShape(runaway.text) }
+            RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit")
+        } else {
+            if let emptyError { throw emptyError }
+            if inspectThinking != nil { AnthropicOAuthTransport.logStopWithoutToolCall(stopReason, runaway.text) }
+        }
+        if let reason = cutoff ? LLMToolBoundaryReason.outputLimit : boundary ? runaway.toolBoundaryReason
+            : LLMToolBoundaryReason(stopReason: stopReason) ?? (inspectThinking == nil ? nil : runaway.toolBoundaryReason) {
+            continuation.yield(.toolBoundary(reason))
+        }
+        continuation.finish()
+        return true
     }
 
-    /// True when THIS adapter instance may ship native tools AND the caller
-    /// opted in by passing a (possibly empty) tools array.
-    ///
-    /// NON-NIL, NOT NON-EMPTY — and that distinction is load-bearing. The chat
-    /// loop passes `ctx.toolSchemas`, which is lazy-filtered per iteration to
-    /// `alwaysOnCore ∪ sessionActive`; a session that has loaded nothing can
-    /// legitimately produce an EMPTY list. If empty meant "not native", the
-    /// adapter would silently fall back to the flatten path and stringify the
-    /// conversation's tool_use/tool_result BLOCKS into prose — the loop would
-    /// think it was on the native lane while the wire said otherwise, and the
-    /// model would never see its own tool results. `nil` (what every non-native
-    /// caller passes) remains the byte-identical legacy path.
+    /// A non-nil tools array selects native block encoding, even when empty.
+    /// Nil retains compatibility encoding; an empty array omits declarations
+    /// while preserving tool-use/result blocks. Ordinary turns expose only `app`.
     func usesNativeToolLane(_ tools: [LLMToolSchema]?) -> Bool {
         tools != nil
     }
@@ -302,6 +337,22 @@ extension AnthropicAdapter {
         return true
     }
 
+    /// Anthropic's native content-block wire fields; message policy stays with its builder.
+    static func anthropicBlock(_ block: LLMContentBlock) -> [String: Any] {
+        switch block {
+        case .text(let text): return ["type": "text", "text": text]
+        case .image(let mediaType, let base64, _, _):
+            return ["type": "image", "source": ["type": "base64", "media_type": mediaType, "data": base64]]
+        case .toolUse(let id, let name, let inputJSON):
+            let input: Any = (try? JSONSerialization.jsonObject(with: inputJSON)) ?? [String: Any]()
+            return ["type": "tool_use", "id": id, "name": name, "input": input]
+        case .toolResult(let id, let content, let isError):
+            var result: [String: Any] = ["type": "tool_result", "tool_use_id": id, "content": content]
+            if isError { result["is_error"] = true }
+            return result
+        }
+    }
+
     /// Encode the conversation with NATIVE tool blocks (P0 shapes A/B):
     ///   assistant → {"type":"tool_use","id","name","input"}
     ///   user      → {"type":"tool_result","tool_use_id","content"[,"is_error"]}
@@ -335,52 +386,18 @@ extension AnthropicAdapter {
                 }
             }
             for block in m.content {
-                switch block {
-                case .text(let t):
-                    // Skip empty text blocks: the API rejects them, and the
-                    // tool loop legitimately produces one when an iteration's
-                    // assistant reply was pure tool_use with no prose.
-                    guard !t.isEmpty else { continue }
-                    blocks.append(["type": "text", "text": t])
-                case .image(let mediaType, let base64, _, _):
-                    blocks.append([
-                        "type": "image",
-                        "source": [
-                            "type": "base64",
-                            "media_type": mediaType,
-                            "data": base64,
-                        ],
-                    ])
-                case .toolUse(let id, let name, let inputJSON):
-                    let input: Any = (try? JSONSerialization.jsonObject(with: inputJSON))
-                        ?? [String: Any]()
-                    blocks.append([
-                        "type": "tool_use",
-                        "id": id,
-                        "name": name,
-                        "input": input,
-                    ])
-                case .toolResult(let toolUseId, let content, let isError):
-                    var b: [String: Any] = [
-                        "type": "tool_result",
-                        "tool_use_id": toolUseId,
-                        "content": content,
-                    ]
-                    if isError { b["is_error"] = true }
-                    blocks.append(b)
-                }
+                // Native messages omit empty text while retaining replay order.
+                if case .text(let text) = block, text.isEmpty { continue }
+                blocks.append(Self.anthropicBlock(block))
             }
             guard !blocks.isEmpty else { continue }
             // Three-way role — see the api-key adapter's note. A `.system`
             // message stays a mid-conversation system message on the native
             // lane too.
-            var entry: [String: Any] = [
-                "role": AnthropicOAuthDirectAdapter.wireRole(m.role),
+            let entry: [String: Any] = [
+                "role": AnthropicOAuthTransport.wireRole(m.role),
                 "content": blocks,
             ]
-            if m.turnScopedClearAtNextUserMessage {
-                entry["clear_at"] = "next_user_message"
-            }
             out.append(entry)
         }
         return out
@@ -403,12 +420,14 @@ extension AnthropicAdapter {
         tools: [LLMToolSchema],
         stream: Bool
     ) async -> [String: Any] {
+        let replay = await thinkingReplayMap(for: messages)
+        let encoded = messages.enumerated().compactMap { index, message -> (Int, [String: Any])? in
+            Self.nativeAnthropicMessages([message], thinkingReplay: replay).first.map { (index, $0) }
+        }
         var body: [String: Any] = [
             "model": model,
             "max_tokens": requestMaxTokens(model: model),
-            "messages": Self.nativeAnthropicMessages(
-                messages, thinkingReplay: await thinkingReplayMap(for: messages)
-            ),
+            "messages": encoded.map { $0.1 },
         ]
         if stream { body["stream"] = true }
         // Omit the key entirely rather than sending `"tools": []` — an empty
@@ -424,6 +443,11 @@ extension AnthropicAdapter {
         }
         if let systemBlocks = Self.makeSystemBlocks(system) {
             body["system"] = systemBlocks
+        }
+        if firstPartyAnthropicToolContract {
+            let usesPrefix = system.map { LLMCallContext.systemSegments?.reassembles(into: $0) == true } ?? false
+            AnthropicOAuthTransport.cacheConversationPrefix(&body, sourceMessages: messages,
+                wireSourceIndices: encoded.map { $0.0 }, usesPrefixShape: usesPrefix)
         }
         FirstPartyExecutionControls.applyAnthropicControls(to: &body, model: model)
         applyThinkingControls(to: &body)
@@ -447,7 +471,7 @@ extension AnthropicAdapter {
                 return nil
             }
             guard !ids.isEmpty,
-                  let blocks = await thinkingLedger.blocks(forAny: ids) else { continue }
+                  let blocks = await thinkingLedger.payload(forAny: ids) else { continue }
             for id in ids { map[id] = blocks }
         }
         return map
@@ -484,200 +508,35 @@ extension AnthropicAdapter {
     /// Non-streaming native-tools request. Returns BOTH text and tool_use
     /// blocks so the caller never has to re-parse prose to find a tool call.
     ///
-    /// Error handling is deliberately identical to `completeMessages` — same
-    /// status ladder, same provider-message preservation — with ONE difference:
-    /// the textless-200 guard is skipped when tool_use blocks are present
-    /// (contract note 1).
+    /// A native tool call can satisfy a response without text.
     public func completeMessagesWithTools(
         messages: [LLMMessage],
         system: String?,
         model: String,
         tools: [LLMToolSchema]
     ) async throws -> AnthropicNativeToolResult {
-        let key = try resolvedCredentialKey()
-
-        var req = URLRequest(url: endpoint)
-        req.httpMethod = "POST"
-        req.setValue(key, forHTTPHeaderField: "x-api-key")
-        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        req.setValue("application/json", forHTTPHeaderField: "content-type")
-        // clear_at requires its beta header only when a message carries it.
-        if let beta = AnthropicOAuthDirectAdapter.clearAtBeta(for: messages) {
-            req.setValue(beta, forHTTPHeaderField: "anthropic-beta")
-        }
-
-        req.httpBody = try JSONSerialization.data(withJSONObject: await makeNativeToolsBody(
+        let req = try request(body: await makeNativeToolsBody(
             messages: messages, system: system, model: model, tools: tools, stream: false
-        ), options: [.sortedKeys])
+        ))
 
-        let requestStartNs = DispatchTime.now().uptimeNanoseconds
-        let data: Data
-        let response: URLResponse
-        do {
-            let (bytes, head) = try await ProviderWire.open(session, req)
-            defer { bytes.task.cancel() }
-            response = head
-            data = try await bytes.reduce(into: Data()) { $0.append($1) }
-        } catch {
-            throw mapTransportError(error, fallback: .underlying(
-                message: "connection refused: \(endpoint.host ?? "anthropic")"))
-        }
-        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        // A3.1: key present here → 401 is a positive credential rejection.
-        // User, 2026-09-06 WHY: preserve the HTTP status even with an empty body.
-        try throwIfChatCompletionsError(status: status, data: data, response: response)
-
-        guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let content = obj["content"] as? [[String: Any]] else {
-            throw malformedSuccessBodyError(data)
-        }
-
-        let text = Self.joinedTextBlocks(content)
-        if obj["stop_reason"] as? String == "max_tokens" {
-            await telemetry.record(
-                requestBody: req.httpBody,
-                provider: providerId,
-                model: model,
-                streaming: false,
-                usage: LLMUsage.fromAnthropic(obj["usage"] as? [String: Any]),
-                ttftMs: nil,
-                durationMs: Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000),
-                status: "incomplete",
-                stopReason: "max_tokens"
-            )
-            throw LLMError.outputLengthLimit(partial: text)
-        }
-        let toolCalls = try Self.nativeToolCalls(content)
-        // Extended thinking is always on for claude-fable-5-1: bank this
-        // response's thinking blocks against its own tool_use ids so the
-        // assistant turn can replay them, signed and in order, when the
-        // paired tool_result round comes back (the API 400s without).
-        if !toolCalls.isEmpty {
-            await thinkingLedger.record(
-                Self.nativeThinkingBlocks(content), toolUseIDs: toolCalls.map(\.id)
-            )
-        }
-        // CONTRACT NOTE 1: a textless 200 carrying tool_use blocks is the
-        // HAPPY PATH on this lane (stop_reason "tool_use"). Only a response
-        // with neither text nor tool calls is the empty-reply class.
-        if text.isEmpty && toolCalls.isEmpty {
-            throw emptyTextResponseError(obj, content: content)
-        }
-
-        let durationMs = Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-        await telemetry.record(
-            requestBody: req.httpBody,
-            provider: providerId,
-            model: model,
-            streaming: false,
-            usage: LLMUsage.fromAnthropic(obj["usage"] as? [String: Any]),
-            ttftMs: nil,
-            durationMs: durationMs
-        )
-        return AnthropicNativeToolResult(
-            text: text,
-            toolCalls: toolCalls,
-            stopReason: obj["stop_reason"] as? String
-        )
+        return try await performCompletion(request: req, model: model, nativeTools: true)
     }
 
     // MARK: - Streaming
 
-    /// Mirrors streamMessages: stall-only text authoring and the first-party
-    /// native tool lane parse SSE; other paths buffer the ProviderWire response.
-    public func messagesStreamKind(tools: [LLMToolSchema]?) -> LLMMessagesStreamKind {
-        (firstPartyAnthropicToolContract && usesNativeToolLane(tools))
-            || (ProviderStreamContext.stallOnly && (tools?.isEmpty ?? true)) ? .incremental : .bufferedKeepAlive
-    }
-
-    /// TWO native-lane transports, chosen by `firstPartyAnthropicToolContract`:
-    ///
-    ///   * FIRST-PARTY (api.anthropic.com, api-key): a REAL SSE parse —
-    ///     `content_block_start` → `input_json_delta` accumulation →
-    ///     `content_block_stop` → one `.toolCall` once input is confirmed,
-    ///     with text deltas streaming as they arrive. The api-key Claude path is a
-    ///     CHAT surface: before this lane existed it rode the grown-prompt SSE
-    ///     and streamed token by token, and moving it to a blocking call would
-    ///     have traded marker-parsing for a frozen bubble. Same shape the
-    ///     OAuth-direct adapter already runs, so the surface's live-delta
-    ///     behavior is identical on both Claude transports.
-    ///   * kimi-code: `completeMessagesWithTools` buffers JSON from ProviderWire
-    ///     with a `.keepAlive` heartbeat; the guard owns timeouts and redials.
-    ///
-    /// The non-native branch (no tools) is the same blocking shape:
-    /// completeMessages → one textDelta when non-empty → finish, heartbeat
-    /// while it runs.
+    /// Anthropic-compatible message routes expose real SSE progress, with or without tools.
     public func streamMessages(
-        messages: [LLMMessage],
-        system: String?,
-        model: String,
-        tools: [LLMToolSchema]?
+        messages: [LLMMessage], system: String?, model: String, tools: [LLMToolSchema]?
     ) -> AsyncThrowingStream<LLMMessageStreamEvent, Error> {
-        // Background text authoring needs actual SSE activity, not a buffered
-        // request with a client-generated heartbeat. No tools are added.
-        if (firstPartyAnthropicToolContract && usesNativeToolLane(tools))
-            || (ProviderStreamContext.stallOnly && (tools?.isEmpty ?? true)) {
-            return AsyncThrowingStream<LLMMessageStreamEvent, Error>(
-                bufferingPolicy: .unbounded
-            ) { continuation in
-                let task = Task {
-                    do {
-                        try await self.runNativeToolsStream(
-                            messages: messages,
-                            system: system,
-                            model: model,
-                            tools: tools ?? [],
-                            continuation: continuation
-                        )
-                    } catch let err as LLMError {
-                        continuation.finish(throwing: err)
-                    } catch is CancellationError {
-                        continuation.finish(throwing: CancellationError())
-                    } catch {
-                        continuation.finish(throwing: mapTransportError(
-                            error,
-                            fallback: .underlying(message: "streamMessages: \(error)")
-                        ))
-                    }
-                }
-                continuation.onTermination = { _ in task.cancel() }
-            }
-        }
-        return AsyncThrowingStream { continuation in
+        AsyncThrowingStream { continuation in
             let task = Task {
-                // Buffered replies yield only on completion. Keep the idle guard
-                // alive meanwhile; ProviderWire marks the sent request and only
-                // the guard bounds it. Cancellation ends the wire and heartbeat.
-                let heartbeatInterval = self.nativeToolKeepAliveInterval
-                let heartbeat = Task {
-                    let nanos = UInt64(max(0.001, heartbeatInterval) * 1_000_000_000)
-                    while !Task.isCancelled {
-                        try? await Task.sleep(nanoseconds: nanos)
-                        if Task.isCancelled { break }
-                        continuation.yield(.keepAlive)
-                    }
-                }
-                defer { heartbeat.cancel() }
                 do {
-                    guard usesNativeToolLane(tools), let tools else {
-                        let reply = try await completeMessages(
-                            messages: messages, system: system, model: model, tools: tools
-                        )
-                        heartbeat.cancel()
-                        if !reply.isEmpty { continuation.yield(.textDelta(reply)) }
-                        continuation.finish()
-                        return
-                    }
-                    let result = try await completeMessagesWithTools(
-                        messages: messages, system: system, model: model, tools: tools
-                    )
-                    heartbeat.cancel()
-                    if !result.text.isEmpty { continuation.yield(.textDelta(result.text)) }
-                    for call in result.toolCalls { continuation.yield(.toolCall(call)) }
+                    try await self.runNativeToolsStream(messages: messages, system: system,
+                        model: model, tools: tools ?? [], continuation: continuation)
                     continuation.finish()
                 } catch {
-                    heartbeat.cancel()
-                    continuation.finish(throwing: error)
+                    continuation.finish(throwing: mapTransportError(error,
+                        fallback: .underlying(message: "streamMessages: \(error)")))
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
@@ -710,20 +569,10 @@ extension AnthropicAdapter {
         tools: [LLMToolSchema],
         continuation: AsyncThrowingStream<LLMMessageStreamEvent, Error>.Continuation
     ) async throws {
-        let key = try resolvedCredentialKey()
-
-        var req = URLRequest(url: endpoint)
-        req.httpMethod = "POST"
-        req.setValue(key, forHTTPHeaderField: "x-api-key")
-        req.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
-        req.setValue("application/json", forHTTPHeaderField: "content-type")
-        req.setValue("text/event-stream", forHTTPHeaderField: "accept")
-        if let beta = AnthropicOAuthDirectAdapter.clearAtBeta(for: messages) {
-            req.setValue(beta, forHTTPHeaderField: "anthropic-beta")
-        }
-        req.httpBody = try JSONSerialization.data(withJSONObject: await makeNativeToolsBody(
+        var req = try request(body: await makeNativeToolsBody(
             messages: messages, system: system, model: model, tools: tools, stream: true
-        ), options: [.sortedKeys])
+        ))
+        req.setValue("text/event-stream", forHTTPHeaderField: "accept")
 
         let requestStartNs = DispatchTime.now().uptimeNanoseconds
         let bytes: URLSession.AsyncBytes
@@ -739,11 +588,6 @@ extension AnthropicAdapter {
         // Status ladder identical to completeMessagesWithTools, with the body
         // drained (bounded) so a provider message survives into the error.
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-        if status == 429 {
-            throw LLMError.rateLimited(
-                message: "rate limited",
-                retryAfterSeconds: parseRetryAfterSeconds(from: response))
-        }
         if !(200..<300).contains(status) {
             let errData = try await ProviderErrorBodyDrain.read(bytes, maxBytes: 4096, timeout: 2.0)
             try throwIfChatCompletionsError(status: status, data: errData, response: response)
@@ -777,194 +621,92 @@ extension AnthropicAdapter {
         var thinkingBlocks: [AnthropicThinkingBlock] = []
         var runaway = RunawayOutputDetector()
 
-        func commitToolCalls(terminal: Bool) async throws {
+        func commitToolCalls(terminal: Bool, stopReason: String?) async throws -> Bool {
+            var committed = false
             while let call = pendingToolCalls.first {
                 if call.inputJSON.isEmpty && !terminal { break }
                 pendingToolCalls.removeFirst()
                 if call.inputJSON.isEmpty,
-                   !["end_turn", "tool_use", "stop_sequence", "pause_turn"].contains(lastStopReason ?? "") { continue }
+                   !["end_turn", "tool_use", "stop_sequence", "pause_turn"].contains(stopReason ?? "") { continue }
                 let json = call.inputJSON.isEmpty ? Data("{}".utf8) : call.inputJSON
                 guard let input = try? JSONSerialization.jsonObject(with: json) as? [String: Any]
                 else { throw LLMError.failure(.malformedResponse) }
                 let calls = try Self.nativeToolCalls([
                     ["type": "tool_use", "id": call.id, "name": call.name, "input": input]
                 ])
-                await thinkingLedger.record(thinkingBlocks, toolUseIDs: calls.map(\.id))
-                yieldedSemanticOutput = true
+                if !thinkingBlocks.isEmpty {
+                    await thinkingLedger.record(thinkingBlocks, callIDs: calls.map(\.id))
+                }
+                committed = true
                 for call in calls { continuation.yield(.toolCall(call)) }
             }
+            return committed
         }
 
         do {
-            // R15: SSEEventStream owns framing; protocol semantics stay here.
             for try await sse in SSEEventStream(bytes) {
-                try Task.checkCancellation()
-                let payload = sse.data
-                if payload.isEmpty || payload == "[DONE]" { continue }
-                guard let data = payload.data(using: .utf8),
-                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                else {
-                    if yieldedSemanticOutput { throw LLMError.streamTruncated(message: "\(providerId): malformed native tools stream frame") }
-                    continue
-                }
-                // The data JSON's own `type` is authoritative per Anthropic's
-                // streaming protocol; the `event:` name is the fallback for a
-                // producer that sends data-only frames.
-                let effectiveEvent = AnthropicAdapter.streamEventType(obj, eventName: sse.event)
-                try AnthropicOAuthDirectAdapter.validateContentBlockEvent(obj, event: effectiveEvent, blocks: &contentBlocks)
-
-                try AnthropicAdapter.consumeStreamEvent(obj, event: effectiveEvent, usage: &usage, stopReason: &lastStopReason)
-                switch effectiveEvent {
-                case "message_stop":
-                    let cutByTokenLimit = LLMToolBoundaryReason(stopReason: lastStopReason) == .outputLimit
-                    let durationMs = Int(
-                        (DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                    await telemetry.record(
-                        requestBody: req.httpBody,
-                        provider: providerId,
-                        model: model,
-                        streaming: true,
-                        usage: usage.isEmpty ? nil : usage,
-                        ttftMs: ttftMs,
-                        durationMs: durationMs,
-                        status: cutByTokenLimit ? "incomplete" : "ok",
-                        stopReason: lastStopReason
-                    )
-                    try await commitToolCalls(terminal: true)
-                    if cutByTokenLimit {
-                        RunawayOutputDetector.writeDiagnostic(runaway.text, reason: "output_limit")
-                        continuation.yield(.toolBoundary(.outputLimit))
-                        continuation.finish()
-                        return
-                    }
-                    if !yieldedSemanticOutput {
-                        throw FirstPartyExecutionControls.anthropicEmptyStreamError(
-                            providerID: providerId,
-                            stopReason: lastStopReason,
-                            expectedOutput: "answer text or tool call"
-                        )
-                    }
-                    if let reason = LLMToolBoundaryReason(stopReason: lastStopReason) { continuation.yield(.toolBoundary(reason)) }
-                    continuation.finish()
-                    return
-                case "content_block_start":
-                    guard let blockObj = obj["content_block"] as? [String: Any] else { continue }
-                    let blockType = blockObj["type"] as? String
-                    if blockType == "thinking" || blockType == "redacted_thinking" {
-                        // Open the block. A redacted block carries its whole
-                        // opaque payload right here (no deltas follow); a
-                        // plain thinking block fills in from thinking_delta +
-                        // signature_delta before its content_block_stop.
-                        openThinkingType = blockType
-                        openThinkingText = blockObj["thinking"] as? String ?? ""
-                        openThinkingSignature = blockObj["signature"] as? String ?? ""
-                        openThinkingData = blockObj["data"] as? String
-                        if blockType == "redacted_thinking" || !openThinkingText.isEmpty {
-                            if ttftMs == nil {
-                                ttftMs = Int(
-                                    (DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                            }
+                let finished = try await Self.consumeStreamEvent(
+                    sse, usage: &usage, stopReason: &lastStopReason, blocks: &contentBlocks,
+                    ttftMs: &ttftMs, semanticOutput: &yieldedSemanticOutput, runaway: &runaway,
+                    requestStartNs: requestStartNs, requestBody: req.httpBody, provider: providerId,
+                    model: model, telemetry: telemetry,
+                    malformedFrame: "\(providerId): malformed native tools stream frame",
+                    continuation: continuation
+                ) { event, obj, stopReason in
+                    switch event {
+                    case "message_stop", "client_tool_boundary":
+                        return try await commitToolCalls(terminal: true, stopReason: stopReason)
+                    case "content_block_start":
+                        guard let block = obj["content_block"] as? [String: Any] else { return false }
+                        let type = block["type"] as? String
+                        if type == "thinking" || type == "redacted_thinking" {
+                            openThinkingType = type
+                            openThinkingText = block["thinking"] as? String ?? ""
+                            openThinkingSignature = block["signature"] as? String ?? ""
+                            openThinkingData = block["data"] as? String
+                        } else if type == "tool_use" {
+                            openToolId = block["id"] as? String ?? ""
+                            openToolName = block["name"] as? String ?? ""
+                            openToolJSON = ""
+                        }
+                    case "content_block_delta":
+                        guard let delta = obj["delta"] as? [String: Any] else { return false }
+                        switch delta["type"] as? String {
+                        case "input_json_delta":
+                            openToolJSON += delta["partial_json"] as? String ?? ""
                             continuation.yield(.keepAlive)
+                        case "thinking_delta":
+                            openThinkingText += delta["thinking"] as? String ?? ""
+                        case "signature_delta":
+                            openThinkingSignature += delta["signature"] as? String ?? ""
+                            continuation.yield(.keepAlive)
+                        default: break
                         }
-                        continue
-                    }
-                    guard blockType == "tool_use" else { continue }
-                    // First model-output frame of a tool-call-first response.
-                    if ttftMs == nil {
-                        ttftMs = Int(
-                            (DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                    }
-                    openToolId = (blockObj["id"] as? String) ?? ""
-                    openToolName = (blockObj["name"] as? String) ?? ""
-                    openToolJSON = ""
-                case "content_block_delta":
-                    guard let delta = obj["delta"] as? [String: Any] else { continue }
-                    switch delta["type"] as? String {
-                    case "text_delta":
-                        guard let text = delta["text"] as? String, !text.isEmpty else { continue }
-                        if ttftMs == nil {
-                            ttftMs = Int(
-                                (DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
+                    case "content_block_stop":
+                        if let type = openThinkingType {
+                            thinkingBlocks.append(AnthropicThinkingBlock(
+                                type: type, text: openThinkingText,
+                                signature: openThinkingSignature.isEmpty ? nil : openThinkingSignature,
+                                data: openThinkingData))
+                            openThinkingType = nil
+                            openThinkingText = ""
+                            openThinkingSignature = ""
+                            openThinkingData = nil
+                        } else if let name = openToolName {
+                            // Empty candidates hold later calls in wire order until the terminal verdict.
+                            let json = openToolJSON.trimmingCharacters(in: .whitespacesAndNewlines)
+                            pendingToolCalls.append(LLMStreamToolCall(
+                                id: openToolId ?? "", name: name, inputJSON: Data(json.utf8)))
+                            openToolId = nil
+                            openToolName = nil
+                            openToolJSON = ""
+                            return try await commitToolCalls(terminal: false, stopReason: stopReason)
                         }
-                        yieldedSemanticOutput = true
-                        let boundary = runaway.feed(text)
-                        let kept = runaway.takeCommittedText()
-                        if !kept.isEmpty { continuation.yield(.textDelta(kept)) }
-                        if boundary {
-                            await telemetry.record(
-                                requestBody: req.httpBody,
-                                provider: providerId,
-                                model: model,
-                                streaming: true,
-                                usage: usage.isEmpty ? nil : usage,
-                                ttftMs: ttftMs,
-                                durationMs: Int((DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000),
-                                status: "ok",
-                                stopReason: "client_tool_boundary"
-                            )
-                            try await commitToolCalls(terminal: true)
-                            if let reason = runaway.toolBoundaryReason { continuation.yield(.toolBoundary(reason)) }
-                            continuation.finish()
-                            return
-                        }
-                    case "input_json_delta":
-                        if ttftMs == nil {
-                            ttftMs = Int(
-                                (DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                        }
-                        openToolJSON += (delta["partial_json"] as? String) ?? ""
-                        continuation.yield(.keepAlive)
-                    case "thinking_delta":
-                        guard let thinking = delta["thinking"] as? String, !thinking.isEmpty else { continue }
-                        if ttftMs == nil {
-                            ttftMs = Int(
-                                (DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                        }
-                        // Preserve replay bytes; signal output without reply text.
-                        openThinkingText += thinking
-                        continuation.yield(.keepAlive)
-                    case "signature_delta":
-                        // The attestation over the thinking text above. Only
-                        // valid alongside that exact text, so it rides on the
-                        // same block; never surfaced anywhere.
-                        openThinkingSignature += (delta["signature"] as? String) ?? ""
-                        continuation.yield(.keepAlive)
-                    default:
-                        continue
+                    default: break
                     }
-                case "content_block_stop":
-                    if let thinkingType = openThinkingType {
-                        thinkingBlocks.append(AnthropicThinkingBlock(
-                            type: thinkingType,
-                            text: openThinkingText,
-                            signature: openThinkingSignature.isEmpty ? nil : openThinkingSignature,
-                            data: openThinkingData
-                        ))
-                        openThinkingType = nil
-                        openThinkingText = ""
-                        openThinkingSignature = ""
-                        openThinkingData = nil
-                        continue
-                    }
-                    guard let name = openToolName else { continue }
-                    // Empty input needs a normal terminal's confirmation. Hold
-                    // later blocks behind it to preserve wire order.
-                    if ttftMs == nil {
-                        ttftMs = Int(
-                            (DispatchTime.now().uptimeNanoseconds &- requestStartNs) / 1_000_000)
-                    }
-                    let json = openToolJSON.trimmingCharacters(in: .whitespacesAndNewlines)
-                    pendingToolCalls.append(LLMStreamToolCall(
-                        id: openToolId ?? "", name: name, inputJSON: Data(json.utf8)
-                    ))
-                    try await commitToolCalls(terminal: false)
-                    openToolId = nil
-                    openToolName = nil
-                    openToolJSON = ""
-                default:
-                    // ping and everything else: safe to ignore.
-                    continue
+                    return false
                 }
+                if finished { return }
             }
             // EOF without message_stop is a truncation, not a clean end.
             throw LLMError.streamTruncated(
@@ -974,7 +716,7 @@ extension AnthropicAdapter {
             try Task.checkCancellation()
             if !(error is any ProviderFailureWrapping), ProviderFailure.classify(error) == .network {
                 pendingToolCalls.removeAll { $0.inputJSON.isEmpty }
-                try await commitToolCalls(terminal: true)
+                _ = try await commitToolCalls(terminal: true, stopReason: lastStopReason)
             }
             if let err = error as? LLMError { throw err }
             throw mapTransportError(error, fallback: .underlying(message: "stream: \(error)"))

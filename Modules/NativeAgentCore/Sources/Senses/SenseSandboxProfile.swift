@@ -18,7 +18,7 @@ public enum SenseSandboxProfile {
             .standardizedFileURL.resolvingSymlinksInPath().path
         func under(_ root: URL) -> Bool {
             let root = root.standardizedFileURL.resolvingSymlinksInPath().path
-            return candidate == root || candidate.hasPrefix(root + "/")
+            return NativeAgentWorkspaceRoot.relativePath(candidate, under: root) != nil
         }
         let policy = exclusions(dataRoot: dataRoot, personaRoot: personaRoot)
         if under(policy.deliveryWorkspace) { return }
@@ -47,7 +47,7 @@ public enum SenseSandboxProfile {
               (scratchAttributes[.ownerAccountID] as? NSNumber)?.uint32Value == geteuid(),
               ![dataRoot, personaRoot].contains(where: {
                   let root = $0.standardizedFileURL.resolvingSymlinksInPath().path
-                  return scratchPath == root || scratchPath.hasPrefix(root + "/")
+                  return NativeAgentWorkspaceRoot.relativePath(scratchPath, under: root) != nil
               }) else {
             throw SenseFailure(code: "bad_reach", message: "Sense scratch must be an owned 0700 directory outside data and persona roots.")
         }

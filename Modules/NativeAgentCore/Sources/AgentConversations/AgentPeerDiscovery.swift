@@ -1,207 +1,16 @@
 import CryptoKit
-import AuthoredCapabilities
 import AgentLinkTransport
-import AgentWorkspace
 import Foundation
+import NativeAgentShared
 import MacControl
 import NativeAgentCore
 import PersistenceCore
-import ProviderRouting
-// Blueprint: | `AgentPeerDiscovery.swift` | `AgentPeerDiscovery` enum; `authenticatedInterface`, `a2aCheck` (an A2A call's card held to its recipe; its dry run), `listTasks`, `probe` (discovery by protocol, never by name: an A2A card on any listening loopback port, a program carrying ACP's methods or advertising an ACP entry, a settings file holding an mcpServers table, all read from verified regular files; the recipe book read after, a find none knows carrying its `draft` recipe under an id of its protocol and path; on Agents and an explicit discover only, launch and installs keep the last finds); launch directly discovers/connects settings hosts from recipes without awaiting Spotlight; the index watcher adds later arrivals after any in-flight scan; recipe-location watchers reconcile once after arming within the same lifecycle; no elevation, and a found program runs (bounded --help and initialize) only on an explicit discover, under `Launch`, the send's own rule for running another agent's program (`agentProgramLaunch`: Full Mac as is, else the builder sandbox, denied or locked down not at all); persistent declines/disconnects win, running hosts get one restart note; host and pass-wide setup failures name files/fields and remedies per candidate and wake key, keep dismissible offers, and clear on automatic/manual recovery; `app.installed` for each whole bundle at a bundle id and version new since the first, silent installed-apps.json baseline |
+import os
+// Blueprint: | `AgentPeerDiscovery.swift` | `AgentPeerDiscovery` enum; `probe` discovers protocols, never names: loopback A2A cards, programs carrying ACP methods or advertising an ACP entry, and settings holding mcpServers, read from verified regular files. Recipes claim known finds; unknown finds carry a draft under an id of protocol and path. Only Agents and explicit discover probe; `Launch` admits bounded --help and initialize under the send's `agentProgramLaunch` rule (Full Mac as is, otherwise the builder sandbox, denied or locked down never). |
 
 /// Bounded read-only discovery. A website, an HTTP success, or an unsupported
 /// protocol is not a connected agent. No contact or credential is written here.
 package enum AgentPeerDiscovery {
-    /// Use the authenticated card for this call only. Never persist it into
-    /// public discovery or forward the credential to a newly declared origin.
-    /// Returns the interface and the card it was chosen from.
-    package static func authenticatedInterface(card: JSONValue, cardURL: URL, bearerToken: String?) async throws -> (AgentA2AWire.Interface, JSONValue) {
-        var selected = try AgentA2AWire.selectInterface(card: card, cardURL: cardURL)
-        try AgentPeerPolicy.peerAuthorizeInterface(selected, cardURL: cardURL, hasCredential: bearerToken != nil)
-        if selected.extendedAgentCard, bearerToken != nil {
-            let request = try AgentA2AWire.operationRequest("GetExtendedAgentCard", interface: selected)
-            let response = try await AgentPeerHTTP.send(request, bearerToken: bearerToken)
-            if !(200..<300).contains(response.statusCode) {
-                throw ProviderFailure.Report(cause: .http(status: response.statusCode,
-                    detail: (try? response.json?.serialize(pretty: false)) ?? ""), work: .nothingRan)
-            }
-            guard (200..<300).contains(response.statusCode), let payload = response.json else { throw AgentA2AWire.WireError.invalid("authenticated extended agent card unavailable") }
-            let extended = try AgentA2AWire.operationResult(payload, interface: selected, requestID: request.requestID)
-            selected = try AgentA2AWire.selectInterface(card: extended, cardURL: cardURL)
-            try AgentPeerPolicy.peerAuthorizeInterface(selected, cardURL: cardURL, hasCredential: true)
-            return (selected, extended)
-        }
-        return (selected, card)
-    }
-
-    /// THE A2A CHECK, before every A2A call and as the whole of its dry run
-    /// (`AgentRecipeStore.dryRun`, background health): the card read where
-    /// the recipe says, with the credential it names, and the interface the
-    /// card (its extended card, when there is one) offers. A send is held to
-    /// what the recipe recorded: a card this app cannot speak is
-    /// `protocol_mismatch`, one whose interface, auth or offer changed is
-    /// `recipe_mismatch` naming each field, and neither sends anything; a
-    /// recipe that never read its card records it. A dry run adds one task
-    /// listing (1.0, the one safe call that proves auth) and learns a change
-    /// into the recipe, except a skill the recipe names that the card dropped:
-    /// that one is hers to decide. Returns the interface to go on with and the
-    /// recipe it was held to, or the receipt that ends the call.
-    package static func a2aCheck(_ peer: AgentPeerContact, bearerToken: String?, sending: Bool)
-        async -> (interface: AgentA2AWire.Interface?, recipe: AgentRecipeStore.Recipe?, receipt: [String: JSONValue]) {
-        let dryRun = AgentRecipeStore.dryRun
-        var receipt: [String: JSONValue] = ["status": .string(dryRun ? "failed" : "unavailable"), "agent": .string("peer:" + peer.id),
-            "transport": .string("a2a"), "sent": .bool(false), "completed": .bool(false)]
-        if dryRun { receipt["dry_run"] = .bool(true) }
-        func refused(_ detail: String) -> (AgentA2AWire.Interface?, AgentRecipeStore.Recipe?, [String: JSONValue]) {
-            receipt["detail"] = .string("\(peer.name): \(detail). Nothing was sent.")
-            return (nil, nil, receipt)
-        }
-        let recipe: AgentRecipeStore.Recipe
-        do { recipe = try AgentRecipeStore.recipe(for: peer) } catch { return refused("\(error). Fix that file, or delete it to have it seeded again") }
-        guard let part = recipe.host.a2a else { return refused("agents/recipes/\(peer.id).json has no a2a part, so its card is not known") }
-        // The card's place may move within the contact's own origin; its credential goes nowhere else.
-        guard let cardURL = URL(string: part.card), AgentPeerPolicy.origin(cardURL) == AgentPeerPolicy.origin(peer.endpoint) else {
-            return refused("its recipe's a2a.card \(part.card) is not on its own origin \(AgentPeerPolicy.origin(peer.endpoint))")
-        }
-        guard part.credential == peer.credentialKey else {
-            return refused("its recipe's a2a.credential \(part.credential ?? "none") names no key it has; its key is \(peer.credentialKey ?? "none")")
-        }
-        var card: JSONValue?
-        func stopped(_ error: Error, at method: String) -> (AgentA2AWire.Interface?, AgentRecipeStore.Recipe?, [String: JSONValue]) {
-            receipt["method"] = .string(method)
-            receipt["untrusted_remote_data"] = .bool(true)
-            if let failure = error as? ToolFailureError {
-                receipt["status"] = .string(failure.status.rawValue)
-                receipt["reason"] = failure.code.map(JSONValue.string)
-                receipt["effects"] = .string(failure.effects.rawValue)
-                receipt["detail"] = .string(failure.message)
-                receipt["remedy"] = Repair.remedy(owner: failure.owner ?? peer.name,
-                    nextCall: failure.nextCall.flatMap { try? JSONValue.parse(Data($0.utf8)) },
-                    tap: failure.tap, instruction: failure.instruction)
-                return (nil, nil, receipt)
-            }
-            switch error as? AgentA2AWire.WireError {
-            case .invalid?, .unsupported?:
-                // What the card advertises, against what this app speaks.
-                let fields: [String: JSONValue] = if case .object(let fields)? = card { fields } else { [:] }
-                let interfaces: [JSONValue] = if case .array(let list)? = fields["supportedInterfaces"] { list }
-                    else { [.object(["protocolVersion": fields["protocolVersion"] ?? .null, "protocolBinding": fields["preferredTransport"] ?? .string("JSONRPC")])] }
-                let advertised = interfaces.compactMap { item -> String? in
-                    guard case .object(let entry) = item, case .string(let version)? = entry["protocolVersion"],
-                          case .string(let binding)? = entry["protocolBinding"] else { return nil }
-                    return version + " " + binding
-                }.joined(separator: ", ")
-                receipt["reason"] = .string("protocol_mismatch")
-                if !advertised.isEmpty { receipt["protocol_version"] = .string(advertised) }
-                if case .string(let version)? = fields["version"] { receipt["program_version"] = .string(version) }
-                receipt["detail"] = .string("\(peer.name): \(method) — \(error.localizedDescription). It advertises \(advertised.isEmpty ? "no readable interface" : advertised); "
-                    + "this app speaks \(AgentA2AWire.spoken). Nothing was sent.")
-            default:
-                if let failure = ProviderFailure.report(error, work: .nothingRan) { AgentPeerPolicy.peerFailure(failure, into: &receipt) }
-                else { receipt["detail"] = .string("\(peer.name): \(method) — \(error.localizedDescription) Nothing was sent.") }
-                if dryRun { receipt["status"] = .string("failed") }
-            }
-            return (nil, nil, receipt)
-        }
-        let selected: AgentA2AWire.Interface, read: AgentHostRow.A2A.Card
-        do {
-            let response = try await AgentPeerHTTP.get(cardURL, bearerToken: bearerToken)
-            guard (200..<300).contains(response.statusCode) else {
-                throw ProviderFailure.Report(cause: .http(status: response.statusCode,
-                    detail: (try? response.json?.serialize(pretty: false)) ?? ""), work: .nothingRan)
-            }
-            guard let json = response.json else { throw AgentA2AWire.WireError.invalid("agent card is not JSON") }
-            card = json
-            let (interface, effective) = try await authenticatedInterface(card: json, cardURL: cardURL, bearerToken: bearerToken)
-            selected = interface
-            read = a2aRead(effective, interface)
-        } catch { return stopped(error, at: "agent card") }
-        let recorded = part.read
-        let drift = recorded.map { AgentHostRow.A2A.Card.drift($0, read) } ?? []
-        // Values the card wrote: labelled as the peer's wherever they appear.
-        if !drift.isEmpty { receipt["untrusted_remote_data"] = .bool(true) }
-        // A send stops for what it relies on; a card whose text alone changed
-        // (its digest) still sends, and its next dry run records it.
-        let relied = drift.filter { !$0.hasPrefix("digest:") }
-        if sending, !dryRun, !relied.isEmpty {
-            receipt["reason"] = .string("recipe_mismatch")
-            receipt["method"] = .string("agent card")
-            receipt["fields"] = .array(relied.map { .string(String($0.prefix { $0 != ":" })) })
-            receipt["detail"] = .string("\(peer.name)'s card no longer matches its recipe — \(relied.joined(separator: "; ")). Nothing was sent.")
-            return (nil, nil, receipt)
-        }
-        guard sending || dryRun else { return (selected, recipe, [:]) }
-        // On 0.3 there is no safe call: the card answered, auth is unproven.
-        let proven = selected.version == "1.0"
-        if dryRun, proven {
-            do { _ = try await listTasks(["pageSize": .int(1)], interface: selected, bearerToken: bearerToken) }
-            catch { return stopped(error, at: "ListTasks") }
-        }
-        let dropped = (recorded?.skills ?? []).filter { !read.skills.contains($0) }
-        if dryRun, !dropped.isEmpty {
-            receipt["reason"] = .string("recipe_mismatch")
-            receipt["method"] = .string("agent card")
-            receipt["detail"] = .string("\(peer.name)'s card dropped \(dropped.joined(separator: ", ")), which its recipe names, so nothing was learned — "
-                + "\(drift.joined(separator: "; ")). Nothing was sent.")
-            return (nil, nil, receipt)
-        }
-        let answered = proven ? "\(peer.name) answered with its card, its auth and a task listing; nothing was sent."
-            : "\(peer.name) answered with its card; auth unchecked — 0.3 has no safe call. Nothing was sent."
-        var checked = recipe
-        // A first read is recorded by a send too; a change only by a dry run.
-        if read != recorded, dryRun || recorded == nil {
-            var host = recipe.host
-            host.a2a?.read = read
-            do { checked = try AgentRecipeStore.learn(recipe, host: host) }
-            catch {
-                receipt["detail"] = .string("\(peer.name)'s recipe could not take what its card says (\(drift.isEmpty ? "its first read" : drift.joined(separator: "; "))): \(error). Nothing was sent.")
-                return (nil, nil, receipt)
-            }
-        }
-        guard dryRun else { return (selected, checked, [:]) }
-        receipt["status"] = .string(!proven ? "unchecked" : recorded == nil || recorded == read ? "passed" : "repaired")
-        receipt["recipe_version"] = .int(Int64(checked.recipeVersion))
-        receipt["detail"] = .string(answered + (recorded == nil ? " Its card is recorded in recipe v\(checked.recipeVersion)." : ""))
-        if recorded != nil, recorded != read {
-            receipt["healed"] = .string("\(peer.name): \(drift.joined(separator: "; ")) — recipe updated to v\(checked.recipeVersion)")
-        }
-        return (nil, checked, receipt)
-    }
-
-    /// What a card offers, as its recipe records it (`AgentHostRow.A2A.Card`).
-    private static func a2aRead(_ card: JSONValue, _ interface: AgentA2AWire.Interface) -> AgentHostRow.A2A.Card {
-        let fields: [String: JSONValue] = if case .object(let fields) = card { fields } else { [:] }
-        func strings(_ list: JSONValue?, _ key: String) -> [String] {
-            guard case .array(let items)? = list else { return [] }
-            return items.compactMap { item -> String? in
-                guard case .object(let item) = item, case .string(let value)? = item[key] else { return nil }
-                return value
-            }.sorted()
-        }
-        var auth: Set<String> = []
-        if case .array(let alternatives) = interface.securityRequirements, case .object(let schemes) = interface.securitySchemes {
-            for case .object(let entry) in alternatives {
-                var names = entry
-                if interface.version == "1.0" { names = if case .object(let named)? = entry["schemes"] { named } else { [:] } }
-                for name in names.keys { auth.insert(name + ": " + ((try? schemes[name]?.serialize(pretty: false)) ?? "undeclared")) }
-            }
-        }
-        let capabilities: [String: JSONValue] = if case .object(let capabilities)? = fields["capabilities"] { capabilities } else { [:] }
-        return .init(endpoint: interface.endpoint.absoluteString, version: interface.version, binding: interface.binding, tenant: interface.tenant,
-                     auth: auth.sorted(), streaming: interface.streaming, pushNotifications: interface.pushNotifications,
-                     extendedCard: interface.extendedAgentCard, skills: strings(fields["skills"], "id"),
-                     extensions: strings(capabilities["extensions"], "uri"), digest: card.digest)
-    }
-
-    /// One ListTasks call: agent_read's listing, a dry run's check.
-    package static func listTasks(_ filters: [String: JSONValue], interface: AgentA2AWire.Interface, bearerToken: String?,
-                                  requestID: String = UUID().uuidString.lowercased()) async throws -> JSONValue {
-        let listing = try AgentA2AWire.operationRequest("ListTasks", parameters: filters, interface: interface, requestID: requestID)
-        let response = try await AgentPeerHTTP.send(listing, bearerToken: bearerToken)
-        guard (200..<300).contains(response.statusCode), let payload = response.json else { throw AgentCommunicationError.invalid("task listing unavailable") }
-        return try AgentA2AWire.normalizeTaskList(payload, interface: interface, requestID: listing.requestID)
-    }
-
     static func localCandidates(ports: Set<Int>) -> [URL] {
         ports.filter { (1...65535).contains($0) }.sorted().flatMap { port in
             ["127.0.0.1", "[::1]"].flatMap { host in
@@ -264,7 +73,7 @@ package enum AgentPeerDiscovery {
 
     /// Recipes own installation evidence; settings and running programs only
     /// annotate it. An app name alone establishes no messaging route.
-    static func scanLocal(_ bundles: [Bundle]) async -> [AgentDiscoveryCandidate] {
+    static func scanLocal() async -> [AgentDiscoveryCandidate] {
         let programs = runningPrograms()
         let fm = FileManager.default
         var results: [AgentDiscoveryCandidate] = []
@@ -304,18 +113,11 @@ package enum AgentPeerDiscovery {
         return results
     }
 
-    /// THE PROBES: what on this Mac speaks a protocol, never a list of names.
-    /// One per signature (an A2A card on a listening loopback port, a program
-    /// that carries ACP's methods or advertises an ACP entry, a settings file
-    /// holding an mcpServers table), each find with what was observed. The
-    /// recipe book is read after: a recipe that knows the find takes it
-    /// (`hostID`, merged into its row's own pass); one none knows carries the
-    /// recipe it would have (`draft`). Reading is all a probe does: a found
-    /// program runs (its --help, then initialize) only when `launch` says it
-    /// may, on an explicit discover, under the rule for running another
-    /// agent's program. Bounded (a card read 0.6s, --help 1s, initialize 3s,
-    /// all at once). Not checked: Bonjour (A2A names no service type, and a
-    /// browse asks for Local Network access), and a chat window no recipe labels.
+    /// Discover protocol signatures: loopback A2A cards, ACP methods/entries and mcpServers settings.
+    /// Recipes then claim known finds by `hostID`; unknown finds carry their `draft` recipe.
+    /// Probes only read unless an explicit discover's `launch` admits --help and initialize under the send's rule.
+    /// Bounds: cards 0.6s, --help 1s, initialize 3s. Bonjour has no A2A service type and needs Local Network access;
+    /// chat windows without a recipe label are not checked.
     static func probe(_ bundles: [Bundle], launch: Launch?) async -> [AgentDiscoveryCandidate] {
         async let programs = acpPrograms(bundles, launch: launch)
         async let settings = mcpSettings(bundles)
@@ -355,19 +157,18 @@ package enum AgentPeerDiscovery {
         case refused(String)
     }
 
-    /// THE ONE WAY A PROBE READS A FILE: a nonblocking open, fstat of a
-    /// regular file of at most `limit` bytes, then bounded reads from that
-    /// descriptor into owned bytes, chunk by chunk, until `each` says stop. A
-    /// FIFO or device never blocks a pass, and no mapping can be truncated
-    /// under it. False when it is no such file.
+    /// Nonblocking open and fstat require a regular file of at most `limit` bytes; read owned chunks until `each` stops.
+    /// FIFOs/devices cannot block a pass and no mapping can be truncated under it. False for any other file.
     static func readRegular(_ path: String, limit: Int64, _ each: (Data) -> Bool) -> Bool {
         let fd = Darwin.open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
         guard fd >= 0 else { return false }
         defer { Darwin.close(fd) }
         var info = stat()
-        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_size <= limit else { return false }
-        var left = Int(info.st_size), chunk = [UInt8](repeating: 0, count: 1 << 20)
+        guard fstat(fd, &info) == 0, info.st_mode & S_IFMT == S_IFREG, info.st_size >= 0,
+              info.st_size <= limit, var left = Int(exactly: info.st_size) else { return false }
+        var chunk = [UInt8](repeating: 0, count: 1 << 20)
         while left > 0 {
+            guard !Task.isCancelled else { return false }
             let count = Darwin.read(fd, &chunk, min(chunk.count, left))
             if count < 0, errno == EINTR { continue }
             guard count > 0 else { break }
@@ -375,6 +176,19 @@ package enum AgentPeerDiscovery {
             guard each(Data(chunk.prefix(count))) else { break }
         }
         return true
+    }
+
+    private struct ProgramSignature: Sendable {
+        let stamp: SnapshotTailOpLog.FileStamp
+        let carries: Bool
+        let head: Data
+    }
+    private static let programSignatures = OSAllocatedUnfairLock<[String: ProgramSignature]>(initialState: [:])
+
+    private static func signatureStamp(_ path: String) -> SnapshotTailOpLog.FileStamp? {
+        var info = stat()
+        guard stat(path, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { return nil }
+        return SnapshotTailOpLog.FileStamp(info)
     }
 
     /// Every TCP port a program other than this app listens on, from the process table.
@@ -398,14 +212,9 @@ package enum AgentPeerDiscovery {
         return ports
     }
 
-    /// ACP: a program on the login PATH, or a helper inside an app, that
-    /// carries ACP's own methods (in its bytes or, a script a link names, the
-    /// files beside it) or advertises an ACP entry (its name or launcher says
-    /// acp, as a console script importing its ACP module does). Started the
-    /// way its recipe, its own name or its --help's ACP entry says, it is sent
-    /// initialize as the transport sends it, when `launch` lets it run. A
-    /// client carries the methods too; only an agent answers, and only an
-    /// answer is connectable.
+    /// ACP candidates on the login PATH or inside apps carry its methods (in their bytes or beside a linked script)
+    /// or advertise an ACP entry in their name/launcher. When `launch` admits it, initialize uses the transport's start
+    /// and arguments from its recipe, name or --help. Clients carry the methods too; only an answer is connectable.
     static func acpPrograms(_ bundles: [Bundle], launch: Launch?) async -> [AgentDiscoveryCandidate] {
         // Without the login PATH, its own row says why.
         guard case .success(let environment) = AgentHostCommandLines.loginEnvironment else { return [] }
@@ -440,6 +249,10 @@ package enum AgentPeerDiscovery {
         }
         /// One read of a file: whether it carries the methods, and its first bytes.
         @Sendable func scan(_ path: String) -> (carries: Bool, head: Data)? {
+            guard !Task.isCancelled, let stamp = signatureStamp(path) else { return nil }
+            if let saved = programSignatures.withLock({ $0[path] }), saved.stamp == stamp {
+                return (saved.carries, saved.head)
+            }
             var missing = methods, window = Data(), head: Data?
             guard readRegular(path, limit: AgentACPExecutable.maximumBytes, { chunk in
                 if head == nil { head = chunk.prefix(65_536) }
@@ -447,7 +260,12 @@ package enum AgentPeerDiscovery {
                 missing.removeAll { window.range(of: $0) != nil }
                 return !missing.isEmpty
             }) else { return nil }
-            return (missing.isEmpty, head ?? Data())
+            guard !Task.isCancelled, signatureStamp(path) == stamp else { return nil }
+            // Only launchers need their first bytes retained; binaries keep a bit.
+            let retainedHead = head.flatMap { $0.starts(with: Data("#!".utf8)) ? $0 : nil } ?? Data()
+            let carries = missing.isEmpty
+            programSignatures.withLock { $0[path] = ProgramSignature(stamp: stamp, carries: carries, head: retainedHead) }
+            return (carries, retainedHead)
         }
         /// What makes it an ACP candidate, read without running it: its methods, or its launcher naming acp.
         @Sendable func signature(_ path: String, beside: Bool) -> String? {
@@ -465,74 +283,86 @@ package enum AgentPeerDiscovery {
         }
         let rows = AgentHostDirectory.rows
         return await withTaskGroup(of: AgentDiscoveryCandidate?.self) { group in
-            for (file, link) in programs {
-                group.addTask {
-                    let name = link.lastPathComponent
-                    guard let why = says(name) ? "its name says acp" : signature(file, beside: link.path != file) else { return nil }
-                    var seen = ["acp: \(link.path): \(why)"]
-                    // A recipe she wrote from this find's own draft is its recipe, wherever it resolves now.
-                    let row = rows.first { $0.installation.executables.values.contains(file) }
-                        ?? AgentRecipeStore.recipe(recipeID(name, "acp", file)).flatMap { $0.seededFrom == "discovery" ? $0.host : nil }
-                    var arguments = row?.acp?.arguments, answer: [String: JSONValue] = [:]
-                    switch launch {
-                    case nil:
-                        seen.append("not run: its --help and initialize run on an explicit discover (agent.contacts {discover: true})")
-                    case .refused(let why)?:
-                        seen.append("not run: " + why)
-                    case .run(let command)?:
-                        // Run exactly the file that was read, as a send would.
-                        guard let executable = try? AgentACPExecutable.capture(path: file) else { seen.append("not run: \(file) could not be read whole"); break }
-                        // A program whose own name says acp is its entry.
-                        if arguments == nil, says(name) { arguments = [] }
-                        if arguments == nil, let help = try? await executable.reported(environment: environment,
-                            command: command(file, ["--help"]), errors: true, grace: .seconds(1), limit: 65_536) {
-                            arguments = acpEntry(help)
-                        }
-                        guard let arguments else { seen.append("entry: its --help names no ACP entry"); break }
-                        seen.append("entry: \(([name] + arguments).joined(separator: " "))" + (row?.acp != nil ? " (its recipe)" : ""))
-                        // The transport's own start, and nothing after it.
-                        let started = command(file, arguments)
-                        do {
-                            if case .object(let result) = try await AgentACPClient().initialize(executable: started[0], arguments: Array(started.dropFirst()),
-                                directory: FileManager.default.temporaryDirectory, environment: environment,
-                                approvedExecutable: executable, timeout: .seconds(3)) { answer = result }
-                            seen.append("initialize: answered ACP 1")
-                        } catch let refused as AgentACPClient.Mismatch { seen.append("initialize: " + refused.detail) }
-                        catch { seen.append("initialize: no ACP answer within 3s (\(error.localizedDescription))") }
-                    }
-                    let agent: [String: JSONValue] = if case .object(let info)? = answer["agentInfo"] { info } else { [:] }
-                    func said(_ key: String) -> String? {
-                        if case .string(let text)? = agent[key], !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { String(text.prefix(80)) } else { nil }
-                    }
-                    if let row {
-                        var known = AgentDiscoveryCandidate(name: row.displayName, detail: "Installed: " + row.installation.evidence.joined(separator: "; "),
-                            hostID: row.id, settingsPath: nil, cardURL: nil, endpoint: nil)
-                        known.foundBy = seen
-                        return known
-                    }
-                    let speaks = !answer.isEmpty ? "Speaks ACP over stdio (\(([name] + (arguments ?? [])).joined(separator: " ")))."
-                        : launch.flatMap { if case .run = $0 { "Looks like an ACP agent, but it did not answer as one; write its recipe's acp.arguments from its own documentation." } else { nil } }
-                        ?? "Looks like an ACP agent; it has not been run, so whether it answers is not checked."
-                    let line = try? JSONValue.object(["executable": .string(name), "arguments": .array((arguments ?? []).map(JSONValue.string)),
-                        "documentation": .string("https://agentclientprotocol.com/protocol/v1/transports"), "permissionMode": .string("ask"),
-                        "referenceVersion": .string(said("version") ?? ""), "environment": .object([:]),
-                        "protocolVersion": answer["protocolVersion"] ?? .null]).decodedExactly(as: AgentHostACP.self)
-                    var found = AgentDiscoveryCandidate(name: said("title") ?? said("name") ?? name, detail: speaks + " No recipe knows it yet.",
-                        hostID: nil, settingsPath: nil, cardURL: nil, endpoint: nil)
-                    found.draft = AgentHostRow(id: recipeID(name, "acp", file), displayName: found.name,
-                        description: "An agent found on this Mac that speaks ACP over stdio.",
-                        aliases: found.name == name ? [] : [name], installMarkers: [], configPath: "", format: .sessionMCP,
-                        restartRequired: false, restartNote: "No restart needed; connection starts an ACP session with reply tools.",
-                        documentation: "https://agentclientprotocol.com/protocol/v1/transports", settingsSupported: false,
-                        acp: line, searchPaths: [link.deletingLastPathComponent().path])
-                    found.foundBy = seen
-                    found.version = said("version")
-                    found.connectable = !answer.isEmpty
-                    return found
-                }
-            }
+            var remaining = programs.makeIterator()
+            var running = 0
             var found: [AgentDiscoveryCandidate] = []
-            for await candidate in group { if let candidate { found.append(candidate) } }
+            while !Task.isCancelled {
+                // At most two programs read signatures or run bounded probes.
+                // Refill only after a worker finishes, rather than spawning one
+                // task per executable and letting them compete for disk reads.
+                while running < 2, let (file, link) = remaining.next() {
+                    running += 1
+                    group.addTask {
+                        guard !Task.isCancelled else { return nil }
+                        let name = link.lastPathComponent
+                        guard let why = says(name) ? "its name says acp" : signature(file, beside: link.path != file) else { return nil }
+                        var seen = ["acp: \(link.path): \(why)"]
+                        // A recipe she wrote from this find's own draft is its recipe, wherever it resolves now.
+                        let row = rows.first { $0.installation.executables.values.contains(file) }
+                            ?? AgentRecipeStore.recipe(recipeID(name, "acp", file)).flatMap { $0.seededFrom == "discovery" ? $0.host : nil }
+                        var arguments = row?.acp?.arguments, answer: [String: JSONValue] = [:]
+                        switch launch {
+                        case nil:
+                            seen.append("not run: its --help and initialize run on an explicit discover (agent.contacts {discover: true})")
+                        case .refused(let why)?:
+                            seen.append("not run: " + why)
+                        case .run(let command)?:
+                            // Run exactly the file that was read, as a send would.
+                            guard let executable = try? AgentACPExecutable.capture(path: file) else { seen.append("not run: \(file) could not be read whole"); break }
+                            // A program whose own name says acp is its entry.
+                            if arguments == nil, says(name) { arguments = [] }
+                            if arguments == nil, let help = try? await executable.reported(environment: environment,
+                                command: command(file, ["--help"]), errors: true, grace: .seconds(1), limit: 65_536) {
+                                arguments = acpEntry(help)
+                            }
+                            guard let arguments else { seen.append("entry: its --help names no ACP entry"); break }
+                            seen.append("entry: \(([name] + arguments).joined(separator: " "))" + (row?.acp != nil ? " (its recipe)" : ""))
+                            // The transport's own start, and nothing after it.
+                            let started = command(file, arguments)
+                            do {
+                                if case .object(let result) = try await AgentACPClient().initialize(executable: started[0], arguments: Array(started.dropFirst()),
+                                    directory: FileManager.default.temporaryDirectory, environment: environment,
+                                    approvedExecutable: executable, timeout: .seconds(3)) { answer = result }
+                                seen.append("initialize: answered ACP 1")
+                            } catch let refused as AgentACPClient.Mismatch { seen.append("initialize: " + refused.detail) }
+                            catch { seen.append("initialize: no ACP answer within 3s (\(error.localizedDescription))") }
+                        }
+                        let agent: [String: JSONValue] = if case .object(let info)? = answer["agentInfo"] { info } else { [:] }
+                        func said(_ key: String) -> String? {
+                            if case .string(let text)? = agent[key], !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { String(text.prefix(80)) } else { nil }
+                        }
+                        if let row {
+                            var known = AgentDiscoveryCandidate(name: row.displayName, detail: "Installed: " + row.installation.evidence.joined(separator: "; "),
+                                hostID: row.id, settingsPath: nil, cardURL: nil, endpoint: nil)
+                            known.foundBy = seen
+                            return known
+                        }
+                        let speaks = !answer.isEmpty ? "Speaks ACP over stdio (\(([name] + (arguments ?? [])).joined(separator: " ")))."
+                            : launch.flatMap { if case .run = $0 { "Looks like an ACP agent, but it did not answer as one; write its recipe's acp.arguments from its own documentation." } else { nil } }
+                            ?? "Looks like an ACP agent; it has not been run, so whether it answers is not checked."
+                        let line = try? JSONValue.object(["executable": .string(name), "arguments": .array((arguments ?? []).map(JSONValue.string)),
+                            "documentation": .string("https://agentclientprotocol.com/protocol/v1/transports"), "permissionMode": .string("ask"),
+                            "referenceVersion": .string(said("version") ?? ""), "environment": .object([:]),
+                            "protocolVersion": answer["protocolVersion"] ?? .null]).decodedExactly(as: AgentHostACP.self)
+                        var found = AgentDiscoveryCandidate(name: said("title") ?? said("name") ?? name, detail: speaks + " No recipe knows it yet.",
+                            hostID: nil, settingsPath: nil, cardURL: nil, endpoint: nil)
+                        found.draft = AgentHostRow(id: recipeID(name, "acp", file), displayName: found.name,
+                            description: "An agent found on this Mac that speaks ACP over stdio.",
+                            aliases: found.name == name ? [] : [name], installMarkers: [], configPath: "", format: .sessionMCP,
+                            restartRequired: false, restartNote: "No restart needed; connection starts an ACP session with reply tools.",
+                            documentation: "https://agentclientprotocol.com/protocol/v1/transports", settingsSupported: false,
+                            acp: line, searchPaths: [link.deletingLastPathComponent().path])
+                        found.foundBy = seen
+                        found.version = said("version")
+                        found.connectable = !answer.isEmpty
+                        return found
+                    }
+                }
+                guard running > 0, let candidate = await group.next() else { break }
+                running -= 1
+                if let candidate { found.append(candidate) }
+            }
+            group.cancelAll()
             return found
         }
     }
@@ -579,7 +409,7 @@ package enum AgentPeerDiscovery {
             var bytes = Data()
             guard !known.contains(path), readRegular(path, limit: 16 << 20, { bytes += $0; return true }),
                   let servers = (try? JSONSerialization.jsonObject(with: bytes) as? [String: Any])?["mcpServers"] as? [String: Any] else { return nil }
-            let shown = path.hasPrefix(home + "/") ? "~" + path.dropFirst(home.count) : path
+            let shown = UserDisplayFormatters.tildifyPath(path)
             let seen = ["mcp: \(path) holds an mcpServers table (\(servers.count) servers)"]
             let owner = folder.hasPrefix(".") ? String(folder.dropFirst()) : folder
             let app = apps.first { [$0.bundleID, $0.name, $0.url.deletingPathExtension().lastPathComponent].contains(owner) }
@@ -615,552 +445,5 @@ package enum AgentPeerDiscovery {
             rows[index].foundBy += candidate.foundBy.filter { !rows[index].foundBy.contains($0) }
         }
         return rows.sorted { ($0.name, $0.id) < ($1.name, $1.id) }
-    }
-
-    package struct Result: Sendable {
-        package let transport: AgentPeerTransport?
-        package let endpoint: URL?
-        package let evidence: JSONValue
-    }
-
-    static func candidates(for endpoint: URL) -> [URL] {
-        var origin = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)!
-        origin.path = ""; origin.query = nil; origin.fragment = nil
-        let root = origin.url!
-        var urls = [endpoint]
-        if !endpoint.path.hasSuffix(".json"), !endpoint.path.hasSuffix("/agent/card") {
-            urls.append(endpoint.appendingPathComponent(".well-known/agent-card.json"))
-        }
-        urls += [root.appendingPathComponent(".well-known/agent-card.json"),
-                 root.appendingPathComponent(".well-known/agent.json")]
-        if !endpoint.path.hasSuffix(".json"), !endpoint.path.hasSuffix("/agent/card") {
-            urls.append(endpoint.appendingPathComponent("agent/card"))
-        } else {
-            urls.append(root.appendingPathComponent("agent/card"))
-        }
-        var seen: Set<String> = []
-        return urls.filter { seen.insert($0.absoluteString).inserted }
-    }
-
-    package static func resolve(_ endpoint: URL, bearerToken: String?) async throws -> Result {
-        try AgentPeerStore.validate(AgentPeerContact(name: "Discovery", endpoint: endpoint, transport: .a2a))
-        var probes: [JSONValue] = []
-        var authenticationBlocked = false
-        var providerFailure: ProviderFailure.Report?
-        func finish(_ status: String, _ detail: String, transport: AgentPeerTransport? = nil,
-                    endpoint: URL? = nil, card: URL? = nil, offer: String? = nil) -> Result {
-            var evidence: [String: JSONValue] = [
-                "status": .string(status), "detail": .string(detail), "probes": .array(probes),
-                "message_sent": .bool(false), "untrusted_remote_data": .bool(true),
-                "supported_transports": .array([.string("a2a"), .string("nativeAgent")])]
-            // An unsupported contract is the peer's own card against what this app
-            // speaks: nothing here is broken and nothing is owed. The card's owner
-            // decides what it offers.
-            if let card, let offer {
-                evidence["remedy"] = Repair.why(owner: "the agent card at " + card.absoluteString,
-                                                tap: "that agent's own setup, whose card must offer " + offer)
-            }
-            return Result(transport: transport, endpoint: endpoint, evidence: .object(evidence))
-        }
-        for url in candidates(for: endpoint) {
-            try Task.checkCancellation()
-            let response: AgentPeerHTTP.Response
-            do { response = try await AgentPeerHTTP.get(url, bearerToken: bearerToken, timeout: 5) }
-            catch {
-                if Task.isCancelled { throw CancellationError() }
-                probes.append(.object(["url": .string(url.absoluteString), "status": .string("unavailable")]))
-                continue
-            }
-            probes.append(.object(["url": .string(url.absoluteString), "http_status": .int(Int64(response.statusCode))]))
-            if response.statusCode >= 400 {
-                let cause = ProviderFailure.http(status: response.statusCode,
-                    detail: (try? response.json?.serialize(pretty: false)) ?? "")
-                if cause != .refused { providerFailure = .init(cause: cause, work: .nothingRan) }
-            }
-            if response.statusCode == 401 || response.statusCode == 403 {
-                authenticationBlocked = true
-                continue
-            }
-            guard (200..<300).contains(response.statusCode), case .object(let card)? = response.json else { continue }
-            if card["protocol"] == .string("nativeagent-bridge") {
-                guard card["version"] == .string("1.0"), url.path.hasSuffix("/agent/card"),
-                      case .object(let message)? = card["message"], case .object(let reply)? = card["reply"],
-                      message["method"] == .string("POST"), message["path"] == .string("/agent/message"),
-                      message["text_field"] == .string("text"), message["session_field"] == .string("sessionId"),
-                      reply["method"] == .string("POST"), reply["path"] == .string("/agent/reply"),
-                      reply["request_field"] == .string("request_id"), reply["session_field"] == .string("session_id"),
-                      case .object(let auth)? = card["authentication"], auth["scheme"] == .string("bearer"),
-                      case .bool(let required)? = auth["required"] else {
-                    return finish("unsupported", "This NativeAgent card does not advertise bridge 1.0 with its message/reply contract and bearer authentication. No contact was saved.",
-                                  card: url, offer: "NativeAgent bridge 1.0 (POST /agent/message and /agent/reply, bearer authentication)")
-                }
-                guard !required || bearerToken != nil else {
-                    return finish("auth_required", "NativeAgent requires this peer's bearer credential. No contact was saved.")
-                }
-                let base = url.deletingLastPathComponent().deletingLastPathComponent()
-                return finish("discovered", "Validated NativeAgent 1.0 message and exact-receipt interfaces. No message sent.", transport: .nativeAgent, endpoint: base)
-            }
-            guard card["protocolVersion"] != nil || card["supportedInterfaces"] != nil else { continue }
-            guard case .string(let name)? = card["name"], !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  case .object? = card["capabilities"], case .array? = card["skills"] else {
-                return finish("unsupported", "This A2A card is missing its name, capabilities or skills. No contact was saved.",
-                              card: url, offer: "a complete A2A card (name, capabilities and skills)")
-            }
-            let selected: AgentA2AWire.Interface
-            do { selected = try AgentA2AWire.selectInterface(card: .object(card), cardURL: url) }
-            catch {
-                return finish("unsupported", "This A2A card offers nothing this app speaks (\(error.localizedDescription)); it speaks \(AgentA2AWire.spoken). No contact was saved.",
-                              card: url, offer: AgentA2AWire.spoken + ", with no required extension")
-            }
-            try AgentPeerPolicy.peerAuthorizeInterface(selected, cardURL: url, hasCredential: bearerToken != nil)
-            let authenticated: AgentA2AWire.Interface
-            do { authenticated = try await authenticatedInterface(card: .object(card), cardURL: url, bearerToken: bearerToken).0 }
-            catch let failure as ToolFailureError { throw failure }
-            catch {
-                if let failure = ProviderFailure.report(error, work: .nothingRan) {
-                    var fields: [String: JSONValue] = ["message_sent": .bool(false)]
-                    AgentPeerPolicy.peerFailure(failure, into: &fields)
-                    return Result(transport: nil, endpoint: nil, evidence: .object(fields))
-                }
-                return finish(bearerToken == nil ? "auth_required" : "unsupported", "Could not validate the authenticated extended agent card. No contact was saved.")
-            }
-            return finish("discovered", "Validated advertised A2A \(authenticated.version) \(authenticated.binding) interface. Messaging and task reads are supported; no message sent.", transport: .a2a, endpoint: url)
-        }
-        if let providerFailure {
-            var fields: [String: JSONValue] = ["probes": .array(probes), "message_sent": .bool(false)]
-            AgentPeerPolicy.peerFailure(providerFailure, into: &fields)
-            return Result(transport: nil, endpoint: nil, evidence: .object(fields))
-        }
-        if authenticationBlocked {
-            return finish("auth_required", "Discovery encountered access requirements. Supply this peer's bearer credential or ask its owner for a supported authenticated agent endpoint; no contact was saved.")
-        }
-        return finish("needs_setup", "No supported agent card was found in bounded discovery. Supply an exact agent-card URL or ask this system's owner to expose A2A or NativeAgent bridge access. A website or model API alone is not an agent session endpoint.")
-    }
-}
-
-/// Session-only observations. These never write contacts, settings or credentials.
-public struct AgentDiscoveryCandidate: Sendable, Equatable, Identifiable {
-    public let name: String
-    public let detail: String
-    public var setupFailure: String?
-    public let hostID: String?
-    public let settingsPath: String?
-    public let cardURL: URL?
-    public let endpoint: URL?
-    /// Each source that saw it, and where: "app: …", "path: …", "config: …",
-    /// "process: …", "a2a: …", "acp: …", "entry: …", "initialize: …", "mcp: …".
-    public var foundBy: [String] = []
-    /// What it reports as its version (or when its program last changed).
-    public var version: String?
-    /// Connecting would find it too (`AgentHostRow.isInstalled`, or a card).
-    public var connectable = true
-    /// A lawful no that stopped its setup (`Repair.why`): the person's control, nothing owed.
-    public var decision: JSONValue?
-    /// The recipe a probe's find would have when no recipe knows it (`AgentPeerDiscovery.probe`).
-    public var draft: AgentHostRow?
-    public init(name: String, detail: String, hostID: String?, settingsPath: String?, cardURL: URL?, endpoint: URL?) {
-        self.name = name
-        self.detail = detail
-        self.hostID = hostID
-        self.settingsPath = settingsPath
-        self.cardURL = cardURL
-        self.endpoint = endpoint
-    }
-    public var id: String { hostID ?? draft?.id ?? cardURL!.absoluteString }
-
-    package var projection: JSONValue {
-        var fields: [String: JSONValue] = [
-            "name": .string(name), "description": .string(detail),
-            "kind": .string(hostID != nil ? "agent_host" : draft?.acp != nil ? "acp_agent" : draft != nil ? "mcp_host" : "a2a_agent"),
-            "state": .string(AgentPeerContactState.listed.rawValue),
-            "state_detail": .string(AgentPeerContactState.listed.detail),
-            "capabilities": .array([]), "read_inputs": .array([]), "found_by": .array(foundBy.map(JSONValue.string))]
-        let row = AgentHostDirectory.rows.first { $0.id == hostID }
-        if row?.settingsSupported != false, let settingsPath, !settingsPath.isEmpty {
-            fields["settings_file"] = .string(settingsPath)
-            let workspace = row?.requiresWorkspace == true
-            fields["setup"] = .string("agent_connect for \"\(name)\""
-                + (workspace ? " with workspace set to the folder the person chose." : " sets this one up."))
-        }
-        if let hostID, let row = AgentHostDirectory.row(named: hostID) {
-            fields["route"] = .string(row.route.rawValue)
-            // Seeing an installed host does not prove a usable connection.
-            fields["can_start_turn"] = .bool(false)
-            fields["can_answer_back"] = .bool(false)
-            if row.format == .shellEnvironment {
-                fields["description"] = .string(row.description)
-                fields["outbound_route"] = .string("none")
-                fields["setup"] = .string("agent_connect for \"\(row.displayName)\" creates a private environment file and returns the local commands to give Dot. Dot can message NativeAgent, and NativeAgent can message Dot in its current ChatGPT conversation after checking the running app and conversation.")
-            }
-            if row.route == .desktopChat {
-                fields["setup"] = .string("agent_connect for \"\(row.displayName)\" sets this one up. Messages go to a chat of its own in the app, and the answer comes back in the same call.")
-            }
-            if let acp = row.acp {
-                fields["setup"] = .string("Connect \(row.displayName) by name to review its executable and starting folder. It runs as you; this app asks only when the agent asks it.")
-                fields["reference_version"] = .string(acp.referenceVersion)
-            }
-        }
-        // The generic path for its protocol: its recipe written, then a connect by name.
-        // Its name and version are what it said of itself, offered or not.
-        if draft?.acp != nil { fields["untrusted_remote_data"] = .bool(true) }
-        if let draft, setupFailure == nil {
-            fields["setup"] = .string("No recipe knows it yet: agent.recipe_write {host: \"\(draft.id)\", recipe: recipe_draft}, then agent_connect for \"\(draft.id)\".")
-            fields["recipe_draft"] = try? JSONValue.fromEncodable(AgentRecipeStore.Recipe(recipeVersion: 1, seededFrom: "discovery",
-                updatedAt: "", source: "written", digest: "", host: draft))
-        }
-        if !connectable { fields["setup"] = nil; fields["description"] = .string(detail) }
-        // Spotlight's miss, a card its own agent serves, or a settings file
-        // Connect could not use: a correction to look at; his rule is his decision.
-        if let decision { fields["remedy"] = decision }
-        else if let setupFailure {
-            let verify = hostID != nil && hostID != "app-index"
-            fields["remedy"] = .object(["kind": .string("inspect"),
-                "instruction": .string("Discovery could not use \(settingsPath ?? cardURL?.absoluteString ?? name): \(setupFailure)"),
-                "next_call": .object(["tool": .string("app"), "input": .object(verify
-                    ? ["action": .string("agent.verify"), "args": .object(["agent": .string(hostID!)])]
-                    : ["action": .string("agent.contacts"), "args": .object(["discover": .bool(true)])])])])
-        }
-        if let cardURL, let endpoint {
-            fields["endpoint"] = .string(endpoint.absoluteString)
-            fields["card_url"] = .string(cardURL.absoluteString)
-            fields["transport"] = .string("a2a")
-            fields["untrusted_remote_data"] = .bool(true)
-            fields["setup"] = .string("Use agent_connect with this name and the card_url as endpoint. A connection may need its own key.")
-        }
-        if let setupFailure { fields["description"] = .string(setupFailure) }
-        return .object(fields)
-    }
-}
-
-/// Opening Agents, explicitly asking to discover, launch and an install refresh
-/// this session cache. Ordinary contact reads never initiate discovery,
-/// including before the first refresh. A refresh connects settings-file hosts
-/// and offers other routes once through `AgentDiscoveryOffer`. The probes
-/// run on Agents and an explicit discover only; launch and an install keep
-/// their last finds.
-public actor AgentDiscoverySession {
-    public static let shared = AgentDiscoverySession()
-    private var cached: [AgentDiscoveryCandidate]?
-    private var probed: [AgentDiscoveryCandidate] = []
-    private var pending: Task<[AgentDiscoveryCandidate], Never>?
-    private var pendingID: UUID?
-    private var pendingGeneration: UUID?
-    /// How far the pending pass goes: 0 recipes, 1 the probes read, 2 found programs may run.
-    private var pendingDepth = 0
-    private var installs: Task<Void, Never>?
-    private var locations: Task<Void, Never>?
-    private var locationEvents: FileChangeEvents?
-    private var locationPaths: [URL] = []
-    private var generation = UUID()
-    private var observing = true
-
-    /// The engine's resident owner closes observation before retiring its scan.
-    public func stop() {
-        observing = false
-        generation = UUID()
-        installs?.cancel(); installs = nil
-        locations?.cancel(); locations = nil
-        locationEvents?.cancel(); locationEvents = nil
-        locationPaths = []
-        pending?.cancel() // Keep exclusion until the scan actually exits.
-    }
-    /// Spotlight's own failure, said beside every scan until its index works again.
-    private var indexFailure: AgentDiscoveryCandidate?
-    private let scan: @Sendable ([AgentPeerDiscovery.Bundle]) async -> [AgentDiscoveryCandidate]
-
-    init(scan: @escaping @Sendable ([AgentPeerDiscovery.Bundle]) async -> [AgentDiscoveryCandidate] = AgentPeerDiscovery.scanLocal) {
-        self.scan = scan
-    }
-
-    public func candidates(refresh: Bool = false, probe: Bool = true, dataRoot: URL) async -> [AgentDiscoveryCandidate] {
-        await candidates(refresh: refresh, probe: probe, launch: nil, dataRoot: dataRoot)
-    }
-
-    /// `launch`: an explicit discover's rule for running a found program
-    /// (`AgentPeerDiscovery.Launch`); without it the probes only read.
-    package func candidates(refresh: Bool, probe: Bool = true, launch: AgentPeerDiscovery.Launch?,
-                            dataRoot: URL) async -> [AgentDiscoveryCandidate] {
-        if !refresh { return cached ?? [] }
-        guard observing, !Task.isCancelled else { return cached ?? [] }
-        AgentHostRow.installationsChanged()
-        // Recipes, programs and cards never wait on Spotlight.
-        return await discover(MacAppIndex.shared.readyApps() ?? [], probe: probe, launch: launch, dataRoot: dataRoot)
-    }
-
-    private func indexFailed(_ error: Error?) {
-        indexFailure = error.map {
-            var failed = AgentDiscoveryCandidate(name: "Installed apps (Spotlight)", detail: $0.localizedDescription,
-                hostID: "app-index", settingsPath: nil, cardURL: nil, endpoint: nil)
-            failed.connectable = false
-            failed.setupFailure = $0.localizedDescription
-            return failed
-        }
-        cached = (cached ?? []).filter { $0.id != "app-index" } + [indexFailure].compactMap { $0 }
-    }
-
-    private func discover(_ bundles: [AgentPeerDiscovery.Bundle], probe: Bool = false, launch: AgentPeerDiscovery.Launch? = nil,
-                          dataRoot: URL) async -> [AgentDiscoveryCandidate] {
-        // A pass that goes as far as this one answers it; a shallower one is waited out, then this one runs.
-        let depth: Int = if !probe { 0 } else if case .run? = launch { 2 } else { 1 }
-        let generation = generation
-        while let pending {
-            if pendingDepth >= depth, pendingGeneration == generation { return await pending.value }
-            _ = await pending.value
-            guard self.generation == generation, !Task.isCancelled else { return cached ?? [] }
-        }
-        guard !Task.isCancelled else { return cached ?? [] }
-        let scan = scan
-        let id = UUID()
-        let task = Task {
-            defer {
-                if pendingID == id { pending = nil; pendingID = nil; pendingGeneration = nil }
-            }
-            nativeLog("AgentDiscoverySession: discovery scan started")
-            async let probing = probe ? AgentPeerDiscovery.probe(bundles, launch: launch) : nil
-            let recipes = await scan(bundles)
-            let found = await probing
-            guard self.generation == generation, !Task.isCancelled else { return cached ?? [] }
-            if let found {
-                // A read-only pass keeps what a find answered when it last ran.
-                probed = found.map { new in
-                    guard launch == nil, let ran = probed.first(where: { $0.id == new.id
-                        && $0.foundBy.contains { $0.hasPrefix("initialize:") || $0.hasPrefix("entry:") } }) else { return new }
-                    return ran
-                }
-            }
-            let result = AgentPeerDiscovery.merged(recipes + probed)
-            nativeLog("AgentDiscoverySession: discovery scan finished")
-            cached = result + [indexFailure].compactMap { $0 }
-            watchLocations(dataRoot: dataRoot)
-            offer(result, dataRoot: dataRoot)
-            return cached ?? result
-        }
-        pending = task
-        pendingID = id
-        pendingGeneration = generation
-        pendingDepth = depth
-        return await task.value
-    }
-
-    /// `app.installed`, delivery only: each bundle id at a version this Mac's
-    /// scans have not seen, once the bundle is whole. The first scan records
-    /// what is there silently. The name and path are plain data.
-    private func arrived(_ bundles: [AgentPeerDiscovery.Bundle], dataRoot: URL) {
-        let url = dataRoot.appendingPathComponent("agents/installed-apps.json")
-        let baseline = FileManager.default.fileExists(atPath: url.path)
-        guard var seen = baseline ? (try? JSONDecoder().decode(Set<String>.self, from: Data(contentsOf: url))) : [] else {
-            return nativeLog("AgentDiscoverySession: %@ does not read; no app arrivals until it is fixed or removed", url.path)
-        }
-        let before = seen
-        for app in bundles {
-            guard let id = app.bundleID, let info = app.info else { continue }
-            if let sdef = info["OSAScriptingDefinition"] as? String,
-               !FileManager.default.fileExists(atPath: app.url.appendingPathComponent("Contents/Resources/" + sdef).path) { continue }
-            guard seen.insert(id + " " + app.version).inserted, baseline else { continue }
-            guard case .object(let payload) = app.json else { continue }
-            AbilityStore(dataRoot: dataRoot).signal("app.installed", payload)
-        }
-        guard seen != before || !baseline else { return }
-        do { try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(seen), to: url) }
-        catch { nativeLog("AgentDiscoverySession: could not keep installed apps: %@", error.localizedDescription) }
-    }
-
-    /// Register once; Spotlight's gathering and update edges own app arrivals.
-    public func watchInstalls(dataRoot: URL) {
-        guard installs == nil, !Task.isCancelled else { return }
-        observing = true
-        let generation = generation
-        watchLocations(dataRoot: dataRoot)
-        installs = Task {
-            defer { if self.generation == generation { installs = nil } }
-            do {
-                for await _ in try await MacAppIndex.shared.changes() {
-                    guard self.generation == generation, !Task.isCancelled else { return }
-                    let bundles = try await AgentPeerDiscovery.bundles()
-                    guard self.generation == generation, !Task.isCancelled else { return }
-                    indexFailed(nil)
-                    arrived(bundles, dataRoot: dataRoot)
-                    await installationsChanged(bundles, dataRoot: dataRoot)
-                }
-            } catch {
-                guard self.generation == generation, !Task.isCancelled else { return }
-                indexFailed(error)
-            }
-        }
-    }
-
-    private func watchLocations(dataRoot: URL) {
-        let paths = AgentHostDirectory.rows.flatMap { $0.installation.locations }
-        guard locations == nil || locationPaths != paths else { return }
-        locations?.cancel()
-        locationEvents?.cancel()
-        locationPaths = paths
-        let generation = generation
-        let events = FileChangeEvents(paths: paths, emitInitial: false)
-        locationEvents = events
-        locations = Task {
-            defer { events.cancel() }
-            // Registration is asynchronous; reconcile once after it to include
-            // an installation that raced the scan which created this watcher.
-            await events.waitUntilArmed()
-            if self.generation == generation, !Task.isCancelled {
-                await installationsChanged(MacAppIndex.shared.readyApps() ?? [], dataRoot: dataRoot)
-            }
-            for await _ in events.stream {
-                guard self.generation == generation, !Task.isCancelled else { return }
-                await installationsChanged(MacAppIndex.shared.readyApps() ?? [], dataRoot: dataRoot)
-            }
-        }
-    }
-
-    private func installationsChanged(_ bundles: [AgentPeerDiscovery.Bundle], dataRoot: URL) async {
-        let generation = generation
-        if let pending { _ = await pending.value }
-        guard self.generation == generation, !Task.isCancelled else { return }
-        AgentHostRow.installationsChanged()
-        watchLocations(dataRoot: dataRoot)
-        _ = await discover(bundles, dataRoot: dataRoot)
-    }
-
-    /// After agent_connect: a connection ends its offer in the same call.
-    public func settle(dataRoot: URL) { offer(cached ?? [], dataRoot: dataRoot) }
-
-    private static func key(_ id: String) -> String { "agent.found." + id }
-
-    private func setupFailed(_ detail: String, for found: [AgentDiscoveryCandidate], dataRoot: URL) {
-        let ids = Set(found.map(\.id))
-        for index in (cached ?? []).indices where ids.contains(cached![index].id) {
-            cached![index].setupFailure = detail
-        }
-        _ = ResidentWake.shared.request(dataRoot: dataRoot, reason: "agent connection setup failed", items: found.map {
-            .init(id: "agent.setup." + $0.id, line: detail, key: "agent.setup." + $0.id, home: true)
-        })
-    }
-
-    /// Settings hosts connect here; other routes are offered once. A person's
-    /// decline or disconnect survives both discovery and program updates.
-    private func offer(_ found: [AgentDiscoveryCandidate], dataRoot: URL) {
-        do { try CredentialFileLock.withLock(AgentDiscoveryOffer.url(dataRoot)) {
-            // Without the contacts nothing can be called unconnected.
-            let peers = try AgentPeerStore(dataRoot: dataRoot).list()
-            var hosts = Set(peers.compactMap { AgentPeerStore.hostRowID($0.endpoint) })
-            // A saved settings-host contact whose key is definitely gone is
-            // repaired on this same contact, like a new host is connected. An
-            // unreadable Keychain is not a missing key: nothing is re-minted.
-            let unkeyed = Set(peers.filter { peer in
-                peer.transport == .mcpHost && peer.hostWorkspace == nil
-                    && (peer.credentialKey == nil || (try? AgentPeerCredentials.read(peerID: peer.id)) == .some(nil))
-            }.compactMap { AgentPeerStore.hostRowID($0.endpoint) })
-            guard var offers = AgentDiscoveryOffer.read(dataRoot) else {
-                throw AgentHostConfigWriter.Failure.unreadable("discovery decisions at \(AgentDiscoveryOffer.url(dataRoot).path)")
-            }
-            let before = offers, now = Date()
-            var items: [ResidentWake.Item] = []
-            for candidate in found {
-                let row = AgentHostDirectory.rows.first { $0.id == candidate.hostID }
-                // A workspace row needs a folder first; its app's own offer covers it.
-                // A recipe connecting would not find is reported, never offered.
-                guard row?.requiresWorkspace != true, candidate.connectable else { continue }
-                var entry = offers[candidate.id] ?? AgentDiscoveryOffer(name: candidate.name)
-                // A saved contact is not recovered while its own repair just failed.
-                var repairFailed = false
-                if let row, row.settingsSupported, row.acp == nil, row.format != .sessionMCP, entry.declinedAt == nil,
-                   unkeyed.contains(row.id) || (!hosts.contains(row.id) && entry.connectedAt == nil) {
-                    do {
-                        let store = AgentPeerStore(dataRoot: dataRoot)
-                        let proposal = try AgentHostConnection.propose(name: row.id, store: store, dataRoot: dataRoot)
-                        _ = try AgentHostConnection.connect(proposal: proposal, store: store)
-                        hosts.insert(row.id)
-                    } catch let decided as ToolFailureError where decided.personDecides {
-                        repairFailed = true
-                        // His own rule decided: said where, owed by no one.
-                        if let index = cached?.firstIndex(where: { $0.id == candidate.id }) {
-                            cached?[index].setupFailure = decided.message
-                            cached?[index].decision = Repair.why(owner: decided.owner ?? row.expandedConfigPath, tap: decided.tap ?? decided.message)
-                        }
-                    } catch {
-                        repairFailed = true
-                        setupFailed("Connection failed: \(error.localizedDescription) Recipe agents/recipes/\(row.id).json: host.configPath=\(row.expandedConfigPath), host.format=\(row.format.rawValue). Read agent.recipe, fix the named field/file, then agent.verify and agent.connect.", for: [candidate], dataRoot: dataRoot)
-                    }
-                }
-                if !repairFailed, candidate.hostID.map(hosts.contains)
-                    ?? peers.contains(where: { $0.endpoint == candidate.cardURL || $0.endpoint == candidate.endpoint }) {
-                    if let index = cached?.firstIndex(where: { $0.id == candidate.id }) {
-                        cached?[index].setupFailure = nil
-                        cached?[index].decision = nil
-                    }
-                    ResidentWake.shared.clear(dataRoot: dataRoot, key: "agent.setup." + candidate.id)
-                    if entry.connectedAt == nil {
-                        entry.connectedAt = now
-                        ResidentWake.shared.withdraw(dataRoot: dataRoot, key: Self.key(candidate.id))
-                        if let row, row.settingsSupported, row.restartRequired,
-                           candidate.foundBy.contains(where: { $0.hasPrefix("process: ") }) {
-                            items.append(.init(id: "agent.restart." + candidate.id,
-                                line: "\(row.displayName): connector added. Restart: \(row.restartNote)",
-                                key: "agent.restart." + candidate.id, home: true))
-                        }
-                    }
-                } else if entry.connectedAt == nil, entry.declinedAt == nil, entry.offeredAt == nil {
-                    entry.offeredAt = now; entry.version = candidate.version
-                    let place = candidate.foundBy.joined(separator: "; ")
-                    items.append(.init(id: Self.key(candidate.id) + ":" + (candidate.version ?? ""),
-                        line: "Found \"\(candidate.name)\" on this Mac (\(place)), not connected. Connect: "
-                            + (candidate.draft.map { _ in "agent.recipe_write with the recipe_draft agent.contacts {discover: \"\(candidate.name)\"} shows, then agent.connect" } ?? "agent.connect")
-                            + "; not wanted: agent.discovery_dismiss.",
-                        // A card names itself: that text carries an unidentified peer's
-                        // provenance, so it waits for the wake and never lands in
-                        // an untainted turn (ResidentWake.take).
-                        key: Self.key(candidate.id), agent: candidate.hostID == nil ? "another agent" : nil))
-                } else if entry.open {
-                    entry.version = candidate.version
-                } else { continue }
-                offers[candidate.id] = entry
-            }
-            // An offer counts only once its wake is kept; otherwise the next pass offers it again.
-            if !items.isEmpty, !ResidentWake.shared.request(dataRoot: dataRoot, reason: "an agent found on this Mac", items: items) {
-                nativeLog("AgentDiscoverySession: the wake for %ld found agents was not kept; offering again next pass", items.count)
-                for id in offers.keys where offers[id]?.offeredAt == now || offers[id]?.connectedAt == now { offers[id] = before[id] }
-            }
-            guard offers != before else { return }
-            try AgentDiscoveryOffer.write(offers, dataRoot)
-        } } catch {
-            setupFailed("Agent discovery state failed: \(error.localizedDescription) Contacts: \(AgentPeerStore(dataRoot: dataRoot).fileURL.path); decisions: \(AgentDiscoveryOffer.url(dataRoot).path). Repair file validity and access, preserving saved declines and disconnects, then refresh Agents.", for: found, dataRoot: dataRoot)
-        }
-    }
-
-    /// agent.discovery_dismiss: the person's or her "no", including after an update.
-    public func dismiss(name: String, dataRoot: URL) -> JSONValue {
-        let file = AgentDiscoveryOffer.url(dataRoot)
-        func failed(_ reason: String, _ detail: String, effects: String) -> JSONValue {
-            .object(["status": .string("failed"), "reason": .string(reason),
-                "changed": effects == "none" ? .bool(false) : .null, "effects": .string(effects), "detail": .string(detail),
-                "remedy": Repair.remedy(owner: file.path,
-                    nextCall: nil, tap: nil,
-                    instruction: ToolFailureError.fileRepairInstruction(file,
-                        shape: "Preserve every saved discovery decline and disconnect in the discovery-decision object.")
-                        + " Repair the file without discarding saved declines or disconnects; inspect the saved decision before declining again.")])
-        }
-        do { return try CredentialFileLock.withLock(AgentDiscoveryOffer.url(dataRoot)) {
-            guard var offers = AgentDiscoveryOffer.read(dataRoot) else {
-                return failed("discovery_decisions_unreadable", "\(file.path) is unreadable; no decline was saved.", effects: "none")
-            }
-            let wanted = name.trimmingCharacters(in: .whitespacesAndNewlines)
-            func named(_ id: String, _ offer: AgentDiscoveryOffer) -> Bool {
-                offer.open && [id, offer.name].contains { $0.caseInsensitiveCompare(wanted) == .orderedSame }
-            }
-            guard let id = offers.keys.sorted().first(where: { named($0, offers[$0]!) }) else {
-                return .object(["status": .string("not_found"), "reason": .string("discovery_offer_not_found"),
-                    "changed": .bool(false), "effects": .string("none"),
-                    "detail": .string("No open discovery offer is named \"\(wanted)\"."),
-                    "remedy": .object(["kind": .string("correct_arguments"),
-                        "instruction": .string("Read Home's PEOPLE lines and use an open offer's exact name."),
-                        "next_call": .object(["tool": .string("app"), "input": .object([:])])])])
-            }
-            offers[id]?.declinedAt = Date()
-            try AgentDiscoveryOffer.write(offers, dataRoot)
-            ResidentWake.shared.withdraw(dataRoot: dataRoot, key: Self.key(id))
-            return .object(["status": .string("declined"), "changed": .bool(true), "name": .string(offers[id]!.name),
-                "detail": .string("Decline saved. This agent will not be offered or connected automatically again.")])
-        } } catch { return failed("discovery_decision_save_failed", "Discovery decision save failed at \(file.path): \(error.localizedDescription). The decline may have been saved.", effects: "unknown") }
     }
 }

@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `WorkshopExecution+OutcomeScoreboard.swift` | Native canonical receipt/record decoding, verification classification, timestamp interpretation and complete `weeklyOutcomeInput` evidence; missing stores are available empty, unreadable/incomplete sources throw. Editable `Resources/abilities/weekly-outcomes.js` owns local ISO-week grouping, statistics, trend thresholds and digest text; EngineLaunch invokes it through `ToolsFacade.withPartDoor` for maintenance, without activating schedules or a Swift policy substitute |
@@ -11,8 +12,7 @@ import PersistenceCore
 /// pre-parsed natively; only normalized outcome facts cross into the digest part.
 public struct WorkshopOutcomeSample: Sendable, Equatable {
     public var id: String
-    /// Stable Workshop identity. New directed-task samples are keyed by their
-    /// Desk handle; daemon-era history falls back to the execution id.
+    /// Stable Workshop identity: the Desk handle when present, otherwise the execution id.
     public var deskHandle: String
     public var createdAt: Date
     public var updatedAt: Date
@@ -24,14 +24,7 @@ public struct WorkshopOutcomeSample: Sendable, Equatable {
     /// another historical source). Lets the scoreboard segment any persisted
     /// cohort without owning a producer for that cohort.
     public var triggerSource: String
-    /// The planner FAILED for this execution (threw / returned non-JSON / 0 valid
-    /// steps) and fell back to a deterministic stub plan — a PLAN-QUALITY signal.
-    /// Derived from the `planner_fallback` timeline event (`fromStub` isn't on
-    /// WorkshopExecutionRecord). NOTE (gpt-5.5): this is the planner-FAILURE rate, NOT
-    /// every stub plan — the autonomy-disabled path also stubs but emits no
-    /// `planner_fallback` event, and that's a deliberate disable, not a quality
-    /// failure, so excluding it is correct. A rising rate = the planner is
-    /// degrading (multi-step jobs quietly collapsing to trivial stubs).
+    /// Planner failure yielding a stub, evidenced by `planner_fallback`; disabled planning does not count.
     public var wasStub: Bool
 
     public init(
@@ -51,42 +44,15 @@ public struct WorkshopOutcomeSample: Sendable, Equatable {
         self.wasStub = wasStub
     }
 
-    public var isTerminal: Bool { WorkshopOutcomeScoreboard.terminalStatuses.contains(status.lowercased()) }
-    public var isCompleted: Bool { WorkshopOutcomeScoreboard.completedStatuses.contains(status.lowercased()) }
+    public var isTerminal: Bool { WorkshopExecutionRecord.isTerminal(status) }
+    public var isCompleted: Bool { WorkshopExecutionRecord.isSuccessful(status) }
 
-    /// Wall time from creation to the LAST execution.json write (createdAt →
-    /// updatedAt). For the common case (an execution not edited after it finishes)
-    /// the last write IS the terminal transition, so this ≈ end-to-end
-    /// execution time. CAVEAT (gpt-5.5 review): later edits can bump
-    /// `updatedAt`, so an execution edited post-terminal would overstate
-    /// this — it's an UPPER BOUND
-    /// on execution time, a useful trend signal, not an exact duration. Exact
-    /// terminal duration needs a dedicated terminal timestamp / timeline parse
-    /// (v2). Clamped at 0 (a clock skew / out-of-order write can't go negative).
+    /// Nonnegative creation-to-last-write time is an upper bound: record writes can follow completion.
     public var wallSeconds: Double { max(0, updatedAt.timeIntervalSince(createdAt)) }
 }
 
 public enum WorkshopOutcomeScoreboard {
-    // Status sets mirror the runner's terminal set (WorkshopExecution.swift ~L1379).
-    public static let completedStatuses: Set<String> = ["completed", "done", "succeeded"]
-    public static let failedStatuses: Set<String> = ["failed"]
-    public static let cancelledStatuses: Set<String> = ["cancelled", "canceled"]
-    public static let unverifiedStatuses: Set<String> = ["unverified"]
-    public static let terminalStatuses: Set<String> =
-        completedStatuses.union(failedStatuses).union(cancelledStatuses).union(unverifiedStatuses)
-
-    /// Parse an execution ISO timestamp. Swift-written records use
-    /// `[.withInternetDateTime, .withFractionalSeconds]` with a `+00:00`
-    /// offset (WorkshopExecution.isoTimestamp). But DAEMON-ERA records on disk carry
-    /// MICROSECOND fractions (`2026-05-07T10:12:54.380610+00:00`), and
-    /// `ISO8601DateFormatter.withFractionalSeconds` only accepts 3-digit
-    /// fractions — so those fail the first two attempts and, without the
-    /// microsecond fallback below, would be silently dropped by the scanner's
-    /// compactMap (the scoreboard would then ignore most of the real history —
-    /// gpt-5.5 review caught this; 19/21 live queue records are microsecond).
-    /// Truncate an over-long fraction to milliseconds and retry. Mirrors
-    /// DreamCycleRunner.parseDaemonISO; kept local to avoid a DreamREMCycle
-    /// module dependency from WorkshopExecution.
+    /// Read ISO timestamps with Z or offset zones and optional millisecond or microsecond fractions.
     static func parseTimestamp(_ s: String) -> Date? {
         let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
         if let d = NativeTimestampFormat.parseISO8601FractionalFirst(trimmed) { return d }
@@ -96,10 +62,7 @@ public enum WorkshopOutcomeScoreboard {
         return nil
     }
 
-    /// Shorten a fractional-seconds component longer than 3 digits to exactly
-    /// 3, preserving the timezone suffix (`.380610+00:00` → `.380+00:00`).
-    /// Returns nil when there is no over-long fraction to shorten (the caller
-    /// already tried the raw string).
+    /// Shorten fractions over three digits to milliseconds, preserving the timezone suffix; otherwise nil.
     static func truncateFractionToMillis(_ s: String) -> String? {
         guard let dot = s.firstIndex(of: ".") else { return nil }
         let firstFrac = s.index(after: dot)
@@ -159,7 +122,7 @@ public enum WorkshopOutcomeScoreboard {
     }
 
     private static func outcomeStatus(status: String, verification: WorkshopVerificationStatus?) -> String {
-        guard completedStatuses.contains(status.lowercased()) else {
+        guard WorkshopExecutionRecord.isSuccessful(status) else {
             return status
         }
         switch verification {
@@ -179,7 +142,7 @@ extension SwiftNativeWorkshopRunner {
     /// L0 rejects a packet over its 4 MiB bound without truncating the history.
     public func weeklyOutcomeInput() async throws -> JSONValue {
         let root = executionRecordsRoot.deletingLastPathComponent().deletingLastPathComponent()
-        let feed = try await persistence.readJSONLReporting(root.appendingPathComponent("workshop/receipts.jsonl"))
+        let feed = try await SwiftNativePersistenceCore.readJSONLReporting(root.appendingPathComponent("workshop/receipts.jsonl"))
         guard feed.report.isClean else {
             throw WorkshopExecutionError.persistenceFailure("Workshop outcome receipts are incomplete")
         }
@@ -200,15 +163,11 @@ extension SwiftNativeWorkshopRunner {
         var samples: [JSONValue] = []
         // The checked reader keeps damaged canonical records visible. Such a
         // record cannot supply a dated sample, so the digest is unavailable.
-        for (id, raw) in try await Self.readQueueRecords(dataRoot: root, persistence: persistence) {
+        for (id, _, record) in try await Self.readQueueRecords(dataRoot: root) {
             try Task.checkCancellation()
             guard Self.isSafeExecutionID(id) else {
                 throw WorkshopExecutionError.invalidRequest("executionId must be a single path component")
             }
-            guard case .object(let object) = raw else {
-                throw WorkshopExecutionError.persistenceFailure("Workshop outcome record is unavailable: " + id)
-            }
-            let record = Self.recordFromJSON(object)
             guard record.status != "corrupt", record.status != "unavailable" else {
                 throw WorkshopExecutionError.persistenceFailure("Workshop outcome record is unavailable: " + id)
             }
@@ -228,7 +187,7 @@ extension SwiftNativeWorkshopRunner {
                     throw WorkshopExecutionError.persistenceFailure("Workshop outcome timestamp is unavailable: " + id)
                 }
                 sample = decoded
-                let timeline = try await persistence.readJSONLReporting(timelinePath(record.id))
+                let timeline = try await SwiftNativePersistenceCore.readJSONLReporting(timelinePath(record.id))
                 guard timeline.report.isClean else {
                     throw WorkshopExecutionError.persistenceFailure("Workshop outcome timeline is incomplete: " + id)
                 }

@@ -1,8 +1,18 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `BuiltInSenses.swift` | Bundle-owned native adapters and JavaScript defaults; file overrides win and accounting lives in AbilityStore state |
+// Blueprint: | `BuiltInSenses.swift` | Bundle-owned native adapters and JavaScript defaults; file overrides win and accounting lives in AbilityStore state; bundled records have built-in origin and no creation/enable placeholders |
 
 public enum BuiltInSenses {
+    fileprivate static let native: [(String, SenseCorner)] = [
+        ("builtin-screen", .app(bundleID: "*")),
+        ("builtin-chrome", .site(host: "*")),
+        ("builtin-web", .stream(id: "web")),
+        ("builtin-browser", .stream(id: "browser")),
+        ("builtin-files", .fileKind("*")),
+        ("builtin-document", .stream(id: "mac.read")),
+        ("builtin-connectors", .stream(id: "connectors")),
+    ]
+
     // Specific grown/JS senses win the registry's exact lookup. These records
     // represent today's generic readers, selected only after that lookup misses.
     public static func fallbackCorner(for corner: SenseCorner) -> SenseCorner? {
@@ -18,7 +28,7 @@ public enum BuiltInSenses {
     /// Call after installing the registry in SensesHub. Missing/malformed kit
     /// resources are launch errors, never an apparently successful empty kit.
     public static func registerAll(dataRoot: URL, resources: URL? = nil) async throws {
-        guard let registry = SensesHub.shared.registry as? FileSenseRegistry else {
+        guard let registry = SensesHub.shared.registry else {
             throw SenseFailure(code: "source_unavailable", message: "The senses registry is not installed.")
         }
         let defaults = try defaults(resources: resources)
@@ -29,36 +39,24 @@ public enum BuiltInSenses {
                   saved.language == record.language, saved.corner == record.corner else {
                 throw SenseFailure(code: "bad_output", message: "Built-in sense identity collision: \(record.id).")
             }
-            if record.language == .native { NativeSenseCatalog.shared.register(ExistingCornerSense(record: saved)) }
         }
     }
 
     static func defaults(resources: URL? = nil) throws -> [FileSenseRegistry.Version] {
         let root = resources ?? resourceRoot()
         let entries = try manifest(at: root.appendingPathComponent("builtin.json"))
-        let now = Date(timeIntervalSince1970: 0)
-        let native: [(String, SenseCorner)] = [
-            ("builtin-screen", .app(bundleID: "*")),
-            ("builtin-chrome", .site(host: "*")),
-            ("builtin-web", .stream(id: "web")),
-            ("builtin-browser", .stream(id: "browser")),
-            ("builtin-files", .fileKind("*")),
-            ("builtin-document", .stream(id: "mac.read")),
-            ("builtin-connectors", .stream(id: "connectors")),
-        ]
         for entry in entries where native.contains(where: { $0.0 == entry.id }) {
             throw SenseFailure(code: "bad_output", message: "Built-in sense identity collision: \(entry.id).")
         }
         var versions = native.map { id, corner in
             FileSenseRegistry.Version(record: SenseRecord(
                 id: id, corner: corner, language: .native, origin: .builtIn,
-                entry: nil, createdAt: now, enabledAt: now
+                entry: nil
             ), files: [])
         }
         for entry in entries {
             let record = SenseRecord(id: entry.id, corner: entry.corner, version: entry.version,
-                language: .javascript, mode: entry.mode, origin: .builtIn, entry: entry.entry, verbs: entry.verbs,
-                createdAt: now, enabledAt: now)
+                language: .javascript, mode: entry.mode, origin: .builtIn, entry: entry.entry, verbs: entry.verbs)
             versions.append(FileSenseRegistry.Version(record: record, files: [entry.entry]))
         }
         return versions
@@ -133,8 +131,13 @@ public enum BuiltInSenses {
     }
 }
 
-private struct ExistingCornerSense: NativeSense {
+struct ExistingCornerSense: Sendable {
     let record: SenseRecord
+
+    init?(record: SenseRecord) {
+        guard BuiltInSenses.native.contains(where: { $0.0 == record.id && $0.1 == record.corner }) else { return nil }
+        self.record = record
+    }
     var id: String { record.id }
     var corner: SenseCorner { record.corner }
 
@@ -155,8 +158,7 @@ private struct ExistingCornerSense: NativeSense {
                     throw SenseFailure(code: "act_denied", message: "Screen verbs require an active app turn.")
                 }
                 let result = try await perform("mac.act", address, SenseScreenThings.selection(address, verb: verb, args: args))
-                let saved = try await SensesHub.shared.registry?.sense(for: corner)
-                return .acted(result, SenseProvenance(record: saved ?? record))
+                return .acted(result, SenseProvenance(record: record))
             } catch let failure as SenseFailure { return .failed(failure) }
             catch { return .failed(SenseFailure(code: "act_denied", message: error.localizedDescription)) }
         }
@@ -168,9 +170,7 @@ private struct ExistingCornerSense: NativeSense {
         }
         do {
             let page = try await source.page(for: corner, address: address)
-            let saved = try await SensesHub.shared.registry?.sense(for: corner)
-            let current = saved.flatMap { $0.id == id ? $0 : nil } ?? record
-            return .page(page, SenseProvenance(record: current))
+            return .page(page, SenseProvenance(record: record))
         } catch let failure as SenseFailure { return .failed(failure) }
         catch { return .failed(SenseFailure(code: "source_unavailable", message: error.localizedDescription)) }
     }

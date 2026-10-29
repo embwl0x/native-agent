@@ -1,5 +1,8 @@
 import AppKit
+import ApprovalTransactions
 import ChatSessionWork
+import ChatTurnRuntime
+import EngineRuntime
 import NativeAgentCore
 import NativeAgentShared
 import SwiftUI
@@ -7,7 +10,7 @@ import SwiftUI
 // Blueprint: | `ShotgunView.swift` | `ShotgunView`: driving-session transcript/composer, live step and Stop/Resume/Watch controls through existing owners |
 
 /// What Shotgun shows (Shotgun.swift owns the window): her live step as one
-/// line on top, the last ten messages of the chat on screen with her reply
+/// line on top, the last ten messages of the selected conversation with her reply
 /// streaming in, a composer that sends into that same chat (and queues while
 /// she works), Stop while a turn runs, Resume while the person holds the Mac,
 /// Watch for the masked screen glimpse, Expand/Open for the full window. A
@@ -23,7 +26,6 @@ struct ShotgunView: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var watching = false
-    @State private var draft = ""
     @State private var notice: String?
     @State private var sending = false
     @State private var inlineCards = InlineInteractionChatBinding()
@@ -31,7 +33,7 @@ struct ShotgunView: View {
 
     var body: some View {
         let controller = ShotgunController.shared
-        let sessionId = controller.drivingSessionID ?? appModel.activeChatSessionId
+        let sessionId = controller.selectedSessionID ?? appModel.activeChatSessionId
         let turns = appModel.engine.turns
         let turn = turns.lifecycle(for: sessionId)?.presentation
         let preview = turns.screenPreview(for: sessionId)
@@ -41,27 +43,47 @@ struct ShotgunView: View {
             driver.session == sessionId && turns.inFlightTurns().contains { $0.turnId == driver.turn }
         } ?? false
         let running = turns.isBusy(sessionId) || turn.map { !$0.isTerminal } == true || remoteRunning
-        let all = appModel.engine.transcripts.messages(for: sessionId)
-        let mirrorRows = all.filter { $0.metadata?.interactionMirror != nil }
-        let mirrorSessions = Set(mirrorRows.compactMap { $0.metadata?.interactionMirror?.sessionID }).sorted()
-        let waiting = all.contains(where: hasPendingApproval)
-            || all.contains { appModel.engine.transcripts.cards(forRow: $0.id, in: sessionId).contains { $0.needsAttention } }
+        let transcript = {
+            let all = appModel.engine.transcripts.messages(for: sessionId)
+            let approvals = Dictionary(appModel.engine.approvals.records.map { ($0.id, $0.status) }, uniquingKeysWith: { first, _ in first })
+            let cardsAvailable: Bool
+            if case .unavailable = appModel.engine.transcripts.transcriptReadStatus(for: sessionId) { cardsAvailable = false }
+            else { cardsAvailable = true }
+            var shown: [ChatMessage] = [], decisions: [(message: ChatMessage, pending: Bool, cards: [InlineCardModel])] = []
+            var mirrors = Set<String>(), lastAssistantId: String?, waiting = false
+            for message in all {
+                if message.role == "user" || message.role == "assistant" { shown.append(message) }
+                if message.role == "assistant" { lastAssistantId = message.id }
+                let pending = message.metadata?.isPendingApproval == true
+                    && ((message.metadata?.approvalId).flatMap { approvals[$0] }.map { $0 == "pending" } ?? true)
+                let cards = cardsAvailable ? message.inlineCards.compactMap { $0.model.needsAttention ? $0.model : nil } : []
+                if let mirror = message.metadata?.interactionMirror { mirrors.insert(mirror.sessionID) }
+                if pending || !cards.isEmpty { waiting = true }
+                if pending || !cards.isEmpty || message.metadata?.interactionMirror != nil { decisions.append((message, pending, cards)) }
+            }
+            return (shown: Array(shown.suffix(10)), decisions: decisions, mirrors: mirrors, waiting: waiting,
+                    lastAssistantId: lastAssistantId, tailId: all.last.flatMap { $0.role == "assistant" ? $0.id : nil })
+        }()
+        let waiting = transcript.waiting
         let done = !running && !waiting && turn?.isTerminal == true
         Group {
             if controller.collapsed && !running && !waiting {
                 pill
             } else {
-                full(sessionId: sessionId, turn: turn, preview: preview, running: running)
+                full(sessionId: sessionId, turn: turn, preview: preview, running: running,
+                     shown: transcript.shown, decisions: transcript.decisions,
+                     lastAssistantId: transcript.lastAssistantId, tailId: transcript.tailId)
             }
         }
         .preferredColorScheme(AppearanceController.shared.colorScheme)
         .onChange(of: done && controller.isShown, initial: true) { _, now in controller.setDone(now) }
-        .onChange(of: draft) { _, _ in notice = nil }
+        .onChange(of: appModel.chatDraft(for: sessionId)) { _, _ in notice = nil }
+        .onChange(of: sessionId) { _, _ in notice = nil }
         .inlineCardSetup(inlineCards)
         .task(id: sessionId) { await appModel.engine.transcripts.refreshCards(in: sessionId) }
         .onReceive(NotificationCenter.default.publisher(for: InlineInteractionWire.changedNotification)) { note in
             guard let origin = note.object as? String else { return }
-            if origin == sessionId || mirrorSessions.contains(origin) {
+            if origin == sessionId || transcript.mirrors.contains(origin) {
                 Task { await appModel.engine.transcripts.refreshCards(in: sessionId) }
             }
         }
@@ -79,7 +101,9 @@ struct ShotgunView: View {
     }
 
     private func full(
-        sessionId: String, turn: TurnPresentationState?, preview: MacChatScreenPreview?, running: Bool
+        sessionId: String, turn: TurnPresentationState?, preview: MacChatScreenPreview?, running: Bool,
+        shown: [ChatMessage], decisions: [(message: ChatMessage, pending: Bool, cards: [InlineCardModel])],
+        lastAssistantId: String?, tailId: String?
     ) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             header(turn: turn, preview: preview, running: running)
@@ -95,8 +119,38 @@ struct ShotgunView: View {
                     )
                     .accessibilityLabel("What I am looking at: \(preview.caption)")
             }
-            messages(sessionId: sessionId, running: running)
-                .frame(maxHeight: .infinity, alignment: .bottom)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(shown) { message in
+                        if message.id == tailId {
+                            StreamingTailBubble(
+                                message: message,
+                                isLastAssistant: message.id == lastAssistantId,
+                                isLive: running
+                            )
+                        } else {
+                            MessageBubble(message: message, isLastAssistant: message.id == lastAssistantId)
+                                .equatable()
+                        }
+                    }
+                    // Decisions belong to this session, regardless of the prose cap.
+                    ForEach(decisions, id: \.message.id) { decision in
+                        if decision.pending {
+                            InlineApprovalCard(message: decision.message)
+                        }
+                        ChatInlineCardHost(cards: decision.cards) { card, action in
+                            inlineCards.handle(card: card, action: action, appModel: appModel)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .scrollIndicators(.automatic)
+            // Opens at the newest and stays there while the reply grows.
+            .defaultScrollAnchor(.bottom, for: .initialOffset)
+            .defaultScrollAnchor(.bottom, for: .alignment)
+            .defaultScrollAnchor(.bottom, for: .sizeChanges)
+            .frame(maxHeight: .infinity, alignment: .bottom)
             ChatQueuedTurnsView(sessionId: sessionId, isBusy: appModel.engine.turns.isBusy(sessionId))
             composer(sessionId: sessionId, running: running)
         }
@@ -223,71 +277,19 @@ struct ShotgunView: View {
             .foregroundStyle(emphasis ? NativeAgentShell.text : NativeAgentShell.secondary)
     }
 
-    // MARK: - Messages
-
-    /// The last ten things said in the chat, newest at the bottom, her reply
-    /// streaming into the last one as it does in the main window.
-    @ViewBuilder
-    private func messages(sessionId: String, running: Bool) -> some View {
-        let all = appModel.engine.transcripts.messages(for: sessionId)
-        let lastAssistantId = all.last(where: { $0.role == "assistant" })?.id
-        let tailId = all.last.flatMap { $0.role == "assistant" ? $0.id : nil }
-        let shown = Array(all.filter { $0.role == "user" || $0.role == "assistant" }.suffix(10))
-        let decisionRows = all.filter { message in
-            hasPendingApproval(message) || message.metadata?.interactionMirror != nil
-                || appModel.engine.transcripts.cards(forRow: message.id, in: sessionId).contains { $0.needsAttention }
-        }
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                ForEach(shown) { message in
-                    if message.id == tailId {
-                        StreamingTailBubble(
-                            message: message,
-                            isLastAssistant: message.id == lastAssistantId,
-                            isLive: running
-                        )
-                    } else {
-                        MessageBubble(message: message, isLastAssistant: message.id == lastAssistantId)
-                            .equatable()
-                    }
-                }
-                // Decisions belong to this session, regardless of the prose cap.
-                ForEach(decisionRows) { message in
-                    if hasPendingApproval(message) {
-                        InlineApprovalCard(message: message)
-                    }
-                    ChatInlineCardHost(cards: appModel.engine.transcripts.cards(forRow: message.id, in: sessionId).filter { $0.needsAttention }) { card, action in
-                        inlineCards.handle(card: card, action: action, appModel: appModel)
-                    }
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .scrollIndicators(.automatic)
-        // Opens at the newest and stays there while the reply grows.
-        .defaultScrollAnchor(.bottom, for: .initialOffset)
-        .defaultScrollAnchor(.bottom, for: .alignment)
-        .defaultScrollAnchor(.bottom, for: .sizeChanges)
-    }
-
-    private func hasPendingApproval(_ message: ChatMessage) -> Bool {
-        guard message.metadata?.isPendingApproval == true else { return false }
-        return appModel.engine.approvals.records.first(where: { $0.id == message.metadata?.approvalId })
-            .map { $0.status == "pending" } ?? true
-    }
-
     // MARK: - Composer
 
     private func composer(sessionId: String, running: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        let draft = appModel.composerDraft(for: sessionId)
+        return VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .bottom, spacing: 8) {
-                TextField("Message \(appModel.agentDisplayName)…", text: $draft, axis: .vertical)
+                TextField("Message \(appModel.agentDisplayName)…", text: draft.textBinding, axis: .vertical)
                     .textFieldStyle(.plain)
                     .font(ShellType.body)
                     .lineLimit(1...4)
                     .focused($composerFocused)
                     .onSubmit { send(sessionId: sessionId) }
-                let canSend = ChatTranscriptPresentation.hasVisibleText(draft) && !sending
+                let canSend = ChatTranscriptPresentation.hasVisibleText(draft.text) && !sending
                 let lit = running || canSend
                 Button {
                     if running { appModel.stopChatStream(sessionId: sessionId) }
@@ -343,19 +345,25 @@ struct ShotgunView: View {
     /// Into the same chat; while she is busy it waits in the send-next queue,
     /// exactly as from the main composer.
     private func send(sessionId: String) {
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let draft = appModel.composerDraft(for: sessionId)
+        let submitted = draft.text
+        let editedAt = draft.editedAt
+        let text = submitted.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !sending else { return }
         sending = true
         Task { @MainActor in
             defer { sending = false }
             switch await appModel.startChatTurnForSession(text, sessionId: sessionId) {
             case .accepted, .queued:
-                if draft.trimmingCharacters(in: .whitespacesAndNewlines) == text { draft = "" }
+                let unchanged = draft.text == submitted && draft.editedAt == editedAt
+                appModel.clearChatDraftAfterSend(submitted, sessionId: sessionId, editedAt: editedAt)
                 // Sent: the keyboard goes back to the app she is driving, and
                 // any keystrokes of hers that waited on this message go on.
-                ShotgunController.shared.giveKeyboardBack()
+                if ShotgunController.shared.selectedSessionID == sessionId, unchanged {
+                    ShotgunController.shared.giveKeyboardBack()
+                }
             case .rejected(let message):
-                notice = message
+                if ShotgunController.shared.selectedSessionID == sessionId { notice = message }
             }
         }
     }

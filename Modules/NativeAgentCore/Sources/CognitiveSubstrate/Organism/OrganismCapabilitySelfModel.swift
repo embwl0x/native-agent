@@ -63,7 +63,7 @@ public enum OrganismCapabilitySelfModel {
             let resolved = evidence.filter { $0.status == .satisfied || $0.status == .violated }
             let expired = evidence.filter { $0.status == .expired }
             let cumulative = ledger.outcomeCountsByKind?[kind.rawValue]
-            let bodyPrior = bodyConfidence(for: kind, in: ledger.bodyConfidence)
+            let bodyPrior = OrganismProspectiveAffect.pathConfidence(for: kind, in: ledger.bodyConfidence)
             // Prefer the forgotten weights over the lifetime tally: the belief
             // is about what this capability does now, not about everything it
             // ever did. `effectiveWeights(at:)` seeds from the tally for states
@@ -107,9 +107,9 @@ public enum OrganismCapabilitySelfModel {
                 kind: kind,
                 successLikelihood: (posterior).clamped01(),
                 uncertainty: (uncertainty).clamped01(),
-                evidenceCount: Int(evidenceWeight.rounded()),
-                resolvedEvidenceCount: Int(resolvedWeight.rounded()),
-                expiredEvidenceCount: Int(expiredWeight.rounded()),
+                evidenceCount: displayedCount(evidenceWeight),
+                resolvedEvidenceCount: displayedCount(resolvedWeight),
+                expiredEvidenceCount: displayedCount(expiredWeight),
                 freshness: (freshness).clamped01(),
                 lastEvidenceAt: last,
                 evidenceBasis: cumulative == nil ? .legacyBodyConfidence : .cumulativeOutcomes
@@ -117,19 +117,10 @@ public enum OrganismCapabilitySelfModel {
         }
     }
 
-    private static func bodyConfidence(
-        for kind: OrganismPredictionKind,
-        in confidence: OrganismBodyConfidence
-    ) -> Double {
-        switch kind {
-        case .toolCompletion: confidence.toolPath
-        case .providerCompletion: confidence.providerPath
-        case .phoneDelivery: confidence.phonePath
-        case .approvalResolution: confidence.approvalPath
-        case .workflowAdvance: confidence.workflowPath
-        // Item 46: no body path exists for a semantic expectation; its
-        // capability belief rests on the cumulative outcome counts alone.
-        case .semanticExpectation: 0.5
-        }
+    /// Display tallies saturate at Int's limit; unknown/nonpositive weight
+    /// supplies no count. The fractional weights remain the belief's evidence.
+    private static func displayedCount(_ weight: Double) -> Int {
+        guard weight > 0 else { return 0 }
+        return Int(exactly: weight.rounded()) ?? Int.max
     }
 }

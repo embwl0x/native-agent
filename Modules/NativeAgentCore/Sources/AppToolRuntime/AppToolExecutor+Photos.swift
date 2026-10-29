@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 import Photos
@@ -59,12 +60,11 @@ extension AppToolExecutor {
                 "media_type": .string(media), "limited_access": .bool(limited),
                 "coverage": .string(limited ? "Only assets shared with NativeAgent; counts are not whole-library totals." : "Accessible Photos library assets; dates are creation dates.")]
             if verb == "recent" {
-                let iso = ISO8601DateFormatter()
                 result["assets"] = .array((0..<assets.count).map { index in
                     let asset = assets.object(at: index)
                     let kind = switch asset.mediaType { case .image: "image"; case .video: "video"; case .audio: "audio"; default: "unknown" }
                     var row: [String: JSONValue] = ["id": .string(asset.localIdentifier),
-                        "date": asset.creationDate.map { .string(iso.string(from: $0)) } ?? .null,
+                        "date": asset.creationDate.map { .string(NativeTimestampFormat.plainZulu($0)) } ?? .null,
                         "media_type": .string(kind), "width": .int(Int64(asset.pixelWidth)),
                         "height": .int(Int64(asset.pixelHeight)), "favorite": .bool(asset.isFavorite)]
                     if let location = asset.location {

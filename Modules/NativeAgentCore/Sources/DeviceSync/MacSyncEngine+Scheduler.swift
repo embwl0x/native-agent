@@ -5,8 +5,8 @@ import PersistenceCore
 import TriggerScheduler
 // Blueprint: | `MacSyncEngine+Scheduler.swift` | `MacSyncEngine`: `schedulerSnapshotData`, `startSchedulerSnapshotObservation` |
 
-enum MobileSchedulerProjection {
-    static func read(using writer: any SchedulerJobWriter, jobID: String? = nil) async throws -> MobileSchedulerSnapshot {
+enum MobileSchedules {
+    static func read(using writer: SwiftNativeTriggerScheduler, jobID: String? = nil) async throws -> MobileSchedulerSnapshot {
         let capturedAt = Date().timeIntervalSince1970
         let rows = try await writer.listJobs()
         // Action readback checks only its own job; full publication still checks every row.
@@ -17,18 +17,11 @@ enum MobileSchedulerProjection {
         }
         let jobs = try selected.map { row in
             let job = try ScheduledJob(row: row)
-            guard case .object(let object) = row else { throw ScheduledJob.RowError.notAnObject }
-            func optionalString(_ key: String) throws -> String? {
-                switch object[key] {
-                case nil, .null?: return nil
-                case .string(let value)?: return value
-                default: throw ScheduledJob.RowError.field(key)
-                }
-            }
+            let object = try JSONRow(row)
             let schedule: String
             if let once = job.onceScheduleDescription {
                 schedule = once
-            } else if case .object(let fields)? = object["schedule"] {
+            } else if case .object(let fields)? = object.fields["schedule"] {
                 // Only schedule metadata; never pass arbitrary payload fields through.
                 let labels = [
                     "type": "Schedule", "kind": "Schedule", "seconds": "Seconds",
@@ -40,22 +33,26 @@ enum MobileSchedulerProjection {
                     "expression": "Cron", "cron": "Cron", "firstRunAt": "First run",
                     "run_at": "Run at", "runAt": "Run at"
                 ]
-                schedule = try fields.keys.filter { labels[$0] != nil }.sorted().map { key in
-                    let value = fields[key]!
-                    if case .string(let text) = value { return "\(labels[key]!): \(text)" }
-                    return "\(labels[key]!): \(String(decoding: try JSONEncoder().encode(value), as: UTF8.self))"
+                schedule = try fields.keys.sorted().compactMap { key -> String? in
+                    guard let label = labels[key], let value = fields[key] else { return nil }
+                    if case .string(let text) = value { return "\(label): \(text)" }
+                    return "\(label): \(String(decoding: try JSONEncoder().encode(value), as: UTF8.self))"
                 }.joined(separator: " · ")
             } else if let seconds = job.intervalSeconds {
                 schedule = "Every \(seconds) seconds"
             } else {
                 throw ScheduledJob.RowError.field("schedule")
             }
-            return MobileSchedulerJob(
-                id: job.id, name: job.name, kind: job.kind, enabled: job.enabled,
-                schedule: schedule, nextRunAt: job.nextRunAt, lastRunAt: job.lastRunAt,
-                lastRunStatus: try optionalString("lastRunStatus"),
-                cancelledAt: try optionalString("cancelledAt")
-            )
+            do {
+                return MobileSchedulerJob(
+                    id: job.id, name: job.name, kind: job.kind, enabled: job.enabled,
+                    schedule: schedule, nextRunAt: job.nextRunAt, lastRunAt: job.lastRunAt,
+                    lastRunStatus: try object.optionalString("lastRunStatus"),
+                    cancelledAt: try object.optionalString("cancelledAt")
+                )
+            } catch JSONRow.Malformed.field(let key) {
+                throw ScheduledJob.RowError.field(key)
+            }
         }
         var snapshot = MobileSchedulerSnapshot(capturedAt: capturedAt, jobs: jobs)
         // The Mac's current zone rides with the facts; the phone shows them in it (Law 7).
@@ -67,7 +64,7 @@ enum MobileSchedulerProjection {
 extension MacSyncEngine {
     func schedulerSnapshotData() async -> SnapshotGroupBuild {
         do {
-            var snapshot = try await MobileSchedulerProjection.read(using: makeSchedulerJobWriter())
+            var snapshot = try await MobileSchedules.read(using: makeSchedulerJobWriter())
             if let path = snapshotDir?.appendingPathComponent("scheduler.json") {
                 let previous = await MobileSnapshotBuilder.shared.build {
                     try? JSONDecoder().decode(MobileSchedulerSnapshot.self, from: Data(contentsOf: path))

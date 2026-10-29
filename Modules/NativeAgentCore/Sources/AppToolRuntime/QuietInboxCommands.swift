@@ -55,7 +55,7 @@ extension QuietInboxHost {
     }
 
     private static func inboxText(_ input: [String: JSONValue], _ key: String) -> String {
-        AppToolExecutor.inputString(input[key])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        input[key]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
     private func inboxGate(verb: String, input: [String: JSONValue]) async -> Result<QuietInboxTarget, QuietInboxRefusal> {
@@ -71,7 +71,7 @@ extension QuietInboxHost {
 
         var ids = [text("id")].filter { !$0.isEmpty }
         if case .array(let many)? = input["ids"] {
-            ids += many.compactMap { AppToolExecutor.inputString($0)?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            ids += many.compactMap { $0.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
         }
         guard !ids.isEmpty else {
@@ -94,8 +94,7 @@ extension QuietInboxHost {
                     "Say why in reason (a few words, e.g. \"stale test note\"); it is saved on the note."))
             }
         case "withdraw":
-            // Agent, 2026-10-01: withdrawing her own pending ask is hers;
-            // answering another agent's is User's.
+            // The agent may withdraw its own pending ask; answering another agent's is the owner's call.
             guard ids.count == 1, let approvalID = byID[ids[0]]?.related_approval_id, !approvalID.isEmpty else {
                 return refuse(AppToolExecutor.failure("no_approval",
                     "That note carries no approval. withdraw takes one note whose read shows approval_id."))
@@ -118,7 +117,7 @@ extension QuietInboxHost {
             guard ids.count == 1, let item = byID[ids[0]] else {
                 return refuse(AppToolExecutor.failure("one_id", "\(verb) takes one id."))
             }
-            let actionIDs = inboxPresentation(item).actions.map { $0.id == "deny" ? "reject" : $0.id }
+            let actionIDs = inboxPresentation(item).actions.map { InboxActionVocabulary.normalizedAction($0.id) }
             // A note's buttons in the words its read shows (inbox.not_now, inbox.open_on_mac · User's).
             let shown = inboxPresentation(item).actions.compactMap { AppToolExecutor.noteButton(id: $0.id, label: $0.label) }
             // A card's Not now is inbox.not_now, its warning on its line; never a bare reject.
@@ -130,7 +129,7 @@ extension QuietInboxHost {
             }
             let action = requested.isEmpty
                 ? actionIDs.first(where: { ["act", "open_approvals", "repair"].contains($0) }) ?? ""
-                : (requested == "deny" ? "reject" : requested)
+                : InboxActionVocabulary.normalizedAction(requested)
             if ["archive", "dismiss", "read", "view"].contains(action) {
                 return refuse(AppToolExecutor.failure("use_verb",
                     "\(action) is its own here: " + (action == "read" || action == "view"
@@ -142,7 +141,7 @@ extension QuietInboxHost {
                         : "This note has no \(action) action. Its actions: \(shown.joined(separator: ", ")).",
                     extra: ["actions": .array(shown.map { .string($0) })]))
             }
-            // User, 10-02: under Full Mac his buttons are hers too.
+            // Full Mac makes the person's buttons available to her.
             let fullMac = await AppToolExecutor.freshQuietPosture(
                 dataRoot: self.dataRootOverride ?? PersistenceCore.defaultDataRoot())?.name == AppToolExecutor.fullMacModeName
             let opensForUser = item.source == self.interactionSource && action == "act"
@@ -208,26 +207,27 @@ extension QuietInboxHost {
             return inboxList(target.items, filter: Self.inboxText(input, "filter"), limit: input["limit"])
         }
         let (ids, byID) = (target.ids, target.byID)
+        let selected = ids.compactMap { id in byID[id].map { (id: id, item: $0) } }
 
         switch verb {
         case "read":
-            return .object(["status": .string("ok"), "notes": .array(ids.map { inboxRow(byID[$0]!, full: true) })])
+            return .object(["status": .string("ok"), "notes": .array(selected.map { inboxRow($0.item, full: true) })])
         case "archive", "dismiss", "mark_read":
             let reason = String(Self.inboxText(input, "reason").prefix(280))
             let action = verb == "mark_read" ? "read" : verb
             var done: [JSONValue] = []
             var skipped: [JSONValue] = []
-            for id in ids {
+            for (id, item) in selected {
                 // Reading is not un-archiving: mark_read leaves settled notes alone.
-                if action == "read", !byID[id]!.isActivityPending {
-                    skipped.append(.object(["id": .string(id), "status": .string(byID[id]!.status)]))
+                if action == "read", !item.isActivityPending {
+                    skipped.append(.object(["id": .string(id), "status": .string(item.status)]))
                     continue
                 }
                 do {
                     try await self.performInboxAction(id, action: action, metadata: [
                         "settled_by": .string("agent"), "settled_reason": .string(reason),
                     ], quiet: false, dataRootOverride: self.dataRootOverride)
-                    done.append(.object(["id": .string(id), "was": .string(byID[id]!.status)]))
+                    done.append(.object(["id": .string(id), "was": .string(item.status)]))
                 } catch {
                     await self.refreshInboxSurfaces()
                     return AppToolExecutor.failure("write_failed",
@@ -286,7 +286,7 @@ extension QuietInboxHost {
             await self.refreshInboxSurfaces()
             if target.decided {
                 HarnessDecidedRow.post(requester: "Full Mac", tool: "inbox.\(action)",
-                                       sessionID: AppToolExecutor.inputString(input["__session_id"]),
+                                       sessionID: input["__session_id"]?.scalarText,
                                        dataRoot: self.dataRootOverride ?? PersistenceCore.defaultDataRoot())
             }
             return .object(["status": .string("ok"), "id": .string(item.id), "action": .string(action),

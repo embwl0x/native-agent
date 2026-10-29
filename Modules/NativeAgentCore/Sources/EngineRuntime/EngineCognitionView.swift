@@ -23,17 +23,9 @@ public final class CognitionViewFacade {
     public nonisolated let runtime: NativeCognitionRuntime?
 
     public var detail: CognitiveObservatoryDetail?
-    public var detailEvidenceStatus: CognitiveObservatoryDetailRead.EvidenceStatus?
     public var contextFlowHealth: ContextFlowObservatoryHealthState = .unavailable
     public var workshop: WorkshopObservatorySnapshot?
-    public var enabled = false
-    public var capsuleEnabled = false
-    public var backgroundEnabled = false
-    public var reflectionEnabled = false
-    public var organismEnabled = false
-    public var reflectionBudget = 0
     public var lastRefresh: Date?
-    public var proposalsDetail: CognitiveObservatoryDetail?
     public var subconsciousRuntime: NativeSubconsciousRuntimeState?
     public var reflectionRoute: NativeReflectionRouteStatus?
     public private(set) var modelCalls = ""
@@ -49,7 +41,7 @@ public final class CognitionViewFacade {
     public var livingSnapshot: LivingStatusSnapshot?
     public var livingRefreshStatus: PanelRefreshStatus?
     @ObservationIgnored private let observatoryLatest = LatestRead()
-    @ObservationIgnored private let proposalsRead = LatestRead()
+    @ObservationIgnored private let detailRead = LatestRead()
     @ObservationIgnored private let vitalsRead = LatestRead()
     @ObservationIgnored private let modelCallsRead = LatestRead()
     @ObservationIgnored private let livingRead = LatestRead()
@@ -67,12 +59,12 @@ public final class CognitionViewFacade {
         return await runtime.changes()
     }
 
-    public nonisolated func observatoryRead() async -> CognitiveObservatoryDetailRead? {
-        await runtime?.observatoryDetailRead()
-    }
-
-    public func refreshProposals() async {
-        _ = await proposalsRead.read({ await runtime?.observatoryDetail() }, publish: { proposalsDetail = $0 })
+    public func refreshDetail() async {
+        _ = await detailRead.read({ await runtime?.observatoryDetail() }, publish: { read in
+            guard let read else { return }
+            detail = read
+            lastRefresh = Date()
+        })
     }
 
     public func refreshVitals() async {
@@ -158,8 +150,7 @@ public final class CognitionViewFacade {
 
     /// TrustCenter supplies policy; DreamREMCycle owns the composite gate arithmetic.
     public nonisolated func dreamGate() async -> DreamREMGatePolicy {
-        let policy = await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicy()
-        return Self.dreamGate(from: policy)
+        DreamREMGatePolicy(authority: .read(dataRoot: dataRoot))
     }
 
     /// Manual REM changes persistent, approval-gated state. Unlike a passive
@@ -168,29 +159,12 @@ public final class CognitionViewFacade {
     /// apparently enabled REM cycle.
     public nonisolated func dreamGateChecked() async throws -> DreamREMGatePolicy {
         let policy = try await SwiftNativeTrustCenter(dataRoot: dataRoot).loadTrustPolicyChecked()
-        return Self.dreamGate(from: policy)
+        return DreamREMGatePolicy(authority: .present(policy))
     }
 
     /// A dream needs both the scheduler and personality-cycle gates.
     public nonisolated func dreamEnabled() async -> Bool {
         await dreamGate().dreamEnabled
-    }
-
-    nonisolated private static func dreamGate(from policy: [String: JSONValue]) -> DreamREMGatePolicy {
-        func boolAt(_ section: String, _ key: String, default def: Bool) -> Bool {
-            guard case .object(let sec)? = policy[section] else { return def }
-            if case .bool(let b)? = sec[key] { return b }
-            return def
-        }
-        // `policy` here is the NORMALIZED policy (loadTrustPolicy merges
-        // defaultTrustPolicy), so these fallbacks only fire for keys the
-        // shipped defaults do not carry. Keep them equal to TrustCenter+Defaults
-        // anyway — a false here silently disagreed with the shipped `true`.
-        return DreamREMGatePolicy(
-            dreamScheduler: boolAt("trainingPolicy", "dream_scheduler", default: true),
-            dreamCycleEnabled: boolAt("personalityPolicy", "dream_cycle_enabled", default: true),
-            remCycleEnabled: boolAt("trainingPolicy", "rem_cycle_enabled", default: true)
-        )
     }
 
     /// The file-backed diary, newest first, with its composite gate.
@@ -311,47 +285,18 @@ public enum LivingStatusFileWatch {
         ]
     }
 
-    /// FileChangeWatcher can follow missing targets through a parent vnode, but
-    /// it cannot observe a parent that is a regular file or cannot be created.
-    /// Make that arming boundary observable rather than leaving the card with
-    /// a successful initial read and no future invalidations.
-    public static func availability(dataRoot: URL) -> Availability {
-        let paths = watchedPaths(dataRoot: dataRoot)
-        // Deterministic order: Set iteration follows the per-process hash seed,
-        // so an unwatchable root could report a different (order-dependent)
-        // unavailable reason from run to run. Sorted, the shallowest parent —
-        // the data root itself — is always diagnosed first.
-        let parents = Set(paths.map { $0.deletingLastPathComponent().standardizedFileURL })
-            .sorted { $0.path < $1.path }
-        for parent in parents {
-            var isDirectory: ObjCBool = false
-            if FileManager.default.fileExists(atPath: parent.path, isDirectory: &isDirectory) {
-                guard isDirectory.boolValue else {
-                    return .unavailable("a status storage folder is not a directory")
-                }
-            } else {
-                do {
-                    try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-                } catch {
-                    return .unavailable("a status storage folder could not be prepared")
-                }
-            }
-        }
-        return .watching(inputCount: paths.count)
-    }
 }
 
 extension CognitionViewFacade {
     public func refreshLivingStatus(
         desk: DeskFacade,
-        approvals: ApprovalsFacade,
         agentDisplayName: @MainActor () -> String,
         dreamErrorDidChange: @MainActor (String?) -> Void
     ) async {
         guard livingRefreshCoalescer.requestRefresh() else { return }
         while true {
             _ = await livingRead.read({
-                await readLivingStatus(desk: desk, approvals: approvals,
+                await readLivingStatus(desk: desk,
                     agentDisplayName: agentDisplayName)
             }, publish: { outcome in
             if outcome.checkedDream { dreamErrorDidChange(outcome.dreamError) }
@@ -381,7 +326,6 @@ extension CognitionViewFacade {
 
     private func readLivingStatus(
         desk: DeskFacade,
-        approvals: ApprovalsFacade,
         agentDisplayName: @MainActor () -> String
     ) async -> (snapshot: LivingStatusSnapshot?, failedEndpoints: [String], checkedDream: Bool, dreamError: String?) {
         guard let organism = await organismSnapshot() else {
@@ -390,7 +334,7 @@ extension CognitionViewFacade {
         var failedEndpoints: [String] = []
         // The Desk's own overview: its Needs you is the one "needs User".
         let board = await desk.loadBoard()
-        let overview = board.overview!
+        guard let overview = board.overview else { return (nil, ["Desk"], false, nil) }
         if !overview.unavailable.isEmpty { failedEndpoints.append("Desk") }
         let activeDeskCount = board.items.filter { !$0.status.isTerminal }.count
         let blockedDeskCount = board.items.filter { $0.status == .blocked }.count
@@ -408,7 +352,7 @@ extension CognitionViewFacade {
 
         let approvalRows: [ApprovalRecord]
         do {
-            approvalRows = try await approvals.list()
+            approvalRows = try board.approvals.get()
         } catch {
             approvalRows = []
             failedEndpoints.append("Approvals")
@@ -439,8 +383,9 @@ extension CognitionViewFacade {
     ) async {
         pendingObservatoryReads += 1
         defer { pendingObservatoryReads -= 1 }
+        guard runtime != nil else { return }
+        await refreshDetail()
         _ = await observatoryLatest.read({
-        guard let nextRead = await observatoryRead() else { return nil as (CognitiveObservatoryDetailRead, ContextFlowObservatoryHealthState, WorkshopObservatorySnapshot)? }
         let nextContextFlowHealth = await contextFlowHealthRead()
         let deskRoot = dataRoot
         let nextWorkshop = await WorkshopObservatorySnapshot.load(
@@ -450,21 +395,10 @@ extension CognitionViewFacade {
                 .appendingPathComponent("receipts.jsonl"),
             includeReceipts: includeWorkshopReceipts()
         )
-        return (nextRead, nextContextFlowHealth, nextWorkshop)
-        }, publish: { read in
-        guard let (nextRead, nextContextFlowHealth, nextWorkshop) = read else { return }
-        let next = nextRead.detail
-        detail = next
-        detailEvidenceStatus = nextRead.evidenceStatus
+        return (nextContextFlowHealth, nextWorkshop)
+        }, publish: { nextContextFlowHealth, nextWorkshop in
         if contextFlowHealth != nextContextFlowHealth { contextFlowHealth = nextContextFlowHealth }
         if workshop != nextWorkshop { workshop = nextWorkshop }
-        enabled = next.configuration.enabled
-        capsuleEnabled = next.configuration.capsuleInjectionEnabled
-        backgroundEnabled = next.configuration.backgroundMicrocyclesEnabled
-        reflectionEnabled = next.configuration.reflectiveCallsEnabled
-        organismEnabled = next.organism.enabled
-        reflectionBudget = next.configuration.dailyReflectionCallBudget
-        lastRefresh = Date()
         })
     }
 }

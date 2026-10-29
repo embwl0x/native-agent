@@ -56,37 +56,17 @@ public enum ToolCausalBoundary {
     private static func binding(
         for rawTool: String
     ) -> (domain: MotorDomain, identityKeys: [String])? {
+        // A binding requires an actual effect and a canonical owner capable of
+        // proving its consequence. Reads and bare cursor movement have no
+        // consequence owner.
         switch rawTool.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "workshop_submit":
             return (.workshopExecution, ["id"])
         case "browser.open_url", "browser_open_url", "browser.open", "browser_open",
              "browser.navigate", "browser_navigate", "navigate_browser":
             return (.browser, ["runId", "run_id", "id"])
-        // W2/W3 — INJECTION. These DO bind, unlike the AX reads: each one sets
-        // a real external effect (a key went into an app, a button was pressed)
-        // that MacControl's operation store owns and can be asked about later.
-        // W6 — mac_wake binds for the same reason: it posted a real HID event.
-        // That the same call also returns a perception result does not make it
-        // a read; the mouse move it emitted is the external effect.
-        // native-look item 3 — legacy closed-loop act tool binds for the same reason: it performs a
-        // real verb through the actuator. That the same call also returns a
-        // percept does not make it a read; the press it emitted is the effect.
         case "mac_wake", "act", "go":
             return (.macControl, ["operationId", "operation_id"])
-        // W7 — legacy bare cursor move tool is deliberately ABSENT too, and it is the one motor
-        // tool here that is. A motor binding claims some domain owner can
-        // later be asked whether the effect settled; a bare cursor move sets
-        // no such effect — nothing was clicked, typed or changed, so there is
-        // no consequence for MacControl's operation store to own. Binding it
-        // would manufacture one and, worse, would make an unapprovable tool
-        // look like it had an external effect worth approving.
-        //
-        // W1b/W3.5 — legacy AX status tool / legacy AX tree tool / legacy AX find tool / mac_view are
-        // deliberately ABSENT from this table. A motor binding claims a tool set an
-        // external effect some domain owner can later prove settled; the AX
-        // reads set no effect at all (no CGEvent, no AXUIElementPerformAction,
-        // no attribute write), so they have no motor owner to reference.
-        // Binding them would manufacture a consequence that never happened.
         // Builder messages settle asynchronously. The durable bridge job owns
         // the returned message id, which is the exact key used by
         // DelegationStatusProjector and the event-driven outcome loop.

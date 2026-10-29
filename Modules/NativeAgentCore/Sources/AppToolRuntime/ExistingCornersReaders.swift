@@ -1,4 +1,5 @@
 import Foundation
+import ChatToolParsing
 import CryptoKit
 import PersistenceCore
 import Senses
@@ -9,7 +10,7 @@ import Dispatcher
 import ChromeControl
 import NativeAgentCore
 import AuthoredCapabilities
-// Blueprint: | `ExistingCornersReaders.swift` | `ExistingCornersSourceProvider`: gated raw readers for screen, files, documents, connectors, private web, visible browser and Chrome; event-backed Chrome material for ordinary reads/following; `NativeChromeNews` observes from tab navigation, owns one tab-bound native reader subscription into `SenseNewsBoard`, retires it when its canonical sense is disabled/replaced, observes catalog changes only while subscriptions start/live, and sends capture failures to Chrome status without consuming its successful baseline |
+// Blueprint: | `ExistingCornersReaders.swift` | `ExistingCornersSourceProvider`: gated raw readers for screen, files, documents, connectors, private web, visible browser and Chrome; event-backed Chrome material for ordinary reads/following; `NativeChromeNews` observes from tab navigation, owns one tab-bound native reader subscription into `SenseNewsBoard`, retires it when its canonical sense is disabled/replaced, observes catalog changes only while subscriptions start/live, reports its actual tab-to-sense watches for Senses presentation, and sends capture failures to Chrome status without consuming its successful baseline |
 
 extension ExistingCornersSourceProvider {
     /// Bind the same raw tool chain used by the app, not a second dispatcher.
@@ -107,13 +108,17 @@ extension ExistingCornersSourceProvider {
             case .stream(let id) where id == "mac.read":
                 return .text(try ExistingCornersReaders.documentText(await rawRead(tool, readerInput)))
             case .stream:
-                return .text(try ExistingCornersReaders.outputText(await rawRead(tool, readerInput)))
+                return .text(try await SenseDoor.$readingRaw.withValue(true) {
+                    try ExistingCornersReaders.outputText(await rawRead(tool, readerInput))
+                })
             case .need:
                 throw SenseFailure(code: "unsupported", message: "There is no existing reader for \(corner.key).")
             }
         }, readPage: { corner, address in
             let (tool, input) = try ExistingCornersReaders.route(corner, address)
-            let result = try await rawRead(tool, input.filter { !$0.key.hasPrefix("__sense_") })
+            let result = try await SenseDoor.$readingRaw.withValue(true) {
+                try await rawRead(tool, input.filter { !$0.key.hasPrefix("__sense_") })
+            }
             if case .app = corner, let page = try SenseScreenThings.page(in: result) {
                 return try SenseNativePages.window(page, arguments: input)
             }
@@ -124,7 +129,7 @@ extension ExistingCornersSourceProvider {
             var things: [NativeThing] = []
             if case .site = corner,
                let page = ChromePageMirror.page(tab: ExistingCornersReaders.integer(input["tab_id"]),
-                    session: ChatToolSessionContext.verifiedSessionId), text.hasPrefix(page.text) {
+                    dataRoot: dataRoot, session: ChatToolSessionContext.verifiedSessionId), text.hasPrefix(page.text) {
                 things = page.rows.map {
                     NativeThing(name: $0.label, kind: $0.role, address: page.url + "#" + $0.node)
                 }
@@ -241,7 +246,7 @@ extension ExistingCornersSourceProvider {
             }
             pair.continuation.onTermination = { _ in task.cancel(); events.cancel() }
             return pair.stream
-        })
+        }, reportWatches: { await NativeChromeNews.shared.liveWatches() })
     }
 }
 
@@ -264,6 +269,14 @@ actor NativeChromeNews {
     private var starting: Set<Int64> = []
     private var catalogObserver: NSObjectProtocol?
 
+    func liveWatches() -> [SenseLiveWatch] {
+        watches.map { tab, watch in
+            SenseLiveWatch(address: "Chrome tab \(tab)" + (watch.url.isEmpty ? "" : " · " + watch.url),
+                senseID: "builtin-chrome", version: watch.senseVersion,
+                corner: .site(host: URL(string: watch.url)?.host ?? "*"))
+        }
+    }
+
     private func observeCatalog() {
         guard catalogObserver == nil else { return }
         catalogObserver = NotificationCenter.default.addObserver(forName: AbilityStore.didChange, object: nil, queue: nil) { [weak self] _ in
@@ -272,6 +285,7 @@ actor NativeChromeNews {
     }
 
     private func reconcile() async {
+        defer { NotificationCenter.default.post(name: SenseNewsBoard.presentationDidChange, object: nil) }
         for (tab, watch) in watches {
             let host = URL(string: watch.url)?.host ?? "*"
             let current = try? await SenseDoor.selectedRecord(for: .site(host: host))
@@ -349,6 +363,7 @@ actor NativeChromeNews {
             }
             watches[tab] = Watch(id: id, task: task, version: Self.version(.object(fields)) ?? "",
                 url: ExistingCornersReaders.string(fields["url"]) ?? "", view: Self.view(fields), snapshot: fields, chrome: chrome, senseVersion: record.version)
+            NotificationCenter.default.post(name: SenseNewsBoard.presentationDidChange, object: nil)
         } catch { await chrome.recordCaptureError(error.localizedDescription, tabID: tab) }
     }
 
@@ -382,6 +397,7 @@ actor NativeChromeNews {
                   record.version == watches[tab]?.senseVersion else {
                 watches.removeValue(forKey: tab)?.task.cancel()
                 retireObserverIfIdle()
+                NotificationCenter.default.post(name: SenseNewsBoard.presentationDidChange, object: nil)
                 return
             }
             guard let version = Self.version(snapshot) else { return }
@@ -459,10 +475,12 @@ actor NativeChromeNews {
             return changes.isEmpty ? "" : "; states: " + changes.joined(separator: ", ")
         }
         var details: [String] = []
-        for key in added.prefix(3) { details.append("added " + label(new[key]!)) }
-        for key in removed.prefix(max(0, 3 - details.count)) { details.append("removed " + label(old[key]!)) }
+        for row in added.prefix(3).compactMap({ new[$0] }) { details.append("added " + label(row)) }
+        for row in removed.prefix(max(0, 3 - details.count)).compactMap({ old[$0] }) { details.append("removed " + label(row)) }
         for key in changed.prefix(max(0, 3 - details.count)) {
-            details.append(try "changed " + label(old[key]!) + " → " + label(new[key]!) + stateChanges(old[key]!, new[key]!))
+            if let before = old[key], let after = new[key] {
+                details.append(try "changed " + label(before) + " → " + label(after) + stateChanges(before, after))
+            }
         }
         func lines(_ fields: [String: JSONValue]) -> [String] {
             guard case .object(let summary)? = fields["summary"] else { return [] }
@@ -492,6 +510,7 @@ actor NativeChromeNews {
     private func ended(_ tab: Int64, id: UUID) {
         if watches[tab]?.id == id { watches.removeValue(forKey: tab) }
         retireObserverIfIdle()
+        NotificationCenter.default.post(name: SenseNewsBoard.presentationDidChange, object: nil)
     }
 }
 
@@ -543,7 +562,7 @@ private enum ExistingCornersReaders {
         case .stream(let id) where id == "browser":
             return ("browser.read_text", input)
         case .stream(let id) where id == "connectors":
-            if address == nil { return ("app", ["read": .string("connectors"), "raw": .bool(true)]) }
+            if address == nil { return ("app", ["page": .string("connectors")]) }
             guard let actionID = string(input.removeValue(forKey: "action")),
                   let action = AppActions.action(actionID), action.read,
                   connectorPages.contains(action.page), !action.tool.isEmpty else {
@@ -572,21 +591,18 @@ private enum ExistingCornersReaders {
     }
 
     static func requireReadable(_ result: JSONValue) throws {
-        if case .object(let fields) = result,
-           fields["ok"] == .bool(false) || fields["status"] == .string("failed") || fields["error"] != nil {
+        guard ChatToolOutcome.hasReadEvidence(result) else {
             throw SenseFailure(code: "source_unavailable", message: "The original reader refused this read.")
         }
     }
 
     static func outputText(_ result: JSONValue) throws -> String {
         if case .string(let text) = result { return text }
-        // This is the turn's existing JSON presentation, including receipts,
-        // failures and byte-window continuation arguments.
         return try result.serialize(pretty: false)
     }
 
     static func documentText(_ result: JSONValue) throws -> String {
-        guard case .object(let object) = result, object["ok"] == .bool(true) else {
+        guard ChatToolOutcome.hasReadEvidence(result), case .object(let object) = result, object["ok"] == .bool(true) else {
             throw SenseFailure(code: "source_unavailable", message: try outputText(result))
         }
         if case .string(let text)? = object["text"] { return text }

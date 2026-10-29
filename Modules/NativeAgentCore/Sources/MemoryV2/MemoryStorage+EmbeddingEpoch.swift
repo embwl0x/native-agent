@@ -32,13 +32,11 @@ extension MemoryStorage {
                                arguments: [epoch.rawValue, hash, Self.encodeEmbedding(vector)])
             }
             if let hashes {
-                for row in try Row.fetchAll(db, sql: "SELECT epoch, text_hash FROM action_embeddings") {
-                    let storedEpoch: String = row["epoch"], hash: String = row["text_hash"]
-                    if storedEpoch != epoch.rawValue || !hashes.contains(hash) {
-                        try db.execute(sql: "DELETE FROM action_embeddings WHERE epoch = ? AND text_hash = ?",
-                                       arguments: [storedEpoch, hash])
-                    }
-                }
+                let retained = String(decoding: try JSONEncoder().encode(hashes), as: UTF8.self)
+                try db.execute(sql: """
+                    DELETE FROM action_embeddings
+                    WHERE epoch <> ? OR text_hash NOT IN (SELECT value FROM json_each(?))
+                    """, arguments: [epoch.rawValue, retained])
             }
         }
     }
@@ -107,7 +105,7 @@ extension MemoryStorage {
             }
             try db.execute(sql: """
                 UPDATE memory_embedding_state
-                SET active_epoch = ?, previous_epoch = ?, activated_at = ?, rollback_available = 0
+                SET active_epoch = ?, previous_epoch = ?, activated_at = ?
                 WHERE id = 1
             """, arguments: [epoch.rawValue, prior.activeEpoch, activatedAt])
 
@@ -141,13 +139,13 @@ extension MemoryStorage {
         result += try Row.fetchAll(db, sql: """
             SELECT id, content FROM memories WHERE embedding IS NOT NULL OR status <> 'active' ORDER BY id
             """).map {
-            MemoryEmbeddingCorpusRow(kind: .memory, id: $0["id"], content: $0["content"])
+            try MemoryEmbeddingCorpusRow(kind: .memory, id: $0.decode(forColumn: "id"), content: $0.decode(forColumn: "content"))
         }
         result += try Row.fetchAll(db, sql: "SELECT id, content FROM proposals ORDER BY id").map {
-            MemoryEmbeddingCorpusRow(kind: .proposal, id: $0["id"], content: $0["content"])
+            try MemoryEmbeddingCorpusRow(kind: .proposal, id: $0.decode(forColumn: "id"), content: $0.decode(forColumn: "content"))
         }
         result += try Row.fetchAll(db, sql: "SELECT content_hash, content FROM tombstones ORDER BY content_hash").map {
-            MemoryEmbeddingCorpusRow(kind: .tombstone, id: $0["content_hash"], content: $0["content"])
+            try MemoryEmbeddingCorpusRow(kind: .tombstone, id: $0.decode(forColumn: "content_hash"), content: $0.decode(forColumn: "content"))
         }
         return result
     }
@@ -157,8 +155,7 @@ extension MemoryStorage {
         return MemoryEmbeddingEpochState(
             activeEpoch: row?["active_epoch"],
             previousEpoch: row?["previous_epoch"],
-            activatedAt: row?["activated_at"],
-            rollbackAvailable: (row?["rollback_available"] as Int? ?? 0) != 0
+            activatedAt: row?["activated_at"]
         )
     }
 

@@ -3,9 +3,6 @@ import NativeAgentCore
 
 // Blueprint: | `ContextProjectionSources.swift` | `ContextCompiledProjectionProvider`: incremental rebuildable source projections, generation-bound exclusions and delivery/publication hooks |
 
-/// Incremental output from a rebuildable non-file Context source projection.
-/// Providers compare their current source of truth with `previousSources` and
-/// return only changed sources plus sources that must leave the next generation.
 /// The chosen atoms a provider drops, and the degraded-source receipts for
 /// what it could not verify (dropped too).
 public struct ContextTurnExclusion: Sendable {
@@ -18,20 +15,27 @@ public struct ContextTurnExclusion: Sendable {
     }
 }
 
+/// Hash changes and retirements from one owner's current source inventory.
 public struct ContextCompiledProjectionResult: Sendable, Equatable {
     public let changedSources: [ContextCompiledSource]
     public let removedSourceIDs: Set<ContextSourceID>
-    /// Derived record identities, accepted only with this projection's generation.
-    public let atomRecordIDs: [ContextAtomID: String]
-
     public init(
         changedSources: [ContextCompiledSource],
-        removedSourceIDs: Set<ContextSourceID> = [],
-        atomRecordIDs: [ContextAtomID: String] = [:]
+        removedSourceIDs: Set<ContextSourceID> = []
     ) {
         self.changedSources = changedSources
         self.removedSourceIDs = removedSourceIDs
-        self.atomRecordIDs = atomRecordIDs
+    }
+
+    public init(owner: String, currentSources: [ContextCompiledSource],
+                previousSources: [ContextSourceID: ContextCompiledSource]) {
+        changedSources = currentSources.filter {
+            previousSources[$0.descriptor.id]?.sourceHash != $0.sourceHash
+        }
+        let currentIDs = Set(currentSources.map(\.descriptor.id))
+        removedSourceIDs = Set(previousSources.values.lazy
+            .filter { $0.descriptor.owner == owner }
+            .map(\.descriptor.id)).subtracting(currentIDs)
     }
 
     public var isEmpty: Bool {
@@ -74,13 +78,8 @@ public protocol ContextCompiledProjectionProvider: Sendable {
         previousSources: [ContextSourceID: ContextCompiledSource]
     ) async throws -> ContextCompiledProjectionResult
 
-    /// Synchronous acceptance after arena publication. Nil carries unchanged
-    /// projection state forward; pinned generations must retain their identities.
-    func didPublish(
-        _ result: ContextCompiledProjectionResult?,
-        generation: ContextStoredGeneration,
-        retaining generationIDs: Set<Int64>
-    )
+    /// Synchronous acceptance of the published generation after arena publication.
+    func didPublish(generation: ContextStoredGeneration)
 }
 
 public extension ContextCompiledProjectionProvider {
@@ -92,11 +91,7 @@ public extension ContextCompiledProjectionProvider {
                 surface: ContextSurface) async -> ContextTurnExclusion { ContextTurnExclusion() }
     func didDeliver(_ items: [ContextPacketItem]) async {}
 
-    func didPublish(
-        _ result: ContextCompiledProjectionResult?,
-        generation: ContextStoredGeneration,
-        retaining generationIDs: Set<Int64>
-    ) {}
+    func didPublish(generation: ContextStoredGeneration) {}
 
     func isInvalidated(by change: DerivedSourceChange) -> Bool {
         guard change.semantic, invalidationNamespaces.contains(change.namespace) else { return false }

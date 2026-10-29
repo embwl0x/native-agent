@@ -20,12 +20,10 @@ public enum OncePerPeriodReservation: Sendable {
 ///
 /// PersistenceCore owns this primitive because both lower-level organs (for
 /// example DreamREMCycle) and BackgroundLoops need the same durable exclusion
-/// boundary. Keeping it in a loop module forced lower-level organs to hand-roll
-/// weaker copies or create a dependency cycle.
+/// boundary.
 public func reserveOncePerPeriod(
     at marker: URL,
     stamp: String,
-    core: SwiftNativePersistenceCore = SwiftNativePersistenceCore(),
     isFresh: @Sendable (_ stored: String?) throws -> Bool
 ) async -> OncePerPeriodReservation {
     do {
@@ -33,7 +31,7 @@ public func reserveOncePerPeriod(
         // lock admission creates a stale-rollback race: another process can
         // stamp between the read and our claim, after which our failed work
         // would restore a marker older than the claim we actually replaced.
-        let claim = try await core.withFileLock(marker) { () -> (reserved: Bool, prior: Data?) in
+        let claim = try await SwiftNativePersistenceCore.withFileLock(marker) { () -> (reserved: Bool, prior: Data?) in
             let prior: Data?
             let stored: String?
             if FileManager.default.fileExists(atPath: marker.path) {
@@ -50,24 +48,22 @@ public func reserveOncePerPeriod(
                 stored = nil
             }
             if try isFresh(stored) { return (false, prior) }
-            guard let stampData = stamp.data(using: .utf8) else {
-                throw PersistenceCoreError.ioFailure("could not encode period marker stamp")
-            }
-            try stampData.write(to: marker, options: .atomic)
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(Data(stamp.utf8), to: marker)
             return (true, prior)
         }
         guard claim.reserved else { return .alreadyReserved }
         let prior = claim.prior
         return .reserved(stamp: stamp, rollback: {
             do {
-                try await core.withFileLock(marker) {
+                try await SwiftNativePersistenceCore.withFileLock(marker) {
                     guard let current = try? Data(contentsOf: marker),
                           String(data: current, encoding: .utf8) == stamp
                     else { return }
                     if let prior {
-                        try prior.write(to: marker, options: .atomic)
+                        try SwiftNativePersistenceCore.writeDataAtomicDurable(prior, to: marker)
                     } else {
                         try FileManager.default.removeItem(at: marker)
+                        try SwiftNativePersistenceCore.syncDirectory(marker.deletingLastPathComponent())
                     }
                 }
             } catch {
@@ -84,8 +80,7 @@ public func reserveOncePerPeriod(
 /// Period-keyed convenience: reserve iff the stored key differs from `key`.
 public func reserveOncePerPeriod(
     key: String,
-    at marker: URL,
-    core: SwiftNativePersistenceCore = SwiftNativePersistenceCore()
+    at marker: URL
 ) async -> OncePerPeriodReservation {
-    await reserveOncePerPeriod(at: marker, stamp: key, core: core) { $0 == key }
+    await reserveOncePerPeriod(at: marker, stamp: key) { $0 == key }
 }

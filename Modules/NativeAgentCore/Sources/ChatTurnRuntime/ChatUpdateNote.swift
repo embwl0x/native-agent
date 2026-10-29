@@ -1,15 +1,9 @@
 import Foundation
+import PersistenceCore
+import NativeAgentShared
 // Blueprint: | `ChatUpdateNote.swift` | Version note selection and launch transaction with supplied bundle resource/version inputs |
 
-/// U1 (User, 2026-09-10): after the app updates, the agent had no way to know
-/// what changed — someone asked theirs and it could not find out.
-///
-/// The app writes ONE record here when the bundle version changes; the turn
-/// engine reads it into the DYNAMIC system segment on the next turn and stamps
-/// it delivered, so it is a note left quietly rather than a push, a sound, or a
-/// chat row that looks like the person typed. The dynamic segment is turn-scoped
-/// volatile (lifted out of the cached prefix), so this costs no prompt-cache
-/// prefix and vanishes after the one delivery.
+/// A bundle-version change writes one note, delivered once through the next turn's dynamic segment outside the cached prefix.
 public struct ChatUpdateNoteRecord: Codable, Equatable, Sendable {
     public var from: String
     public var to: String
@@ -67,13 +61,9 @@ public enum ChatUpdateNote {
     public static func write(_ record: ChatUpdateNoteRecord, dataRoot: URL) {
         let url = recordURL(dataRoot: dataRoot)
         do {
-            try FileManager.default.createDirectory(
-                at: url.deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
-            try encoder.encode(record).write(to: url, options: [.atomic])
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(encoder.encode(record), to: url)
         } catch {
             nativeLog("[update-note] could not write the update note: %@", error.localizedDescription)
         }

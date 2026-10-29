@@ -6,8 +6,8 @@ import Experiences
 import Transcripts
 import TurnTrace
 import ProviderRouting
-import Experiences
-// Blueprint: | `ChatOrchestration+Continuation.swift` | `SwiftNativeTurnEngine`: `executeTurnWithStreamingToolLoop`; `TurnCheckpointScope`, serialized `TurnCheckpointWriter`; same-turn transcript/receipt recovery and finished-run cleanup |
+import NativeAgentShared
+// Blueprint: | `ChatOrchestration+Continuation.swift` | `SwiftNativeTurnEngine`: `executeTurnWithStreamingToolLoop`, closing expansion predictions through `Expansion.withTurn` after the whole turn, including deferred after-reply work or its abandonment; `TurnCheckpointScope`, serialized `TurnCheckpointWriter`; same-turn transcript/receipt recovery and finished-run cleanup |
 
 public enum TurnCheckpointScope {
     @TaskLocal public static var resuming: TurnCheckpoint?
@@ -88,9 +88,8 @@ extension SwiftNativeChatOrchestrationClient {
     public static func retainRequestedResult(dataRoot: URL, sessionId: String, runId: String, deliveryId: String) async throws {
         guard NativeAgentChatSessionID.normalizedPathComponent(sessionId) == sessionId else { throw CocoaError(.fileReadInvalidFileName) }
         let path = dataRoot.appendingPathComponent("chat/messages/\(sessionId).jsonl")
-        let persistence = SwiftNativePersistenceCore()
-        try await persistence.withFileLock(path) {
-            let read = try await persistence.readJSONLReporting(path)
+        try await SwiftNativePersistenceCore.withFileLock(path) {
+            let read = try await SwiftNativePersistenceCore.readJSONLReporting(path)
             guard read.report.malformedLineCount == 0, !read.report.trailingPartialLine,
                   read.rows.allSatisfy({ if case .object = $0 { return true }; return false }) else {
                 throw CocoaError(.fileReadCorruptFile)
@@ -173,18 +172,22 @@ extension SwiftNativeChatOrchestrationClient {
         return found
     }
 
-    public static func savedReply(dataRoot: URL, sessionId: String, runId: String, turnId: String? = nil) async throws -> ChatResponse? {
+    public static func savedReply(dataRoot: URL, sessionId: String, runId: String?, turnId: String? = nil,
+                                  deliveryId: String? = nil, requestDigest: String? = nil) async throws -> ChatResponse? {
         guard NativeAgentChatSessionID.normalizedPathComponent(sessionId) == sessionId else {
             throw CocoaError(.fileReadInvalidFileName)
         }
         let path = dataRoot.appendingPathComponent("chat/messages/\(sessionId).jsonl")
-        let persistence = SwiftNativePersistenceCore()
-        let read = try await persistence.withFileLock(path) { try await persistence.readJSONLReporting(path) }
+        let read = try await SwiftNativePersistenceCore.withFileLock(path) { try await SwiftNativePersistenceCore.readJSONLReporting(path) }
         guard read.report.malformedLineCount == 0, !read.report.trailingPartialLine,
               read.rows.allSatisfy({ if case .object = $0 { return true }; return false }) else {
             throw CocoaError(.fileReadCorruptFile)
         }
         let rows = read.rows
+        guard let runId = try runId ?? deliveryId.flatMap({
+            try CodexCompletionTranscriptEvidence.recoverRunId(from: rows, deliveryId: $0,
+                requestDigest: requestDigest, sessionId: sessionId)
+        }) else { return nil }
         for row in rows.reversed() {
             guard case .object(let fields) = row, fields["role"] == .string("assistant"),
                   fields["runId"] == .string(runId), fields["sessionId"] == .string(sessionId),
@@ -212,17 +215,9 @@ extension SwiftNativeChatOrchestrationClient {
             let answerRef = Self.transcriptRef(sessionId, outcome.messageID)
             let heardID = TurnEnvelope.fromPersistedMetadata(metadata["envelope"])?.answerExperienceID ?? outcome.turnID
             // The same birth the turn wrote, so a lost one is restored and a kept one stands.
-            await Self.recordAnswer(id: Experience.answer(run: runId), heardID: heardID, evidence: answerRef, state: state,
-                              dataRoot: dataRoot) { [attachments = response.attachments ?? []] in
-                var answer = Experience(id: Experience.answer(run: runId), kind: .answer, cause: [heardID],
-                    evidence: [answerRef], face: Self.face(content, attachments), addressedTo: ["conversation:" + sessionId])
-                let checkpoint = try? TurnCheckpoint.read(dataRoot: dataRoot, sessionId: sessionId, turnId: outcome.turnID)
-                if let owed = checkpoint?.owedDelivery(status: state.rawValue) {
-                    answer.addressedTo.append(owed.to)
-                    answer.owes[owed.key] = .init(to: owed.to)
-                }
-                return answer
-            }
+            await Self.recordAnswer(runID: runId, heardID: heardID, evidence: answerRef, state: state,
+                dataRoot: dataRoot, words: content, attachments: response.attachments ?? [],
+                conversation: (sessionId, outcome.turnID))
             return response
         }
         return nil
@@ -256,7 +251,7 @@ extension SwiftNativeChatOrchestrationClient {
     }
 
     public func resumeTurn(_ checkpoint: TurnCheckpoint, request: TurnRequest,
-                           progress: ChatOrchestrationProgressHandler? = nil) async throws -> ChatResponse {
+                           progress: TurnEventSink? = nil) async throws -> ChatResponse {
         guard try DataRootLife.isCurrent(checkpoint.lifeID, in: dataRoot) else { throw CancellationError() }
         let history = try await history.messagesWithStats(forSessionId: checkpoint.sessionId, strictEvidence: true)
         guard history.stats.malformedRowCount == 0, history.stats.invalidShapeRowCount == 0 else {
@@ -385,13 +380,14 @@ extension SwiftNativeTurnEngine {
         surface: String = "chat", userMessage: String, sessionId: String? = nil,
         toolSessionId: String? = nil, runId: String? = nil,
         llm: any LLMClient,
-        tools: any ToolDispatchClient, preBuiltContext: TurnContext? = nil,
-        progress: ChatOrchestrationProgressHandler? = nil,
+        tools: any ToolDispatchClient, preBuiltContext: TurnContext,
+        progress: TurnEventSink? = nil,
+        onDelivery: (@Sendable () async -> Void)? = nil,
         cancelFlagPath: URL? = nil, providerAdmission: (@Sendable () async throws -> Void)? = nil,
         fileAccess: String = "auto", capabilityProfile: String? = nil
     ) async throws -> TurnEngineResult {
         let heardID = sessionId == nil ? TurnTraceContext.turnId : ChatToolSessionContext.envelope?.answerExperienceID
-        let effectiveProgress: ChatOrchestrationProgressHandler = { [remPinsDataRoot] event in
+        let effectiveProgress: TurnEventSink = { [remPinsDataRoot] event in
             if let root = remPinsDataRoot, let heardID {
                 switch event {
                 case .delta, .toolUse, .toolResult, .notice, .replyTextSettled:
@@ -428,13 +424,15 @@ extension SwiftNativeTurnEngine {
         return try await TurnCheckpointScope.$current.withValue(checkpoint) {
         return try await DeskContinuationScope.$current.withValue(journal) {
             do {
-                let result = try await Self.untilStopped(cancelFlagPath) { [self] in
-                    try await executeContinuationTurnBody(
-                        surface: surface, userMessage: userMessage, sessionId: sessionId,
-                        toolSessionId: toolSessionId, runId: runId,
-                        llm: llm, tools: tools,
-                        preBuiltContext: preBuiltContext, progress: effectiveProgress,
-                        cancelFlagPath: cancelFlagPath, providerAdmission: providerAdmission)
+                let result = try await Expansion.withTurn(dataRoot: remPinsDataRoot, afterReply: { $0.afterReply }) {
+                    try await Self.untilStopped(cancelFlagPath) { [self] in
+                        try await executeContinuationTurnBody(
+                            surface: surface, userMessage: userMessage, sessionId: sessionId,
+                            toolSessionId: toolSessionId, runId: runId,
+                            llm: llm, tools: tools,
+                            preBuiltContext: preBuiltContext, progress: effectiveProgress, onDelivery: onDelivery,
+                            cancelFlagPath: cancelFlagPath, providerAdmission: providerAdmission)
+                    }
                 }
                 let reason = result.terminalReason ?? .incomplete
                 let state: DeskContinuation.State

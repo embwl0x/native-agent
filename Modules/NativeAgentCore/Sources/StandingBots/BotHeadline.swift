@@ -1,14 +1,7 @@
 import Foundation
-// Blueprint: | `BotHeadline.swift` | `BotHeadline` enum; `make` |
+// Blueprint: | `BotHeadline.swift` | `BotHeadline` enum; `make`, `clipped` preserve whole-word reply headlines |
 
-/// The one line a bot card shows for a reply (2026-09-11, found by Agent
-/// driving her first bot: the headline was the first 240 bytes of a markdown
-/// table, pipes and all). The first line of prose, with markdown marks
-/// stripped; table rows, fences and rules are skipped. Falls back to a plain
-/// nothing at all when the reply has no prose: a run that said nothing has no
-/// headline, and "Reply saved" over an empty reply was a claim the record did
-/// not support (Agent, 2026-09-13 — an interrupted, empty run read as a saved
-/// reply). The card derives the line from the run's status instead.
+/// Headlines use the first prose line without markdown; replies without prose have no headline.
 public enum BotHeadline {
     public static func make(from reply: String, cap: Int = 240) -> String {
         var fence: (mark: Character, length: Int)?
@@ -33,8 +26,19 @@ public enum BotHeadline {
             while let first = line.first, "#>-*•".contains(first) { line.removeFirst(); line = line.trimmingCharacters(in: .whitespaces) }
             line = line.replacingOccurrences(of: "**", with: "").replacingOccurrences(of: "`", with: "")
             if line.isEmpty { continue }
-            return String(line.prefix(cap))
+            return clipped(line, cap: cap)
         }
         return ""
+    }
+
+    /// Keep whole words, including when reading headlines saved by older builds.
+    public static func clipped(_ text: String, cap: Int = 240) -> String {
+        guard cap > 0 else { return "" }
+        guard text.count > cap else { return text }
+        let end = text.index(text.startIndex, offsetBy: cap)
+        let prefix = text[..<end]
+        if text[end].isWhitespace { return prefix.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard let boundary = prefix.lastIndex(where: { $0.isWhitespace }) else { return "…" }
+        return prefix[..<boundary].trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }

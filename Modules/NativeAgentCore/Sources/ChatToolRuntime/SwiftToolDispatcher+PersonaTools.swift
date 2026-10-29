@@ -13,7 +13,7 @@ import Context
 import SwarmRuns
 import WorkshopExecution
 import DreamREMCycle
-// Blueprint: | `SwiftToolDispatcher+PersonaTools.swift` | `SwiftToolDispatcher`: `impl_get_persona_doc`, `impl_persona_read`, `impl_persona_write` |
+// Blueprint: | `SwiftToolDispatcher+PersonaTools.swift` | `SwiftToolDispatcher`: persona read/write tools; introspection separates durable bundle/build/data-root identity from launch ids and names the surface/model/effort route and context-budget owners; get-persona-document truncates at a valid UTF-8 scalar boundary within its 64 KiB source cap |
 
 // MARK: - Persona and runtime introspection tools
 
@@ -21,7 +21,6 @@ extension SwiftToolDispatcher {
     private static let personaDocMaxBytes = 64 * 1024
 
     func impl_get_persona_doc(input: [String: JSONValue]) async throws -> JSONValue {
-        // 2026-09-22: persona_read/write/append take `kind`; accept it here too.
         let doc = try requireString(input, input["doc"] == nil && input["kind"] != nil ? "kind" : "doc")
         // Reject path-traversal characters.
         if doc.contains("/") || doc.contains("..") || doc.hasPrefix(".") {
@@ -30,36 +29,23 @@ extension SwiftToolDispatcher {
             )
         }
         let docName = doc.hasSuffix(".md") ? doc : "\(doc).md"
-        // CANONICAL persona doc path = <personaRoot>/<doc>.md.
-        // PersonaRootResolver.resolve() is the single source of truth for
-        // where the canonical persona docs live (mirrors PersonaCompiler's
-        // `readDoc(root:, id:)` at line 306 of PersonaEngine+Compiler.swift —
-        // PersonaCompiler treats this exact path as the authoritative doc.)
-        // The per-persona subdir <root>/<name>/<doc>.md is an OVERRIDE for
-        // multi-persona setups, NOT a fallback — exposing it via this tool
-        // would conflate "read THE doc" with "read someone's customization
-        // of the doc" and turn callers into path-fiddlers. If a future
-        // multi-persona override surface is needed, that's its own tool
-        // (get_persona_override or similar).
-        let personaRoot = personaRootForTools()
-        let rootPath = personaRoot.resolvingSymlinksInPath().path
-        let url = personaRoot
-            .appendingPathComponent(docName)
-            .resolvingSymlinksInPath()
-        guard url.path == rootPath || url.path.hasPrefix(rootPath + "/") else {
-            throw AutonomyGateError.toolDenied(
-                reason: "SwiftToolDispatcher: persona path escapes personaRoot ('\(docName)')"
-            )
+        let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
+        let result = PersonaSystemActions.personaRead([:],
+            ConnectorActionContext(repoRoot: rootForRead, dataRoot: dataRoot, personaRoot: personaRoot),
+            selectedDocument: personaRoot.appendingPathComponent(docName))
+        guard case .object(let fields) = result else {
+            throw ToolFailureError("Persona reader returned an invalid response.", effects: .none)
         }
-        guard let bytes = try? Data(contentsOf: url),
-              let text = String(data: bytes, encoding: .utf8) else {
-            throw AutonomyGateError.toolDenied(
-                reason: "SwiftToolDispatcher: persona doc not found at '\(url.path)'"
-            )
+        guard case .string(let text)? = fields["content"] else {
+            throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher: " + (fields["error"]?.stringValue ?? "Persona document read failed."))
         }
+        let bytes = Data(text.utf8)
         if bytes.count > Self.personaDocMaxBytes {
-            let head = bytes.prefix(Self.personaDocMaxBytes)
-            let headText = String(data: head, encoding: .utf8) ?? text
+            var head = bytes.prefix(Self.personaDocMaxBytes)
+            // The whole document is valid UTF-8; only the final scalar may
+            // straddle this cap. Remove its incomplete bytes, never the cap.
+            while !head.isEmpty, String(data: head, encoding: .utf8) == nil { head.removeLast() }
+            let headText = String(decoding: head, as: UTF8.self)
             return .string(headText + "\n... [truncated, \(bytes.count) bytes total]")
         }
         return .string(text)
@@ -68,15 +54,15 @@ extension SwiftToolDispatcher {
     func impl_persona_read(input: [String: JSONValue]) async throws -> JSONValue {
         let kind = try requireString(input, "kind")
         let result = PersonaSystemActions.personaRead(["kind": .string(kind)],
-            ConnectorActionContext(repoRoot: rootForRead.path, dataRoot: dataRoot.path,
-                                   personaRoot: personaRootForTools().path))
+            ConnectorActionContext(repoRoot: rootForRead, dataRoot: dataRoot,
+                                   personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)))
         if case .object(let fields) = result, fields["ok"] == .bool(false) {
-            let error = jsonString(fields["error"]) ?? ""
+            let error = fields["error"]?.stringValue ?? ""
             if fields["error_code"] == .string("bad_input") {
                 throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher persona_read " + error)
             }
             if fields["error_code"] == .string("persona_not_found"),
-               let target = SwiftNativePersonaEngine.personaDocumentPath(kind: kind, root: personaRootForTools()) {
+               let target = SwiftNativePersonaEngine.personaDocumentPath(kind: kind, root: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)) {
                 throw AutonomyGateError.toolDenied(reason: "SwiftToolDispatcher persona_read doc not found at '\(target.path)'")
             }
             throw AutonomyGateError.toolDenied(reason: error)
@@ -87,7 +73,7 @@ extension SwiftToolDispatcher {
     func impl_persona_write(input: [String: JSONValue]) async throws -> JSONValue {
         let kind = try requireString(input, "kind")
         let content = try requireString(input, "content")
-        let engine = SwiftNativePersonaEngine(root: personaRootForTools(), dataRoot: dataRoot)
+        let engine = SwiftNativePersonaEngine(root: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot), dataRoot: dataRoot)
         // GROWTH keeps the lines REM approved, graduated standing lessons among
         // them (a 10-09 rewrite silently dropped some). One goes only when
         // `retire` names it with a reason; it is then tombstoned, as a REM deny
@@ -136,7 +122,7 @@ extension SwiftToolDispatcher {
                     }
                     for row in retired {
                         try await REMTombstoneStore(dataRoot: dataRoot).record(
-                            row.asREMProposal, reason: retire[row.proposalText.trimmingCharacters(in: .whitespacesAndNewlines)] ?? "")
+                            row, reason: retire[row.proposalText.trimmingCharacters(in: .whitespacesAndNewlines)] ?? "")
                     }
                     try REMConsolidator.emitREMPinsIndex(dataRoot: dataRoot)
                     fields["retired"] = .array(retired.map { .string($0.proposalText) })
@@ -165,7 +151,7 @@ extension SwiftToolDispatcher {
         let kind = try requireString(input, "kind")
         let title = try requireString(input, "title")
         let content = try requireString(input, "content")
-        let engine = SwiftNativePersonaEngine(root: personaRootForTools(), dataRoot: dataRoot)
+        let engine = SwiftNativePersonaEngine(root: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot), dataRoot: dataRoot)
         do {
             let result = try await engine.personaAppendSection(
                 kind: kind,
@@ -181,8 +167,8 @@ extension SwiftToolDispatcher {
     }
 
     func impl_agent_introspect(input: [String: JSONValue]) async throws -> JSONValue {
-        let sessionId = Self.extractSessionId(from: input)
-        let fullDetail = (jsonString(input["detail"]) ?? "compact")
+        let sessionId = ChatToolSessionInjection.explicitSessionId(in: input)
+        let fullDetail = (input["detail"]?.stringValue ?? "compact")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() == "full"
         let pid = ProcessInfo.processInfo.processIdentifier
@@ -200,13 +186,23 @@ extension SwiftToolDispatcher {
                 "tool_loop": .string("SwiftNativeTurnEngine.executeTurnWithStreamingToolLoop"),
                 "dispatcher": .string("SwiftToolDispatcher"),
             ]),
-            "runtime_instance_id": .string(runtimeInstanceID),
-            "process_id": .int(Int64(pid)),
+            "identity": .object([
+                "bundle_id": Bundle.main.bundleIdentifier.map(JSONValue.string) ?? .null,
+                "data_root": .string(dataRoot.path),
+                "build": Self.buildStamp(identity: .current),
+            ]),
+            "launch": .object([
+                "runtime_instance_id": .string(runtimeInstanceID), "process_id": .int(Int64(pid)),
+                "note": .string("These ids identify this running process only and change on relaunch; they are not your durable identity."),
+            ]),
             "tool_state": .string("app is your one tool; app {find} finds an action by what you want done. Request detail=full for diagnostic roots and outcome population health"),
         ]
         if case .object(let stamp) = provider, case .string(let model)? = stamp["model"] {
-            response["context_window"] = .object(ChatSessionAutocompactionConfig.productionDefault().contextWindowReadout(
-                forModel: model, providerID: jsonString(stamp["name"]), dataRoot: dataRoot))
+            var window = ChatSessionAutocompactionConfig.productionDefault().contextWindowReadout(
+                forModel: model, providerID: stamp["name"]?.stringValue, dataRoot: dataRoot)
+            window["route"] = .object(stamp.filter { ["name", "model", "surface", "reasoning_effort", "source"].contains($0.key) })
+            window["owner"] = .string("The surface's provider/model/effort route selects the model. ProviderRouting's verified model catalog supplies its native window; Settings > Context window and ChatSessionAutocompactionConfig set the effective history budget. Effort is reported as routing context, not a separate window multiplier.")
+            response["context_window"] = .object(window)
         }
         if !sessionId.isEmpty {
             // session_id stays as a compatibility alias, but now names the
@@ -225,7 +221,7 @@ extension SwiftToolDispatcher {
             .union(LLMCallContext.turnActiveTools ?? [])
             .intersection(modelVisibleAvailableTools)
             .sorted()
-        let personaRoot = personaRootForTools()
+        let personaRoot = PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
         let trustedRoots = await trustedWorkspaceRoots()
         let outcomeDimensionHealth: JSONValue
         do {
@@ -257,25 +253,24 @@ extension SwiftToolDispatcher {
         response["compatibility"] = .object([
             "recall_search": .string("alias_for_recall_memory"),
         ])
-        response["build"] = Self.buildStamp(identity: .current, pid: pid)
+        response["build"] = Self.buildStamp(identity: .current)
         return .object(response)
     }
 
-    /// Which binary is answering this turn. Full detail only — the compact
-    /// payload stays free of build mass on ordinary turns.
+    /// Which binary is answering this turn, independent of this launch's ids.
     ///
     /// Reads `NativeAgentBuildIdentity`, the SAME type the local bridge's
     /// `buildIdentity` payload reports, so an in-turn answer and an
     /// out-of-band bridge read can never name different binaries.
     /// `exactSourceRevision` is null on a dirty or unstamped build: absence is
     /// the honest answer, never a bare `sourceRevision` promoted to proof.
-    static func buildStamp(identity: NativeAgentBuildIdentity, pid: Int32) -> JSONValue {
+    static func buildStamp(identity: NativeAgentBuildIdentity) -> JSONValue {
         .object([
             "version": .string(identity.version),
+            "build": .string(identity.build),
             "exactSourceRevision": identity.exactSourceRevision.map(JSONValue.string) ?? .null,
             "sourceDirty": .bool(identity.sourceDirty),
             "sourceContentID": identity.sourceContentID.map(JSONValue.string) ?? .null,
-            "pid": .int(Int64(pid)),
         ])
     }
 
@@ -285,15 +280,7 @@ extension SwiftToolDispatcher {
     /// differ from the configured one on a per-turn override. `source` tells the
     /// agent which it got: live_turn / configured / unresolved.
     static func providerStamp(dataRoot: URL) async -> JSONValue {
-        let router = SwiftNativeProviderRouting(
-            dataRoot: dataRoot,
-            surfacesPathOverride: dataRoot
-                .appendingPathComponent("providers", isDirectory: true)
-                .appendingPathComponent("surfaces.json"),
-            activeProviderPathOverride: dataRoot
-                .appendingPathComponent("providers", isDirectory: true)
-                .appendingPathComponent("active.json")
-        )
+        let router = SwiftNativeProviderRouting(dataRoot: dataRoot)
         if let turn = ChatTurnRuntimeContext.current,
            !turn.model.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             // Report the exact transport admitted with this turn. Model-family
@@ -312,6 +299,7 @@ extension SwiftToolDispatcher {
                 ),
                 "model": .string(turn.model),
                 "surface": .string(turn.surface),
+                "reasoning_effort": LLMCallContext.reasoningEffort.map(JSONValue.string) ?? .null,
                 "surface_active_provider": surfaceActiveProvider.map { JSONValue.string($0) } ?? .null,
                 "source": .string("live_turn"),
             ])
@@ -330,6 +318,7 @@ extension SwiftToolDispatcher {
                 "name": .string(surfaceActiveProvider ?? router.inferProviderForModel(pref.model) ?? "unknown"),
                 "model": .string(pref.model),
                 "surface": .string("chat"),
+                "reasoning_effort": .string(pref.reasoningEffort),
                 "surface_active_provider": surfaceActiveProvider.map { JSONValue.string($0) } ?? .null,
                 "source": .string("configured"),
             ])

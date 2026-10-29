@@ -7,19 +7,17 @@ import PersonaEngine
 
 // Blueprint: | `SkillLifecycleView.swift` | `SkillLifecycleView`: persona-guidance list/search/source reads and explicit build-draft handoff through existing chat owners |
 
-// MARK: - SkillLifecycleView (redesigned 2026-07-03, User's direction)
-//
 // This page reads persona guidance; authored abilities live in Tools.
 enum SkillLifecycleSearchPresentation {
     struct Results {
-        let displayed: [SkillInfo]
+        let displayed: [SkillRecord]
         let isFiltering: Bool
         let resultCountText: String?
         let emptyTitle: String
         let emptyDetail: String
     }
 
-    static func results(_ skills: [SkillInfo], query: String) -> Results {
+    static func results(_ skills: [SkillRecord], query: String) -> Results {
         let isFiltering = !normalized(query).isEmpty
         let displayed = filtered(skills, query: query)
         return Results(
@@ -35,7 +33,7 @@ enum SkillLifecycleSearchPresentation {
         )
     }
 
-    static func filtered(_ skills: [SkillInfo], query: String) -> [SkillInfo] {
+    static func filtered(_ skills: [SkillRecord], query: String) -> [SkillRecord] {
         let needle = normalized(query)
         guard !needle.isEmpty else { return skills }
         return skills.filter { info in
@@ -43,15 +41,8 @@ enum SkillLifecycleSearchPresentation {
         }
     }
 
-    private static func searchableFields(for info: SkillInfo) -> [String] {
-        [
-            info.id,
-            info.registry.name,
-            info.registry.state,
-            info.manifest.name,
-            info.manifest.type,
-            info.manifest.description,
-        ] + (info.manifest.tags ?? [])
+    private static func searchableFields(for info: SkillRecord) -> [String] {
+        [info.id, info.name, info.description, "built in", "guidance"]
     }
 
     private static func normalized(_ value: String) -> String {
@@ -102,25 +93,24 @@ struct SkillLifecycleView: View {
     @Environment(AppModel.self) private var appModel
     @State private var searchText = ""
     @State private var readerTarget: String?
-    private let loadsOnAppear: Bool
 
-    init(initialSearchText: String = "", loadsOnAppear: Bool = true) {
-        _searchText = State(initialValue: initialSearchText)
-        self.loadsOnAppear = loadsOnAppear
+    private var skills: [SkillRecord] {
+        appModel.engine.tools.skills.map { record in
+            var skill = record
+            if skill.id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { skill.id = skill.name }
+            if skill.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { skill.name = skill.id }
+            return skill
+        }
     }
 
     private var searchResults: SkillLifecycleSearchPresentation.Results {
-        SkillLifecycleSearchPresentation.results(appModel.engine.tools.skillDetails, query: searchText)
+        SkillLifecycleSearchPresentation.results(skills, query: searchText)
     }
 
     var body: some View {
-        // 2026-09-03 Advanced refinement: the page's own gradient "Skills"
-        // title, the rule under the controls and the two banner strips were
-        // chrome sitting on the shell's sheet. What is left is one line about
-        // what skills are, the controls, and the rows.
         VStack(alignment: .leading, spacing: 16) {
             HStack(spacing: 8) {
-                Text("\(appModel.engine.tools.skillDetails.count) skills · I pull up the right one when a conversation calls for it; the full text loads only when it is needed.")
+                Text("\(skills.count) skills · I pull up the right one when a conversation calls for it; the full text loads only when it is needed.")
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -161,7 +151,7 @@ struct SkillLifecycleView: View {
                 Spacer(minLength: 8)
             }
 
-            if let feedback = appModel.skillLifecycleFeedback, feedback.kind == .failure {
+            if let feedback = appModel.skillLifecycleFeedback {
                 HStack(spacing: 8) {
                     Text(feedback.message)
                         .font(ShellType.label)
@@ -212,11 +202,10 @@ struct SkillLifecycleView: View {
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
         .task {
-            guard loadsOnAppear else { return }
             await appModel.loadSkillManifests()
         }
         .sheet(isPresented: Binding(get: { readerTarget != nil }, set: { if !$0 { readerTarget = nil } })) {
-            if let info = appModel.engine.tools.skillDetails.first(where: { $0.id == readerTarget }) {
+            if let info = skills.first(where: { $0.id == readerTarget }) {
                 SkillSourceSheet(info: info, onDismiss: { readerTarget = nil })
             }
         }
@@ -226,22 +215,22 @@ struct SkillLifecycleView: View {
 // MARK: - One skill row
 
 private struct SkillRow: View {
-    let info: SkillInfo
+    let info: SkillRecord
     let onRead: () -> Void
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(info.manifest.name.isEmpty ? info.id : info.manifest.name)
+                Text(info.name)
                     .font(ShellType.bodySemibold)
                     .foregroundStyle(NativeAgentShell.text)
-                Text(info.manifest.description)
+                Text(info.description)
                     .font(ShellType.label)
                     .foregroundStyle(NativeAgentShell.secondary)
                     .lineLimit(2)
             }
             Spacer(minLength: 8)
-            Text(info.registry.state)
+            Text("built in")
                 .font(ShellType.captionSemibold)
                 .padding(.horizontal, 8).padding(.vertical, 4)
                 .background(NativeAgentShell.quietFill, in: Capsule())
@@ -262,18 +251,18 @@ private struct SkillRow: View {
 // MARK: - Source review
 
 struct SkillSourceSheet: View {
-    let info: SkillInfo
+    let info: SkillRecord
     let onDismiss: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text(info.manifest.name).font(ShellType.title)
+                Text(info.name).font(ShellType.title)
                 Spacer()
                 Button("Done") { onDismiss() }.keyboardShortcut(.defaultAction)
             }
             ScrollView {
-                if let source = info.readme {
+                if let source = info.body {
                     BoundedSkillText(text: source, limit: 4_000)
                 } else {
                     Text("This guidance has no text to show.")
@@ -299,12 +288,7 @@ private struct BoundedSkillText: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            // PATCH-2026-05-11: skill-review-freeze-fix — `.textSelection(.enabled)`
-            // on a multi-thousand-character mono `Text` inside a material-
-            // backed sheet panel installs TextKit selection state per glyph
-            // at first paint. We now only enable selection once the user
-            // explicitly expanded the preview; the truncated default path
-            // renders without selection so presentation stays snappy.
+            // Enable selection only for expanded previews to avoid per-glyph TextKit setup at first paint.
             Group {
                 if expanded {
                     Text(visibleText)
@@ -337,17 +321,11 @@ extension Notification.Name {
 /// part of the contract: a repeated failure is a new event even when its text
 /// is byte-for-byte identical to the prior one.
 struct SkillLifecycleFeedback: Identifiable, Equatable, Sendable {
-    enum Kind: Equatable, Sendable {
-        case failure
-    }
-
     let id: UUID
-    let kind: Kind
     let message: String
 
-    init(kind: Kind, message: String) {
+    init(message: String) {
         self.id = UUID()
-        self.kind = kind
         self.message = message
     }
 }
@@ -358,7 +336,7 @@ extension AppModel {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         skillManifestError = trimmed
-        skillLifecycleFeedback = SkillLifecycleFeedback(kind: .failure, message: trimmed)
+        skillLifecycleFeedback = SkillLifecycleFeedback(message: trimmed)
     }
 
     @MainActor

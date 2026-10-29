@@ -1,5 +1,3 @@
-// Move-only extraction (tightness Wave C) from NativeCognitionRuntime.swift
-
 import Foundation
 import CognitiveSubstrate
 import Context
@@ -62,7 +60,7 @@ extension NativeCognitionRuntime {
         }
     }
 
-    func restoreProviderLifecycleEvidence() async {  // internal for actor extensions (move-only Wave C)
+    func restoreProviderLifecycleEvidence() async {
         // Keep a bounded evidence window across the canonical turn files and
         // standalone ledger, then restore the newest provider outcomes.
         let rows = (try? await TurnTraceRecentReader(
@@ -123,7 +121,7 @@ extension NativeCognitionRuntime {
         now: Date,
         halfLife: TimeInterval = 2 * 60 * 60,
         staleAfter: TimeInterval = 6 * 60 * 60
-    ) -> ProviderPathBeliefProjection? {
+    ) -> ProviderPathEstimate? {
         guard let capability,
               capability.kind == .providerCompletion,
               capability.evidenceBasis == .cumulativeOutcomes,
@@ -137,15 +135,13 @@ extension NativeCognitionRuntime {
         let freshness = age <= boundedStaleAfter
             ? exp(-log(2) * age / boundedHalfLife)
             : 0
-        return ProviderPathBeliefProjection(
+        return ProviderPathEstimate(
             generatedAt: now,
             estimate: capability.successLikelihood,
             freshness: freshness,
             uncertainty: capability.uncertainty,
             evidenceCount: capability.evidenceCount,
-            newestEvidenceAt: lastEvidenceAt,
-            state: .unobserved,
-            bodySchemaProvidersHealthy: nil
+            newestEvidenceAt: lastEvidenceAt
         )
     }
 

@@ -13,8 +13,9 @@ import MacControl
 import NativeAgentCore
 import NativeAgentShared
 import Photos
+import UserNotifications
 
-// Blueprint: | `SystemPermissionPreflight.swift` | `SystemPermissionPreflight`: person-initiated macOS permission prompts before System Settings handoff, including Bluetooth prompt lifecycle |
+// Blueprint: | `SystemPermissionPreflight.swift` | `SystemPermissionPreflight`: shared card and Settings consent acquisition, checked unresolved-grant handoff and Bluetooth prompt lifecycle |
 
 extension SystemPermissionPreflight {
     /// From a card tap, with the person there: fire macOS's own prompt where
@@ -22,8 +23,21 @@ extension SystemPermissionPreflight {
     /// off. True when the card should wait for that pane.
     @MainActor
     static func askMacOSForCard(_ ids: [String], mode: InlineInteraction.AccessMode?) async -> Bool {
+        !(await requestMacOSAccess(ids, mode: mode)).isEmpty
+    }
+
+    /// Both permission cards and Settings request through this owner. A grant
+    /// that succeeds stays in NativeAgent; only unresolved access opens a pane.
+    @MainActor
+    static func requestMacOSAccess(
+        _ ids: [String], mode: InlineInteraction.AccessMode? = nil
+    ) async -> [String] {
+        var problems: [String] = []
+        var openedPanes: Set<SystemPermissionCapability> = []
+        defer { NotificationCenter.default.post(name: permissionDidChange, object: nil) }
         for id in ids {
-            guard let gate = cardSettingsCapability(id), let url = settingsURL(for: gate) else { continue }
+            guard let gate = cardSettingsCapability(id),
+                  await cardBlockReason([id], mode: mode) != nil else { continue }
             if !NSApp.isActive {
                 let activation = AsyncStream<Void>(bufferingPolicy: .bufferingNewest(1)) { continuation in
                     nonisolated(unsafe) let token = NotificationCenter.default.addObserver(
@@ -34,52 +48,63 @@ extension SystemPermissionPreflight {
                 NSApp.activate(ignoringOtherApps: true)
                 for await _ in activation {}
             }
-            guard NSApp.isActive, !Task.isCancelled else { return true }
-            // Settings must not take focus before macOS receives the request.
-            defer {
-                let opened = NSWorkspace.shared.open(url)
-                ModuleLog.app("[permission-card] \(opened ? "Opened" : "Could not open") \(url.absoluteString)")
+            guard NSApp.isActive, !Task.isCancelled else {
+                return problems + ["The macOS permission request was interrupted."]
             }
-            if let bundleID = SystemAppleScriptAdapter.automationTarget(id) {
-                _ = await SystemAppleScriptAdapter.automationPermission(bundleID: bundleID, ask: true)
-                continue
-            }
-            if gate == .notifications {
-                if await NativeAgentNotifications.notificationSettings().authorizationStatus == "not_determined" {
+            if let bundleID = AppleScriptExecution.automationTarget(id) {
+                _ = await AppleScriptExecution.automationPermission(bundleID: bundleID, ask: true)
+            } else if gate == .notifications {
+                if await NativeAgentNotifications.notificationSettings().authorizationStatus == .notDetermined {
                     _ = await NativeAgentNotifications.requestAuthorizationError()
                 }
-                continue
+            } else {
+                switch gate {
+                case .calendars where mode == .write:
+                    _ = try? await LocalPIMConnectorActions.requestCalendarWriteAccessIfNeeded(store: EKEventStore())
+                case .calendars: _ = await LocalPIMConnectorActions.requestCalendarAccess()
+                case .reminders: _ = await LocalPIMConnectorActions.requestReminderAccess()
+                case .contacts where status(gate) == .notDetermined:
+                    _ = try? await CNContactStore().requestAccess(for: .contacts)
+                case .speechRecognition: _ = await requestSpeechRecognitionIfNotDetermined()
+                case .location: MacLocationReader.requestAuthorization()
+                case .microphone where status(gate) == .notDetermined:
+                    _ = await AVCaptureDevice.requestAccess(for: .audio)
+                case .camera where status(gate) == .notDetermined:
+                    _ = await AVCaptureDevice.requestAccess(for: .video)
+                case .photos where status(gate) == .notDetermined:
+                    _ = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+                case .bluetooth where status(gate) == .notDetermined: await BluetoothPrompt.ask()
+                // These two list the app in their pane on first ask, so the
+                // person has a switch to turn on.
+                case .accessibility:
+                    _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+                case .screenRecording: _ = CGRequestScreenCaptureAccess()
+                case .inputMonitoring: _ = CGRequestListenEventAccess()
+                case .fullDiskAccess:
+                    NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+                default: break
+                }
             }
-            guard cardStatus(gate, mode: mode) != .granted else { continue }
-            switch gate {
-            case .calendars where mode == .write:
-                _ = try? await LocalPIMConnectorActions.requestCalendarWriteAccessIfNeeded(store: EKEventStore())
-            case .calendars: _ = await LocalPIMConnectorActions.requestCalendarAccess()
-            case .reminders: _ = await LocalPIMConnectorActions.requestReminderAccess()
-            case .contacts where status(gate) == .notDetermined:
-                _ = try? await CNContactStore().requestAccess(for: .contacts)
-            case .speechRecognition: _ = await requestSpeechRecognitionIfNotDetermined()
-            case .location: MacLocationReader.requestAuthorization()
-            case .microphone where status(gate) == .notDetermined:
-                _ = await AVCaptureDevice.requestAccess(for: .audio)
-            case .camera where status(gate) == .notDetermined:
-                _ = await AVCaptureDevice.requestAccess(for: .video)
-            case .photos where status(gate) == .notDetermined:
-                _ = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
-            case .bluetooth where status(gate) == .notDetermined: await BluetoothPrompt.ask()
-            // These two list the app in their pane on first ask, so the
-            // person has a switch to turn on.
-            case .accessibility:
-                _ = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
-            case .screenRecording: _ = CGRequestScreenCaptureAccess()
-            case .inputMonitoring: _ = CGRequestListenEventAccess()
-            case .fullDiskAccess:
-                NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
-            default: break
+            if let reason = await cardBlockReason([id], mode: mode) {
+                problems.append(reason)
+                if openedPanes.insert(gate).inserted, let failure = openSettings(gate) {
+                    problems.append(failure)
+                }
             }
         }
-        NotificationCenter.default.post(name: permissionDidChange, object: nil)
-        return await cardBlockReason(ids, mode: mode) != nil
+        return problems
+    }
+
+    /// Retain a failed handoff as a visible request error in Settings.
+    @MainActor
+    static func openSettings(_ capability: SystemPermissionCapability) -> String? {
+        guard let url = settingsURL(for: capability) else {
+            return "NativeAgent could not find a System Settings privacy pane for \(capability.displayName)."
+        }
+        guard NSWorkspace.shared.open(url) else {
+            return "NativeAgent could not open System Settings → Privacy & Security → \(capability.displayName). Open System Settings manually, enable NativeAgent, then return here and refresh."
+        }
+        return nil
     }
 
 }

@@ -52,7 +52,7 @@ public struct BrowserToolPlatformPort: Sendable {
     /// preview: reads only, nil when none refuses.
     func inboxFence(verb: String, input: [String: JSONValue]) async -> JSONValue?
     /// One `mind_run` verb, through the call its Dreams, Self-Improvement or
-    /// Observatory control makes.
+    /// mind control makes.
     func runMind(verb: String, input: [String: JSONValue]) async -> (ok: Bool, detail: String, fields: [String: JSONValue])
     /// One `ability_manage` verb (`Parts`), as the Tools page's own calls make it.
     /// `steer` names the peers steering this turn (`PeerDataTaint.carried`).
@@ -92,25 +92,6 @@ public typealias QuietToolPage = NativeAgentShared.QuietToolPage
     func contextReceiptRead(input: [String: JSONValue]) async -> JSONValue
     func agentViewRead(input: [String: JSONValue]) async -> JSONValue
     func pageScreenshot(input: [String: JSONValue]) async -> JSONValue
-}
-
-/// Adapter to the existing interaction transaction owner (C2). No second inbox
-/// or continuation state is kept by the tool runtime.
-@MainActor public protocol ToolInteractionResolving: Sendable {
-    func waitForAnswer(_ interaction: InlineInteraction, tool: String, input: [String: JSONValue], sessionID: String, dataRoot: URL) async -> JSONValue
-    func interaction(id: String, sessionID: String, dataRoot: URL) async -> InlineInteraction?
-    /// The conversation that raised a card, by its inbox note (`interaction:<id>`).
-    func sessionID(ofCard id: String, dataRoot: URL) async -> String?
-    func originEnvelope(of id: String, sessionID: String, dataRoot: URL) async -> TurnEnvelope?
-    func descriptor(for interaction: InlineInteraction, dataRoot: URL) -> InlineInteractionDescriptor
-    func begin(id: String, sessionID: String, expectedRevision: Int?, dataRoot: URL) async throws -> InlineInteraction
-    func decline(id: String, sessionID: String, expectedRevision: Int?, dataRoot: URL) async throws -> InlineInteraction
-    func returnToPending(_ interaction: InlineInteraction, sessionID: String, dataRoot: URL) async throws -> InlineInteraction
-    func complete(id: String, sessionID: String, selection: String?, scope: InlineInteraction.Scope?, expectedRevision: Int?, attribution: String?, setupError: String?, note: String?, dataRoot: URL) async throws -> InlineInteraction
-    func takeContinuationHandBack(id: String) -> String?
-    func cardFields(_ interaction: InlineInteraction, descriptor: InlineInteractionDescriptor) -> [String: JSONValue]
-    func receiptEnvelope(_ interaction: InlineInteraction) -> JSONValue
-    func liveOutcomeSummary(_ interaction: InlineInteraction, dataRoot: URL) async -> String?
 }
 
 /// Desktop/Grok effects are still supplied by the app's platform adapters.

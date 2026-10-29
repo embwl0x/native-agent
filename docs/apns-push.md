@@ -63,7 +63,8 @@ configured key path is unavailable.
 Receipts are returned to the caller, including APNS status/errors and the
 bridge message ID.
 `apnsAccepted` means Apple accepted the request; `lockScreenDisplayVerified`
-remains false. The relay sets `cloudKitVisualPushEligible` to false.
+remains false. The receipt retains `cloudKitVisualPushEligible: false` for compatibility;
+iOS clears any older CloudKit visual-ready claim with the deployed unavailable value.
 
 For an installed-app check, enable phone notifications and send one benign
 notification through `app` action `notify.phone`. Inspect its receipt and
@@ -72,11 +73,11 @@ APNS success, a sync receipt, or a subscription's name.
 
 ## Source owners
 
-- `Modules/NativeAgentCore/Sources/DeviceSync/SwiftNativeAPNS.swift` — credentials,
-  token targeting, APNS sends and receipts.
+- `DeviceSync/SwiftNativeAPNSSender.swift` owns credentials; `APNSNotificationReadiness.swift`
+  owns targeting, `APNSNotificationDelivery.swift` sends, and `MobileNotificationDeliveryReceipt.swift` holds receipts.
 - `Modules/NativeAgentCore/Sources/DeviceSync/MacSyncMobileNotificationRelay.swift`
   — canonical APNs registration/delivery-state mutations and direct/bridge routing.
-- `Modules/NativeAgentShared/Sources/NativeAgentShared/CloudKitDeviceTransport.swift`
+- `Modules/NativeAgentShared/Sources/NativeAgentShared/CloudKitDeviceTransport+Subscriptions.swift`
   — subscription registration and repair.
 - `iOS/NativeAgentMobile/Sources/MobilePushNotifications.swift` — token sync,
   background drains and local notification projection.

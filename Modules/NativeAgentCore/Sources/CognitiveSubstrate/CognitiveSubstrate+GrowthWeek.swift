@@ -22,11 +22,7 @@ public enum CognitiveGrowthOutcome: String, Sendable, Equatable, CaseIterable {
     /// dressed up as either.
     case expiredUnresolved
     case unavailable
-    /// A REPLAY PASS RAN. A dream night or a consolidation sweep is not a
-    /// proposal and never was: it proposes nothing, carries nothing, and
-    /// answers nothing. It used to land in `.proposed` because that is where a
-    /// row with no resolution starts, so every dream night Agent had read back
-    /// as a lesson she had put forward and nobody had answered (2026-09-14).
+    /// A replay pass runs without proposing or resolving a lesson.
     case replayed
 
 }
@@ -99,14 +95,7 @@ extension CognitiveSubstrate {
                 return outcome
             }
         }
-        // The REM replay pass records a proposal's resolution with the status
-        // in the TITLE and no tag at all, so every one of those rows read
-        // "Schema proposal accepted — proposed" — the prose and the machine
-        // channel contradicting each other on the same line (Agent, 2026-09-14;
-        // five of her twelve rows). Nobody signs a REM resolution, so accepted
-        // is `held` (her own) and rejected is `letGo`, never the person's
-        // `approved`/`declined`. New rows carry the tag (CognitiveSubstrate+Replay);
-        // this reads the ones already on disk.
+        // Untagged REM resolutions use titles: accepted is `held`, rejected is `letGo`.
         let title = event.title.lowercased()
         if title.hasPrefix("schema proposal accepted") { return .held }
         if title.hasPrefix("schema proposal rejected") { return .letGo }
@@ -123,16 +112,12 @@ extension CognitiveSubstrate {
     public func growthWeek(from timeline: [CognitiveDevelopmentalTimelineEvent], at now: Date? = nil) async -> CognitiveGrowthWeek {
         let end = now ?? dependencies.now()
         let start = end.addingTimeInterval(-7 * 24 * 60 * 60)
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd"
-        formatter.timeZone = .current
         let events: [JSONValue] = timeline.filter { $0.occurredAt >= start && $0.occurredAt <= end
             && !Self.isRetiredViewTimelineEvent($0) }.map { event in
             .object([
                 "id": .string(event.id.uuidString), "artifactId": event.artifactId.map { .string($0.uuidString) } ?? .null,
                 "kind": .string(event.kind.rawValue), "title": .string(event.title), "summary": .string(event.summary),
-                "at": .double(event.occurredAt.timeIntervalSince1970), "day": .string(formatter.string(from: event.occurredAt)),
+                "at": .double(event.occurredAt.timeIntervalSince1970), "day": .string(NativeTimestampFormat.calendarDay(event.occurredAt)),
                 "lineageId": .string(event.lineageId), "evidence": .array(event.externalEvidenceIds.map(JSONValue.string)),
                 "outcome": Self.growthOutcome(of: event).map { .string($0.rawValue) } ?? .null,
             ])

@@ -1,5 +1,5 @@
-import GrokLink
 import Foundation
+import NativeAgentCore
 import Darwin
 import PersistenceCore
 
@@ -43,17 +43,9 @@ private enum LinkFailure: Error {
 /// Credentials never enter command arguments, stdout, logs, or persisted state.
 private struct BridgeDescriptor {
     let endpoint: URL
+    /// The selected bearer: an explicit contact key, the connector's environment
+    /// key, or the shared descriptor token. Environment keys never enter arguments.
     let token: String
-    /// THIS CONNECTION'S OWN SECRET, when the app set this entry up itself.
-    ///
-    /// It comes from the environment of the entry the app wrote into the other
-    /// agent's settings (with NATIVE_AGENT_PEER_ID), is sent as the bearer, and
-    /// the bridge resolves it to the contact that owns it. Absent — every
-    /// hand-made entry — the descriptor's main token is used as before.
-    ///
-    /// Environment, never an argument: arguments are readable by every process
-    /// on the Mac.
-    let peerSecret: String?
 
     static var path: String {
         ProcessInfo.processInfo.environment["NATIVE_AGENT_BRIDGE_DESCRIPTOR"]
@@ -94,7 +86,7 @@ private struct BridgeDescriptor {
         url.path = "/agent/mcp"
         guard let endpoint = url.url else { throw LinkFailure.descriptor(path, "Descriptor url could not form the MCP endpoint.") }
         let environment = ProcessInfo.processInfo.environment
-        if let bearer { return Self(endpoint: endpoint, token: bearer, peerSecret: nil) }
+        if let bearer { return Self(endpoint: endpoint, token: bearer) }
         func identity(_ name: String) -> String? {
             guard let raw = environment[name]?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !raw.isEmpty, raw.utf8.count <= 8192,
@@ -110,16 +102,14 @@ private struct BridgeDescriptor {
            peerID == nil || peerSecret == nil {
             throw LinkFailure.descriptor(path, "Connector identity is incomplete or invalid. Repair NATIVE_AGENT_PEER_ID and NATIVE_AGENT_PEER_SECRET together with agent.connect; the shared bearer was not used.")
         }
-        // 2026-09-22: a connection with its own identity sends its SECRET as
-        // the bearer and no identity headers; the bridge maps it on contact
-        // paths, so the main token is never read or sent.
+        // A connector sends its own bearer without identity headers or the shared token.
         if peerID != nil, let peerSecret {
-            return Self(endpoint: endpoint, token: peerSecret, peerSecret: peerSecret)
+            return Self(endpoint: endpoint, token: peerSecret)
         }
         guard let token = object["token"] as? String, !token.isEmpty, token.utf8.count <= 8192,
               !token.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
         else { throw LinkFailure.descriptor(path, "Descriptor token is missing or invalid; regenerate it through the bridge owner. No credential value was logged.") }
-        return Self(endpoint: endpoint, token: token, peerSecret: nil)
+        return Self(endpoint: endpoint, token: token)
     }
 }
 
@@ -168,7 +158,7 @@ private enum BridgeHTTP {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("2025-11-25", forHTTPHeaderField: "MCP-Protocol-Version")
-        // This relay reads SSE answers; older relays only claim to in Accept.
+        // Declare that the relay reads SSE answers.
         request.setValue("1", forHTTPHeaderField: "X-NativeAgent-Relay-SSE")
         let bytes: URLSession.AsyncBytes
         let response: URLResponse
@@ -179,28 +169,20 @@ private enum BridgeHTTP {
         guard (200...299).contains(http.statusCode) else { throw LinkFailure.http(http.statusCode) }
         if http.statusCode == 202 { return nil }
         func clean(_ object: [String: Any]) -> [String: Any]? {
-            // Defensive removal even if a compromised local server echoes a secret
-            // back. This connection's own key is scrubbed alongside the bearer.
-            var scrubbed = scrub(object, token: descriptor.token)
-            if let secret = descriptor.peerSecret { scrubbed = scrub(scrubbed, token: secret) }
-            return scrubbed as? [String: Any]
+            // Remove the selected bearer even if a compromised local server echoes it.
+            scrub(object, token: descriptor.token) as? [String: Any]
         }
         if http.mimeType == "text/event-stream" {
-            // One JSON-RPC message per `data:` line: notifications first, then the response.
-            var line = Data()
+            var parser = SSEEventParser()
             do {
                 for try await byte in bytes {
-                    guard byte == 10 else {
-                        guard line.count < 1_048_576 else { throw LinkFailure.response }
-                        line.append(byte); continue
-                    }
-                    defer { line.removeAll(keepingCapacity: true) }
-                    guard line.starts(with: Data("data:".utf8)),
-                          let object = try? JSONSerialization.jsonObject(with: line.dropFirst(5)) as? [String: Any],
+                    guard let event = try parser.consume(byte: byte, maximumBytes: 1_048_576),
+                          let object = try? JSONSerialization.jsonObject(with: Data(event.data.utf8)) as? [String: Any],
                           let message = clean(object) else { continue }
                     if message["method"] != nil { forward?(message) } else { return message }
                 }
             } catch let failure as LinkFailure { throw failure }
+            catch is CocoaError { throw LinkFailure.response }
             catch { throw LinkFailure.transport }
             throw LinkFailure.response
         }
@@ -372,7 +354,7 @@ private struct NativeAgentLink {
             let endpoint = local.endpoint.deletingLastPathComponent().appendingPathComponent("grok-reply")
             // Only the contact's bearer crosses loopback. The main token and
             // credentials never go to Grok, stdout or process arguments.
-            let descriptor = BridgeDescriptor(endpoint: endpoint, token: credential.replyToken, peerSecret: nil)
+            let descriptor = BridgeDescriptor(endpoint: endpoint, token: credential.replyToken)
             _ = try await BridgeHTTP.post(["message_id": reply.message_id, "text": reply.text], descriptor: descriptor)
             output(["status": "reply_received", "automatically_resent": false])
         } catch {
@@ -404,10 +386,6 @@ private struct NativeAgentLink {
                 }
                 defer { line.removeAll(keepingCapacity: true) }
                 if line.isEmpty { continue }
-                guard (try? JSONSerialization.jsonObject(with: line)) is [String: Any] else {
-                    output(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "Invalid JSON object"]])
-                    continue
-                }
                 let request = line
                 group.addTask { await relayOne(request) }
             }
@@ -415,7 +393,10 @@ private struct NativeAgentLink {
     }
 
     private static func relayOne(_ request: Data) async {
-        guard let payload = try? JSONSerialization.jsonObject(with: request) as? [String: Any] else { return }
+        guard let payload = try? JSONSerialization.jsonObject(with: request) as? [String: Any] else {
+            output(["jsonrpc": "2.0", "id": NSNull(), "error": ["code": -32700, "message": "Invalid JSON object"]])
+            return
+        }
         let id = payload["id"]
         do {
             // A notification is not held for a restart; a request is.

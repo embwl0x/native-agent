@@ -1,30 +1,113 @@
 import AppKit
+import EngineRuntime
 import NativeAgentShared
 import ChatTurnRuntime
+import MultimodalTTS
+import ScreenVision
 import UniformTypeIdentifiers
 
-// Blueprint: | `ChatClipboardAndAttachmentSupport.swift` | `ChatComposerSupport` and `ChatClipboard`: shared drop/paste/picker intake, destination capture and off-main image conversion |
-
-typealias ChatComposerSupport = NativeAgentShared.ChatAttachmentTypeResolver
+// Blueprint: | `ChatClipboardAndAttachmentSupport.swift` | `ChatAttachmentTypeResolver` and `ChatClipboard`: shared dictation preparation, screenshot submission/reconciliation, drop/paste/picker intake and off-main image conversion |
 
 extension NativeAgentShared.ChatAttachmentTypeResolver {
     static let attachmentContentTypes: [UTType] = [.fileURL, .image]
 
+    /// Surfaces keep their session/lifetime fence and publish the draft only
+    /// after permission returns to that same composer.
+    @MainActor
+    static func beginDictation(
+        _ input: VoiceInputCapture, draft: ChatComposerDraft, isCurrent: () -> Bool,
+        prepareDraft: (String, UInt64) -> Void, showToast: (String) -> Void
+    ) async -> Bool {
+        guard isCurrent() else { return false }
+        VoiceOutputController.sharedMessagePlayback.stop()
+        input.errorMessage = nil
+        showToast("Checking microphone...")
+        let permission = await input.requestPermission()
+        if let message = permission.errorMessage {
+            showToast(message)
+            return false
+        }
+        guard isCurrent() else { return false }
+        prepareDraft(draft.text, draft.manualEditRevision)
+        input.startListening()
+        if let message = input.errorMessage, !input.isListening { showToast(message) }
+        else if input.isListening { showToast("Listening") }
+        return input.isListening
+    }
+
+    @MainActor
+    struct ScreenshotDraft {
+        let text: String
+        let editedAt: Date
+        let attachments: [MultimodalAttachment]
+
+        init(_ draft: ChatComposerDraft, attachments: [MultimodalAttachment]) {
+            text = draft.text
+            editedAt = draft.editedAt
+            self.attachments = attachments
+        }
+
+        func clearIfUnchanged(
+            appModel: AppModel, draft: ChatComposerDraft,
+            attachments current: inout [MultimodalAttachment]
+        ) -> Bool {
+            guard draft.text == text, draft.editedAt == editedAt,
+                  Set(current.map(\.id)) == Set(attachments.map(\.id)) else { return false }
+            appModel.clearChatDraftAfterSend(text, sessionId: draft.sessionId, editedAt: editedAt)
+            current = []
+            return true
+        }
+    }
+
+    /// Mac turn admission stays with the caller's existing session route.
+    @MainActor
+    static func sendScreenshot(
+        _ draft: ScreenshotDraft, canSubmit: () -> Bool,
+        submit: @MainActor (String, [MultimodalAttachment]) async -> MacChatTurnAcceptance,
+        accepted: (String) -> Void, showToast: (String) -> Void
+    ) async {
+        do {
+            let capture = try await Task.detached(priority: .userInitiated) {
+                try await NativeScreenCapture.captureImageBase64()
+            }.value
+            guard canSubmit() else { return }
+            showToast(String(format: "Sending screenshot (%.1f MB)...", Double(capture.byteSize) / (1024 * 1024)))
+            let attachment = MultimodalAttachment(type: "image", base64: capture.base64,
+                                                  mime: capture.mime, name: capture.name,
+                                                  byteSize: capture.byteSize)
+            let prompt = draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "Look at this screenshot and tell me what you see." : draft.text
+            switch await submit(prompt, draft.attachments + [attachment]) {
+            case .accepted(let sessionID), .queued(let sessionID, _): accepted(sessionID)
+            case .rejected(let message): showToast(message)
+            }
+        } catch let error as NativeScreenCapture.CaptureError {
+            showToast(error.localizedDescription)
+        } catch {
+            showToast(UserFacingError.message(error, action: "send the screenshot"))
+        }
+    }
+
     @MainActor
     static func finishDictation(
-        _ result: VoiceInputStopResult, wasListening: Bool, base: inout String,
-        draft: inout String, attachments: inout [MultimodalAttachment],
-        attachment: MultimodalAttachment?, showToast: (String) -> Void
-    ) -> Bool {
-        defer { base = "" }
+        _ input: VoiceInputCapture, draft: ChatComposerDraft, revision: UInt64,
+        isCurrent: () -> Bool, base: () -> String, finished: () -> Void,
+        attach: (MultimodalAttachment) -> Void, showToast: (String) -> Void
+    ) async -> Bool {
+        let wasListening = input.isListening
+        let result = await input.stopListeningResult()
+        guard isCurrent() else { return false }
+        defer { finished() }
+        // Typing supersedes late recognition; the requested action may proceed.
+        guard draft.manualEditRevision == revision else { return true }
         let final = result.transcriptForSubmission
         guard !final.isEmpty else {
-            draft = base
+            draft.edit(base())
             showToast(result.userFacingFailureMessage ?? "No speech detected")
             return false
         }
-        if wasListening { draft = voiceDraft(base: base, transcript: final) }
-        if let attachment { attachments.append(attachment) }
+        if wasListening { draft.edit(voiceDraft(base: base(), transcript: final)) }
+        if let attachment = input.attachment { attach(attachment) }
         return true
     }
 

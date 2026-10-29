@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 // Blueprint: | `NativeAgentBuildIdentity.swift` | process-cached current identity, injectable `from`, `writeLaunchStamp` |
 
 /// Exact identity of the bytes currently running inside the app bundle.
@@ -6,12 +7,9 @@ import Foundation
 /// Development and release builders stamp these values before signing. The
 /// source revision is useful only together with `sourceDirty`: a dirty build is
 /// intentionally never presented as exact proof of the named commit.
+/// `sourceContentID` identifies the source snapshot, including dirty edits.
 ///
-/// Lives in NativeAgentCore (moved from the app target 2026-09-01) so the
-/// in-turn `agent_introspect` build stamp and the local bridge's
-/// `buildIdentity` payload read ONE source of truth. Two readers deriving the
-/// running binary independently is exactly the disagreement this type exists
-/// to prevent.
+/// All surfaces read the same process-cached running-binary identity.
 public struct NativeAgentBuildIdentity: Sendable, Equatable {
     public let version: String
     public let build: String
@@ -91,7 +89,7 @@ public struct NativeAgentBuildIdentity: Sendable, Equatable {
             "sourceRevision": sourceRevision ?? NSNull(),
             "sourceDirty": sourceDirty,
             "sourceContentID": sourceContentID ?? NSNull(),
-            "writtenAt": ISO8601DateFormatter().string(from: at),
+            "writtenAt": NativeTimestampFormat.plainZulu(at),
             // Which process this launch is: the same build relaunched is a new window.
             "pid": Int(ProcessInfo.processInfo.processIdentifier),
         ]

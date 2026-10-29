@@ -57,11 +57,8 @@ public struct WorkshopCompiledProcedureInvocationOutcome: Sendable {
     }
 }
 
-/// Shared production/manual adapter from an explicitly requested, reviewed
-/// local-copy procedure to Workshop's canonical queue. It is not a selector,
-/// scheduler, tool owner, or authority owner. The caller supplies the existing
-/// TrustCenter read and the existing file-tool dispatcher; this type owns only
-/// the exact invocation mechanics that were previously trapped in `chat-drive`.
+/// Invokes a reviewed local-copy procedure through the canonical Workshop queue.
+/// The caller supplies TrustCenter reads and the canonical file-tool dispatcher.
 public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
     public typealias PolicyAllowed = @Sendable () async -> Bool
     public typealias ToolDispatch = @Sendable (
@@ -175,46 +172,13 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
             // action by the supplied canonical dispatcher.
             stepApprovalEnforced: { false },
             terminalEventSink: { record, reason in
-                await WorkshopDeskReceiptBridge.recordTerminal(
-                    record,
-                    reason: reason,
-                    dataRoot: dataRoot
-                )
+                await WorkshopDeskReceiptBridge.recordTerminal([record], reason: reason, dataRoot: dataRoot)
             }
         )
-        let executor = WorkshopCompiledProcedureInvocationExecutor(
-            runner: runner,
-            expectedExecutionID: executionID,
-            expectedContract: planner.contract,
-            submitAndExecute: { _ in
-                if try await runner.getWorkshopExecution(executionID) != nil {
-                    // Admission owns reuse; do not create another Desk item for a retry.
-                    _ = try await runner.submit(spec: WorkshopExecutionSpec(
-                        title: "Approved compiled local file copy",
-                        objective: "Execute the locally reviewed deterministic workspace file-copy procedure.",
-                        triggerSource: "manual", trustRequired: "none", deskHandle: deskHandle))
-                    return try await Self.executeOrAwaitCanonicalProcedure(
-                        executionID: executionID, runner: runner, loop: loop)
-                }
-                let submission = try await WorkshopDirectedTaskSubmitter(
-                    dataRoot: dataRoot,
-                    runner: runner
-                ).submit(spec: WorkshopExecutionSpec(
-                    title: "Approved compiled local file copy",
-                    objective: "Execute the locally reviewed deterministic workspace file-copy procedure.",
-                    triggerSource: "manual",
-                    trustRequired: "none"
-                ), existing: deskHandle)
-                guard submission.executionId == executionID else {
-                    throw WorkshopCompiledProcedureRuntimeError.queueIdentityDiverged
-                }
-                return try await Self.executeOrAwaitCanonicalProcedure(
-                    executionID: executionID,
-                    runner: runner,
-                    loop: loop
-                )
-            }
-        )
+        let executor: ProcedureCanonicalExecution = { artifact, rule, reference, _ in
+            try await self.executeProcedureRule(
+                artifact: artifact, rule: rule, opaqueInputReference: reference, loop: loop)
+        }
         let context = ProcedureDryRunContext(
             taskFamily: planner.contract.taskFamily,
             inputClass: planner.contract.inputClass,
@@ -275,23 +239,13 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
             // one-shot activation-review handoff. Custom/test roots return at
             // the coordinator's first guard; once active, production returns
             // after one checked pointer lookup.
-            await WorkshopProcedureExactActivationCoordinator
+            await WorkshopProcedureActivation
                 .reconcileLocalFileCopyIfQualified(dataRoot: dataRoot)
         }
         return outcome
     }
 
-    /// HARD deadline on the canonical terminal observation below.
-    ///
-    /// fix-locked-unbounded-wait (2026-08-02): this observation runs INSIDE
-    /// `ProcedureArtifactStore.invoke`'s `withFileLock(invocations.jsonl)` —
-    /// an untimed cross-process `LOCK_EX`. With three Workshop executions already
-    /// running, `claim` returns nil, `start` throws, and the wait below used to
-    /// be unbounded: the record stayed `queued`, nothing ever wrote it again,
-    /// and EVERY procedure invocation in EVERY process wedged behind the flock.
-    /// One hang became a system-wide wedge. The deadline converts that into one
-    /// typed, logged, per-caller failure.
-    /// Companion rule (design doc C-2): no unbounded wait under a file lock.
+    /// Bound canonical observation under the invocation file lock; expiry is a typed failure, never an unbounded locked wait.
     static var canonicalObservationTimeoutSeconds: TimeInterval {
         BoundedWait.seconds(
             fromEnv: "NATIVE_AGENT_WORKSHOP_CANONICAL_OBSERVATION_TIMEOUT_SECONDS",
@@ -299,8 +253,6 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
         )
     }
 
-    /// Internal (not private) so the bounded-observation test can drive it
-    /// directly: the whole point of the deadline is that this call RETURNS.
     static func executeOrAwaitCanonicalProcedure(
         executionID: String,
         runner: SwiftNativeWorkshopRunner,
@@ -309,21 +261,11 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
         do {
             return try await loop.start(executionId: executionID)
         } catch let error as WorkshopExecutionError {
-            // NARROW on purpose: the ONLY tolerated failure is losing the
-            // queued→running CAS to the resident executor (a typed
-            // `invalidRequest` refusal) — it is still the same canonical record
-            // caused by this invocation, so we fall through and observe it.
-            // The old blanket `catch {}` also swallowed CancellationError and
-            // every real dispatch/IO failure, so a cancelled or broken start
-            // became an unbounded wait under the invocation flock instead of an
-            // error. Anything else rethrows.
+            // Observe the same canonical record after an invalidRequest start refusal; every other failure propagates.
             guard case .invalidRequest = error else { throw error }
         }
-        let terminal: Set<String> = [
-            "completed", "done", "succeeded", "failed", "cancelled", "canceled",
-        ]
         if let current = try await runner.getWorkshopExecution(executionID),
-           terminal.contains(current.status.lowercased()) {
+           current.isTerminal {
             return current
         }
         let timeout = canonicalObservationTimeoutSeconds
@@ -335,17 +277,134 @@ public struct WorkshopCompiledLocalFileCopyInvocation: Sendable {
             defer { changes.cancel() }
             // Close the registration race without a timer or poll.
             if let current = try await runner.getWorkshopExecution(executionID),
-               terminal.contains(current.status.lowercased()) {
+               current.isTerminal {
                 return current
             }
             for await _ in changes.stream {
                 try Task.checkCancellation()
                 if let current = try await runner.getWorkshopExecution(executionID),
-                   terminal.contains(current.status.lowercased()) {
+                   current.isTerminal {
                     return current
                 }
             }
             throw WorkshopCompiledProcedureRuntimeError.canonicalObservationEnded
         }
+    }
+
+    /// Queue admission and verification run inside the procedure invocation lock.
+    private func executeProcedureRule(
+        artifact: DeclarativeProcedureArtifact,
+        rule: ProcedureTransitionRule,
+        opaqueInputReference: String,
+        loop: WorkshopExecutorLoop
+    ) async throws -> ProcedureCanonicalExecutionResult {
+        guard ProcedureArtifactStore.valid(artifact), artifact.domain == "workshop_execution",
+              artifact.authorityClass == "low_risk",
+              rule.sequence == 0,
+              rule.actionKind == "queue_admission",
+              rule.beforeState == nil,
+              rule.afterState == "queued",
+              opaqueInputReference == CausalTransitionEvidence.opaqueIdentity(executionID),
+              planner.contract.taskFamily == artifact.inputContract.taskFamily,
+              planner.contract.inputClass == artifact.inputContract.inputClass,
+              planner.contract.procedureShapeIdentity == artifact.procedureShapeIdentity,
+              artifact.inputContract.acceptedParameterSchemaIdentities.contains(
+                planner.contract.parameterSchemaIdentity
+              ),
+              planner.contract.authorityClass == artifact.authorityClass,
+              Set(planner.contract.externalEffectClasses).isSubset(
+                of: Set(artifact.inputContract.allowedExternalEffectClasses)
+              ),
+              !planner.contract.externalEffectClasses.contains("external_send"),
+              !planner.contract.externalEffectClasses.contains("unknown") else {
+            return Self.abstained(authorityRechecked: false)
+        }
+
+        let finalRecord: WorkshopExecutionRecord
+        if try await runner.getWorkshopExecution(executionID) != nil {
+            // Admission owns reuse; do not create another Desk item for a retry.
+            _ = try await runner.submit(spec: WorkshopExecutionSpec(
+                title: "Approved compiled local file copy",
+                objective: "Execute the locally reviewed deterministic workspace file-copy procedure.",
+                triggerSource: "manual", trustRequired: "none", deskHandle: deskHandle))
+            finalRecord = try await Self.executeOrAwaitCanonicalProcedure(
+                executionID: executionID, runner: runner, loop: loop)
+        } else {
+            let submission = try await WorkshopDirectedTaskSubmitter(
+                dataRoot: dataRoot,
+                runner: runner
+            ).submit(spec: WorkshopExecutionSpec(
+                title: "Approved compiled local file copy",
+                objective: "Execute the locally reviewed deterministic workspace file-copy procedure.",
+                triggerSource: "manual",
+                trustRequired: "none"
+            ), existing: deskHandle)
+            guard submission.executionId == executionID else {
+                throw WorkshopCompiledProcedureRuntimeError.queueIdentityDiverged
+            }
+            finalRecord = try await Self.executeOrAwaitCanonicalProcedure(
+                executionID: executionID,
+                runner: runner,
+                loop: loop
+            )
+        }
+        guard finalRecord.id == executionID,
+              CausalTransitionEvidence.opaqueIdentity(finalRecord.id) == opaqueInputReference,
+              ["none", "draft_auto"].contains(finalRecord.trustRequired),
+              finalRecord.planningProviderCallCount == 0,
+              finalRecord.planningRemovableOrchestrationProviderCallCount == 0,
+              finalRecord.hasExactZeroProviderStepAccounting,
+              SwiftNativeWorkshopRunner.procedureContractProjection(plan: finalRecord.plan,
+                trustRequired: finalRecord.trustRequired, triggerSource: finalRecord.triggerSource) == planner.contract else {
+            return Self.unverified(canonicalEvidenceMatched: false)
+        }
+
+        guard try await runner.matchingProcedureTrajectory(for: artifact, record: finalRecord) != nil else {
+            return Self.unverified(canonicalEvidenceMatched: false)
+        }
+        let action = SwiftNativeWorkshopRunner.motorActionReadModel(record: finalRecord)
+        switch (action.phase, action.verification) {
+        case (.succeeded, .satisfied):
+            return Self.verified(.verifiedSuccess)
+        case (.failed, .failed):
+            return Self.verified(.verifiedFailure)
+        case (.cancelled, .notRequired):
+            return Self.verified(.cancelled)
+        default:
+            return Self.unverified(canonicalEvidenceMatched: true)
+        }
+    }
+
+    private static func abstained(
+        authorityRechecked: Bool
+    ) -> ProcedureCanonicalExecutionResult {
+        ProcedureCanonicalExecutionResult(
+            status: .abstained,
+            authorityRechecked: authorityRechecked,
+            canonicalEvidenceMatched: false,
+            verified: false
+        )
+    }
+
+    private static func unverified(
+        canonicalEvidenceMatched: Bool
+    ) -> ProcedureCanonicalExecutionResult {
+        ProcedureCanonicalExecutionResult(
+            status: .unverified,
+            authorityRechecked: true,
+            canonicalEvidenceMatched: canonicalEvidenceMatched,
+            verified: false
+        )
+    }
+
+    private static func verified(
+        _ status: ProcedureCanonicalExecutionStatus
+    ) -> ProcedureCanonicalExecutionResult {
+        ProcedureCanonicalExecutionResult(
+            status: status,
+            authorityRechecked: true,
+            canonicalEvidenceMatched: true,
+            verified: true
+        )
     }
 }

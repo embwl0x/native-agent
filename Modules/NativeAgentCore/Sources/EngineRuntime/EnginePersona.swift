@@ -12,6 +12,7 @@ import PersonaEngine
 @Observable
 public final class PersonaFacade {
     public nonisolated let dataRoot: URL
+    public nonisolated let personaRoot: URL
     private nonisolated let owner: SwiftNativePersonaEngine
     public private(set) var profile: PersonalityProfile?
     public private(set) var documents: [PersonaDocSpec] = []
@@ -22,9 +23,8 @@ public final class PersonaFacade {
 
     public nonisolated init(dataRoot: URL, isolated: Bool) {
         self.dataRoot = dataRoot
-        self.owner = isolated ? .isolated(dataRoot: dataRoot) : SwiftNativePersonaEngine(
-            root: PersonaRootResolver.resolve(dataRootProvider: { dataRoot }), dataRoot: dataRoot
-        )
+        self.personaRoot = isolated ? PersonaRootResolver.resolveIsolated(dataRoot: dataRoot) : PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot)
+        self.owner = SwiftNativePersonaEngine(root: personaRoot, dataRoot: dataRoot)
     }
 
     @discardableResult

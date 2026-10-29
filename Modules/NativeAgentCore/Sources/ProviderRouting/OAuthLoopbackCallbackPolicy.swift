@@ -5,6 +5,7 @@ public enum OAuthLoopbackCallbackError: LocalizedError {
     case timedOut
     case canceled
     case alreadyWaiting
+    case invalidTimeout
     case socket(String)
 
     public var errorDescription: String? {
@@ -15,6 +16,8 @@ public enum OAuthLoopbackCallbackError: LocalizedError {
             return "oauth_sign_in_cancelled: The sign-in listener was cancelled. Leave sign-in stopped; no further action is needed."
         case .alreadyWaiting:
             return "oauth_callback_already_waiting: This sign-in already has a callback listener waiting. Complete the sign-in already open in the browser."
+        case .invalidTimeout:
+            return "oauth_callback_invalid_timeout: The sign-in timeout must be finite, nonnegative and representable by the callback clock."
         case .socket(let message):
             return "oauth_callback_socket_failed: \(message) Inspect this local socket error and correct the loopback listener before starting a new sign-in from its original control."
         }

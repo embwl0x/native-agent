@@ -1,5 +1,3 @@
-// detached-chat-windows Phase 1 W1.3 — drag-off-onto-desktop gesture.
-//
 // SwiftUI's `.onDrag` hides NSDraggingSource's
 // `draggingSession(_:endedAt:operation:)` callback, so we can't detect
 // "the user dropped this on empty desktop (no in-app target accepted)".
@@ -9,7 +7,7 @@
 //
 // Click pass-through: the underlying NSView's `hitTest` returns nil, so
 // taps and right-clicks reach the SwiftUI row beneath. Drag detection is
-// done via app-local NSEvent monitors that observe mouseDown/mouseDragged
+// done via an app-local NSEvent monitor that observes mouseDown/mouseDragged
 // regardless of hit-test, fire `beginDraggingSession` past a small
 // threshold, and only consume the dragged event (clicks pass through
 // untouched). On drag end, the detached panel opens IFF the left button is
@@ -58,13 +56,9 @@ struct SessionDragSource: NSViewRepresentable {
         nsView.sessionTitle = sessionTitle
     }
 
-    // Deterministic teardown of the per-row NSEvent monitors. Without this,
-    // cleanup relies on viewDidMoveToWindow(nil) + deinit — which DO fire,
-    // but SwiftUI calls dismantleNSView at the exact moment the row leaves
-    // the hierarchy, so removing the 3 app-local monitors here guarantees
-    // they don't linger across a LazyVStack recycle. (gpt-5.5 review MEDIUM.)
+    // Remove the row-local event monitor before SwiftUI recycles the view.
     static func dismantleNSView(_ nsView: SessionDragSourceNSView, coordinator: ()) {
-        nsView.teardownMonitors()
+        nsView.teardownMonitor()
     }
 }
 
@@ -72,70 +66,60 @@ final class SessionDragSourceNSView: NSView, NSDraggingSource {
     var sessionId: String = ""
     var sessionTitle: String = ""
 
-    // nonisolated(unsafe): NSEvent monitor tokens are typed `Any?` and not
-    // Sendable; deinit is nonisolated in Swift 6 strict-concurrency, so we
-    // mark them unsafe-readable so cleanup can run on teardown.
-    nonisolated(unsafe) private var mouseDownMonitor: Any?
-    nonisolated(unsafe) private var mouseDraggedMonitor: Any?
-    nonisolated(unsafe) private var mouseUpMonitor: Any?
+    // The non-Sendable event token must be readable by nonisolated deinit for cleanup.
+    nonisolated(unsafe) private var eventMonitor: Any?
     private var pressStart: NSPoint?
     private var dragInFlight = false
 
     // Click/right-click pass-through: never claim hits. Drag is detected
-    // via app-local NSEvent monitors instead of mouseDown overrides.
+    // via an app-local NSEvent monitor instead of mouseDown overrides.
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        removeMonitors()
+        removeMonitor()
         guard window != nil else { return }
-        installMonitors()
+        installMonitor()
     }
 
     deinit {
         // NSEvent monitor removal is main-actor-isolated indirectly via
         // NSEvent.removeMonitor, but it's safe to call here.
-        if let m = mouseDownMonitor { NSEvent.removeMonitor(m) }
-        if let m = mouseDraggedMonitor { NSEvent.removeMonitor(m) }
-        if let m = mouseUpMonitor { NSEvent.removeMonitor(m) }
+        if let eventMonitor { NSEvent.removeMonitor(eventMonitor) }
     }
 
-    private func removeMonitors() {
-        if let m = mouseDownMonitor { NSEvent.removeMonitor(m); mouseDownMonitor = nil }
-        if let m = mouseDraggedMonitor { NSEvent.removeMonitor(m); mouseDraggedMonitor = nil }
-        if let m = mouseUpMonitor { NSEvent.removeMonitor(m); mouseUpMonitor = nil }
+    private func removeMonitor() {
+        if let eventMonitor { NSEvent.removeMonitor(eventMonitor); self.eventMonitor = nil }
         pressStart = nil
     }
 
     /// Public teardown entry for `dismantleNSView` — deterministic monitor
     /// removal when SwiftUI tears the row out of the hierarchy.
-    func teardownMonitors() { removeMonitors() }
+    func teardownMonitor() { removeMonitor() }
 
-    private func installMonitors() {
-        mouseDownMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
-            guard let self, let win = self.window, event.window === win, !self.dragInFlight else { return event }
-            let pointInView = self.convert(event.locationInWindow, from: nil)
-            if self.bounds.contains(pointInView) {
-                self.pressStart = event.locationInWindow
-            } else {
+    private func installMonitor() {
+        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
+            guard let self else { return event }
+            switch event.type {
+            case .leftMouseDown:
+                guard let win = self.window, event.window === win, !self.dragInFlight else { return event }
+                let pointInView = self.convert(event.locationInWindow, from: nil)
+                self.pressStart = self.bounds.contains(pointInView) ? event.locationInWindow : nil
+            case .leftMouseDragged:
+                guard let start = self.pressStart, !self.dragInFlight else { return event }
+                let dx = event.locationInWindow.x - start.x
+                let dy = event.locationInWindow.y - start.y
+                if hypot(dx, dy) > 4 {
+                    self.pressStart = nil
+                    self.dragInFlight = true
+                    self.beginDrag(with: event)
+                    return nil
+                }
+            case .leftMouseUp:
                 self.pressStart = nil
+            default:
+                break
             }
-            return event
-        }
-        mouseDraggedMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDragged) { [weak self] event in
-            guard let self, let start = self.pressStart, !self.dragInFlight else { return event }
-            let dx = event.locationInWindow.x - start.x
-            let dy = event.locationInWindow.y - start.y
-            if hypot(dx, dy) > 4 {
-                self.pressStart = nil
-                self.dragInFlight = true
-                self.beginDrag(with: event)
-                return nil
-            }
-            return event
-        }
-        mouseUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp) { [weak self] event in
-            self?.pressStart = nil
             return event
         }
     }
@@ -143,16 +127,7 @@ final class SessionDragSourceNSView: NSView, NSDraggingSource {
     private func beginDrag(with event: NSEvent) {
         let pbItem = NSPasteboardItem()
         let idData = Data(sessionId.utf8)
-        // Custom UTI ONLY — no plain-text. The 2026-06-08 live-verify that
-        // forced a prefixed plain-text sibling ("SwiftUI's pinned-strip
-        // .onDrop only matches the PLAIN-TEXT type from an AppKit
-        // NSPasteboardItem") ran a month BEFORE the UTI was declared in
-        // Info.plist (UTExportedTypeDeclarations, 767984ca 2026-07-10);
-        // with the type declared, the custom-type drop matches (re-verified
-        // live 2026-07-24). The plain-text was what Finder materialized as
-        // a "nativeagent-chat-session-…" .textClipping on every desktop
-        // drop — User's desktop-icons bug — so it must NOT come back as a
-        // convenience payload.
+        // Use only the declared custom UTI; plain text creates unwanted Finder textClippings.
         pbItem.setData(idData, forType: NSPasteboard.PasteboardType(sessionDragUTI))
 
         let dragItem = NSDraggingItem(pasteboardWriter: pbItem)
@@ -210,19 +185,7 @@ final class SessionDragSourceNSView: NSView, NSDraggingSource {
                          endedAt screenPoint: NSPoint,
                          operation: NSDragOperation) {
         dragInFlight = false
-        // Discriminate by drop POINT, not `operation` (2026-06-08 W1.3), and
-        // by the mouse button for cancels (2026-07-24): with the plain-text
-        // payload gone, Finder REJECTS desktop drops, so both a desktop drop
-        // and an Esc-cancel report an empty operation — and with the
-        // slide-back animation suppressed in beginDrag, both also end at the
-        // cursor. What still separates them is the button: a real drop means
-        // the user RELEASED; an Esc-cancel ends the session with the button
-        // still held down.
-        //   • drop on the pinned strip (in-app) → point INSIDE the main
-        //     window → no detach; the strip's own .onDrop handles the pin.
-        //   • Esc-cancel → left button still pressed → no detach.
-        //   • genuine desktop drop → released, OUTSIDE all app windows →
-        //     detach at the drop point.
+        // Detach only on release outside all app windows; drop operations cannot distinguish desktop drops from Esc.
         let visibleFrames = NSApp.windows.compactMap { window -> NSRect? in
             guard window.isVisible, window.frame.width > 1, window.frame.height > 1 else { return nil }
             return window.frame

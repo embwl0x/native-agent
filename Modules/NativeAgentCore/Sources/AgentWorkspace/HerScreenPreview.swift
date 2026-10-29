@@ -1,7 +1,9 @@
 import Foundation
+import Synchronization
 import NativeAgentCore
 import NativeAgentShared
 import PersistenceCore
+import Transcripts
 // Blueprint: | `HerScreenPreview.swift` | shared screen/room text projection |
 
 /// User's window into her shared glance and room renderers. Preview home omits
@@ -33,7 +35,7 @@ package enum AgentWorkspaceScreenPreview {
 
     /// The glance as a turn renders it, without a turn's pin or budget.
     public static func glance(dataRoot: URL, scope: String) async -> String? {
-        if scope.hasPrefix("bot-") { return nil }
+        if SessionConversation.isHelper(scope, dataRoot: dataRoot) { return nil }
         return await HerScreen.$previewing.withValue(true) {
             let now = Date()
             async let parts = AgentWorkspacePorts.parts(for: "", dataRoot: dataRoot)
@@ -53,7 +55,7 @@ package enum AgentWorkspaceScreenPreview {
         let key = dataRoot.standardizedFileURL.path + "\u{0}" + scope
         let pages = await navigation.browserPages(key: key)
         if room == "home" { return await HerScreen.home(dataRoot: dataRoot, scope: scope, browserPages: pages, markSeen: false) }
-        let schemas = lock.withLock { catalogs[dataRoot.standardizedFileURL.path] }
+        let schemas = cache.withLock { $0.catalogs[dataRoot.standardizedFileURL.path] }
         let catalog: AgentWorkspace.Catalog = { schemas ?? [] }
         let noCatalog = room.uppercased() + " · laid out from the tools her chat offers. She hasn't opened a place since the app started, so this view has no tool list to show it from."
 
@@ -74,7 +76,7 @@ package enum AgentWorkspaceScreenPreview {
 
         // Her own rooms: no owner read comes first.
         if let text = await HerScreen.room(location, dataRoot: dataRoot, scope: scope) { return text }
-        var projection: AgentWorkspaceProjection
+        var projection: WorkspacePage
         switch location {
         case .arrivals: projection = await navigation.arrivalProjection(key: key)
         case .openPlaces: projection = await navigation.openPlaces(key: key)
@@ -101,11 +103,11 @@ package enum AgentWorkspaceScreenPreview {
             projection.actions.append(.init(label: "Refresh this view", action: .open(location)))
         }
         let name = HerScreen.textRoomName(location) ?? room
-        return HerScreen.textRoom(name, place: location, projection: projection, frame: .object(["status": outcome]), dataRoot: dataRoot)
+        return HerScreen.textRoom(name, place: location, projection: projection, status: outcome, dataRoot: dataRoot)
     }
 
     private static func shown(_ room: String, dataRoot: URL, tool: String) -> String {
-        guard let kept = lock.withLock({ rooms[dataRoot.standardizedFileURL.path + "\u{0}" + room] }) else {
+        guard let kept = cache.withLock({ $0.rooms[dataRoot.standardizedFileURL.path + "\u{0}" + room] }) else {
             return room.uppercased() + " · opens with \(tool), her own tool read through its gates and receipts. This view runs no tool, "
                 + "and she hasn't opened \(room) since the app started, so there is no copy to show."
         }
@@ -114,15 +116,13 @@ package enum AgentWorkspaceScreenPreview {
 
     // MARK: What her workspace last showed, in memory only
 
-    private static let lock = NSLock()
-    nonisolated(unsafe) private static var catalogs: [String: [LLMToolSchema]] = [:]
-    nonisolated(unsafe) private static var rooms: [String: (text: String, at: Date)] = [:]
+    private static let cache = Mutex<(catalogs: [String: [LLMToolSchema]], rooms: [String: (text: String, at: Date)])>(([:], [:]))
 
     static func keep(catalog: [LLMToolSchema], dataRoot: URL) {
-        lock.withLock { catalogs[dataRoot.standardizedFileURL.path] = catalog }
+        cache.withLock { $0.catalogs[dataRoot.standardizedFileURL.path] = catalog }
     }
 
     static func keep(room: String, text: String, dataRoot: URL) {
-        lock.withLock { rooms[dataRoot.standardizedFileURL.path + "\u{0}" + room] = (text, Date()) }
+        cache.withLock { $0.rooms[dataRoot.standardizedFileURL.path + "\u{0}" + room] = (text, Date()) }
     }
 }

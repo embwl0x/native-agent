@@ -1,7 +1,6 @@
 import Foundation
-// Blueprint: | `SwiftCodexDeviceLoginManager.swift` | `SwiftCodexDeviceLoginManager` enum; CLI executable readiness |
-
-public enum SwiftCodexDeviceLoginManager {
+// Blueprint: | `SwiftCodexDeviceLoginManager.swift` | `CodexExecutable`: inherited-first PATH and explicit-override executable selection shared by readiness and process execution |
+public enum CodexExecutable {
     static var executableSearchDirectories: [String] {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         return [
@@ -25,23 +24,15 @@ public enum SwiftCodexDeviceLoginManager {
         return parts.joined(separator: ":")
     }
 
-    public static func resolveCodexExecutable(environment: [String: String]) throws -> URL {
+    public static func resolveCodexExecutable(environment: [String: String], program: String? = nil) throws -> URL {
         let fm = FileManager.default
-        if let override = environment["NATIVE_AGENT_CODEX_BIN"], !override.isEmpty {
-            let path = (override as NSString).expandingTildeInPath
-            if fm.isExecutableFile(atPath: path) {
-                return URL(fileURLWithPath: path)
-            }
-        }
-        let path = environment["PATH"] ?? augmentedPath(nil)
-        for dir in path.split(separator: ":").map(String.init) {
-            let candidate = URL(fileURLWithPath: dir).appendingPathComponent("codex")
-            if fm.isExecutableFile(atPath: candidate.path) {
-                return candidate
-            }
-        }
+        let override = environment["NATIVE_AGENT_CODEX_BIN"].flatMap { $0.isEmpty ? nil : $0 }
+        let name = ((program ?? override ?? "codex") as NSString).expandingTildeInPath
+        let candidates = name.contains("/") ? [URL(fileURLWithPath: name)]
+            : augmentedPath(environment["PATH"]).split(separator: ":").map { URL(fileURLWithPath: String($0)).appendingPathComponent(name) }
+        if let executable = candidates.first(where: { fm.isExecutableFile(atPath: $0.path) }) { return executable }
         throw NSError(domain: "NativeAgentSwiftOnly", code: -2, userInfo: [
-            NSLocalizedDescriptionKey: "Could not find an executable codex CLI. Install codex or set NATIVE_AGENT_CODEX_BIN."
+            NSLocalizedDescriptionKey: "Could not find an executable Codex CLI at '\(name)'. Install Codex or set NATIVE_AGENT_CODEX_BIN."
         ])
     }
 }

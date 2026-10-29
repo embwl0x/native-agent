@@ -8,19 +8,10 @@ import NativeAgentShared
 import Observation
 import AppKit
 import CoreGraphics
-import ScreenCaptureKit
 import ScreenVision
-import Speech
-import AVFoundation
 import UniformTypeIdentifiers
 import MemoryV2
 import PersistenceCore
-#if canImport(CoreSpotlight)
-import CoreSpotlight
-#endif
-#if canImport(CloudKit)
-import CloudKit
-#endif
 
 // Blueprint: | `ApprovalsView.swift` | `ApprovalsView`: checked approval decisions/history, payload preview and known risk-badge/toast presentation |
 
@@ -52,25 +43,6 @@ enum ApprovalRiskBadgePresentation {
             return .init(label: "Unrecognized risk", status: "warn")
         }
     }
-}
-
-/// An approval decision is only reviewable when the canonical inbox reader
-/// supplied the payload preview that describes the proposed effect.  Treating
-/// an omitted or whitespace-only preview as a harmless empty section lets a
-/// damaged/partial row retain live Approve and Deny buttons without the facts
-/// the human is meant to assess.
-enum ApprovalPayloadPreviewPresentation {
-    enum State: Sendable, Equatable {
-        case available(String)
-        case unavailable
-    }
-
-    static func state(for approval: ApprovalRecord) -> State {
-        let preview = approval.payloadPreview.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !preview.isEmpty else { return .unavailable }
-        return .available(preview)
-    }
-
 }
 
 /// Toasts describe the durable approval decision, never merely the button the
@@ -144,34 +116,19 @@ enum ApprovalHistoryRowPresentation {
 
     static func icon(for approval: ApprovalRecord) -> Icon {
         let decision = normalized(approval.decision)
-        switch decision {
-        case .some("approved"):
-            return .init(systemName: "checkmark.circle.fill", tone: .success)
-        case .some("denied"), .some("rejected"):
-            return .init(systemName: "xmark.circle.fill", tone: .denial)
-        case .some("canceled"), .some("cancelled"):
-            return .init(systemName: "minus.circle.fill", tone: .neutral)
-        case nil:
-            return legacyStatusIcon(status: normalized(approval.status) ?? "")
-        default:
-            // A present but unsupported decision must not inherit a possibly
-            // stale status label and claim a terminal outcome it does not prove.
-            return .init(systemName: "exclamationmark.triangle.fill", tone: .warning)
-        }
-    }
-
-    private static func legacyStatusIcon(status: String) -> Icon {
-        switch status {
+        let value = decision ?? normalized(approval.status) ?? ""
+        switch value {
         case "approved":
             return .init(systemName: "checkmark.circle.fill", tone: .success)
         case "denied", "rejected":
             return .init(systemName: "xmark.circle.fill", tone: .denial)
         case "canceled", "cancelled":
             return .init(systemName: "minus.circle.fill", tone: .neutral)
-        case "resolved":
-            return .init(systemName: "exclamationmark.triangle.fill", tone: .warning)
         default:
-            return .init(systemName: "questionmark.circle.fill", tone: .warning)
+            // Unsupported decisions and resolved records without a decision warn.
+            let symbol = decision != nil || value == "resolved"
+                ? "exclamationmark.triangle.fill" : "questionmark.circle.fill"
+            return .init(systemName: symbol, tone: .warning)
         }
     }
 
@@ -191,7 +148,6 @@ enum ApprovalHistoryRowPresentation {
     }
 }
 
-// PATCH-2026-05-09: design-system-pass ApprovalsView — NativePanel cards, design tokens
 struct ApprovalsView: View {
     var focusedID: String? = nil
     @Environment(AppModel.self) private var appModel
@@ -253,7 +209,7 @@ struct ApprovalsView: View {
                 .padding(.horizontal, NativeAgentSpacing.xl)
                 .padding(.top, NativeAgentSpacing.lg)
 
-                NativePanel(tint: summaryColor) {
+                NativePanel() {
                     HStack(alignment: .top, spacing: NativeAgentSpacing.md) {
                         Image(systemName: summaryIcon)
                             .font(.title3)
@@ -276,7 +232,7 @@ struct ApprovalsView: View {
                 .padding(.horizontal, NativeAgentSpacing.xl)
 
                 if let errorText {
-                    NativePanel(tint: .red) {
+                    NativePanel() {
                         Label(errorText, systemImage: "exclamationmark.triangle.fill")
                             .font(NativeAgentFont.body)
                             .foregroundStyle(.red)
@@ -289,7 +245,7 @@ struct ApprovalsView: View {
                         ForEach(pending) { approval in
                             ApprovalRequestPanel(
                                 approval: approval,
-                                isDeciding: decidingID == approval.id || appModel.isResolvingApproval(id: approval.id),
+                                isDeciding: decidingID == approval.id || appModel.engine.approvals.isResolving(id: approval.id),
                                 onResolve: { decision in
                                     Task { await resolveApproval(id: approval.id, decision: decision) }
                                 }
@@ -298,7 +254,7 @@ struct ApprovalsView: View {
                     }
 
                     if !recent.isEmpty {
-                        NativePanel(title: "Recent Decisions", systemImage: "clock.arrow.circlepath", tint: .secondary) {
+                        NativePanel(title: "Recent Decisions") {
                             VStack(spacing: 0) {
                                 ForEach(recent.prefix(12)) { approval in
                                     ApprovalHistoryRow(approval: approval)
@@ -309,7 +265,7 @@ struct ApprovalsView: View {
                             }
                         }
                     } else if pending.isEmpty, approvals.hasLoadedSnapshot, approvals.refreshErrorText == nil {
-                        NativePanel(tint: .secondary) {
+                        NativePanel() {
                             Label("No approval history yet. Risky actions will be listed here after they are approved or denied.", systemImage: "clock")
                                 .font(NativeAgentFont.body)
                                 .foregroundStyle(.secondary)
@@ -371,11 +327,6 @@ struct ApprovalPayloadPreviewView: View {
     let preview: String
     @State private var isExpanded = false
 
-    init(preview: String, initiallyExpanded: Bool = false) {
-        self.preview = preview
-        _isExpanded = State(initialValue: initiallyExpanded)
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             if isExpanded {
@@ -417,10 +368,6 @@ private struct ApprovalRequestPanel: View {
         ApprovalRiskBadgePresentation.badge(for: approval.risk)
     }
 
-    private var payloadPreview: ApprovalPayloadPreviewPresentation.State {
-        ApprovalPayloadPreviewPresentation.state(for: approval)
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: NativeAgentSpacing.sm) {
             HStack(alignment: .top) {
@@ -442,10 +389,9 @@ private struct ApprovalRequestPanel: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(5)
             }
-            switch payloadPreview {
-            case .available(let preview):
-                ApprovalPayloadPreviewView(preview: preview)
-            case .unavailable:
+            if ApprovalChatCards.canResolve(approval) {
+                ApprovalPayloadPreviewView(preview: approval.payloadPreview.trimmingCharacters(in: .whitespacesAndNewlines))
+            } else {
                 Label(
                     ApprovalChatCards.unavailableText,
                     systemImage: "exclamationmark.triangle.fill"

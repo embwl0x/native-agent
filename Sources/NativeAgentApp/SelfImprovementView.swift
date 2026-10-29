@@ -1,3 +1,4 @@
+import NativeAgentShared
 import EngineRuntime
 import BackgroundWork
 import AttentionRouting
@@ -37,8 +38,8 @@ struct SelfImprovementView: View {
                         HStack {
                             Text(lesson.lesson).font(.callout.weight(.semibold))
                             Spacer()
-                            Text("\(lesson.count(week: MemoryStatusProjection.isoWeek())) this week · "
-                                 + "\(lesson.count(week: MemoryStatusProjection.isoWeek(ago: 1))) last week")
+                            Text("\(lesson.count(week: MemoryRecoveryReadout.isoWeek())) this week · "
+                                 + "\(lesson.count(week: MemoryRecoveryReadout.isoWeek(ago: 1))) last week")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                         ForEach(lesson.misses) { miss in

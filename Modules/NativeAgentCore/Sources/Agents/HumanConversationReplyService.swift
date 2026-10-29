@@ -6,11 +6,11 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 
-// Blueprint: | `HumanConversationReplyService.swift` | `HumanConversationReplyService.reply`: explicit assistant replies through transcript and delivery owners; claim before mutation and no automatic replay |
+// Blueprint: | `HumanConversationReplyService.swift` | `HumanConversationReplies.reply`: explicit assistant replies through transcript and delivery owners; claim before mutation and no automatic replay |
 
 /// Explicit replies reuse the established assistant transcript and completion delivery owners.
 /// No provider call and no synthetic human message is involved.
-public actor HumanConversationReplyService {
+public actor HumanConversationReplies {
     let dataRoot: URL
     let sender: any AgentBridgeCompletionSending
     let lifecycle: CodexCompletionLifecycle
@@ -27,9 +27,9 @@ public actor HumanConversationReplyService {
     }
 
     public func reply(input: [String: JSONValue]) async throws -> JSONValue {
-        guard let id = HumanConversationReader.string(input["conversation_session_id"]),
-              let expected = HumanConversationReader.string(input["last_message_id"]),
-              let text = HumanConversationReader.string(input["text"]),
+        guard let id = input["conversation_session_id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }),
+              let expected = input["last_message_id"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }),
+              let text = input["text"]?.stringValue.flatMap({ $0.isEmpty ? nil : $0 }),
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, text.count <= 16000 else {
             return failure("missing_reply", "Open the conversation, then supply the reply text.")
         }
@@ -51,7 +51,7 @@ public actor HumanConversationReplyService {
         // Known setup failures happen before a claim or transcript mutation.
         do {
             let artifacts = try AgentBridgeCompletionRouter.artifacts(deliveryId: deliveryID,
-                surface: deliverySurface, text: text, attachments: [])
+                text: text, attachments: [])
             try await sender.preflight(surface: deliverySurface, route: route, artifacts: artifacts)
         } catch {
             return failure("unavailable", "This conversation's delivery connection is unavailable. Nothing was saved or sent.")

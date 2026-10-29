@@ -20,15 +20,16 @@ extension MacFourVerbs {
         }
     }
 
-    /// A workspace selection already names the exact observed control. Never
-    /// resolve its display label again: the canonical action owner checks the
-    /// frame, app, window and handle for drift before injecting anything.
+    /// Workspace-owned frame/handle references select the exact observed control.
+    /// The action owner checks drift and ordinary admission before input;
+    /// the structured selection receipt retains those references.
     public func actSelection(verb: String, handle: String, frameID: String,
                              text: String? = nil, mode: MacTypeMode = .replace, direction: String? = nil) async -> MacFourVerbsReply {
         guard await MacActSerial.shared.acquire() else {
             return .init(ok: false, text: "The action was cancelled before it started.", detail: ["error": .string("cancelled")])
         }
         defer { Task { await MacActSerial.shared.release() } }
+        await MacActSerial.shared.ownInputs(MacDriverContext.binding)
         // An exact act moves the screen on too: a stopped batch in this chat is over.
         if let root = flowRoot, let session = flowSession { Flow.dropped(root, scope: Self.actFlowScope(session)) }
         // A screen page lists "press" among a control's verbs.
@@ -53,13 +54,6 @@ extension MacFourVerbs {
             let output = Self.object(result.output)
             let effect = Self.effectWords(output: output)
             let verified = result.ok && output["verified"] == .bool(true)
-            detail["status"] = .string(effect.status == "acted" && !verified ? "acted_unobserved" : effect.status)
-            detail["verification"] = .string(verified ? "satisfied"
-                : effect.status == "acted_mismatch" || !result.ok ? "failed" : "unverified")
-            if verified {
-                detail["verification_evidence"] = output["verification_evidence"] ?? .string(effect.sentence)
-                detail["verification_scope"] = output["verification_scope"] ?? .string("observed_control_effect")
-            } else { detail.removeValue(forKey: "verification_evidence") }
             // The owner's result is already redacted and distinguishes input
             // acceptance from an observed effect. Keep that evidence intact.
             detail["selection_result"] = result.toJSON()
@@ -67,10 +61,9 @@ extension MacFourVerbs {
             // The fresh screen the act left, as a look prints it, anchored to
             // the app of the owner's own post-effect read, so no look is needed
             // after it. Its frame supersedes the receipt's frame and glance.
-            let walked = postRead.walked
             var screen = "raw view · accessibility · Selected control's closed-loop action receipt."
-            if let acted = walked?.read.app,
-               case .seen(let after) = await sight(part: nil, app: acted.bundleIdentifier ?? acted.name, observed: walked) {
+            if let acted = postRead.walked?.read.app,
+               case .seen(let after) = await sight(part: nil, app: acted.bundleIdentifier ?? acted.name, observed: postRead) {
                 screen = after.render
                 if case .object(var receipt)? = detail["selection_result"] {
                     receipt["output"] = .object(output.filter { !["frame_id", "frame_ttl_seconds", "glance", "how_to_read"].contains($0.key) })

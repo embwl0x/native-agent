@@ -1,34 +1,29 @@
 import AgentWorkspace
-import Dispatcher
 import ApprovalInbox
-import Privacy
-import TurnTrace
 import Transcripts
-import DeviceSync
 import Foundation
 import Observation
 import ImageIO
 import UniformTypeIdentifiers
-import NativeAgentShared
+@_exported import NativeAgentShared
 import PersistenceCore
 import ChatTurnRuntime
 import ChatTurnContracts
 import ChatSessionWork
-// Blueprint: | `ChatModels.swift` | `ChatMessage`: `NativeAppChatMessage`, `ChatMessageMetadata`, `CodingKeys`; decode-only inline cards travel with loaded message revisions and never re-encode onto transcript wire; transcript-owned attachment preview bytes/unavailable status carried to Mac and DeviceSync, bounded to the existing 720px display decode; transport copies can omit optional previews before rejecting history |
+// Blueprint: | `ChatModels.swift` | `ChatMessage`: `ChatMessageMetadata`, `CodingKeys`; decode-only inline cards travel with loaded message revisions and never re-encode onto transcript wire; Mac ImageIO generation fills Shared's optional attachment preview bytes with a 720px display decode; transport copies can omit previews before rejecting history; concrete Markdown export and clipboard formatting |
 
 public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
     public var id: String = UUID().uuidString
     public var sessionId: String? = nil
-    // FIX: safe defaults so one message missing role/content doesn't fail the
-    // whole transcript read and blank the primary chat surface.
+    // Missing canonical fields do not discard the transcript.
     public var role: String = "assistant"
     public var content: String = ""
-    public var createdAt: String = ISO8601DateFormatter().string(from: Date())
+    public var createdAt: String = NativeTimestampFormat.plainZulu(Date())
     public var runId: String? = nil
     public var source: String? = nil
     public var metadata: ChatMessageMetadata? = nil
     /// Presentation only; travels with the transcript revision, never on its wire.
-    public var inlineCards: [ChatTranscriptProjection.Card] = []
+    public var inlineCards: [TranscriptReadout.Card] = []
     private enum CodingKeys: String, CodingKey {
         case id, sessionId, role, content, createdAt, runId, source, metadata
     }
@@ -43,7 +38,7 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
         sessionId: String? = nil,
         role: String = "assistant",
         content: String = "",
-        createdAt: String = ISO8601DateFormatter().string(from: Date()),
+        createdAt: String = NativeTimestampFormat.plainZulu(Date()),
         runId: String? = nil,
         source: String? = nil,
         metadata: ChatMessageMetadata? = nil
@@ -64,13 +59,12 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
     /// advisory sibling must not discard a valid metadata.origin trust signal:
     /// each field degrades independently to its default.
     public init(row o: [String: JSONValue]) {
-        self.id = chatRowString(o["id"]) ?? UUID().uuidString
-        self.sessionId = chatRowString(o["sessionId"])
-        self.content = chatRowString(o["content"]) ?? ""
-        self.createdAt = chatRowString(o["createdAt"])
-            ?? ISO8601DateFormatter().string(from: Date())
-        self.runId = chatRowString(o["runId"])
-        self.source = chatRowString(o["source"])
+        self.id = o["id"]?.stringValue ?? UUID().uuidString
+        self.sessionId = o["sessionId"]?.stringValue
+        self.content = o["content"]?.stringValue ?? ""
+        self.createdAt = o["createdAt"]?.stringValue ?? NativeTimestampFormat.plainZulu(Date())
+        self.runId = o["runId"]?.stringValue
+        self.source = o["source"]?.stringValue
 
         // Missing/null metadata is the normal historical shape. A PRESENT
         // value of the wrong JSON type is different: silently turning it
@@ -88,7 +82,7 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
             self.metadata = unreadable
         }
 
-        let decodedRole = chatRowString(o["role"])
+        let decodedRole = o["role"]?.stringValue
         let normalizedRole = decodedRole?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
@@ -103,8 +97,7 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
         }
     }
 
-    /// The same row contract for a Codable container (the phone snapshot's
-    /// own type is Codable). Encodable stays synthesized.
+    /// The tolerant canonical row contract for a Codable container. Encodable stays synthesized.
     public init(from decoder: Decoder) throws {
         guard case .object(let o) = try JSONValue(from: decoder) else {
             throw DecodingError.typeMismatch(
@@ -116,8 +109,6 @@ public struct ChatMessage: Identifiable, Codable, Hashable, Sendable {
     }
 }
 
-public typealias NativeAppChatMessage = ChatMessage
-
 extension ChatMessage {
     /// A wake input she wrote to herself (what changed, what she carries):
     /// hers, recorded for her, never the person's words. Her acts on the
@@ -128,138 +119,18 @@ extension ChatMessage {
     }
 }
 
-public struct ChatMessageMetadata: Encodable, Hashable, Sendable {
+extension ChatMessageMetadata {
     /// Shared transcript vocabulary for an approval awaiting a human decision.
     /// Producers must mint this value and transcript grouping/rendering must
     /// consume it through `isPendingApproval`; a literal drift must never hide
     /// an actionable card behind a collapsed tool summary.
     public static let approvalPendingKind = ChatTranscriptToolMessageKind.approvalPending
 
-    // Assistant brain metadata
-    public var model: String?
-    public var requestedModel: String?
-    public var reasoningEffort: String?
-    public var fileAccessMode: String?
-    public var codexSandbox: String?
-    public var error: String?
-    /// Refusals never regenerate directly; a proven pre-dispatch refusal may prepare a draft.
-    public var providerRefusal: Bool? = nil
-    public var providerRefusalDraft: Bool? = nil
-    // Truncated-turn markers — written by persistPartialIfNeeded when a turn
-    // fails or is cancelled mid-stream. Decoded so the UI can distinguish a
-    // partial/cancelled row from a completed reply; otherwise a persisted
-    // partial counts as "assistant landed" and suppresses the failure bubble
-    // (audit finding #2, 2026-06-14).
-    public var partial: Bool? = nil
-    public var cancelled: Bool? = nil
-    /// Exact engine outcome of a persisted assistant turn.
-    public var completionState: String?
-    // PATCH-2026-05-08: wave2-chat-ux Tool-use pill metadata (role=tool messages)
-    public var kind: String?          // "tool_use" | `approvalPendingKind`
-    public var toolName: String?      // e.g. "read_file"
-    // Input dict serialized as JSON string for Codable simplicity
-    public var inputJSON: String?
-    public var resultSummary: String?
-    /// The row's own settled state ("pending", "superseded", "declined", …),
-    /// written beside the receipt by the same locked write. Read by the tool
-    /// fold, which trusts it over the envelope when both are present.
-    public var resultStatus: String?
-    /// The state of the row's own `metadata.interaction`, lifted out at decode
-    /// time. Decode-only: `interaction` itself has never round-tripped through
-    /// this model, and re-encoding a lifted copy would put a second, divergent
-    /// answer on the wire.
-    ///
-    /// It is what classifies a row written BEFORE `result_status` existed.
-    /// Superseding rewrote the interaction on those rows but not the receipt,
-    /// so they still carry a stale `needs_input` envelope and counted as open
-    /// forever.
-    public var interactionState: String?
-    public var ok: Bool?
-    public var durationMs: Int?
-    // write_file diff support
-    public var beforeContent: String?
-    public var afterContent: String?
-    // approval_pending
-    public var approvalId: String?
-
     public var isPendingApproval: Bool {
         kind == Self.approvalPendingKind
     }
-    /// Decode-only: a mirror of a card raised in another conversation
-    /// (`ApprovalChatCards.interactionMirrorKind`) — where the original is.
-    public var mirrorInteractionId: String?
-    public var mirrorInteractionSessionId: String?
-    public var interactionMirror: (sessionID: String, interactionID: String)? {
-        guard kind == "interaction_mirror", let mirrorInteractionId, let mirrorInteractionSessionId
-        else { return nil }
-        return (mirrorInteractionSessionId, mirrorInteractionId)
-    }
-    // eval3/T3: attachments persisted under metadata.attachments by
-    // ChatOrchestrationClient.appendMessage (NativeAgentCore). Round-tripped
-    // here so the transcript read → MacSyncEngine snapshot → iOS refreshChatHistory
-    // preserves attachments instead of dropping them at the snapshot edge.
-    public var attachments: [PersistedAttachment]?
-    /// 658.14 session provenance. Present on user rows that did NOT originate
-    /// from the human at this Mac (bridge wakes and automated injections).
-    /// Absent means "no claim recorded", never "trusted human" — see
-    /// MacChatMessageProvenance for how absence is rendered.
-    public var origin: ChatMessageOriginMetadata?
-    // 2026-09-28: Decode-only surface/agent projection of the recorded turn envelope for presentation.
-    public var envelope: ChatMessageOriginMetadata?
-    /// How many LEADING characters of this assistant row are the working
-    /// commentary the model spoke between tool rounds, rather than its answer.
-    /// Written by the engine; the settled bubble folds that prefix away instead
-    /// of leaving "I'll check… now I'll read… here's what I found" as one
-    /// permanent answer. Absent on single-round turns and on every user row.
-    public var workingCommentaryChars: Int?
-    /// Opaque identity of the turn that produced this assistant row.
-    public var turnTraceId: String?
-    /// The engine's `mechanicalKind` stamp. Decode-only: `systemRow` marks a
-    /// persisted turn-failure notice, which is not a reply.
-    public var mechanicalKind: String?
-    /// What a failed turn had done when it stopped: a
-    /// `ProviderFailure.WorkState` raw value ("nothing ran", "ran partly",
-    /// "outcome unknown"), or "not sent" when the request provably never left
-    /// this Mac. Decode-only on persisted failure rows; stamped in memory on
-    /// synthetic failure bubbles. The failure card reads it so Retry never
-    /// calls a turn harmless when it may have acted.
-    public var failureWork: String?
-
-    // Custom CodingKeys to map camelCase Swift properties → snake_case daemon keys
-    enum CodingKeys: String, CodingKey {
-        case model, requestedModel, reasoningEffort, fileAccessMode, codexSandbox, error, partial, cancelled, completionState, failureWork
-        case providerRefusal = "provider_refusal"
-        case providerRefusalDraft = "provider_refusal_draft"
-        case kind
-        case toolName = "tool_name"
-        case resultSummary = "result_summary"
-        case resultStatus = "result_status"
-        case ok
-        case durationMs = "duration_ms"
-        case beforeContent = "before_content"
-        case afterContent = "after_content"
-        case approvalId = "approval_id"
-        case inputJSON = "input"
-        case attachments
-        case origin
-        case workingCommentaryChars
-        case turnTraceId
-    }
-
-    /// Empty metadata. Declaring `init(from:)` in the body suppresses the
-    /// synthesized memberwise init, so callers that need to stamp a single
-    /// field (the synthetic-error bubbles below) had no way to build one.
-    public init() {}
-
-    /// Metadata for an in-memory synthetic failure bubble. `error` is the field
-    /// `messageNeedsRetry` (ChatMessageListView) reads, so stamping it is what
-    /// makes the "Try again" affordance the bubble's own copy names actually
-    /// render (sweep R4 C7). `userRowPersisted` records whether the ORIGINAL
-    /// turn wrote the user's message to the transcript before failing — the
-    /// no-provider guard bails out before client.chat ever runs, so retrying
-    /// that bubble with suppressUserAppend would lose the user's message from
-    /// the persisted thread (gpt-5.5 review 2026-08-06, blocking). In-memory
-    /// only: deliberately NOT in CodingKeys, so it never touches the wire.
+    /// In-memory failure metadata: `error` enables Retry; `userRowPersisted` prevents suppressing an unsaved user message.
+    /// Retry guards are excluded from CodingKeys and never written to the wire.
     public static func syntheticError(
         _ message: String,
         userRowPersisted: Bool = true,
@@ -272,46 +143,34 @@ public struct ChatMessageMetadata: Encodable, Hashable, Sendable {
         return metadata
     }
 
-    /// See `syntheticError(_:userRowPersisted:)`. Nil on every decoded row —
-    /// only synthetic in-memory bubbles carry it.
-    public var syntheticUserRowPersisted: Bool?
-    /// Payload-free retry guard for a synthetic failure whose optimistic user
-    /// row never reached canonical persistence. Attachment bytes are never
-    /// retained here; this records only that text-only regeneration is unsafe.
-    public var syntheticInputHadAttachments: Bool?
-
     private static func _capString(_ s: String?, _ limit: Int) -> String? {
         guard let s, s.count > limit else { return s }
         return String(s.prefix(limit)) + "\n…(truncated)"
     }
 
-    /// The row's `metadata` object. Metadata is display/advisory data: one
-    /// wrong-typed sibling reads as absent and never discards the whole message
-    /// (and with it a valid authority-bearing origin object). Streamed and
-    /// persisted rows spell some keys in camelCase, the daemon in snake_case;
-    /// the snake_case spelling wins.
-    /// PATCH-2026-05-08: review-fix-B Cap big strings at read time so a tool
-    /// returning a 500KB blob doesn't blow up SwiftUI rendering or memory.
+    /// Wrong-typed advisory fields read as absent without discarding the row or its authority-bearing origin.
+    /// Where both key spellings exist, snake_case wins; cap displayed strings to bound rendering and memory.
     public init(fields o: [String: JSONValue]) {
-        model = chatRowString(o["model"])
-        turnTraceId = chatRowString(o["turnTraceId"])
-        requestedModel = chatRowString(o["requestedModel"])
-        reasoningEffort = chatRowString(o["reasoningEffort"])
-        fileAccessMode = chatRowString(o["fileAccessMode"])
-        codexSandbox = chatRowString(o["codexSandbox"])
-        error = chatRowString(o["error"])
-        providerRefusal = chatRowBool(o["provider_refusal"])
-        providerRefusalDraft = chatRowBool(o["provider_refusal_draft"])
-        partial = chatRowBool(o["partial"])
-        cancelled = chatRowBool(o["cancelled"])
-        completionState = chatRowString(o["completionState"])
-        kind = chatRowString(o["kind"])
-        toolName = chatRowString(o["tool_name"]) ?? chatRowString(o["toolName"])
+        self.init()
+        model = o["model"]?.stringValue
+        turnTraceId = o["turnTraceId"]?.stringValue
+        requestedModel = o["requestedModel"]?.stringValue
+        reasoningEffort = o["reasoningEffort"]?.stringValue
+        fileAccessMode = o["fileAccessMode"]?.stringValue
+        codexSandbox = o["codexSandbox"]?.stringValue
+        error = o["error"]?.stringValue
+        providerRefusal = o["provider_refusal"]?.boolValue
+        providerRefusalDraft = o["provider_refusal_draft"]?.boolValue
+        partial = o["partial"]?.boolValue
+        cancelled = o["cancelled"]?.boolValue
+        completionState = o["completionState"]?.stringValue
+        kind = o["kind"]?.stringValue
+        toolName = o["tool_name"]?.stringValue ?? o["toolName"]?.stringValue
         resultSummary = Self._capString(
-            chatRowString(o["result_summary"]) ?? chatRowString(o["resultSummary"]),
+            o["result_summary"]?.stringValue ?? o["resultSummary"]?.stringValue,
             4_000
         )
-        resultStatus = chatRowString(o["result_status"]) ?? chatRowString(o["resultStatus"])
+        resultStatus = o["result_status"]?.stringValue ?? o["resultStatus"]?.stringValue
         // Just the interaction's state name: the one field every build has
         // written since v1, so a shape this build does not understand still
         // yields it.
@@ -324,22 +183,18 @@ public struct ChatMessageMetadata: Encodable, Hashable, Sendable {
         } else {
             interactionState = nil
         }
-        ok = chatRowBool(o["ok"])
+        ok = o["ok"]?.boolValue
         durationMs = chatRowInt(o["duration_ms"])
-        beforeContent = Self._capString(chatRowString(o["before_content"]), 16_000)
-        afterContent = Self._capString(chatRowString(o["after_content"]), 16_000)
-        approvalId = chatRowString(o["approval_id"]) ?? chatRowString(o["approvalId"])
-        mirrorInteractionId = chatRowString(o["interactionId"])
-        mirrorInteractionSessionId = chatRowString(o["interactionSessionId"])
+        beforeContent = Self._capString(o["before_content"]?.stringValue, 16_000)
+        afterContent = Self._capString(o["after_content"]?.stringValue, 16_000)
+        approvalId = o["approval_id"]?.stringValue ?? o["approvalId"]?.stringValue
+        mirrorInteractionId = o["interactionId"]?.stringValue
+        mirrorInteractionSessionId = o["interactionSessionId"]?.stringValue
         attachments = PersistedAttachment.list(o["attachments"])
         if case .object(let fields)? = o["envelope"] {
             envelope = ChatMessageOriginMetadata(fields: fields)
         }
-        // 658.14: this read is the whole badge. It degrades in the honest
-        // direction: a PRESENT but unreadable origin (null included) becomes
-        // an unrecognized one, which MacChatMessageProvenance renders as
-        // "Automated" — no blanking, and never a false human. Absent stays
-        // absent.
+        // Present but unreadable origins (including null) render as "Automated"; absent origins stay absent.
         switch o["origin"] {
         case nil:
             origin = nil
@@ -350,20 +205,20 @@ public struct ChatMessageMetadata: Encodable, Hashable, Sendable {
             origin = ChatMessageOriginMetadata(surface: "unreadable")
         }
         workingCommentaryChars = chatRowInt(o["workingCommentaryChars"])
-        mechanicalKind = chatRowString(o["mechanicalKind"])
-        failureWork = chatRowString(o["failureWork"])
+        mechanicalKind = o["mechanicalKind"]?.stringValue
+        failureWork = o["failureWork"]?.stringValue
         // A legacy `input` object is shown as its JSON text; otherwise the
         // text the writer stored.
         if case .object(let rawInput)? = o["input"] {
             var dict: [String: Any] = [:]
-            for key in rawInput.keys.sorted() {
-                dict[key] = Self.displayValue(rawInput[key]!)
+            for (key, value) in rawInput.sorted(by: { $0.key < $1.key }) {
+                dict[key] = Self.displayValue(value)
             }
             let json = (try? JSONSerialization.data(withJSONObject: dict)).flatMap { String(data: $0, encoding: .utf8) }
             inputJSON = Self._capString(json, 4_000)
         } else {
             inputJSON = Self._capString(
-                chatRowString(o["input"]) ?? chatRowString(o["inputJSON"]),
+                o["input"]?.stringValue ?? o["inputJSON"]?.stringValue,
                 4_000
             )
         }
@@ -381,41 +236,6 @@ public struct ChatMessageMetadata: Encodable, Hashable, Sendable {
         }
     }
 
-    public func encode(to encoder: Encoder) throws {
-        var c = encoder.container(keyedBy: CodingKeys.self)
-        try c.encodeIfPresent(model, forKey: .model)
-        try c.encodeIfPresent(turnTraceId, forKey: .turnTraceId)
-        try c.encodeIfPresent(requestedModel, forKey: .requestedModel)
-        try c.encodeIfPresent(reasoningEffort, forKey: .reasoningEffort)
-        try c.encodeIfPresent(fileAccessMode, forKey: .fileAccessMode)
-        try c.encodeIfPresent(codexSandbox, forKey: .codexSandbox)
-        try c.encodeIfPresent(error, forKey: .error)
-        try c.encodeIfPresent(providerRefusal, forKey: .providerRefusal)
-        try c.encodeIfPresent(providerRefusalDraft, forKey: .providerRefusalDraft)
-        try c.encodeIfPresent(partial, forKey: .partial)
-        try c.encodeIfPresent(cancelled, forKey: .cancelled)
-        // How the turn ended is the phone's proof that a saved row IS the
-        // reply it already shows (same run, terminal): without these the
-        // snapshot row and the live bubble both stayed on the phone.
-        try c.encodeIfPresent(completionState, forKey: .completionState)
-        try c.encodeIfPresent(failureWork, forKey: .failureWork)
-        try c.encodeIfPresent(kind, forKey: .kind)
-        try c.encodeIfPresent(toolName, forKey: .toolName)
-        try c.encodeIfPresent(resultSummary, forKey: .resultSummary)
-        try c.encodeIfPresent(resultStatus, forKey: .resultStatus)
-        try c.encodeIfPresent(ok, forKey: .ok)
-        try c.encodeIfPresent(durationMs, forKey: .durationMs)
-        try c.encodeIfPresent(beforeContent, forKey: .beforeContent)
-        try c.encodeIfPresent(afterContent, forKey: .afterContent)
-        try c.encodeIfPresent(approvalId, forKey: .approvalId)
-        try c.encodeIfPresent(inputJSON, forKey: .inputJSON)
-        try c.encodeIfPresent(attachments, forKey: .attachments)
-        // Must survive Mac-side re-encoding and snapshot emission. The current
-        // iOS receiver intentionally ignores this additive field (658.14 adds
-        // no phone badge), but the Mac encoder must not silently erase it.
-        try c.encodeIfPresent(origin, forKey: .origin)
-        try c.encodeIfPresent(workingCommentaryChars, forKey: .workingCommentaryChars)
-    }
 }
 
 /// Per-message attachment metadata with the transcript owner's display preview.
@@ -425,39 +245,20 @@ public struct ChatMessageMetadata: Encodable, Hashable, Sendable {
 /// `metadata.attachments` in `chat/messages/<sid>.jsonl`. Encoded on the Mac
 /// `ChatMessage.metadata`, snapshotted into iCloud `chat_transcripts.json`,
 /// and decoded by iOS into `ChatMessageRecord.metadata.attachments`.
-public struct PersistedAttachment: Encodable, Hashable, Sendable {
-    public var id: String
-    public var type: String
-    public var mime: String
-    public var name: String?
-    public var byteSize: Int64
-    public var path: String?
-    public var utterance: SpeechUtterance?
-    public var preview: TranscriptAttachmentPreview?
-
-    public init(id: String, type: String, mime: String, name: String?, byteSize: Int64, path: String? = nil) {
-        self.id = id; self.type = type; self.mime = mime; self.name = name; self.byteSize = byteSize; self.path = path
-    }
-
+extension PersistedAttachment {
     /// One `metadata.attachments` element. A non-object, or a string field
     /// holding another type, is unreadable; a missing or non-integral
     /// byteSize reads as 0.
     public init?(value: JSONValue) {
-        guard case .object(let o) = value else { return nil }
-        func field(_ key: String) -> String?? {
-            switch o[key] {
-            case nil, .null?: return .some(nil)
-            case .string(let s)?: return .some(s)
-            default: return nil
-            }
-        }
-        guard let id = field("id"), let type = field("type"), let mime = field("mime"),
-              let name = field("name"), let path = field("path") else { return nil }
-        self.id = id ?? UUID().uuidString
-        self.type = type ?? "file"
-        self.mime = mime ?? "application/octet-stream"
-        self.name = name
-        self.path = path
+        guard let row = try? JSONRow(value) else { return nil }
+        do {
+            self.init(id: try row.optionalString("id") ?? UUID().uuidString,
+                      type: try row.optionalString("type") ?? "file",
+                      mime: try row.optionalString("mime") ?? "application/octet-stream",
+                      name: try row.optionalString("name"), byteSize: 0,
+                      path: try row.optionalString("path"))
+        } catch { return nil }
+        let o = row.fields
         if let value = o["preview"], let bytes = try? value.serializedData(pretty: false) {
             self.preview = try? JSONDecoder().decode(TranscriptAttachmentPreview.self, from: bytes)
         }
@@ -484,32 +285,24 @@ public struct PersistedAttachment: Encodable, Hashable, Sendable {
         }
         return out
     }
-    enum CodingKeys: String, CodingKey { case id, type, mime, name, byteSize, path, utterance, preview }
 }
 
-public struct TranscriptAttachmentPreview: Codable, Hashable, Sendable {
-    public let png: Data?
+extension TranscriptAttachmentPreview {
     fileprivate init(path: String?) {
         // Keep the measured 720px decode: a 360pt transcript bubble at 2×.
-        let options: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: 720,
-        ]
         let bytes = NSMutableData()
         if let path, let source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
-           let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary),
+           let image = Self.thumbnail(from: source, maxDimension: 720),
            let destination = CGImageDestinationCreateWithData(bytes, UTType.png.identifier as CFString, 1, nil) {
             CGImageDestinationAddImage(destination, image, nil)
-            png = CGImageDestinationFinalize(destination) ? bytes as Data : nil
+            self.init(png: CGImageDestinationFinalize(destination) ? bytes as Data : nil)
         } else {
-            png = nil
+            self.init(png: nil)
         }
     }
 }
 
-extension ChatTranscriptProjection {
+extension TranscriptReadout {
     /// Attachment files are refreshed outside the transcript-file cache: their
     /// contents may change without changing the message's path or JSONL row.
     func attachmentPreviews() async -> Self {
@@ -532,79 +325,40 @@ extension ChatTranscriptProjection {
     }
 }
 
-// ChatSession, RuntimeHealth, RunRecord, MemoryRecord moved to NativeAgentShared.
-
 /// Decoded twin of the `metadata.origin` object written by
 /// ChatOrchestrationClient.appendMessage. Deliberately dumb: it carries the
 /// raw recorded strings and makes no display decisions. All allowlisting and
 /// sanitizing happens in MacChatMessageProvenance, at the render boundary.
-public struct ChatMessageOriginMetadata: Encodable, Hashable, Sendable {
-    public var surface: String?
-    public var agent: String?
-    public var authored: String?
-    public var peerSources: [String]?
-    public var elevatedPeerSources: [String]?
-
-    public init(surface: String? = nil, agent: String? = nil) {
-        self.surface = surface
-        self.agent = agent
-    }
-
+extension ChatMessageOriginMetadata {
     /// The recorded strings, or nil when either is present with another type.
     public init?(fields o: [String: JSONValue]) {
+        self.init()
         for key in ["surface", "agent"] {
             switch o[key] {
             case nil, .null?, .string?: continue
             default: return nil
             }
         }
-        surface = chatRowString(o["surface"])
-        agent = chatRowString(o["agent"])
-        authored = chatRowString(o["authored"])
+        surface = o["surface"]?.stringValue
+        agent = o["agent"]?.stringValue
+        authored = o["authored"]?.stringValue
+        verifiedUserId = o["verifiedUserId"]?.stringValue
         if case .array(let values)? = o["peerSources"] {
-            peerSources = values.compactMap { chatRowString($0) }
+            peerSources = values.compactMap { $0.stringValue }
         }
         if case .array(let values)? = o["elevatedPeerSources"] {
-            elevatedPeerSources = values.compactMap { chatRowString($0) }
+            elevatedPeerSources = values.compactMap { $0.stringValue }
         }
     }
 }
 
 // MARK: - Transcript row fields
 
-/// A string field; any other JSON type reads as absent.
-private func chatRowString(_ value: JSONValue?) -> String? {
-    if case .string(let s)? = value { return s }
-    return nil
-}
-
-private func chatRowBool(_ value: JSONValue?) -> Bool? {
-    if case .bool(let b)? = value { return b }
-    return nil
-}
-
 /// An integer field; an integral JSON float reads as its integer.
 private func chatRowInt(_ value: JSONValue?) -> Int? {
-    switch value {
-    case .int(let n)?: return Int(exactly: n)
-    case .double(let d)?: return Int(exactly: d)
-    default: return nil
-    }
+    if case .double(let number)? = value, number != number.rounded() { return nil }
+    return value?.integerValue.flatMap(Int.init(exactly:))
 }
-
-extension ChatMessage: DeviceSyncTranscriptMessage {
-    public var isPersonVisible: Bool { !isHerOwnTurnInput }
-
-    public mutating func omitAttachmentPreviews() {
-        let attachments = metadata?.attachments?.map { original in
-            var attachment = original
-            attachment.preview = nil
-            return attachment
-        }
-        metadata?.attachments = attachments
-    }
-}
-
 extension ChatMessage: MacChatRetryMessage {
     public var retryOrigin: ChatMessageOrigin? {
         guard let recorded = metadata?.origin else { return nil }
@@ -631,9 +385,6 @@ extension ChatMessage: FirstRunWelcomeMessage {
     }
 }
 
-extension PersistedAttachment: ChatExportAttachment {}
-extension ChatMessageMetadata: ChatExportMetadata {}
-extension ChatMessage: ChatExportMessage {}
 extension ChatMessageMetadata: ChatTurnFailureMetadata {}
 extension ChatMessage: ChatTurnFailureMessage {}
 
@@ -644,61 +395,138 @@ extension ChatMessage: MacChatRenderedMessage {
 }
 
 extension ChatMessage {
-    public static func slashCommandReceipt(result: DispatchResult, tool: String, input: [String: Any]) -> ChatMessage {
-        let badge: String
-        switch result.status.lowercased() {
-        case "ok":               badge = "✅"
-        case "pending_approval": badge = "⏳"
-        case "failed":           badge = "❌"
-        case "blocked":          badge = "🚫"
-        case "dry_run":          badge = "🔍"
-        default:                 badge = "•"
-        }
-
-        var argSummary = ""
-        if !input.isEmpty {
-            if let data = try? JSONSerialization.data(withJSONObject: input),
-               let value = try? JSONValue.parse(data),
-               let json = try? TurnTraceRedactor.redactValue(value).serialize(pretty: false) {
-                let safe = NativeAppSecretRedactor.redactText(
-                    SwiftNativeChatOrchestrationClient.redactedPersistedToolInput(tool: tool, json: json))
-                let preview = safe.count > 80 ? String(safe.prefix(77)) + "…" : safe
-                argSummary = "(\(preview))"
-            }
-        }
-
-        var outputBlock = ""
-        if result.ok, let out = result.output {
-            let json = (try? TurnTraceRedactor.redactValue(out.value).serialize(pretty: false)) ?? "{}"
-            let safe = NativeAppSecretRedactor.redactText(
-                SwiftNativeChatOrchestrationClient.redactedPersistedToolResult(
-                    tool: tool, json: json))
-            let preview = safe.count > 400
-                ? String(safe.prefix(400)) + "\n…(truncated)"
-                : safe
-            outputBlock = "\n```\n\(preview)\n```"
-        }
-
-        var errorBlock = ""
-        if let err = result.error {
-            errorBlock = "\n`\(NativeAppSecretRedactor.redactText(err.code))` \(NativeAppSecretRedactor.redactText(err.message))"
-        }
-
-        let trace = "\n*\(result.durationMs)ms · autonomy: \(result.effectiveAutonomy)*"
-
-        let content = NativeAppSecretRedactor.redactText(
-            "\(badge) **\(tool)**\(argSummary)\(outputBlock)\(errorBlock)\(trace)")
-        return ChatMessage(role: "system", content: content)
-    }
-}
-
-
-extension ChatMessage {
     public init(approval: ApprovalRecord) {
         var metadata = ChatMessageMetadata()
         metadata.kind = ChatMessageMetadata.approvalPendingKind
         metadata.approvalId = approval.id
         self.init(id: approval.id, role: "tool",
                   content: "\(approval.title)\n\(approval.reason)\n\(approval.payloadPreview)", metadata: metadata)
+    }
+}
+
+public enum ChatExport {
+    public static func export(
+        session: ChatSession?,
+        sessionId: String,
+        messages: [ChatMessage],
+        exportedAt: Date = Date()
+    ) async throws -> ChatExportResult {
+        try await Task.detached(priority: .userInitiated) {
+            guard !sessionId.isEmpty else { throw ChatExportError.noActiveSession }
+            guard !messages.isEmpty else { throw ChatExportError.noMessages }
+            guard let downloadsDir = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first else {
+                throw ChatExportError.downloadsUnavailable
+            }
+
+            let timestamp = fileTimestamp(exportedAt)
+            let safeSessionId = safeFilesystemSessionId(sessionId)
+            let fileURL = downloadsDir.appendingPathComponent("\(InstallPaths.current.name("NativeAgent"))-chat-\(safeSessionId)-\(timestamp)-\(UUID().uuidString).md")
+            let assets = fileURL.deletingPathExtension().appendingPathExtension("assets")
+            var imagePaths: [String: String] = [:]
+            var unavailableImages: [String: String] = [:]
+            var unavailableDetails: [String] = []
+            do {
+                for message in messages {
+                    if message.role == "system" && message.content.hasPrefix("[tool:") { continue }
+                    for attachment in message.metadata?.attachments ?? [] where attachment.type == "image" {
+                        guard imagePaths[attachment.id] == nil, unavailableImages[attachment.id] == nil else { continue }
+                        let label = attachment.name ?? attachment.id
+                        guard let path = attachment.path, !path.isEmpty else {
+                            let detail = "\(label): no saved file"
+                            unavailableImages[attachment.id] = detail
+                            unavailableDetails.append(detail)
+                            continue
+                        }
+                        let source = URL(fileURLWithPath: path)
+                        let name = UUID().uuidString + "." + safeFilesystemSessionId(source.pathExtension)
+                        let destination = assets.appendingPathComponent(name)
+                        do {
+                            try FileManager.default.createDirectory(at: assets, withIntermediateDirectories: true)
+                            try FileManager.default.copyItem(at: source, to: destination)
+                            imagePaths[attachment.id] = assets.lastPathComponent + "/" + name
+                        } catch {
+                            try? FileManager.default.removeItem(at: destination)
+                            let detail = "\(label): \(error.localizedDescription)"
+                            unavailableImages[attachment.id] = detail
+                            unavailableDetails.append(detail)
+                        }
+                    }
+                }
+                let markdown = sessionMarkdown(session: session, sessionId: sessionId, messages: messages,
+                                               exportedAt: exportedAt, imagePaths: imagePaths,
+                                               unavailableImages: unavailableImages)
+                try markdown.write(to: fileURL, atomically: true, encoding: .utf8)
+                return ChatExportResult(url: fileURL, unavailableImages: unavailableDetails)
+            } catch {
+                if FileManager.default.fileExists(atPath: assets.path) { try? FileManager.default.removeItem(at: assets) }
+                throw error
+            }
+        }.value
+    }
+
+    public static func sessionMarkdown(
+        session: ChatSession?,
+        sessionId: String,
+        messages: [ChatMessage],
+        exportedAt: Date,
+        imagePaths: [String: String] = [:],
+        unavailableImages: [String: String] = [:]
+    ) -> String {
+        let title = (session?.title ?? "chat").replacingOccurrences(of: "/", with: "-")
+        var markdown = "# \(title)\n\n"
+        markdown += "_Session: \(sessionId) - Exported: \(ISO8601DateFormatter().string(from: exportedAt))_\n\n"
+        for message in messages {
+            if message.role == "system" && message.content.hasPrefix("[tool:") {
+                continue
+            }
+            markdown += messageMarkdown(message, imagePaths: imagePaths, unavailableImages: unavailableImages)
+        }
+        return markdown
+    }
+
+    /// Render one chat message as Markdown: role header, content, and compact
+    /// attachment references. Each block ends blank so consecutive messages
+    /// stay separated in exports and clipboard copies.
+    public static func messageMarkdown(
+        _ message: ChatMessage, imagePaths: [String: String] = [:], unavailableImages: [String: String] = [:]
+    ) -> String {
+        let role = message.role.capitalized
+        var out = "**\(role):** \(message.content)\n\n"
+        if let attachments = message.metadata?.attachments, !attachments.isEmpty {
+            for attachment in attachments {
+                let label = attachment.name ?? attachment.id
+                if attachment.type == "image" {
+                    if let detail = unavailableImages[attachment.id] {
+                        out += "- image unavailable: \(detail)\n"
+                        continue
+                    }
+                    let target = imagePaths[attachment.id] ?? label
+                    guard let escaped = target.addingPercentEncoding(withAllowedCharacters:
+                        CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~/")) else {
+                        out += "- image unavailable: its export target could not be encoded\n"
+                        continue
+                    }
+                    out += "![image](\(escaped))\n"
+                } else {
+                    out += "- attachment: \(label) (\(attachment.mime ?? "application/octet-stream"))\n"
+                }
+            }
+            out += "\n"
+        }
+        return out
+    }
+
+    private static func fileTimestamp(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        formatter.timeZone = TimeZone.current
+        return formatter.string(from: date)
+    }
+
+    private static func safeFilesystemSessionId(_ sessionId: String) -> String {
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
+        let scalars = sessionId.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" }
+        let cleaned = String(scalars)
+        return cleaned.isEmpty ? "session" : String(cleaned.prefix(64))
     }
 }

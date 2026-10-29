@@ -1,46 +1,11 @@
+import Transcripts
 import Foundation
 import NativeAgentCore
 import PersistenceCore
 
 // Blueprint: | `CognitiveSubstrate+CaringEvent.swift` | `CognitiveSubstrate` caring event admission: turn context, semantic verdict delivery and distinct encounter/refusal accounting |
 
-// CARING EVENTS, APPRAISED BY THE ONLY OWNER THAT CAN (2026-09-11, second pass).
-//
-// The organism feels tenderness but runs no appraisal; the appraisal lives here.
-// So this file does exactly one thing: decide whether a turn WAS a caring moment
-// and, if so, which kind, and hand the organism that verdict plus the opaque
-// scope it needs to count the moment once. The law it feeds is in
-// `OrganismCaringEvent` and `OrganismChemistry`, and it is unchanged.
-//
-// THE VERDICT IS NO LONGER A PHRASE LIST. The first pass partitioned
-// `relationalWarmthBoost`'s high tier into four kinds and matched needles.
-// Agent named the three moments of this week that should have registered and
-// none of them contains a needle — see the header of
-// `CognitiveSubstrate+CaringAppraisal.swift` for what they were. The verdict now
-// comes from the shared after-turn interpretation on the Memory route.
-//
-// THE WARMTH TIER IS UNTOUCHED. The phrase groups below still exist and
-// `relationalWarmthBoost` still composes its high tier from them, exactly as
-// before; `conversationalAppraisal` still reads `repairPhrases`. Nothing about
-// warmth changed. What went away is the classifier that read those lists to
-// decide a MOMENT.
-//
-// THE GATES THAT ARE STILL CHEAP AND STILL LOCAL, because they are facts about
-// the event rather than judgments about the text — the model is never asked any
-// of these:
-//   · her own turns, tool output, anything she authored (Law 3 / audit C3).
-//   · anything that is not a lived turn.
-//   · a retelling surface (`OrganismCaringEvent.retellingSurfaces`): a
-//     recollection summary, a reflection, a dream, the REM pass.
-//   · a turn with no usable (session, turn) scope — the dedupe could not hold.
-//
-// WHAT CHANGED AT THE GATE: BRIDGE RELAYS. A bridge row used to be refused
-// outright. Two of Agent's three moments arrived that way — Claude relaying
-// User's own words about her, attributed. So a bridge row is now a CANDIDATE and
-// the model is asked the extra question (does this attribute what it carries to
-// the human?). A working agent-to-agent message is `none`; so is a digest or a
-// recap of an earlier conversation, which is a retelling whatever wire it came
-// on.
+// Local provenance gates admit lived turns for semantic caring appraisal; the organism owns dosing.
 
 /// Provenance from the durable incoming transcript row, independent of affect.
 public struct AfterTurnOrigin: Sendable {
@@ -49,6 +14,9 @@ public struct AfterTurnOrigin: Sendable {
     public let messageId: String
     public let occurredAt: Date?
     public let userMessage: String
+    /// What her turn took, one plain line from the stem when it used tools:
+    /// part of what happened, read beside the exchange.
+    public var took: String?
 
     public init(sessionId: String, runId: String?, messageId: String,
                 occurredAt: Date?, userMessage: String) {
@@ -70,13 +38,20 @@ public struct AfterTurnContext: Sendable {
     public let generation: UInt64
     /// The cares the call is shown for this exchange; empty asks nothing about cares.
     public let cares: [CognitiveCareLine]
+    /// The forgetting epochs the moment was admitted under (stamped at ingest).
+    /// A part whose domain has been forgotten since refuses the moment:
+    /// `mindEpoch` for affect, tags and cares, `bodyEpoch` for the body.
+    public let mindEpoch: UInt64
+    public let bodyEpoch: UInt64
 
     public init(event: CognitiveEvent, caring: CaringAppraisalRequest?, generation: UInt64,
-                cares: [CognitiveCareLine] = []) {
+                cares: [CognitiveCareLine] = [], mindEpoch: UInt64 = 0, bodyEpoch: UInt64 = 0) {
         self.event = event
         self.caring = caring
         self.generation = generation
         self.cares = cares
+        self.mindEpoch = mindEpoch
+        self.bodyEpoch = bodyEpoch
     }
 }
 
@@ -115,8 +90,7 @@ extension CognitiveSubstrate {
     /// The affectionate-emoji set the high tier treats as unambiguous affection.
     public static let caringEmoji = ["💜", "❤", "🥰", "😘", "💕"]
 
-    /// An apology or owning it — the repair class `conversationalAppraisal`
-    /// reads.
+    /// An apology or owning it — the repair class `studioValence` reads.
     public static let repairPhrases = [
         "i'm sorry", "im sorry", "i am sorry", "still sorry", "my bad", "my fault",
         "i was out of line", "that was me being", "took it out on you", "i was cruel",
@@ -133,40 +107,27 @@ extension CognitiveSubstrate {
 
     // MARK: - The seam
 
-    /// Install the model appraiser. Without one nothing ever doses, which is the
-    /// safe direction and the state every test and every headless tool starts in.
-
-    /// Install the door into the body. Without one a verdict is computed and
-    /// dropped, which is again the safe direction and what a test or a headless
-    /// tool gets. One closure rather than a reference to the kernel: this module
-    /// must not decide who owns the organism, and the app layer already knows
-    /// both.
-    public func setCaringEventSink(_ sink: CaringEventAdmitting?) {
-        caringEventSink = sink
-    }
-
-    /// Install the writer that records a refusal onto the appraisal's own receipt
-    /// row. Without one a refusal is still a refusal — nothing doses either way;
-    /// only the receipt is quieter, which is what a test or a headless tool wants.
+    /// Record refusals on the appraisal's own receipt when a writer is supplied.
     public func setCaringRefusalRecorder(_ recorder: CaringRefusalRecording?) {
         caringRefusalRecorder = recorder
     }
 
-    /// Drop everything the caring lane is holding and ignore every verdict
-    /// already in flight (review item 4). Called by `clearTransientState` and by
-    /// Reset Body, which clears the chemistry this lane doses.
-    ///
-    /// THE GENERATION COUNTER is the whole of "ignore in-flight": a task cannot
-    /// be un-awaited, but a verdict stamped with a generation the substrate has
-    /// moved past is dropped on return instead of dosing. Cancelling the tasks
-    /// as well is belt — `MindCaringAppraiser` checks `Task.isCancelled`.
+    /// Stamp new turns with the body's epoch; a changed epoch clears dose evidence.
+    /// Adopt only newer kernel revisions: a reset rollback can restore an older
+    /// epoch at a newer revision. Reset Body forgets only the body.
+    public func adoptBodyEpoch(_ epoch: UInt64, revision: UInt64) {
+        if let adopted = bodyEpochRevision, revision <= adopted { return }
+        bodyEpochRevision = revision
+        guard epoch != bodyEpoch else { return }
+        bodyEpoch = epoch
+        recentCaringEncounters.removeAll(keepingCapacity: false)
+    }
+
+    /// Clear mind admissions and caring context; the generation rejects in-flight
+    /// verdicts. Reset Body instead moves only its epoch through `adoptBodyEpoch`.
     public func clearCaringState() {
         caringAppraisalGeneration &+= 1
         deferredTurns.removeAll()
-        afterTurnAppraisals.removeAll()
-        afterTurnAppraisalOrder.removeAll()
-        appraisedCaringTurns.removeAll(keepingCapacity: false)
-        appraisedCaringTurnOrder.removeAll(keepingCapacity: false)
         recentTurnsBySession.removeAll(keepingCapacity: false)
         recentCaringEncounters.removeAll(keepingCapacity: false)
     }
@@ -182,12 +143,8 @@ extension CognitiveSubstrate {
     /// not a candidate — which is the overwhelming majority of events, and the
     /// honest answer for a working day.
     ///
-    /// THE SCOPE, and why these two ids. `subject.id` is the chat turn's own key
-    /// ("<session>:<messageId>"), which is what makes the dedupe survive the
-    /// thing it exists for: one chat message is minted into a cognitive event by
-    /// two different producers (`NativeCognitiveEventFactory` and
-    /// `ChatOrchestrationClient`), with different event ids and the same subject.
-    /// Keyed on the event id instead, one caring moment would dose twice.
+    /// Session and `subject.id` identify the originating chat turn across
+    /// producers; differing event ids must not make one moment dose twice.
     func caringEventCandidate(for event: CognitiveEvent) -> CaringAppraisalRequest? {
         guard configuration.enabled else { return nil }
         guard Self.isUserAuthored(event.kind) else { return nil }
@@ -198,20 +155,13 @@ extension CognitiveSubstrate {
             // User himself, typed here.
             relayed = false
         case (.imported, _):
-            // Anything the bridge carried into the user seat — an attested peer
-            // OR an unattested relay (Claude's own bridge sends no `authored`,
-            // so `relationalSource` reads it as `.user`; the first live drive on
-            // 2026-09-11 dropped every relay here). A candidate only because it
-            // may be carrying his words; the model decides whether it is.
+            // Attested peers and unattested relays qualify only when the model identifies the human's words.
             relayed = true
         default:
             return nil
         }
         let surface = Self.caringEventSurface(in: event)
-        // The retelling lanes still refuse — except that a relay's own surface
-        // IS "bridge", which is the one name this pass had to stop treating as a
-        // retelling. Everything else in the deny-set (recollection, reflection,
-        // dream, REM, compaction, …) refuses on both paths.
+        // Relays admit the bridge surface; all other retelling surfaces refuse.
         if relayed {
             guard OrganismCaringEvent.surfaceMayDose(surface, ignoring: ["bridge"]) else {
                 return nil
@@ -222,41 +172,21 @@ extension CognitiveSubstrate {
         let session = (event.sessionId ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let turn = event.subject.id.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !session.isEmpty, !turn.isEmpty else { return nil }
-        // A BOT RUN IS NOT AN ENCOUNTER (Astra audit 2, finding 9, 2026-09-11).
-        // `BotDefinition.sessionID` is "bot-<uuid>", and the text in the user
-        // seat is the bot's own standing brief recurring on every run — nobody
-        // said it to her. Live rows 4 and 9 of caring_appraisals.jsonl appraised
-        // Plainspoken's brief with relayed=false; both returned `none`, but an
-        // affectionate brief would have passed on its wording. The memory lane
-        // refuses the same sessions by the same prefix
-        // (`MemoryV2+AdaptivePromoter`: `if sessionId.hasPrefix("bot-")`); the
-        // surface deny-set in `OrganismCaringEvent` is the belt for a bot event
-        // that reaches here without its session id.
-        guard !session.lowercased().hasPrefix("bot-") else { return nil }
+        // A helper's standing brief and her own work are not encounters.
+        // Read their recorded owners/kinds; peer conversations remain eligible.
+        guard !SessionConversation.isHelper(session, dataRoot: conversationDataRoot, includingArchived: true),
+              SessionConversation.kind(session, dataRoot: conversationDataRoot, includingArchived: true)?.isOwnWork != true else { return nil }
         let text = event.summary.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
         let name = dependencies.userName().trimmingCharacters(in: .whitespacesAndNewlines)
         return CaringAppraisalRequest(
             userMessage: text,
-            // THE ORIGINATING TURN'S OWN CLOCK (2026-09-11, fourth pass; review
-            // item 2). The encounter window is measured against this, never
-            // against the moment the model call happened to return.
+            // Encounter windows use the originating turn's clock, never verdict arrival time.
             at: event.occurredAt,
-            // THE SURROUNDING EXCHANGE, not one preceding line (2026-09-11,
-            // third pass). Agent's two examples are both context problems: an
-            // affectionate pet name is not by itself a need met, and "how do you
-            // feel" is care or a diagnostic question depending entirely on what
-            // is being talked about. One preceding assistant line cannot settle
-            // either. The last few turns from BOTH sides can.
+            // Caring appraisal uses recent turns from both sides to distinguish care from work talk.
             context: recentTurnsBySession[session] ?? [],
             relayed: relayed,
-            // THE RELAY RULE IS EVIDENCE, NOT THE CLOCK (2026-09-11, fourth
-            // pass, Agent). A relay may be retelling an exchange that already
-            // reached her directly and already dosed, so the appraisal is shown
-            // the encounters that recently dosed — their kinds, times and
-            // one-clause reasons — and asked whether THIS describes a distinct
-            // moment. Only a relay gets the list; a turn User typed here is his
-            // own words arriving, which is evidence of itself.
+            // Only relays need recent encounters as evidence of whether their moment is distinct.
             recentEncounters: relayed ? recentCaringEncounters : [],
             personName: name.isEmpty ? nil : name,
             session: session,
@@ -264,39 +194,9 @@ extension CognitiveSubstrate {
         )
     }
 
-    // MARK: - The hop
-
-    /// Appraise `event` as a possible caring moment, off the hot path.
-    ///
-    /// `observe(_:)` is awaited while User's message is being persisted, BEFORE
-    /// the reply runs; a twenty-second model call there would be twenty seconds
-    /// of the send button doing nothing. So the call is LAUNCHED here and
-    /// returns immediately. Nothing blocks and nothing is stamped on any signal.
-    ///
-    /// WHEN THE VERDICT COMES BACK it goes straight into the body through
-    /// `caringEventSink` (`OrganismKernel.admitCaringEvent`), carrying the
-    /// ORIGINATING turn's timestamp and a fixed dose. The third pass instead
-    /// stamped the verdict on the NEXT somatic signal to come through, which
-    /// scaled the dose by that signal's intensity, measured the encounter window
-    /// against that signal's ingest clock, and dropped the verdict altogether
-    /// when no further signal arrived (review items 1, 2 and 3). All three are
-    /// gone with the queue.
-    ///
-    /// Idempotent per turn: a turn is appraised at most once
-    /// (`appraisedCaringTurns`), so the two minters for one chat message cost one
-    /// call, not two.
-    public func noteCaringTurn(for event: CognitiveEvent) {
-        // Record the turn AFTER building its request, so a turn is never part of
-        // its own context.
-        noteTurnForContext(event)
-    }
-
-    /// Remember the last few turns of this session, BOTH sides, so the appraisal
-    /// can read a turn in the exchange it happened in. A short ring per session,
-    /// clipped, bounded — never persisted, because a caring moment is judged
-    /// inside a live conversation and a relaunch has no conversation to be
-    /// inside.
-    private func noteTurnForContext(_ event: CognitiveEvent) {
+    /// Keep clipped turns from both sides in a bounded, in-memory session ring
+    /// for subsequent caring requests.
+    func noteTurnForContext(_ event: CognitiveEvent) {
         let speaker: CaringAppraisalRequest.Speaker
         if event.kind == .assistantTurnCompleted {
             speaker = .agent
@@ -311,8 +211,9 @@ extension CognitiveSubstrate {
         let text = CaringAppraisalLane.clip(event.summary)
         guard !text.isEmpty else { return }
         if recentTurnsBySession[session] == nil,
-           recentTurnsBySession.count >= Self.caringContextSessionCap {
-            recentTurnsBySession.removeValue(forKey: recentTurnsBySession.keys.first!)
+           recentTurnsBySession.count >= Self.caringContextSessionCap,
+           let oldest = recentTurnsBySession.keys.first {
+            recentTurnsBySession.removeValue(forKey: oldest)
         }
         var ring = recentTurnsBySession[session] ?? []
         ring.append(CaringAppraisalRequest.ContextTurn(speaker: speaker, text: text))
@@ -322,183 +223,214 @@ extension CognitiveSubstrate {
         recentTurnsBySession[session] = ring
     }
 
-    /// Ask the model, once per turn, without blocking the turn, and hand the
-    /// verdict to the body the moment it lands. `reply` is her answer: the
-    /// cares shown are the ones closest to both sides of the exchange.
-    public func afterTurnContext(origin: AfterTurnOrigin, reply: String) async -> AfterTurnContext? {
-        guard let deferred = deferredTurns.first(where: {
-            $0.context.event.sessionId == origin.sessionId
-                && $0.context.event.metadata["messageId"] == .string(origin.messageId)
-                && (origin.runId == nil || $0.context.event.metadata["runId"] == origin.runId.map(JSONValue.string))
-        }) else { return nil }
-        let context = deferred.context
-        var caring = context.caring
-        if let request = caring, request.relayed {
+    /// The admission entry, until the journal records it. Its record is also
+    /// what interpretation and folding read; there is no rehydrated RAM copy.
+    public func deferredTurnRecord(origin: AfterTurnOrigin) -> CognitiveDeferredTurnRecord? {
+        deferredTurns.first(where: {
+            $0.event.sessionId == origin.sessionId
+                && $0.event.metadata["messageId"] == .string(origin.messageId)
+                && (origin.runId == nil || $0.event.metadata["runId"] == origin.runId.map(JSONValue.string))
+        })
+    }
+
+    public func releaseDeferredTurn(_ record: CognitiveDeferredTurnRecord) {
+        deferredTurns.removeAll { $0.event.subject == record.event.subject }
+    }
+
+    /// The forgetting epochs a moment admitted now is stamped with.
+    public func forgettingEpochs() -> (mind: UInt64, body: UInt64) {
+        (mindEpoch, bodyEpoch)
+    }
+
+    /// New judgments read current cares and relay evidence; a recorded meaning
+    /// reads its saved caring request and needs no care-selection work.
+    public func afterTurnContext(record: CognitiveDeferredTurnRecord, exchange: String? = nil) async -> AfterTurnContext {
+        var caring = record.caring
+        if exchange != nil, let request = caring, request.relayed {
             caring = CaringAppraisalRequest(userMessage: request.userMessage, at: request.at,
                 context: request.context, relayed: true,
                 recentEncounters: recentCaringEncounters.filter { $0.at <= request.at },
                 personName: request.personName, session: request.session, turn: request.turn)
         }
-        return AfterTurnContext(event: context.event, caring: caring, generation: context.generation,
-                                cares: await caresShown(for: origin.userMessage + "\n" + reply))
+        let cares = if let exchange, record.mindEpoch == mindEpoch { await caresShown(for: exchange) }
+            else { [CognitiveCareLine]() }
+        return AfterTurnContext(event: record.event, caring: caring, generation: caringAppraisalGeneration,
+                                cares: cares, mindEpoch: record.mindEpoch, bodyEpoch: record.bodyEpoch)
     }
 
-    public func finishAfterTurn(_ context: AfterTurnContext, appraisal: AffectAppraisal?,
-                                caring: CaringAppraisalVerdict?) async -> [String: JSONValue]? {
-        let touchedCares = await appraisalCares(in: context.event.summary)
+    /// What the mind's share of one lived moment did, and what it hands the
+    /// body (docs/SUBCONSCIOUS.md, "Lived moments").
+    public struct MindFold: Sendable {
+        /// False when a piece did not save (the moment is folded again). Her
+        /// inner life off, or a moment from before a Clear, lands as nothing.
+        public var saved: Bool
+        /// The person's reaction to her last completion, for the body.
+        public var reaction: [String: JSONValue]
+        /// The caring reading the body measures, when the verdict passed every
+        /// gate the mind owns (refusals are written on the receipt here).
+        public var caring: OrganismCaringEvent.Reading?
+        public var caringWindow: TimeInterval
+        public var caringWhy: String
+        public var event: CognitiveEvent
+    }
+
+    /// The mind's share of one lived moment: affect (with its temporal anchors),
+    /// the emotion tag on the turn's node, the reconsolidation of the completion
+    /// it answers, and her cares. Each piece carries a watermark (`lived` = the
+    /// moment's fold seq) set at that piece's last mutation for the moment, in
+    /// the same synchronous segment, and saved with the piece by whichever
+    /// writer saves it; a piece already at or past `seq` is left alone. The
+    /// pieces are saved before this returns, so the moment is lived only once
+    /// they are durable.
+    ///
+    /// It reads the RECORDED deferred-turn entry (`record`), never RAM state
+    /// that a relaunch would have lost.
+    public func foldTurn(
+        _ context: AfterTurnContext, record: CognitiveDeferredTurnRecord,
+        appraisal: AffectAppraisal?, caring verdict: CaringAppraisalVerdict?,
+        cares judgments: [CognitiveCareJudgment], appAuthored: Bool,
+        seq: UInt64, momentID: String
+    ) async -> MindFold {
+        let event = context.event
+        var fold = MindFold(saved: true, reaction: [:], caring: nil,
+                            caringWindow: OrganismCaringEvent.encounterWindow, caringWhy: "",
+                            event: event)
+        let touchedCares = await appraisalCares(in: event.summary)
         await waitForMaintenanceTransition()
-        guard context.generation == caringAppraisalGeneration,
-              let index = deferredTurns.firstIndex(where: {
-                  $0.context.event.subject == context.event.subject
-                      && $0.context.generation == context.generation
-              }) else { return nil }
-        let deferred = deferredTurns.remove(at: index)
-        guard configuration.enabled, let appraisal else { return nil }
-        var weighted = appraisal
-        let weight = Self.relationalSource(for: context.event).appraisalWeight
-        weighted.valence *= weight
-        weighted.warmth *= weight
-        weighted.tension *= weight
-        weighted.pressure *= weight
-        weighted.arousal *= weight
-        weighted.warmthBoost *= weight
-        weighted.affectionWeight = weight
-        afterTurnAppraisals[context.event.subject.id] = appraisal
-        afterTurnAppraisalOrder.append(context.event.subject.id)
-        if afterTurnAppraisalOrder.count > 32 {
-            afterTurnAppraisals.removeValue(forKey: afterTurnAppraisalOrder.removeFirst())
-        }
+        let entry = record
+        guard configuration.enabled, context.mindEpoch == mindEpoch else { return fold }
+        func has(_ key: String) -> Bool { field.hasLived(seq, key: key) }
         let now = dependencies.now()
-        let updated = applyAffectFromEvent(context.event, precomputedAppraisal: weighted,
-                                          precomputedWarmthBoost: weighted.warmthBoost)
-        if let outcome = deferred.outcome, field.node(forKey: outcome.key) != nil {
-            let semantic = semanticAppraisal(for: context.event, post: updated,
-                precomputedAppraisal: weighted, precomputedWarmthBoost: weighted.warmthBoost,
-                precomputedCares: touchedCares)
-            let tag = emotionTag(for: context.event, affect: updated, semantic: semantic,
-                                 precomputedAppraisal: weighted)
-            field.stampEmotionTag(key: outcome.key, tag: tag, isNewNode: true, configuration: configuration)
-        }
-        let currentCompletion = pendingCompletion
-        pendingCompletion = deferred.completion
-        reconsolidatePendingCompletion(with: context.event, outcome: deferred.outcome,
-                                       now: context.event.occurredAt, precomputedAppraisal: weighted)
-        pendingCompletion = currentCompletion
-        let reaction = await semanticExpectationMetadata(for: context.event)
-        if weighted.warmthBoost > 0 { lastWarmPresenceAt = context.event.occurredAt }
-        markDirty(at: now)
-        publishAttentionProjection(at: now)
-        if configuration.persistenceEnabled, !configuration.backgroundMicrocyclesEnabled {
-            await persistArtifact(kind: "affect", id: stableArtifactID("affect"), status: "current",
-                score: updated.arousal, payload: updated.toJSON(
-                    lastUserPresenceAt: lastUserPresenceAt, lastWarmPresenceAt: lastWarmPresenceAt))
-            await notingPersistence("snapshot") { try await persistSnapshot() }
-        }
-        if let request = context.caring, let caring, let kind = caring.kind {
-            let scope = "\(request.session)|\(request.turn)"
-            guard !appraisedCaringTurns.contains(scope) else { return reaction }
-            appraisedCaringTurns.insert(scope)
-            appraisedCaringTurnOrder.append(scope)
-            if appraisedCaringTurnOrder.count > OrganismCaringEvent.maximumRememberedKeys {
-                appraisedCaringTurns.remove(appraisedCaringTurnOrder.removeFirst())
+        var touchedMind = false
+        if let appraisal {
+            var weighted = appraisal
+            let weight = Self.relationalSource(for: event).appraisalWeight
+            weighted.valence *= weight
+            weighted.warmth *= weight
+            weighted.tension *= weight
+            weighted.pressure *= weight
+            weighted.arousal *= weight
+            weighted.warmthBoost *= weight
+            weighted.affectionWeight = weight
+            // ONE await-free segment: affect, tag and reconsolidation, each
+            // stamped at its own last mutation.
+            var updated = affect
+            if affect.lived < seq {
+                updated = applyAffectFromEvent(event, precomputedAppraisal: weighted,
+                                               precomputedWarmthBoost: weighted.warmthBoost)
+                affect.lived = seq
+                // A late fold never moves a newer presence anchor backward.
+                if weighted.warmthBoost > 0 {
+                    lastWarmPresenceAt = max(lastWarmPresenceAt ?? event.occurredAt, event.occurredAt)
+                }
+                touchedMind = true
             }
-            await deliverCaringVerdict(caring, kind: kind, for: request, generation: context.generation)
-        }
-        return reaction
-    }
-
-    /// Hand one verdict to the body, and decide which encounter window it is
-    /// measured against.
-    ///
-    /// THE RELAY RULE, per Agent: evidence, not time. A relay doses only when the
-    /// appraisal — shown the encounters that recently dosed — says this describes
-    /// a DISTINCT moment. A relay it calls a retelling does not dose however long
-    /// the silence before it, and an uncertain relay does not dose either. The
-    /// six-hour window survives only as the FLOOR for a relay whose distinctness
-    /// the model never answered, which is the one case with no judgment to use.
-    /// A turn User typed here is his own words arriving and is measured against
-    /// the ordinary thirty-minute window, exactly as before.
-    func deliverCaringVerdict(
-        _ verdict: CaringAppraisalVerdict,
-        kind: OrganismCaringEvent.Kind,
-        for request: CaringAppraisalRequest,
-        generation: UInt64
-    ) async {
-        // A verdict from before a clear describes a conversation that no longer
-        // exists in this substrate. It must not dose (review item 4).
-        //
-        // THE ONE INTERLEAVING THIS DOES NOT COVER, stated rather than implied: a
-        // clear that arrives while the hop into the kernel below is itself in
-        // flight. The two are separate actors, so the dose and the clear can only
-        // be ordered by the kernel, and a dose that lands after the clear stands.
-        // That window is the duration of one actor hop; the window this guard
-        // closes is the duration of a model call.
-        guard generation == caringAppraisalGeneration else {
-            await recordCaringRefusal(
-                request,
-                why: "the conversation was cleared while this appraisal was in flight")
-            return
-        }
-        guard let sink = caringEventSink else {
-            await recordCaringRefusal(
-                request, why: "no organism sink installed — nothing could be dosed")
-            return
-        }
-        var window = OrganismCaringEvent.encounterWindow
-        if request.relayed {
-            switch verdict.distinctness {
-            case .distinct:
-                // "Distinct" is only a judgment when there was evidence to judge
-                // against. After a relaunch the ledger is empty while the body's
-                // persisted encounter may be hours old (review r2): with nothing
-                // shown, fall back to the six-hour floor instead of the ordinary
-                // window, so a retelling cannot redose the moment it retells.
-                window = request.recentEncounters.isEmpty
-                    ? OrganismCaringEvent.relayEncounterWindow
-                    : OrganismCaringEvent.encounterWindow
-            case .retelling:
-                // "Already counted" is a claim about a PRIOR DOSE. Cite the one
-                // this coalesced into, or say the prior cannot be named — the
-                // ledger only holds encounters that actually dosed, so a relay
-                // whose first telling never dosed has no prior to point at
-                // (comb 3 lane 2 item 6).
-                await recordCaringRefusal(request, why: Self.retellingRefusalWhy(request))
-                return
-            case .unsure:
-                await recordCaringRefusal(
-                    request,
-                    why: "relay distinctness unsure — a relay doses only on evidence")
-                return
-            case .unstated:
-                window = OrganismCaringEvent.relayEncounterWindow
+            if let outcome = entry.outcome, field.node(forKey: outcome.key) != nil, !has(outcome.key) {
+                let semantic = semanticAppraisal(for: event, post: updated,
+                    precomputedAppraisal: weighted, precomputedWarmthBoost: weighted.warmthBoost,
+                    precomputedCares: touchedCares)
+                let tag = emotionTag(for: event, affect: updated, semantic: semantic,
+                                     precomputedAppraisal: weighted)
+                field.stampEmotionTag(key: outcome.key, tag: tag, isNewNode: true, configuration: configuration)
+                field.markLived(seq, key: outcome.key)
+                touchedMind = true
+            }
+            fold.reaction = Self.foldReaction(event: event, completion: entry.completion,
+                outcome: entry.outcome, now: event.occurredAt, valence: weighted.valence)
+            if let completion = entry.completion, !has(completion.nodeKey) {
+                if !fold.reaction.isEmpty {
+                    reconsolidateCompletion(completion, outcome: entry.outcome,
+                                            now: event.occurredAt, reaction: weighted.valence)
+                }
+                field.markLived(seq, key: completion.nodeKey)
+                touchedMind = true
+            }
+            if touchedMind {
+                markDirty(at: now)
+                publishAttentionProjection(at: now)
             }
         }
-        let outcome = await sink(OrganismCaringEvent.Reading(
-            kind: kind,
-            session: request.session,
-            turn: request.turn,
-            at: request.at
-        ), window)
-        guard outcome.dosed else { return }
-        // A clear that landed while the sink hop was in flight (review r2): the
-        // body already dropped the dose with the reset; do not remember it.
-        guard generation == caringAppraisalGeneration else { return }
-        noteRecentCaringEncounter(CaringAppraisalRequest.RecentEncounter(
-            kind: kind,
-            at: request.at,
-            why: verdict.why
-        ))
+        if !judgments.isEmpty {
+            do {
+                _ = try await applyCares(
+                    judgments, provenance: careProvenance(for: event, appAuthored: appAuthored),
+                    generation: caringAppraisalGeneration, seq: seq, momentID: momentID)
+            } catch {
+                fold.saved = false
+            }
+        }
+        // Durable before the moment is lived: the affect row (with its
+        // anchors and watermark) and the field (with the node watermarks). A
+        // refold saves them again whatever it skipped.
+        if configuration.persistenceEnabled, appraisal != nil {
+            do {
+                try await persistAffectAndNodes()
+            } catch {
+                fold.saved = false
+            }
+        }
+        if let request = context.caring, let verdict, let kind = verdict.kind {
+            if let window = await caringWindow(verdict, for: request) {
+                fold.caring = OrganismCaringEvent.Reading(kind: kind, session: request.session, turn: request.turn,
+                                                          at: request.at)
+                fold.caringWindow = window
+                fold.caringWhy = verdict.why
+            }
+        }
+        return fold
     }
 
-    /// The refusal reason for a `retelling` verdict.
+    /// One accepted user turn answers a same-session completion inside its
+    /// window. The caller supplies admission time or the recorded event time.
+    static func foldReaction(event: CognitiveEvent, completion: PendingCompletion?,
+                             outcome: ContinuityField.IngestOutcome?, now: Date,
+                             valence: Double) -> [String: JSONValue] {
+        guard isUserAuthored(event.kind), outcome != nil,
+              let completion, let session = event.sessionId,
+              completion.sessionId == session else { return [:] }
+        let age = now.timeIntervalSince(completion.recordedAt)
+        guard age >= 0, age <= pendingCompletionMaxAge else { return [:] }
+        return [OrganismSemanticExpectation.reactionMetadataKey: .object([
+            OrganismSemanticExpectation.reactionField: .string(semanticReactionLabel(fromValence: valence)),
+            OrganismSemanticExpectation.sessionField: .string(session),
+            OrganismSemanticExpectation.turnField: .string(completion.nodeKey),
+        ])]
+    }
+
+    /// The encounter window a caring verdict is measured against, or nil when
+    /// the mind refuses it (written on its receipt).
     ///
-    /// The verdict says the relay retells ONE OF the encounters it was shown; it
-    /// never says which. So this names the candidate set, not a winner: picking
-    /// the newest row asserted a relationship the model did not supply, and with
-    /// several recent doses the newest may be unrelated (comb 3 lane 2 item 6,
-    /// review d3 item 3). The recent-encounter ledger records ONLY encounters
-    /// that dosed, so when it is empty no prior counted this moment and the
-    /// receipt says exactly that instead of inventing one.
+    /// Local turns use thirty minutes. Relays judged distinct against supplied
+    /// encounters use that window; absent evidence or an unstated judgment uses
+    /// six hours. Retelling and unsure judgments refuse regardless of time.
+    private func caringWindow(_ verdict: CaringAppraisalVerdict,
+                              for request: CaringAppraisalRequest) async -> TimeInterval? {
+        guard request.relayed else { return OrganismCaringEvent.encounterWindow }
+        switch verdict.distinctness {
+        case .distinct:
+            // A distinct judgment without prior encounter evidence uses six hours.
+            return request.recentEncounters.isEmpty
+                ? OrganismCaringEvent.relayEncounterWindow
+                : OrganismCaringEvent.encounterWindow
+        case .retelling:
+            await recordCaringRefusal(request, why: Self.retellingRefusalWhy(request))
+            return nil
+        case .unsure:
+            await recordCaringRefusal(request, why: "relay distinctness unsure — a relay doses only on evidence")
+            return nil
+        case .unstated:
+            return OrganismCaringEvent.relayEncounterWindow
+        }
+    }
+
+    /// The body's recently-dosed encounters, adopted from the body (which keeps
+    /// them with its chemistry) after the opening and after each body fold.
+    public func adoptRecentDoses(_ doses: [CaringAppraisalRequest.RecentEncounter]) {
+        recentCaringEncounters = Array(doses.suffix(Self.recentCaringEncounterCap))
+    }
+
+    /// A retelling verdict identifies no particular prior dose. Name the whole
+    /// supplied candidate set, or state that no prior dose is on record.
     static func retellingRefusalWhy(_ request: CaringAppraisalRequest) -> String {
         let priors = request.recentEncounters.sorted { $0.at > $1.at }
         guard !priors.isEmpty else {
@@ -506,10 +438,11 @@ extension CognitiveSubstrate {
                 + " to have counted it — refusing rather than claiming one"
         }
         let listed = priors.map { prior -> String in
-            let minutes = max(0, Int(request.at.timeIntervalSince(prior.at) / 60))
+            let minutes = max(0, request.at.timeIntervalSince(prior.at) / 60).rounded(.towardZero) + 0
             let ago = minutes < 60
-                ? "\(minutes) min ago"
-                : "\(minutes / 60) h \(minutes % 60) min ago"
+                ? String(format: "%.0f min ago", minutes)
+                : String(format: "%.0f h %.0f min ago", (minutes / 60).rounded(.towardZero),
+                         minutes.truncatingRemainder(dividingBy: 60))
             return "\(prior.kind.rawValue) \(ago)"
         }
         let noun = priors.count == 1 ? "encounter" : "encounters"
@@ -518,36 +451,12 @@ extension CognitiveSubstrate {
             + " so no new moment is counted"
     }
 
-    /// Write "nothing was dosed, and here is why" onto this appraisal's own
-    /// receipt row (review c4 item 4). Every refusal above this module's sink call
-    /// goes through here, so a reader of the receipt sees the same shape for a
-    /// refusal the substrate made and one the body made.
+    /// Write the refusal reason on this appraisal's receipt, matching body refusals.
     private func recordCaringRefusal(
         _ request: CaringAppraisalRequest, why: String
     ) async {
         guard let recorder = caringRefusalRecorder else { return }
         await recorder(request.session, request.turn, why)
-    }
-
-    /// The short ledger of encounters that actually DOSED, shown to the appraisal
-    /// when it judges whether a relay is describing one of them again.
-    ///
-    /// In memory, bounded, never persisted — like the context ring and for the
-    /// same reason: it exists to tell a live relay from a retelling of something
-    /// that reached her in this run, and a relaunch has no run to compare
-    /// against. Entries older than the relay floor are of no use to that
-    /// question and are dropped.
-    private func noteRecentCaringEncounter(
-        _ entry: CaringAppraisalRequest.RecentEncounter
-    ) {
-        recentCaringEncounters.append(entry)
-        let horizon = entry.at.addingTimeInterval(-OrganismCaringEvent.relayEncounterWindow)
-        recentCaringEncounters.removeAll { $0.at < horizon }
-        if recentCaringEncounters.count > Self.recentCaringEncounterCap {
-            recentCaringEncounters.removeFirst(
-                recentCaringEncounters.count - Self.recentCaringEncounterCap
-            )
-        }
     }
 
     /// The surface a turn arrived on: the top-level key, else the out-of-band
@@ -566,4 +475,19 @@ extension CognitiveSubstrate {
     /// more than a fortnight of real days ever put inside one relay floor, and
     /// the prompt stays one small call.
     public static let recentCaringEncounterCap = 6
+}
+
+extension CognitiveDeferredTurnRecord {
+    var completion: CognitiveSubstrate.PendingCompletion? {
+        completionNodeKey.map {
+            CognitiveSubstrate.PendingCompletion(nodeKey: $0, recordedAt: completionRecordedAt ?? event.occurredAt,
+                                                  sessionId: completionSessionId)
+        }
+    }
+
+    var outcome: ContinuityField.IngestOutcome? {
+        // Refolding uses only the node key; tag stamping treats the moment as
+        // new and completion reconsolidation reads only identity.
+        outcomeKey.map { ContinuityField.IngestOutcome(key: $0, isNewNode: false) }
+    }
 }

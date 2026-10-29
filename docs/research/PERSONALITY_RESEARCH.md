@@ -1497,11 +1497,13 @@ division of labour:
   become different people only through what each lived, appraised, kept and
   retold.
 
-For orientation: NORTHSTAR's clause 4 already describes an
-appraisal→tag→mood→disposition chain, and SUBCONSCIOUS.md lists views, dreams
-and reach. The science supports those as the right organs. What it adds is
-that they need concerns at the root, consolidation into a self and a
-relationship model, and one loop through all of them.
+For implementation orientation: NORTHSTAR's clause 4 describes the
+appraisal→tag→mood→disposition chain. [Cares](../SUBCONSCIOUS.md#cares) now
+own concerns, stances and open gaps; retired views and thought seeds are
+migration inputs, and appraisal matches events against live cares. Dreams
+and Reach retain their roles. The proposals here for consolidation into a
+self, a relationship model and one loop through them remain research;
+this orientation does not establish that those proposals are implemented.
 
 ### Key risks, and what human development says about each
 

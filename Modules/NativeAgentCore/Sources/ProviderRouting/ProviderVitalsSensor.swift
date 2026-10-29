@@ -2,12 +2,13 @@ import TurnTrace
 import Foundation
 import NativeAgentCore
 import PersistenceCore
+import NativeAgentShared
 
 // Blueprint: | `ProviderVitalsSensor.swift` | `ProviderVitalsSensor`: passive lifecycle-derived latency/error bands, first-output evidence and persisted bounded health state |
 
 // MARK: - INTEROCEPTION: provider vitals sensor
 //
-// A passive body-sense organ (prerelease campaign §"INTEROCEPTION stays").
+// A passive body-sense organ.
 // It listens to the EXISTING `LLMCallLifecycleEvent` seam that the shared
 // provider router (SwiftNativeLLMClient / LLMClient+Real.swift) already threads
 // around every real adapter call, and maintains per-provider exponential moving
@@ -156,9 +157,7 @@ public actor ProviderVitalsSensor {
         var emaErrorRate: Double = 0
         var consecutiveFailures: Int = 0
         var sampleCount: Int = 0
-        /// LRU stamp for the provider-row cap (gpt-5.5 review: `states` was
-        /// unbounded — an adversarial/misconfigured provider-id stream could
-        /// grow memory and telemetry forever).
+        /// LRU stamp for the bounded provider-row store.
         var lastSampleAt: Date?
     }
 
@@ -253,8 +252,13 @@ public actor ProviderVitalsSensor {
         // Error-rate EMA + consecutive-failure run.
         let errorPoint = sample.isError ? 1.0 : 0.0
         state.emaErrorRate = ema(state.emaErrorRate, errorPoint, alpha: Self.fastAlpha) ?? errorPoint
-        state.consecutiveFailures = sample.isError ? state.consecutiveFailures + 1 : 0
-        state.sampleCount += 1
+        let (failures, failuresOverflow) = state.consecutiveFailures.addingReportingOverflow(1)
+        let (samples, samplesOverflow) = state.sampleCount.addingReportingOverflow(1)
+        state.consecutiveFailures = sample.isError ? (failuresOverflow ? Int.max : failures) : 0
+        state.sampleCount = samplesOverflow ? Int.max : samples
+        if samplesOverflow || (sample.isError && failuresOverflow) {
+            nativeLog("Provider vitals counter exhausted for %@; count is saturated", key)
+        }
 
         // Band with hysteresis. Cold-start providers are pinned nominal until
         // enough samples have accumulated to trust the EMAs.
@@ -262,21 +266,7 @@ public actor ProviderVitalsSensor {
         let nextBand = resolveBand(current: state.band, strain: strain)
         state.band = nextBand
 
-        // User, 2026-09-06: the baseline is what NORMAL looks like, so it learns
-        // only from samples that were nominal going in AND coming out.
-        //
-        // Folding every sample in taught the baseline the provider's own
-        // degradation: under sustained slowness `ratio = ema / base` walked
-        // back toward 1, the latency contributor fell out of the strain, and
-        // the sensor announced a recovery that never happened. Gating on the
-        // PREVIOUS band alone still let the transition sample through — the
-        // one sample that broke the band is the worst one to call normal, and
-        // on a flapping provider every excursion donated its first bad sample
-        // to the baseline. The band is resolved first (against the established
-        // baseline, which is the comparison that makes it meaningful), and the
-        // baseline learns only if the sample left the provider nominal too.
-        // Cold start still learns freely — a warming provider is pinned
-        // nominal until `warmupSamples`.
+        // After warmup, the baseline learns only from samples nominal both before and after band resolution.
         if previousBand == .nominal, nextBand == .nominal, let duration = sample.durationMs {
             state.baselineLatencyMs = ema(
                 state.baselineLatencyMs, duration, alpha: Self.baselineAlpha)
@@ -340,7 +330,7 @@ public actor ProviderVitalsSensor {
             } else if row["kind"] == .string("llm.call"), payload["streaming"] == .bool(true),
                       case .int(let ms)? = payload["ttftMs"], case .string(let model)? = payload["model"] {
                 let kind: String? = if case .string(let kind)? = payload["streamKind"] { kind } else { nil }
-                let bytes: Int? = if case .int(let bytes)? = payload["requestBytes"] { Int(bytes) } else { nil }
+                let bytes: Int? = if case .int(let bytes)? = payload["requestBytes"] { Int(exactly: bytes) } else { nil }
                 joinFirstOutput(firstOutputKey(provider, model, kind), seconds: Double(ms) / 1000, bytes: bytes)
             }
         }
@@ -387,6 +377,11 @@ public actor ProviderVitalsSensor {
     /// outputs and one leaves only when a newer one pushes it out. (The trace
     /// is shared with other rows, so after a relaunch a key may hold fewer.)
     private func joinFirstOutput(_ key: FirstOutputKey, seconds: Double, bytes: Int?) {
+        guard seconds >= 0, UInt64(exactly: (seconds * 1_000_000_000).rounded(.up)) != nil,
+              bytes.map({ $0 >= 0 }) ?? true else {
+            unreadableTraceRows += 1
+            return
+        }
         firstOutputs[key, default: []].append((seconds, bytes))
         let over = firstOutputs[key, default: []].count - JSONLLineCaps.traceEvents
         if over > 0 { firstOutputs[key]?.removeFirst(over) }
@@ -449,7 +444,6 @@ public actor ProviderVitalsSensor {
     @discardableResult
     public func restoreSnapshot(
         dataRoot: URL? = nil,
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore(),
         now: Date = Date(),
         maxAge: TimeInterval = 6 * 60 * 60,
         futureSkewAllowance: TimeInterval = 5 * 60
@@ -458,7 +452,7 @@ public actor ProviderVitalsSensor {
         let path = root
             .appendingPathComponent("telemetry", isDirectory: true)
             .appendingPathComponent("provider_vitals.json")
-        let value = try await persistence.readJSON(path, ifMissing: .null)
+        let value = try await SwiftNativePersistenceCore.readJSON(path, ifMissing: .null)
         guard case .object(let snapshot) = value,
               case .string("provider.vitals.v1")? = snapshot["schema"],
               let generatedAt = Self.date(snapshot["generatedAt"]),
@@ -475,16 +469,18 @@ public actor ProviderVitalsSensor {
             guard !key.isEmpty,
                   case .object(let row) = value,
                   let band = Self.band(row["band"]),
-                  let errorRate = Self.number(row["emaErrorRate"]), errorRate >= 0, errorRate <= 1,
+                  let errorRate = row["emaErrorRate"]?.numberValue(coercingStrings: false, finiteOnly: true), errorRate >= 0, errorRate <= 1,
                   let failures = Self.integer(row["consecutiveFailures"]), failures >= 0,
                   let samples = Self.integer(row["sampleCount"]), samples >= failures else {
                 continue
             }
-            let lastSampleAt = Self.optionalDate(row["lastSampleAt"])
-            guard lastSampleAt != .invalid,
-                  let sampledAt = lastSampleAt.value,
-                  now.timeIntervalSince(sampledAt) <= max(0, maxAge),
-                  (lastSampleAt.value?.timeIntervalSince(now) ?? 0) <= max(0, futureSkewAllowance) else {
+            guard samples < Int.max, failures < Int.max else {
+                nativeLog("Provider vitals restore refused exhausted counters for %@", key)
+                continue
+            }
+            guard let lastSampleAt = Self.date(row["lastSampleAt"]),
+                  now.timeIntervalSince(lastSampleAt) <= max(0, maxAge),
+                  lastSampleAt.timeIntervalSince(now) <= max(0, futureSkewAllowance) else {
                 continue
             }
             guard let latency = Self.optionalNonnegativeNumber(row["emaLatencyMs"]),
@@ -502,7 +498,7 @@ public actor ProviderVitalsSensor {
             state.emaErrorRate = errorRate
             state.consecutiveFailures = failures
             state.sampleCount = samples
-            state.lastSampleAt = lastSampleAt.value
+            state.lastSampleAt = lastSampleAt
             restored.append((key, state))
         }
 
@@ -526,15 +522,14 @@ public actor ProviderVitalsSensor {
     /// organ and it is never called from `observe(_:)` — an owner schedules it
     /// on a periodic/idle timer. Non-fatal on failure.
     public func persistSnapshot(
-        dataRoot: URL? = nil,
-        persistence: any PersistenceCoreProtocol = SwiftNativePersistenceCore()
+        dataRoot: URL? = nil
     ) async {
         let root = dataRoot ?? PersistenceCore.defaultDataRoot()
         let path = root
             .appendingPathComponent("telemetry", isDirectory: true)
             .appendingPathComponent("provider_vitals.json")
         do {
-            try await persistence.writeJSON(snapshotJSON(), to: path)
+            try await SwiftNativePersistenceCore.writeJSON(snapshotJSON(), to: path)
         } catch {
             FileHandle.standardError.write(
                 Data("ProviderVitalsSensor: snapshot write failed: \(error)\n".utf8)
@@ -588,16 +583,6 @@ public actor ProviderVitalsSensor {
         String(raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().prefix(80))
     }
 
-    private enum OptionalDate: Equatable {
-        case value(Date?)
-        case invalid
-
-        var value: Date? {
-            guard case .value(let date) = self else { return nil }
-            return date
-        }
-    }
-
     private static func formatDate(_ date: Date) -> String {
         ISO8601DateFormatter().string(from: date)
     }
@@ -605,12 +590,6 @@ public actor ProviderVitalsSensor {
     private static func date(_ value: JSONValue?) -> Date? {
         guard case .string(let raw)? = value else { return nil }
         return ISO8601DateFormatter().date(from: raw)
-    }
-
-    private static func optionalDate(_ value: JSONValue?) -> OptionalDate {
-        guard let value else { return .value(nil) }
-        guard let parsed = date(value) else { return .invalid }
-        return .value(parsed)
     }
 
     private static func band(_ value: JSONValue?) -> ProviderVitalsBand? {
@@ -625,20 +604,10 @@ public actor ProviderVitalsSensor {
         return Int(raw)
     }
 
-    private static func number(_ value: JSONValue?) -> Double? {
-        let result: Double
-        switch value {
-        case .double(let raw)?: result = raw
-        case .int(let raw)?: result = Double(raw)
-        default: return nil
-        }
-        return result.isFinite ? result : nil
-    }
-
     /// `nil` means a valid absent optional value; outer nil means malformed.
     private static func optionalNonnegativeNumber(_ value: JSONValue?) -> Double?? {
         guard let value else { return .some(nil) }
-        guard let number = number(value), number >= 0 else { return nil }
+        guard let number = value.numberValue(coercingStrings: false, finiteOnly: true), number >= 0 else { return nil }
         return .some(number)
     }
 

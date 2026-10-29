@@ -85,7 +85,7 @@ public struct TurnCheckpoint: Codable, Sendable, Equatable {
         try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
         var record = self
         record.updatedAt = Date()
-        try JSONEncoder().encode(record).write(to: path, options: .atomic)
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(JSONEncoder().encode(record), to: path)
     }
 
     public static func read(dataRoot: URL, sessionId: String, turnId: String) throws -> Self? {
@@ -222,7 +222,7 @@ public struct AbandonedTurnReconciler: Sendable {
         // and judged on their own days, and the window stays pending.
         var persistenceFailures: [String] = []
         for dayOffset in terminalOnlyDays + Array(scan.newestOffset...scan.oldestOffset) {
-            guard let day = Self.dayCalendar.date(byAdding: .day, value: -dayOffset, to: today)
+            guard let day = TurnTracePersistLane.dayCalendar.date(byAdding: .day, value: -dayOffset, to: today)
             else { continue }
             let path = lane.path(for: day)
             do {
@@ -300,7 +300,7 @@ public struct AbandonedTurnReconciler: Sendable {
             if let checkpoint = checkpoints[turnId] {
                 do {
                     let days = Set([row.ts, checkpoint.updatedAt, today].flatMap { day in
-                        [day] + [-1, 1].compactMap { Self.dayCalendar.date(byAdding: .day, value: $0, to: day) }
+                        [day] + [-1, 1].compactMap { TurnTracePersistLane.dayCalendar.date(byAdding: .day, value: $0, to: day) }
                     }.map { lane.path(for: $0) })
                     for path in days { try await readDay(path, includeAccepted: false) }
                     let hasTerminal = days.contains { terminalIndex[$0]!.terminated.contains(turnId) }
@@ -375,16 +375,10 @@ public struct AbandonedTurnReconciler: Sendable {
                 written.append(turnId)
             } catch { persistenceFailures.append("Turn recovery could not keep its repair obligation: \(error)") }
         }
-        // Once every eligible candidate in the days ACTUALLY SCANNED has been
-        // confirmed, the cursor advances over exactly those days and no
-        // further. When the backlog was longer than `maximumDayWindow` the
-        // newest scanned day is not today: the unscanned remainder stays
-        // behind the cursor and the next sweep continues from there, instead
-        // of the old jump to today that abandoned it forever (GPT-5.6 round
-        // review, 2026-09-11).
+        // The cursor advances only over scanned days whose candidates are confirmed.
         // A failed read/append or deferred candidate leaves the window pending.
         // Stable repair identities make another sweep of unfinished turns idempotent.
-        if persistenceFailures.isEmpty, !deferred, let newestScannedDay = Self.dayCalendar.date(
+        if persistenceFailures.isEmpty, !deferred, let newestScannedDay = TurnTracePersistLane.dayCalendar.date(
             byAdding: .day, value: -scan.newestOffset, to: today
         ) {
             writeCursor(day: newestScannedDay)
@@ -428,20 +422,14 @@ public struct AbandonedTurnReconciler: Sendable {
     /// next sweep continues where this one stopped rather than skipping to
     /// today.
     private func scanRange(today: Date) -> (newestOffset: Int, oldestOffset: Int) {
-        // No cursor (first run, or a corrupt file) is NOT "start at today":
-        // that records today as swept and strands every older trace file
-        // forever, which is also the migration path for every install made
-        // before the cursor existed. Start one day BEFORE the oldest day file
-        // that actually exists and let the ordinary 30-day window walk
-        // forward, oldest-first, over successive sweeps (GPT-5.6 round review
-        // r2, 2026-09-11).
+        // Without a cursor, drain from before the oldest trace day, oldest-first.
         guard let cursorDay = persistedCursorDay() ?? oldestTraceDay().flatMap({
-            Self.dayCalendar.date(byAdding: .day, value: -1, to: $0)
+            TurnTracePersistLane.dayCalendar.date(byAdding: .day, value: -1, to: $0)
         }) else {
             // Nothing has ever been traced. Ordinary window ending today.
             return (0, Self.dayWindow - 1)
         }
-        let calendar = Self.dayCalendar
+        let calendar = TurnTracePersistLane.dayCalendar
         let lastOffset = max(0, calendar.dateComponents(
             [.day],
             from: calendar.startOfDay(for: cursorDay),
@@ -481,16 +469,6 @@ public struct AbandonedTurnReconciler: Sendable {
             .min()
     }
 
-    /// Day arithmetic in exactly the timezone the ledger file names are
-    /// formatted in. A fixed 86,400s "day" can name the wrong calendar day on
-    /// a 23- or 25-hour local day, which means reading and locking the wrong
-    /// ledger file.
-    static let dayCalendar: Calendar = {
-        var calendar = Calendar.current
-        calendar.timeZone = TurnTracePersistLane.dayTimeZone
-        return calendar
-    }()
-
     private var cursorPath: URL {
         dataRoot
             .appendingPathComponent("turn_traces", isDirectory: true)
@@ -498,9 +476,7 @@ public struct AbandonedTurnReconciler: Sendable {
     }
 
     private func writeCursor(day date: Date) {
-        let dir = cursorPath.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let day = TurnTracePersistLane.dayString(from: date)
-        try? Data("{\"lastSweptDay\":\"\(day)\"}".utf8).write(to: cursorPath, options: .atomic)
+        try? SwiftNativePersistenceCore.writeDataAtomicDurable(Data("{\"lastSweptDay\":\"\(day)\"}".utf8), to: cursorPath)
     }
 }

@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 // Blueprint: | `ToolActivityPresentation.swift` | `ToolActivityPresentation`: shared card/progress/approval copy from bounded call names; tool IDs and execution arguments stay unchanged |
 
@@ -57,7 +58,7 @@ public enum ToolActivityPresentation {
         case "search_kg": return "Searching knowledge graph"
         default:
             let key = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            let words = titles[key] ?? actionLabelLock.withLock { actionLabels[key] }
+            let words = titles[key] ?? actionLabels.withLock { $0[key] }
             return words.flatMap(underway) ?? title(name)
         }
     }
@@ -66,11 +67,10 @@ public enum ToolActivityPresentation {
     /// the connection"), and by the folded tool a call is shown as
     /// (files.write → write_file), installed once at launch from the door's registry.
     public static func installActionLabels(_ labels: [String: String]) {
-        actionLabelLock.withLock { actionLabels = labels }
+        actionLabels.withLock { $0 = labels }
     }
 
-    private static let actionLabelLock = NSLock()
-    nonisolated(unsafe) private static var actionLabels: [String: String] = [:]
+    private static let actionLabels = OSAllocatedUnfairLock(initialState: [String: String]())
 
     /// A label as something under way when its first word is a known verb
     /// ("Test the connection" → "Testing the connection"), else as it is;

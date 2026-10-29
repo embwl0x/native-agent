@@ -1,4 +1,5 @@
 import Foundation
+import NativeAgentShared
 import NativeAgentCore
 import PersistenceCore
 // Blueprint: | `SwarmRunsReader.swift` | `SwiftNativeSwarmRunsReader`: owns live-board and receipt storage and worker report IDs; one read-only recovery projection for crews, report inspection and the live board; inspection gives pending live workers their deterministic IDs and marks absent output unavailable, preserving strict terminal-report validation; durable receipts win, interrupted completion time stays unknown, and `SwarmCrew.liveness(of:)` classifies every crew view without promoting unknown to running or replaying work; its writer records recoveryObservedAt once when committing projected recovery before the next board write and removes it only after receipt durability |
@@ -430,10 +431,8 @@ public struct SwarmCrew: Identifiable, Equatable, Sendable {
 
     nonisolated private static func crew(_ row: [String: Any]) -> SwarmCrew? {
         guard let id = row["id"] as? String, let objective = row["objective"] as? String else { return nil }
-        let dates = ISO8601DateFormatter(), whole = ISO8601DateFormatter()
-        dates.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let at = (row["completedAt"] as? String ?? row["createdAt"] as? String)
-            .flatMap { dates.date(from: $0) ?? whole.date(from: $0) } ?? .distantPast
+            .flatMap(NativeTimestampFormat.parseISO8601FractionalFirst) ?? .distantPast
         let workers = (row["workers"] as? [[String: Any]] ?? []).enumerated().map { index, worker in
             let role = (worker["role"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? worker["name"] as? String ?? "Worker \(index + 1)"
             let output = (worker["output"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)

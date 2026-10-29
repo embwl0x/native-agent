@@ -228,6 +228,11 @@ check_production_cloudkit_schema() {
     grep -Eq "^[[:space:]]*$field[[:space:]]+STRING" "$PRODUCTION_CLOUDKIT_SCHEMA" ||
       local_fail "Production CloudKit schema is missing required field $field."
   done
+  for record_type in NAChatMessage NANotification; do
+    sed -n "/RECORD TYPE ${record_type}[[:space:]]*(/,/);/p" "$PRODUCTION_CLOUDKIT_SCHEMA" |
+      grep -Eq '^[[:space:]]*payloadAsset[[:space:]]+ASSET' ||
+      local_fail "Production CloudKit schema is missing ${record_type}.payloadAsset ASSET."
+  done
   if [[ "$LOCAL_FAILURES" == "$failures_before" ]]; then
     pass "fresh production CloudKit export contains the device-sync schema"
   fi

@@ -14,7 +14,7 @@ public struct QuietBackupRestoreFailure: Error {
 
 extension AppToolExecutor {
     public static func quietBackupRestoreTarget(_ input: [String: JSONValue], dataRoot: URL) async -> Result<BackupRecord, QuietBackupRestoreFailure> {
-        let id = AppToolExecutor.inputString(input["id"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let id = input["id"]?.scalarText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let backups: [BackupRecord]
         do { backups = try TrustBackupPersistence.readBackupRecords(root: dataRoot) }
         catch {

@@ -1,9 +1,10 @@
 import Foundation
 import Darwin
 import NativeAgentCore
+import NativeAgentShared
 // Blueprint: | `JSONLRetention.swift` | SwiftNativePersistenceCore owns the activity event envelope, path and append; producers preserve redacted values, IDs and timestamps; JSONLCapCheckCounter owns cap-check cadence |
 
-// MARK: - JSONL line cap (U5 W-G, 2026-06-11)
+// MARK: - JSONL retention
 
 /// Per-path append counter driving `JSONLLineCaps.capCheckStride`. Process-local
 /// and deliberately not persisted: a fresh process checks on its first append to
@@ -50,189 +51,120 @@ final class JSONLCapCheckCounter: @unchecked Sendable {
     }
 }
 
-/// Trim a JSONL file to its newest `maxLines` lines. Returns the number of
-/// lines dropped (0 when under the cap or the file is missing). The CALLER
-/// must hold the file's flock — this helper is the trim step of an
-/// append-then-cap sequence and does no locking of its own (mirrors the
-/// notification-inbox 1000-line recipe). Never silent: callers log the
-/// returned drop count.
-///
-/// H3/M6 (2026-07-09): the size check happens FIRST. This helper used to read
-/// the entire file into memory on every append just to discover it was under the
-/// cap — quadratic on an append-only feed, and it did that read while holding the
-/// feed's flock on the chat turn path (a 20k-line trace file meant ~18MB read per
-/// appended row). Two cheap `stat`-based early-outs now short-circuit it:
-///   - `trimWhenBytesExceed`: an optional soft trigger. Below it the cap is not
-///     evaluated at all. It is NOT a byte cap: retained rows can remain above
-///     the trigger. Shared appends amortize calls separately. Callers that
-///     need the exact newest-`maxLines` invariant after EVERY append omit it.
-///   - an exact lower bound: a file of `n` bytes holds at most `n` lines (every
-///     line but the last carries a newline), so `size < maxLines` cannot be over
-///     the cap. Sound for every caller, no semantic change.
+/// Select line retention, then byte retention, and durably publish once.
+/// The caller holds the feed's lock. Checked append bytes may be carried in
+/// to avoid rereading a diagnostic feed admitted before its append.
 @discardableResult
-public func enforceJSONLLineCap(
+public func enforceJSONLRetention(
     at path: URL,
-    maxLines: Int,
+    maxLines: Int? = nil,
+    minimumRowsPerKind: Int? = nil,
     trimWhenBytesExceed: Int? = nil,
-    trimToLines: Int? = nil
+    trimToLines: Int? = nil,
+    maxBytes: Int? = nil,
+    trimToBytes: Int? = nil,
+    preserveOversizedNewestRow: Bool = true,
+    data checkedData: Data? = nil
 ) throws -> Int {
-    guard maxLines > 0, FileManager.default.fileExists(atPath: path.path) else { return 0 }
-    // An unstattable-but-present file falls through to the full read rather than
-    // silently skipping the cap.
-    if let size = ((try? FileManager.default.attributesOfItem(atPath: path.path))?[.size] as? NSNumber)?.intValue {
-        if size == 0 { return 0 }
-        if let trigger = trimWhenBytesExceed, size < trigger { return 0 }
-        if size < maxLines { return 0 }
+    let selection = try selectJSONLRetention(
+        at: path, maxLines: maxLines, minimumRowsPerKind: minimumRowsPerKind,
+        trimWhenBytesExceed: trimWhenBytesExceed, trimToLines: trimToLines,
+        maxBytes: maxBytes, trimToBytes: trimToBytes,
+        preserveOversizedNewestRow: preserveOversizedNewestRow, data: checkedData)
+    if let retained = selection.retained {
+        try SwiftNativePersistenceCore.writeDataAtomicDurable(retained, to: path)
     }
-    let data = try Data(contentsOf: path)
-    guard let s = String(data: data, encoding: .utf8) else {
-        // U5 fix-round (2026-06-11, gpt-5.5 NIT): never silent — a non-UTF8
-        // feed means the cap cannot run, which the state-lifecycle rule says
-        // must be visible, not a quiet `return 0`.
-        nativeLog("enforceJSONLLineCap: %@ is not valid UTF-8 (%d bytes) — cap skipped",
-              path.path, data.count)
-        return 0
-    }
-    var lines = s.split(separator: "\n", omittingEmptySubsequences: false)
-    if lines.last?.isEmpty == true { lines.removeLast() }
-    guard lines.count > maxLines else { return 0 }
-    let retainedLines = min(maxLines, max(1, trimToLines ?? maxLines))
-    let dropped = lines.count - retainedLines
-    let trimmed = lines.suffix(retainedLines).joined(separator: "\n") + "\n"
-    // Durable rewrite: the append that preceded this trim was fsync'd, so the
-    // trim must not be the weak link — a bare .atomic write + replaceItemAt
-    // can commit the rename before the data blocks on power loss, leaving the
-    // feed truncated with the old contents already unlinked.
-    try SwiftNativePersistenceCore.atomicWrite(Data(trimmed.utf8), to: path)
-    return dropped
+    return selection.dropped?.count ?? 0
 }
 
-/// Grouped JSONL line retention. Keeps the total budget unchanged while
-/// reserving the newest `minimumRowsPerKind` rows for every decodable `kind`.
-/// Remaining slots are the newest rows globally. Output stays in original
-/// chronological order, malformed rows still survive when they are recent,
-/// and no other JSONL feed inherits this policy.
-@discardableResult
-func enforceJSONLKindLineCap(
+/// One selection of original rows; nil dropped rows mean unreadable UTF-8.
+private func selectJSONLRetention(
     at path: URL,
-    maxLines: Int,
-    minimumRowsPerKind: Int,
+    maxLines: Int? = nil,
+    minimumRowsPerKind: Int? = nil,
     trimWhenBytesExceed: Int? = nil,
-    trimToLines: Int? = nil
-) throws -> Int {
-    guard maxLines > 0,
-          minimumRowsPerKind > 0,
-          FileManager.default.fileExists(atPath: path.path) else { return 0 }
-    if let size = ((try? FileManager.default.attributesOfItem(
+    trimToLines: Int? = nil,
+    maxBytes: Int? = nil,
+    trimToBytes: Int? = nil,
+    preserveOversizedNewestRow: Bool = true,
+    data checkedData: Data? = nil
+) throws -> (retained: Data?, dropped: [Substring]?) {
+    guard (maxLines ?? 0) > 0 || (maxBytes ?? 0) > 0 else { return (nil, []) }
+    guard checkedData != nil || FileManager.default.fileExists(atPath: path.path) else { return (nil, []) }
+    let size = checkedData?.count ?? ((try? FileManager.default.attributesOfItem(
         atPath: path.path
-    ))?[.size] as? NSNumber)?.intValue {
-        if size == 0 { return 0 }
-        if let trigger = trimWhenBytesExceed, size < trigger { return 0 }
-        if size < maxLines { return 0 }
-    }
-    let data = try Data(contentsOf: path)
+    ))?[.size] as? NSNumber)?.intValue
+    let checkLines = maxLines.map { limit in
+        limit > 0 && size.map { $0 >= limit && $0 >= (trimWhenBytesExceed ?? 0) } != false
+    } ?? false
+    let byteTarget = trimToBytes ?? maxBytes ?? 0
+    let checkBytes = maxBytes.map { limit in
+        limit > 0 && byteTarget > 0 && byteTarget <= limit && size.map { $0 > limit } != false
+    } ?? false
+    guard checkLines || checkBytes else { return (nil, []) }
+    let data = try checkedData ?? Data(contentsOf: path)
     guard let text = String(data: data, encoding: .utf8) else {
-        nativeLog("enforceJSONLKindLineCap: %@ is not valid UTF-8 (%d bytes) — cap skipped",
-              path.path, data.count)
-        return 0
-    }
-    var lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-    if lines.last?.isEmpty == true { lines.removeLast() }
-    guard lines.count > maxLines else { return 0 }
-    let retainedLines = min(maxLines, max(1, trimToLines ?? maxLines))
-
-    var reserved = Set<Int>()
-    var retainedPerKind: [String: Int] = [:]
-    for index in lines.indices.reversed() {
-        guard let row = try? JSONValue.parse(Data(lines[index].utf8)),
-              case .object(let object) = row,
-              case .string(let rawKind)? = object["kind"] else { continue }
-        let kind = rawKind.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !kind.isEmpty, retainedPerKind[kind, default: 0] < minimumRowsPerKind else {
-            continue
-        }
-        reserved.insert(index)
-        retainedPerKind[kind, default: 0] += 1
-    }
-
-    var kept = Set(lines.indices.suffix(retainedLines))
-    kept.formUnion(reserved)
-    let oldestFirst = kept.sorted()
-    let removalOrder = oldestFirst.filter { !reserved.contains($0) }
-        + oldestFirst.filter { reserved.contains($0) }
-    for index in removalOrder.prefix(max(0, kept.count - retainedLines)) {
-        kept.remove(index)
-    }
-    let ordered = kept.sorted().map { lines[$0] }
-    let dropped = lines.count - ordered.count
-    guard dropped > 0 else { return 0 }
-    try SwiftNativePersistenceCore.atomicWrite(
-        Data((ordered.joined(separator: "\n") + "\n").utf8),
-        to: path
-    )
-    return dropped
-}
-
-/// Trim a JSONL file to the newest whole rows that fit within `trimToBytes`
-/// once it crosses `maxBytes`. The caller must hold the file's flock. The
-/// lower target provides hysteresis so a busy feed does not reread/rewrite the
-/// entire file on every append after reaching its ceiling.
-/// A newest whole row larger than the low-water target may survive by itself;
-/// diagnostic mode still requires it to fit the hard maximum. Default mode
-/// preserves even an oversized newest evidence row for its owning caller.
-@discardableResult
-public func enforceJSONLByteCap(
-    at path: URL,
-    maxBytes: Int,
-    trimToBytes: Int,
-    preserveOversizedNewestRow: Bool = true
-) throws -> Int {
-    guard maxBytes > 0,
-          trimToBytes > 0,
-          trimToBytes <= maxBytes,
-          FileManager.default.fileExists(atPath: path.path) else {
-        return 0
-    }
-    let size = ((try? FileManager.default.attributesOfItem(atPath: path.path))?[.size] as? NSNumber)?.intValue
-    guard size.map({ $0 > maxBytes }) != false else { return 0 }
-    let data = try Data(contentsOf: path)
-    guard data.count > maxBytes else { return 0 }
-    guard let text = String(data: data, encoding: .utf8) else {
-        if !preserveOversizedNewestRow {
+        if checkBytes, let maxBytes, data.count > maxBytes, !preserveOversizedNewestRow {
             throw JSONLPathOwnedAppendError.unreadableDiagnosticFeed(path.standardizedFileURL.path)
         }
-        nativeLog("enforceJSONLByteCap: %@ is not valid UTF-8 (%d bytes) — cap skipped",
-              path.path, data.count)
-        return 0
+        nativeLog("enforceJSONLRetention: %@ is not valid UTF-8 (%d bytes) — cap skipped",
+                  path.path, data.count)
+        return (nil, nil)
     }
     var lines = text.split(separator: "\n", omittingEmptySubsequences: false)
     if lines.last?.isEmpty == true { lines.removeLast() }
-    var keptReversed: [Substring] = []
-    var keptBytes = 0
-    for line in lines.reversed() {
-        let lineBytes = line.utf8.count + 1
-        // Only opted-in disposable diagnostics may discard a legacy row that
-        // alone exceeds the hard ceiling. Evidence-owning callers keep the
-        // historical default. New oversized diagnostic rows are refused before
-        // append by appendJSONLCapped, so this is recovery for inherited data.
-        if !preserveOversizedNewestRow, lineBytes > maxBytes { continue }
-        if !keptReversed.isEmpty, keptBytes + lineBytes > trimToBytes {
-            break
+    let original = lines
+    let originalCount = lines.count
+    var selected = Array(lines.indices)
+    if checkLines, let maxLines, lines.count > maxLines {
+        let retainedLines = min(maxLines, max(1, trimToLines ?? maxLines))
+        var reserved = Set<Int>()
+        if let minimumRowsPerKind, minimumRowsPerKind > 0 {
+            var retainedPerKind: [String: Int] = [:]
+            for index in lines.indices.reversed() {
+                guard let row = try? JSONValue.parse(Data(lines[index].utf8)),
+                      case .object(let object) = row,
+                      case .string(let rawKind)? = object["kind"] else { continue }
+                let kind = rawKind.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !kind.isEmpty, retainedPerKind[kind, default: 0] < minimumRowsPerKind else { continue }
+                reserved.insert(index)
+                retainedPerKind[kind, default: 0] += 1
+            }
         }
-        // A single row should already be bounded by its owner. Preserve the
-        // newest row even if a corrupt/legacy row exceeds the target so the
-        // cap never replaces the feed with an empty file.
-        keptReversed.append(line)
-        keptBytes += lineBytes
-        if keptBytes >= trimToBytes { break }
+        var kept = Set(lines.indices.suffix(retainedLines))
+        kept.formUnion(reserved)
+        let oldestFirst = kept.sorted()
+        let removalOrder = oldestFirst.filter { !reserved.contains($0) }
+            + oldestFirst.filter { reserved.contains($0) }
+        for index in removalOrder.prefix(max(0, kept.count - retainedLines)) { kept.remove(index) }
+        selected = kept.sorted()
+        lines = selected.map { original[$0] }
     }
-    let kept = keptReversed.reversed()
-    let dropped = max(0, lines.count - kept.count)
-    guard dropped > 0 else { return 0 }
-    let trimmed = kept.isEmpty ? "" : kept.joined(separator: "\n") + "\n"
-    // Same durable rewrite as enforceJSONLLineCap — see the note there.
-    try SwiftNativePersistenceCore.atomicWrite(Data(trimmed.utf8), to: path)
-    return dropped
+    // A line trim normalizes the trailing separator before the byte selection.
+    let selectedBytes = lines.count < originalCount
+        ? lines.reduce(0) { $0 + $1.utf8.count + 1 } : data.count
+    if checkBytes, let maxBytes, selectedBytes > maxBytes {
+        var keptReversed: [Int] = []
+        var keptBytes = 0
+        for index in selected.reversed() {
+            let line = original[index]
+            let lineBytes = line.utf8.count + 1
+            // Disposable diagnostics may drop inherited rows above the hard cap.
+            if !preserveOversizedNewestRow, lineBytes > maxBytes { continue }
+            if !keptReversed.isEmpty, keptBytes + lineBytes > byteTarget { break }
+            // Evidence retains its newest whole row even above the target.
+            keptReversed.append(index)
+            keptBytes += lineBytes
+            if keptBytes >= byteTarget { break }
+        }
+        selected = Array(keptReversed.reversed())
+        lines = selected.map { original[$0] }
+    }
+    let dropped = originalCount - lines.count
+    guard dropped > 0 else { return (nil, []) }
+    let retained = lines.isEmpty ? "" : lines.joined(separator: "\n") + "\n"
+    let kept = Set(selected)
+    return (Data(retained.utf8), original.indices.filter { !kept.contains($0) }.map { original[$0] })
 }
 
 /// Owns activity/events.jsonl: the event envelope, path and capped append.
@@ -242,26 +174,6 @@ public func enforceJSONLByteCap(
 extension SwiftNativePersistenceCore {
     public static func activityEventsPath(dataRoot: URL) -> URL {
         dataRoot.appendingPathComponent("activity/events.jsonl")
-    }
-
-    public static func activityTail(dataRoot: URL) throws -> (data: Data, startsMidFile: Bool) {
-        let path = activityEventsPath(dataRoot: dataRoot)
-        let fileManager = FileManager.default
-        guard fileManager.fileExists(atPath: path.path) else { return (Data(), false) }
-        let attributes = try fileManager.attributesOfItem(atPath: path.path)
-        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
-        guard size > 0 else { return (Data(), false) }
-
-        let maximumBytes = UInt64(1_048_576)
-        let count = min(size, maximumBytes)
-        let startsMidFile = size > count
-        let handle = try FileHandle(forReadingFrom: path)
-        defer { try? handle.close() }
-        if startsMidFile {
-            try handle.seek(toOffset: size - count)
-        }
-        let data = handle.readData(ofLength: Int(count))
-        return (data, startsMidFile)
     }
 
     public static func activityEvent(
@@ -277,29 +189,21 @@ extension SwiftNativePersistenceCore {
     }
 
     public static func appendActivityEvent(
-        _ event: JSONValue, to path: URL, using persistence: any PersistenceCoreProtocol,
-        logLabel: String
+        _ event: JSONValue, to path: URL, logLabel: String
     ) async throws {
-        try await appendJSONLCapped(event, to: path, using: persistence, logLabel: logLabel)
+        try await appendJSONLCapped(event, to: path, logLabel: logLabel)
     }
 }
 
-/// U5 fix-round (2026-06-11, gpt-5.5 review): THE shared capped-append for
-/// JSONL activity-style feeds. Appends `event` to `path`, then trims the file
+/// Appends `event` to `path`, then trims the file
 /// to its newest `maxLines` lines, logging what the rotation dropped. Every
-/// live `activity/events.jsonl` writer routes through here so no append path
-/// can grow the feed unbounded again (PersonaEngine doc-save emit, Skills,
-/// Executions, SchedulerDueJobRunner).
+/// live `activity/events.jsonl` writer routes through here to bound the feed.
 ///
-/// Locking: when `takeLock` is true (default) the append+cap runs under
-/// `withFileLock(path)` — for EVERY conformer, not just the SwiftNative impl —
-/// so the cap's read-trim-replace cannot race a concurrent capped writer. Callers
-/// that already hold the events-feed flock pass `takeLock: false` to avoid
-/// double-acquiring it.
+/// Append and retention share `withFileLock(path)`, reusing a held same-path
+/// lock. Only a compound transaction protected by a different path bypasses it.
 public func appendJSONLCapped(
     _ event: JSONValue,
     to path: URL,
-    using persistence: any PersistenceCoreProtocol,
     maxLines: Int = JSONLLineCaps.activityEvents,
     logLabel: String,
     takeLock: Bool = true,
@@ -309,16 +213,11 @@ public func appendJSONLCapped(
     capCheckStride: Int = JSONLLineCaps.capCheckStride,
     // Validated by the caller under the same file lock as this append.
     validatedExistingCounts: (lines: Int, bytes: Int)? = nil,
-    // When the feed is a RECORD rather than telemetry, the append has to be on
-    // the platter before this call returns. `appendBytes` refuses a raw durable
-    // append to a path-owned feed, so the durable route has to run here, inside
-    // the permit — a caller cannot get both guarantees any other way.
+    // Confirm append durability before retention when this feed is a record of truth.
     durable: Bool = false,
-    beforePotentialLineCap: (@Sendable () async throws -> Void)? = nil
+    beforePotentialLineCap: (@Sendable ([Substring]?) async throws -> Void)? = nil
 ) async throws {
-    // F2 (2026-08-28): when the FILE owns its retention, the table wins over
-    // whatever budget this call site remembered to pass. A mismatch is logged
-    // rather than silently accepted so a stale local constant is visible.
+    // Path-owned retention overrides caller budgets; mismatches are logged.
     let policy = jsonlPathOwnedCapPolicy(for: path)
     if let policy, policy.maxLines != maxLines {
         nativeLog("%@: %@ has a path-owned cap of %d line(s) — ignoring the call site's %d",
@@ -329,21 +228,20 @@ public func appendJSONLCapped(
     let effectiveMaxBytes = policy?.maxBytes ?? maxBytes
     let effectiveTrimToBytes = policy?.trimToBytes ?? trimToBytes ?? effectiveMaxBytes
     let diagnosticByteBound = policy?.maxBytes != nil
-    let diagnosticAppendBytes: Int?
+    let payload = try SwiftNativePersistenceCore.serializeJSONL([event])
+    let diagnosticAppendBytes: Int? = diagnosticByteBound ? payload.count : nil
     // Reject rather than truncate a new diagnostic record that cannot fit in
     // its file's hard budget. Audit/authoritative callers do not inherit this.
     if diagnosticByteBound, let effectiveMaxBytes {
-        let count = try event.serialize(pretty: false).utf8.count + 1
-        guard count <= effectiveMaxBytes else {
+        guard payload.count <= effectiveMaxBytes else {
             throw JSONLPathOwnedAppendError.recordExceedsByteLimit(
-                path.standardizedFileURL.path, count, effectiveMaxBytes
+                path.standardizedFileURL.path, payload.count, effectiveMaxBytes
             )
         }
-        diagnosticAppendBytes = count
-    } else {
-        diagnosticAppendBytes = nil
     }
     let work: @Sendable () async throws -> Void = {
+        var checkedData: Data?
+        var selection: (retained: Data?, dropped: [Substring]?)?
         // Do not keep growing an inherited malformed diagnostic feed merely
         // because retention cannot decode it. Preserve the evidence and refuse
         // this append before it crosses the ceiling; no quarantine copy can
@@ -358,20 +256,15 @@ public func appendJSONLCapped(
                 guard String(data: data, encoding: .utf8) != nil else {
                     throw JSONLPathOwnedAppendError.unreadableDiagnosticFeed(path.standardizedFileURL.path)
                 }
+                checkedData = data
             }
         }
-        // Decide once, before the append, whether this call can enter the
-        // full-read line-cap path. Owners that must preserve pre-trim evidence
-        // use the hook to archive at exactly the same amortized checkpoints;
-        // they must not independently reread a multi-megabyte feed on every
-        // append merely in case this is the one that trims.
+        // Archive selected original rows at the same checkpoints that enforce retention.
         let fullCheckWillBeDue = JSONLCapCheckCounter.shared.isFullCheckDueOnNextAppend(
             path: path, stride: capCheckStride
         )
-        // A soft trigger is not a ceiling: once a retained file remained above
-        // it, the old code rewrote that file for EVERY new row. Trigger-backed
-        // feeds now count only at bounded stride checkpoints, even when mature.
-        // Explicit hard byte ceilings are checked on every append separately.
+        // Soft triggers count at bounded stride checkpoints; hard byte ceilings
+        // are checked on every append.
         let shouldCheckLines = validatedExistingCounts.map { $0.lines + 1 > effectiveMaxLines }
             ?? (fullCheckWillBeDue || effectiveTrimTrigger == nil)
         if let beforePotentialLineCap {
@@ -380,23 +273,32 @@ public func appendJSONLCapped(
                 let currentBytes = ((try? FileManager.default.attributesOfItem(
                     atPath: path.path
                 ))?[.size] as? NSNumber)?.intValue
-                let appendedBytes = (try? event.serialize(pretty: false).utf8.count + 1)
                 reachesByteCeiling = currentBytes == nil
-                    || appendedBytes == nil
-                    || currentBytes! + appendedBytes! > effectiveMaxBytes
+                    || currentBytes! + payload.count > effectiveMaxBytes
             } else {
                 reachesByteCeiling = false
             }
             if shouldCheckLines || reachesByteCeiling {
-                try await beforePotentialLineCap()
+                var prospective = try checkedData ?? (FileManager.default.fileExists(atPath: path.path)
+                    ? Data(contentsOf: path) : Data())
+                if !prospective.isEmpty, prospective.last != 0x0A { prospective.append(0x0A) }
+                prospective.append(payload)
+                selection = try selectJSONLRetention(
+                    at: path, maxLines: shouldCheckLines ? effectiveMaxLines : nil,
+                    minimumRowsPerKind: policy?.minimumRowsPerKind, trimToLines: policy?.trimToLines,
+                    maxBytes: effectiveMaxBytes, trimToBytes: effectiveTrimToBytes,
+                    preserveOversizedNewestRow: !diagnosticByteBound, data: prospective)
+                try await beforePotentialLineCap(selection!.dropped)
             }
         }
-        try await JSONLPathOwnedAppendPermit.$isInsideCappedAppend.withValue(true) {
-            if durable {
-                try await persistence.appendJSONLDurable(event, to: path)
-            } else {
-                try await persistence.appendJSONL(event, to: path)
-            }
+        try JSONLPathOwnedAppendPermit.$isInsideCappedAppend.withValue(true) {
+            try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try SwiftNativePersistenceCore.appendOwnedBytes(payload, to: path, durable: durable)
+            _ = chmod(path.path, 0o600)
+        }
+        if checkedData != nil {
+            if !checkedData!.isEmpty, checkedData!.last != 0x0A { checkedData!.append(0x0A) }
+            checkedData!.append(payload)
         }
         // Spend the checkpoint only after a successful append. The caller's
         // file lock keeps the earlier evidence-hook preview and this decision
@@ -404,61 +306,29 @@ public func appendJSONLCapped(
         _ = JSONLCapCheckCounter.shared.isFullCheckDue(
             path: path, stride: capCheckStride
         )
-        let dropped: Int
-        if !shouldCheckLines {
-            dropped = 0
-        } else if let minimumRowsPerKind = policy?.minimumRowsPerKind {
-            dropped = try enforceJSONLKindLineCap(
-                at: path,
-                maxLines: effectiveMaxLines,
-                minimumRowsPerKind: minimumRowsPerKind,
-                trimWhenBytesExceed: nil,
-                trimToLines: policy?.trimToLines
-            )
-        } else {
-            dropped = try enforceJSONLLineCap(
-                at: path,
-                maxLines: effectiveMaxLines,
-                trimWhenBytesExceed: nil,
-                trimToLines: policy?.trimToLines
-            )
+        let checkBytes = validatedExistingCounts.map {
+            $0.bytes + payload.count > (effectiveMaxBytes ?? Int.max)
+        } ?? true
+        let selected = try selection ?? selectJSONLRetention(
+            at: path, maxLines: shouldCheckLines ? effectiveMaxLines : nil,
+            minimumRowsPerKind: policy?.minimumRowsPerKind, trimToLines: policy?.trimToLines,
+            maxBytes: checkBytes ? effectiveMaxBytes : nil,
+            trimToBytes: effectiveTrimToBytes,
+            preserveOversizedNewestRow: !diagnosticByteBound, data: checkedData)
+        if let retained = selected.retained {
+            try SwiftNativePersistenceCore.writeDataAtomicDurable(retained, to: path)
         }
+        let dropped = selected.dropped?.count ?? 0
         if dropped > 0 {
             nativeLog("%@: %@ cap dropped %d oldest line(s)",
                   logLabel, path.lastPathComponent, dropped)
         }
-        if let effectiveMaxBytes, let effectiveTrimToBytes,
-           try validatedExistingCounts.map({
-               $0.bytes + (try event.serialize(pretty: false).utf8.count) + 1 > effectiveMaxBytes
-           }) ?? true {
-            let byteDropped = try enforceJSONLByteCap(
-                at: path,
-                maxBytes: effectiveMaxBytes,
-                trimToBytes: effectiveTrimToBytes,
-                preserveOversizedNewestRow: !diagnosticByteBound
-            )
-            if byteDropped > 0 {
-                nativeLog("%@: %@ byte cap dropped %d oldest line(s)",
-                      logLabel, path.lastPathComponent, byteDropped)
-            }
-        }
     }
     if takeLock {
-        // L7 (2026-08-01 audit): this used to downcast to
-        // `SwiftNativePersistenceCore` and, on failure, append UNROTATED with no
-        // log — a silent fallback that quietly disabled every line/byte cap for
-        // any other conformer, letting the feed grow without bound while the
-        // call still reported success. The downcast was also gratuitous:
-        // `withFileLock` is a PersistenceCoreProtocol EXTENSION
-        // (PersistenceCore+FileLock.swift:4), so every conformer already has it,
-        // and it locks a local `<path>.lock` sidecar with flock independent of
-        // the append backend. The `takeLock: false` branch below has always run
-        // the cap for arbitrary conformers, so refusing to run it here was
-        // internally inconsistent too. Now uniform: lock, append, cap — and a
-        // lock-acquire failure THROWS rather than degrading in silence.
-        try await persistence.withFileLock(path, work)
+        // Append and cap share the feed lock; acquisition failure throws.
+        try await SwiftNativePersistenceCore.withFileLock(path, work)
     } else {
-        // Caller already holds the events-feed flock.
+        // Caller holds the compound transaction's different-path lock.
         try await work()
     }
 }
@@ -467,12 +337,7 @@ public enum JSONLPathOwnedAppendError: Error, Equatable {
     case unregisteredPath(String)
     case recordExceedsByteLimit(String, Int, Int)
     case unreadableDiagnosticFeed(String)
-    /// A raw (uncapped) append reached a file whose retention is path-owned.
-    /// F2 (2026-08-28): the registry used to be opt-in at the CALL SITE, so the
-    /// invariant "this feed is capped" held only as long as every writer
-    /// remembered to use `appendPathOwnedJSONL`. It is now enforced at the one
-    /// byte-writer every append funnels through, so forgetting fails loudly at
-    /// the first write instead of silently growing the feed forever.
+    /// The shared byte writer refuses uncapped appends to path-owned feeds.
     case rawAppendToPathOwnedFeed(String)
 }
 
@@ -486,17 +351,15 @@ enum JSONLPathOwnedAppendPermit {
 
 /// Append through the path-owned cap registry. An unregistered path fails loud
 /// so a typo or newly introduced writer cannot silently bypass retention.
-/// Callers that already hold the feed lock pass `takeLock:false`.
+/// Same-path lock reentry keeps an enclosing feed transaction intact.
 public func appendPathOwnedJSONL(
     _ event: JSONValue,
     to path: URL,
-    using persistence: any PersistenceCoreProtocol,
     logLabel: String,
-    takeLock: Bool = true,
     durable: Bool = false,
     // Passthrough to `appendJSONLCapped`'s pre-trim hook, for the owners whose
     // feed must not lose a row to a trim. It throws to STOP the append.
-    beforePotentialLineCap: (@Sendable () async throws -> Void)? = nil
+    beforePotentialLineCap: (@Sendable ([Substring]?) async throws -> Void)? = nil
 ) async throws {
     guard let policy = jsonlPathOwnedCapPolicy(for: path) else {
         throw JSONLPathOwnedAppendError.unregisteredPath(path.standardizedFileURL.path)
@@ -504,10 +367,8 @@ public func appendPathOwnedJSONL(
     try await appendJSONLCapped(
         event,
         to: path,
-        using: persistence,
         maxLines: policy.maxLines,
         logLabel: logLabel,
-        takeLock: takeLock,
         trimWhenBytesExceed: policy.trimWhenBytesExceed,
         durable: durable,
         beforePotentialLineCap: beforePotentialLineCap

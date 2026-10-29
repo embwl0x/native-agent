@@ -48,14 +48,8 @@ public enum WorkshopCompiledProcedurePlanError: Error, LocalizedError, Equatable
     }
 }
 
-/// The first deliberately narrow, provider-free Workshop plan target.
-///
-/// This is not a new executor, scheduler, store, or authority owner. It is a
-/// value-only `WorkshopPlannerLLM` adapter that turns one locally reviewed,
-/// immutable declarative artifact into the same canonical two-step Workshop
-/// plan the ordinary planner previously produced. Submission, tool dispatch,
-/// verification, receipts, cancellation, Desk state, and Trust Center gates
-/// remain owned by their existing systems.
+/// A reviewed immutable artifact supplies typed, provider-free copy steps.
+/// The canonical Workshop queue, dispatch, verification and Trust gates execute them.
 public struct WorkshopCompiledLocalFileCopyPlanner: WorkshopPlannerLLM, Sendable {
     public static let maximumSourceBytes = 64 * 1_024
     public static let procedureID = "local_file_copy_v1"
@@ -71,10 +65,9 @@ public struct WorkshopCompiledLocalFileCopyPlanner: WorkshopPlannerLLM, Sendable
     public static let qualificationProtocolIdentity =
         ProcedureExactActivationProposal.requiredQualificationProtocolIdentity
 
-    public let directProviderCallCountPerInvocation: Int? = 0
     public let sourceToolPath: String
     public let destinationToolPath: String
-    public let contract: WorkshopProcedureContractProjection
+    public let contract: WorkshopProcedureContractReadout
     /// Opaque binding over the artifact, relative input locations, and exact
     /// bounded source bytes. A caller combines this with its stable request key
     /// so crash/retry reuses one procedure invocation without persisting raw
@@ -83,7 +76,7 @@ public struct WorkshopCompiledLocalFileCopyPlanner: WorkshopPlannerLLM, Sendable
 
     public let binding: WorkshopCompiledFileCopyBinding
 
-    private let encodedPlan: String
+    private let steps: [WorkshopExecutionStep]
 
     public init(
         artifact: DeclarativeProcedureArtifact,
@@ -154,7 +147,8 @@ public struct WorkshopCompiledLocalFileCopyPlanner: WorkshopPlannerLLM, Sendable
                     "max_bytes": .int(Int64(Self.maximumSourceBytes)),
                     "path": .string(sourceToolPath),
                 ]),
-                autonomy: "needs_approval"
+                autonomy: "needs_approval",
+                optional: false
             ),
             WorkshopExecutionStep(
                 id: "step-2",
@@ -165,29 +159,13 @@ public struct WorkshopCompiledLocalFileCopyPlanner: WorkshopPlannerLLM, Sendable
                     "content": .string("{{step:step-1}}"),
                     "path": .string(destinationToolPath),
                 ]),
-                autonomy: "needs_approval"
+                autonomy: "needs_approval",
+                optional: false
             ),
         ]
-        let record = WorkshopExecutionRecord(
-            id: "compiled-procedure-projection",
-            title: "Compiled local file copy",
-            objective: "Execute an approved deterministic local file copy",
-            createdAt: "1970-01-01T00:00:00Z",
-            status: "queued",
-            plan: steps,
-            stepsCompleted: [],
-            receiptsDir: "",
-            triggerSource: "manual",
-            trustRequired: "none",
-            expectedOutputs: [],
-            currentStepId: "",
-            updatedAt: "1970-01-01T00:00:00Z",
-            result: .null,
-            rerunCount: 0,
-            planningProviderCallCount: 0,
-            planningRemovableOrchestrationProviderCallCount: 0
+        let contract = SwiftNativeWorkshopRunner.procedureContractProjection(
+            plan: steps, trustRequired: "none", triggerSource: "manual"
         )
-        let contract = SwiftNativeWorkshopRunner.procedureContractProjection(record: record)
         guard contract.taskFamily == artifact.inputContract.taskFamily,
               contract.inputClass == artifact.inputContract.inputClass,
               contract.procedureShapeIdentity == artifact.procedureShapeIdentity,
@@ -215,57 +193,18 @@ public struct WorkshopCompiledLocalFileCopyPlanner: WorkshopPlannerLLM, Sendable
             destinationRelative,
             sourceContentIdentity,
         ].joined(separator: "|"))
-        self.encodedPlan = try JSONValue.object([
-            "working_directory": .string(workspace.path),
-            "steps": .array(steps.map { step in
-                .object([
-                    "id": .string(step.id),
-                    "description": .string(step.description),
-                    "tool_or_action": .string(step.toolOrAction),
-                    "args": step.args,
-                    "autonomy_hint": .string(step.autonomy),
-                ])
-            }),
-        ]).serialize(pretty: false)
+        self.steps = steps
     }
 
-    public func availableConnectorActions() async -> [JSONValue] {
-        [
-            .object([
-                "id": .string("read_file"),
-                "description": .string("Read a workspace file"),
-            ]),
-            .object([
-                "id": .string("write_file"),
-                "description": .string("Write a workspace file"),
-            ]),
-        ]
-    }
-
-    public func runCodex(
-        prompt: String,
-        surface: String,
-        timeoutSeconds: Int
-    ) async throws -> (model: String, output: String) {
-        (model: "native-procedure", output: encodedPlan)
+    public func plan(spec: WorkshopExecutionSpec, dataRoot: URL, now: Date) async throws
+        -> (steps: [WorkshopExecutionStep], providerCallCount: Int?, binding: WorkshopCompiledFileCopyBinding?) {
+        try Task.checkCancellation()
+        return (steps, 0, binding)
     }
 
     public static func isEligibleArtifact(_ artifact: DeclarativeProcedureArtifact) -> Bool {
-        guard (artifact.schema == DeclarativeProcedureArtifact.schema
-                || artifact.schema == "declarative-procedure-transition-table.v1"),
-              artifact.domain == "workshop_execution",
-              artifact.canonicalOracle == .workshopRecordAndTimeline,
-              artifact.authorityClass == "low_risk",
-              artifact.reviewerDecision.verdict == .approve,
-              artifact.manualInvocationEligible,
-              !artifact.automaticSelectionEligible,
-              !artifact.generatedExecutableCode,
-              !artifact.safety.externalSendsEligible,
-              !artifact.safety.permissionAuthority,
-              !artifact.safety.automaticActivationAllowed,
-              artifact.safety.trustCenterCapability == "workshop_execution" else {
-            return false
-        }
+        guard ProcedureArtifactStore.valid(artifact), artifact.domain == "workshop_execution",
+              artifact.authorityClass == "low_risk" else { return false }
         let expectedActions: [String?] = [
             "queue_admission", "execute_plan", "tool:read_file", "tool:write_file", nil,
         ]
@@ -319,7 +258,7 @@ public struct WorkshopCompiledLocalFileCopyPlanner: WorkshopPlannerLLM, Sendable
     fileprivate static func isContained(_ candidate: URL, by root: URL) -> Bool {
         let rootPath = root.standardizedFileURL.resolvingSymlinksInPath().path
         let candidatePath = candidate.standardizedFileURL.resolvingSymlinksInPath().path
-        return candidatePath == rootPath || candidatePath.hasPrefix(rootPath + "/")
+        return NativeAgentWorkspaceRoot.relativePath(candidatePath, under: rootPath) != nil
     }
 }
 

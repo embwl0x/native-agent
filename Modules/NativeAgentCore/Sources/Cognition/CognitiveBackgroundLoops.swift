@@ -14,12 +14,8 @@ public struct CognitiveMaintenanceLoop: LoopRunner {
     public var loopId: String { "cognition_maintenance" }
     public var tickTimeoutOverride: TimeInterval? { 30 }
 
-    public func tick() async {
-        _ = await tickOutcome()
-    }
-
     public func tickOutcome() async -> LoopTickOutcome {
-        await runtime.runMaintenance(reason: loopId).loopTickOutcome
+        await runtime.runMaintenance(reason: loopId)
     }
 }
 
@@ -34,12 +30,8 @@ public struct CognitiveReplayLoop: LoopRunner {
     public var loopId: String { "cognition_replay" }
     public var tickTimeoutOverride: TimeInterval? { 30 }
 
-    public func tick() async {
-        _ = await tickOutcome()
-    }
-
     public func tickOutcome() async -> LoopTickOutcome {
-        await runtime.runReplay(reason: loopId).loopTickOutcome
+        await runtime.runReplay(reason: loopId)
     }
 }
 
@@ -56,12 +48,8 @@ public struct CognitiveReflectionLoop: LoopRunner {
     public var loopId: String { "cognition_reflection" }
     public var tickTimeoutOverride: TimeInterval? { 180 }
 
-    public func tick() async {
-        _ = await tickOutcome()
-    }
-
     public func tickOutcome() async -> LoopTickOutcome {
-        // C2 lease PRIORITY: the window is claimed INSIDE runReflectionIfDue,
+        // The window is claimed inside runReflectionIfDue,
         // after the cognition gate and before planning; a refused plan or a
         // pre-provider skip returns it, so a not-due tick never spends the
         // window and blocks the workshop for nothing.
@@ -70,16 +58,6 @@ public struct CognitiveReflectionLoop: LoopRunner {
             reason: "scheduled cognitive reflection",
             demand: .spontaneous,
             sameSourceCooldown: 6 * 3600
-        ).loopTickOutcome
-    }
-}
-
-private extension CognitiveBackgroundRunOutcome {
-    var loopTickOutcome: LoopTickOutcome {
-        switch self {
-        case .completed(let result): return .completed(result: result)
-        case .skipped(let reason): return .skipped(reason: reason)
-        case .failed(let error): return .failed(error: error)
-        }
+        )
     }
 }

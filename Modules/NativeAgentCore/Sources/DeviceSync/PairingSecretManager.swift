@@ -1,19 +1,19 @@
-// PATCH-2026-05-08: icloud-pairing-ui — single source of truth for the HMAC pairing secret
-// Both MacSyncEngine (HMAC validation) and MacPairingView (QR display) go through here.
+// Shared HMAC secret for device validation and pairing display.
 import Foundation
 import CryptoKit
 import Security
 import NativeAgentShared
 import PersistenceCore
 
-// Blueprint: | `PairingSecretManager.swift` | `PairingSecretManager`: checked device-only HMAC secret ownership, explicit rotation and pairing material publication |
+// Blueprint: | `PairingSecretManager.swift` | `PairingSecret`: checked device-only HMAC secret ownership, explicit rotation and pairing material publication |
 
 private enum PairingKVSPublishResult: Sendable {
     case skippedCurrent
+    case versionExhausted
     case published(version: Int, synced: Bool)
 }
 
-public enum PairingSecretManager {
+public enum PairingSecret {
     private static let secretService = "NativeAgent.icloud-pairing"
 
     private static func secretAccount(for url: URL) -> String {
@@ -140,7 +140,7 @@ public enum PairingSecretManager {
         let secretDigest = SHA256.hash(data: secret).map { String(format: "%02x", $0) }.joined()
         // KVS reads include unsynchronized local writes. Only a checkpoint
         // recorded after synchronization proves this secret/version was sent.
-        let result = await withCKTimeout("PairingSecretManager.publishMaterialToKVS") {
+        let result = await withCKTimeout("PairingSecret.publishMaterialToKVS") {
             let kvs = NSUbiquitousKeyValueStore.default
             let defaults = UserDefaults.standard
             let existingB64 = kvs.string(forKey: "NativeAgent.pairing.hmacSecret") ?? ""
@@ -152,7 +152,8 @@ public enum PairingSecretManager {
                checkpoint?["version"] as? Int == version {
                 return PairingKVSPublishResult.skippedCurrent
             }
-            let nextVersion = version + 1
+            let (nextVersion, overflow) = version.addingReportingOverflow(1)
+            guard !overflow else { return PairingKVSPublishResult.versionExhausted }
             defaults.removeObject(forKey: synchronizationCheckpointKey)
             kvs.set(secretB64, forKey: "NativeAgent.pairing.hmacSecret")
             kvs.set(ISO8601DateFormatter().string(from: Date()), forKey: "NativeAgent.pairing.publishedAt")
@@ -169,6 +170,9 @@ public enum PairingSecretManager {
         case .skippedCurrent:
             nativeLog("[PairingBootstrap] KVS already has current HMAC secret — skipping publish")
             return true
+        case .versionExhausted:
+            nativeLog("[PairingBootstrap] Pairing version exhausted; material and checkpoint left unchanged")
+            return false
         case .published(let nextVersion, let synced):
             nativeLog(
                 "[PairingBootstrap] Published HMAC pairing_secret_version=%d to KVS (synchronize=%@)",
@@ -181,7 +185,7 @@ public enum PairingSecretManager {
     }
 
     @discardableResult
-    static func publishMaterial(_ secret: Data, to transport: DeviceSyncTransport) async -> Bool {
+    static func publishMaterial(_ secret: Data, to transport: CloudKitDeviceTransport) async -> Bool {
         guard secret.count == 32 else { return false }
         do {
             try await transport.publishPairing(secret: secret)

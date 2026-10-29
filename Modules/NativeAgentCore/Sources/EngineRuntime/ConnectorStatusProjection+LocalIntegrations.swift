@@ -11,7 +11,7 @@ import AttentionRouting
 import AppToolRuntime
 import ToolExecution
 import Senses
-// Blueprint: | `ConnectorStatusProjection+LocalIntegrations.swift` | connector platform actions, EventKit status, proof cache, local PIM and phone readiness, action evidence; Mac assistant catalog reads invoke the editable `mac-watch-catalog` seed through L0 Parts.call with effects refused; integration recovery parts supply words only over native reasons, preserving operation status/identity/effects, including batch actions, with visible recovery unavailability |
+// Blueprint: | `ConnectorStatusProjection+LocalIntegrations.swift` | connector platform actions, EventKit status, local proof and phone readiness snapshots, action evidence; Mac assistant catalog reads invoke the editable `mac-watch-catalog` seed through L0 Parts.call with effects refused; integration recovery parts supply words only over native reasons, preserving operation status/identity/effects, including batch actions, with visible recovery unavailability |
 
 /// The catalog is data, never an execution route for a watch. Even a changed
 /// catalog cannot create a schedule through the status/UI read's host.
@@ -77,9 +77,9 @@ enum MacAssistantParts {
     }
 }
 
-extension ConnectorStatusProjection {
-    public static func actionStatusEvidence(actionID: String, root: URL, platform: any ConnectorStatusPlatform) async -> ConnectorActionStatusEvidence? {
-        let connectors = (try? await ConnectorStatusProjection.readConnectorRecords(
+extension ConnectorReadiness {
+    public static func actionStatusEvidence(actionID: String, root: URL, platform: AppConnectorStatusPlatform) async -> ConnectorActionStatusEvidence? {
+        let connectors = (try? await ConnectorReadiness.readConnectorRecords(
             root: root, platform: platform
         )) ?? []
         let actions = ConnectorActionRecord.records(connectors: connectors)
@@ -92,50 +92,36 @@ extension ConnectorStatusProjection {
 /// A connector's proof = the Connectors page's own row: connected, and health
 /// still "ok" after `ConnectorHealthDecay` (a real call succeeded in the last
 /// 7 days). Local files only; one registry read per status call.
-public actor NativeAppConnectorProofProvider: ConnectorProofProvider {
-    private let root: URL
-    private var rows: [ConnectorRecord]?
-
-    private let platform: any ConnectorStatusPlatform
-    public init(root: URL, platform: any ConnectorStatusPlatform) {
-        self.root = root
-        self.platform = platform
-    }
-
-    public func proofStatus(provider id: String) async -> [String: JSONValue] {
-        if rows == nil {
-            rows = (try? await ConnectorStatusProjection.readConnectorRecords(root: root, platform: platform)) ?? []
-        }
-        let row = rows?.first { $0.id == id }
-        if row?.healthStatus == "ok" { return ["verified": .bool(true)] }
+extension ConnectorReadiness {
+    static func isProven(id: String, root: URL, platform: AppConnectorStatusPlatform) async -> Bool {
+        let rows = (try? await readConnectorRecords(root: root, platform: platform)) ?? []
+        let row = rows.first { $0.id == id }
+        if row?.healthStatus == "ok" { return true }
         // An owner with no registry row (the Mac bridge) is proven the same
         // way a row is: a successful receipt of its own within the window.
         if row == nil, let proof = ConnectorProofLedger.latestByConnector(root: root)[ConnectorProofLedger.canonicalID(id)],
            proof.succeeded, Date().timeIntervalSince(proof.at) < ConnectorHealthDecay.provenWindow {
-            return ["verified": .bool(true)]
+            return true
         }
-        return ["verified": .bool(false)]
+        return false
     }
 }
 
 /// iPhone push is ready when a notification can actually reach a phone: the
 /// person hasn't switched phone delivery off, and either the paired iPhone
 /// advertised CloudKit visual notifications or direct APNs has a target.
-public struct NativeAppMobilePushStatusProvider: MobilePushStatusProvider {
-    let deviceSync: DeviceSync
-    public init(deviceSync: DeviceSync) { self.deviceSync = deviceSync }
-    public func pushStatus() async -> [String: JSONValue] {
+extension ConnectorReadiness {
+    static func mobilePushStatus(deviceSync: DeviceSync) async -> [String: JSONValue] {
         guard NotificationChannelPreference.push() else {
             return ["status": .string("off"), "nextStep": .string("Turn on Deliver to the phone in Settings.")]
         }
-        let peerReady = await MainActor.run { deviceSync.bridge.cloudKitVisualNotificationPeerReady }
         let apnsTargets: Int
         do {
             apnsTargets = try await deviceSync.apns.deliverableTargetCount()
         } catch {
             return ["status": .string("unavailable"), "nextStep": .string(error.localizedDescription)]
         }
-        if peerReady || apnsTargets > 0 {
+        if apnsTargets > 0 {
             return ["status": .string("ready"), "tokenConfigured": .bool(apnsTargets > 0)]
         }
         return ["status": .string("needs_setup"), "nextStep": .string("Configure mobile push in NativeAgent settings")]
@@ -144,7 +130,7 @@ public struct NativeAppMobilePushStatusProvider: MobilePushStatusProvider {
 
 /// The Mac's side of the connector owners: EventKit permission, the agent's
 /// display voice, and whether this is a distributed public build.
-public struct AppConnectorStatusPlatform: ConnectorStatusPlatform {
+public struct AppConnectorStatusPlatform: Sendable {
     public func calendarEventKitReadState() -> String {
         switch EKEventStore.authorizationStatus(for: .event) {
         case .authorized, .fullAccess:
@@ -169,12 +155,12 @@ public struct AppConnectorStatusPlatform: ConnectorStatusPlatform {
 /// Spotlight, notifications, git, and the Mac assistant status.
 public struct AppConnectorActionPlatform: ConnectorActionPlatform {
     let dataRoot: URL
-    private let statusPlatform: any ConnectorStatusPlatform
+    private let statusPlatform: AppConnectorStatusPlatform
     private let router: @Sendable () -> AttentionRouter
     private let macAssistant: any MacAssistantStatusClient
     private let notification: @Sendable (String, String) async -> [String: JSONValue]
 
-    public init(dataRoot: URL, statusPlatform: any ConnectorStatusPlatform,
+    public init(dataRoot: URL, statusPlatform: AppConnectorStatusPlatform,
                 router: @escaping @Sendable () -> AttentionRouter, macAssistant: any MacAssistantStatusClient,
                 notification: @escaping @Sendable (String, String) async -> [String: JSONValue]) {
         self.dataRoot = dataRoot
@@ -216,11 +202,11 @@ public struct AppConnectorActionPlatform: ConnectorActionPlatform {
     }
 
     public func statusEvidence(actionID: String) async -> ConnectorActionStatusEvidence? {
-        await ConnectorStatusProjection.actionStatusEvidence(actionID: actionID, root: dataRoot, platform: statusPlatform)
+        await ConnectorReadiness.actionStatusEvidence(actionID: actionID, root: dataRoot, platform: statusPlatform)
     }
 
     public func runGit(_ arguments: [String], repoRoot: URL, timeout: TimeInterval) async throws -> (status: Int32, stdout: String, stderr: String) {
-        try await SystemProcessAdapter.runBounded(
+        try await ProcessExecution.runBounded(
             executable: "/usr/bin/git", arguments: arguments, currentDirectory: repoRoot, timeout: timeout
         )
     }

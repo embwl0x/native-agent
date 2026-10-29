@@ -33,6 +33,9 @@ conversation. A follow-up reuses that assignment. A different
 `workingDirectoryIgnored` and `directoryNote`. Omit that field on follow-ups.
 First allocation is single-flight per config root, agent and conversation;
 concurrent requests reread the winning assignment before probing a repository.
+Conversation and checkout reservation waits respond to Stop: a canceled waiter
+leaves the queue, and a cancellation racing ownership transfer releases that
+ownership exactly once before returning.
 
 New allocation can retire up to three checkouts idle for seven days. Reuse
 refreshes the pointer's mtime; all pointers to a checkout participate in the

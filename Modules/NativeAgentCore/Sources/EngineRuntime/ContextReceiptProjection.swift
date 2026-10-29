@@ -5,22 +5,11 @@ import NativeAgentCore
 import PersistenceCore
 import TurnTrace
 import ProviderRouting
-// Blueprint: | `ContextReceiptProjection.swift` | `ComposerContextReceiptRow`, `ComposerContextReceipt`, `ComposerContextReceiptState`, `ContextReceiptProjection`; shared context trace/receipt facts and checked Composer receipt reader using the caller engine's root for trace and provider/window reads |
+// Blueprint: | `ContextReceiptProjection.swift` | `ComposerContextReceiptRow`, `ComposerContextReceipt`, `ComposerContextReceiptState`, `ContextReceipts`; shared context trace/receipt facts and checked Composer receipt reader using the caller engine's root for trace and provider/window reads; sizes are nonnegative whole counts, checked totals and estimates stay unavailable when unrepresentable |
 
-/// The composer's context receipt: what the last turn of THIS conversation
-/// actually put on the wire, component by component.
-///
-/// 2026-09-16 removed the old "Context receipt" link because nothing had
-/// produced a receipt since the Python daemon. The producer exists now — the
-/// turn traces — so the ring's card reads `context.snapshot` for the session's
-/// last accepted turn and shows only what that row records.
-///
-/// 2026-09-24 (User): every row speaks in TOKENS and every percent is of the
-/// model's whole window. The provider's own input count for the turn's first
-/// request is split across the rows by their measured byte share — so the
-/// rows add up to the provider's number, not to a guess — and the tool rounds
-/// after it are the provider's own difference. A component whose size the
-/// trace does not record still has no size here.
+/// The composer's receipt reads the session's last accepted `context.snapshot`.
+/// Rows use traced sizes and split the provider's first-request input tokens by byte share.
+/// Tool rounds use the provider's difference; percentages use her selected-model window.
 public struct ComposerContextReceiptRow: Identifiable, Equatable, Sendable {
     public let label: String
     /// The count that makes the row legible — tools on the wire, messages
@@ -41,8 +30,8 @@ public struct ComposerContextReceipt: Equatable, Sendable {
     public let model: String?
     public let ranAt: Date
     public let rows: [ComposerContextReceiptRow]
-    /// The sum of the rows that HAVE a size.
-    public let assembledBytes: Int
+    /// The sum of the rows that HAVE a size; nil when that sum overflows.
+    public let assembledBytes: Int?
     /// The provider's input tokens for the turn's LAST request, from the same
     /// turn's `llm.call` rows — never from another turn's receipt file.
     public let lastRequestTokens: Int?
@@ -50,8 +39,7 @@ public struct ComposerContextReceipt: Equatable, Sendable {
     /// for the request those bytes built. nil when there is nothing to split
     /// by (no provider count, or an image turn, whose tokens are not bytes).
     public let bytesPerToken: Double?
-    /// The window every percent is of: HER window on the selected model
-    /// (`ContextBudgetPolicy.windowTokens`), set by the card.
+    /// Her selected-model window, derived from the same native window shown beside it.
     public var windowTokens: Int? = nil
     /// The selected model's own window, named beside hers in the caption.
     public var nativeWindowTokens: Int? = nil
@@ -78,28 +66,29 @@ public enum ComposerContextReceiptState: Equatable, Sendable {
 
 // MARK: - Reading the trace
 
-public enum ContextReceiptProjection {
+public enum ContextReceipts {
     private static let snapshotKind = "context.snapshot"
     private static let callKind = "llm.call"
-    /// The default 2,000-row tail ends before a session's latest turn on a
-    /// busy day (live 09-24: the card showed a turn five hours old beside the
-    /// footer of the newest one).
     public static let rowLimit = 20_000
+    public static let nearRowLimit = 2_000
 
-    /// The receipt with its window. User, 2026-09-24: every percent is of HER
-    /// window on the SELECTED model — the one the ring also reads — with the
-    /// model's own window named beside it. No pick of its own means the turn
-    /// ran on the resolved model; that one is used.
+    /// Percentages use her selected-model window (resolved model if unselected), with the native window named.
     public static func load(sessionId: String, selectedModel: String, dataRoot: URL) async throws -> ComposerContextReceiptState {
-        let loaded = try await load(sessionId: sessionId, reader: TurnTraceRecentReader(dataRootOverride: dataRoot, rowLimit: rowLimit))
+        // The newest rows first: her latest turn is almost always in them, and
+        // parsing the whole day's trace on every open made the popover slow.
+        let near = try await load(sessionId: sessionId, reader: TurnTraceRecentReader(dataRootOverride: dataRoot, rowLimit: nearRowLimit))
+        let loaded: ComposerContextReceiptState
+        if case .outsideSearch = near {
+            loaded = try await load(sessionId: sessionId, reader: TurnTraceRecentReader(dataRootOverride: dataRoot, rowLimit: rowLimit))
+        } else { loaded = near }
         guard case .receipt(var receipt) = loaded else { return loaded }
         let selected = selectedModel.trimmingCharacters(in: .whitespacesAndNewlines)
         let windowModel = selected.isEmpty ? (receipt.model ?? "") : selected
         // The selected model on the Chat route, as the ring reads it; a window
         // no catalog row states stays nil, and the card says so.
         let route = await SwiftNativeProviderRouting(dataRoot: dataRoot).chatRouteProvider()
-        receipt.windowTokens = ContextBudgetPolicy.windowTokens(forModel: windowModel, providerID: route, dataRoot: dataRoot)
         receipt.nativeWindowTokens = ProviderRouting.verifiedContextLength(forModel: windowModel, providerID: route, dataRoot: dataRoot)
+        receipt.windowTokens = ChatSessionAutocompactionConfig.productionDefault().effectiveWindowTokens(nativeWindowTokens: receipt.nativeWindowTokens)
         receipt.windowModelName = windowModel.isEmpty
             ? nil
             : FirstPartyModelCatalog.descriptor(for: windowModel)?.name ?? windowModel
@@ -115,17 +104,21 @@ public enum ContextReceiptProjection {
         now: Date = Date()
     ) async throws -> ComposerContextReceiptState {
         guard !sessionId.isEmpty else { return .noTurn }
-        let earlier = try await reader.read(now: now.addingTimeInterval(-86_400))
-        let today = try await reader.read(now: now)
-        let events = earlier.events + today.events
-        let projected = project(events: events, sessionId: sessionId)
-        if projected == .noTurn, !events.contains(where: {
-            $0.kind == TurnLifecycleMilestone.turnAccepted.rawValue && $0.sessionId == sessionId
-        }) {
-            return .outsideSearch
+        // A tail read is bounded by design, and a bound is coverage, not a fault: the newest
+        // rows are always in the tail, so the session's latest acceptance in today's window is
+        // its latest turn, and that turn's rows run unbroken to the end of the window. Only a
+        // turn that is not in a window cut short is unknown, and then it is older than the search.
+        let accepted = TurnLifecycleMilestone.turnAccepted.rawValue
+        func holdsTurn(_ read: TurnTraceRecentReader.Snapshot) -> Bool {
+            read.events.contains { $0.kind == accepted && $0.sessionId == sessionId }
         }
-        return projected
-
+        let today = try await reader.read(now: now)
+        if holdsTurn(today) { return project(events: today.events, sessionId: sessionId) }
+        if today.truncated { return .outsideSearch }
+        // Yesterday too: the ledger is day-keyed, and a turn accepted at 23:59 runs on past midnight.
+        let earlier = try await reader.read(now: now.addingTimeInterval(-86_400))
+        guard holdsTurn(earlier) else { return .outsideSearch }
+        return project(events: earlier.events + today.events, sessionId: sessionId)
     }
 
     /// Pure projection, so the rows can be reasoned about without touching a
@@ -195,31 +188,40 @@ public enum ContextReceiptProjection {
         let toolsAsText = catalogInSystem != nil
             || calls.first.flatMap { int($0, "tools.wireSchemaBytes") } == 0
         let toolBytes = toolsAsText
-            ? catalogInSystem.map { $0 + (catalogInBrief ?? 0) }
+            ? catalogInSystem.flatMap { sum($0, catalogInBrief ?? 0) }
             : int(payload, "toolSchemaMaterialBytes")
-        let systemBytes = int(payload, "systemTotalBytes").map { max(0, $0 - (catalogInSystem ?? 0)) }
-        let briefBytes = int(payload, "volatileBlockBytes").map { max(0, $0 - (catalogInBrief ?? 0)) }
+        let systemBytes = int(payload, "systemTotalBytes").flatMap { difference($0, catalogInSystem ?? 0) }
+        let briefBytes = int(payload, "volatileBlockBytes").flatMap { difference($0, catalogInBrief ?? 0) }
+        // What this turn fed her rides in the system prompt's changing part
+        // (pinned facts, recalled memories, inner state, clock), plus any brief.
+        // When the per-turn part rides as the brief, the snapshot's dynamic IS
+        // the brief and the system prompt holds none of it.
+        let dynamicBytes = int(payload, "dynamicBytes")
+        let ridesBrief = (int(payload, "volatileBlockBytes") ?? 0) > 0 && int(payload, "volatileBlockBytes") == dynamicBytes
+        let personaBytes = ridesBrief ? systemBytes
+            : dynamicBytes.flatMap { dynamic in systemBytes.flatMap { difference($0, dynamic) } } ?? systemBytes
+        let fedBytes = ridesBrief ? briefBytes : dynamicBytes.map { $0 + max(briefBytes ?? 0, 0) } ?? briefBytes
         let historyBytes = int(payload, "historyMessageBytes")
         let userBytes = int(payload, "userMessageBytes")
         let imageBytes = int(payload, "imagePayloadBytes").flatMap { $0 > 0 ? $0 : nil }
         let assembled = [systemBytes, briefBytes, toolBytes, historyBytes, userBytes, imageBytes]
-            .reduce(0) { $0 + ($1 ?? 0) }
+            .reduce(Optional(0)) { total, bytes in total.flatMap { sum($0, bytes ?? 0) } }
 
         let firstTokens = calls.first.flatMap(inputTokens)
         let lastTokens = calls.last.flatMap(inputTokens)
         let tokensPerByte: Double? = {
-            guard let firstTokens, assembled > 0, imageBytes == nil else { return nil }
+            guard let firstTokens, let assembled, assembled > 0, imageBytes == nil else { return nil }
             return Double(firstTokens) / Double(assembled)
         }()
         func tokens(_ bytes: Int?) -> Int? {
             guard let bytes, let tokensPerByte else { return nil }
-            return Int((Double(bytes) * tokensPerByte).rounded())
+            return Int(exactly: (Double(bytes) * tokensPerByte).rounded())
         }
         // What the last exchange added to the history she carries — tool
         // rounds never persist into it, so this is the per-turn growth.
         let historyGrowth: Int? = {
             guard let historyBytes, let previousHistoryBytes,
-                  historyBytes > previousHistoryBytes else { return nil }
+                  previousHistoryBytes >= 0, historyBytes > previousHistoryBytes else { return nil }
             return tokens(historyBytes - previousHistoryBytes)
         }()
 
@@ -227,14 +229,14 @@ public enum ContextReceiptProjection {
             ComposerContextReceiptRow(
                 label: "System and persona",
                 detail: personaDetail(payload, tokens: tokens),
-                bytes: systemBytes,
-                tokens: tokens(systemBytes)
+                bytes: personaBytes,
+                tokens: tokens(personaBytes)
             ),
             ComposerContextReceiptRow(
-                label: "Turn brief",
-                detail: briefBytes == nil ? nil : "recall, capsule and clock, as one block",
-                bytes: briefBytes,
-                tokens: tokens(briefBytes)
+                label: "Fed this turn",
+                detail: fedBytes == nil ? nil : "pinned facts, recalled memories, inner state and the clock",
+                bytes: fedBytes,
+                tokens: tokens(fedBytes)
             ),
             ComposerContextReceiptRow(
                 label: "Memory recall",
@@ -259,9 +261,6 @@ public enum ContextReceiptProjection {
                 bytes: userBytes,
                 tokens: tokens(userBytes)
             ),
-            // Sol, 2026-09-17: the trace measures the image blocks and the
-            // receipt spent them silently — on a multimodal turn the bytes
-            // that dominate the context were missing from the total.
             ComposerContextReceiptRow(
                 label: "Images",
                 detail: imageDetail(payload),
@@ -295,11 +294,13 @@ public enum ContextReceiptProjection {
     /// The provider's logical input for one request — Anthropic's three
     /// disjoint counters summed, OpenAI's total as is (`LLMUsage` owns that).
     private static func inputTokens(_ call: [String: JSONValue]) -> Int? {
-        LLMUsage(
+        let provider = string(call, "provider") ?? ""
+        return LLMUsage(
             inputTokens: int(call, "inputTokens"),
             cacheReadInputTokens: int(call, "cacheReadInputTokens"),
-            cacheCreationInputTokens: int(call, "cacheCreationInputTokens")
-        ).logicalInputTokens(provider: string(call, "provider") ?? "")
+            cacheCreationInputTokens: int(call, "cacheCreationInputTokens"),
+            additiveInputCounters: LLMUsage.persistedAdditiveInputCounters(call["additiveInputCounters"], provider: provider)
+        ).logicalInputTokens(provider: provider)
     }
 
     // MARK: Details
@@ -314,7 +315,7 @@ public enum ContextReceiptProjection {
         guard let bytes = int(payload, "personaSourceBytes"), bytes > 0 else { return nil }
         let size = tokens(bytes).map {
             "\(formatTokens($0, approximate: true)) tokens"
-        } ?? "\(formatTokens(estimatedTokens(bytes), approximate: true)) tokens"
+        } ?? "\(ComposerContextReceiptPresentation.exact(bytes)) bytes"
         return "including \(size) of persona"
     }
 
@@ -397,19 +398,24 @@ public enum ContextReceiptProjection {
     // MARK: Payload access
 
     private static func int(_ payload: [String: JSONValue], _ key: String) -> Int? {
-        switch payload[key] {
-        case .int(let value): Int(value)
-        case .double(let value) where value.isFinite && abs(value) < 1e15: Int(value)
-        default: nil
-        }
+        guard let value = payload[key]?.exactIntegerValue, value >= 0 else { return nil }
+        return value
+    }
+
+    private static func sum(_ lhs: Int, _ rhs: Int) -> Int? {
+        let result = lhs.addingReportingOverflow(rhs)
+        return result.overflow ? nil : result.partialValue
+    }
+
+    private static func difference(_ lhs: Int, _ rhs: Int) -> Int? {
+        guard lhs >= rhs else { return nil }
+        return lhs - rhs
     }
 
     private static func string(_ payload: [String: JSONValue], _ key: String) -> String? {
         guard case .string(let value)? = payload[key], !value.isEmpty else { return nil }
         return value
     }
-
-    public static func estimatedTokens(_ bytes: Int) -> Int { Int((Double(bytes) / 2.8).rounded()) }
 
     public static func formatTokens(_ count: Int, approximate: Bool) -> String {
         let text: String
@@ -424,10 +430,10 @@ public enum ContextReceiptProjection {
     }
 }
 
-extension ContextReceiptProjection {
+extension ContextReceipts {
     public static func read(sessionId: String, selectedModel: String, dataRoot: URL) async -> ComposerContextReceiptState {
         do {
-            return try await ContextReceiptProjection.load(sessionId: sessionId, selectedModel: selectedModel, dataRoot: dataRoot)
+            return try await ContextReceipts.load(sessionId: sessionId, selectedModel: selectedModel, dataRoot: dataRoot)
         } catch {
             return .unavailable(UserFacingError.cause(error, action: "read the turn trace"))
         }
@@ -444,18 +450,19 @@ public enum ComposerContextReceiptPresentation {
     /// Percent of the whole window: one decimal below 10%, because on a 1M
     /// window every row lives there.
     public static func share(_ fraction: Double?) -> String? {
-        guard let fraction else { return nil }
+        guard let fraction, fraction.isFinite, fraction >= 0 else { return nil }
         let percent = fraction * 100
         if percent <= 0 { return "0%" }
         if percent < 0.1 { return "<0.1%" }
         if percent < 10 { return String(format: "%.1f%%", percent) }
-        return "\(Int(percent.rounded()))%"
+        guard let whole = Int(exactly: percent.rounded()) else { return nil }
+        return "\(whole)%"
     }
 
     /// The row's value column: tokens when the turn has a provider count to
     /// split, bytes as assembled otherwise (image turns, older traces).
     public static func value(_ row: ComposerContextReceiptRow) -> String? {
-        if let count = row.tokens { return ContextReceiptProjection.formatTokens(count, approximate: !row.measured) }
+        if let count = row.tokens { return ContextReceipts.formatTokens(count, approximate: !row.measured) }
         return row.bytes.map { "\(exact($0)) bytes" }
     }
 
@@ -470,7 +477,7 @@ public enum ComposerContextReceiptPresentation {
     /// has no provider count for this turn.
     public static func total(_ receipt: ComposerContextReceipt) -> (label: String, value: String, share: String?) {
         guard let last = receipt.lastRequestTokens else {
-            return ("Assembled", "\(exact(receipt.assembledBytes)) bytes", nil)
+            return ("Assembled", receipt.assembledBytes.map { "\(exact($0)) bytes" } ?? "Size unavailable", nil)
         }
         return ("Last request", exact(last), share(receipt.share(tokens: last)))
     }
@@ -502,7 +509,7 @@ public enum ComposerContextReceiptPresentation {
         switch state {
         case .loading: return [("loading", "Reading the last turn…")]
         case .noTurn: return [("no-turn", "No turn yet")]
-        case .outsideSearch: return [("outside-search", "No receipt found in today's or yesterday's trace. Older turns are outside this search.")]
+        case .outsideSearch: return [("outside-search", "No receipt found in the newest trace rows. Older turns are outside this search.")]
         case .unavailable(let reason): return [("unavailable", "The turn trace could not be read: \(reason)")]
         case .receipt(let receipt):
             var lines = receipt.rows.map { ($0.id, rowAccessibility($0, share: receipt.share($0))) }

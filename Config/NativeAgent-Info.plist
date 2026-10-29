@@ -6,7 +6,6 @@
 	<array>
 		<string>$(NATIVEAGENT_BACKGROUND_TASK_PREFIX).dream_cycle</string>
 		<string>$(NATIVEAGENT_BACKGROUND_TASK_PREFIX).rem_cycle</string>
-		<string>$(NATIVEAGENT_BACKGROUND_TASK_PREFIX).memory_consolidation</string>
 		<string>$(NATIVEAGENT_BACKGROUND_TASK_PREFIX).self_improvement_sweep</string>
 	</array>
 	<key>CFBundleDevelopmentRegion</key>

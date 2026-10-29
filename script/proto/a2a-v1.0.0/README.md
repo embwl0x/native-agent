@@ -10,7 +10,9 @@ the included LICENSE and source copyright notices apply.
 
 Run `script/regenerate_a2a_grpc.sh` with protoc 33.4, SwiftProtobuf's
 `protoc-gen-swift` 1.38.1 and grpc-swift-protobuf's `protoc-gen-grpc-swift-2`
-2.4.1. Generated public messages and service/client interfaces live in
+2.4.1. Generated public messages and server interfaces live in
 `Modules/NativeAgentCore/Sources/AgentLinkTransport/Generated/` so the app
-server and outbound client share one schema.
+server and outbound adapter share one schema. The generator disables client
+APIs; `script/trim_a2a_grpc.rb` removes the unused simple-service API while
+preserving the server's streaming adapters.
 Annotations are compiler inputs only and do not add generated runtime targets.

@@ -106,43 +106,14 @@ public struct StudioWorkingShelf: Sendable {
     /// serving the sentence unchanged would present words she has already
     /// struck through as what she currently says.
     ///
-    /// RANGES, not string containment: a correction over "beta. Gamma" overlaps
-    /// the shelved sentence "Alpha beta." without either string containing the
-    /// other, and containment could not say WHERE inside the sentence the
-    /// correction lands. Both are resolved in the ORIGINAL response, the same
-    /// way `responseAsCorrected` and the amend write path resolve them.
-    ///
     /// Only `response` is amendable, so a `stance.reason` quote never matches.
     private func supersession(_ slot: Slot, entry: StudioJournalEntry) -> Supersession? {
         guard slot.quoteField == "response",
               let response = entry.response,
               let sentence = response.range(of: slot.sentence) else { return nil }
-        var applied: [(range: Range<String.Index>, amendment: StudioAmendment)] = []
-        for amendment in entry.amendments {
-            guard let passage = amendment.supersedes,
-                  let range = response.range(of: passage),
-                  range.overlaps(sentence),
-                  // An amendment overlapping one already applied would nest one
-                  // strike-through inside another, exactly as the projection in
-                  // `responseAsCorrected` guards against.
-                  !applied.contains(where: { $0.range.overlaps(range) }) else { continue }
-            applied.append((range, amendment))
-        }
-        guard !applied.isEmpty else { return nil }
-        applied.sort { $0.range.lowerBound < $1.range.lowerBound }
-        // Rebuild the SENTENCE the way `responseAsCorrected` rebuilds the whole
-        // response, clipped to the sentence: a correction reaching past either
-        // end marks only the words inside the sentence it is shown beside.
-        var rebuilt = ""
-        var cursor = sentence.lowerBound
-        for (range, amendment) in applied {
-            let clipped = max(range.lowerBound, sentence.lowerBound)..<min(range.upperBound, sentence.upperBound)
-            if cursor < clipped.lowerBound { rebuilt += response[cursor..<clipped.lowerBound] }
-            rebuilt += "~~\(response[clipped])~~ \(amendment.correction) [corrected \(amendment.amendedOn) — \(amendment.reason)]"
-            cursor = max(cursor, clipped.upperBound)
-        }
-        if cursor < sentence.upperBound { rebuilt += response[cursor..<sentence.upperBound] }
-        return Supersession(amendments: applied.map(\.amendment), correctedSentence: rebuilt)
+        let corrected = entry.correctedResponse(in: sentence)
+        guard !corrected.amendments.isEmpty else { return nil }
+        return Supersession(amendments: corrected.amendments, correctedSentence: corrected.text)
     }
 
     private enum QuoteSource {
@@ -207,12 +178,11 @@ public struct StudioWorkingShelf: Sendable {
 
     public func replace(_ value: JSONValue) async throws {
         let slots = try Self.decodeSlots(value)
-        let persistence = SwiftNativePersistenceCore()
         try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
-        try await persistence.withFileLock(path) {
+        try await SwiftNativePersistenceCore.withFileLock(path) {
             try await validateReplacement(slots)
-            try await persistence.writeJSON(.object(["version": .int(1), "slots": .array(slots.map(\.json))]), to: path)
+            try await SwiftNativePersistenceCore.writeJSON(.object(["version": .int(1), "slots": .array(slots.map(\.json))]), to: path)
         }
     }
 

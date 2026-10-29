@@ -1,6 +1,5 @@
-// Move-only extraction (tightness Wave C) from NativeCognitionRuntime.swift
-
 import Foundation
+import NativeAgentShared
 import ChatTurnRuntime
 import BackgroundLoops
 import AgentWorkspace
@@ -13,7 +12,7 @@ import Desk
 import Experiences
 import ProviderRouting
 
-// Blueprint: | `NativeCognitionRuntime+Pursuit.swift` | `NativeCognitionRuntime` pursuit projection: canonical Desk invalidations and bounded resident intent, without turn-time Desk I/O |
+// Blueprint: | `NativeCognitionRuntime+Pursuit.swift` | Complete Desk/queue advisory snapshots publish through LatestRead on the runtime actor; source invalidations publish unavailable; resident intent has no turn-time Desk I/O |
 
 extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
     public func queueTurnCandidates() -> (candidates: [DeskItem]?, refreshPendingAfterWrite: Bool) {
@@ -22,8 +21,6 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
                 !isFlushedForTermination && pursuitCompletedRefreshRevision != revision)
     }
 
-    // G-M3: single-consumer bound relocated from the core runtime into the
-    // extension that owns its only reader (prefix() below).
     private static let maximumPursuitCandidates = 8
 
     /// Her top resident self-pursuit projection. This method is deliberately
@@ -43,7 +40,7 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
     /// Register before the first replay so no committed Desk edge can land in
     /// the read/subscription gap. Matching by exact path preserves injected
     /// data-root hermeticity; `.desk` would cross-invalidate every runtime.
-    func startPursuitObservationIfNeeded() {  // internal for actor extensions (move-only Wave C)
+    func startPursuitObservationIfNeeded() {
         guard !isFlushedForTermination, pursuitObservationTask == nil else { return }
         startCognitiveSourceObservations()
         let sourceObservations = sourceWakes
@@ -92,10 +89,11 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
 
     private func pursuitSourceInvalidated() {
         guard !isFlushedForTermination else { return }
-        pursuitProjectionGeneration &+= 1
-        pursuitReadRevision = nil
-        // A possibly closed pursuit must stop steering attention immediately.
-        attentionProjection.replacePursuit(activeTask: nil, goal: nil)
+        pursuitRead.write {
+            pursuitReadRevision = nil
+            // A possibly closed pursuit must stop steering attention immediately.
+            attentionProjection.replacePursuit(activeTask: nil, goal: nil)
+        }
         if pursuitRefreshInFlight {
             pursuitRefreshQueued = true
             return
@@ -105,7 +103,7 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
         }
     }
 
-    func startPursuitRefresh() async {  // internal for actor extensions (move-only Wave C)
+    func startPursuitRefresh() async {
         guard !isFlushedForTermination else { return }
         if pursuitRefreshInFlight {
             pursuitRefreshQueued = true
@@ -113,87 +111,78 @@ extension NativeCognitionRuntime: MyQueueTurnProjectionProviding {
         }
         pursuitRefreshInFlight = true
         sourceWakes.pursuitNextAt = nil
-        let generation = pursuitProjectionGeneration
-        let root = dataRoot
-        let task = Task.detached(priority: .utility) { [weak self] in
-            // A commit during replay invalidates the read, never relabels it.
-            let revision = SwiftNativeDeskStore.currentRevision
-            let state: DeskState?
-            do {
-                state = try await SwiftNativeDeskStore(dataRoot: root).liveState()
-            } catch {
-                state = nil
-            }
-            await self?.finishPursuitRefresh(state: state, revision: revision, generation: generation)
+        pursuitRefreshTask = Task { [weak self] in
+            await self?.finishPursuitRefresh()
         }
-        pursuitRefreshTask = task
     }
 
-    private func finishPursuitRefresh(state: DeskState?, revision: UInt64, generation: UInt64) async {
-        if generation == pursuitProjectionGeneration { pursuitReadRevision = nil }
-        guard !isFlushedForTermination else {
-            pursuitRefreshInFlight = false
-            pursuitRefreshTask = nil
-            pursuitRefreshQueued = false
-            return
-        }
-        if generation == pursuitProjectionGeneration, revision == SwiftNativeDeskStore.currentRevision, let state {
+    private func finishPursuitRefresh() async {
+        let root = dataRoot, clock = now
+        let snapshot = await pursuitRead.read({
+            let task = Task.detached(priority: .utility) {
+                // A commit during replay invalidates the read, never relabels it.
+                let revision = SwiftNativeDeskStore.currentRevision
+                let state = try? await SwiftNativeDeskStore(dataRoot: root).liveState()
+                let context = state.map { _ in HerScreen.queueContext(dataRoot: root, now: clock(), ownTurn: true) }
+                return (state: state, revision: revision, context: context)
+            }
+            return await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+        }, publish: { snapshot in
+            pursuitReadRevision = nil
+            guard !isFlushedForTermination, snapshot.revision == SwiftNativeDeskStore.currentRevision,
+                  let state = snapshot.state else { return }
             sourceWakes.pursuitNextAt = state.items.filter { !$0.status.isTerminal }
                 .compactMap { $0.deferUntil.flatMap(DeskSequencing.parseDeferStamp) }.filter { $0 > now() }.min()
             let before = Dictionary(pursuitCandidates.filter { !$0.status.isTerminal }.map { ($0.handle, $0) },
                 uniquingKeysWith: { first, _ in first })
-            let root = dataRoot, at = now()
-            let context = await Task.detached(priority: .utility) {
-                HerScreen.queueContext(dataRoot: root, now: at, ownTurn: true)
-            }.value
-            if generation == pursuitProjectionGeneration, revision == SwiftNativeDeskStore.currentRevision, !isFlushedForTermination {
-                if pursuitCandidates != state.items { sourceWakes.reachDirty = true }
-                pursuitCandidates = state.items
-                pursuitCarriedContext = context
-                pursuitReadRevision = revision
-                // A condition may have settled before its wait reached the Desk.
-                Task { await self.carriedConditionsChanged() }
-                var signals: [(String, SomaticSignalKind)] = []
-                for item in state.items {
-                    let wasCarried = before[item.handle].map(Self.carries) == true
-                    guard Self.carries(item) || wasCarried else { continue }
-                    if item.status.isTerminal || !Self.carries(item) {
-                        ResidentWake.shared.withdraw(dataRoot: dataRoot, key: "carry." + item.handle)
-                        if wasCarried && item.status.isTerminal {
-                            signals.append((item.handle, item.status == .canceled ? .deskItemCancelled : .deskItemClosed))
-                        }
-                    } else if !wasCarried {
-                        signals.append((item.handle, .deskItemCreated))
-                    } else if item.status == .blocked, before[item.handle]?.status != .blocked {
-                        signals.append((item.handle, .deskItemBlocked))
+            if pursuitCandidates != state.items { sourceWakes.reachDirty = true }
+            pursuitCandidates = state.items
+            pursuitCarriedContext = snapshot.context
+            pursuitReadRevision = snapshot.revision
+            // A condition may have settled before its wait reached the Desk.
+            Task { await self.carriedConditionsChanged() }
+            var signals: [(String, SomaticSignalKind)] = []
+            for item in state.items {
+                let wasCarried = before[item.handle].map(Self.carries) == true
+                guard Self.carries(item) || wasCarried else { continue }
+                if item.status.isTerminal || !Self.carries(item) {
+                    ResidentWake.shared.withdraw(dataRoot: dataRoot, key: "carry." + item.handle)
+                    if wasCarried && item.status.isTerminal {
+                        signals.append((item.handle, item.status == .canceled ? .deskItemCancelled : .deskItemClosed))
                     }
-                    // Old arrival identities retire without renaming stored records.
-                    ResidentWake.shared.withdraw(dataRoot: dataRoot, key: "harness." + item.handle)
-                    ResidentWake.shared.withdraw(dataRoot: dataRoot, key: "queue:" + item.handle)
+                } else if !wasCarried {
+                    signals.append((item.handle, .deskItemCreated))
+                } else if item.status == .blocked, before[item.handle]?.status != .blocked {
+                    signals.append((item.handle, .deskItemBlocked))
                 }
-                // Bootstrap's awaited replay must finish before signal ingestion
-                // can await that same bootstrap. Later writes use this same tail.
-                Task { [weak self] in
-                    for (handle, kind) in signals {
-                        await self?.ingestOrganismSignal(kind: kind, sourceOrgan: "carry." + handle,
-                            metadata: ["predictionCorrelationId": .string(handle)],
-                            persistSynchronously: false)
-                    }
-                    await self?.rescheduleResidualRepairDeadline()
-                }
+                // Old arrival identities retire without renaming stored records.
+                ResidentWake.shared.withdraw(dataRoot: dataRoot, key: "harness." + item.handle)
+                ResidentWake.shared.withdraw(dataRoot: dataRoot, key: "queue:" + item.handle)
             }
-        }
+            // Bootstrap's awaited replay must finish before signal ingestion
+            // can await that same bootstrap. Later writes use this same tail.
+            Task { [weak self] in
+                for (handle, kind) in signals {
+                    await self?.ingestOrganismSignal(kind: kind, sourceOrgan: "carry." + handle,
+                        metadata: ["predictionCorrelationId": .string(handle)],
+                        persistSynchronously: false)
+                }
+                await self?.rescheduleResidualRepairDeadline()
+            }
+        })
+
         pursuitRefreshInFlight = false
         pursuitRefreshTask = nil
+        guard !isFlushedForTermination else { pursuitRefreshQueued = false; return }
         let intent = currentPursuitIntent(now: now())
         attentionProjection.replacePursuit(
             activeTask: intent?.activeTask,
             goal: intent?.goal
         )
-        let needsFollowUp = pursuitRefreshQueued || generation != pursuitProjectionGeneration
+        let needsFollowUp = pursuitRefreshQueued
         pursuitRefreshQueued = false
         // A failed settled refresh stays unavailable, but no longer claims to be pending.
-        if !needsFollowUp { pursuitCompletedRefreshRevision = revision }
+        if !needsFollowUp { pursuitCompletedRefreshRevision = snapshot.revision }
         if needsFollowUp {
             await startPursuitRefresh()
         }
@@ -236,7 +225,7 @@ extension NativeCognitionRuntime {
             if let deferred = item.deferUntil.flatMap(DeskSequencing.parseDeferStamp) { crossing = max(crossing, deferred) }
             crossing = max(crossing, quietAt)
             context.now = max(at, crossing)
-            let ready = readyByTime[context.now] ?? Set(MyQueueReady.ready(items: candidates, context: context).map(\.handle))
+            let ready = readyByTime[context.now] ?? Set(MyQueueReady.ready(items: candidates, context: context, dataRoot: dataRoot).map(\.handle))
             readyByTime[context.now] = ready
             guard ready.contains(item.handle) else { continue }
             if crossing > at { next = min(next ?? crossing, crossing); continue }
@@ -263,10 +252,7 @@ extension NativeCognitionRuntime {
     static func deskDate(_ raw: String) -> Date? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = fractional.date(from: trimmed) { return date }
-        if let date = ISO8601DateFormatter().date(from: trimmed) { return date }
+        if let date = NativeTimestampFormat.parseISO8601FractionalFirst(trimmed) { return date }
         let day = DateFormatter()
         day.calendar = Calendar(identifier: .gregorian)
         day.locale = Locale(identifier: "en_US_POSIX")

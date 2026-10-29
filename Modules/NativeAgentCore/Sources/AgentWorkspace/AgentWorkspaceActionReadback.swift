@@ -1,11 +1,13 @@
 import Foundation
 import PersistenceCore
-// Blueprint: | `AgentWorkspaceActionReadback.swift` | `AgentWorkspaceActionReadback` enum; `dispatchEffect`, `followUp` |
+import ChatToolParsing
+// Blueprint: | `AgentWorkspaceActionReadback.swift` | `AgentWorkspaceActionReadback` enum; `dispatchEffect`, `followUp`. Computer readback retains the resolved recipient; unidentified recipients return unavailable rather than reading an unrelated foreground app. |
 
 /// Completes an already-dispatched action with its owner's current view. This
 /// never repeats an effect, changes tabs, or replaces a receipt with a claim of
 /// success. Browser reads retain the exact tab; Computer reads obtain fresh
-/// bounded controls, and Calendar/Reminders use their canonical bounded lists.
+/// bounded controls from the resolved recipient (never an unrelated foreground
+/// app), and Calendar/Reminders use their canonical bounded lists.
 enum AgentWorkspaceActionReadback {
     struct Readback {
         let location: AgentWorkspaceLocation
@@ -40,46 +42,75 @@ enum AgentWorkspaceActionReadback {
                          title: String, perform: AgentWorkspace.Perform) async throws -> Readback? {
         let owner = object(receipt)
         let status = string(owner["status"])
+        var source: AgentWorkspaceLocation?
+        var scope: String?
+        var failure = "The action returned, but its current result could not be read: "
+        var caution = ". Reopen this source to read; do not repeat the action."
         if computerEffects.contains(tool) {
             // Even a stale/refused selection returns a current, bounded set of
             // choices. Never replay an action or turn its display name into a
             // fallback target. A read is observation, not proof of settlement.
             var arguments: [String: JSONValue] = ["structured": .bool(true)]
-            if tool == "menu_press", let app = string(input["app"]) { arguments["app"] = .string(app) }
-            let source = AgentWorkspaceLocation.record(tool: "screen", input: arguments, title: "Computer")
+            let detail = object(owner["detail"] ?? .null)
+            let output = object(owner["output"] ?? .null)
+            func recipient(_ fields: [String: JSONValue]) -> String? {
+                let app = object(fields["app"] ?? .null)
+                return string(fields["bundle_identifier"]) ?? string(app["bundle_id"])
+                    ?? string(fields["app"]) ?? string(app["name"]) ?? string(fields["matched_name"])
+            }
+            let app = recipient(detail) ?? recipient(output) ?? recipient(owner) ?? string(input["app"])
+            if let app { arguments["app"] = .string(app) }
+            let computer = AgentWorkspaceLocation.record(tool: "screen", input: arguments, title: "Computer")
+            guard app != nil else {
+                return .init(location: computer, result: unavailable(receipt: receipt,
+                    detail: "The action did not identify its receiving app. Read the intended app explicitly; foreground state would not establish this action's destination. The action was not repeated."))
+            }
+            source = computer
+            failure = "The current screen could not be read: "
+            caution = ". The action was not repeated."
+        } else if calendarReminderEffects.contains(tool), status == "completed",
+           owner["source"] == .string("eventkit"), ChatToolOutcome.exactResultClass(receipt) == .succeeded {
+            caution = ". Do not repeat the change."
+            if tool.hasPrefix("mac_reminders_"), tool != "mac_reminders_delete", let id = string(owner["reminderId"]) {
+                source = .record(tool: "mac_reminders_read", input: ["id": .string(id)], title: "Reminder")
+                failure = "The change completed, but the exact reminder could not be read: "
+            } else {
+                let placeID = tool.hasPrefix("mac_calendar_") ? "calendar" : "reminders"
+                if let place = AgentWorkspaceActivity.destinations.first(where: { $0.id == placeID }), let reader = place.tool {
+                    source = .record(tool: reader, input: place.input, title: place.title)
+                    failure = "The change completed, but its current list could not be read: "
+                    scope = placeID == "calendar"
+                        ? "Upcoming events, within this reader's normal limit. The action receipt identifies the changed event; absence from this window does not mean the write failed."
+                        : "Incomplete reminders across all dates, within this reader's normal limit. Completed or deleted reminders may not appear here."
+                }
+            }
+        } else if ChatToolOutcome.exactResultClass(receipt) == .succeeded,
+           ["write_file", "commit_memory", "desk_note", "desk_update_item", "desk_set_status", "desk_add_ref", "desk_add_item", "bot_create", "bot_update", "bot_pause"].contains(tool) {
+            source = AgentWorkspaceEnvironment.readback(tool: tool, input: input)
+            if tool == "bot_create", let id = string(owner["id"]), UUID(uuidString: id) != nil {
+                source = .record(tool: "bot_list", input: ["id": .string(id)], title: string(owner["name"]) ?? "Created helper")
+            }
+            if tool == "commit_memory", let id = string(owner["id"]) {
+                source = .record(tool: "recall_memory", input: ["memory_id": .string(id), "max_characters": .int(2000)], title: "Recorded memory")
+            }
+            if tool == "desk_add_item", let handle = string(owner["handle"]) {
+                source = .record(tool: "desk_read", input: ["handle": .string(handle), "structured": .bool(true)], title: "Created work")
+            }
+        }
+        if let source, case .record(let reader, let arguments, _) = source {
             do {
-                let fresh = try await perform("screen", arguments)
-                return .init(location: source, result: attaching(fresh, receipt: receipt))
+                let current = try await perform(reader, arguments)
+                let location = reader == "desk_read"
+                    ? AgentWorkspaceLocation.record(tool: reader, input: arguments,
+                        title: AgentWorkspaceWork.desk(input: arguments, result: current).title)
+                    : source
+                var row = object(attaching(current, receipt: receipt))
+                if let scope { row["workspace_readback_scope"] = .string(scope) }
+                return .init(location: location, result: .object(row))
             } catch is CancellationError { throw CancellationError() }
             catch {
                 return .init(location: source, result: unavailable(receipt: receipt,
-                    detail: "The current screen could not be read: " + error.localizedDescription + ". The action was not repeated."))
-            }
-        }
-        if calendarReminderEffects.contains(tool), status == "completed",
-           owner["source"] == .string("eventkit"), !hasError(owner) {
-            if tool.hasPrefix("mac_reminders_"), tool != "mac_reminders_delete", let id = string(owner["reminderId"]) {
-                let arguments: [String: JSONValue] = ["id": .string(id)]
-                let source = AgentWorkspaceLocation.record(tool: "mac_reminders_read", input: arguments, title: "Reminder")
-                do {
-                    let current = try await perform("mac_reminders_read", arguments)
-                    return .init(location: source, result: attaching(current, receipt: receipt))
-                } catch is CancellationError { throw CancellationError() }
-                catch { return .init(location: source, result: unavailable(receipt: receipt,
-                    detail: "The change completed, but the exact reminder could not be read: " + error.localizedDescription + ". Do not repeat the change.")) }
-            }
-            let placeID = tool.hasPrefix("mac_calendar_") ? "calendar" : "reminders"
-            if let place = AgentWorkspaceActivity.destinations.first(where: { $0.id == placeID }), let reader = place.tool {
-                let source = AgentWorkspaceLocation.record(tool: reader, input: place.input, title: place.title)
-                do {
-                    let current = try await perform(reader, place.input)
-                    var row = object(attaching(current, receipt: receipt))
-                    row["workspace_readback_scope"] = .string(placeID == "calendar"
-                        ? "Upcoming events, within this reader's normal limit. The action receipt identifies the changed event; absence from this window does not mean the write failed."
-                        : "Incomplete reminders across all dates, within this reader's normal limit. Completed or deleted reminders may not appear here.")
-                    return .init(location: source, result: .object(row))
-                } catch is CancellationError { throw CancellationError() }
-                catch { return .init(location: source, result: unavailable(receipt: receipt, detail: "The change completed, but its current list could not be read: " + error.localizedDescription + ". Do not repeat the change.")) }
+                    detail: failure + error.localizedDescription + caution))
             }
         }
         if browserEffects.contains(tool), status == "outcome_unknown", owner["error"] != nil,
@@ -94,34 +125,6 @@ enum AgentWorkspaceActionReadback {
                 return .init(location: source, result: unavailable(receipt: receipt, detail: "The selected page is unavailable. Reopen it to read; no browser action was repeated.", observation: fresh))
             } catch is CancellationError { throw CancellationError() }
             catch { return .init(location: source, result: unavailable(receipt: receipt, detail: "Reading the selected page failed: " + error.localizedDescription + ". No browser action was repeated.")) }
-        }
-        if (owner["ok"] == .bool(true) || status == "ok" || status == "completed"),
-           owner["error"] == nil, owner["error_code"] == nil,
-           ["write_file", "commit_memory", "desk_note", "desk_update_item", "desk_set_status", "desk_add_ref", "desk_add_item", "bot_create", "bot_update", "bot_pause"].contains(tool) {
-            var source = AgentWorkspaceEnvironment.readback(tool: tool, input: input)
-            if tool == "bot_create", let id = string(owner["id"]), UUID(uuidString: id) != nil {
-                source = .record(tool: "bot_list", input: ["id": .string(id)], title: string(owner["name"]) ?? "Created helper")
-            }
-            if tool == "commit_memory", let id = string(owner["id"]) {
-                source = .record(tool: "recall_memory", input: ["memory_id": .string(id), "max_characters": .int(2000)], title: "Recorded memory")
-            }
-            if tool == "desk_add_item", let handle = string(owner["handle"]) {
-                source = .record(tool: "desk_read", input: ["handle": .string(handle), "structured": .bool(true)], title: "Created work")
-            }
-            if let source, case .record(let reader, let arguments, _) = source {
-                do {
-                    let current = try await perform(reader, arguments)
-                    let location = reader == "desk_read"
-                        ? AgentWorkspaceLocation.record(tool: reader, input: arguments,
-                            title: AgentWorkspaceWork.desk(input: arguments, result: current).title)
-                        : source
-                    return .init(location: location, result: attaching(current, receipt: receipt))
-                } catch is CancellationError { throw CancellationError() }
-                catch {
-                    return .init(location: source, result: unavailable(receipt: receipt,
-                        detail: "The action returned, but its current result could not be read: " + error.localizedDescription + ". Reopen this source to read; do not repeat the action."))
-                }
-            }
         }
         guard browserEffects.contains(tool), owner["ok"] != .bool(false), owner["error"] == nil,
               owner["error_code"] == nil else { return nil }
@@ -173,7 +176,7 @@ enum AgentWorkspaceActionReadback {
 
     private static func matches(_ snapshot: JSONValue, tab: Int64, sequence: Int64?) -> Bool {
         let row = object(snapshot)
-        guard row["ok"] != .bool(false), row["error"] == nil, row["error_code"] == nil,
+        guard ChatToolOutcome.hasReadEvidence(snapshot),
               row["tabId"] == .int(tab), string(row["snapshotId"]) != nil,
               integer(row["tabId"]) != nil, case .array? = row["nodes"],
               let observed = integer(row["userSequence"]) else { return false }
@@ -195,9 +198,6 @@ enum AgentWorkspaceActionReadback {
     }
 
     private static func object(_ value: JSONValue) -> [String: JSONValue] { if case .object(let row) = value { return row }; return [:] }
-    private static func hasError(_ row: [String: JSONValue]) -> Bool {
-        ["error", "error_code"].contains { row[$0] != nil && row[$0] != .null }
-    }
     private static func string(_ value: JSONValue?) -> String? { guard case .string(let text)? = value, !text.isEmpty, text.count <= 8192 else { return nil }; return text }
     private static func integer(_ value: JSONValue?) -> Int64? { guard case .int(let value)? = value, value >= 0 else { return nil }; return value }
 }

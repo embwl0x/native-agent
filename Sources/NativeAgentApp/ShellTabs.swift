@@ -48,11 +48,8 @@ final class ShellScrollGutter {
     }
 }
 
-/// One page column: the trailing gutter is the legacy scroller's width, always.
-/// It never follows whether the content overflows: that measurement fed the
-/// margin, the margin rewrapped the text, the rewrap flipped the measurement,
-/// and a page whose height sat at the boundary looped inside one frame until
-/// AppKit aborted (10-23: Providers crashed on open).
+/// The trailing gutter always follows the legacy scroller's width.
+/// Never derive it from content overflow: rewrapping would feed back into that measurement.
 private struct PageScrollColumn: ViewModifier {
     func body(content: Content) -> some View {
         content.contentMargins(.trailing, ShellScrollGutter.shared.width, for: .scrollContent)
@@ -93,12 +90,7 @@ private struct PageActionsModifier<Actions: View>: ViewModifier {
     }
 }
 
-// User, 2026-09-04: the Advanced pages come out from behind Settings and onto
-// the rail, and the ones that belong together become tabs on one page. The
-// tab row is the rail's own idiom turned sideways: the rail's 14pt medium
-// words, the selected one in the text colour with the rail's 2pt bar that
-// travels, the rest secondary with a hover fade on the word. No segmented
-// control, no second accent.
+// Related rail destinations share a page with tabs styled like the rail.
 
 /// One tab: a stable key (persisted per page) and the word a person reads.
 struct ShellTab<Key: Hashable>: Identifiable {
@@ -107,8 +99,7 @@ struct ShellTab<Key: Hashable>: Identifiable {
     var id: Key { key }
 }
 
-/// The page's sections as the Mac's own segmented control (User 09-27: all
-/// controls native; her colour arrives through the app tint).
+/// Page sections use the native segmented control and the app tint.
 struct ShellTabs<Key: Hashable>: View {
     let tabs: [ShellTab<Key>]
     @Binding var selection: Key
@@ -152,7 +143,7 @@ struct ShellTabbedPage<Key: Hashable, Content: View>: View {
         let shown = quietOffscreenRead
             ? (tabs.first { ($0.key as? String) == quietRailTab } ?? tabs.first)?.key ?? selection
             : selection
-        ShellPageFrame(title: title, subtitle: subtitlePage.flatMap { appModel.engine.transcripts.presentation.words("page:"+$0.normalized.rawValue) } ?? subtitle, showsBack: false, alive: alive) {
+        ShellPageFrame(title: title, subtitle: subtitlePage.flatMap { appModel.engine.transcripts.presentation.words("page:"+$0.normalized.rawValue) } ?? subtitle, alive: alive) {
             VStack(alignment: .leading, spacing: 0) {
                 ShellTabs(tabs: tabs, selection: quietOffscreenRead ? .constant(shown) : $selection)
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { tabRowHeight = $0 }
@@ -229,24 +220,11 @@ struct ShellRailPage<Content: View>: View {
 
     var body: some View {
         ShellPageFrame(title: title, subtitle: subtitlePage.flatMap { appModel.engine.transcripts.presentation.words("page:"+$0.normalized.rawValue) } ?? subtitle,
-            showsBack: false, wide: wide, alive: alive) { content }
+            wide: wide, alive: alive) { content }
             .quietReadTask(id: subtitlePage?.normalized.rawValue) {
                 if let page=subtitlePage?.normalized {
                     await appModel.engine.transcripts.presentation.prepare("page:"+page.rawValue,input:.object(["kind":.string("page"),"page":.string(page.rawValue)]))
                 }
             }
-    }
-}
-
-struct ShellRailSubtitle: View {
-    @Environment(AppModel.self) private var appModel
-    let page: SidebarItem
-    var body: some View {
-        Group {
-            if let text=appModel.engine.transcripts.presentation.words("page:"+page.normalized.rawValue) { Text(text) }
-        }.quietReadTask(id:page.normalized.rawValue) {
-            await appModel.engine.transcripts.presentation.prepare("page:"+page.normalized.rawValue,
-                input:.object(["kind":.string("page"),"page":.string(page.normalized.rawValue)]))
-        }
     }
 }
