@@ -3,6 +3,7 @@ import Foundation
 import NativeAgentCore
 import PersistenceCore
 import Desk
+import AgentConversations
 import Experiences
 import ToolExecution
 // Blueprint: | `SwiftToolDispatcher+DeskTools.swift` | `SwiftToolDispatcher`: ordinary Desk mutations, exact raw clear/set admission and checked pursuit evidence; person waits use existing status fields, dependency waits retain their conditions, and close resolves holds once while retaining closed children on conflict |
@@ -437,7 +438,7 @@ extension SwiftToolDispatcher {
             guard case .string(let id) = value, !id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
             return id.trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        let correction = "desk.wait takes on: a person's or agent's name (for example User, owner or Claude Desktop), a conversation id (its next message), a Desk handle/number, an experience id (card, message, delivery or repair), or a list of those dependency ids. note is optional."
+        let correction = "desk.wait takes on: a person's or agent's name (for example User, owner or Claude Desktop) or an agent's peer: id, a conversation id (its next message), a Desk handle/number, an experience id (card, message, delivery or repair), or a list of those dependency ids. note is optional."
         guard !ids.isEmpty, ids.count == values.count else { throw ToolFailureError(correction, argumentPath: "$.on", effects: .none, code: "invalid_input") }
         let store = deskStore()
         // An id an owner just handed out may still be on its way into the store.
@@ -460,7 +461,9 @@ extension SwiftToolDispatcher {
                 let conversation = NativeAgentChatSessionID.normalizedPathComponent(id).map {
                     FileManager.default.fileExists(atPath: dataRoot.appendingPathComponent("chat/messages/\($0).jsonl").path)
                 } ?? false
-                if ids.count == 1, personName || conversation, case .string? = input["on"] {
+                // A contact is named by the id agent.read hands out (peer:…) as well as by name.
+                let contact = id.hasPrefix("peer:") && ((try? AgentPeerStore(dataRoot: dataRoot).list())?.contains { "peer:" + $0.id == id } ?? false)
+                if ids.count == 1, personName || conversation || contact, case .string? = input["on"] {
                     var statusInput = input
                     statusInput.removeValue(forKey: "wait")
                     statusInput["handle"] = .string(handle)

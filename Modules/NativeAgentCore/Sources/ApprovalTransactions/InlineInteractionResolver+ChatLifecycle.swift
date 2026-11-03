@@ -123,8 +123,24 @@ extension InlineInteractionResolver {
         }
         switch descriptor.control {
         case .internetAccounts:
+            // Mail's card does what Mail's readiness says: the card is the person's
+            // yes to reading Mail, one check lets macOS ask to control Mail, and
+            // Internet Accounts opens only when Mail has no account to read.
+            do {
+                _ = try await MacIntegrationPermissionStore(dataRoot: dataRoot).setWithReceipt(
+                    integrationId: "mail", read: true, write: nil, actionID: "\(interaction.id)-mail",
+                    surface: "inline_card", provenance: .local(), onlyAddingAxes: true)
+            } catch {
+                await finish(selection: nil, error: error.localizedDescription)
+                return
+            }
+            let readiness = await platform.mailReadiness(root: dataRoot, check: true)
+            if readiness.status == "ready" {
+                await finish(selection: "mail", note: "Mail connected" + (readiness.next.map { ". " + $0 } ?? ""))
+                return
+            }
             watch()
-            present(.internetAccounts)
+            if readiness.status == "needs_setup" { present(.internetAccounts) }
         case .chromeSetup:
             if !controls.chromeControlEnabled, !controls.fullMacGrantIsActive {
                 await controls.enableChromeControl()

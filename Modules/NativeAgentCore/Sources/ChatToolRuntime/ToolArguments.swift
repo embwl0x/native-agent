@@ -192,6 +192,10 @@ public extension ToolDispatchClient {
             if native || OwnedProgramRunner.wake == nil {
                 try ToolArguments.admit(normalized, schema: parameters, transportMetadata: true, declaredKeysOnly: native)
             }
+        } else if AuthoredToolEffects.isPrimitiveEffect(canonical) {
+            // A primitive effect (fetch, apps.call, …) has no catalog row: Trust
+            // admits it by its effect identity and its broker checks its arguments.
+            normalized = input
         } else {
             throw ToolFailureError("No current input schema is available for \(canonical). Nothing ran.",
                 effects: .none, owner: "Tool catalog", code: "tool_schema_unavailable",

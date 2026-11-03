@@ -92,7 +92,7 @@ extension SystemPermissionPreflight {
                 let cause = "\(gate.displayName) (\(id)) permission request could not complete: \(error.localizedDescription)"
                 // A cancelled caller never opens another pane. Other request
                 // failures retain their cause alongside the existing remedy.
-                let handoff = Task.isCancelled || TaskWaitDeadline.expired || !openedPanes.insert(gate).inserted ? nil : openSettings(gate)
+                let handoff = Task.isCancelled || TaskWaitDeadline.expired || !openedPanes.isEmpty || !openedPanes.insert(gate).inserted ? nil : openSettings(gate)
                 let remedy = " Open System Settings > Privacy & Security > \(gate.displayName), allow NativeAgent, then return here and refresh."
                 problems.append(cause + remedy + (handoff.map { " " + $0 } ?? ""))
                 requestFailed = true
@@ -105,7 +105,9 @@ extension SystemPermissionPreflight {
             }
             if let reason = await cardBlockReason([id], mode: mode) {
                 problems.append(reason)
-                if openedPanes.insert(gate).inserted, let failure = openSettings(gate) {
+                // One pane at a time, the first still off: System Settings shows only
+                // the last pane opened, so a second would hide the one that matters.
+                if openedPanes.isEmpty, openedPanes.insert(gate).inserted, let failure = openSettings(gate) {
                     problems.append(failure)
                 }
             }

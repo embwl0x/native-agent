@@ -44,6 +44,7 @@ extension BuiltInToolSchemaFactory {
                 ("conversation", conversation),
                 ("new_conversation", ToolSchema.boolSchema()),
                 ("expects_reply", ToolSchema.boolSchema("false for a message needing no answer. Acceptance is still owed until the recipient receives it. Omit for questions and work.")),
+                ("dry_run", ToolSchema.boolSchema("true checks this contact's send route end to end without sending anything (agent.verify uses it). Omit to send.")),
                 ("wait_seconds", ToolSchema.intSchema("Wait for a live lane's reply inline: default 20, maximum 120; 0 sends and continues. Async lanes ignore the wait and say wait_ignored:lane_is_async. Timeout keeps the queued receipt; the later answer still arrives once.", minimum: 0, maximum: 120)),
                 ("conversation_id", ToolSchema.strSchema("Advanced override: exact existing remote conversation identity. Normally omit; the app remembers it. A failed resume never falls back to a fresh conversation. Bots retain their own conversation.")),
                 ("message_id", ToolSchema.strSchema("Optional caller message identity for coding agents or A2A; NativeAgent accepts a UUID for receipt correlation, not deduplication. Not supported for bot sends. Use returned request identity for recovery.")),

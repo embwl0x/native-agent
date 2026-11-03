@@ -124,6 +124,9 @@ extension iCloudBridge {
                 case .missing:
                     break
                 }
+                // A message sent before this life began was another life's to answer
+                // (an earlier install on this Mac, or before a restore): history, never a turn.
+                if message.timestamp < (try DataRootLife.began(in: dataRoot)) { return .completed }
                 let age = Date().timeIntervalSince(message.timestamp)
                 guard age <= 24 * 60 * 60, age >= -15 * 60 else { return .stale }
                 guard canDispatch else { return .unavailable }

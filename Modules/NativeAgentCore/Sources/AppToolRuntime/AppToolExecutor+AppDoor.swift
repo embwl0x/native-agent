@@ -96,7 +96,7 @@ extension AppToolExecutor {
     /// Let go of a repair she owes, saying why: the only settlement besides the operation working again.
     @MainActor
     func runRepairLetGo(input: [String: JSONValue]) async -> JSONValue {
-        let id = (input["id"]?.scalarText ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        var id = (input["id"]?.scalarText ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let reason = (input["reason"]?.scalarText ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !id.isEmpty, !reason.isEmpty else {
             return Self.doorRefusal("invalid_args", "Pass id (from an OWED line on your home) and reason. Nothing was let go.",
@@ -106,7 +106,14 @@ extension AppToolExecutor {
         let store = ExperienceStore.at(root)
         do {
             await store.drained()
-            let owed = try await store.experience(id)
+            var owed = try await store.experience(id)
+            // A debt answers to the subject it names too (Doctor's "Turn <id>"): the one open repair whose operation ends with it.
+            if owed == nil {
+                let named = try await store.open().filter { debt in
+                    RepairOwed.isOwed(debt) && debt.claims.contains { $0.claim == "operation: " + id || $0.claim.hasPrefix("operation: ") && $0.claim.hasSuffix(":" + id) }
+                }
+                if named.count == 1 { owed = named[0]; id = named[0].id }
+            }
             // A reply she owes a who is let go by its owner, so its delivery and the experience agree; the Desk line asking for it then settles.
             if let owed, owed.owes["deliver"]?.phase.isSettled == false,
                owed.evidence.contains(where: { $0.source == "codex-completion-lifecycle" }) {

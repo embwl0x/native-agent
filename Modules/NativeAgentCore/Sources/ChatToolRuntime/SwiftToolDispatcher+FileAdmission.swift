@@ -241,6 +241,11 @@ extension SwiftToolDispatcher {
            let path = input["path"]?.stringValue, path == "docs" || path.hasPrefix("docs/") {
             input["path"] = .string(try await resolveTrustedFilePath(path).path)
         }
+        // The git tools' contract: an omitted cwd reads the app's verified source
+        // checkout, or the workspace when this Mac has none.
+        let sourceRoot = ["git_status", "git_diff", "git_log", "repo_dirty_summary"].contains(tool)
+            && (input["cwd"]?.stringValue ?? "").isEmpty ? Self.builderSourceRepoRoot(dataRoot: dataRoot) : nil
+        if let sourceRoot { input["cwd"] = .string(sourceRoot.path) }
         if ["mac_volume", "mac_media"].contains(tool) {
             let impl = makeMacControl(
                 policyProvider: SwiftToolDispatcherMacControlPolicyProvider(policy: access.macPolicy),
@@ -258,7 +263,7 @@ extension SwiftToolDispatcher {
                 rootForRead,
                 PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot),
                 workspaceRoot,
-            ],
+            ] + (sourceRoot.map { [$0] } ?? []),
             personaRoot: PersistenceCore.defaultPersonaRoot(dataRoot: dataRoot),
             workspaceRoot: workspaceRoot
         )

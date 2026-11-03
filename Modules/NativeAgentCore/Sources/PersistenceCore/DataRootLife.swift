@@ -37,6 +37,18 @@ public enum DataRootLife {
         try current(in: root) == life(of: lifeID)
     }
 
+    /// When this root's life began: anything sent to it before then was
+    /// addressed to an earlier life (another install, or what a restore left behind).
+    public static func began(in root: URL) throws -> Date {
+        _ = try current(in: root)
+        var info = stat()
+        guard lstat(root.appendingPathComponent("life-id").path, &info) == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        return Date(timeIntervalSince1970: TimeInterval(info.st_birthtimespec.tv_sec)
+            + TimeInterval(info.st_birthtimespec.tv_nsec) / 1_000_000_000)
+    }
+
     /// The durable restore intent supplies one new identity across interrupted installation.
     public static func begin(in root: URL, id: UUID) throws {
         try SwiftNativePersistenceCore.writeDataAtomicDurable(
