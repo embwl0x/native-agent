@@ -35,10 +35,10 @@ public enum DreamBackgroundWork {
         return try await cycle.runDream(force: force, trigger: trigger) { delivery in
             switch delivery.effect {
             case .reflectionJudgment(let material):
-                if let receipt = try await cognitionRuntime.produceDreamReflection(id: delivery.id, material: material) {
-                    return .reflection(receipt)
+                switch try await cognitionRuntime.produceDreamReflection(id: delivery.id, material: material) {
+                case .judged(let receipt): return .reflection(receipt)
+                case .skipped(let reason): return .skipped(reason)
                 }
-                return .skipped("reflection disabled")
             case .reflectionIntegration(let receipt):
                 do {
                     if let reason = try await cognitionRuntime.integrateDreamReflection(receipt) { return .skipped(reason) }

@@ -28,9 +28,13 @@ private enum CognitiveReflectionPersonaError: Error, Sendable, CustomStringConve
 }
 
 extension NativeCognitionRuntime {
+    /// A dream's reflection: a judgment, or settled without one (reflection off,
+    /// or the night left nothing unresolved to reflect on). Budget and in-flight refusals stay owed.
+    public enum DreamReflection: Sendable { case judged(CognitiveReflectionReceipt), skipped(String) }
+
     /// Produce once, integrate later. The provider receipt is durable before
     /// returning to the dream journal; recovery finds it by this exact reason.
-    public func produceDreamReflection(id: UUID, material: [String: CognitiveReflectionCause]) async throws -> CognitiveReflectionReceipt? {
+    public func produceDreamReflection(id: UUID, material: [String: CognitiveReflectionCause]) async throws -> DreamReflection {
         await bootstrap()
         guard usesLiveAppBody, !isFlushedForTermination, !Task.isCancelled else {
             throw PersistenceCoreError.ioFailure("dream reflection awaits the running mind")
@@ -41,10 +45,10 @@ extension NativeCognitionRuntime {
             $0.request.reason == reason && !$0.cancelled && $0.judgment != nil
         }) {
             try await substrate.checkpointReflectionResultChecked(receipt)
-            return receipt
+            return .judged(receipt)
         }
         let configuration = await substrate.configurationSnapshot()
-        guard configuration.enabled, configuration.reflectiveCallsEnabled else { return nil }
+        guard configuration.enabled, configuration.reflectiveCallsEnabled else { return .skipped("reflection disabled") }
         guard configuration.persistenceEnabled else {
             throw PersistenceCoreError.ioFailure("dream reflection requires durable inner life")
         }
@@ -65,10 +69,12 @@ extension NativeCognitionRuntime {
             $0.request.reason == reason && !$0.cancelled && $0.judgment != nil
         }) {
             try await substrate.checkpointReflectionResultChecked(receipt)
-            return receipt
+            return .judged(receipt)
         }
         switch outcome {
         case .failed(let error): throw PersistenceCoreError.ioFailure("dream reflection failed: \(error)")
+        case .skipped(let reason, _) where reason == CognitiveSubstrate.reflectionRefusalDisabled
+            || reason == CognitiveSubstrate.reflectionRefusalLoadBelowThreshold: return .skipped(reason)
         case .skipped(let reason, _): throw PersistenceCoreError.ioFailure("dream reflection remains owed: \(reason)")
         case .completed: throw PersistenceCoreError.ioFailure("dream reflection returned no judgment receipt")
         }
