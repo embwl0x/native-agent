@@ -13,7 +13,8 @@
 # Helpers: exit 0 = authoritative stdout paths (empty means clean); exit 2 = failed scan.
 
 # Shared secret value and filename patterns for release and artifact verification.
-RELEASE_SECRET_VALUE_RE='(sk-(proj-)?[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{20,}|[0-9]{7,12}:[A-Za-z0-9_-]{30,}|AIza[0-9A-Za-z_-]{30,}|ya29\.[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|(sk|rk)_live_[0-9A-Za-z]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,})'
+# A token starts at a boundary: a real key is never glued onto letters ("task-…" or a mangled Swift "…Ieghr_…").
+RELEASE_SECRET_VALUE_RE='(^|[^A-Za-z0-9_])(sk-(proj-)?[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|xox[abprs]-[A-Za-z0-9-]{20,}|[0-9]{7,12}:[A-Za-z0-9_-]{30,}|AIza[0-9A-Za-z_-]{30,}|ya29\.[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|(sk|rk)_live_[0-9A-Za-z]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|eyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,})'
 # shellcheck disable=SC2034  # consumed by release.sh / verify_release_artifact.sh
 RELEASE_SECRET_FILE_RE='(^|/)(\.env($|[._-])|.*\.env$|\.npmrc$|\.pypirc$|\.netrc$|id_rsa$|id_dsa$|id_ecdsa$|id_ed25519$|credentials?\.(json|ya?ml|toml|ini)$|.*credentials?\.(json|ya?ml|toml|ini)$|token(s)?\.(json|ya?ml|toml|ini)$|.*token(s)?\.(json|ya?ml|toml|ini)$|oauth.*token.*\.(json|ya?ml|toml|ini)$|client_secret(s)?\.(json|ya?ml|toml|ini)$|.*client_secret.*\.(json|ya?ml|toml|ini)$|service[-_]?account.*\.(json|ya?ml|toml|ini)$|firebase-adminsdk.*\.json$|.*\.(pem|p12|pfx|jks|keystore|key|gpg|asc)$)'
 
@@ -389,8 +390,8 @@ release_scan_binary_for_local_identity() {
   [[ "$rc" -le 1 ]] || { echo "ERROR: $label byte-run scan failed ($rc)." >&2; return 2; }
   # Raw runs shorter than eight bytes need ordinary word casing; longer paths or addresses survive.
   if [[ "$rc" -eq 0 ]]; then
-    # Raw runs under four bytes can be ARM64 instructions; strings catches real short literals.
-    out="$(LC_ALL=C awk 'length($0) >= 8 || ($0 ~ /^[^A-Za-z]*([a-z]+|[A-Z][a-z]+|[A-Z]+)[^A-Za-z]*$/ && length($0) >= 4)' <<<"$out")"
+    # A run of four bytes or fewer is one ARM64 instruction word or noise in compressed data; it proves nothing.
+    out="$(LC_ALL=C awk 'length($0) >= 8 || ($0 ~ /^[^A-Za-z]*([a-z]+|[A-Z][a-z]+|[A-Z]+)[^A-Za-z]*$/ && length($0) >= 5)' <<<"$out")"
     [[ -n "$out" ]] || rc=1
   fi
   # The code signature carries the signing certificate's subject ("Developer ID
@@ -403,6 +404,8 @@ release_scan_binary_for_local_identity() {
     out="$(LC_ALL=C grep -Ev -e "$signer_re" <<<"$out" || true)"
     [[ -n "$out" ]] || rc=1
   fi
+  # String-table runs take the same short-run rule: four bytes prove nothing.
+  string_hits="$(LC_ALL=C awk 'length($0) >= 8 || ($0 ~ /^[^A-Za-z]*([a-z]+|[A-Z][a-z]+|[A-Z]+)[^A-Za-z]*$/ && length($0) >= 5)' <<<"$string_hits")"
   [[ -z "$string_hits" ]] || printf '%s\n' "$string_hits"
   [[ "$rc" -ne 0 ]] || printf '%s\n' "$out" | head -20
   return 0
